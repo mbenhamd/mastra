@@ -1,7 +1,16 @@
 import type { ConnectionOptions } from 'node:tls';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import { createStorageErrorId, MastraCompositeStore } from '@mastra/core/storage';
-import type { StorageDomains } from '@mastra/core/storage';
+import {
+  createStorageErrorId,
+  MastraCompositeStore,
+  normalizeHarnessSessionRecordProjectionConfig,
+} from '@mastra/core/storage';
+import type {
+  ExecutionClosureImportResult,
+  ExecutionClosureKey,
+  ExecutionClosurePayload,
+  StorageDomains,
+} from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import { Pool } from 'pg';
 import {
@@ -45,6 +54,7 @@ import { ToolProviderConnectionsPG } from './domains/tool-provider-connections';
 import { WorkflowDefinitionsPG } from './domains/workflow-definitions';
 import { WorkflowsPG } from './domains/workflows';
 import { WorkspacesPG } from './domains/workspaces';
+import { exportExecutionClosure, importExecutionClosure } from './execution-closure';
 
 /** Default maximum number of connections in the pool */
 const DEFAULT_MAX_CONNECTIONS = 20;
@@ -245,6 +255,8 @@ export class PostgresStore extends MastraCompositeStore {
   #readDb: DbClient;
   #ownsWritePool: boolean;
   #writePoolClosed: boolean = false;
+  /** Destination bound projection restaging must satisfy on closure import. */
+  #projectionMaxPayloadBytes: number;
   private schema: string;
   private isInitialized: boolean = false;
   // Caches the in-flight init() so concurrent callers share one initialization
@@ -263,6 +275,9 @@ export class PostgresStore extends MastraCompositeStore {
       super({ id: config.id, name: 'PostgresStore', disableInit: config.disableInit, retention: config.retention });
       // Validate schema name to prevent SQL injection
       this.schema = parseSqlIdentifier(config.schemaName || 'public', 'schema name');
+      this.#projectionMaxPayloadBytes = normalizeHarnessSessionRecordProjectionConfig(
+        config.sessionRecordProjection,
+      ).maxPayloadBytes;
 
       if (isPoolConfig(config)) {
         this.#writePool = config.pool;
@@ -526,6 +541,32 @@ export class PostgresStore extends MastraCompositeStore {
   /** The underlying reader pg.Pool, falling back to the writer pool when unset. */
   public get readPool(): Pool {
     return this.#readPool;
+  }
+
+  /**
+   * Export one harness session subtree as a versioned execution-closure
+   * payload under a single REPEATABLE READ snapshot. A `complete` unit also
+   * retires the exported incarnation on the source inside the same
+   * transaction. See `exportExecutionClosure` for the manifest/pin contract.
+   */
+  async exportExecutionClosure(key: ExecutionClosureKey): Promise<ExecutionClosurePayload> {
+    return exportExecutionClosure(this.#db, key, { schemaName: this.schema });
+  }
+
+  /**
+   * Stage and apply an exported execution closure into this store's schema.
+   * See `importExecutionClosure` for the verification/fresh-authority contract.
+   */
+  async importExecutionClosure(payload: ExecutionClosurePayload): Promise<ExecutionClosureImportResult> {
+    return importExecutionClosure(this.#db, payload, {
+      schemaName: this.schema,
+      maxProjectionPayloadBytes: this.#projectionMaxPayloadBytes,
+      // Capability is the configured feature, not table presence: a store
+      // whose terminal handoff/projection is disabled cannot claim the live
+      // work a closure may carry, so the importer pins rather than strands it.
+      terminalHandoffEnabled: this.stores.harness?.supportsTerminalHandoff === true,
+      projectionEnabled: this.stores.harness?.supportsSessionRecordProjection === true,
+    });
   }
 
   /**

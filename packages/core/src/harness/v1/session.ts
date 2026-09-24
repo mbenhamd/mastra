@@ -79,10 +79,12 @@ import {
   HarnessTerminalHandoffCancelledError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
+  boundHarnessTerminalError,
   harnessTerminalIntentId,
   HarnessTerminalHandoffUnsupportedError,
   HarnessTerminalHandoffValidationError,
   HarnessTerminalFinalizationPendingError,
+  assertJsonValue as assertBoundedTerminalJsonValue,
   validateHarnessTerminalExecutionGrant,
 } from '../../storage/domains/harness';
 import type {
@@ -7721,18 +7723,7 @@ export class Session {
       // RangeError/DataCloneError.
       ...(opts.terminalAdmissionSeed === undefined
         ? {}
-        : {
-            terminalAdmissionSeed: (() => {
-              try {
-                return structuredClone(opts.terminalAdmissionSeed);
-              } catch {
-                throw new HarnessTerminalHandoffValidationError(
-                  'terminalAdmissionSeed',
-                  'must be JSON serializable within the terminal handoff bounds',
-                );
-              }
-            })(),
-          }),
+        : { terminalAdmissionSeed: snapshotTerminalAdmissionSeed(opts.terminalAdmissionSeed) }),
     };
 
     if (opts.stream === true && opts.output !== undefined) {
@@ -7843,7 +7834,7 @@ export class Session {
       opts.terminalAdmissionSeed !== undefined ||
       opts.onTerminalCommit !== undefined ||
       opts.onTerminalCommitError !== undefined;
-    if (terminalRequested && this._terminalFinalizer === undefined) {
+    if (terminalRequested && (this._terminalFinalizer === undefined || !this._storage.supportsTerminalHandoff)) {
       throw new HarnessTerminalHandoffUnsupportedError();
     }
     const terminalIdentity = terminalRequested
@@ -8826,6 +8817,11 @@ export class Session {
     const admittedOpts = {
       ...opts,
       ...(logicalMessageIdentity === undefined ? {} : { logicalMessageIdentity }),
+      // Same boundary contract as message(): a seed that cannot round-trip
+      // bounded JSON must fail here before the admission hash runs.
+      ...(opts.terminalAdmissionSeed === undefined
+        ? {}
+        : { terminalAdmissionSeed: snapshotTerminalAdmissionSeed(opts.terminalAdmissionSeed) }),
     };
     if (opts.admissionId === undefined || opts.admissionId.length === 0) {
       throw new HarnessValidationError('admitMessage().admissionId', 'admissionId must be a non-empty string');
@@ -10101,7 +10097,9 @@ export class Session {
       ...(finishReason !== undefined ? { finishReason } : {}),
       completedAt: Date.now(),
       ...(endReason === 'error'
-        ? { error: projectHarnessPublicError(full.error ?? new Error('agent run failed')) }
+        ? {
+            error: boundHarnessTerminalError(projectHarnessPublicError(full.error ?? new Error('agent run failed'))),
+          }
         : {}),
     };
     // The admitted finalizer identity is durable — a deployment that
@@ -20917,6 +20915,31 @@ function publicErrorProjectionToError(error: { code: string; message: string }):
   projected.name = error.code;
   (projected as Error & { code: string }).code = error.code;
   return projected;
+}
+
+/**
+ * Snapshot a caller-supplied terminal admission seed for hashing + persistence.
+ * The seed is bound into the admission hash AND persisted on the durable
+ * admission row, but the admit happens after awaits — snapshot it at the
+ * public boundary so a caller mutating its object mid-flight cannot split the
+ * hashed value from the persisted one.
+ *
+ * `structuredClone` alone admits cyclic graphs, which then overflow the
+ * recursive canonical hashers before `prepareHarnessTerminalAdmission` can
+ * apply its bounded-JSON validation. Validate as bounded terminal JSON first
+ * so a cyclic, non-plain, or unboundedly deep seed fails here with the typed
+ * terminal validation error rather than a raw RangeError/DataCloneError.
+ */
+function snapshotTerminalAdmissionSeed(seed: JsonValue): JsonValue {
+  assertBoundedTerminalJsonValue(seed, 'terminalAdmissionSeed');
+  try {
+    return structuredClone(seed);
+  } catch {
+    throw new HarnessTerminalHandoffValidationError(
+      'terminalAdmissionSeed',
+      'must be JSON serializable within the terminal handoff bounds',
+    );
+  }
 }
 
 function cloneAttachmentMetadata(metadata: Record<string, JsonValue>): Record<string, JsonValue> {

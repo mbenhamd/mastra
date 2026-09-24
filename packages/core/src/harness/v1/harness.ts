@@ -1082,7 +1082,29 @@ export class Harness {
     this._persistTransientStreamingEvents = config.sessions?.persistTransientStreamingEvents ?? true;
     this._onBeforeQueuedTurn = config.sessions?.onBeforeQueuedTurn;
     this._onBeforeToolExecution = config.sessions?.onBeforeToolExecution;
-    this._terminalFinalizer = config.sessions?.terminalHandoff?.finalizer;
+    // The terminal finalizer is validated at construction: a missing or
+    // malformed registration must not be accepted only to strand every
+    // admitted terminal grant as a retryable pending failure at settlement.
+    const terminalHandoff = config.sessions?.terminalHandoff;
+    if (terminalHandoff !== undefined) {
+      const finalizer = terminalHandoff.finalizer;
+      if (
+        finalizer === undefined ||
+        finalizer === null ||
+        typeof finalizer !== 'object' ||
+        typeof finalizer.id !== 'string' ||
+        finalizer.id.length === 0 ||
+        typeof finalizer.version !== 'string' ||
+        finalizer.version.length === 0 ||
+        typeof finalizer.finalize !== 'function'
+      ) {
+        throw new HarnessConfigError(
+          'sessions.terminalHandoff.finalizer',
+          'must be a terminal finalizer with a non-empty id, a non-empty version, and a finalize callback',
+        );
+      }
+      this._terminalFinalizer = finalizer;
+    }
     this._lockRenewMs = config.sessions?.lockRenewMs ?? DEFAULT_LEASE_RENEW_MS;
     if (!Number.isInteger(this._lockRenewMs) || this._lockRenewMs < 1 || this._lockRenewMs >= this._leaseTtlMs) {
       throw new HarnessConfigError('sessions.lockRenewMs', 'must be a positive integer less than lockTtlMs');
@@ -3708,7 +3730,7 @@ export class Harness {
       // scoped) lookup do not share a resolution and bypass each other's
       // tenant check inside `_resolveById`.
       return this._singleflightResolve(
-        // canonicalJson is NUL-/sentinel-safe: every byte (incl.  ) is
+        // canonicalJson is NUL-/sentinel-safe: every byte (incl. \x00) is
         // JSON-escaped, so distinct (sessionId, resourceId) pairs never collide.
         canonicalJson(['id', sessionId, resourceId ?? null]),
         () => this._resolveById(storage, sessionId, resourceId),

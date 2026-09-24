@@ -8,6 +8,7 @@ import {
   HarnessTerminalHandoffUnsupportedError,
   HarnessTerminalHandoffValidationError,
   TABLE_HARNESS_SESSION_PROJECTION_FENCES,
+  TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
   TABLE_HARNESS_SESSION_PROJECTION_PRESSURE,
   TABLE_HARNESS_TERMINAL_ADMISSIONS,
@@ -253,12 +254,25 @@ describe('HarnessPG native terminal handoff', () => {
     expect(await rowCount(TABLE_HARNESS_TERMINAL_INTENTS)).toBe(1);
     await expect(harness().getTerminalQueuePressure({ harnessName: HARNESS })).resolves.toEqual(pressure);
 
-    // A mutated replay under the same grant is an identity conflict, not a
-    // silent overwrite of the committed winner.
+    // A raced committer whose finalizer bytes diverge from the sealed winner
+    // is still the same operation — every durable identity field matched — so
+    // the durable receipt replays instead of reporting an identity conflict.
+    // (Cross-process finalizers are nondeterministic: terminalResult's
+    // caller-side completedAt alone differs per committer.)
+    const raced = await harness().commitTerminalHandoff({
+      ...args,
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-commit', payload: { text: 'other' } },
+    });
+    expect(raced.status).toBe('duplicate');
+    expect(raced.intent?.id).toBe(committed.intent!.id);
+    await expect(harness().getTerminalQueuePressure({ harnessName: HARNESS })).resolves.toEqual(pressure);
+
+    // A replay that mutates a durable identity field under the same grant is
+    // a conflict, not a race artifact — the sealed winner is never rewritten.
     await expect(
       harness().commitTerminalHandoff({
         ...args,
-        projection: { projectionKind: 'chat.summary', projectionId: 'summary-commit', payload: { text: 'other' } },
+        resultEvidence: { ...args.resultEvidence, admissionHash: 'hash-other' },
       }),
     ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
   });
@@ -288,6 +302,64 @@ describe('HarnessPG native terminal handoff', () => {
       harness().admitTerminalHandoff({ ...input, runId: 'run-other', signalId: 'signal-other' }),
     ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
     expect(await rowCount(TABLE_HARNESS_TERMINAL_ADMISSIONS)).toBe(1);
+  });
+
+  it('conflicts a second grant admitted to the same session run', async () => {
+    const session = await createNativeSession(harness(), 'session-run-admit');
+    const first = admissionFor(session, 'run-admit-a');
+    // A different grant aiming at the same (session, incarnation, run) —
+    // recovery resolves admissions by that tuple, so two rows would make the
+    // LIMIT 1 probe nondeterministic.
+    const second = { ...admissionFor(session, 'run-admit-b'), runId: first.runId };
+    await harness().writeMessageResultEvidence(pendingEvidence(first));
+    await harness().writeMessageResultEvidence(pendingEvidence(second));
+
+    await expect(harness().admitTerminalHandoff(first)).resolves.toMatchObject({ status: 'created' });
+    await expect(harness().admitTerminalHandoff(second)).resolves.toMatchObject({
+      status: 'conflict',
+      admission: expect.objectContaining({ admissionId: first.admissionId, runId: first.runId }),
+    });
+    expect(await rowCount(TABLE_HARNESS_TERMINAL_ADMISSIONS)).toBe(1);
+
+    // The run still resolves deterministically to the first admission.
+    await expect(
+      harness().loadTerminalAdmissionByRun({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        sessionIncarnation: session.sessionIncarnation!,
+        runId: first.runId,
+      }),
+    ).resolves.toMatchObject({ admissionId: first.admissionId });
+  });
+
+  it('rejects a terminal result bound to a different run before writing any rows', async () => {
+    const session = await createNativeSession(harness(), 'session-run-result');
+    const input = admissionFor(session, 'run-result');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+
+    // The intent's top-level runId comes from the admission; a result naming
+    // another run would persist two disagreeing run identities.
+    await expect(
+      harness().commitTerminalHandoff({
+        ...commitInput(input, 'run-result'),
+        terminalResult: { status: 'completed', runId: 'run-other', completedAt: Date.now() },
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+    expect(await rowCount(TABLE_HARNESS_TERMINAL_INTENTS)).toBe(0);
+
+    // The admission is untouched — a correctly bound retry still commits.
+    await expect(
+      harness().loadPendingTerminalAdmission({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        sessionIncarnation: session.sessionIncarnation!,
+        runId: input.runId,
+      }),
+    ).resolves.toMatchObject({ status: 'pending' });
+    await expect(harness().commitTerminalHandoff(commitInput(input, 'run-result'))).resolves.toMatchObject({
+      status: 'committed',
+    });
   });
 
   it('keeps an absent-row cancellation tombstone that fences late admission and commit', async () => {
@@ -641,6 +713,43 @@ describe('HarnessPG native terminal handoff', () => {
     expect(replay.status).toBe('duplicate');
   });
 
+  it('binds claim settlement to the consumer that minted the claim', async () => {
+    const session = await createNativeSession(harness(), 'session-consumer');
+    const input = admissionFor(session, 'consumer');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    await harness().commitTerminalHandoff(commitInput(input, 'consumer'));
+
+    const t0 = Date.now();
+    const claimed = await claimFirst(harness(), 'worker-a', t0);
+    expect(claimed.consumerId).toBe('worker-a');
+
+    // The claim id is durable evidence a stale caller can replay — but the
+    // lease belongs to the consumer that minted it, so the same claim id
+    // under another consumer cannot renew, ack, or fail the intent.
+    await expect(
+      harness().ackTerminalIntent({ ...claimIdentityOf(claimed, 'worker-b'), now: t0 + 10 }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffClaimConflictError);
+    await expect(
+      harness().renewTerminalIntent({ ...claimIdentityOf(claimed, 'worker-b'), now: t0 + 10, leaseMs: 5_000 }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffClaimConflictError);
+    await expect(
+      harness().failTerminalIntent({
+        ...claimIdentityOf(claimed, 'worker-b'),
+        error: { code: 'x', message: 'x' },
+        now: t0 + 10,
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffClaimConflictError);
+
+    // The owning consumer still settles, and the claim clears its consumer.
+    const acked = await harness().ackTerminalIntent({
+      ...claimIdentityOf(claimed, 'worker-a'),
+      now: t0 + 20,
+    });
+    expect(acked.status).toBe('acked');
+    expect(acked.intent.consumerId).toBeUndefined();
+  });
+
   it('requeues a failed claim with backoff and dead-letters at maxAttempts', async () => {
     const session = await createNativeSession(harness(), 'session-retry');
     const input = admissionFor(session, 'retry');
@@ -805,6 +914,121 @@ describe('HarnessPG native terminal handoff', () => {
       expect(await optionalRowCount(TABLE_HARNESS_SESSION_PROJECTION_INTENTS)).toBe(0);
       expect(await optionalRowCount(TABLE_HARNESS_SESSION_PROJECTION_FENCES)).toBe(0);
       expect(await optionalRowCount(TABLE_HARNESS_SESSION_PROJECTION_PRESSURE)).toBe(0);
+    } finally {
+      await terminalOnly.close();
+    }
+  });
+
+  it('mints an incarnation when a legacy NULL-incarnation row is loaded or updated', async () => {
+    const terminalOnly = terminalStore('pg-harness-terminal-legacy-store', schemaName, {}, { enabled: false });
+    await terminalOnly.init();
+    try {
+      const th = terminalOnly.stores.harness!;
+      const session = await createNativeSession(th, 'legacy-upgrade-session');
+      // Simulate a row written before terminal handoff existed.
+      await terminalOnly.db.none(
+        `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}" SET session_incarnation = NULL WHERE id = $1`,
+        [session.id],
+      );
+      // Loading repairs the legacy row and returns the persisted incarnation.
+      const legacy = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(legacy?.sessionIncarnation).toEqual(expect.any(String));
+      // The mint is persisted once: every later reader sees the same winner.
+      const reread = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reread?.sessionIncarnation).toBe(legacy?.sessionIncarnation);
+      const byThread = await th.loadSessionByThread({
+        harnessName: HARNESS,
+        threadId: session.threadId,
+        resourceId: session.resourceId,
+      });
+      expect(byThread?.sessionIncarnation).toBe(legacy?.sessionIncarnation);
+
+      // An update that omits the incarnation keeps the minted fence.
+      await th.saveSession(
+        { ...legacy!, sessionIncarnation: undefined },
+        { ownerId: legacy!.ownerId, ifVersion: legacy!.version },
+      );
+      const reloaded = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reloaded?.sessionIncarnation).toBe(legacy?.sessionIncarnation);
+    } finally {
+      await terminalOnly.close();
+    }
+  });
+
+  it('repairs a legacy NULL-incarnation row on the create-or-load rehydration path', async () => {
+    const terminalOnly = terminalStore(
+      'pg-harness-terminal-legacy-create-load-store',
+      schemaName,
+      {},
+      { enabled: false },
+    );
+    await terminalOnly.init();
+    try {
+      const th = terminalOnly.stores.harness!;
+      const session = await createNativeSession(th, 'legacy-create-load-session');
+      // Simulate a row written before terminal handoff existed.
+      await terminalOnly.db.none(
+        `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}" SET session_incarnation = NULL WHERE id = $1`,
+        [session.id],
+      );
+
+      // The Harness.sessions.create(...) rehydration path resolves the
+      // existing owner by (resource, thread) — it must repair the legacy row
+      // before returning, or every terminal message fences in
+      // _prepareTerminalIdentity.
+      const rehydrated = await th.createOrLoadActiveSession(
+        createSampleSessionRecord({
+          id: 'legacy-create-load-other',
+          harnessName: HARNESS,
+          resourceId: session.resourceId,
+          threadId: session.threadId,
+        }),
+        { initialLease: { ownerId: 'owner-other', ttlMs: 60_000 } },
+      );
+      expect(rehydrated.created).toBe(false);
+      expect(rehydrated.record.id).toBe(session.id);
+      expect(rehydrated.record.sessionIncarnation).toEqual(expect.any(String));
+
+      // The mint is persisted once: a fresh load sees the same winner.
+      const reread = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reread?.sessionIncarnation).toBe(rehydrated.record.sessionIncarnation);
+
+      // Terminal handoff works on the repaired identity — the admission the
+      // hydrated record drives is created, not fenced.
+      const input = admissionFor(reread!, 'legacy-create-load');
+      await th.writeMessageResultEvidence(pendingEvidence(input));
+      await expect(th.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'created' });
+    } finally {
+      await terminalOnly.close();
+    }
+  });
+
+  it('mints an incarnation on the first update of a legacy row before any load repairs it', async () => {
+    const terminalOnly = terminalStore('pg-harness-terminal-legacy-save-store', schemaName, {}, { enabled: false });
+    await terminalOnly.init();
+    try {
+      const th = terminalOnly.stores.harness!;
+      const session = await createNativeSession(th, 'legacy-save-session');
+      // Simulate a row written before terminal handoff existed, observed by a
+      // caller record that also lacks the incarnation.
+      await terminalOnly.db.none(
+        `UPDATE "${schemaName}"."${TABLE_HARNESS_SESSIONS}" SET session_incarnation = NULL WHERE id = $1`,
+        [session.id],
+      );
+      await th.saveSession(
+        { ...session, sessionIncarnation: undefined },
+        { ownerId: session.ownerId, ifVersion: session.version },
+      );
+      const upgraded = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(upgraded?.sessionIncarnation).toEqual(expect.any(String));
+
+      // A later update that omits the incarnation keeps the minted fence.
+      await th.saveSession(
+        { ...upgraded!, sessionIncarnation: undefined },
+        { ownerId: upgraded!.ownerId, ifVersion: upgraded!.version },
+      );
+      const reloaded = await th.loadSession({ harnessName: HARNESS, sessionId: session.id });
+      expect(reloaded?.sessionIncarnation).toBe(upgraded?.sessionIncarnation);
     } finally {
       await terminalOnly.close();
     }
@@ -1031,14 +1255,25 @@ describe('HarnessPG native terminal handoff', () => {
     expect(replay.status).toBe('duplicate');
     expect(replay.intent?.id).toBe(committed.intent!.id);
 
-    // A genuinely different result still conflicts — normalization must not
-    // widen the equality.
+    // A raced committer whose result payload differs from the sealed winner
+    // replays the durable receipt — same admission, grant, signal, and run —
+    // rather than reporting an identity conflict. The durable identity fields
+    // still gate the replay: mutating one conflicts instead of overwriting.
+    const raced = await harness().commitTerminalHandoff({
+      ...args,
+      resultEvidence: {
+        ...args.resultEvidence,
+        result: { text: 'provider output date', generatedAt: new Date('2026-09-21T12:00:00.000Z') },
+      },
+    });
+    expect(raced.status).toBe('duplicate');
+    expect(raced.intent?.id).toBe(committed.intent!.id);
     await expect(
       harness().commitTerminalHandoff({
         ...args,
         resultEvidence: {
           ...args.resultEvidence,
-          result: { text: 'provider output date', generatedAt: new Date('2026-09-21T12:00:00.000Z') },
+          signalId: 'signal-other',
         },
       }),
     ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
@@ -1180,6 +1415,7 @@ describe('HarnessPG native terminal handoff', () => {
           harnessName: HARNESS,
           sessionId: input.sessionId,
           runId: input.runId,
+          sessionIncarnation: input.sessionIncarnation,
         }),
       ).rejects.toBeInstanceOf(expected);
       await expect(
@@ -1187,6 +1423,7 @@ describe('HarnessPG native terminal handoff', () => {
           harnessName: HARNESS,
           sessionId: input.sessionId,
           runId: input.runId,
+          sessionIncarnation: input.sessionIncarnation,
         }),
       ).rejects.toBeInstanceOf(expected);
       await expect(disabled.commitTerminalHandoff(commitInput(input, 'disabled'))).rejects.toBeInstanceOf(expected);

@@ -1003,11 +1003,14 @@ export function createOpenAISuite(layer: SchemaCompatLayer) {
 
       const json = layer.processToJSONSchema(schema);
 
-      // Strict mode cannot express an open-ended map, so the value schema is not kept either.
-      // Assert the whole node, so that record support must update this expectation on purpose.
+      // Strict mode permits a schema-valued additionalProperties on record
+      // nodes, but requires `properties`/`required` keys to exist on every
+      // object node — the compat layer keeps the value schema and supplies the
+      // empty members. Assert the whole node so the contract is deliberate.
       expect(json.properties!['flags']).toEqual({
         type: 'object',
-        additionalProperties: false,
+        properties: {},
+        additionalProperties: { type: 'string' },
         required: [],
       });
     });

@@ -214,6 +214,73 @@ describe('output-format-handlers', () => {
       expect(objectResultChunk?.object).toEqual({ name: 'John', age: 30 });
     });
 
+    it('should map compat-shaped null optionals back before zod validation when a model is provided', async () => {
+      // OpenAI strict mode rewrites optional fields as required+nullable, so
+      // providers legitimately emit null for them — including inside record
+      // values reached through additionalProperties. Validation must run the
+      // compat layer's post-processing before the original zod schema.
+      const schema = z.object({
+        rows: z.array(
+          z.object({
+            studyId: z.string(),
+            cellEvidence: z.record(
+              z.string(),
+              z.object({
+                anchors: z.array(
+                  z.object({
+                    doi: z.string().optional(),
+                    quote: z.string(),
+                  }),
+                ),
+              }),
+            ),
+          }),
+        ),
+      });
+
+      const transformer = createObjectStreamTransformer({
+        structuredOutput: { schema },
+        model: { provider: 'openrouter', modelId: 'openai/gpt-5', supportsStructuredOutputs: true },
+      });
+
+      const providerJson = JSON.stringify({
+        rows: [
+          {
+            studyId: 's1',
+            cellEvidence: { population: { anchors: [{ doi: null, quote: 'q1' }] } },
+          },
+        ],
+      });
+
+      const streamParts: ChunkType<typeof schema>[] = [
+        {
+          type: 'text-delta',
+          runId: 'test-run',
+          from: ChunkFrom.AGENT,
+          payload: { id: 'text-1', text: providerJson },
+        },
+        {
+          type: 'text-end',
+          runId: 'test-run',
+          from: ChunkFrom.AGENT,
+          payload: { id: 'text-1' },
+        },
+      ];
+
+      // @ts-expect-error - web/stream readable stream type error
+      const stream = convertArrayToReadableStream(streamParts).pipeThrough(transformer);
+      const chunks = await convertAsyncIterableToArray(stream);
+
+      const errorChunk = chunks.find(c => c?.type === 'error');
+      expect(errorChunk).toBeUndefined();
+
+      const objectResultChunk = chunks.find(c => c?.type === 'object-result');
+      expect(objectResultChunk).toBeDefined();
+      expect(objectResultChunk?.object).toEqual({
+        rows: [{ studyId: 's1', cellEvidence: { population: { anchors: [{ quote: 'q1' }] } } }],
+      });
+    });
+
     it('should extract final JSON object from mixed prompt-injection text', async () => {
       const schema = z.object({
         decision: z.enum(['done', 'continue', 'waiting']),

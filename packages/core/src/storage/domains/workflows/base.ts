@@ -45,6 +45,7 @@ import type {
   RollbackWorkflowResumeResult,
   ReleaseWorkflowTerminalizationInput,
   ReleaseWorkflowTerminalizationResult,
+  UpdateWorkflowResultsResult,
   UpdateWorkflowStateOptions,
   WorkflowRun,
   WorkflowRuns,
@@ -256,7 +257,7 @@ export abstract class WorkflowsStorage extends StorageDomain {
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
     executionGeneration?: string;
-  }): Promise<Record<string, StepResult<any, any, any, any>>>;
+  }): Promise<UpdateWorkflowResultsResult>;
 
   abstract updateWorkflowState({
     workflowName,
@@ -268,6 +269,13 @@ export abstract class WorkflowsStorage extends StorageDomain {
     opts: UpdateWorkflowStateOptions;
   }): Promise<WorkflowRunState | undefined>;
 
+  /**
+   * `expectedExecutionGeneration` guards the upsert compare-and-set style:
+   * adapters that enforce it throw `WorkflowStaleSnapshotPersistError` when
+   * the stored row is missing or its snapshot generation differs, so a stale
+   * execution lifetime cannot resurrect a deleted run or overwrite the
+   * reopened run's row. Adapters without the guard ignore the field.
+   */
   abstract persistWorkflowSnapshot(_: {
     workflowName: string;
     runId: string;
@@ -275,6 +283,7 @@ export abstract class WorkflowsStorage extends StorageDomain {
     snapshot: WorkflowRunState;
     createdAt?: Date;
     updatedAt?: Date;
+    expectedExecutionGeneration?: string;
   }): Promise<void>;
 
   abstract loadWorkflowSnapshot({

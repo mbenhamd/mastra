@@ -64,7 +64,7 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "@mastra/core": ">=2.0.0-alpha.11 <3.0.0-0"
+    "@mastra/core": ">=2.0.0-alpha.12 <3.0.0-0"
   },
   "files": [
     "dist"
