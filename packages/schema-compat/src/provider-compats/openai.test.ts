@@ -195,7 +195,7 @@ describe('OpenAISchemaCompatLayer', () => {
 
       const tags = result.properties.tags;
       expect(tags).not.toHaveProperty('const');
-      expect(tags.anyOf).toEqual([{ type: 'array', items: { type: 'string' }, const: ['stable'] }, { type: 'null' }]);
+      expect(tags.anyOf).toEqual([{ type: 'array', items: { type: 'string' }, enum: [['stable']] }, { type: 'null' }]);
 
       const nullResult: any = await compatSchema['~standard'].validate({ filter: null, tags: null });
       expect(nullResult).not.toHaveProperty('issues');
@@ -240,7 +240,7 @@ describe('OpenAISchemaCompatLayer', () => {
       expect(result.properties.anyFilter).not.toHaveProperty('oneOf');
 
       const oneObjectBranch = result.properties.oneFilter.anyOf.find((branch: any) => branch.type === 'object');
-      expect(oneObjectBranch.oneOf).toHaveLength(2);
+      expect(oneObjectBranch.anyOf).toHaveLength(2);
       expect(result.properties.oneFilter).not.toHaveProperty('oneOf');
 
       const arrayObjectBranch = result.properties.arrayFilter.anyOf.find((branch: any) => branch.type === 'array');
@@ -332,7 +332,7 @@ describe('OpenAISchemaCompatLayer', () => {
         expect(branch.anyOf).toHaveLength(2);
       }
       for (const branch of result.properties.oneValue.anyOf.filter((branch: any) => branch.type !== 'null')) {
-        expect(branch.oneOf).toHaveLength(2);
+        expect(branch.anyOf).toHaveLength(2);
       }
       for (const branch of result.properties.notValue.anyOf.filter((branch: any) => branch.type !== 'null')) {
         expect(branch.not).toEqual(expect.any(Object));
@@ -633,6 +633,65 @@ describe('OpenAISchemaCompatLayer', () => {
       const json = compat.processToJSONSchema(z.object({ flags: z.record(z.string(), z.string()) }));
 
       expect(json.properties!['flags']).not.toHaveProperty('propertyNames');
+    });
+  });
+
+  // OpenAI strict mode rejects `oneOf`, `const`, and `discriminator`; zod's
+  // discriminatedUnion emits all of them (const on each branch discriminator).
+  describe('z.discriminatedUnion() under strict mode', () => {
+    const unionSchema = z.object({
+      effect: z.discriminatedUnion('kind', [
+        z.object({ kind: z.literal('size'), value: z.number() }),
+        z.object({ kind: z.literal('range'), lo: z.number(), hi: z.number() }),
+      ]),
+    });
+
+    it('normalizes oneOf to anyOf', () => {
+      const json = compat.processToJSONSchema(unionSchema);
+      const effect = json.properties!['effect'] as Record<string, unknown>;
+
+      expect(effect).not.toHaveProperty('oneOf');
+      expect(Array.isArray(effect['anyOf'])).toBe(true);
+      expect(effect['anyOf']).toHaveLength(2);
+    });
+
+    it('converts const discriminators to single-value enum', () => {
+      const json = compat.processToJSONSchema(unionSchema);
+      const effect = json.properties!['effect'] as Record<string, unknown>;
+      const branches = effect['anyOf'] as Array<Record<string, any>>;
+      const kinds = branches.map(b => b.properties.kind);
+
+      for (const kind of kinds) {
+        expect(kind).not.toHaveProperty('const');
+        expect(Array.isArray(kind.enum)).toBe(true);
+        expect(kind.enum).toHaveLength(1);
+      }
+      expect(kinds.map(k => k.enum[0]).sort()).toEqual(['range', 'size']);
+    });
+
+    it('maps branch-local optional nulls back on the matching variant only', async () => {
+      // Both variants are type 'object'; traversal must pick the branch whose
+      // discriminator matches so branch-local optional nulls are converted on
+      // either side of the union.
+      const branchy = z.object({
+        effect: z.discriminatedUnion('kind', [
+          z.object({ kind: z.literal('size'), value: z.number(), unit: z.string().optional() }),
+          z.object({ kind: z.literal('range'), lo: z.number(), hi: z.number(), basis: z.string().optional() }),
+        ]),
+      });
+      const compatSchema = compat.processToCompatSchema(branchy);
+
+      const sizeResult: any = await compatSchema['~standard'].validate({
+        effect: { kind: 'size', value: 3, unit: null },
+      });
+      expect(sizeResult).not.toHaveProperty('issues');
+      expect(sizeResult.value.effect).toEqual({ kind: 'size', value: 3 });
+
+      const rangeResult: any = await compatSchema['~standard'].validate({
+        effect: { kind: 'range', lo: 1, hi: 9, basis: null },
+      });
+      expect(rangeResult).not.toHaveProperty('issues');
+      expect(rangeResult.value.effect).toEqual({ kind: 'range', lo: 1, hi: 9 });
     });
   });
 

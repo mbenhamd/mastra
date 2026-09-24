@@ -9,8 +9,8 @@ import { toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
 import type { ValidationResult } from '../aisdk/v5/compat';
 import { ChunkFrom } from '../types';
 import type { ChunkType } from '../types';
-import { getTransformedSchema } from './schema';
-import type { ZodLikePartialSchema } from './schema';
+import { getCompatValidationSchema, getTransformedSchema } from './schema';
+import type { SchemaModelInfo, ZodLikePartialSchema } from './schema';
 
 type StreamTransformerStructuredOutput<OUTPUT> = Omit<StructuredOutputOptions<OUTPUT>, 'schema'> & {
   schema: PublicSchema<OUTPUT>;
@@ -173,13 +173,24 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
    */
   readonly schema: StandardSchemaWithJSON<OUTPUT> | undefined;
   /**
+   * Provider-compat validating schema. Set when the wire schema was rewritten by
+   * a compat layer (e.g. OpenAI strict mode turns optionals into required
+   * nullable fields); provider responses must be validated through it so compat
+   * post-processing maps values back before the original schema runs.
+   */
+  readonly validationSchema?: StandardSchemaWithJSON<OUTPUT> | undefined;
+  /**
    * Validate partial chunks as they are streamed. @planned
    */
   readonly validatePartialChunks: boolean = false;
   readonly partialSchema?: ZodLikePartialSchema<OUTPUT> | undefined;
 
-  constructor(schema?: StandardSchemaWithJSON<OUTPUT>, options: { validatePartialChunks?: boolean } = {}) {
+  constructor(
+    schema?: StandardSchemaWithJSON<OUTPUT>,
+    options: { validatePartialChunks?: boolean; validationSchema?: StandardSchemaWithJSON<OUTPUT> } = {},
+  ) {
     this.schema = schema;
+    this.validationSchema = options.validationSchema;
 
     if (
       options.validatePartialChunks &&
@@ -203,17 +214,18 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
    * Validates a value against the schema using StandardSchemaWithJSON's validate method.
    */
   protected async validateValue(value: unknown): Promise<ValidationResult<OUTPUT>> {
-    if (!this.schema) {
+    const schema = this.validationSchema ?? this.schema;
+    if (!schema) {
       return {
         success: true,
         value: value as OUTPUT,
       };
     }
 
-    if (this.isZodSchema(this.schema)) {
+    if (this.isZodSchema(schema)) {
       // Use Standard Schema for consistent error message format + safeParse for ZodError cause
       try {
-        const ssResult = await this.schema['~standard'].validate(value);
+        const ssResult = await schema['~standard'].validate(value);
 
         if (!ssResult.issues) {
           return {
@@ -226,7 +238,7 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
         const errorMessages = ssResult.issues.map(e => `- ${e.path?.join('.') || 'root'}: ${e.message}`).join('\n');
 
         // Also use safeParse to get ZodError as cause (for backward compatibility with tests)
-        const zodResult = this.schema.safeParse(value);
+        const zodResult = schema.safeParse(value);
         const zodError = !zodResult.success ? zodResult.error : undefined;
 
         return {
@@ -256,7 +268,7 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
     // All schemas are wrapped via toStandardSchema() before reaching here,
     // so we can use ~standard.validate() uniformly.
     try {
-      const ssResult = await this.schema['~standard'].validate(value);
+      const ssResult = await schema['~standard'].validate(value);
 
       if (!ssResult.issues) {
         return {
@@ -608,20 +620,32 @@ class EnumFormatHandler<OUTPUT = undefined> extends BaseFormatHandler<OUTPUT> {
  * @param transformedSchema - Wrapped/transformed schema used for LLM generation (arrays wrapped in {elements: []}, enums in {result: ""})
  * @returns Handler instance for the detected format type
  */
-function createOutputHandler<OUTPUT = undefined>({ schema }: { schema?: PublicSchema<OUTPUT> }) {
+function createOutputHandler<OUTPUT = undefined>({
+  schema,
+  model,
+}: {
+  schema?: PublicSchema<OUTPUT>;
+  model?: SchemaModelInfo;
+}) {
   // Direct transformer callers can pass any PublicSchema; normalize it before
   // selecting the format-specific handler.
   const normalizedSchema = schema ? toStandardSchema(schema) : undefined;
 
-  const transformedSchema = getTransformedSchema(normalizedSchema);
+  const transformedSchema = getTransformedSchema(normalizedSchema, { model });
+  // When a provider compat layer rewrote the wire schema (e.g. OpenAI strict
+  // mode converts optionals to required nullable fields), response values
+  // arrive in the compat shape; validate through the layer's compat schema so
+  // post-processing maps them back before the original schema runs.
+  const validationSchema = normalizedSchema && model ? getCompatValidationSchema(normalizedSchema, model) : undefined;
+  const options = validationSchema ? { validationSchema } : {};
   switch (transformedSchema?.outputFormat) {
     case 'array':
-      return new ArrayFormatHandler(normalizedSchema);
+      return new ArrayFormatHandler(normalizedSchema, options);
     case 'enum':
-      return new EnumFormatHandler(normalizedSchema);
+      return new EnumFormatHandler(normalizedSchema, options);
     case 'object':
     default:
-      return new ObjectFormatHandler(normalizedSchema);
+      return new ObjectFormatHandler(normalizedSchema, options);
   }
 }
 
@@ -639,11 +663,13 @@ function createOutputHandler<OUTPUT = undefined>({ schema }: { schema?: PublicSc
 export function createObjectStreamTransformer<OUTPUT = undefined>({
   structuredOutput,
   logger,
+  model,
 }: {
   structuredOutput?: StreamTransformerStructuredOutput<OUTPUT>;
   logger?: IMastraLogger;
+  model?: SchemaModelInfo;
 }) {
-  const handler = createOutputHandler<OUTPUT>({ schema: structuredOutput?.schema });
+  const handler = createOutputHandler<OUTPUT>({ schema: structuredOutput?.schema, model });
 
   let accumulatedText = '';
   let previousObject: unknown = undefined;
