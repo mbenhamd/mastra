@@ -22,17 +22,17 @@ Every imported session row receives a `session_incarnation` minted or adopted at
 ## Usage
 
 ```typescript
-import { PostgresStore } from '@mastra/pg';
+import { PostgresStore } from '@mastra/pg'
 
-const source = new PostgresStore({ id: 'source', connectionString: SOURCE_URL });
-const destination = new PostgresStore({ id: 'dest', connectionString: DEST_URL });
+const source = new PostgresStore({ id: 'source', connectionString: SOURCE_URL })
+const destination = new PostgresStore({ id: 'dest', connectionString: DEST_URL })
 
 const payload = await source.exportExecutionClosure({
   harnessName: 'default',
   sessionId: 'session-to-migrate',
-});
+})
 
-const result = await destination.importExecutionClosure(payload);
+const result = await destination.importExecutionClosure(payload)
 // result.status === 'imported' | 'pinned'
 ```
 
