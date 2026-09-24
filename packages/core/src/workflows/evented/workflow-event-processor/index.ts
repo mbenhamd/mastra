@@ -48,7 +48,7 @@ import {
   resolveForeachConcurrency,
   validateStepResumeData,
 } from '../../utils';
-import { getPersistedRequestContext, resolveCurrentState } from '../helpers';
+import { getPersistedRequestContext, resolveCurrentState, runExpectsPersistedRow } from '../helpers';
 import { createEventedResumeLabels, mergeEventedResumeLabels, normalizeEventedResumeLabels } from '../resume-label';
 import { StepExecutor } from '../step-executor';
 import {
@@ -3625,13 +3625,13 @@ export class WorkflowEventProcessor extends EventProcessor {
         });
         // A guard miss (or a run record already gone) means the reopened
         // lifetime owns the row — stop before pruning or publishing. A `{}`
-        // result write means no row ever existed: only nested runs that
-        // explicitly opted out of persistence legitimately take that path —
-        // a durable child whose row disappeared stops here as well.
+        // result write means no row ever existed: only a run whose own
+        // persistence decision opted out legitimately takes that path —
+        // a run whose row disappeared stops here as well.
         if (
           workflowsStore !== undefined &&
           suspendedState === undefined &&
-          !(parentWorkflow?.shouldPersistSnapshot === false && this.#isMissingRecordResult(stateWrite))
+          !(this.#isMissingRecordResult(stateWrite) && !runExpectsPersistedRow(workflow, parentWorkflow, stepResults))
         ) {
           return;
         }
@@ -3926,7 +3926,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           if (this.#isStaleResultWrite(bailWrite, { workflowId: workflow.id, runId, stepId: getEntryId(step.step) })) {
             return;
           }
-          if (this.#isMissingRecordResult(bailWrite) && parentWorkflow?.shouldPersistSnapshot !== false) {
+          if (this.#isMissingRecordResult(bailWrite) && runExpectsPersistedRow(workflow, parentWorkflow, stepResults)) {
             return;
           }
           await publishStepLifecycle?.();
@@ -4041,10 +4041,13 @@ export class WorkflowEventProcessor extends EventProcessor {
       if (this.#isStaleResultWrite(newStepResults, { workflowId: workflow.id, runId, stepId: getEntryId(step.step) })) {
         return;
       }
-      // Same missing-row halt as the ordinary step path below: only a nested
-      // run that explicitly opted out of persistence may continue on `{}` —
+      // Same missing-row halt as the ordinary step path below: only a run
+      // whose own persistence decision opted out may continue on `{}` —
       // for any other run the row was deleted and iteration events must stop.
-      if (this.#isMissingRecordResult(newStepResults) && parentWorkflow?.shouldPersistSnapshot !== false) {
+      if (
+        this.#isMissingRecordResult(newStepResults) &&
+        runExpectsPersistedRow(workflow, parentWorkflow, stepResults)
+      ) {
         return;
       }
 
@@ -4066,7 +4069,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (this.#isStaleResultWrite(stateWrite, { workflowId: workflow.id, runId, stepId: '__state' })) {
           return;
         }
-        if (this.#isMissingRecordResult(stateWrite) && parentWorkflow?.shouldPersistSnapshot !== false) {
+        if (this.#isMissingRecordResult(stateWrite) && runExpectsPersistedRow(workflow, parentWorkflow, stepResults)) {
           return;
         }
       }
@@ -4326,7 +4329,10 @@ export class WorkflowEventProcessor extends EventProcessor {
           ) {
             return;
           }
-          if (this.#isMissingRecordResult(foreachSuspendWrite) && parentWorkflow?.shouldPersistSnapshot !== false) {
+          if (
+            this.#isMissingRecordResult(foreachSuspendWrite) &&
+            runExpectsPersistedRow(workflow, parentWorkflow, stepResults)
+          ) {
             return;
           }
 
@@ -4371,12 +4377,15 @@ export class WorkflowEventProcessor extends EventProcessor {
             });
             // `undefined` conflates a stale-generation CAS miss with a
             // missing row; the `{}` result-write fallback proves the row was
-            // never persisted, which is legitimate only for nested runs that
-            // explicitly opted out of persistence.
+            // never persisted, which is legitimate only when this run's own
+            // persistence decision opted out.
             if (
               workflowsStore !== undefined &&
               suspendedState === undefined &&
-              !(parentWorkflow?.shouldPersistSnapshot === false && this.#isMissingRecordResult(foreachStateWrite))
+              !(
+                this.#isMissingRecordResult(foreachStateWrite) &&
+                !runExpectsPersistedRow(workflow, parentWorkflow, stepResults)
+              )
             ) {
               return;
             }
@@ -4486,14 +4495,16 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
 
       // When the Mastra has no storage configured, workflowsStore is undefined
-      // and updateWorkflowResults returns undefined. A nested run whose parent
-      // declared it transient may also legitimately have no row, so `{}` keeps
-      // the inline result there. For a top-level evented run the initial row
-      // always exists (EventedRun.start persists it regardless of
-      // shouldPersistSnapshot), so `{}` means deleteWorkflowRunById removed
-      // this lifetime — stop instead of advancing a deleted run's events.
+      // and updateWorkflowResults returns undefined. A run whose own
+      // shouldPersistSnapshot opted out (a transient nested execution) may
+      // also legitimately have no row, so `{}` keeps the inline result there.
+      // For a top-level evented run the initial row always exists
+      // (EventedRun.start persists it regardless of shouldPersistSnapshot),
+      // and for a nested run whose child opted in the row exists as well —
+      // in both cases `{}` means the row was deleted or fenced out, so stop
+      // instead of advancing a deleted run's events.
       if (!newStepResults || Object.keys(newStepResults).length === 0) {
-        if (newStepResults !== undefined && parentWorkflow?.shouldPersistSnapshot !== false) {
+        if (newStepResults !== undefined && runExpectsPersistedRow(workflow, parentWorkflow, stepResults)) {
           return;
         }
         stepResults = { ...(stepResults ?? {}), [stepId]: storedResult };
@@ -4655,12 +4666,15 @@ export class WorkflowEventProcessor extends EventProcessor {
           },
         });
         // Same missing-row discrimination: `undefined` is a stale CAS miss
-        // for persisted runs, but the ordinary opt-out when a nested run that
-        // explicitly opted out of persistence fell back to `{}`.
+        // for persisted runs, but the ordinary opt-out when this run's own
+        // persistence decision fell back to `{}`.
         if (
           workflowsStore !== undefined &&
           suspendedState === undefined &&
-          !(parentWorkflow?.shouldPersistSnapshot === false && this.#isMissingRecordResult(suspendStateWrite))
+          !(
+            this.#isMissingRecordResult(suspendStateWrite) &&
+            !runExpectsPersistedRow(workflow, parentWorkflow, stepResults)
+          )
         ) {
           return;
         }

@@ -6,7 +6,7 @@ import { isStaleExecutionResult } from '../../../storage/types';
 import type { UpdateWorkflowResultsResult } from '../../../storage/types';
 import { getEntryId, getEntryWorkflow } from '../../step-entry';
 import { resolveForeachConcurrency } from '../../utils';
-import { getPersistedRequestContext, resolveCurrentState } from '../helpers';
+import { getPersistedRequestContext, resolveCurrentState, runExpectsPersistedRow } from '../helpers';
 import type { StepExecutor } from '../step-executor';
 import { createPendingMarker } from '../types';
 import {
@@ -32,12 +32,12 @@ export function isQueuedForeachIteration(value: unknown): value is { [FOREACH_QU
 
 /**
  * Returns true when an `updateWorkflowResults` write fell back to the `{}`
- * missing-record result: no snapshot row exists for the run. Only a nested
- * run whose parent explicitly opted out of persistence
- * (`parentWorkflow.shouldPersistSnapshot === false`) may continue on that
- * path — for a top-level run the initial row always exists and for a durable
- * child it should too, so `{}` there means the row was deleted mid-flight and
- * the handler must stop before publishing further iteration events.
+ * missing-record result: no snapshot row exists for the run. Only a run
+ * whose own `shouldPersistSnapshot` opted out (a transient nested execution)
+ * may continue on that path — a durable row that disappeared was deleted
+ * mid-flight, so the handler must stop before publishing further iteration
+ * events. The discriminator is the run's own persistence decision, not the
+ * parent workflow's (see `runExpectsPersistedRow`).
  */
 function isMissingRecordResult(write: UpdateWorkflowResultsResult | undefined): boolean {
   return write !== undefined && !isStaleExecutionResult(write) && Object.keys(write).length === 0;
@@ -45,13 +45,16 @@ function isMissingRecordResult(write: UpdateWorkflowResultsResult | undefined): 
 
 function isDeletedRunResultWrite(
   write: UpdateWorkflowResultsResult | undefined,
+  workflow: ProcessorArgs['workflow'],
   parentWorkflow: ProcessorArgs['parentWorkflow'],
+  stepResults: ProcessorArgs['stepResults'],
 ): boolean {
-  return isMissingRecordResult(write) && parentWorkflow?.shouldPersistSnapshot !== false;
+  return isMissingRecordResult(write) && runExpectsPersistedRow(workflow, parentWorkflow, stepResults);
 }
 
 export async function processWorkflowLoop(
   {
+    workflow,
     workflowId,
     prevResult,
     runId,
@@ -178,7 +181,7 @@ export async function processWorkflowLoop(
       requestContext: getPersistedRequestContext(requestContext),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
-    return isStaleExecutionResult(write) || isDeletedRunResultWrite(write, parentWorkflow);
+    return isStaleExecutionResult(write) || isDeletedRunResultWrite(write, workflow, parentWorkflow, stepResults);
   };
 
   // A fenced (stale-lifetime) write means this loop's run moved to a different
@@ -217,6 +220,7 @@ export async function processWorkflowLoop(
 
 export async function processWorkflowForEach(
   {
+    workflow,
     workflowId,
     prevResult,
     runId,
@@ -254,10 +258,11 @@ export async function processWorkflowForEach(
   // A fenced (stale-lifetime) write means this foreach's run moved to a
   // different execution generation: stop before advancing stepResults or
   // publishing further iteration events. A `{}` missing-record write means
-  // the row was deleted mid-flight — also terminal unless the run is a nested
-  // execution whose parent explicitly opted out of persistence.
+  // the row was deleted mid-flight — also terminal unless the run's own
+  // persistence decision opted out (a transient nested execution).
   const stopOnStaleWrite = (write: UpdateWorkflowResultsResult | undefined, stepId: string): boolean => {
-    if (!isStaleExecutionResult(write) && !isDeletedRunResultWrite(write, parentWorkflow)) return false;
+    if (!isStaleExecutionResult(write) && !isDeletedRunResultWrite(write, workflow, parentWorkflow, stepResults))
+      return false;
     mastra
       .getLogger()
       ?.debug?.('WorkflowEventProcessor: stopping stale-lifetime foreach handler after fenced result write', {

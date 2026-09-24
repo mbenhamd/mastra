@@ -4,6 +4,34 @@
 
 import { TripWire } from '../../agent/trip-wire';
 import { MASTRA_AUTH_ORGANIZATION_KEY } from '../../request-context';
+import type { StepResult } from '../types';
+import type { Workflow } from '../workflow';
+import type { ParentWorkflow } from './workflow-event-processor';
+
+/**
+ * Whether this run's durable snapshot row is expected to exist — the axis
+ * that makes an `{}` write result survivable. Top-level evented runs always
+ * persist their initial record in `EventedRun.start`, so a missing row there
+ * means deletion. A nested run's row exists only when the CHILD's own
+ * `shouldPersistSnapshot` opted in: `parentWorkflow.shouldPersistSnapshot`
+ * describes the parent's snapshot, not this run's, so consulting it would
+ * abandon transient children of durable parents (their first completed step
+ * would halt without advancing, hanging the parent) and would let deleted
+ * durable children of transient parents fall through as if opted out.
+ */
+export function runExpectsPersistedRow(
+  workflow: Workflow,
+  parentWorkflow: ParentWorkflow | undefined,
+  stepResults: Record<string, StepResult<any, any, any, any>> | undefined,
+): boolean {
+  if (parentWorkflow === undefined) return true;
+  return (
+    workflow.options?.shouldPersistSnapshot?.({
+      stepResults: stepResults ?? {},
+      workflowStatus: 'running',
+    }) ?? true
+  );
+}
 
 /** Keep authenticated selection live in events, but never recover it from a stored context. */
 export function getPersistedRequestContext(requestContext: Record<string, any>): Record<string, any> {

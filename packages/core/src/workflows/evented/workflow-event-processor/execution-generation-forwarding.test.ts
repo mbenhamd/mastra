@@ -672,6 +672,9 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
       id: `transient-suspend-${Math.random().toString(36).slice(2)}`,
       inputSchema: z.object({}),
       outputSchema: z.object({ value: z.string() }),
+      // The CHILD's own persistence option is what makes this run transient:
+      // a durable parent's flag must not be consulted for this decision.
+      options: { shouldPersistSnapshot: () => false },
       steps: [suspendingStep],
     })
       .then(suspendingStep)
@@ -692,8 +695,11 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
     });
     const workflowsStore = (await storage.getStore('workflows'))!;
 
-    // The nested run is transient: no snapshot row exists, so updateWorkflowResults
-    // answers the {} missing-record fallback and updateWorkflowState finds no row.
+    // The nested run is transient via the CHILD's own shouldPersistSnapshot:
+    // no snapshot row exists, so updateWorkflowResults answers the {}
+    // missing-record fallback and updateWorkflowState finds no row. The
+    // durable parent below must not flip that decision — this is the
+    // durable-parent/transient-child combination that used to halt here.
     const runId = `run-${Math.random().toString(36).slice(2)}`;
     const resultWrites = vi.spyOn(workflowsStore, 'updateWorkflowResults');
     const stateUpdates = vi.spyOn(workflowsStore, 'updateWorkflowState');
@@ -742,15 +748,18 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
           resumeSteps: [],
           resumeData: undefined,
           input: {},
-          shouldPersistSnapshot: false,
+          shouldPersistSnapshot: true,
         },
       },
     });
 
     expect(handled).toEqual({ ok: true });
+    // A genuinely transient child writes nothing durable — no `__state`
+    // result write and no updateWorkflowState — yet its suspension still
+    // publishes workflow.suspend so the durable parent keeps advancing.
     const stateWrite = resultWrites.mock.calls.find(([args]) => (args as { stepId?: string }).stepId === '__state');
-    expect(stateWrite).toBeTruthy();
-    expect(stateUpdates).toHaveBeenCalled();
+    expect(stateWrite).toBeUndefined();
+    expect(stateUpdates).not.toHaveBeenCalled();
     expect(engineEvents).toContain('workflow.suspend');
   });
 
@@ -980,7 +989,10 @@ describe('updateWorkflowResults executionGeneration forwarding', () => {
           resumeSteps: [],
           resumeData: undefined,
           input: {},
-          shouldPersistSnapshot: true,
+          // The PARENT's persistence flag must not be consulted for the
+          // child's missing-row decision: a transient parent cannot launder
+          // a deleted durable child row into a legitimate opt-out.
+          shouldPersistSnapshot: false,
         },
       },
     });
