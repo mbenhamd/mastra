@@ -3950,17 +3950,30 @@ export class Run<
    * @internal Adopt a lifecycle lineage on this shared Run handle, replacing
    * execution-scoped cancellation and uncommitted terminal state. Only a caller
    * that owns the lineage — or needs no durable claim — may invoke this.
+   *
+   * A cancellation admitted against the adopted lineage survives the reset:
+   * `cancel()` can land durably between the storage claim and this adoption, so
+   * clearing it here would let the engine run steps against a canceled run.
    */
   protected adoptLifecycleExecution(lifecycleExecution: {
     executionGeneration: WorkflowExecutionGeneration;
     lifecycleResumeAttempt: number;
     lifecycleStepStates: WorkflowStepLifecycleStateMap;
   }): void {
+    const admittedCancellation =
+      this.#admittedCancellation?.executionGeneration === lifecycleExecution.executionGeneration &&
+      this.#admittedCancellation.lifecycleResumeAttempt === lifecycleExecution.lifecycleResumeAttempt
+        ? this.#admittedCancellation
+        : undefined;
     this.resetAbortController();
     this.#committedTerminalStatus = undefined;
     this.#executionGeneration = lifecycleExecution.executionGeneration;
     this.#lifecycleResumeAttempt = lifecycleExecution.lifecycleResumeAttempt;
     this.#lifecycleStepStates = lifecycleExecution.lifecycleStepStates;
+    if (admittedCancellation) {
+      this.#admittedCancellation = admittedCancellation;
+      this.abortController.abort();
+    }
   }
 
   /** @internal Establish a fresh lifecycle lineage for start, restart, or time travel. */
@@ -4245,7 +4258,22 @@ export class Run<
           cancellationSpan?.endTree({ attributes: { status: 'canceled' } });
           throw error;
         }
-        if (!isCurrentExecution()) return;
+        if (!isCurrentExecution()) {
+          // The compare-and-set still landed durably on the loaded lineage. When
+          // that lineage is the live one — a restart or time-travel claim
+          // adopted it while this cancel was in flight — keep the admitted
+          // cancellation on the live controller so the adoption cannot reset
+          // it away.
+          if (canceled?.executionGeneration && canceled.executionGeneration === this.#executionGeneration) {
+            this.#admittedCancellation = {
+              executionGeneration: canceled.executionGeneration,
+              lifecycleResumeAttempt: canceled.lifecycleResumeAttempt ?? 0,
+            };
+            this.abortController.abort();
+            this.workflowRunStatus = 'canceled';
+          }
+          return;
+        }
         if (concurrentCas && !canceled) {
           const current = await workflowsStore.loadWorkflowSnapshot({
             workflowName: this.workflowId,
@@ -5374,6 +5402,54 @@ export class Run<
       workflowId: this.workflowId,
       runId: this.runId,
     });
+    await this.preserveClaimedLifecycleCancellation({ workflowsStore, lifecycleExecution });
+  }
+
+  /**
+   * @internal Keep a cancellation admitted while the lineage claim was in
+   * flight.
+   *
+   * `cancel()` can persist `canceled` against the claimed generation after the
+   * storage claim installs it but before this shared handle adopts it. Owning
+   * that admission here keeps the adoption from clearing a cancellation that
+   * already owns the lineage's terminal outcome — including one recorded from
+   * another Run handle or process, which only the durable record reveals.
+   */
+  protected async preserveClaimedLifecycleCancellation({
+    workflowsStore,
+    lifecycleExecution,
+  }: {
+    workflowsStore: WorkflowsStorage | undefined;
+    lifecycleExecution: {
+      executionGeneration: WorkflowExecutionGeneration;
+      lifecycleResumeAttempt: number;
+    };
+  }): Promise<void> {
+    const { executionGeneration, lifecycleResumeAttempt } = lifecycleExecution;
+    // Settle cancels already in flight against the claimed lineage so any
+    // admission their compare-and-set recorded is visible before adoption.
+    await Promise.all(
+      [...this.#pendingCancellations]
+        .filter(
+          pending =>
+            pending.executionGeneration === executionGeneration &&
+            pending.lifecycleResumeAttempt === lifecycleResumeAttempt,
+        )
+        .map(pending => pending.settled),
+    );
+    if (
+      this.#admittedCancellation?.executionGeneration === executionGeneration &&
+      this.#admittedCancellation.lifecycleResumeAttempt === lifecycleResumeAttempt
+    ) {
+      return;
+    }
+    const claimed = await workflowsStore?.getWorkflowExecutionState({
+      workflowName: this.workflowId,
+      runId: this.runId,
+    });
+    if (claimed?.status === 'canceled' && claimed.executionGeneration === executionGeneration) {
+      this.#admittedCancellation = { executionGeneration, lifecycleResumeAttempt };
+    }
   }
 
   protected async _resume<TResume>(

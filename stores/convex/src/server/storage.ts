@@ -937,7 +937,14 @@ export async function handleTypedOperation(
           return { ok: true, result: '' };
         }
       }
-      if (expectedExecutionGeneration !== undefined && snapshot.executionGeneration !== expectedExecutionGeneration) {
+      if (
+        expectedExecutionGeneration !== undefined &&
+        (expectedExecutionGeneration === null
+          ? // `null` requires the stored lineage to still be absent; a persisted
+            // null or other malformed value fails the guard instead.
+            snapshot.executionGeneration !== undefined
+          : snapshot.executionGeneration !== expectedExecutionGeneration)
+      ) {
         return { ok: true, result: '' };
       }
       if (

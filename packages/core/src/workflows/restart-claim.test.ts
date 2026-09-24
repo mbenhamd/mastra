@@ -345,4 +345,233 @@ describe('restart lifecycle claim', () => {
     expect(run.workflowRunStatus).toBe('success');
     await mastra.shutdown();
   });
+
+  /**
+   * Produces the pre-upgrade stranded shape a recovery sweep can still
+   * encounter: a durably `running` snapshot written before lifecycle
+   * generations existed, so it carries no lineage fields at all.
+   */
+  async function strandedLegacyRun() {
+    const storage = new MockStore();
+    const { workflow, getWorkExecutions } = createOnceSuspendedWorkflow();
+    const mastra = new Mastra({
+      storage,
+      workflows: { 'restart-race-wf': workflow },
+      logger: false,
+    });
+
+    const run = await workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const workflowsStore = await storage.getStore('workflows');
+    const suspended = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+    });
+    const legacy = {
+      ...suspended!,
+      status: 'running' as const,
+      suspendedPaths: {},
+      activePaths: [0],
+      activeStepsPath: { work: [0] },
+    };
+    delete legacy.executionGeneration;
+    delete legacy.lifecycleResumeAttempt;
+    delete legacy.lifecycleStepStates;
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+      snapshot: legacy,
+    });
+
+    return { mastra, run, workflowsStore, getWorkExecutions };
+  }
+
+  it('lets only one claimant install a generation on a legacy running snapshot', async () => {
+    const { mastra, run, workflowsStore, getWorkExecutions } = await strandedLegacyRun();
+    const updates: UpdateWorkflowStateOptions[] = [];
+    const original = workflowsStore.updateWorkflowState.bind(workflowsStore);
+    vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(async args => {
+      updates.push(args.opts);
+      return original(args);
+    });
+
+    const settled = await Promise.allSettled([run.restart(), run.restart()]);
+    const fulfilled = settled.filter(
+      (outcome): outcome is PromiseFulfilledResult<Awaited<ReturnType<typeof run.restart>>> =>
+        outcome.status === 'fulfilled',
+    );
+    const rejected = settled.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0]!.reason as { id?: string }).id).toBe('WORKFLOW_RESTART_NOT_CLAIMED');
+    expect(fulfilled[0]!.value.status).toBe('success');
+    // The loser never entered the engine: one original suspend plus the
+    // winner's re-execution, never a losing pass.
+    expect(getWorkExecutions()).toBe(2);
+
+    // The claim still fenced the row: it required the stored generation to
+    // stay absent rather than degrading to a status-only guard both racing
+    // recovery workers would pass.
+    const claim = updates.find(
+      opts => opts.expectedStatus === 'running' && typeof opts.executionGeneration === 'string',
+    );
+    expect(claim).toBeDefined();
+    expect(claim!.expectedExecutionGeneration).toBeNull();
+    expect(claim!.expectedLifecycleResumeAttempt).toBe(0);
+
+    const stored = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+    });
+    expect(stored?.status).toBe('success');
+    await mastra.shutdown();
+  });
+
+  it('honors a cancellation admitted while the restart claim was in flight', async () => {
+    const storage = new MockStore();
+    const { workflow, getWorkExecutions } = createOnceSuspendedWorkflow();
+    const mastra = new Mastra({
+      storage,
+      workflows: { 'restart-race-wf': workflow },
+      logger: false,
+    });
+
+    const run = await workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const workflowsStore = await storage.getStore('workflows');
+    const suspended = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+    });
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+      snapshot: {
+        ...suspended!,
+        status: 'running',
+        suspendedPaths: {},
+        activePaths: [0],
+        activeStepsPath: { work: [0] },
+      },
+    });
+
+    // Land a durable cancellation inside the claim window: the claim has
+    // installed the candidate generation but the shared Run handle has not yet
+    // adopted it, so the cancel persists `canceled` while holding the old
+    // in-memory controller and generation.
+    const original = workflowsStore.updateWorkflowState.bind(workflowsStore);
+    let cancelFired = false;
+    vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(async args => {
+      const updated = await original(args);
+      if (
+        !cancelFired &&
+        updated &&
+        args.opts.status === 'running' &&
+        typeof args.opts.executionGeneration === 'string'
+      ) {
+        cancelFired = true;
+        await run.cancel();
+      }
+      return updated;
+    });
+
+    const result = await run.restart();
+    // Adoption must keep the admitted cancellation instead of resetting it
+    // away: the engine resolves canceled without running a single step.
+    expect(result.status).toBe('canceled');
+    expect(getWorkExecutions()).toBe(1);
+    expect(run.workflowRunStatus).toBe('canceled');
+
+    const stored = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-race-wf',
+      runId: run.runId,
+    });
+    expect(stored?.status).toBe('canceled');
+    await mastra.shutdown();
+  });
+
+  it('honors a cancellation that lands while the claimed lineage is being adopted', async () => {
+    let workExecutions = 0;
+    let cancelPromise: Promise<void> | undefined;
+
+    const workStep = createStep({
+      id: 'work',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ suspend }) => {
+        workExecutions++;
+        if (workExecutions === 1) {
+          await suspend({ reason: 'pause once' });
+          return { done: false };
+        }
+        // Hold the winning execution's only step until the mid-adoption
+        // cancellation has fully landed, so the outcome cannot race it.
+        await cancelPromise;
+        return { done: true };
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'restart-adopt-cancel-wf',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      steps: [workStep],
+      options: { validateInputs: false },
+    })
+      .then(workStep)
+      .commit();
+
+    const storage = new MockStore();
+    const mastra = new Mastra({
+      storage,
+      workflows: { 'restart-adopt-cancel-wf': workflow },
+      logger: false,
+    });
+
+    const run = await workflow.createRun();
+    const started = await run.start({ inputData: { item: 'widget' } });
+    expect(started.status).toBe('suspended');
+
+    const workflowsStore = await storage.getStore('workflows');
+    const suspended = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-adopt-cancel-wf',
+      runId: run.runId,
+    });
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'restart-adopt-cancel-wf',
+      runId: run.runId,
+      snapshot: {
+        ...suspended!,
+        status: 'running',
+        suspendedPaths: {},
+        activePaths: [0],
+        activeStepsPath: { work: [0] },
+      },
+    });
+
+    // Fire the cancel at the adoption recheck: its durable write then lands
+    // against a lineage this handle has already taken over.
+    const originalExecutionState = workflowsStore.getWorkflowExecutionState.bind(workflowsStore);
+    vi.spyOn(workflowsStore, 'getWorkflowExecutionState').mockImplementation(async args => {
+      cancelPromise ??= run.cancel();
+      return originalExecutionState(args);
+    });
+
+    const result = await run.restart();
+    await cancelPromise;
+    expect(result.status).toBe('canceled');
+    expect(run.workflowRunStatus).toBe('canceled');
+
+    const stored = await workflowsStore.loadWorkflowSnapshot({
+      workflowName: 'restart-adopt-cancel-wf',
+      runId: run.runId,
+    });
+    expect(stored?.status).toBe('canceled');
+    await mastra.shutdown();
+  });
 });

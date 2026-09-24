@@ -48,8 +48,12 @@ export async function claimWorkflowRestart({
       ...(concurrentCas
         ? {
             expectedStatus: snapshot.status,
-            expectedExecutionGeneration: snapshot.executionGeneration,
-            expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt,
+            // A pre-upgrade `running` snapshot carries no lineage fields, so
+            // name the absent generation explicitly: the guard then fails for a
+            // second claimant that loaded the same legacy row after the winner
+            // installed its generation, instead of degrading to status alone.
+            expectedExecutionGeneration: snapshot.executionGeneration ?? null,
+            expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
           }
         : {}),
     },
@@ -70,7 +74,7 @@ export async function claimWorkflowRestart({
       runId,
       expectedStatus: snapshot.status ?? 'unknown',
       actualStatus: current?.status ?? 'missing',
-      expectedExecutionGeneration: snapshot.executionGeneration ?? 'unknown',
+      expectedExecutionGeneration: snapshot.executionGeneration ?? 'absent',
       actualExecutionGeneration: current?.executionGeneration ?? 'missing',
       expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 'unknown',
       actualLifecycleResumeAttempt: current?.lifecycleResumeAttempt ?? 'missing',

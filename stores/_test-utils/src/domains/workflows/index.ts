@@ -793,6 +793,60 @@ export function createWorkflowsTests({ storage }: WorkflowsTestOptions) {
       expect(results.filter(result => result !== undefined)).toHaveLength(1);
     });
 
+    it('should let only the first claimant install a generation on a legacy row without one', async () => {
+      if (!supportsConcurrentUpdates) {
+        console.log('Skipping absent-generation guard test');
+        return;
+      }
+      const workflowName = 'test-workflow';
+      const runId = `run-${randomUUID()}`;
+
+      // Pre-upgrade shape: a durably `running` row with no lineage fields.
+      await workflowsStorage.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: { status: 'running', context: {} } as any,
+      });
+
+      // `null` means the persisted generation must still be absent; two callers
+      // that both loaded the legacy row race on that discriminator, so only the
+      // first installs its generation.
+      const legacyGuards = {
+        expectedStatus: 'running' as const,
+        expectedExecutionGeneration: null,
+        expectedLifecycleResumeAttempt: 0,
+      };
+      await expect(
+        workflowsStorage.updateWorkflowState({
+          workflowName,
+          runId,
+          opts: {
+            status: 'running',
+            executionGeneration: 'wfeg:winner',
+            lifecycleResumeAttempt: 0,
+            ...legacyGuards,
+          },
+        }),
+      ).resolves.toMatchObject({ status: 'running', executionGeneration: 'wfeg:winner' });
+
+      await expect(
+        workflowsStorage.updateWorkflowState({
+          workflowName,
+          runId,
+          opts: {
+            status: 'running',
+            executionGeneration: 'wfeg:loser',
+            lifecycleResumeAttempt: 0,
+            ...legacyGuards,
+          },
+        }),
+      ).resolves.toBeUndefined();
+      await expect(workflowsStorage.loadWorkflowSnapshot({ workflowName, runId })).resolves.toMatchObject({
+        status: 'running',
+        executionGeneration: 'wfeg:winner',
+      });
+    });
+
     it('should update workflow results in snapshot', async () => {
       if (!supportsConcurrentUpdates) {
         console.log('Skipping workflow state updates sequentially test');

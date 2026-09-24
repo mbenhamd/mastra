@@ -28,6 +28,22 @@ describe('matchesExpectedWorkflowState', () => {
       expect(matchesExpectedWorkflowState(workflowStateWithAttempt(lifecycleResumeAttempt), expected)).toBe(false);
     }
   });
+
+  it('matches a null expected generation only when the persisted lineage is absent', () => {
+    const expectAbsent = {
+      expectedStatus: 'running' as const,
+      expectedExecutionGeneration: null,
+    };
+    const state = (executionGeneration: unknown): Parameters<typeof matchesExpectedWorkflowState>[0] =>
+      ({ status: 'running', executionGeneration }) as Parameters<typeof matchesExpectedWorkflowState>[0];
+
+    expect(matchesExpectedWorkflowState(state(undefined), expectAbsent)).toBe(true);
+    // Once a claimant installs a generation, the same guard rejects the next
+    // caller that loaded the legacy row.
+    expect(matchesExpectedWorkflowState(state('wfeg:claimed'), expectAbsent)).toBe(false);
+    // A persisted null generation is malformed, not absent — fail closed.
+    expect(matchesExpectedWorkflowState(state(null), expectAbsent)).toBe(false);
+  });
 });
 
 describe('buildStorageSchema', () => {

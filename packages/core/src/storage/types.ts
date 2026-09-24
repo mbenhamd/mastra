@@ -3194,8 +3194,12 @@ export interface UpdateWorkflowStateOptions {
    * Guard fields are never merged into the persisted snapshot.
    */
   expectedStatus?: WorkflowRunStatus | WorkflowRunStatus[];
-  /** Require the persisted snapshot to belong to this exact execution lineage. Guard only. */
-  expectedExecutionGeneration?: string;
+  /**
+   * Require the persisted snapshot to belong to this exact execution lineage.
+   * `null` requires the lineage to still be absent — the pre-upgrade shape — so
+   * the first caller to install a generation wins the claim. Guard only.
+   */
+  expectedExecutionGeneration?: string | null;
   /** Require the persisted snapshot to be at this exact resume cycle. Guard only. */
   expectedLifecycleResumeAttempt?: number;
 }
@@ -3227,7 +3231,12 @@ export function matchesExpectedWorkflowState(
   return (
     matchesExpectedWorkflowStatus(snapshot.status, expected.expectedStatus) &&
     (expected.expectedExecutionGeneration === undefined ||
-      snapshot.executionGeneration === expected.expectedExecutionGeneration) &&
+      (expected.expectedExecutionGeneration === null
+        ? // Only an omitted persisted generation denotes an unclaimed lineage.
+          // Persisted null or other malformed values fail the guard rather than
+          // admit a claimant the fence cannot name.
+          snapshot.executionGeneration === undefined
+        : snapshot.executionGeneration === expected.expectedExecutionGeneration)) &&
     // Only an absent legacy field denotes attempt zero. Persisted null or other
     // malformed values must fail the guard rather than admit a stale writer.
     (expected.expectedLifecycleResumeAttempt === undefined ||
