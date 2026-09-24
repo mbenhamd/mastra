@@ -314,6 +314,10 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         if hasExpectedGeneration == '1' and snapshot.executionGeneration ~= expectedGeneration then
           return nil
         end
+        -- '2' requires the stored lineage to still be absent (pre-upgrade rows).
+        if hasExpectedGeneration == '2' and snapshot.executionGeneration ~= nil then
+          return nil
+        end
         if expectedAttempt ~= '' then
           local currentAttempt = snapshot.lifecycleResumeAttempt
           if currentAttempt == nil then currentAttempt = 0 end
@@ -352,7 +356,7 @@ export class WorkflowsUpstash extends WorkflowsStorage {
           JSON.stringify(state),
           now,
           expectedStatusJson,
-          expectedExecutionGeneration === undefined ? '0' : '1',
+          expectedExecutionGeneration === undefined ? '0' : expectedExecutionGeneration === null ? '2' : '1',
           expectedExecutionGeneration ?? '',
           expectedLifecycleResumeAttempt === undefined ? '' : String(expectedLifecycleResumeAttempt),
         ],

@@ -237,7 +237,10 @@ export class WorkflowsStorageMongoDB extends WorkflowsStorage {
         filter['snapshot.status'] = { $in: Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus] };
       }
       if (expectedExecutionGeneration !== undefined) {
-        filter['snapshot.executionGeneration'] = expectedExecutionGeneration;
+        // `null` requires the stored lineage to still be absent (pre-upgrade
+        // rows), so only documents missing the field may claim it.
+        filter['snapshot.executionGeneration'] =
+          expectedExecutionGeneration === null ? { $exists: false } : expectedExecutionGeneration;
       }
       if (expectedLifecycleResumeAttempt !== undefined) {
         filter.$expr = {

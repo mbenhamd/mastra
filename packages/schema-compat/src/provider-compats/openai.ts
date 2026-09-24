@@ -10,6 +10,7 @@ import {
   isArraySchema,
   isNumberSchema,
   isObjectSchema,
+  isOneOfSchema,
   isStringSchema,
   isUnionSchema,
 } from '../json-schema/utils';
@@ -288,6 +289,23 @@ export class OpenAISchemaCompatLayer extends SchemaCompatLayer {
   }
 
   postProcessJSONNode(schema: JSONSchema7): void {
+    // OpenAI strict mode rejects `oneOf`, which zod's discriminatedUnion emits.
+    // `anyOf` is accepted and still lets discriminated unions resolve because
+    // branch discriminator fields carry literal values.
+    if (isOneOfSchema(schema)) {
+      schema.anyOf = [...schema.oneOf, ...(Array.isArray(schema.anyOf) ? schema.anyOf : [])];
+      delete (schema as JSONSchema7).oneOf;
+    }
+
+    // OpenAI strict mode rejects `const`; a single-value `enum` is equivalent.
+    if (schema.const !== undefined) {
+      schema.enum = schema.enum ?? [schema.const];
+      delete schema.const;
+    }
+
+    // `discriminator` is an OpenAPI keyword, not part of the strict JSON Schema subset.
+    delete (schema as Record<string, unknown>).discriminator;
+
     // Handle union schemas in post-processing (after children are processed)
     if (isUnionSchema(schema)) {
       this.defaultUnionHandler(schema);
@@ -313,10 +331,33 @@ export class OpenAISchemaCompatLayer extends SchemaCompatLayer {
     // Ensure bare {"type":"object"} nodes (e.g., inside anyOf) have additionalProperties: false.
     // OpenAI strict mode requires this on every object-type node, even without properties.
     if (isObjectSchema(schema)) {
-      schema.additionalProperties = false;
+      // A record node (z.record) emits `propertyNames` (key constraint, rejected by
+      // strict mode) and a schema-valued `additionalProperties` (the value type).
+      // Detect it before stripping so the value schema can be preserved — forcing
+      // additionalProperties:false on a record makes it an unfillable empty object.
+      const isRecordNode =
+        schema.propertyNames !== undefined ||
+        (!schema.properties && typeof schema.additionalProperties === 'object' && schema.additionalProperties !== null);
 
       // OpenAI strict mode rejects `propertyNames`, which z.record() emits for its key type.
       delete schema.propertyNames;
+
+      // OpenAI strict mode requires every object node to carry `properties` and
+      // `required` keys (even empty) — otherwise the parent object's `required`
+      // entry for this property is rejected as an "extra required key".
+      if (!schema.properties) {
+        schema.properties = {};
+      }
+      if (!schema.required) {
+        schema.required = [];
+      }
+
+      // Preserve the record's value schema in additionalProperties; strict mode
+      // accepts a schema-valued additionalProperties, and it is the only way the
+      // model can emit arbitrary record keys. Non-record objects stay closed.
+      if (!isRecordNode) {
+        schema.additionalProperties = false;
+      }
 
       if (schema.properties) {
         for (const key of Object.keys(schema.properties)) {
@@ -466,11 +507,23 @@ export class OpenAISchemaCompatLayer extends SchemaCompatLayer {
 
     const obj = value as Record<string, unknown>;
     const optionalProperties = (resolved['x-optional'] ?? []) as string[];
+    // Record nodes carry their value schema in `additionalProperties`; keys not
+    // declared in `properties` must be traversed against it so nested optional
+    // fields (x-optional markers) still get null -> undefined conversion.
+    const additional =
+      typeof resolved.additionalProperties === 'object' && resolved.additionalProperties !== null
+        ? (resolved.additionalProperties as Record<string, unknown>)
+        : undefined;
     for (const key in obj) {
       if (optionalProperties.includes(key) && obj[key] === null) {
-        obj[key] = undefined;
+        // Delete rather than assign undefined: optional zod fields accept an
+        // absent key identically, and explicit undefined entries are not JSON
+        // values — they poison deep JSON admission checks on the result.
+        delete obj[key];
       } else if (properties[key]) {
         obj[key] = this.#traverse(obj[key], properties[key]);
+      } else if (additional) {
+        obj[key] = this.#traverse(obj[key], additional);
       }
     }
 
@@ -500,7 +553,34 @@ export class OpenAISchemaCompatLayer extends SchemaCompatLayer {
       if (valueType) {
         const hasType = (variant: Record<string, unknown>, type: string) =>
           (Array.isArray(variant.type) ? (variant.type as string[]) : [variant.type]).includes(type);
-        const exactMatch = nonNullVariants.find(variant => hasType(variant, valueType));
+        const candidates = nonNullVariants.filter(variant => hasType(variant, valueType));
+        // Discriminated unions arrive as multiple same-typed object variants
+        // (zod's oneOf branches normalized to anyOf). Prefer the variant whose
+        // literal discriminator property (const/single-value enum) matches the
+        // value, so branch-local optional fields get null -> absent conversion.
+        if (
+          valueType === 'object' &&
+          candidates.length > 1 &&
+          value !== null &&
+          typeof value === 'object' &&
+          !Array.isArray(value)
+        ) {
+          const valueRecord = value as Record<string, unknown>;
+          const discriminated = candidates.find(variant => {
+            const props = variant.properties as Record<string, Record<string, unknown>> | undefined;
+            if (!props) return false;
+            return Object.entries(props).some(([key, propSchema]) => {
+              if (!propSchema || typeof propSchema !== 'object') return false;
+              const literal =
+                Array.isArray(propSchema.enum) && propSchema.enum.length === 1 ? propSchema.enum[0] : propSchema.const;
+              return literal !== undefined && valueRecord[key] === literal;
+            });
+          });
+          if (discriminated) {
+            return { ...schema, ...discriminated };
+          }
+        }
+        const exactMatch = candidates[0];
         if (exactMatch) {
           return { ...schema, ...exactMatch };
         }
