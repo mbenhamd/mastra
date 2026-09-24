@@ -374,7 +374,7 @@ jobs:
           # reachable — it connects lazily per command. Require an
           # authenticated PING through the proxy before admitting the suite.
           for _attempt in {1..60}; do
-            if curl -fsS -X POST http://127.0.0.1:8079/ \
+            if curl -fsS --max-time 2 -X POST http://127.0.0.1:8079/ \
               -H 'Authorization: Bearer test_token' \
               -H 'Content-Type: application/json' \
               -d '["ping"]' 2>/dev/null | grep -q '"PONG"'; then

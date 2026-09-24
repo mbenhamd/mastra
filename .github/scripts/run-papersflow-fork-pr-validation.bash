@@ -15406,9 +15406,11 @@ const deadline = Date.now() + 20_000;
 
 function probe() {
   let settled = false;
+  let deadlineTimer;
   const finish = success => {
     if (settled) return;
     settled = true;
+    clearTimeout(deadlineTimer);
     if (success) process.exit(0);
     if (Date.now() >= deadline) {
       console.error(`Required ${serviceName} test service is unavailable at ${host}:${port}.`);
@@ -15430,6 +15432,7 @@ function probe() {
     },
     response => {
       let body = '';
+      response.once('error', () => finish(false));
       response.on('data', chunk => (body += chunk));
       response.on('end', () =>
         finish(response.statusCode === 200 && body.includes('PONG')),
@@ -15441,6 +15444,13 @@ function probe() {
     finish(false);
   });
   request.once('error', () => finish(false));
+  // The request timeout only fires on socket inactivity; a proxy that trickles
+  // data without ending the response would keep the probe alive past the
+  // retry deadline. Bound each attempt absolutely instead.
+  deadlineTimer = setTimeout(() => {
+    request.destroy();
+    finish(false);
+  }, Math.max(0, deadline - Date.now()));
   request.end(JSON.stringify(['ping']));
 }
 
