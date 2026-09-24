@@ -470,4 +470,160 @@ describe('parallel nested workflow restart recovery (issue #20225)', () => {
       await mastra.stopWorkers?.();
     }
   });
+
+  it('propagates the terminal child state to the parent on evented restart', async () => {
+    const storage = new MockStore();
+    const pubsub = new EventEmitterPubSub();
+
+    const inputSchema = z.object({ value: z.string() });
+    const outputSchema = z.object({ branch: z.string(), value: z.string() });
+
+    const mockFastA = vi.fn().mockResolvedValue({ branch: 'fastBranchA', value: 'repro' });
+    const mockFastC = vi.fn().mockResolvedValue({ branch: 'fastBranchC', value: 'repro' });
+
+    const makeBranch = (id: string, execute: typeof mockFastA) => {
+      const step = createEventedStep({
+        id: `${id}Step`,
+        execute,
+        inputSchema,
+        outputSchema,
+      });
+      return createEventedWorkflow({
+        id,
+        inputSchema,
+        outputSchema,
+        steps: [step],
+      })
+        .then(step)
+        .commit();
+    };
+
+    const fastBranchA = makeBranch('fastBranchA', mockFastA);
+    const fastBranchC = makeBranch('fastBranchC', mockFastC);
+
+    const parentWorkflow = createEventedWorkflow({
+      id: 'parallelNestedParentEventedState',
+      inputSchema,
+      outputSchema: z.any(),
+    })
+      .parallel([fastBranchA, fastBranchC])
+      .commit();
+
+    const mastra = new Mastra({
+      logger: false,
+      storage,
+      pubsub,
+      workflows: {
+        [parentWorkflow.id]: parentWorkflow,
+        [fastBranchA.id]: fastBranchA,
+        [fastBranchC.id]: fastBranchC,
+      },
+    });
+
+    const workflowsStore = await storage.getStore('workflows');
+    expect(workflowsStore).toBeTruthy();
+
+    const runId = `parallel-nested-evented-state-${Date.now()}`;
+    const startedAt = Date.now();
+    const input = { value: 'repro' };
+
+    await workflowsStore!.persistWorkflowSnapshot({
+      workflowName: parentWorkflow.id,
+      runId,
+      snapshot: {
+        runId,
+        status: 'running',
+        activePaths: [0],
+        activeStepsPath: {
+          fastBranchA: [0, 0],
+          fastBranchC: [0, 1],
+        },
+        value: {},
+        context: {
+          input,
+          fastBranchA: { payload: input, startedAt, status: 'running' },
+          fastBranchC: { payload: input, startedAt, status: 'running' },
+        },
+        serializedStepGraph: (parentWorkflow as any).serializedStepGraph,
+        suspendedPaths: {},
+        waitingPaths: {},
+        resumeLabels: {},
+        timestamp: Date.now(),
+      },
+    });
+
+    const fastResultA = { branch: 'fastBranchA', value: 'repro' };
+    const fastResultC = { branch: 'fastBranchC', value: 'repro' };
+    const childStateA = { childMarkerA: 'from-child-a' };
+    const childStateC = { childMarkerC: 'from-child-c' };
+
+    const nestedRunIdFor = (branch: { id: string }, leafIndex: number) =>
+      createNestedWorkflowRunId({
+        parentWorkflowId: parentWorkflow.id,
+        parentRunId: runId,
+        nestedWorkflowId: branch.id,
+        stepId: branch.id,
+        executionPath: [0, leafIndex],
+      });
+
+    for (const [branch, leafIndex, result, childState] of [
+      [fastBranchA, 0, fastResultA, childStateA],
+      [fastBranchC, 1, fastResultC, childStateC],
+    ] as const) {
+      const nestedRunId = nestedRunIdFor(branch, leafIndex);
+      await workflowsStore!.persistWorkflowSnapshot({
+        workflowName: branch.id,
+        runId: nestedRunId,
+        snapshot: {
+          runId: nestedRunId,
+          status: 'success',
+          result: { status: 'success', output: result, endedAt: startedAt + 150 },
+          activePaths: [],
+          activeStepsPath: {},
+          // The child's terminal setState() output — must be published to the
+          // parent (mirroring the live path's `state: finalState`), not
+          // dropped in favor of the parent's pre-child currentState.
+          value: childState,
+          context: {
+            input,
+            [`${branch.id}Step`]: {
+              payload: input,
+              startedAt,
+              status: 'success',
+              output: result,
+              endedAt: startedAt + 150,
+            },
+          },
+          serializedStepGraph: (branch as any).serializedStepGraph,
+          suspendedPaths: {},
+          waitingPaths: {},
+          resumeLabels: {},
+          timestamp: Date.now(),
+        },
+      });
+    }
+
+    await mastra.startWorkers();
+    try {
+      const run = await parentWorkflow.createRun({ runId });
+      const restartResult = await run.restart();
+
+      expect(restartResult.status).toBe('success');
+
+      // Synthesized step-end replays run in activeStepsPath order, so the
+      // last terminal child's resolved state wins — the same last-finisher
+      // semantics as the live path. Without passing the child's snapshot
+      // state this stays the parent's pre-child {} instead.
+      const persisted = await workflowsStore!.loadWorkflowSnapshot({
+        workflowName: parentWorkflow.id,
+        runId,
+      });
+      expect((persisted?.context as any)?.__state).toMatchObject(childStateC);
+
+      expect(mockFastA).toHaveBeenCalledTimes(0);
+      expect(mockFastC).toHaveBeenCalledTimes(0);
+    } finally {
+      await mastra.stopWorkers?.();
+    }
+  });
 });

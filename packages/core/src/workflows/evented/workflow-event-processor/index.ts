@@ -2921,7 +2921,12 @@ export class WorkflowEventProcessor extends EventProcessor {
               timeTravel,
               restart,
               perStep,
-              state: currentState,
+              // The live child-completion path publishes the nested run's
+              // resolved state (finalState) — processWorkflowStepEnd prefers
+              // the passed state when parentContext is set. Passing the
+              // parent's pre-child currentState here would drop the child's
+              // terminal setState() updates on evented restart.
+              state: snapshot.value ?? currentState,
               outputOptions,
               forEachIndex,
               nestedRunId,
