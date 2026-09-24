@@ -166,6 +166,8 @@ export interface HarnessTerminalIntent extends HarnessTerminalIdentity {
   attempts: number;
   claimId?: string;
   claimExpiresAt?: number;
+  /** Which consumer holds the live claim; ack/fail/renew identities must match it. */
+  consumerId?: string;
   nextAttemptAt?: number;
   lastError?: HarnessTerminalError;
   createdAt: number;
@@ -486,6 +488,19 @@ export function canonicalHarnessTerminalResult(result: HarnessTerminalResult): H
   return cloneHarnessTerminal(result);
 }
 
+/**
+ * Bounds a projected public terminal error to the canonical id-character
+ * ceiling before it reaches `canonicalHarnessTerminalResult`. Recognized
+ * harness errors carry constructed messages of arbitrary length; left
+ * unbounded, the canonicalization gate would reject the commit and strand the
+ * admission pending forever. The error code is preserved verbatim — only the
+ * message is truncated.
+ */
+export function boundHarnessTerminalError<T extends { code: string; message: string }>(error: T): T {
+  if (error.message.length <= MAX_HARNESS_TERMINAL_ID_CHARS) return error;
+  return { ...error, message: error.message.slice(0, MAX_HARNESS_TERMINAL_ID_CHARS) };
+}
+
 export function canonicalJson(value: JsonValue): string {
   assertJsonValue(value, 'value');
   return JSON.stringify(sortJson(value));
@@ -503,7 +518,13 @@ function sortJson(value: JsonValue): JsonValue {
   return value;
 }
 
-function assertJsonValue(value: unknown, path: string, depth = 0): asserts value is JsonValue {
+/**
+ * Bounded-JSON validation for terminal-handoff payloads: plain objects and
+ * arrays only, finite numbers, bounded key length and nesting depth. A cyclic
+ * graph exhausts the depth bound here rather than overflowing the recursive
+ * canonical hashers that consume the value afterwards.
+ */
+export function assertJsonValue(value: unknown, path: string, depth = 0): asserts value is JsonValue {
   if (depth > MAX_HARNESS_TERMINAL_JSON_DEPTH) {
     throw new HarnessTerminalHandoffValidationError(path, `exceeds ${MAX_HARNESS_TERMINAL_JSON_DEPTH} nesting levels`);
   }
@@ -517,6 +538,10 @@ function assertJsonValue(value: unknown, path: string, depth = 0): asserts value
     return;
   }
   if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new HarnessTerminalHandoffValidationError(path, 'must be a plain JSON object');
+    }
     for (const [key, entry] of Object.entries(value)) {
       if (key.length > MAX_HARNESS_TERMINAL_ID_CHARS) {
         throw new HarnessTerminalHandoffValidationError(
