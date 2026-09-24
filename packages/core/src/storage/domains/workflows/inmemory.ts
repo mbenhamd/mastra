@@ -83,8 +83,9 @@ import type {
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
   WorkflowExecutionState,
+  UpdateWorkflowResultsResult,
 } from '../../types';
-import { matchesExpectedWorkflowState } from '../../types';
+import { STALE_EXECUTION_RESULT, matchesExpectedWorkflowState } from '../../types';
 import {
   createEmptyWorkflowSnapshot,
   mergeWorkflowStepResult,
@@ -92,6 +93,7 @@ import {
 } from '../../workflow-snapshot';
 import {
   WorkflowSnapshotHandoffFenceError,
+  WorkflowStaleSnapshotPersistError,
   compareWorkflowSnapshotHandoffCursors,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
@@ -2216,7 +2218,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
     executionGeneration?: string;
-  }): Promise<Record<string, StepResult<any, any, any, any>>> {
+  }): Promise<UpdateWorkflowResultsResult> {
     const key = this.getWorkflowKey(workflowName, runId);
     for (let attempt = 1; ; attempt++) {
       const run = this.db.workflows.get(key);
@@ -2249,13 +2251,15 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // Compare-and-set guards run before any merge: a delayed result write
       // from a deleted execution lifetime must not merge into the snapshot a
       // reopened lifetime installed under the same runId (PF-4385 tombstone
-      // reopen). Mirrors the updateWorkflowState guard below.
+      // reopen). The stale sentinel — not the `{}` missing-record fallback —
+      // tells the caller its execution lifetime ended so it stops rather than
+      // advancing with an inline result. Mirrors the updateWorkflowState guard.
       if (
         !matchesExpectedWorkflowState(working, {
           expectedExecutionGeneration: executionGeneration,
         })
       ) {
-        return {};
+        return STALE_EXECUTION_RESULT;
       }
 
       mergeWorkflowStepResult({ snapshot: working, stepId, result, requestContext });
@@ -2393,6 +2397,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     snapshot,
     createdAt,
     updatedAt,
+    expectedExecutionGeneration,
   }: {
     workflowName: string;
     runId: string;
@@ -2400,6 +2405,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     snapshot: WorkflowRunState;
     createdAt?: Date;
     updatedAt?: Date;
+    expectedExecutionGeneration?: string;
   }): Promise<void> {
     validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
     const key = this.getWorkflowKey(workflowName, runId);
@@ -2407,6 +2413,20 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     for (let attempt = 1; ; attempt++) {
       const existing = this.db.workflows.get(key);
       this.assertWorkflowSnapshotHandoffAvailable(workflowName, runId);
+      // A generation-guarded persist must not resurrect a deleted run or
+      // overwrite the reopened lifetime's row: the guard fails closed on a
+      // missing record as well as on a generation mismatch.
+      if (expectedExecutionGeneration !== undefined) {
+        const storedSnapshot =
+          existing?.snapshot === undefined
+            ? undefined
+            : typeof existing.snapshot === 'string'
+              ? (JSON.parse(existing.snapshot) as WorkflowRunState)
+              : existing.snapshot;
+        if (storedSnapshot?.executionGeneration !== expectedExecutionGeneration) {
+          throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
+        }
+      }
       // Cloning the caller snapshot can invoke toJSON/getters that reenter
       // this map; restart if a reentrant write changed the row so a persisted
       // snapshot never silently overwrites a newer record.

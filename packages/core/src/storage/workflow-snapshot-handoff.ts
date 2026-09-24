@@ -30,6 +30,40 @@ export class WorkflowSnapshotHandoffFenceError extends TypeError {
   }
 }
 
+/**
+ * Raised when a generation-guarded `persistWorkflowSnapshot` finds the stored
+ * row missing or owned by a different execution generation — the caller's
+ * execution lifetime ended (deletion-tombstone reopen), so writing its
+ * snapshot would resurrect or overwrite the reopened run's row.
+ */
+export class WorkflowStaleSnapshotPersistError extends TypeError {
+  readonly code = 'WORKFLOW_SNAPSHOT_PERSIST_STALE_GENERATION';
+  readonly workflowName: string;
+  readonly runId: string;
+
+  constructor({ workflowName, runId }: { workflowName: string; runId: string }) {
+    super(`Workflow snapshot persist rejected a stale execution generation for ${workflowName}/${runId}`);
+    this.name = 'WorkflowStaleSnapshotPersistError';
+    this.workflowName = workflowName;
+    this.runId = runId;
+  }
+}
+
+/**
+ * Matches the stale-persist rejection across `@mastra/core` module instances:
+ * a CJS-loaded store adapter and an ESM consumer can resolve separate copies
+ * of the class, defeating `instanceof`. The stable `code` field is the
+ * cross-instance discriminator.
+ */
+export function isWorkflowStaleSnapshotPersistError(error: unknown): error is WorkflowStaleSnapshotPersistError {
+  return (
+    error instanceof WorkflowStaleSnapshotPersistError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'WORKFLOW_SNAPSHOT_PERSIST_STALE_GENERATION')
+  );
+}
+
 function sortCanonicalJson(value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map(sortCanonicalJson);
