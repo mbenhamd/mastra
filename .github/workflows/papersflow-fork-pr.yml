@@ -330,6 +330,56 @@ jobs:
           docker logs mastra-fork-pubsub-emulator
           exit 1
 
+      - name: Start MongoDB test service when owned
+        env:
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- stores/mongodb; then
+            echo 'MongoDB workspace unchanged; no port 27017 service required.'
+            exit 0
+          fi
+          docker run --detach --name mastra-fork-mongodb --publish 27017:27017 \
+            mongo@sha256:340c1c56fb10e95cf79ff547f8664b96bc6ead9909bc355238cbf865a9695a6f
+          for _attempt in {1..60}; do
+            if docker exec mastra-fork-mongodb mongosh --quiet --eval 'db.adminCommand({ ping: 1 })' 2>/dev/null | grep -q 'ok: 1'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mastra-fork-mongodb
+          exit 1
+
+      - name: Start Upstash-compatible Redis HTTP service when owned
+        env:
+          BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- stores/upstash; then
+            echo 'Upstash workspace unchanged; no port 8079 service required.'
+            exit 0
+          fi
+          docker network create mastra-fork-upstash
+          docker run --detach --name mastra-fork-upstash-redis \
+            --network mastra-fork-upstash \
+            redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005 \
+            redis-server --requirepass redis_password
+          docker run --detach --name mastra-fork-upstash-http \
+            --network mastra-fork-upstash --publish 8079:80 \
+            --env SRH_MODE=env \
+            --env SRH_TOKEN=test_token \
+            --env SRH_CONNECTION_STRING='redis://:redis_password@mastra-fork-upstash-redis:6379' \
+            hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
+          for _attempt in {1..60}; do
+            if timeout 1 bash -c '</dev/tcp/127.0.0.1/8079' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs mastra-fork-upstash-redis
+          docker logs mastra-fork-upstash-http
+          exit 1
+
       - name: Validate fork PR
         env:
           BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
