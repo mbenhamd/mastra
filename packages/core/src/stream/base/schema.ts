@@ -1,5 +1,13 @@
 import type { JSONSchema7, Schema } from '@internal/ai-sdk-v5';
-import { AnthropicSchemaCompatLayer, applyCompatLayer } from '@mastra/schema-compat';
+import {
+  AnthropicSchemaCompatLayer,
+  applyCompatLayer,
+  DeepSeekSchemaCompatLayer,
+  GoogleSchemaCompatLayer,
+  MetaSchemaCompatLayer,
+  OpenAIReasoningSchemaCompatLayer,
+  OpenAISchemaCompatLayer,
+} from '@mastra/schema-compat';
 import type { z as z3 } from 'zod/v3';
 import type { z as z4 } from 'zod/v4';
 import type { PublicSchema, StandardSchemaWithJSON } from '../../schema';
@@ -70,11 +78,41 @@ export function asJsonSchema(schema: StandardSchemaWithJSON | undefined): JSONSc
   return schema;
 }
 
-type SchemaModelInfo = {
+export type SchemaModelInfo = {
   provider: string;
   modelId: string;
   supportsStructuredOutputs: boolean;
 };
+
+function createSchemaCompatLayers(model: SchemaModelInfo) {
+  return [
+    new OpenAIReasoningSchemaCompatLayer(model),
+    new OpenAISchemaCompatLayer(model),
+    new GoogleSchemaCompatLayer(model),
+    new AnthropicSchemaCompatLayer(model),
+    new DeepSeekSchemaCompatLayer(model),
+    new MetaSchemaCompatLayer(model),
+  ];
+}
+
+/**
+ * Returns the matched provider compatibility layer's validating schema, or
+ * undefined when no layer applies. Provider responses generated against a
+ * compat-transformed wire schema (e.g. OpenAI strict mode emits null for
+ * optional fields) must be validated through this schema so compat post-
+ * processing maps values back to the original schema's expectations.
+ */
+export function getCompatValidationSchema<OUTPUT = undefined>(
+  schema: StandardSchemaWithJSON<OUTPUT>,
+  model: SchemaModelInfo,
+): StandardSchemaWithJSON<OUTPUT> | undefined {
+  for (const layer of createSchemaCompatLayers(model)) {
+    if (layer.shouldApply()) {
+      return layer.processToCompatSchema(schema) as StandardSchemaWithJSON<OUTPUT>;
+    }
+  }
+  return undefined;
+}
 
 export function getTransformedSchema<OUTPUT = undefined>(
   schema?: StandardSchemaWithJSON<OUTPUT>,
@@ -87,7 +125,7 @@ export function getTransformedSchema<OUTPUT = undefined>(
   const jsonSchema = options?.model
     ? (applyCompatLayer({
         schema: schema as PublicSchema<OUTPUT>,
-        compatLayers: [new AnthropicSchemaCompatLayer(options.model)],
+        compatLayers: createSchemaCompatLayers(options.model),
         mode: 'jsonSchema',
       }) as JSONSchema7)
     : asJsonSchema(schema);
