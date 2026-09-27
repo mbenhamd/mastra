@@ -74,7 +74,6 @@ describe('Fetch compiler adapter parity', () => {
       });
       return { adapter: null, app: router };
     },
-    executeHttpRequest: async (app: FetchRouter, httpRequest: HttpRequest) =>
-      executeFetchRequest(app, httpRequest),
+    executeHttpRequest: async (app: FetchRouter, httpRequest: HttpRequest) => executeFetchRequest(app, httpRequest),
   });
 });

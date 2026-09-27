@@ -259,9 +259,11 @@ export async function checkFetchRouteAuth(
     return null;
   }
   const errorBody = result.body as { error?: string } | undefined;
-  return { status: result.status, error: errorBody?.error ?? 'Access denied', headers: result.headers as
-    | Record<string, string>
-    | undefined };
+  return {
+    status: result.status,
+    error: errorBody?.error ?? 'Access denied',
+    headers: result.headers as Record<string, string> | undefined,
+  };
 }
 
 class FetchBodyTooLargeError extends Error {
@@ -347,9 +349,7 @@ export async function parseFetchRequestParams(
   const queryParams: Record<string, QueryParamValue> = {};
   for (const key of new Set(url.searchParams.keys())) {
     const values = url.searchParams.getAll(key);
-    queryParams[key] = (
-      values.length > 1 ? values : (values[0] as QueryParamValue)
-    ) as QueryParamValue;
+    queryParams[key] = (values.length > 1 ? values : (values[0] as QueryParamValue)) as QueryParamValue;
   }
   const normalizedQuery = normalizeQueryParams(queryParams);
 
@@ -483,8 +483,7 @@ function mapThrownError(mastra: Mastra, route: ServerRoute, error: unknown): Res
   const customResponse = getCustomHTTPExceptionResponse(error);
   if (customResponse) return customResponse;
   const statusCode =
-    (error as { status?: unknown })?.status ??
-    (error as { details?: { status?: unknown } })?.details?.status;
+    (error as { status?: unknown })?.status ?? (error as { details?: { status?: unknown } })?.details?.status;
   const status =
     typeof statusCode === 'number' && Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599
       ? statusCode
@@ -565,7 +564,10 @@ async function writeFetchStreamResponse(
   return new Response(framed as ReadableStream<Uint8Array>, { status: 200, headers });
 }
 
-export function compileFetchRouteHandler(route: ServerRoute, deps: FetchCompilerDeps): (request: Request) => Promise<Response> {
+export function compileFetchRouteHandler(
+  route: ServerRoute,
+  deps: FetchCompilerDeps,
+): (request: Request) => Promise<Response> {
   const prefix = normalizeRoutePath(deps.prefix ?? '/api');
   return async (request: Request): Promise<Response> => {
     const pendingHeaders = new Headers();
@@ -629,10 +631,7 @@ export function compileFetchRouteHandler(route: ServerRoute, deps: FetchCompiler
       try {
         if (route.queryParamSchema) {
           params.queryParams = (await route.queryParamSchema.parseAsync(
-            parseComplexQueryParams(
-              route.queryParamSchema as import('zod/v4').ZodTypeAny,
-              params.queryParams,
-            ),
+            parseComplexQueryParams(route.queryParamSchema as import('zod/v4').ZodTypeAny, params.queryParams),
           )) as Record<string, QueryParamValue>;
         }
       } catch (error) {
@@ -744,11 +743,7 @@ export function compileFetchRouteHandler(route: ServerRoute, deps: FetchCompiler
         ...(typeof params.body === 'object' && params.body !== null ? (params.body as Record<string, unknown>) : {}),
       });
       if (fgaError) {
-        return jsonResponse(
-          { error: fgaError.error, message: fgaError.message },
-          fgaError.status,
-          pendingHeaders,
-        );
+        return jsonResponse({ error: fgaError.error, message: fgaError.message }, fgaError.status, pendingHeaders);
       }
 
       const result = await route.handler(handlerParams);
@@ -807,8 +802,7 @@ export function compileFetchRouter(routes: readonly ServerRoute[], deps: FetchCo
   const routerDeps: FetchCompilerDeps = { ...deps, serverRoutes: deps.serverRoutes ?? snapshot };
   const compiled: FetchCompiledRoute[] = [];
   for (const route of routes) {
-    const methods =
-      route.method.toUpperCase() === 'ALL' ? [...ALL_METHODS] : [route.method.toUpperCase()];
+    const methods = route.method.toUpperCase() === 'ALL' ? [...ALL_METHODS] : [route.method.toUpperCase()];
     for (const method of methods) {
       if (compiled.some(entry => entry.method === method && entry.pattern.pattern === route.path)) {
         continue;

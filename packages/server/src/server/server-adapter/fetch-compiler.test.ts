@@ -33,7 +33,10 @@ function makeLogger() {
   return { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
 }
 
-function makeMastra(overrides: Record<string, unknown> = {}): { mastra: Mastra; logger: ReturnType<typeof makeLogger> } {
+function makeMastra(overrides: Record<string, unknown> = {}): {
+  mastra: Mastra;
+  logger: ReturnType<typeof makeLogger>;
+} {
   const logger = makeLogger();
   const mastra = {
     getLogger: () => logger,
@@ -523,9 +526,7 @@ describe('stream responses', () => {
     expect(response.headers.get('cache-control')).toBe('no-cache');
     expect(response.headers.get('x-accel-buffering')).toBe('no');
     expect(response.headers.get('transfer-encoding')).toBeNull();
-    expect(await response.text()).toBe(
-      'data: {"type":"text","text":"a"}\n\ndata: {"type":"text","text":"b"}\n\n',
-    );
+    expect(await response.text()).toBe('data: {"type":"text","text":"a"}\n\ndata: {"type":"text","text":"b"}\n\n');
   });
 
   it('prefixes the flush marker when sseFlushOnConnect is set', async () => {
@@ -611,14 +612,16 @@ describe('stream responses', () => {
           }),
         }),
       });
-    const redacted = await compileFetchRouteHandler(streamRoute(), makeDeps(mastra))(
-      new Request('http://test/echo', { method: 'POST' }),
-    );
+    const redacted = await compileFetchRouteHandler(
+      streamRoute(),
+      makeDeps(mastra),
+    )(new Request('http://test/echo', { method: 'POST' }));
     expect(await redacted.text()).toBe('data: {"type":"finish","payload":{"metadata":{"step":"x"}}}\n\n');
 
-    const raw = await compileFetchRouteHandler(streamRoute(), makeDeps(mastra, { redact: false }))(
-      new Request('http://test/echo', { method: 'POST' }),
-    );
+    const raw = await compileFetchRouteHandler(
+      streamRoute(),
+      makeDeps(mastra, { redact: false }),
+    )(new Request('http://test/echo', { method: 'POST' }));
     expect(await raw.text()).toBe(
       'data: {"type":"finish","payload":{"metadata":{"request":{"secret":1},"step":"x"}}}\n\n',
     );
