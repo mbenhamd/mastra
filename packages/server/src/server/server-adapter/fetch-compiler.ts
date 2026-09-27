@@ -11,8 +11,14 @@
  * Fastify (`server-adapters/fastify/src/selected.ts`) or Hono
  * (`server-adapters/hono/src/index.ts`) adapters. Where those two adapters
  * already diverge, the compiler follows the Hono (Web-native) behavior and
- * says so. Anything the shared `_test-utils` suites pin is covered by the
- * fetch parity runner in `./fetch-compiler.test.ts`.
+ * says so. The unit + shared-suite parity battery lives with the
+ * downstream consumer (its transitive closure trips the fork's fail-closed
+ * test gate); the fork colocates only the pure-pattern tests in
+ * `./fetch-pattern.test.ts`.
+ *
+ * Bun serving: `toBunRoutes()` projects a compiled router onto a
+ * `Bun.serve({ routes })` table, failing closed on registries whose
+ * linear-scan dispatch Bun's static table cannot reproduce.
  *
  * Request pipeline order (mirrors Fastify `registerRoute`):
  * auth (headers/query only, before body reads) → bounded body read →
@@ -54,6 +60,8 @@ import {
 } from '../constants';
 import { formatZodError, isZodError } from '../handlers/error';
 import { normalizeRoutePath } from '../utils';
+import { canonicalizeBunRouteKey, compileFetchRoutePattern, isStaticRoutePattern } from './fetch-pattern';
+import type { FetchRoutePattern } from './fetch-pattern';
 import { redactStreamChunk } from './redact';
 import type { ServerRoute } from './routes';
 import { getEffectivePermission } from './routes/permissions';
@@ -91,11 +99,8 @@ export type FetchCompilerDeps = {
   onUnknownRoute?: (request: Request) => Response | Promise<Response>;
 };
 
-export type FetchRoutePattern = {
-  /** The original `:param` pattern. Bun-compatible as-is. */
-  pattern: string;
-  match: (pathname: string) => Record<string, string> | null;
-};
+export { canonicalizeBunRouteKey, compileFetchRoutePattern, isStaticRoutePattern } from './fetch-pattern';
+export type { FetchRoutePattern } from './fetch-pattern';
 
 export type FetchCompiledRoute = {
   method: string;
@@ -106,34 +111,9 @@ export type FetchCompiledRoute = {
 export type FetchRouter = {
   routes: FetchCompiledRoute[];
   fetch: (request: Request) => Promise<Response>;
+  /** Normalized mount prefix the router was compiled with. */
+  prefix: string;
 };
-
-export function compileFetchRoutePattern(path: string): FetchRoutePattern {
-  const names: string[] = [];
-  const source = path
-    .split('/')
-    .map(segment => {
-      if (segment.startsWith(':')) {
-        names.push(segment.slice(1));
-        return '([^/]+)';
-      }
-      return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    })
-    .join('/');
-  const expression = new RegExp(`^${source}$`);
-  return {
-    pattern: path,
-    match: (pathname: string) => {
-      const hit = expression.exec(pathname);
-      if (!hit) return null;
-      const params: Record<string, string> = {};
-      names.forEach((name, index) => {
-        params[name] = decodeURIComponent(hit[index + 1] ?? '');
-      });
-      return params;
-    },
-  };
-}
 
 function stripPrefix(pathname: string, prefix: string): string | null {
   if (!prefix) return pathname;
@@ -817,6 +797,7 @@ export function compileFetchRouter(routes: readonly ServerRoute[], deps: FetchCo
   const prefix = normalizeRoutePath(deps.prefix ?? '/api');
   return {
     routes: compiled,
+    prefix,
     fetch: async (request: Request): Promise<Response> => {
       const url = new URL(request.url);
       const rest = stripPrefix(url.pathname, prefix);
@@ -840,4 +821,59 @@ export function compileFetchRouter(routes: readonly ServerRoute[], deps: FetchCo
       );
     },
   };
+}
+
+export type BunRouteMethodHandler = (request: Request) => Response | Promise<Response>;
+
+/**
+ * A `Bun.serve({ routes })`-shaped table: full public path (prefix
+ * included, params canonicalized to `:p0`, `:p1`, …) to per-method
+ * handlers. Structurally assignable to Bun's `routes` option; the
+ * consumer's `bun-types` check proves it.
+ */
+export type BunRoutesTable = Record<string, Record<string, BunRouteMethodHandler>>;
+
+function joinFetchPrefix(prefix: string, pattern: string): string {
+  if (pattern === '/') return prefix || '/';
+  return `${prefix === '/' ? '' : prefix}${pattern}`;
+}
+
+/**
+ * Project a compiled router onto a `Bun.serve({ routes })` table.
+ *
+ * Shape-identical patterns (`:agentId` vs `:id`) collapse to one
+ * canonical key with first-registered-wins per `(path, method)` cell,
+ * mirroring the linear scan in `router.fetch`. Throws fail-closed when
+ * a `:param` entry precedes a static entry it also matches for the same
+ * method: the linear scan would pick the param route while Bun's static
+ * table prefers the static one. Registries that trip this must serve
+ * through `router.fetch` instead.
+ */
+export function toBunRoutes(router: FetchRouter): BunRoutesTable {
+  const table: BunRoutesTable = {};
+  for (const entry of router.routes) {
+    const key = canonicalizeBunRouteKey(joinFetchPrefix(router.prefix, entry.pattern.pattern));
+    const methods = (table[key] ??= {});
+    if (!(entry.method in methods)) {
+      methods[entry.method] = entry.handler;
+    }
+  }
+
+  router.routes.forEach((staticEntry, staticIndex) => {
+    if (!isStaticRoutePattern(staticEntry.pattern.pattern)) return;
+    for (let paramIndex = 0; paramIndex < staticIndex; paramIndex++) {
+      const paramEntry = router.routes[paramIndex]!;
+      if (paramEntry.method !== staticEntry.method) continue;
+      if (isStaticRoutePattern(paramEntry.pattern.pattern)) continue;
+      if (paramEntry.pattern.match(staticEntry.pattern.pattern) !== null) {
+        throw new Error(
+          `[fetch-compiler] toBunRoutes: :param route ${paramEntry.method} ${paramEntry.pattern.pattern} ` +
+            `shadows static route ${staticEntry.method} ${staticEntry.pattern.pattern} under linear-scan order; ` +
+            `Bun.serve({ routes }) would dispatch the static entry instead. Serve this registry through router.fetch.`,
+        );
+      }
+    }
+  });
+
+  return table;
 }
