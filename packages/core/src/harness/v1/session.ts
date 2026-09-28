@@ -80,6 +80,7 @@ import {
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
   boundHarnessTerminalError,
+  HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT,
   harnessTerminalIntentId,
   HarnessTerminalHandoffUnsupportedError,
   HarnessTerminalHandoffValidationError,
@@ -112,6 +113,8 @@ import type {
   HarnessRuntimeDependencyRefs,
   InboxResponseReceipt,
   PendingInteractionExpiryGeneration,
+  PendingMessageAdmission,
+  PendingMessageAdmissionScanCursor,
   QueueAdmissionReceipt,
   PendingResume,
   PermissionRules,
@@ -695,6 +698,14 @@ const SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS = 30_000;
 const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
+/**
+ * Settlement recorded when session adoption finds an admitted `message()`
+ * dispatch whose owner died mid-run. The run is interrupted, never re-run.
+ */
+const HARNESS_RUN_INTERRUPTED_ERROR = {
+  code: 'harness.run_interrupted',
+  message: 'The run was interrupted when the process that owned it stopped; it was not re-run.',
+} as const;
 /**
  * §S4.1 — max transiently-failed event-ledger appends retained for retry before
  * fail-stop. A transient `appendSessionEvent` failure no longer permanently latches
@@ -1637,6 +1648,12 @@ export class Session {
   /** Span-summary — runIds whose `run_completed` was already emitted, so duplicate terminal `agent_end` paths finalize at most once. Bounded by {@link MAX_FINALIZED_RUN_IDS}. */
   private readonly _finalizedRunIds = new Set<string>();
   /**
+   * Span-summary — identities of runs this process never started but settled on
+   * adoption (an orphaned dispatch), consumed by the reconstructed
+   * `run_completed` so it reports the admitted mode/model, not the session's.
+   */
+  private readonly _recoveredRunIdentities = new Map<string, RunSpanIdentity>();
+  /**
    * Durable resume-usage fence. `_recordTurnCompletion` applies a resumed run's
    * usage delta to the live counter immediately, and every flush persists the
    * live counter — so an unrelated flush landing before the pending-clearing
@@ -2525,13 +2542,15 @@ export class Session {
    * those (usage + identity + finishReason are still reported).
    */
   private _finalizeRunSpan(runId: string, finishReason: string, usage: TokenUsage, completedAt: number): void {
+    const recoveredIdentity = this._recoveredRunIdentities.get(runId);
+    this._recoveredRunIdentities.delete(runId);
     if (this._finalizedRunIds.has(runId)) return;
     if (this._finalizedRunIds.size >= MAX_FINALIZED_RUN_IDS) this._finalizedRunIds.clear();
     this._finalizedRunIds.add(runId);
 
     const span = this._openRuns.get(runId);
     const reconstructed = span === undefined;
-    const identity = span?.identity ?? this._captureRunSpanIdentity();
+    const identity = span?.identity ?? recoveredIdentity ?? this._captureRunSpanIdentity();
     const status: RunCompletedStatus =
       finishReason === 'complete' ? 'completed' : finishReason === 'error' ? 'failed' : 'interrupted';
 
@@ -3485,6 +3504,237 @@ export class Session {
       return;
     }
     await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(pending));
+  }
+
+  /**
+   * @internal — adoption recovery for admitted `message()` dispatches whose
+   * owner died mid-run. Called while the adopting Harness holds the freshly
+   * acquired session lease, before queue replay starts.
+   *
+   * A pending admitted message is interrupted only when its dispatch claim is
+   * absent or expired by the storage clock, no run for it is live in this
+   * process, it is not a suspension parked for resume, and its run never
+   * reached a terminal (no durable run summary). Interruption
+   * settles it `failed{harness.run_interrupted}` — through the native terminal
+   * commit (with an aborted terminal intent) when a pending terminal admission
+   * owns it, otherwise through the dispatch CAS — then emits `agent_end`
+   * (aborted) and the reconstructed `run_completed` (interrupted). It never
+   * re-dispatches or re-runs provider work; a retry must be a new admission.
+   */
+  async _interruptOrphanedMessageDispatchesOnHydrate(): Promise<void> {
+    if (!this._storage.supportsDispatchRecovery) return;
+    const orphaned: AgentSignalResultEvidence[] = [];
+    let cursor: PendingMessageAdmissionScanCursor | undefined;
+    do {
+      const page = await this._storage.listPendingMessageAdmissions({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        limit: HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
+      for (const admission of page.items) {
+        if (this._isOrphanedMessageDispatch(admission)) orphaned.push(admission.evidence);
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    for (const evidence of orphaned) {
+      // A durable run summary means the owner already reached the run's
+      // terminal (for example an expired approval wait, or a completion whose
+      // evidence write was lost). That run was not interrupted mid-flight, so
+      // it is neither relabelled nor reported a second time.
+      const summary = await this._storage.loadRunSummary({
+        harnessName: this._record.harnessName,
+        runId: evidence.runId!,
+      });
+      if (summary !== null) continue;
+      await this._interruptOrphanedMessageDispatch(evidence);
+    }
+  }
+
+  private _isOrphanedMessageDispatch({ evidence, dispatchClaim }: PendingMessageAdmission): boolean {
+    // A still-valid claim means a dispatcher stamped it recently; leave it to
+    // settle on its own (or to a later adoption once the claim has expired).
+    if (dispatchClaim === 'live') return false;
+    const runId = evidence.runId;
+    if (
+      evidence.status !== 'pending' ||
+      evidence.operationKind !== 'message' ||
+      evidence.admissionId === undefined ||
+      evidence.admissionHash === undefined ||
+      runId === undefined
+    ) {
+      return false;
+    }
+    // A suspension parked for resume is waiting on a response, not orphaned.
+    if (this._record.pendingResume?.runId === runId) return false;
+    // Any in-process trace of the run means it is live (or settling) here.
+    if (
+      this._messageAdmissionStarts.has(evidence.admissionId) ||
+      this._runCompletionPromises.has(runId) ||
+      this._completedRuns.has(runId)
+    ) {
+      return false;
+    }
+    let agent: Agent | undefined;
+    try {
+      agent = this._harness.getAgentForMode(evidence.modeId ?? this._record.modeId);
+    } catch (error) {
+      // An unregistered mode/agent cannot be running this run in this process.
+      if (!(error instanceof HarnessConfigError)) throw error;
+    }
+    return !agent?.getRunOutput(runId);
+  }
+
+  private async _interruptOrphanedMessageDispatch(evidence: AgentSignalResultEvidence): Promise<void> {
+    const runId = evidence.runId!;
+    const error = { ...HARNESS_RUN_INTERRUPTED_ERROR };
+    const terminal = await this._commitInterruptedTerminalHandoff(evidence, runId, error);
+    if (terminal === 'unowned') {
+      const swapped = await this._storage.compareAndSwapSignalTerminal({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: evidence.signalId,
+        admissionId: evidence.admissionId!,
+        admissionHash: evidence.admissionHash!,
+        operationKind: 'message',
+        expected: evidence.dispatch ?? { state: 'reserved' },
+        terminal: {
+          status: 'failed',
+          signalId: evidence.signalId,
+          runId,
+          error,
+          ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
+          ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
+        },
+        updatedAt: Date.now(),
+      });
+      // A concurrent settlement won; its writer owns reporting the outcome.
+      if (!swapped.applied) return;
+    } else if (terminal !== 'committed') {
+      return;
+    }
+    const modeId = evidence.modeId ?? this._record.modeId;
+    this._recoveredRunIdentities.set(runId, {
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      agentId: this._modeAgentId(modeId),
+      modeId,
+      modelId: evidence.modelId ?? this._record.modelId,
+      operationKind: 'signal',
+      ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
+    });
+    // The run's start was emitted by the dead owner, so this terminal carries
+    // no span: `run_completed` is `interrupted` + `reconstructed`, and any
+    // persisted assistant draft for the run is terminalized as interrupted.
+    this._emitTurnEvent({ type: 'agent_end', runId, finishReason: 'aborted', usage: this._runUsage() });
+  }
+
+  /**
+   * Settle an orphaned dispatch owned by a pending native terminal admission:
+   * the finalizer projects the interrupted outcome (it receives no output) and
+   * storage commits failed evidence, the aborted terminal result, and its
+   * delivery intent in one transaction. `unowned` means no pending admission
+   * owns the dispatch (or it was cancelled meanwhile), so the evidence CAS
+   * settles it; `skipped` leaves it pending — this process cannot finalize the
+   * admitted finalizer identity, or a concurrent commit already sealed it.
+   */
+  private async _commitInterruptedTerminalHandoff(
+    evidence: AgentSignalResultEvidence,
+    runId: string,
+    error: { code: string; message: string },
+  ): Promise<'committed' | 'unowned' | 'skipped'> {
+    const sessionIncarnation = this._record.sessionIncarnation;
+    if (!this._storage.supportsTerminalHandoff || sessionIncarnation === undefined) return 'unowned';
+    const admission = await this._storage.loadTerminalAdmissionByRun({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      runId,
+      sessionIncarnation,
+    });
+    if (
+      admission === null ||
+      admission.status !== 'pending' ||
+      admission.admissionId !== evidence.admissionId ||
+      admission.signalId !== evidence.signalId
+    ) {
+      return 'unowned';
+    }
+    const finalizer = this._terminalFinalizer;
+    if (
+      finalizer === undefined ||
+      finalizer.id !== admission.finalizerId ||
+      finalizer.version !== admission.finalizerVersion
+    ) {
+      console.error(
+        `[harness/v1] orphaned terminal admission for run "${runId}" left pending: the admitted finalizer ${admission.finalizerId}@${admission.finalizerVersion} is not registered`,
+      );
+      return 'skipped';
+    }
+    const identity: HarnessTerminalIdentity = {
+      harnessName: admission.harnessName,
+      sessionId: admission.sessionId,
+      resourceId: admission.resourceId,
+      threadId: admission.threadId,
+      sessionIncarnation: admission.sessionIncarnation,
+      admissionId: admission.admissionId,
+      admissionHash: admission.admissionHash,
+      signalId: admission.signalId,
+      runId: admission.runId,
+      executionGrant: { ...admission.executionGrant },
+    };
+    const now = Date.now();
+    const terminalResult: HarnessTerminalResult = {
+      status: 'aborted',
+      runId,
+      completedAt: now,
+      error: boundHarnessTerminalError(error),
+    };
+    const projection = await finalizer.finalize({
+      identity,
+      seed: admission.seed,
+      finalizerId: admission.finalizerId,
+      finalizerVersion: admission.finalizerVersion,
+      result: terminalResult,
+      fullOutput: undefined,
+    });
+    const receipt = await this._storage.commitTerminalHandoff({
+      admission: {
+        ...identity,
+        finalizerId: admission.finalizerId,
+        finalizerVersion: admission.finalizerVersion,
+        seed: admission.seed,
+        createdAt: admission.createdAt,
+      },
+      resultEvidence: {
+        status: 'failed',
+        signalId: identity.signalId,
+        runId,
+        error,
+        ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
+        ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
+        operationKind: 'message',
+        ...(evidence.dispatch !== undefined ? { dispatch: evidence.dispatch } : {}),
+        admissionId: identity.admissionId,
+        admissionHash: identity.admissionHash,
+        harnessName: identity.harnessName,
+        sessionId: identity.sessionId,
+        resourceId: identity.resourceId,
+        threadId: identity.threadId,
+        createdAt: evidence.createdAt,
+        updatedAt: now,
+      },
+      terminalResult,
+      projection,
+    });
+    if (receipt.status === 'committed') {
+      this._drainTerminalObservers(runId, receipt);
+      return 'committed';
+    }
+    return receipt.status === 'cancelled' ? 'unowned' : 'skipped';
   }
 
   /**

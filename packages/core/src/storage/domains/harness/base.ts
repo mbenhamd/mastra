@@ -89,6 +89,10 @@ import type {
   ListChannelDiagnosticsInput,
   ListDuePendingInteractionsInput,
   ListDuePendingInteractionsResult,
+  ListPendingMessageAdmissionsInput,
+  ListPendingMessageAdmissionsResult,
+  ListRecoverableSessionsInput,
+  ListRecoverableSessionsResult,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -152,6 +156,20 @@ export function normalizePendingInteractionDueScanInput(input: ListDuePendingInt
   };
 }
 
+/** Hard storage-side page ceiling for orphaned-dispatch recovery discovery. */
+export const HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT = 100;
+
+/**
+ * Validate and cap a recovery-discovery page size before an adapter queries.
+ * Kept in the storage domain so every adapter enforces identical bounds.
+ */
+export function normalizeDispatchRecoveryScanLimit(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new RangeError('Dispatch recovery scan limit must be a positive safe integer');
+  }
+  return Math.min(limit, HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT);
+}
+
 export interface WriteMessageResultEvidenceResult {
   created: boolean;
   /** True only when this write changed the durable evidence row. */
@@ -192,6 +210,14 @@ export interface CompareAndSwapSignalTerminalInput {
   signalId: string;
   admissionId: string;
   admissionHash: string;
+  /**
+   * Durable operation discriminator of the admitted row. `'signal'` (the
+   * default) keeps the admitted-signal contract. `'message'` settles an
+   * admitted `message()` row: an unstamped row matches `expected: reserved`
+   * and settles against the run id it was admitted with. The stored row's
+   * operation kind must match.
+   */
+  operationKind?: 'message' | 'signal';
   expected: AgentSignalDispatchState;
   terminal:
     | {
@@ -531,6 +557,14 @@ export class HarnessStorageSignalDispatchUnsupportedError extends HarnessStorage
   }
 }
 
+export class HarnessStorageDispatchRecoveryUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageDispatchRecoveryUnsupportedError';
+  readonly code = 'harness.storage.dispatch_recovery_unsupported' as const;
+  constructor() {
+    super('Harness storage adapter does not support orphaned dispatch recovery discovery');
+  }
+}
+
 export class HarnessStorageChannelBindingUnsupportedError extends HarnessStorageDomainError {
   readonly name = 'HarnessStorageChannelBindingUnsupportedError';
   readonly code = 'harness.storage.channel_binding_unsupported' as const;
@@ -789,6 +823,15 @@ export abstract class HarnessStorage extends StorageDomain {
     return false;
   }
 
+  /**
+   * Native adapters override this after implementing `listRecoverableSessions`,
+   * `listPendingMessageAdmissions`, and the `'message'` terminal CAS. Session
+   * adoption skips orphaned-dispatch interruption when it is false.
+   */
+  get supportsDispatchRecovery(): boolean {
+    return false;
+  }
+
   constructor(
     options: {
       terminalHandoff?: HarnessTerminalHandoffOption;
@@ -877,6 +920,30 @@ export abstract class HarnessStorage extends StorageDomain {
    * session CAS so a response/new pending generation can win safely.
    */
   abstract listDuePendingInteractions(opts: ListDuePendingInteractionsInput): Promise<ListDuePendingInteractionsResult>;
+
+  /**
+   * Discover open sessions whose lease has lapsed (unowned, or expired by the
+   * STORAGE clock) while durable work is still pending: an admitted `message()`
+   * result row, a queued item, or an unfinished close. Keyset-paginated by
+   * session id. Discovery evidence only — a recovery worker adopts each session
+   * through `harness.session()`, whose lease compare-and-set is the reservation
+   * and whose adoption step interrupts orphaned dispatches.
+   */
+  async listRecoverableSessions(_opts: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
+    throw new HarnessStorageDispatchRecoveryUnsupportedError();
+  }
+
+  /**
+   * List a session's pending admitted `message()` result rows, each with its
+   * dispatch-claim state evaluated by the STORAGE clock. Keyset-paginated by
+   * signal id. Session adoption uses it to find dispatches orphaned by a dead
+   * owner; it never grants authority to settle a row (settlement is a CAS).
+   */
+  async listPendingMessageAdmissions(
+    _opts: ListPendingMessageAdmissionsInput,
+  ): Promise<ListPendingMessageAdmissionsResult> {
+    throw new HarnessStorageDispatchRecoveryUnsupportedError();
+  }
 
   /**
    * Run a small critical section while new active-session admission for this
@@ -1168,6 +1235,10 @@ export abstract class HarnessStorage extends StorageDomain {
    * with the exact finalizer bytes and durable delivery intent in one adapter
    * transaction. This replaces the ordinary completed-evidence write on the
    * opted-in path; there is no completed → prepare → commit sequence.
+   *
+   * `resultEvidence` may instead be `failed` when `terminalResult` is not
+   * `completed` — the interrupted outcome of a dispatch orphaned by a dead
+   * owner, which never produced provider output.
    */
   async commitTerminalHandoff(_input: {
     admission: HarnessTerminalAdmissionInput;

@@ -71,6 +71,7 @@ import {
   assertPlanTaskCreateIdempotencyInput,
   decodePlanTaskCursor,
   encodePlanTaskCursor,
+  normalizeDispatchRecoveryScanLimit,
   normalizePendingInteractionDueScanInput,
   buildHarnessSessionRecordProjectionIntent,
   projectHarnessSessionRecordProjectionFence,
@@ -141,6 +142,11 @@ import type {
   ListChannelDiagnosticsInput,
   ListDuePendingInteractionsInput,
   ListDuePendingInteractionsResult,
+  ListPendingMessageAdmissionsInput,
+  ListPendingMessageAdmissionsResult,
+  ListRecoverableSessionsInput,
+  ListRecoverableSessionsResult,
+  PendingMessageDispatchClaim,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -218,6 +224,13 @@ type PgHarnessExecuteResult = { rows: Record<string, unknown>[]; rowsAffected: n
 type PgHarnessTx = PgHarnessClient & { closed: boolean; commit(): Promise<void>; rollback(): Promise<void> };
 type HarnessAttachmentOperationKind = 'put' | 'delete';
 const HARNESS_ATTACHMENT_PUT_ABANDONMENT_DELAY_MS = 60_000;
+/**
+ * Database-clock epoch milliseconds. Lease and dispatch-claim expiry decisions
+ * that several processes race on (lease CAS, recovery discovery) compare
+ * against this one clock instead of each caller's wall clock. `now()` is stable
+ * for the statement/transaction, so a scan evaluates one instant.
+ */
+const PG_STORAGE_NOW_MS = 'floor(extract(epoch FROM now()) * 1000)::bigint';
 type HarnessAttachmentOperationStatus =
   | 'pending'
   | 'uploaded'
@@ -813,6 +826,10 @@ export class HarnessPG extends HarnessStorage {
     return this.terminalHandoff.enabled;
   }
 
+  override get supportsDispatchRecovery(): boolean {
+    return true;
+  }
+
   static getDefaultIndexDefs(schemaPrefix: string) {
     return harnessIndexDefs(schemaPrefix);
   }
@@ -1310,6 +1327,108 @@ export class HarnessPG extends HarnessStorage {
     return {
       items,
       ...(generations.length > limit && last ? { nextCursor: { dueAt: last.dueAt, sessionId: last.sessionId } } : {}),
+    };
+  }
+
+  async listRecoverableSessions(input: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
+    const limit = normalizeDispatchRecoveryScanLimit(input.limit);
+    await this.#ensureMessageResultsTable();
+    const args: (string | number)[] = [this.#resolveHarnessName(input.harnessName)];
+    const cursorCondition = input.cursor !== undefined ? 'AND s.id > ?' : '';
+    if (input.cursor !== undefined) args.push(input.cursor.sessionId);
+    args.push(limit + 1);
+
+    // The lease is compared on the database clock so discovery and the
+    // adopter's lease CAS agree on which sessions have lapsed.
+    const result = await this.#client.execute({
+      sql: `SELECT * FROM (
+              SELECT s.harness_name, s.id, s.resource_id, s.thread_id,
+                     s.closing_at IS NOT NULL AS closing,
+                     s.pending_queue <> '[]'::jsonb AS pending_queue,
+                     EXISTS (
+                       SELECT 1 FROM ${TABLE_HARNESS_MESSAGE_RESULTS} m
+                       WHERE m.harness_name = s.harness_name
+                         AND m.session_id = s.id
+                         AND m.resource_id = s.resource_id
+                         AND m.thread_id = s.thread_id
+                         AND m.status = 'pending'
+                         AND m.operation_kind = 'message'
+                         AND m.admission_id IS NOT NULL
+                         AND m.admission_hash IS NOT NULL
+                     ) AS pending_message_admission
+              FROM ${TABLE_HARNESS_SESSIONS} s
+              WHERE s.harness_name = ?
+                AND s.closed_at IS NULL
+                AND (s.owner_id IS NULL OR s.lease_expires_at IS NULL OR s.lease_expires_at <= ${PG_STORAGE_NOW_MS})
+                ${cursorCondition}
+            ) candidates
+            WHERE closing OR pending_queue OR pending_message_admission
+            ORDER BY id ASC
+            LIMIT ?`,
+      args,
+    });
+    const sessions = result.rows.map(row => ({
+      harnessName: String(row.harness_name),
+      sessionId: String(row.id),
+      resourceId: String(row.resource_id),
+      threadId: String(row.thread_id),
+      pendingMessageAdmission: row.pending_message_admission === true,
+      pendingQueue: row.pending_queue === true,
+      closing: row.closing === true,
+    }));
+    const items = sessions.slice(0, limit);
+    const last = items.at(-1);
+    return {
+      items,
+      ...(sessions.length > limit && last ? { nextCursor: { sessionId: last.sessionId } } : {}),
+    };
+  }
+
+  async listPendingMessageAdmissions(
+    input: ListPendingMessageAdmissionsInput,
+  ): Promise<ListPendingMessageAdmissionsResult> {
+    const limit = normalizeDispatchRecoveryScanLimit(input.limit);
+    await this.#ensureMessageResultsTable();
+    const args: (string | number)[] = [
+      this.#resolveHarnessName(input.harnessName),
+      input.sessionId,
+      input.resourceId,
+      input.threadId,
+    ];
+    const cursorCondition = input.cursor !== undefined ? 'AND signal_id > ?' : '';
+    if (input.cursor !== undefined) args.push(input.cursor.signalId);
+    args.push(limit + 1);
+
+    // Claim expiry is evaluated on the database clock. A malformed stamped
+    // claim reads as live: recovery must never interrupt what it cannot date.
+    const result = await this.#client.execute({
+      sql: `SELECT *,
+                   CASE
+                     WHEN dispatch IS NULL OR dispatch->>'state' IS DISTINCT FROM 'dispatching' THEN 'none'
+                     WHEN jsonb_typeof(dispatch->'claimExpiresAt') IS DISTINCT FROM 'number' THEN 'live'
+                     WHEN (dispatch->>'claimExpiresAt')::numeric <= ${PG_STORAGE_NOW_MS} THEN 'expired'
+                     ELSE 'live'
+                   END AS dispatch_claim
+            FROM ${TABLE_HARNESS_MESSAGE_RESULTS}
+            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
+              AND status = 'pending'
+              AND operation_kind = 'message'
+              AND admission_id IS NOT NULL
+              AND admission_hash IS NOT NULL
+              ${cursorCondition}
+            ORDER BY signal_id ASC
+            LIMIT ?`,
+      args,
+    });
+    const admissions = result.rows.map(row => ({
+      evidence: rowToMessageResultEvidence(row as Record<string, unknown>),
+      dispatchClaim: row.dispatch_claim as PendingMessageDispatchClaim,
+    }));
+    const items = admissions.slice(0, limit);
+    const last = items.at(-1);
+    return {
+      items,
+      ...(admissions.length > limit && last ? { nextCursor: { signalId: last.evidence.signalId } } : {}),
     };
   }
 
@@ -3174,22 +3293,22 @@ export class HarnessPG extends HarnessStorage {
     harnessName,
   }: AcquireSessionLeaseInput): Promise<SessionLeaseResult> {
     const namespace = this.#resolveHarnessName(harnessName);
-    const now = Date.now();
-    const expiresAt = now + ttlMs;
 
+    // Stamp and compare on the database clock: every adopter racing this CAS
+    // (and recovery discovery) then agrees on when a lease lapsed.
     const result = await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
-            SET owner_id = ?, lease_expires_at = ?
+            SET owner_id = ?, lease_expires_at = ${PG_STORAGE_NOW_MS} + ?
             WHERE harness_name = ?
               AND id = ?
               AND (
                 owner_id IS NULL
                 OR lease_expires_at IS NULL
-                OR lease_expires_at <= ?
+                OR lease_expires_at <= ${PG_STORAGE_NOW_MS}
                 OR owner_id = ?
               )
-            RETURNING version`,
-      args: [ownerId, expiresAt, namespace, sessionId, now, ownerId],
+            RETURNING version, lease_expires_at`,
+      args: [ownerId, ttlMs, namespace, sessionId, ownerId],
     });
 
     if (result.rows.length === 0) {
@@ -3202,7 +3321,7 @@ export class HarnessPG extends HarnessStorage {
       );
     }
 
-    return { version: Number(result.rows[0]!.version), expiresAt };
+    return { version: Number(result.rows[0]!.version), expiresAt: Number(result.rows[0]!.lease_expires_at) };
   }
 
   async renewSessionLease({
@@ -3212,19 +3331,17 @@ export class HarnessPG extends HarnessStorage {
     harnessName,
   }: RenewSessionLeaseInput): Promise<SessionLeaseResult> {
     const namespace = this.#resolveHarnessName(harnessName);
-    const now = Date.now();
-    const expiresAt = now + ttlMs;
 
     const result = await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
-            SET lease_expires_at = ?
+            SET lease_expires_at = ${PG_STORAGE_NOW_MS} + ?
             WHERE harness_name = ?
               AND id = ?
               AND owner_id = ?
               AND lease_expires_at IS NOT NULL
-              AND lease_expires_at > ?
-            RETURNING version`,
-      args: [expiresAt, namespace, sessionId, ownerId, now],
+              AND lease_expires_at > ${PG_STORAGE_NOW_MS}
+            RETURNING version, lease_expires_at`,
+      args: [ttlMs, namespace, sessionId, ownerId],
     });
 
     if (result.rows.length === 0) {
@@ -3237,7 +3354,7 @@ export class HarnessPG extends HarnessStorage {
       );
     }
 
-    return { version: Number(result.rows[0]!.version), expiresAt };
+    return { version: Number(result.rows[0]!.version), expiresAt: Number(result.rows[0]!.lease_expires_at) };
   }
 
   async renewSessionLeaseSubtree({
@@ -3247,8 +3364,6 @@ export class HarnessPG extends HarnessStorage {
     harnessName,
   }: RenewSessionLeaseSubtreeInput): Promise<SubtreeSessionLeaseResult> {
     const namespace = this.#resolveHarnessName(harnessName);
-    const now = Date.now();
-    const expiresAt = now + ttlMs;
 
     // §5.8 atomic subtree renewal: one transaction locks the root, gathers every
     // ACTIVE (non-closed) descendant under one owner, then renews root + descendants
@@ -3260,13 +3375,17 @@ export class HarnessPG extends HarnessStorage {
     const tx = await this.#client.transaction('write');
     try {
       const rootResult = await tx.execute({
-        sql: `SELECT version, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+        sql: `SELECT version, owner_id, lease_expires_at, ${PG_STORAGE_NOW_MS} AS storage_now_ms
+              FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ?
               FOR UPDATE`,
         args: [namespace, rootSessionId],
       });
       const rootRow = rootResult.rows[0] as Record<string, unknown> | undefined;
       if (!rootRow) throw new HarnessStorageSessionNotFoundError(rootSessionId);
+      // Database clock, read once in the renewal transaction (see PG_STORAGE_NOW_MS).
+      const now = Number(rootRow.storage_now_ms);
+      const expiresAt = now + ttlMs;
       const rootOwner = (rootRow.owner_id ?? null) as string | null;
       const rootExpires = rootRow.lease_expires_at == null ? undefined : Number(rootRow.lease_expires_at);
       if (rootOwner !== ownerId || rootExpires === undefined || rootExpires <= now) {
@@ -5092,7 +5211,7 @@ export class HarnessPG extends HarnessStorage {
       // recorded; only the evidence-row comparisons are conditional on the
       // evidence still existing.
       if (
-        resultEvidence.status !== 'completed' ||
+        !terminalEvidenceMatchesResult(resultEvidence, terminalResult) ||
         resultEvidence.signalId !== stored.signalId ||
         resultEvidence.runId !== stored.runId ||
         resultEvidence.sessionId !== stored.sessionId ||
@@ -5226,22 +5345,27 @@ export class HarnessPG extends HarnessStorage {
       }
 
       if (currentEvidence.status === 'completed') {
-        if (stableJsonString(currentEvidence.result) !== stableJsonString(persistedJsonValue(resultEvidence.result))) {
+        if (
+          resultEvidence.status !== 'completed' ||
+          stableJsonString(currentEvidence.result) !== stableJsonString(persistedJsonValue(resultEvidence.result))
+        ) {
           throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
         }
       } else if (currentEvidence.status === 'pending') {
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
-                SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = ?, status = 'completed',
-                    dispatch = ?, result = ?, error = NULL, updated_at = ?
+                SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = ?, status = ?,
+                    dispatch = ?, result = ?, error = ?, updated_at = ?
                 WHERE id = ?`,
           args: [
-            resultEvidence.runId,
+            resultEvidence.runId ?? null,
             resultEvidence.modeId ?? null,
             resultEvidence.modelId ?? null,
             resultEvidence.operationKind ?? null,
+            resultEvidence.status,
             resultEvidence.dispatch === undefined ? null : JSON.stringify(resultEvidence.dispatch),
-            JSON.stringify(resultEvidence.result),
+            resultEvidence.status === 'completed' ? JSON.stringify(resultEvidence.result) : null,
+            resultEvidence.status === 'failed' ? JSON.stringify(resultEvidence.error) : null,
             resultEvidence.updatedAt,
             evidenceId,
           ],
@@ -5879,28 +6003,35 @@ export class HarnessPG extends HarnessStorage {
       ) {
         throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
       }
-      if (!isSignalAdmissionEvidence(current)) {
+      const operationKind = input.operationKind ?? 'signal';
+      if (!messageEvidenceMatchesDispatchKind(current, operationKind)) {
         throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
       }
       if (isTerminalMessageEvidence(current) || !signalDispatchMatches(current, input.expected)) {
         await tx.commit();
         return { applied: false, evidence: current };
       }
-      if (
-        input.expected.state === 'reserved' ||
-        (input.terminal.runId !== undefined && input.terminal.runId !== input.expected.runId)
-      ) {
+      // A reserved signal never dispatched, so it has no run to settle. An
+      // unstamped admitted message row already carries its admitted run id.
+      const runId =
+        input.expected.state === 'reserved'
+          ? operationKind === 'message'
+            ? current.runId
+            : undefined
+          : input.expected.runId;
+      if (runId === undefined || (input.terminal.runId !== undefined && input.terminal.runId !== runId)) {
         throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
       }
       const terminal = input.terminal;
       await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
-              SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = 'signal', status = ?, result = ?, error = ?, updated_at = ?
+              SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = ?, status = ?, result = ?, error = ?, updated_at = ?
               WHERE id = ? AND operation_kind IS NOT DISTINCT FROM ?`,
         args: [
-          input.expected.runId,
+          runId,
           terminal.modeId ?? current.modeId ?? null,
           terminal.modelId ?? current.modelId ?? null,
+          operationKind,
           terminal.status,
           terminal.status === 'completed' ? JSON.stringify(terminal.result) : null,
           terminal.status === 'failed' ? JSON.stringify(terminal.error) : null,
@@ -5912,11 +6043,11 @@ export class HarnessPG extends HarnessStorage {
       const evidence: AgentSignalResultEvidence = {
         ...current,
         ...terminal,
-        operationKind: 'signal',
-        runId: input.expected.runId,
+        operationKind,
+        runId,
         modeId: terminal.modeId ?? current.modeId,
         modelId: terminal.modelId ?? current.modelId,
-        dispatch: input.expected,
+        dispatch: operationKind === 'message' ? current.dispatch : input.expected,
         createdAt: current.createdAt,
         updatedAt: input.updatedAt,
       };
@@ -11599,6 +11730,14 @@ function sameMessageEvidenceIdentity(a: AgentSignalResultEvidence, b: AgentSigna
 
 function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
   return record.status === 'completed' || record.status === 'failed';
+}
+
+/**
+ * Terminal commits seal completed evidence; a non-completed terminal outcome
+ * (an interrupted orphaned dispatch) may instead seal failed evidence.
+ */
+function terminalEvidenceMatchesResult(evidence: AgentSignalResultEvidence, result: HarnessTerminalResult): boolean {
+  return evidence.status === 'completed' || (evidence.status === 'failed' && result.status !== 'completed');
 }
 
 function isSignalAdmissionEvidence(record: AgentSignalResultEvidence): boolean {

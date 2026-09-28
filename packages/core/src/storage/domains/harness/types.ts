@@ -1863,6 +1863,74 @@ export interface ListDuePendingInteractionsResult {
   nextCursor?: PendingInteractionDueScanCursor;
 }
 
+export interface RecoverableSessionScanCursor {
+  sessionId: string;
+}
+
+export interface ListRecoverableSessionsInput {
+  harnessName?: string;
+  /** Positive page size; adapters cap it at the storage-wide maximum. */
+  limit: number;
+  /** Return sessions strictly after this session id. */
+  cursor?: RecoverableSessionScanCursor;
+}
+
+/**
+ * An open session whose lease has lapsed by the storage clock while durable
+ * work is still pending. Discovery evidence only: a recovery worker adopts it
+ * through `harness.session()`, whose lease compare-and-set is the reservation.
+ */
+export interface RecoverableSession {
+  harnessName: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  /** An admitted `message()` result row is still pending. */
+  pendingMessageAdmission: boolean;
+  /** The durable queue still holds items. */
+  pendingQueue: boolean;
+  /** A close started and never finished. */
+  closing: boolean;
+}
+
+export interface ListRecoverableSessionsResult {
+  items: RecoverableSession[];
+  nextCursor?: RecoverableSessionScanCursor;
+}
+
+export interface PendingMessageAdmissionScanCursor {
+  signalId: string;
+}
+
+export interface ListPendingMessageAdmissionsInput {
+  harnessName?: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  /** Positive page size; adapters cap it at the storage-wide maximum. */
+  limit: number;
+  /** Return rows strictly after this signal id. */
+  cursor?: PendingMessageAdmissionScanCursor;
+}
+
+/**
+ * Dispatch-claim state of a pending admitted message, evaluated by the storage
+ * clock. `none`: no claim was stamped (a plain admitted `message()` is fenced
+ * by the session lease alone). `live`: a stamped `dispatching` claim has not
+ * expired. `expired`: it has.
+ */
+export type PendingMessageDispatchClaim = 'none' | 'live' | 'expired';
+
+export interface PendingMessageAdmission {
+  evidence: AgentSignalResultEvidence;
+  dispatchClaim: PendingMessageDispatchClaim;
+}
+
+export interface ListPendingMessageAdmissionsResult {
+  items: PendingMessageAdmission[];
+  nextCursor?: PendingMessageAdmissionScanCursor;
+}
+
 export interface WithThreadDeleteFenceInput {
   threadId: string;
   /** Unique acquisition token; only the current matching owner may release a fence. */

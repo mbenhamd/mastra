@@ -31,6 +31,7 @@ import {
   HarnessStorageVersionConflictError,
   HarnessStorageWakeupClaimConflictError,
   HarnessStorageWakeupTransitionError,
+  normalizeDispatchRecoveryScanLimit,
   normalizePendingInteractionDueScanInput,
 } from './base';
 import type {
@@ -152,6 +153,10 @@ import type {
   ListChannelDiagnosticsInput,
   ListDuePendingInteractionsInput,
   ListDuePendingInteractionsResult,
+  ListPendingMessageAdmissionsInput,
+  ListPendingMessageAdmissionsResult,
+  ListRecoverableSessionsInput,
+  ListRecoverableSessionsResult,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -159,9 +164,12 @@ import type {
   JsonValue,
   OperationAdmissionEvidence,
   OperationAdmissionTombstone,
+  PendingMessageAdmission,
+  PendingMessageDispatchClaim,
   PendingResume,
   ProviderCallbackSelectorKind,
   QueueAdmissionReceipt,
+  RecoverableSession,
   ReleaseSessionLeaseInput,
   RenewSessionLeaseInput,
   RenewSessionLeaseSubtreeInput,
@@ -224,6 +232,10 @@ export class InMemoryHarness extends HarnessStorage {
 
   override get supportsSessionRecordProjection(): boolean {
     return this.sessionRecordProjection.enabled;
+  }
+
+  override get supportsDispatchRecovery(): boolean {
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -378,6 +390,73 @@ export class InMemoryHarness extends HarnessStorage {
     return {
       items: page.map(cloneJson),
       ...(due.length > limit && last ? { nextCursor: { dueAt: last.dueAt, sessionId: last.sessionId } } : {}),
+    };
+  }
+
+  async listRecoverableSessions(input: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
+    const limit = normalizeDispatchRecoveryScanLimit(input.limit);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    const now = Date.now();
+    const sessionsWithPendingAdmission = new Set<string>();
+    for (const evidence of this.db.harnessMessageResultEvidence.values()) {
+      if (evidence.harnessName === namespace && isPendingAdmittedMessage(evidence)) {
+        sessionsWithPendingAdmission.add(evidence.sessionId);
+      }
+    }
+    const recoverable: RecoverableSession[] = [];
+    for (const record of this.db.harnessSessions.values()) {
+      if (record.harnessName !== namespace || record.closedAt !== undefined) continue;
+      if (input.cursor !== undefined && record.id <= input.cursor.sessionId) continue;
+      if (record.ownerId !== undefined && record.leaseExpiresAt !== undefined && record.leaseExpiresAt > now) continue;
+      const pendingMessageAdmission = sessionsWithPendingAdmission.has(record.id);
+      const pendingQueue = record.pendingQueue.length > 0;
+      const closing = record.closingAt !== undefined;
+      if (!pendingMessageAdmission && !pendingQueue && !closing) continue;
+      recoverable.push({
+        harnessName: record.harnessName,
+        sessionId: record.id,
+        resourceId: record.resourceId,
+        threadId: record.threadId,
+        pendingMessageAdmission,
+        pendingQueue,
+        closing,
+      });
+    }
+    recoverable.sort((a, b) => compareStrings(a.sessionId, b.sessionId));
+    const page = recoverable.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      items: page,
+      ...(recoverable.length > limit && last ? { nextCursor: { sessionId: last.sessionId } } : {}),
+    };
+  }
+
+  async listPendingMessageAdmissions(
+    input: ListPendingMessageAdmissionsInput,
+  ): Promise<ListPendingMessageAdmissionsResult> {
+    const limit = normalizeDispatchRecoveryScanLimit(input.limit);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    const now = Date.now();
+    const pending: PendingMessageAdmission[] = [];
+    for (const evidence of this.db.harnessMessageResultEvidence.values()) {
+      if (
+        evidence.harnessName !== namespace ||
+        evidence.sessionId !== input.sessionId ||
+        evidence.resourceId !== input.resourceId ||
+        evidence.threadId !== input.threadId ||
+        !isPendingAdmittedMessage(evidence)
+      ) {
+        continue;
+      }
+      if (input.cursor !== undefined && evidence.signalId <= input.cursor.signalId) continue;
+      pending.push({ evidence: cloneJson(evidence), dispatchClaim: pendingMessageDispatchClaim(evidence, now) });
+    }
+    pending.sort((a, b) => compareStrings(a.evidence.signalId, b.evidence.signalId));
+    const page = pending.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      items: page,
+      ...(pending.length > limit && last ? { nextCursor: { signalId: last.evidence.signalId } } : {}),
     };
   }
 
@@ -1642,7 +1721,7 @@ export class InMemoryHarness extends HarnessStorage {
       harnessName: namespace,
     };
     if (
-      resultEvidence.status !== 'completed' ||
+      !terminalEvidenceMatchesResult(resultEvidence, input.terminalResult) ||
       resultEvidence.signalId !== stored.signalId ||
       resultEvidence.runId !== stored.runId ||
       resultEvidence.sessionId !== stored.sessionId ||
@@ -1701,7 +1780,8 @@ export class InMemoryHarness extends HarnessStorage {
       }
       if (
         currentEvidence.status === 'completed' &&
-        stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result)
+        (resultEvidence.status !== 'completed' ||
+          stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result))
       ) {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
@@ -1733,7 +1813,8 @@ export class InMemoryHarness extends HarnessStorage {
     // branches (and the Postgres adapter) apply before mutating anything.
     if (
       currentEvidence.status === 'completed' &&
-      stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result)
+      (resultEvidence.status !== 'completed' ||
+        stableJsonString(currentEvidence.result) !== stableJsonString(resultEvidence.result))
     ) {
       throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
     }
@@ -2234,7 +2315,8 @@ export class InMemoryHarness extends HarnessStorage {
     ) {
       throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
     }
-    if (!isSignalAdmissionEvidence(existing)) {
+    const operationKind = input.operationKind ?? 'signal';
+    if (!messageEvidenceMatchesDispatchKind(existing, operationKind)) {
       throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
     }
     if (isTerminalMessageEvidence(existing)) {
@@ -2243,10 +2325,15 @@ export class InMemoryHarness extends HarnessStorage {
     if (!signalDispatchMatches(existing, input.expected)) {
       return { applied: false, evidence: cloneJson(existing) };
     }
-    if (
-      input.expected.state === 'reserved' ||
-      (input.terminal.runId !== undefined && input.terminal.runId !== input.expected.runId)
-    ) {
+    // A reserved signal never dispatched, so it has no run to settle. An
+    // unstamped admitted message row already carries its admitted run id.
+    const runId =
+      input.expected.state === 'reserved'
+        ? operationKind === 'message'
+          ? existing.runId
+          : undefined
+        : input.expected.runId;
+    if (runId === undefined || (input.terminal.runId !== undefined && input.terminal.runId !== runId)) {
       throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
     }
     const terminal: AgentSignalResultEvidence = {
@@ -2257,13 +2344,13 @@ export class InMemoryHarness extends HarnessStorage {
       resourceId: input.resourceId,
       threadId: input.threadId,
       signalId: input.signalId,
-      runId: input.expected.runId,
+      runId,
       admissionId: input.admissionId,
       admissionHash: input.admissionHash,
-      operationKind: 'signal',
+      operationKind,
       modeId: input.terminal.modeId ?? existing.modeId,
       modelId: input.terminal.modelId ?? existing.modelId,
-      dispatch: cloneJson(input.expected),
+      dispatch: operationKind === 'message' ? cloneJson(existing.dispatch) : cloneJson(input.expected),
       createdAt: existing.createdAt,
       updatedAt: input.updatedAt,
     };
@@ -4854,6 +4941,29 @@ function cloneJson<T>(value: T): T {
 
 function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Terminal commits seal completed evidence; a non-completed terminal outcome
+ * (an interrupted orphaned dispatch) may instead seal failed evidence.
+ */
+function terminalEvidenceMatchesResult(evidence: AgentSignalResultEvidence, result: HarnessTerminalResult): boolean {
+  return evidence.status === 'completed' || (evidence.status === 'failed' && result.status !== 'completed');
+}
+
+function isPendingAdmittedMessage(evidence: AgentSignalResultEvidence): boolean {
+  return (
+    evidence.status === 'pending' &&
+    evidence.operationKind === 'message' &&
+    evidence.admissionId !== undefined &&
+    evidence.admissionHash !== undefined
+  );
+}
+
+function pendingMessageDispatchClaim(evidence: AgentSignalResultEvidence, now: number): PendingMessageDispatchClaim {
+  const dispatch = evidence.dispatch;
+  if (dispatch?.state !== 'dispatching') return 'none';
+  return dispatch.claimExpiresAt <= now ? 'expired' : 'live';
 }
 
 function isDueScannablePendingResume(
