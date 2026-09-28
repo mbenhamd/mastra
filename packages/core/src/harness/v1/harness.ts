@@ -5799,11 +5799,25 @@ export class Harness {
 
     const lease = await this._acquireLease(storage, record.harnessName, record.id);
     let latest: SessionRecord | null;
+    // A cold record with pending admitted messages may be resuming a close its
+    // crashed owner started: it is adopted like a queued record (below) so the
+    // orphaned dispatches are interrupted (never re-run) before terminalizing.
+    let hasPendingMessageAdmissions = false;
     try {
       latest = await storage.loadSession({ harnessName: record.harnessName, sessionId: record.id });
       if (!latest) throw new HarnessSessionNotFoundError(record.id);
       if (scope.resourceId !== undefined && latest.resourceId !== scope.resourceId) {
         throw new HarnessSessionNotFoundError(record.id);
+      }
+      if (storage.supportsDispatchRecovery) {
+        const pending = await storage.listPendingMessageAdmissions({
+          harnessName: latest.harnessName,
+          sessionId: latest.id,
+          resourceId: latest.resourceId,
+          threadId: latest.threadId,
+          limit: 1,
+        });
+        hasPendingMessageAdmissions = pending.items.length > 0;
       }
     } catch (err) {
       try {
@@ -5824,12 +5838,20 @@ export class Harness {
       leaseExpiresAt: lease.expiresAt,
       version: lease.version,
     };
-    if ((leasedRecord.pendingQueue?.length ?? 0) > 0) {
+    if ((leasedRecord.pendingQueue?.length ?? 0) > 0 || hasPendingMessageAdmissions) {
       const recovered = this._adoptSession(storage, leasedRecord, {
         emitCreated: false,
         kickQueueDrain: false,
         eventReplaySeed: await this._eventReplaySeedFor(storage, leasedRecord),
       });
+      if (hasPendingMessageAdmissions) {
+        try {
+          await recovered._interruptOrphanedMessageDispatchesOnHydrate();
+        } catch (err) {
+          await this._discardFailedMaterialization(storage, recovered);
+          throw err;
+        }
+      }
       return {
         record: recovered.getRecord(),
         depth,

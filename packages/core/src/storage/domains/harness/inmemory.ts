@@ -397,18 +397,32 @@ export class InMemoryHarness extends HarnessStorage {
     const limit = normalizeDispatchRecoveryScanLimit(input.limit);
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
     const now = Date.now();
-    const sessionsWithPendingAdmission = new Set<string>();
+    // Only rows adoption would interrupt make a session discoverable: claim
+    // not live, run not the parked resume, and no run summary (the run never
+    // reached a terminal). Anything else would be rediscovered on every pass.
+    const interruptibleRunIdsBySession = new Map<string, string[]>();
     for (const evidence of this.db.harnessMessageResultEvidence.values()) {
-      if (evidence.harnessName === namespace && isPendingAdmittedMessage(evidence)) {
-        sessionsWithPendingAdmission.add(evidence.sessionId);
+      if (
+        evidence.harnessName !== namespace ||
+        !isPendingAdmittedMessage(evidence) ||
+        evidence.runId === undefined ||
+        pendingMessageDispatchClaim(evidence, now) === 'live' ||
+        this.db.harnessRunSummaries.has(`${namespace}::${evidence.runId}`)
+      ) {
+        continue;
       }
+      const runIds = interruptibleRunIdsBySession.get(evidence.sessionId) ?? [];
+      runIds.push(evidence.runId);
+      interruptibleRunIdsBySession.set(evidence.sessionId, runIds);
     }
     const recoverable: RecoverableSession[] = [];
     for (const record of this.db.harnessSessions.values()) {
       if (record.harnessName !== namespace || record.closedAt !== undefined) continue;
       if (input.cursor !== undefined && record.id <= input.cursor.sessionId) continue;
       if (record.ownerId !== undefined && record.leaseExpiresAt !== undefined && record.leaseExpiresAt > now) continue;
-      const pendingMessageAdmission = sessionsWithPendingAdmission.has(record.id);
+      const pendingMessageAdmission = (interruptibleRunIdsBySession.get(record.id) ?? []).some(
+        runId => runId !== record.pendingResume?.runId,
+      );
       const pendingQueue = record.pendingQueue.length > 0;
       const closing = record.closingAt !== undefined;
       if (!pendingMessageAdmission && !pendingQueue && !closing) continue;

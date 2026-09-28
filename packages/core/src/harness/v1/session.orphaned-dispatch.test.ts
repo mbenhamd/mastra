@@ -146,6 +146,48 @@ describe('Session adoption — orphaned message dispatch', () => {
     },
   );
 
+  it('finishes a crashed close through closeSession and interrupts its orphaned dispatch', async () => {
+    const db = new InMemoryDB();
+    const deadOwner = await dispatchHeldTurn(db, plainAdmittedMessage);
+    // The owner persisted its closing marker, then died before the close drained.
+    const record = (await deadOwner.storage.loadSession({ sessionId: deadOwner.sessionId }))!;
+    await deadOwner.storage.saveSession(
+      { ...record, closingAt: Date.now(), closeDeadlineAt: Date.now() + 60_000 },
+      { ownerId: deadOwner.harness.ownerId, ifVersion: record.version },
+    );
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+
+    const adopterAgent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
+    const adopter = harnessProcess(db, adopterAgent, false);
+    const events: HarnessEvent[] = [];
+    adopter.harness.subscribe(event => events.push(event));
+    try {
+      const discovered = await adopter.storage.listRecoverableSessions({ limit: 10 });
+      expect(discovered.items).toMatchObject([
+        { sessionId: deadOwner.sessionId, closing: true, pendingMessageAdmission: true },
+      ]);
+
+      // `harness.session()` rejects a closing session; the existing close API
+      // resumes the persisted close under the lease compare-and-set.
+      await adopter.harness.closeSession({ sessionId: deadOwner.sessionId, resourceId: 'u1' });
+
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: 'run_completed', runId: deadOwner.runId, status: 'interrupted' }),
+      );
+      await expect(
+        adopter.storage.loadMessageResultEvidence({ ...deadOwner.scope, signalId: deadOwner.signalId }),
+      ).resolves.toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
+      expect((await adopter.storage.loadSession({ sessionId: deadOwner.sessionId }))?.closedAt).toBeDefined();
+      await expect(adopter.storage.listRecoverableSessions({ limit: 10 })).resolves.toEqual({ items: [] });
+      expect(adopterAgent.streamCalls).toHaveLength(0);
+    } finally {
+      await adopter.harness.shutdown();
+      await stopDeadOwner(deadOwner);
+    }
+  });
+
   it('leaves a dispatch whose claim is still valid untouched', async () => {
     const db = new InMemoryDB();
     const liveOwner = await dispatchHeldTurn(db, terminalHandoffMessage);

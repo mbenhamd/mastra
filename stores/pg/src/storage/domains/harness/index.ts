@@ -230,7 +230,18 @@ const HARNESS_ATTACHMENT_PUT_ABANDONMENT_DELAY_MS = 60_000;
  * against this one clock instead of each caller's wall clock. `now()` is stable
  * for the statement/transaction, so a scan evaluates one instant.
  */
-const PG_STORAGE_NOW_MS = 'floor(extract(epoch FROM now()) * 1000)::bigint';
+export const PG_STORAGE_NOW_MS = 'floor(extract(epoch FROM now()) * 1000)::bigint';
+/**
+ * Dispatch-claim state of a message-result row (alias `m`) on the database
+ * clock. A malformed stamped claim reads as live: recovery must never
+ * interrupt what it cannot date.
+ */
+const PG_MESSAGE_DISPATCH_CLAIM_SQL = `CASE
+    WHEN m.dispatch IS NULL OR m.dispatch->>'state' IS DISTINCT FROM 'dispatching' THEN 'none'
+    WHEN jsonb_typeof(m.dispatch->'claimExpiresAt') IS DISTINCT FROM 'number' THEN 'live'
+    WHEN (m.dispatch->>'claimExpiresAt')::numeric <= ${PG_STORAGE_NOW_MS} THEN 'expired'
+    ELSE 'live'
+  END`;
 type HarnessAttachmentOperationStatus =
   | 'pending'
   | 'uploaded'
@@ -830,6 +841,12 @@ export class HarnessPG extends HarnessStorage {
     return true;
   }
 
+  /** Database-clock epoch milliseconds, for session lease comparisons (see PG_STORAGE_NOW_MS). */
+  async #storageNowMs(client: PgHarnessClient = this.#client): Promise<number> {
+    const result = await client.execute(`SELECT ${PG_STORAGE_NOW_MS} AS now_ms`);
+    return Number(result.rows[0]!.now_ms);
+  }
+
   static getDefaultIndexDefs(schemaPrefix: string) {
     return harnessIndexDefs(schemaPrefix);
   }
@@ -1333,13 +1350,19 @@ export class HarnessPG extends HarnessStorage {
   async listRecoverableSessions(input: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
     const limit = normalizeDispatchRecoveryScanLimit(input.limit);
     await this.#ensureMessageResultsTable();
+    await this.#ensureRunSummariesTable();
     const args: (string | number)[] = [this.#resolveHarnessName(input.harnessName)];
     const cursorCondition = input.cursor !== undefined ? 'AND s.id > ?' : '';
     if (input.cursor !== undefined) args.push(input.cursor.sessionId);
     args.push(limit + 1);
 
     // The lease is compared on the database clock so discovery and the
-    // adopter's lease CAS agree on which sessions have lapsed.
+    // adopter's lease CAS agree on which sessions have lapsed. A pending
+    // admitted message only makes a session discoverable when adoption would
+    // interrupt it: its claim is not live, its run is not the parked
+    // resume, and its run never reached a terminal (no run summary).
+    // Otherwise adoption skips the row and the session would be rediscovered
+    // on every pass.
     const result = await this.#client.execute({
       sql: `SELECT * FROM (
               SELECT s.harness_name, s.id, s.resource_id, s.thread_id,
@@ -1355,6 +1378,13 @@ export class HarnessPG extends HarnessStorage {
                          AND m.operation_kind = 'message'
                          AND m.admission_id IS NOT NULL
                          AND m.admission_hash IS NOT NULL
+                         AND m.run_id IS NOT NULL
+                         AND ${PG_MESSAGE_DISPATCH_CLAIM_SQL} <> 'live'
+                         AND m.run_id IS DISTINCT FROM s.pending_resume->>'runId'
+                         AND NOT EXISTS (
+                           SELECT 1 FROM ${TABLE_HARNESS_RUN_SUMMARIES} r
+                           WHERE r.harness_name = m.harness_name AND r.run_id = m.run_id
+                         )
                      ) AS pending_message_admission
               FROM ${TABLE_HARNESS_SESSIONS} s
               WHERE s.harness_name = ?
@@ -1395,28 +1425,21 @@ export class HarnessPG extends HarnessStorage {
       input.resourceId,
       input.threadId,
     ];
-    const cursorCondition = input.cursor !== undefined ? 'AND signal_id > ?' : '';
+    const cursorCondition = input.cursor !== undefined ? 'AND m.signal_id > ?' : '';
     if (input.cursor !== undefined) args.push(input.cursor.signalId);
     args.push(limit + 1);
 
-    // Claim expiry is evaluated on the database clock. A malformed stamped
-    // claim reads as live: recovery must never interrupt what it cannot date.
+    // Claim expiry is evaluated on the database clock.
     const result = await this.#client.execute({
-      sql: `SELECT *,
-                   CASE
-                     WHEN dispatch IS NULL OR dispatch->>'state' IS DISTINCT FROM 'dispatching' THEN 'none'
-                     WHEN jsonb_typeof(dispatch->'claimExpiresAt') IS DISTINCT FROM 'number' THEN 'live'
-                     WHEN (dispatch->>'claimExpiresAt')::numeric <= ${PG_STORAGE_NOW_MS} THEN 'expired'
-                     ELSE 'live'
-                   END AS dispatch_claim
-            FROM ${TABLE_HARNESS_MESSAGE_RESULTS}
-            WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?
-              AND status = 'pending'
-              AND operation_kind = 'message'
-              AND admission_id IS NOT NULL
-              AND admission_hash IS NOT NULL
+      sql: `SELECT m.*, ${PG_MESSAGE_DISPATCH_CLAIM_SQL} AS dispatch_claim
+            FROM ${TABLE_HARNESS_MESSAGE_RESULTS} m
+            WHERE m.harness_name = ? AND m.session_id = ? AND m.resource_id = ? AND m.thread_id = ?
+              AND m.status = 'pending'
+              AND m.operation_kind = 'message'
+              AND m.admission_id IS NOT NULL
+              AND m.admission_hash IS NOT NULL
               ${cursorCondition}
-            ORDER BY signal_id ASC
+            ORDER BY m.signal_id ASC
             LIMIT ?`,
       args,
     });
@@ -1663,10 +1686,10 @@ export class HarnessPG extends HarnessStorage {
               AND (
                 owner_id IS NULL
                 OR lease_expires_at IS NULL
-                OR lease_expires_at <= ?
+                OR lease_expires_at <= ${PG_STORAGE_NOW_MS}
                 OR owner_id = ?
               )`,
-      args: [...updateValues, harnessName, record.id, opts.ifVersion, Date.now(), opts.ownerId],
+      args: [...updateValues, harnessName, record.id, opts.ifVersion, opts.ownerId],
     });
 
     if (updateResult.rowsAffected === 0) {
@@ -1675,7 +1698,7 @@ export class HarnessPG extends HarnessStorage {
       if (!existing) {
         throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, 0);
       }
-      const now = Date.now();
+      const now = await this.#storageNowMs();
       const leaseHeld =
         existing.ownerId !== undefined &&
         existing.leaseExpiresAt !== undefined &&
@@ -1733,10 +1756,10 @@ export class HarnessPG extends HarnessStorage {
                 AND (
                   owner_id IS NULL
                   OR lease_expires_at IS NULL
-                  OR lease_expires_at <= ?
+                  OR lease_expires_at <= ${PG_STORAGE_NOW_MS}
                   OR owner_id = ?
                 )`,
-        args: [...updateValues, harnessName, record.id, opts.ifVersion, Date.now(), opts.ownerId],
+        args: [...updateValues, harnessName, record.id, opts.ifVersion, opts.ownerId],
       });
 
       if (updateResult.rowsAffected === 0) {
@@ -1850,7 +1873,8 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, 0);
       }
       const existing = rowToSession(existingRow);
-      assertPgSessionLease(existing, opts.ownerId);
+      const leaseNow = await this.#storageNowMs(tx);
+      assertPgSessionLease(existing, opts.ownerId, leaseNow);
       if (existing.version !== opts.ifVersion) {
         throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, existing.version);
       }
@@ -1876,7 +1900,7 @@ export class HarnessPG extends HarnessStorage {
               SET ${updateNames.map(n => `${n} = ?`).join(', ')}
               WHERE harness_name = ? AND id = ? AND version = ?
                 AND (owner_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ? OR owner_id = ?)`,
-        args: [...updateValues, harnessName, record.id, opts.ifVersion, now, opts.ownerId],
+        args: [...updateValues, harnessName, record.id, opts.ifVersion, leaseNow, opts.ownerId],
       });
       if (updateResult.rowsAffected === 0) {
         throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, existing.version);
@@ -1931,7 +1955,8 @@ export class HarnessPG extends HarnessStorage {
       const existingRow = existingResult.rows[0] as Record<string, unknown> | undefined;
       if (!existingRow) throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, 0);
       const existing = rowToSession(existingRow);
-      assertPgSessionLease(existing, opts.ownerId);
+      const leaseNow = await this.#storageNowMs(tx);
+      assertPgSessionLease(existing, opts.ownerId, leaseNow);
       if (existing.version !== opts.ifVersion) {
         throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, existing.version);
       }
@@ -1957,7 +1982,7 @@ export class HarnessPG extends HarnessStorage {
               SET ${updateNames.map(n => `${n} = ?`).join(', ')}
               WHERE harness_name = ? AND id = ? AND version = ?
                 AND (owner_id IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ? OR owner_id = ?)`,
-        args: [...updateValues, harnessName, record.id, opts.ifVersion, now, opts.ownerId],
+        args: [...updateValues, harnessName, record.id, opts.ifVersion, leaseNow, opts.ownerId],
       });
       if (updateResult.rowsAffected === 0)
         throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, existing.version);
@@ -2221,7 +2246,7 @@ export class HarnessPG extends HarnessStorage {
     if (!existing) {
       throw new HarnessStorageVersionConflictError(record.id, opts.ifVersion, 0);
     }
-    const now = Date.now();
+    const now = await this.#storageNowMs();
     const leaseHeld =
       existing.ownerId !== undefined &&
       existing.leaseExpiresAt !== undefined &&
@@ -2242,16 +2267,21 @@ export class HarnessPG extends HarnessStorage {
     if (this.#localThreadDeleteFences.has(record.threadId)) {
       throw new HarnessStorageThreadDeleteFenceConflictError(record.threadId);
     }
-    let storageNow = Date.now();
+    // Thread-delete fences and projection rows keep the app clock they are
+    // stamped with; the session lease (and the returned `storageNow` it is
+    // relative to) uses the database clock, like every other lease operation.
+    let now = Date.now();
+    let leaseNow: number | undefined;
     const tx = await this.#client.transaction('write');
     try {
       await this.#lockThreadDeleteFence(tx, record.threadId);
-      storageNow = Date.now();
+      now = Date.now();
+      leaseNow = await this.#storageNowMs(tx);
       const fence = await tx.execute({
         sql: `SELECT thread_id FROM ${TABLE_HARNESS_THREAD_DELETE_FENCES}
               WHERE thread_id = ? AND expires_at > ?
               LIMIT 1`,
-        args: [record.threadId, storageNow],
+        args: [record.threadId, now],
       });
       if (fence.rows[0]) {
         throw new HarnessStorageThreadDeleteFenceConflictError(record.threadId);
@@ -2304,7 +2334,7 @@ export class HarnessPG extends HarnessStorage {
           leaseAcquired: false,
           version: existing.version,
           expiresAt: existing.leaseExpiresAt,
-          storageNow,
+          storageNow: leaseNow,
         };
       }
 
@@ -2346,7 +2376,7 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessStorageVersionConflictError(record.id, 0, Number(existingById.rows[0]!.version));
       }
 
-      const expiresAt = storageNow + opts.initialLease.ttlMs;
+      const expiresAt = leaseNow + opts.initialLease.ttlMs;
       const sessionIncarnation =
         this.sessionRecordProjection.enabled || this.#attachmentByteOwner !== undefined || this.terminalHandoff.enabled
           ? randomUUID()
@@ -2371,14 +2401,14 @@ export class HarnessPG extends HarnessStorage {
       // pipeline, so writing them while it is disabled would consume quota
       // that is never released.
       if (sessionIncarnation !== undefined && this.sessionRecordProjection.enabled) {
-        const intent = this.#buildProjectionIntent(namespacedRecord, sessionIncarnation, 1, storageNow);
+        const intent = this.#buildProjectionIntent(namespacedRecord, sessionIncarnation, 1, now);
         await this.#upsertProjectionFenceTx(
           tx,
           projectHarnessSessionRecordProjectionFence(namespacedRecord, {
             sessionIncarnation,
             state: 'active',
             revision: 1,
-            updatedAt: storageNow,
+            updatedAt: now,
           }),
         );
         await this.#insertProjectionIntentTx(tx, intent);
@@ -2392,7 +2422,7 @@ export class HarnessPG extends HarnessStorage {
         leaseAcquired: true,
         version: 1,
         expiresAt,
-        storageNow,
+        storageNow: leaseNow,
       };
     } catch (err) {
       if (!tx.closed) await tx.rollback();
@@ -2423,7 +2453,7 @@ export class HarnessPG extends HarnessStorage {
             leaseAcquired: false,
             version: active.version,
             expiresAt: active.leaseExpiresAt,
-            storageNow,
+            storageNow: leaseNow ?? (await this.#storageNowMs()),
           };
         }
         const existingById = await this.loadSession({ harnessName, sessionId: record.id });
@@ -6316,7 +6346,8 @@ export class HarnessPG extends HarnessStorage {
   async #assertPlanTaskFence(tx: PgHarnessClient, fence: PlanTaskSessionFence): Promise<string> {
     const namespace = this.#resolveHarnessName(fence.harnessName);
     const res = await tx.execute({
-      sql: `SELECT version, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+      sql: `SELECT version, owner_id, lease_expires_at, ${PG_STORAGE_NOW_MS} AS storage_now_ms
+            FROM ${TABLE_HARNESS_SESSIONS}
             WHERE harness_name = ? AND id = ?
             FOR UPDATE`,
       args: [namespace, fence.sessionId],
@@ -6325,7 +6356,7 @@ export class HarnessPG extends HarnessStorage {
     if (!row) throw new HarnessStorageSessionNotFoundError(fence.sessionId);
     const ownerId = (row.owner_id ?? undefined) as string | undefined;
     const leaseExpiresAt = row.lease_expires_at == null ? undefined : Number(row.lease_expires_at);
-    const now = Date.now();
+    const now = Number(row.storage_now_ms);
     // Plan-task writes require this exact owner to hold a live lease. An
     // expired/released lease is no authority for a stale session object.
     const leaseHeld = ownerId !== undefined && leaseExpiresAt !== undefined && leaseExpiresAt > now;
@@ -10738,8 +10769,7 @@ function requirePgProjectionIncarnation(record: SessionRecord): string {
   return record.sessionIncarnation;
 }
 
-function assertPgSessionLease(record: SessionRecord, ownerId: string): void {
-  const now = Date.now();
+function assertPgSessionLease(record: SessionRecord, ownerId: string, now: number): void {
   const leaseHeld =
     record.ownerId !== undefined &&
     record.leaseExpiresAt !== undefined &&

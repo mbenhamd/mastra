@@ -51,7 +51,7 @@ import type {
 import { parseSqlIdentifier } from '@mastra/core/utils';
 import type { DbClient, TxClient } from './client';
 import { getSchemaName, getTableName } from './db';
-import { rowToSession } from './domains/harness';
+import { PG_STORAGE_NOW_MS, rowToSession } from './domains/harness';
 import { parseJsonResilient } from './domains/utils';
 
 export interface ExportExecutionClosureOptions {
@@ -1152,6 +1152,10 @@ export async function exportExecutionClosure(
     // worker already mid-write — so the closure pins instead of silently
     // split-braining the session.
     const exportObservedAt = Date.now();
+    // Session leases are stamped on the database clock; judge them on it too.
+    const leaseObservedAt = Number(
+      (await t.one<{ now_ms: string | number }>(`SELECT ${PG_STORAGE_NOW_MS} AS now_ms`)).now_ms,
+    );
     for (const row of sessionRows) {
       // A row still stamped with the tombstone owner was already handed off
       // by an earlier `complete` export: re-exporting it as `complete` would
@@ -1172,7 +1176,7 @@ export async function exportExecutionClosure(
         row.owner_id.length > 0 &&
         row.lease_expires_at != null &&
         Number.isFinite(leaseExpiresAt) &&
-        leaseExpiresAt > exportObservedAt;
+        leaseExpiresAt > leaseObservedAt;
       if (leaseActive) {
         pins.push({
           reason: 'session-lease-active',

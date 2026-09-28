@@ -82,6 +82,30 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     const orphanEvidence = pendingMessage(orphan, 'orphan');
     await harness().writeMessageResultEvidence(orphanEvidence);
     await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: orphan.id, ownerId: 'owner-dead' });
+    // Its only pending row belongs to a run that already reached a terminal:
+    // adoption skips it, so discovery must not return it at all.
+    const summarized = await createSession(harness(), 'summarized', 'owner-done');
+    const summarizedEvidence = pendingMessage(summarized, 'summarized');
+    await harness().writeMessageResultEvidence(summarizedEvidence);
+    await harness().saveRunSummary({
+      summary: {
+        harnessName: HARNESS,
+        runId: summarizedEvidence.runId!,
+        sessionId: summarized.id,
+        resourceId: summarized.resourceId,
+        threadId: summarized.threadId,
+        agentId: 'agent',
+        modeId: 'default',
+        modelId: 'model',
+        status: 'completed',
+        finishReason: 'complete',
+        reconstructed: false,
+        completedAt: Date.now(),
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        createdAt: Date.now(),
+      },
+    });
+    await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: summarized.id, ownerId: 'owner-done' });
 
     // A caller whose wall clock runs ten minutes ahead must not see the live
     // lease as lapsed: discovery and the lease CAS read the database clock.
@@ -102,6 +126,12 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     });
     await expect(
       harness().acquireSessionLease({ harnessName: HARNESS, sessionId: live.id, ownerId: 'adopter', ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    await expect(
+      harness().saveSession(
+        { ...live, lastActivityAt: live.lastActivityAt + 1 },
+        { harnessName: HARNESS, ownerId: 'adopter', ifVersion: live.version },
+      ),
     ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
     vi.restoreAllMocks();
 
@@ -138,6 +168,18 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     await expect(harness().listRecoverableSessions({ harnessName: HARNESS, limit: 10 })).resolves.toEqual({
       items: [],
     });
+
+    // An adoption pass over the summarized session leaves its row pending (it
+    // is not relabelled) and the session is still not rediscovered.
+    await harness().acquireSessionLease({
+      harnessName: HARNESS,
+      sessionId: summarized.id,
+      ownerId: 'adopter',
+      ttlMs: 60_000,
+    });
+    await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: summarized.id, ownerId: 'adopter' });
+    const rediscovered = await harness().listRecoverableSessions({ harnessName: HARNESS, limit: 10 });
+    expect(rediscovered.items.map(item => item.sessionId)).not.toContain(summarized.id);
   });
 
   it('commits an aborted terminal intent over failed evidence and leaves a live claim untouched', async () => {

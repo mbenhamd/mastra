@@ -1877,19 +1877,30 @@ export interface ListRecoverableSessionsInput {
 
 /**
  * An open session whose lease has lapsed by the storage clock while durable
- * work is still pending. Discovery evidence only: a recovery worker adopts it
- * through `harness.session()`, whose lease compare-and-set is the reservation.
+ * work that recovery can advance is still pending. Discovery evidence only: a
+ * recovery worker adopts an open session through `harness.session()`, or
+ * finishes a `closing` one through `harness.closeSession()`; in both the lease
+ * compare-and-set is the reservation. Pending rows adoption would skip (a live
+ * dispatch claim, a parked resume, a run that already reached a terminal) do
+ * not make a session discoverable, so a worker never loops on them.
  */
 export interface RecoverableSession {
   harnessName: string;
   sessionId: string;
   resourceId: string;
   threadId: string;
-  /** An admitted `message()` result row is still pending. */
+  /**
+   * An admitted `message()` result row is pending with no live dispatch
+   * claim, is not the parked resume, and its run has no durable run summary:
+   * adoption (or a resumed close) interrupts it.
+   */
   pendingMessageAdmission: boolean;
   /** The durable queue still holds items. */
   pendingQueue: boolean;
-  /** A close started and never finished. */
+  /**
+   * A close started and never finished. `harness.session()` rejects closing
+   * sessions; `harness.closeSession()` resumes the persisted close.
+   */
   closing: boolean;
 }
 
