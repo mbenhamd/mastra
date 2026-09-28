@@ -7,11 +7,12 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { HarnessTerminalFinalizer } from '../../storage/domains/harness';
+import type { AgentSignalResultEvidence, HarnessTerminalFinalizer } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { MockAgent } from './__test-utils__/mock-agent';
+import { HarnessSessionLockedError } from './errors';
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 
@@ -53,7 +54,12 @@ const terminalHandoffMessage: DispatchShape = {
 };
 
 /** One Harness process over the shared durable store. */
-function harnessProcess(db: InMemoryDB, agent: MockAgent, terminal: boolean) {
+function harnessProcess(
+  db: InMemoryDB,
+  agent: MockAgent,
+  terminal: boolean,
+  terminalFinalizer: HarnessTerminalFinalizer = finalizer,
+) {
   const storage = new InMemoryHarness({
     db,
     ...(terminal ? { terminalHandoff: { enabled: true }, sessionRecordProjection: { enabled: true } } : {}),
@@ -62,7 +68,7 @@ function harnessProcess(db: InMemoryDB, agent: MockAgent, terminal: boolean) {
     agents: { default: agent } as any,
     modes: [{ id: 'default', agentId: 'default' }],
     defaultModeId: 'default',
-    sessions: { storage, ...(terminal ? { terminalHandoff: { finalizer } } : {}) },
+    sessions: { storage, ...(terminal ? { terminalHandoff: { finalizer: terminalFinalizer } } : {}) },
   });
   return { harness, storage };
 }
@@ -77,7 +83,7 @@ async function dispatchHeldTurn(db: InMemoryDB, shape: DispatchShape) {
   const stream = (await session.message({ ...shape.message, stream: true } as never)) as { runId: string };
   expect(agent.streamCalls).toHaveLength(1);
   const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
-  const pending = await owner.storage.listPendingMessageAdmissions({ ...scope, limit: 10 });
+  const pending = await owner.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
   expect(pending.items).toHaveLength(1);
   const signalId = pending.items[0]!.evidence.signalId;
   return { ...owner, agent, scope, sessionId: session.id, runId: stream.runId, signalId, release };
@@ -146,32 +152,38 @@ describe('Session adoption — orphaned message dispatch', () => {
     },
   );
 
-  it('finishes a crashed close through closeSession and interrupts its orphaned dispatch', async () => {
+  it('refuses to close while a dispatch claim is live, then finishes the crashed close', async () => {
     const db = new InMemoryDB();
-    const deadOwner = await dispatchHeldTurn(db, plainAdmittedMessage);
-    // The owner persisted its closing marker, then died before the close drained.
+    const deadOwner = await dispatchHeldTurn(db, terminalHandoffMessage);
+    // The owner persisted its closing marker, then died before the close
+    // drained; its session lease lapses before its dispatch claim does.
     const record = (await deadOwner.storage.loadSession({ sessionId: deadOwner.sessionId }))!;
     await deadOwner.storage.saveSession(
       { ...record, closingAt: Date.now(), closeDeadlineAt: Date.now() + 60_000 },
       { ownerId: deadOwner.harness.ownerId, ifVersion: record.version },
     );
-
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+    await deadOwner.storage.releaseSessionLease({ sessionId: deadOwner.sessionId, ownerId: deadOwner.harness.ownerId });
 
     const adopterAgent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
-    const adopter = harnessProcess(db, adopterAgent, false);
+    const adopter = harnessProcess(db, adopterAgent, true);
     const events: HarnessEvent[] = [];
     adopter.harness.subscribe(event => events.push(event));
+    const target = { sessionId: deadOwner.sessionId, resourceId: 'u1' };
     try {
-      const discovered = await adopter.storage.listRecoverableSessions({ limit: 10 });
-      expect(discovered.items).toMatchObject([
-        { sessionId: deadOwner.sessionId, closing: true, pendingMessageAdmission: true },
-      ]);
-
       // `harness.session()` rejects a closing session; the existing close API
-      // resumes the persisted close under the lease compare-and-set.
-      await adopter.harness.closeSession({ sessionId: deadOwner.sessionId, resourceId: 'u1' });
+      // resumes the persisted close, but not over a dispatch it cannot settle.
+      await expect(adopter.harness.closeSession(target)).rejects.toBeInstanceOf(HarnessSessionLockedError);
+      expect((await adopter.storage.loadSession({ sessionId: deadOwner.sessionId }))?.closedAt).toBeUndefined();
+      await expect(adopter.storage.listRecoverableSessions({ now: Date.now(), limit: 10 })).resolves.toMatchObject({
+        items: [{ sessionId: deadOwner.sessionId, closing: true, pendingMessageAdmission: false }],
+      });
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+      await expect(adopter.storage.listRecoverableSessions({ now: Date.now(), limit: 10 })).resolves.toMatchObject({
+        items: [{ sessionId: deadOwner.sessionId, closing: true, pendingMessageAdmission: true }],
+      });
+      await adopter.harness.closeSession(target);
 
       expect(events).toContainEqual(
         expect.objectContaining({ type: 'run_completed', runId: deadOwner.runId, status: 'interrupted' }),
@@ -180,7 +192,150 @@ describe('Session adoption — orphaned message dispatch', () => {
         adopter.storage.loadMessageResultEvidence({ ...deadOwner.scope, signalId: deadOwner.signalId }),
       ).resolves.toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
       expect((await adopter.storage.loadSession({ sessionId: deadOwner.sessionId }))?.closedAt).toBeDefined();
-      await expect(adopter.storage.listRecoverableSessions({ limit: 10 })).resolves.toEqual({ items: [] });
+      await expect(adopter.storage.listRecoverableSessions({ now: Date.now(), limit: 10 })).resolves.toEqual({
+        items: [],
+      });
+      expect(adopterAgent.streamCalls).toHaveLength(0);
+    } finally {
+      await adopter.harness.shutdown();
+      await stopDeadOwner(deadOwner);
+    }
+  });
+
+  it('settles a pending admission whose run already has a summary without re-running the provider', async () => {
+    const db = new InMemoryDB();
+    const deadOwner = await dispatchHeldTurn(db, plainAdmittedMessage);
+    // A summary proves only that a terminal was reported, not that it settled.
+    await deadOwner.storage.saveRunSummary({
+      summary: {
+        harnessName: 'default',
+        runId: deadOwner.runId,
+        sessionId: deadOwner.sessionId,
+        resourceId: 'u1',
+        threadId: deadOwner.scope.threadId,
+        agentId: 'default',
+        modeId: 'default',
+        modelId: 'model',
+        status: 'failed',
+        finishReason: 'error',
+        reconstructed: false,
+        completedAt: Date.now(),
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        createdAt: Date.now(),
+      },
+    });
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+
+    const adopterAgent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
+    const adopter = harnessProcess(db, adopterAgent, false);
+    try {
+      await adopter.harness.session({ sessionId: deadOwner.sessionId, resourceId: 'u1' });
+
+      await expect(
+        adopter.storage.loadMessageResultEvidence({ ...deadOwner.scope, signalId: deadOwner.signalId }),
+      ).resolves.toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
+      expect(adopterAgent.streamCalls).toHaveLength(0);
+    } finally {
+      await adopter.harness.shutdown();
+      await stopDeadOwner(deadOwner);
+    }
+  });
+
+  it.each([
+    { shape: plainAdmittedMessage, method: 'compareAndSwapSignalTerminal' as const },
+    { shape: terminalHandoffMessage, method: 'commitTerminalHandoff' as const },
+  ])(
+    'publishes the interrupted completion on a later adoption when the settlement acknowledgement is lost: $shape.name',
+    async ({ shape, method }) => {
+      const db = new InMemoryDB();
+      const deadOwner = await dispatchHeldTurn(db, shape);
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+
+      const adopterAgent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
+      const adopter = harnessProcess(db, adopterAgent, shape.terminal);
+      // The settlement commits, but its acknowledgement never reaches the adopter.
+      const settle = (adopter.storage[method] as (input: unknown) => Promise<unknown>).bind(adopter.storage);
+      let acknowledgementLost = false;
+      (adopter.storage as unknown as Record<string, unknown>)[method] = async (input: unknown) => {
+        const settled = await settle(input);
+        if (acknowledgementLost) return settled;
+        acknowledgementLost = true;
+        throw new Error('settlement acknowledgement lost');
+      };
+      const events: HarnessEvent[] = [];
+      adopter.harness.subscribe(event => events.push(event));
+      const target = { sessionId: deadOwner.sessionId, resourceId: 'u1' };
+      try {
+        await expect(adopter.harness.session(target)).rejects.toThrow();
+        await expect(
+          adopter.storage.loadMessageResultEvidence({ ...deadOwner.scope, signalId: deadOwner.signalId }),
+        ).resolves.toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
+
+        await adopter.harness.session(target);
+
+        const completions = events.filter(event => event.type === 'run_completed' && event.runId === deadOwner.runId);
+        expect(completions).toEqual([expect.objectContaining({ status: 'interrupted', reconstructed: true })]);
+        await expect(adopter.storage.loadRunSummary({ runId: deadOwner.runId })).resolves.toMatchObject({
+          status: 'interrupted',
+        });
+        expect(adopterAgent.streamCalls).toHaveLength(0);
+      } finally {
+        await adopter.harness.shutdown();
+        await stopDeadOwner(deadOwner);
+      }
+    },
+  );
+
+  it('does not interrupt a dispatch that a zombie owner re-claims while the finalizer runs', async () => {
+    const db = new InMemoryDB();
+    const deadOwner = await dispatchHeldTurn(db, terminalHandoffMessage);
+    const observed = (await deadOwner.storage.loadMessageResultEvidence({
+      ...deadOwner.scope,
+      signalId: deadOwner.signalId,
+    })) as AgentSignalResultEvidence;
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+
+    const zombieReclaimingFinalizer: HarnessTerminalFinalizer = {
+      ...finalizer,
+      finalize: async input => {
+        // The stalled owner resumes and stamps a fresh claim before the
+        // adopter's interrupted settlement commits.
+        await deadOwner.storage.compareAndSwapSignalDispatch({
+          ...deadOwner.scope,
+          signalId: deadOwner.signalId,
+          admissionId: observed.admissionId!,
+          admissionHash: observed.admissionHash!,
+          operationKind: 'message',
+          expected: observed.dispatch!,
+          next: { ...observed.dispatch!, attemptId: 'zombie-attempt', claimExpiresAt: Date.now() + 30_000 } as never,
+          updatedAt: Date.now(),
+        });
+        return finalizer.finalize(input);
+      },
+    };
+    const adopterAgent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
+    const adopter = harnessProcess(db, adopterAgent, true, zombieReclaimingFinalizer);
+    const events: HarnessEvent[] = [];
+    adopter.harness.subscribe(event => events.push(event));
+    try {
+      await adopter.harness.session({ sessionId: deadOwner.sessionId, resourceId: 'u1' });
+
+      expect(events).not.toContainEqual(expect.objectContaining({ type: 'run_completed', runId: deadOwner.runId }));
+      await expect(
+        adopter.storage.loadMessageResultEvidence({ ...deadOwner.scope, signalId: deadOwner.signalId }),
+      ).resolves.toMatchObject({ status: 'pending', dispatch: { attemptId: 'zombie-attempt' } });
+      await expect(
+        adopter.storage.loadTerminalAdmission({
+          harnessName: 'default',
+          sessionId: deadOwner.sessionId,
+          admissionId: 'orphaned-turn',
+          executionGrant: grant,
+        }),
+      ).resolves.toMatchObject({ status: 'pending' });
       expect(adopterAgent.streamCalls).toHaveLength(0);
     } finally {
       await adopter.harness.shutdown();

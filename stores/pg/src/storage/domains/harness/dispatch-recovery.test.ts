@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
-import {
-  HarnessStorageLeaseConflictError,
-  type AgentSignalResultEvidence,
-  type HarnessStorage,
-  type SessionRecord,
+import type {
+  AgentSignalDispatchState,
+  AgentSignalResultEvidence,
+  HarnessRunSummary,
+  HarnessStorage,
+  SessionRecord,
 } from '@mastra/core/storage';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -17,16 +18,41 @@ vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 const HARNESS = 'default';
 const INTERRUPTED = { code: 'harness.run_interrupted', message: 'interrupted on adoption' };
 
-async function createSession(harness: HarnessStorage, id: string, ownerId: string): Promise<SessionRecord> {
+async function createSession(
+  harness: HarnessStorage,
+  id: string,
+  ownerId: string,
+  overrides: Partial<SessionRecord> = {},
+): Promise<SessionRecord> {
   const record = createSampleSessionRecord({
     id,
     harnessName: HARNESS,
     resourceId: `resource-${id}`,
     threadId: `thread-${id}`,
+    ...overrides,
   });
   const result = await harness.createOrLoadActiveSession(record, { initialLease: { ownerId, ttlMs: 60_000 } });
   if (!result.created) throw new Error(`expected a fresh session for ${id}`);
   return (await harness.loadSession({ harnessName: HARNESS, sessionId: id }))!;
+}
+
+function runSummary(session: SessionRecord, runId: string, status: HarnessRunSummary['status']): HarnessRunSummary {
+  return {
+    harnessName: HARNESS,
+    runId,
+    sessionId: session.id,
+    resourceId: session.resourceId,
+    threadId: session.threadId,
+    agentId: 'agent',
+    modeId: 'default',
+    modelId: 'model',
+    status,
+    finishReason: status === 'failed' ? 'error' : 'aborted',
+    reconstructed: true,
+    completedAt: Date.now(),
+    usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    createdAt: Date.now(),
+  };
 }
 
 function pendingMessage(session: SessionRecord, tag: string): AgentSignalResultEvidence {
@@ -75,88 +101,72 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     await store.close();
   });
 
-  it('discovers a lapsed session by the database clock and settles its orphaned message as interrupted', async () => {
+  it('discovers lapsed sessions by the caller clock and settles and publishes orphaned messages', async () => {
     const live = await createSession(harness(), 'live-owner', 'owner-live');
     const orphan = await createSession(harness(), 'orphaned', 'owner-dead');
     await harness().writeMessageResultEvidence(pendingMessage(live, 'live'));
     const orphanEvidence = pendingMessage(orphan, 'orphan');
     await harness().writeMessageResultEvidence(orphanEvidence);
     await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: orphan.id, ownerId: 'owner-dead' });
-    // Its only pending row belongs to a run that already reached a terminal:
-    // adoption skips it, so discovery must not return it at all.
+    // A run summary does not prove the admission settled: still recoverable.
     const summarized = await createSession(harness(), 'summarized', 'owner-done');
     const summarizedEvidence = pendingMessage(summarized, 'summarized');
     await harness().writeMessageResultEvidence(summarizedEvidence);
-    await harness().saveRunSummary({
-      summary: {
-        harnessName: HARNESS,
-        runId: summarizedEvidence.runId!,
-        sessionId: summarized.id,
-        resourceId: summarized.resourceId,
-        threadId: summarized.threadId,
-        agentId: 'agent',
-        modeId: 'default',
-        modelId: 'model',
-        status: 'completed',
-        finishReason: 'complete',
-        reconstructed: false,
-        completedAt: Date.now(),
-        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
-        createdAt: Date.now(),
+    await harness().saveRunSummary({ summary: runSummary(summarized, summarizedEvidence.runId!, 'failed') });
+    await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: summarized.id, ownerId: 'owner-done' });
+    // A queue parked behind an unexpired approval wait cannot be advanced.
+    const blocked = await createSession(harness(), 'blocked-queue', 'owner-blocked', {
+      pendingQueue: [{ id: 'queued-1', enqueuedAt: Date.now(), content: 'later', attachments: [] }],
+      pendingResume: {
+        kind: 'tool-approval',
+        itemId: 'approval-1',
+        runId: 'run-blocked',
+        toolCallId: 'tool-call-1',
+        source: 'parent',
+        requestedAt: Date.now(),
+        expiresAt: Date.now() + 60 * 60_000,
       },
     });
-    await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: summarized.id, ownerId: 'owner-done' });
+    await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: blocked.id, ownerId: 'owner-blocked' });
 
-    // A caller whose wall clock runs ten minutes ahead must not see the live
-    // lease as lapsed: discovery and the lease CAS read the database clock.
     const realNow = Date.now();
-    vi.spyOn(Date, 'now').mockReturnValue(realNow + 10 * 60_000);
-    await expect(harness().listRecoverableSessions({ harnessName: HARNESS, limit: 10 })).resolves.toEqual({
-      items: [
-        {
-          harnessName: HARNESS,
-          sessionId: orphan.id,
-          resourceId: orphan.resourceId,
-          threadId: orphan.threadId,
-          pendingMessageAdmission: true,
-          pendingQueue: false,
-          closing: false,
-        },
-      ],
-    });
-    await expect(
-      harness().acquireSessionLease({ harnessName: HARNESS, sessionId: live.id, ownerId: 'adopter', ttlMs: 60_000 }),
-    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
-    await expect(
-      harness().saveSession(
-        { ...live, lastActivityAt: live.lastActivityAt + 1 },
-        { harnessName: HARNESS, ownerId: 'adopter', ifVersion: live.version },
-      ),
-    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
-    vi.restoreAllMocks();
+    const listed = (now: number) =>
+      harness()
+        .listRecoverableSessions({ harnessName: HARNESS, now, limit: 10 })
+        .then(page => page.items.map(item => item.sessionId));
+    await expect(listed(realNow)).resolves.toEqual([orphan.id, summarized.id]);
+    // Leases and claims are judged by the caller's clock, like `_flushUpdate`.
+    await expect(listed(realNow + 10 * 60_000)).resolves.toEqual([live.id, orphan.id, summarized.id]);
 
+    // Lease expiries are stamped on the caller's clock too.
+    vi.spyOn(Date, 'now').mockReturnValue(realNow + 10 * 60_000);
     const scope = {
       harnessName: HARNESS,
       sessionId: orphan.id,
       resourceId: orphan.resourceId,
       threadId: orphan.threadId,
     };
-    const pending = await harness().listPendingMessageAdmissions({ ...scope, limit: 10 });
-    expect(pending.items).toMatchObject([{ evidence: { signalId: orphanEvidence.signalId }, dispatchClaim: 'none' }]);
-
     const lease = await harness().acquireSessionLease({ ...scope, ownerId: 'adopter', ttlMs: 60_000 });
-    expect(lease.expiresAt).toBeGreaterThan(realNow);
-    const settled = await harness().compareAndSwapSignalTerminal({
-      ...scope,
-      signalId: orphanEvidence.signalId,
-      admissionId: orphanEvidence.admissionId!,
-      admissionHash: orphanEvidence.admissionHash!,
-      operationKind: 'message',
-      expected: { state: 'reserved' },
-      terminal: { status: 'failed', signalId: orphanEvidence.signalId, error: INTERRUPTED },
-      updatedAt: Date.now(),
-    });
-    expect(settled.applied).toBe(true);
+    expect(lease.expiresAt).toBe(realNow + 10 * 60_000 + 60_000);
+    vi.restoreAllMocks();
+
+    const pending = await harness().listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
+    expect(pending.items).toMatchObject([{ evidence: { signalId: orphanEvidence.signalId }, dispatchClaim: 'none' }]);
+    const settle = (ownerId: string) =>
+      harness().compareAndSwapSignalTerminal({
+        ...scope,
+        signalId: orphanEvidence.signalId,
+        admissionId: orphanEvidence.admissionId!,
+        admissionHash: orphanEvidence.admissionHash!,
+        operationKind: 'message',
+        expected: { state: 'reserved' },
+        terminal: { status: 'failed', signalId: orphanEvidence.signalId, error: INTERRUPTED },
+        leaseOwner: { ownerId, now: Date.now() },
+        updatedAt: Date.now(),
+      });
+    // Settlement is fenced by the recovering owner's lease.
+    await expect(settle('not-the-owner')).resolves.toMatchObject({ applied: false });
+    await expect(settle('adopter')).resolves.toMatchObject({ applied: true });
     await expect(
       harness().loadMessageResultEvidence({ ...scope, signalId: orphanEvidence.signalId }),
     ).resolves.toMatchObject({
@@ -165,21 +175,17 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       operationKind: 'message',
       error: INTERRUPTED,
     });
-    await expect(harness().listRecoverableSessions({ harnessName: HARNESS, limit: 10 })).resolves.toEqual({
+
+    // The settled row stays recoverable until its completion is published.
+    const unpublished = await harness().listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
+    expect(unpublished.items).toMatchObject([{ evidence: { signalId: orphanEvidence.signalId, status: 'failed' } }]);
+    await harness().releaseSessionLease({ ...scope, ownerId: 'adopter' });
+    await expect(listed(Date.now())).resolves.toContain(orphan.id);
+    await harness().saveRunSummary({ summary: runSummary(orphan, orphanEvidence.runId!, 'interrupted') });
+    await expect(harness().listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 })).resolves.toEqual({
       items: [],
     });
-
-    // An adoption pass over the summarized session leaves its row pending (it
-    // is not relabelled) and the session is still not rediscovered.
-    await harness().acquireSessionLease({
-      harnessName: HARNESS,
-      sessionId: summarized.id,
-      ownerId: 'adopter',
-      ttlMs: 60_000,
-    });
-    await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: summarized.id, ownerId: 'adopter' });
-    const rediscovered = await harness().listRecoverableSessions({ harnessName: HARNESS, limit: 10 });
-    expect(rediscovered.items.map(item => item.sessionId)).not.toContain(summarized.id);
+    await expect(listed(Date.now())).resolves.toEqual([summarized.id]);
   });
 
   it('commits an aborted terminal intent over failed evidence and leaves a live claim untouched', async () => {
@@ -228,10 +234,19 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     const expired = await stamp('expired', Date.now() - 1_000);
     await stamp('live', Date.now() + 60_000);
 
-    const pending = await harness().listPendingMessageAdmissions({ ...scope, limit: 10 });
-    expect(pending.items.map(item => [item.evidence.signalId, item.dispatchClaim])).toEqual([
+    const claims = (now: number) =>
+      harness()
+        .listPendingMessageAdmissions({ ...scope, now, limit: 10 })
+        .then(page => page.items.map(item => [item.evidence.signalId, item.dispatchClaim]));
+    await expect(claims(Date.now())).resolves.toEqual([
       ['signal-expired', 'expired'],
       ['signal-live', 'live'],
+    ]);
+    // Claims are stamped by `Session.message()` on the caller clock; the
+    // caller's `now` decides their expiry.
+    await expect(claims(Date.now() + 120_000)).resolves.toEqual([
+      ['signal-expired', 'expired'],
+      ['signal-live', 'expired'],
     ]);
 
     const terminalResult = {
@@ -240,26 +255,35 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       completedAt: Date.now(),
       error: INTERRUPTED,
     };
-    const receipt = await harness().commitTerminalHandoff({
-      admission: expired.admission,
-      resultEvidence: {
-        ...expired.evidence,
-        status: 'failed',
-        error: INTERRUPTED,
-        dispatch: expired.dispatch,
-        updatedAt: Date.now(),
-      },
-      terminalResult,
-      projection: { projectionKind: 'chat.summary', projectionId: 'interrupted', payload: { status: 'aborted' } },
-    });
+    const commitInterrupted = (expectedDispatch: AgentSignalDispatchState | null) =>
+      harness().commitTerminalHandoff({
+        admission: expired.admission,
+        resultEvidence: {
+          ...expired.evidence,
+          status: 'failed',
+          error: INTERRUPTED,
+          dispatch: expired.dispatch,
+          updatedAt: Date.now(),
+        },
+        terminalResult,
+        projection: { projectionKind: 'chat.summary', projectionId: 'interrupted', payload: { status: 'aborted' } },
+        recovery: { expectedDispatch, leaseOwner: { ownerId: 'owner-dead', now: Date.now() } },
+      });
+    // A dispatch that changed since recovery observed it is never overwritten.
+    await expect(commitInterrupted(null)).resolves.toMatchObject({ status: 'conflict' });
+    await expect(
+      harness().loadMessageResultEvidence({ ...scope, signalId: expired.evidence.signalId }),
+    ).resolves.toMatchObject({ status: 'pending', dispatch: expired.dispatch });
+    const receipt = await commitInterrupted(expired.dispatch);
     expect(receipt.status).toBe('committed');
     expect(receipt.intent?.terminalResult).toEqual(terminalResult);
     await expect(
       harness().loadMessageResultEvidence({ ...scope, signalId: expired.evidence.signalId }),
     ).resolves.toMatchObject({ status: 'failed', error: INTERRUPTED });
-    const remaining = await harness().listPendingMessageAdmissions({ ...scope, limit: 10 });
-    expect(remaining.items.map(item => [item.evidence.signalId, item.dispatchClaim])).toEqual([
-      ['signal-live', 'live'],
+    const remaining = await harness().listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
+    expect(remaining.items.map(item => [item.evidence.signalId, item.evidence.status, item.dispatchClaim])).toEqual([
+      ['signal-expired', 'failed', 'none'],
+      ['signal-live', 'pending', 'live'],
     ]);
   });
 });

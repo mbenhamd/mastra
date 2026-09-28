@@ -31,7 +31,8 @@ import {
   HarnessStorageVersionConflictError,
   HarnessStorageWakeupClaimConflictError,
   HarnessStorageWakeupTransitionError,
-  normalizeDispatchRecoveryScanLimit,
+  HARNESS_RUN_INTERRUPTED_ERROR_CODE,
+  normalizeDispatchRecoveryScanInput,
   normalizePendingInteractionDueScanInput,
 } from './base';
 import type {
@@ -39,6 +40,7 @@ import type {
   CompareAndSwapSignalDispatchResult,
   CompareAndSwapSignalTerminalInput,
   CompareAndSwapSignalTerminalResult,
+  HarnessTerminalRecoveryPrecondition,
   WriteMessageResultEvidenceResult,
 } from './base';
 import {
@@ -394,36 +396,22 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   async listRecoverableSessions(input: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
-    const limit = normalizeDispatchRecoveryScanLimit(input.limit);
+    const { now, limit } = normalizeDispatchRecoveryScanInput(input);
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
-    const now = Date.now();
-    // Only rows adoption would interrupt make a session discoverable: claim
-    // not live, run not the parked resume, and no run summary (the run never
-    // reached a terminal). Anything else would be rediscovered on every pass.
-    const interruptibleRunIdsBySession = new Map<string, string[]>();
-    for (const evidence of this.db.harnessMessageResultEvidence.values()) {
-      if (
-        evidence.harnessName !== namespace ||
-        !isPendingAdmittedMessage(evidence) ||
-        evidence.runId === undefined ||
-        pendingMessageDispatchClaim(evidence, now) === 'live' ||
-        this.db.harnessRunSummaries.has(`${namespace}::${evidence.runId}`)
-      ) {
-        continue;
-      }
-      const runIds = interruptibleRunIdsBySession.get(evidence.sessionId) ?? [];
-      runIds.push(evidence.runId);
-      interruptibleRunIdsBySession.set(evidence.sessionId, runIds);
-    }
     const recoverable: RecoverableSession[] = [];
     for (const record of this.db.harnessSessions.values()) {
       if (record.harnessName !== namespace || record.closedAt !== undefined) continue;
       if (input.cursor !== undefined && record.id <= input.cursor.sessionId) continue;
       if (record.ownerId !== undefined && record.leaseExpiresAt !== undefined && record.leaseExpiresAt > now) continue;
-      const pendingMessageAdmission = (interruptibleRunIdsBySession.get(record.id) ?? []).some(
-        runId => runId !== record.pendingResume?.runId,
+      const pendingMessageAdmission = this.recoverableMessageAdmissions(namespace, record, now).some(
+        admission => admission.evidence.status !== 'pending' || admission.dispatchClaim !== 'live',
       );
-      const pendingQueue = record.pendingQueue.length > 0;
+      // A queue parked behind an interaction that has not expired cannot drain.
+      const pendingResume = record.pendingResume;
+      const pendingQueue =
+        record.pendingQueue.length > 0 &&
+        (pendingResume === undefined ||
+          (isDueScannablePendingResume(pendingResume) && pendingResumeDueAt(pendingResume) <= now));
       const closing = record.closingAt !== undefined;
       if (!pendingMessageAdmission && !pendingQueue && !closing) continue;
       recoverable.push({
@@ -448,30 +436,68 @@ export class InMemoryHarness extends HarnessStorage {
   async listPendingMessageAdmissions(
     input: ListPendingMessageAdmissionsInput,
   ): Promise<ListPendingMessageAdmissionsResult> {
-    const limit = normalizeDispatchRecoveryScanLimit(input.limit);
+    const { now, limit } = normalizeDispatchRecoveryScanInput(input);
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
-    const now = Date.now();
-    const pending: PendingMessageAdmission[] = [];
-    for (const evidence of this.db.harnessMessageResultEvidence.values()) {
-      if (
-        evidence.harnessName !== namespace ||
-        evidence.sessionId !== input.sessionId ||
-        evidence.resourceId !== input.resourceId ||
-        evidence.threadId !== input.threadId ||
-        !isPendingAdmittedMessage(evidence)
-      ) {
-        continue;
-      }
-      if (input.cursor !== undefined && evidence.signalId <= input.cursor.signalId) continue;
-      pending.push({ evidence: cloneJson(evidence), dispatchClaim: pendingMessageDispatchClaim(evidence, now) });
-    }
-    pending.sort((a, b) => compareStrings(a.evidence.signalId, b.evidence.signalId));
-    const page = pending.slice(0, limit);
+    const record = this.db.harnessSessions.get(sessionKey(namespace, input.sessionId));
+    const admissions = (record ? this.recoverableMessageAdmissions(namespace, record, now) : []).filter(
+      admission =>
+        admission.evidence.resourceId === input.resourceId &&
+        admission.evidence.threadId === input.threadId &&
+        (input.cursor === undefined || admission.evidence.signalId > input.cursor.signalId),
+    );
+    admissions.sort((a, b) => compareStrings(a.evidence.signalId, b.evidence.signalId));
+    const page = admissions.slice(0, limit);
     const last = page.at(-1);
     return {
       items: page,
-      ...(pending.length > limit && last ? { nextCursor: { signalId: last.evidence.signalId } } : {}),
+      ...(admissions.length > limit && last ? { nextCursor: { signalId: last.evidence.signalId } } : {}),
     };
+  }
+
+  /**
+   * Admitted message rows recovery must act on: pending rows other than the
+   * parked resume (with their claim state at `now`), and rows it settled
+   * interrupted whose completion is unpublished (no run summary yet).
+   */
+  private recoverableMessageAdmissions(
+    namespace: string,
+    record: SessionRecord,
+    now: number,
+  ): PendingMessageAdmission[] {
+    const admissions: PendingMessageAdmission[] = [];
+    for (const evidence of this.db.harnessMessageResultEvidence.values()) {
+      if (
+        evidence.harnessName !== namespace ||
+        evidence.sessionId !== record.id ||
+        evidence.operationKind !== 'message' ||
+        evidence.admissionId === undefined ||
+        evidence.admissionHash === undefined ||
+        evidence.runId === undefined
+      ) {
+        continue;
+      }
+      if (evidence.status === 'pending') {
+        if (evidence.runId === record.pendingResume?.runId) continue;
+        admissions.push({ evidence: cloneJson(evidence), dispatchClaim: pendingMessageDispatchClaim(evidence, now) });
+      } else if (
+        evidence.status === 'failed' &&
+        evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE &&
+        !this.db.harnessRunSummaries.has(`${namespace}::${evidence.runId}`)
+      ) {
+        admissions.push({ evidence: cloneJson(evidence), dispatchClaim: 'none' });
+      }
+    }
+    return admissions;
+  }
+
+  private holdsSessionLease(namespace: string, sessionId: string, lease: { ownerId: string; now: number }): boolean {
+    const record = this.db.harnessSessions.get(sessionKey(namespace, sessionId));
+    return (
+      record !== undefined &&
+      record.ownerId === lease.ownerId &&
+      record.leaseExpiresAt !== undefined &&
+      record.leaseExpiresAt > lease.now
+    );
   }
 
   async withThreadDeleteFence<T>(
@@ -1705,6 +1731,7 @@ export class InMemoryHarness extends HarnessStorage {
     resultEvidence: AgentSignalResultEvidence;
     terminalResult: HarnessTerminalResult;
     projection: HarnessTerminalProjection;
+    recovery?: HarnessTerminalRecoveryPrecondition;
   }): Promise<HarnessTerminalCommitReceipt> {
     this.assertTerminalHandoffEnabled();
     const namespace = resolveHarnessName(input.admission.harnessName, this.harnessName);
@@ -1787,6 +1814,14 @@ export class InMemoryHarness extends HarnessStorage {
     }
     if (currentEvidence.status === 'failed') {
       throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
+    }
+    if (
+      input.recovery !== undefined &&
+      (currentEvidence.status !== 'pending' ||
+        !sameSignalDispatch(currentEvidence.dispatch, input.recovery.expectedDispatch ?? undefined) ||
+        !this.holdsSessionLease(namespace, stored.sessionId, input.recovery.leaseOwner))
+    ) {
+      return { status: 'conflict', admission: cloneHarnessTerminal(stored) };
     }
     if (existingIntent) {
       if (!sameTerminalIntentValue(existingIntent, terminalResult, projection)) {
@@ -2337,6 +2372,9 @@ export class InMemoryHarness extends HarnessStorage {
       return { applied: false, evidence: cloneJson(existing) };
     }
     if (!signalDispatchMatches(existing, input.expected)) {
+      return { applied: false, evidence: cloneJson(existing) };
+    }
+    if (input.leaseOwner !== undefined && !this.holdsSessionLease(harnessName, input.sessionId, input.leaseOwner)) {
       return { applied: false, evidence: cloneJson(existing) };
     }
     // A reserved signal never dispatched, so it has no run to settle. An
@@ -4963,15 +5001,6 @@ function compareStrings(a: string, b: string): number {
  */
 function terminalEvidenceMatchesResult(evidence: AgentSignalResultEvidence, result: HarnessTerminalResult): boolean {
   return evidence.status === 'completed' || (evidence.status === 'failed' && result.status !== 'completed');
-}
-
-function isPendingAdmittedMessage(evidence: AgentSignalResultEvidence): boolean {
-  return (
-    evidence.status === 'pending' &&
-    evidence.operationKind === 'message' &&
-    evidence.admissionId !== undefined &&
-    evidence.admissionHash !== undefined
-  );
 }
 
 function pendingMessageDispatchClaim(evidence: AgentSignalResultEvidence, now: number): PendingMessageDispatchClaim {

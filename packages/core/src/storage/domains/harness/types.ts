@@ -1869,6 +1869,8 @@ export interface RecoverableSessionScanCursor {
 
 export interface ListRecoverableSessionsInput {
   harnessName?: string;
+  /** Caller clock (epoch ms) that leases and dispatch claims are judged by. */
+  now: number;
   /** Positive page size; adapters cap it at the storage-wide maximum. */
   limit: number;
   /** Return sessions strictly after this session id. */
@@ -1876,13 +1878,13 @@ export interface ListRecoverableSessionsInput {
 }
 
 /**
- * An open session whose lease has lapsed by the storage clock while durable
+ * An open session whose lease has lapsed at the caller's clock while durable
  * work that recovery can advance is still pending. Discovery evidence only: a
  * recovery worker adopts an open session through `harness.session()`, or
  * finishes a `closing` one through `harness.closeSession()`; in both the lease
- * compare-and-set is the reservation. Pending rows adoption would skip (a live
- * dispatch claim, a parked resume, a run that already reached a terminal) do
- * not make a session discoverable, so a worker never loops on them.
+ * compare-and-set is the reservation. Work recovery cannot advance yet (a live
+ * dispatch claim, a parked resume, a queue behind an unexpired interaction)
+ * does not make a session discoverable, so a worker never loops on it.
  */
 export interface RecoverableSession {
   harnessName: string;
@@ -1890,16 +1892,18 @@ export interface RecoverableSession {
   resourceId: string;
   threadId: string;
   /**
-   * An admitted `message()` result row is pending with no live dispatch
-   * claim, is not the parked resume, and its run has no durable run summary:
-   * adoption (or a resumed close) interrupts it.
+   * An admitted `message()` turn needs recovery: it is pending with no live
+   * dispatch claim and is not the parked resume (adoption, or a resumed close,
+   * interrupts it), or it was interrupted and its completion is unpublished.
    */
   pendingMessageAdmission: boolean;
-  /** The durable queue still holds items. */
+  /** The durable queue holds items that are not parked behind an unexpired interaction. */
   pendingQueue: boolean;
   /**
    * A close started and never finished. `harness.session()` rejects closing
-   * sessions; `harness.closeSession()` resumes the persisted close.
+   * sessions; `harness.closeSession()` resumes the persisted close, and
+   * refuses with `HarnessSessionLockedError` while another process's dispatch
+   * claim on one of its turns is still live.
    */
   closing: boolean;
 }
@@ -1918,6 +1922,8 @@ export interface ListPendingMessageAdmissionsInput {
   sessionId: string;
   resourceId: string;
   threadId: string;
+  /** Caller clock (epoch ms) that dispatch claims are judged by. */
+  now: number;
   /** Positive page size; adapters cap it at the storage-wide maximum. */
   limit: number;
   /** Return rows strictly after this signal id. */
@@ -1925,10 +1931,10 @@ export interface ListPendingMessageAdmissionsInput {
 }
 
 /**
- * Dispatch-claim state of a pending admitted message, evaluated by the storage
- * clock. `none`: no claim was stamped (a plain admitted `message()` is fenced
- * by the session lease alone). `live`: a stamped `dispatching` claim has not
- * expired. `expired`: it has.
+ * Dispatch-claim state of an admitted message at the caller's clock. `none`:
+ * no claim was stamped (a plain admitted `message()` is fenced by the session
+ * lease alone) or the row is already settled. `live`: a stamped `dispatching`
+ * claim has not expired. `expired`: it has.
  */
 export type PendingMessageDispatchClaim = 'none' | 'live' | 'expired';
 

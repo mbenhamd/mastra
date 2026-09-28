@@ -4504,8 +4504,9 @@ export class Harness {
       // cannot start until every recovery barrier has succeeded.
       await session._reconcilePendingInteractionExpiryOnHydrate();
       // Admitted message dispatches orphaned by a dead owner are interrupted
-      // (never re-run) while this process holds the adopted lease.
-      await session._interruptOrphanedMessageDispatchesOnHydrate();
+      // (never re-run) while this process holds the adopted lease. A dispatch
+      // another process still claims is left for a later recovery.
+      await session._recoverOrphanedMessageDispatches();
       await session._reconcileDelegationsOnHydrate();
       if (this._shutdown) throw new Error('Harness is shut down');
       session._emit({ type: 'session_hydrated' });
@@ -5777,6 +5778,7 @@ export class Harness {
       if (scope.resourceId !== undefined && ready.resourceId !== scope.resourceId) {
         throw new HarnessSessionNotFoundError(record.id);
       }
+      await this._settleOrphanedDispatchesBeforeClose(ready);
       return {
         record: ready.getRecord(),
         depth,
@@ -5789,6 +5791,7 @@ export class Harness {
       if (scope.resourceId !== undefined && live.resourceId !== scope.resourceId) {
         throw new HarnessSessionNotFoundError(record.id);
       }
+      await this._settleOrphanedDispatchesBeforeClose(live);
       return {
         record: live.getRecord(),
         depth,
@@ -5799,9 +5802,9 @@ export class Harness {
 
     const lease = await this._acquireLease(storage, record.harnessName, record.id);
     let latest: SessionRecord | null;
-    // A cold record with pending admitted messages may be resuming a close its
-    // crashed owner started: it is adopted like a queued record (below) so the
-    // orphaned dispatches are interrupted (never re-run) before terminalizing.
+    // A cold record with admitted messages to recover may be resuming a close
+    // its crashed owner started: it is adopted like a queued record (below) so
+    // the orphaned dispatches are settled (never re-run) before terminalizing.
     let hasPendingMessageAdmissions = false;
     try {
       latest = await storage.loadSession({ harnessName: record.harnessName, sessionId: record.id });
@@ -5815,6 +5818,7 @@ export class Harness {
           sessionId: latest.id,
           resourceId: latest.resourceId,
           threadId: latest.threadId,
+          now: Date.now(),
           limit: 1,
         });
         hasPendingMessageAdmissions = pending.items.length > 0;
@@ -5846,7 +5850,7 @@ export class Harness {
       });
       if (hasPendingMessageAdmissions) {
         try {
-          await recovered._interruptOrphanedMessageDispatchesOnHydrate();
+          await this._settleOrphanedDispatchesBeforeClose(recovered);
         } catch (err) {
           await this._discardFailedMaterialization(storage, recovered);
           throw err;
@@ -5864,6 +5868,19 @@ export class Harness {
       depth,
       leaseAcquired: true,
     };
+  }
+
+  /**
+   * A close must not hide an admitted turn: orphaned dispatches are settled
+   * first, and while another process's dispatch claim on one of its turns is
+   * still live the close is refused (retry after `expiresAt`). Once a session
+   * is closed no recovery would ever look at that turn again.
+   */
+  private async _settleOrphanedDispatchesBeforeClose(session: Session): Promise<void> {
+    const { blockedBy } = await session._recoverOrphanedMessageDispatches();
+    if (blockedBy !== undefined) {
+      throw new HarnessSessionLockedError(session.id, blockedBy.attemptId, blockedBy.claimExpiresAt);
+    }
   }
 
   private async _markCloseNodeClosing(
