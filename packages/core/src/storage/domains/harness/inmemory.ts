@@ -40,6 +40,7 @@ import type {
   CompareAndSwapSignalDispatchResult,
   CompareAndSwapSignalTerminalInput,
   CompareAndSwapSignalTerminalResult,
+  HarnessSessionLeasePrecondition,
   HarnessTerminalRecoveryPrecondition,
   WriteMessageResultEvidenceResult,
 } from './base';
@@ -403,16 +404,19 @@ export class InMemoryHarness extends HarnessStorage {
       if (record.harnessName !== namespace || record.closedAt !== undefined) continue;
       if (input.cursor !== undefined && record.id <= input.cursor.sessionId) continue;
       if (record.ownerId !== undefined && record.leaseExpiresAt !== undefined && record.leaseExpiresAt > now) continue;
-      const pendingMessageAdmission = this.recoverableMessageAdmissions(namespace, record, now).some(
+      const admissions = this.recoverableMessageAdmissions(namespace, record, now);
+      const pendingMessageAdmission = admissions.some(
         admission => admission.evidence.status !== 'pending' || admission.dispatchClaim !== 'live',
       );
+      // A close is refused while any of its turns is still claimed.
+      const claimed = admissions.some(admission => admission.dispatchClaim === 'live');
       // A queue parked behind an interaction that has not expired cannot drain.
       const pendingResume = record.pendingResume;
       const pendingQueue =
         record.pendingQueue.length > 0 &&
         (pendingResume === undefined ||
           (isDueScannablePendingResume(pendingResume) && pendingResumeDueAt(pendingResume) <= now));
-      const closing = record.closingAt !== undefined;
+      const closing = record.closingAt !== undefined && !claimed;
       if (!pendingMessageAdmission && !pendingQueue && !closing) continue;
       recoverable.push({
         harnessName: record.harnessName,
@@ -490,13 +494,14 @@ export class InMemoryHarness extends HarnessStorage {
     return admissions;
   }
 
-  private holdsSessionLease(namespace: string, sessionId: string, lease: { ownerId: string; now: number }): boolean {
+  /** Judged when the guarded write commits, by the clock leases are stamped with. */
+  private holdsSessionLease(namespace: string, sessionId: string, lease: HarnessSessionLeasePrecondition): boolean {
     const record = this.db.harnessSessions.get(sessionKey(namespace, sessionId));
     return (
       record !== undefined &&
       record.ownerId === lease.ownerId &&
       record.leaseExpiresAt !== undefined &&
-      record.leaseExpiresAt > lease.now
+      record.leaseExpiresAt > Date.now()
     );
   }
 
@@ -1621,7 +1626,10 @@ export class InMemoryHarness extends HarnessStorage {
   // Native chat terminal handoff
   // -------------------------------------------------------------------------
 
-  async admitTerminalHandoff(input: HarnessTerminalAdmissionInput): Promise<HarnessTerminalAdmissionReceipt> {
+  async admitTerminalHandoff(
+    input: HarnessTerminalAdmissionInput,
+    opts: { leaseOwner?: HarnessSessionLeasePrecondition } = {},
+  ): Promise<HarnessTerminalAdmissionReceipt> {
     this.assertTerminalHandoffEnabled();
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
     const normalizedInput = { ...input, harnessName: namespace };
@@ -1640,6 +1648,19 @@ export class InMemoryHarness extends HarnessStorage {
         throw new HarnessTerminalHandoffIdentityConflictError(input.executionGrant.key);
       }
       return { status: 'duplicate', admission: cloneHarnessTerminal(existing) };
+    }
+    if (opts.leaseOwner !== undefined) {
+      // A stalled owner must not admit a turn recovery has taken over: it no
+      // longer holds the lease, or recovery already settled the turn.
+      const evidence = this.db.harnessMessageResultEvidence.get(
+        messageEvidenceKey(namespace, input.sessionId, input.signalId),
+      );
+      if (
+        !this.holdsSessionLease(namespace, input.sessionId, opts.leaseOwner) ||
+        (evidence !== undefined && isTerminalMessageEvidence(evidence))
+      ) {
+        return { status: 'fenced', admission: { ...admission, status: 'fenced' } };
+      }
     }
     // The durable incarnation fence covers admissions inserted after a fence
     // sweep: a fenced incarnation rejects new admissions even while the

@@ -128,6 +128,38 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       },
     });
     await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: blocked.id, ownerId: 'owner-blocked' });
+    // A closing session whose only turn is still claimed by another process
+    // cannot be closed yet, so it is not discoverable until the claim expires.
+    const closingClaimed = await createSession(harness(), 'closing-claimed', 'owner-closing', {
+      closingAt: Date.now(),
+      closeDeadlineAt: Date.now() + 60_000,
+    });
+    const claimedEvidence = pendingMessage(closingClaimed, 'closing-claimed');
+    await harness().writeMessageResultEvidence(claimedEvidence);
+    await harness().compareAndSwapSignalDispatch({
+      harnessName: HARNESS,
+      sessionId: closingClaimed.id,
+      resourceId: closingClaimed.resourceId,
+      threadId: closingClaimed.threadId,
+      signalId: claimedEvidence.signalId,
+      admissionId: claimedEvidence.admissionId!,
+      admissionHash: claimedEvidence.admissionHash!,
+      operationKind: 'message',
+      expected: { state: 'reserved' },
+      next: {
+        state: 'dispatching',
+        attemptId: 'attempt-closing',
+        claimExpiresAt: Date.now() + 60_000,
+        delivery: 'idle',
+        runId: claimedEvidence.runId!,
+      },
+      updatedAt: Date.now(),
+    });
+    await harness().releaseSessionLease({
+      harnessName: HARNESS,
+      sessionId: closingClaimed.id,
+      ownerId: 'owner-closing',
+    });
 
     const realNow = Date.now();
     const listed = (now: number) =>
@@ -136,7 +168,12 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
         .then(page => page.items.map(item => item.sessionId));
     await expect(listed(realNow)).resolves.toEqual([orphan.id, summarized.id]);
     // Leases and claims are judged by the caller's clock, like `_flushUpdate`.
-    await expect(listed(realNow + 10 * 60_000)).resolves.toEqual([live.id, orphan.id, summarized.id]);
+    await expect(listed(realNow + 10 * 60_000)).resolves.toEqual([
+      closingClaimed.id,
+      live.id,
+      orphan.id,
+      summarized.id,
+    ]);
 
     // Lease expiries are stamped on the caller's clock too.
     vi.spyOn(Date, 'now').mockReturnValue(realNow + 10 * 60_000);
@@ -161,11 +198,15 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
         operationKind: 'message',
         expected: { state: 'reserved' },
         terminal: { status: 'failed', signalId: orphanEvidence.signalId, error: INTERRUPTED },
-        leaseOwner: { ownerId, now: Date.now() },
+        leaseOwner: { ownerId },
         updatedAt: Date.now(),
       });
-    // Settlement is fenced by the recovering owner's lease.
+    // Settlement is fenced by the recovering owner's lease, judged when the
+    // settlement commits.
     await expect(settle('not-the-owner')).resolves.toMatchObject({ applied: false });
+    vi.spyOn(Date, 'now').mockReturnValue(lease.expiresAt + 1);
+    await expect(settle('adopter')).resolves.toMatchObject({ applied: false });
+    vi.restoreAllMocks();
     await expect(settle('adopter')).resolves.toMatchObject({ applied: true });
     await expect(
       harness().loadMessageResultEvidence({ ...scope, signalId: orphanEvidence.signalId }),
@@ -267,7 +308,7 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
         },
         terminalResult,
         projection: { projectionKind: 'chat.summary', projectionId: 'interrupted', payload: { status: 'aborted' } },
-        recovery: { expectedDispatch, leaseOwner: { ownerId: 'owner-dead', now: Date.now() } },
+        recovery: { expectedDispatch, leaseOwner: { ownerId: 'owner-dead' } },
       });
     // A dispatch that changed since recovery observed it is never overwritten.
     await expect(commitInterrupted(null)).resolves.toMatchObject({ status: 'conflict' });
@@ -280,9 +321,48 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     await expect(
       harness().loadMessageResultEvidence({ ...scope, signalId: expired.evidence.signalId }),
     ).resolves.toMatchObject({ status: 'failed', error: INTERRUPTED });
+    // A stalled owner cannot admit a terminal handoff for a turn recovery
+    // already settled, nor without holding the session lease.
+    const lateEvidence = pendingMessage(session, 'late');
+    await harness().writeMessageResultEvidence(lateEvidence);
+    const lateAdmission = {
+      ...expired.admission,
+      admissionId: lateEvidence.admissionId!,
+      admissionHash: lateEvidence.admissionHash!,
+      signalId: lateEvidence.signalId,
+      runId: lateEvidence.runId!,
+      executionGrant: { key: 'grant-late', generation: 1 },
+    };
+    await expect(
+      harness().admitTerminalHandoff(lateAdmission, { leaseOwner: { ownerId: 'not-the-owner' } }),
+    ).resolves.toMatchObject({ status: 'fenced' });
+    await harness().compareAndSwapSignalTerminal({
+      ...scope,
+      signalId: lateEvidence.signalId,
+      admissionId: lateEvidence.admissionId!,
+      admissionHash: lateEvidence.admissionHash!,
+      operationKind: 'message',
+      expected: { state: 'reserved' },
+      terminal: { status: 'failed', signalId: lateEvidence.signalId, error: INTERRUPTED },
+      leaseOwner: { ownerId: 'owner-dead' },
+      updatedAt: Date.now(),
+    });
+    await expect(
+      harness().admitTerminalHandoff(lateAdmission, { leaseOwner: { ownerId: 'owner-dead' } }),
+    ).resolves.toMatchObject({ status: 'fenced' });
+    await expect(
+      harness().loadTerminalAdmission({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        admissionId: lateAdmission.admissionId,
+        executionGrant: lateAdmission.executionGrant,
+      }),
+    ).resolves.toBeNull();
+
     const remaining = await harness().listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
     expect(remaining.items.map(item => [item.evidence.signalId, item.evidence.status, item.dispatchClaim])).toEqual([
       ['signal-expired', 'failed', 'none'],
+      ['signal-late', 'failed', 'none'],
       ['signal-live', 'pending', 'live'],
     ]);
   });

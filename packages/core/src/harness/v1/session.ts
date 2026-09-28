@@ -705,6 +705,8 @@ const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
  */
 const HARNESS_RUN_INTERRUPTED_MESSAGE =
   'The run was interrupted when the process that owned it stopped; it was not re-run.';
+/** Back-off before recovery retries a turn whose settlement did not commit. */
+const ORPHANED_DISPATCH_RETRY_MS = 1_000;
 /**
  * §S4.1 — max transiently-failed event-ledger appends retained for retry before
  * fail-stop. A transient `appendSessionEvent` failure no longer permanently latches
@@ -1652,6 +1654,14 @@ export class Session {
    * `run_completed` so it reports the admitted mode/model, not the session's.
    */
   private readonly _recoveredRunIdentities = new Map<string, RunSpanIdentity>();
+  /** Orphaned-dispatch recovery in flight (one per session at a time). */
+  private _orphanRecovery?: Promise<{ blockedBy?: { holder: string; retryAt: number } }>;
+  /**
+   * When recovery left a turn it could not settle yet (another process's
+   * claim, or a settlement that did not commit), the time to run it again on
+   * the session's next resolution. Cleared once nothing is blocked.
+   */
+  private _orphanRecheckAt?: number;
   /**
    * Durable resume-usage fence. `_recordTurnCompletion` applies a resumed run's
    * usage delta to the live counter immediately, and every flush persists the
@@ -3527,15 +3537,39 @@ export class Session {
    * next recovery, so a settlement whose acknowledgement was lost is never
    * left unreported. A run whose completion was already published keeps it.
    *
-   * Returns the live dispatch claim of another process that blocks a close.
+   * Returns what blocks a close: another process's live claim, or a turn whose
+   * settlement did not commit.
    */
-  async _recoverOrphanedMessageDispatches(): Promise<{
-    blockedBy?: { attemptId: string; claimExpiresAt: number };
+  async _recoverOrphanedMessageDispatches(): Promise<{ blockedBy?: { holder: string; retryAt: number } }> {
+    if (this._orphanRecovery !== undefined) return this._orphanRecovery;
+    const recovery = this._recoverOrphanedMessageDispatchesOnce().finally(() => {
+      if (this._orphanRecovery === recovery) this._orphanRecovery = undefined;
+    });
+    this._orphanRecovery = recovery;
+    return recovery;
+  }
+
+  /**
+   * @internal — re-run recovery on a resolved live session once a turn it had
+   * to leave (a claim that has since expired, or a settlement that did not
+   * commit) is due. A failure keeps it due, so the next resolution retries.
+   */
+  async _recheckOrphanedDispatchesIfDue(): Promise<void> {
+    if (this._orphanRecheckAt === undefined || Date.now() < this._orphanRecheckAt) return;
+    if (this._state !== 'live') return;
+    await this._recoverOrphanedMessageDispatches();
+  }
+
+  private async _recoverOrphanedMessageDispatchesOnce(): Promise<{
+    blockedBy?: { holder: string; retryAt: number };
   }> {
     if (!this._storage.supportsDispatchRecovery) return {};
     const orphaned: AgentSignalResultEvidence[] = [];
     const unpublished: AgentSignalResultEvidence[] = [];
-    let blockedBy: { attemptId: string; claimExpiresAt: number } | undefined;
+    let blockedBy: { holder: string; retryAt: number } | undefined;
+    const block = (holder: string, retryAt: number) => {
+      if (blockedBy === undefined || retryAt < blockedBy.retryAt) blockedBy = { holder, retryAt };
+    };
     let cursor: PendingMessageAdmissionScanCursor | undefined;
     do {
       const page = await this._storage.listPendingMessageAdmissions({
@@ -3556,17 +3590,37 @@ export class Session {
         const state = this._classifyPendingMessageDispatch(admission);
         if (state === 'orphaned') orphaned.push(evidence);
         if (state === 'claimed' && evidence.dispatch?.state === 'dispatching') {
-          blockedBy = { attemptId: evidence.dispatch.attemptId, claimExpiresAt: evidence.dispatch.claimExpiresAt };
+          block(evidence.dispatch.attemptId, evidence.dispatch.claimExpiresAt);
         }
       }
       cursor = page.nextCursor;
     } while (cursor !== undefined);
     for (const evidence of orphaned) {
-      if (await this._interruptOrphanedMessageDispatch(evidence)) unpublished.push(evidence);
+      if (await this._interruptOrphanedMessageDispatch(evidence)) {
+        unpublished.push(evidence);
+        continue;
+      }
+      // The settlement did not commit (a fresh claim, a moved lease, or a
+      // finalizer this process cannot run). A turn still pending blocks.
+      const latest = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: evidence.signalId,
+      });
+      if (latest === null || !('status' in latest) || latest.status !== 'pending') continue;
+      const claim = latest.dispatch;
+      if (claim?.state === 'dispatching' && claim.claimExpiresAt > Date.now()) {
+        block(claim.attemptId, claim.claimExpiresAt);
+      } else {
+        block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+      }
     }
     for (const evidence of unpublished) {
       await this._publishInterruptedRunCompletion(evidence);
     }
+    this._orphanRecheckAt = blockedBy?.retryAt;
     return blockedBy !== undefined ? { blockedBy } : {};
   }
 
@@ -3614,7 +3668,8 @@ export class Session {
   private async _interruptOrphanedMessageDispatch(evidence: AgentSignalResultEvidence): Promise<boolean> {
     const runId = evidence.runId!;
     const error = { code: HARNESS_RUN_INTERRUPTED_ERROR_CODE, message: HARNESS_RUN_INTERRUPTED_MESSAGE };
-    const leaseOwner = { ownerId: this._harness.ownerId, now: Date.now() };
+    // The adapter judges the lease when the settlement commits.
+    const leaseOwner = { ownerId: this._harness.ownerId };
     const terminal = await this._commitInterruptedTerminalHandoff(evidence, runId, error, leaseOwner);
     if (terminal === 'committed') return true;
     if (terminal === 'skipped') return false;
@@ -3668,6 +3723,9 @@ export class Session {
     // The run's start was emitted by the dead owner, so this terminal carries
     // no span: `run_completed` is `interrupted` + `reconstructed`, and any
     // persisted assistant draft for the run is terminalized as interrupted.
+    // An earlier attempt on this session may have emitted it but failed to
+    // persist the summary; finalize again so persistence is retried.
+    this._finalizedRunIds.delete(runId);
     this._emitTurnEvent({ type: 'agent_end', runId, finishReason: 'aborted', usage: this._runUsage() });
     await this._runSummaryPersistence;
     if ((await this._storage.loadRunSummary(summary)) === null) {
@@ -3694,7 +3752,7 @@ export class Session {
     evidence: AgentSignalResultEvidence,
     runId: string,
     error: { code: string; message: string },
-    leaseOwner: { ownerId: string; now: number },
+    leaseOwner: { ownerId: string },
   ): Promise<'committed' | 'unowned' | 'skipped'> {
     const sessionIncarnation = this._record.sessionIncarnation;
     if (!this._storage.supportsTerminalHandoff || sessionIncarnation === undefined) return 'unowned';
@@ -8493,20 +8551,27 @@ export class Session {
             throw conflict;
           }
         }
-        if (terminalIdentity !== undefined && this._terminalFinalizer !== undefined) {
+        const terminalHandoffTurn = terminalIdentity !== undefined && this._terminalFinalizer !== undefined;
+        if (terminalHandoffTurn) {
           await this._admitTerminalHandoff(
             terminalIdentity,
             admittedOpts.terminalAdmissionSeed!,
             opts.onTerminalCommitError,
           );
-          // Stamp the durable dispatch marker before invoking sendSignal: a
-          // retry that finds this reservation with a pending admission but no
-          // `dispatching` state knows the provider was never invoked and may
-          // re-drive safely; anything past this point is treated as possibly
-          // executed and is never auto-replayed. The stamp is a compare-and-swap
-          // on the durable row, so a concurrent worker holding the same
-          // admission cannot also reach sendSignal — the CAS loser takes the
-          // duplicate path instead of dispatching a second provider turn.
+        }
+        // Stamp the durable dispatch marker before invoking sendSignal: a
+        // retry that finds this reservation with a pending admission but no
+        // `dispatching` state knows the provider was never invoked and may
+        // re-drive safely; anything past this point is treated as possibly
+        // executed and is never auto-replayed. The stamp is a compare-and-swap
+        // on the durable row, so a concurrent worker holding the same
+        // admission cannot also reach sendSignal — the CAS loser takes the
+        // duplicate path instead of dispatching a second provider turn. A plain
+        // admitted turn is stamped too when the storage supports orphaned-
+        // dispatch recovery, which settles unstamped reservations: an owner that
+        // stalled after its reservation then loses the CAS instead of
+        // dispatching a turn recovery already interrupted.
+        if (terminalHandoffTurn || (terminalIdentity === undefined && this._storage.supportsDispatchRecovery)) {
           if (admissionIdentity !== undefined && admissionHash !== undefined) {
             const stamped = await this._storage.compareAndSwapSignalDispatch({
               harnessName: this._record.harnessName,
@@ -8520,9 +8585,9 @@ export class Session {
               expected: { state: 'reserved' },
               next: {
                 state: 'dispatching',
-                attemptId: `terminal-dispatch-${randomUUID()}`,
+                attemptId: `${terminalHandoffTurn ? 'terminal' : 'message'}-dispatch-${randomUUID()}`,
                 claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
-                delivery: 'idle',
+                delivery: terminalHandoffTurn || sub.activeRunId() === null ? 'idle' : 'active',
                 runId: admissionIdentity.runId,
               },
               updatedAt: Date.now(),
@@ -10111,12 +10176,17 @@ export class Session {
     };
     let receipt: HarnessTerminalAdmissionReceipt;
     try {
-      receipt = await this._storage.admitTerminalHandoff({
-        ...identity,
-        finalizerId: finalizer.id,
-        finalizerVersion: finalizer.version,
-        seed,
-      });
+      // Only the lease holder may admit: a stalled owner whose turn recovery
+      // has taken over is fenced instead of leaving a pending admission.
+      receipt = await this._storage.admitTerminalHandoff(
+        {
+          ...identity,
+          finalizerId: finalizer.id,
+          finalizerVersion: finalizer.version,
+          seed,
+        },
+        { leaseOwner: { ownerId: this._harness.ownerId } },
+      );
     } catch (error) {
       return reportFailure(error);
     }

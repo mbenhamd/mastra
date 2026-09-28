@@ -180,6 +180,7 @@ import type {
   CompareAndSwapSignalDispatchResult,
   CompareAndSwapSignalTerminalInput,
   CompareAndSwapSignalTerminalResult,
+  HarnessSessionLeasePrecondition,
   HarnessTerminalRecoveryPrecondition,
   WriteMessageResultEvidenceResult,
   HarnessTerminalAckReceipt,
@@ -1362,20 +1363,14 @@ export class HarnessPG extends HarnessStorage {
     tx: PgHarnessClient,
     harnessName: string,
     sessionId: string,
-    lease: { ownerId: string; now: number },
+    lease: HarnessSessionLeasePrecondition,
   ): Promise<boolean> {
     const result = await tx.execute({
       sql: `SELECT owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
             WHERE harness_name = ? AND id = ? LIMIT 1 FOR SHARE`,
       args: [harnessName, sessionId],
     });
-    const row = result.rows[0] as Record<string, unknown> | undefined;
-    return (
-      row !== undefined &&
-      row.owner_id === lease.ownerId &&
-      row.lease_expires_at != null &&
-      Number(row.lease_expires_at) > lease.now
-    );
+    return rowHoldsSessionLease(result.rows[0] as Record<string, unknown> | undefined, lease);
   }
 
   async listRecoverableSessions(input: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
@@ -1384,6 +1379,8 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureRunSummariesTable();
     const cursorCondition = input.cursor !== undefined ? 'AND s.id > ?' : '';
     const args: (string | number)[] = [
+      HARNESS_RUN_INTERRUPTED_ERROR_CODE,
+      now,
       now,
       HARNESS_RUN_INTERRUPTED_ERROR_CODE,
       now,
@@ -1396,11 +1393,23 @@ export class HarnessPG extends HarnessStorage {
     // Leases and claims are stamped with the caller's clock, so `now` judges
     // them. Only work recovery can advance makes a session discoverable: a
     // recoverable admitted message whose claim is not live, a queue not parked
-    // behind an unexpired interaction, or an unfinished close.
+    // behind an unexpired interaction, or an unfinished close none of whose
+    // turns is still claimed (the close would be refused until then).
     const result = await this.#client.execute({
       sql: `SELECT * FROM (
               SELECT s.harness_name, s.id, s.resource_id, s.thread_id,
-                     s.closing_at IS NOT NULL AS closing,
+                     (
+                       s.closing_at IS NOT NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM ${TABLE_HARNESS_MESSAGE_RESULTS} m
+                         WHERE m.harness_name = s.harness_name
+                           AND m.session_id = s.id
+                           AND m.resource_id = s.resource_id
+                           AND m.thread_id = s.thread_id
+                           AND ${PG_RECOVERABLE_MESSAGE_SQL}
+                           AND ${PG_MESSAGE_DISPATCH_CLAIM_SQL} = 'live'
+                       )
+                     ) AS closing,
                      (
                        s.pending_queue <> '[]'::jsonb
                        AND (
@@ -4980,9 +4989,13 @@ export class HarnessPG extends HarnessStorage {
     }
   }
 
-  async admitTerminalHandoff(input: HarnessTerminalAdmissionInput): Promise<HarnessTerminalAdmissionReceipt> {
+  async admitTerminalHandoff(
+    input: HarnessTerminalAdmissionInput,
+    opts: { leaseOwner?: HarnessSessionLeasePrecondition } = {},
+  ): Promise<HarnessTerminalAdmissionReceipt> {
     this.#assertTerminalHandoffEnabled();
     await this.#ensureTerminalHandoffTables();
+    if (opts.leaseOwner !== undefined) await this.#ensureMessageResultsTable();
     const harnessName = this.#resolveHarnessName(input.harnessName);
     const admissionInput = { ...input, harnessName };
     const admission = prepareHarnessTerminalAdmission(admissionInput, this.terminalHandoff);
@@ -5000,7 +5013,7 @@ export class HarnessPG extends HarnessStorage {
       }
 
       const session = await tx.execute({
-        sql: `SELECT session_incarnation FROM ${TABLE_HARNESS_SESSIONS}
+        sql: `SELECT session_incarnation, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ? LIMIT 1 FOR UPDATE`,
         args: [harnessName, admission.sessionId],
       });
@@ -5024,6 +5037,26 @@ export class HarnessPG extends HarnessStorage {
         }
         await tx.commit();
         return { status: 'duplicate', admission: stored };
+      }
+
+      if (opts.leaseOwner !== undefined) {
+        // A stalled owner must not admit a turn recovery has taken over: it no
+        // longer holds the lease, or recovery already settled the turn. The
+        // evidence row is locked after the session row, the order recovery's
+        // settlement uses.
+        const evidence = await tx.execute({
+          sql: `SELECT status FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR SHARE`,
+          args: [messageEvidenceId({ harnessName, sessionId: admission.sessionId, signalId: admission.signalId })],
+        });
+        const evidenceStatus = evidence.rows[0]?.status;
+        if (
+          !rowHoldsSessionLease(session.rows[0] as Record<string, unknown>, opts.leaseOwner) ||
+          evidenceStatus === 'completed' ||
+          evidenceStatus === 'failed'
+        ) {
+          await tx.commit();
+          return { status: 'fenced', admission: { ...admission, status: 'fenced' } };
+        }
       }
 
       // The durable incarnation fence covers admissions inserted after a
@@ -5306,14 +5339,10 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessTerminalHandoffIdentityConflictError(stored.executionGrant.key);
       }
       if (input.recovery !== undefined) {
-        const sessionRow = session.rows[0] as Record<string, unknown> | undefined;
-        const leaseExpiresAt = sessionRow?.lease_expires_at == null ? undefined : Number(sessionRow.lease_expires_at);
         if (
           currentEvidence.status !== 'pending' ||
           !sameSignalDispatch(currentEvidence.dispatch, input.recovery.expectedDispatch ?? undefined) ||
-          sessionRow?.owner_id !== input.recovery.leaseOwner.ownerId ||
-          leaseExpiresAt === undefined ||
-          leaseExpiresAt <= input.recovery.leaseOwner.now
+          !rowHoldsSessionLease(session.rows[0] as Record<string, unknown> | undefined, input.recovery.leaseOwner)
         ) {
           await tx.commit();
           return { status: 'conflict', admission: stored };
@@ -11804,6 +11833,19 @@ function sameMessageEvidenceIdentity(a: AgentSignalResultEvidence, b: AgentSigna
 
 function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
   return record.status === 'completed' || record.status === 'failed';
+}
+
+/** Judged when the guarded write commits, by the clock leases are stamped with. */
+function rowHoldsSessionLease(
+  row: Record<string, unknown> | undefined,
+  lease: HarnessSessionLeasePrecondition,
+): boolean {
+  return (
+    row !== undefined &&
+    row.owner_id === lease.ownerId &&
+    row.lease_expires_at != null &&
+    Number(row.lease_expires_at) > Date.now()
+  );
 }
 
 /**

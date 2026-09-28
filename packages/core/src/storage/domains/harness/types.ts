@@ -1900,10 +1900,10 @@ export interface RecoverableSession {
   /** The durable queue holds items that are not parked behind an unexpired interaction. */
   pendingQueue: boolean;
   /**
-   * A close started and never finished. `harness.session()` rejects closing
-   * sessions; `harness.closeSession()` resumes the persisted close, and
-   * refuses with `HarnessSessionLockedError` while another process's dispatch
-   * claim on one of its turns is still live.
+   * A close started and never finished, and none of its turns is still
+   * claimed by another process's live dispatch (the close would be refused
+   * until the claim expires). `harness.session()` rejects closing sessions;
+   * `harness.closeSession()` resumes the persisted close.
    */
   closing: boolean;
 }

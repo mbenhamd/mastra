@@ -186,13 +186,13 @@ export function normalizeDispatchRecoveryScanInput(input: { now: number; limit: 
 }
 
 /**
- * Recovery-only fence: the settling process must still hold the session lease
- * at `now` (its own clock, the one leases are stamped with) when the write
- * commits. A lapsed or foreign lease rejects the write without changing it.
+ * Fence for writes that must only land while their writer owns the session:
+ * the adapter checks, when the write commits, that `ownerId` holds an
+ * unexpired lease by its own clock (the clock leases are stamped with). A
+ * lapsed or foreign lease rejects the write without changing anything.
  */
 export interface HarnessSessionLeasePrecondition {
   ownerId: string;
-  now: number;
 }
 
 /**
@@ -1269,7 +1269,17 @@ export abstract class HarnessStorage extends StorageDomain {
    * serialize this against the grant cancellation tombstone, so a missing
    * session or missing admission can never be interpreted as refundable work.
    */
-  async admitTerminalHandoff(_input: HarnessTerminalAdmissionInput): Promise<HarnessTerminalAdmissionReceipt> {
+  async admitTerminalHandoff(
+    _input: HarnessTerminalAdmissionInput,
+    _opts?: {
+      /**
+       * Refuse (`fenced`, nothing written) unless this owner holds the lease
+       * and the admitted turn's result evidence is not already terminal, so a
+       * stalled owner cannot admit a turn recovery has taken over.
+       */
+      leaseOwner?: HarnessSessionLeasePrecondition;
+    },
+  ): Promise<HarnessTerminalAdmissionReceipt> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }
 

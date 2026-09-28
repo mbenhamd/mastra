@@ -3706,9 +3706,16 @@ export class Harness {
       throw new Error('Harness is shut down');
     }
     let admission!: Promise<Session>;
-    admission = this._resolveSession(opts).finally(() => {
-      this._sessionAdmissionsInFlight.delete(admission);
-    });
+    admission = this._resolveSession(opts)
+      .then(async session => {
+        // A live session keeps its lease, so discovery never lists it: a turn
+        // its adoption had to leave is recovered here once it is due.
+        await session._recheckOrphanedDispatchesIfDue();
+        return session;
+      })
+      .finally(() => {
+        this._sessionAdmissionsInFlight.delete(admission);
+      });
     this._sessionAdmissionsInFlight.add(admission);
     return admission;
   }
@@ -5872,14 +5879,15 @@ export class Harness {
 
   /**
    * A close must not hide an admitted turn: orphaned dispatches are settled
-   * first, and while another process's dispatch claim on one of its turns is
-   * still live the close is refused (retry after `expiresAt`). Once a session
-   * is closed no recovery would ever look at that turn again.
+   * first, and the close is refused (retry after `expiresAt`) while a turn is
+   * still pending — another process's dispatch claim is live, or its
+   * settlement did not commit. Once a session is closed no recovery would
+   * ever look at that turn again.
    */
   private async _settleOrphanedDispatchesBeforeClose(session: Session): Promise<void> {
     const { blockedBy } = await session._recoverOrphanedMessageDispatches();
     if (blockedBy !== undefined) {
-      throw new HarnessSessionLockedError(session.id, blockedBy.attemptId, blockedBy.claimExpiresAt);
+      throw new HarnessSessionLockedError(session.id, blockedBy.holder, blockedBy.retryAt);
     }
   }
 
