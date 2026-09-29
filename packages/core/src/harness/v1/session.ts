@@ -73,6 +73,7 @@ import { RequestContext } from '../../request-context';
 import {
   HarnessStorageAdmissionConflictError,
   HarnessStorageLeaseConflictError,
+  HarnessStorageSessionClosedError,
   HarnessStorageSessionEventReplayUnsupportedError,
   HarnessStorageVersionConflictError,
   HarnessTerminalHandoffError,
@@ -3567,7 +3568,8 @@ export class Session {
    * it, before `closedAt` is persisted; a closed session is never recovered
    * again. Recovery first settles what it can. Before the drain, a turn
    * parked for a user response then blocks too, until its interaction is due
-   * (it is then expired and its turn settled): close would keep its record
+   * (it is then expired, or its stale resume recovered, and its turn settled):
+   * close would keep its record
    * but close over its pending admission. After the drain — which can leave
    * turns pending (a starter that failed closed on a lapsed claim, a run
    * whose result write failed) and which does not wait for the turns it
@@ -3586,10 +3588,12 @@ export class Session {
       this._scheduleOrphanRecheck(blocked.retryAt);
       return blocked;
     }
-    // An interaction already due is expired first — its terminal admission is
-    // cancelled and its turn settled — so it no longer blocks the close.
+    // An interaction already due is expired first — or, when its response was
+    // admitted but the resume went stale, recovered as abandoned — so its
+    // terminal admission is cancelled and its turn settled, and it no longer
+    // blocks the close. A resume still running here is left to finish.
     const due = this._record.pendingResume;
-    if (due !== undefined && due.resumedAt === undefined && this._pendingInteractionDueAt(due) <= Date.now()) {
+    if (due !== undefined && this._pendingInteractionDueAt(due) <= Date.now()) {
       await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(due), {
         drainQueue: false,
         whileClosing: true,
@@ -8634,7 +8638,9 @@ export class Session {
             },
             // A reservation lands only while the open session's lease still
             // names this process: a stalled one never lands pending on a
-            // session another process has since adopted or closed.
+            // session another process has since adopted or closed. The fence
+            // is ownership, not liveness: `_dispatchClaimStillHeld` enforces
+            // liveness before dispatch.
             { compatibleAdmissionHashes, leaseOwner: { ownerId: this._harness.ownerId } },
           ),
           activeTurnWaiter.promise,
@@ -8808,9 +8814,11 @@ export class Session {
         }
       } catch (err) {
         const rejection =
-          err instanceof HarnessStorageLeaseConflictError
-            ? new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt)
-            : err;
+          err instanceof HarnessStorageSessionClosedError
+            ? new HarnessSessionClosedError(this.id)
+            : err instanceof HarnessStorageLeaseConflictError
+              ? new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt)
+              : err;
         failOwnedMessageTurnBeforeDispatch(rejection);
         // §13.3f.1 — message() is a public §4.2b boundary; the admission
         // reservation write can reject with a raw storage error. Redact before
@@ -9559,7 +9567,13 @@ export class Session {
           evidence.error.code === 'harness.terminal_cancelled' &&
           opts.executionAuthorityGrant !== undefined
         ) {
-          throw new HarnessTerminalHandoffCancelledError(opts.executionAuthorityGrant.key);
+          const terminalError = new HarnessTerminalHandoffCancelledError(opts.executionAuthorityGrant.key);
+          try {
+            opts.onTerminalCommitError?.(terminalError);
+          } catch {
+            // The terminal outcome below is authoritative.
+          }
+          throw terminalError;
         }
         if (opts.stream === true) {
           if (evidence.status === 'pending') {
@@ -10093,9 +10107,20 @@ export class Session {
         updatedAt: Date.now(),
       });
       if (!swapped.applied) this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-    } catch {
+    } catch (err) {
       // The admission is already cancelled; its row is left to recovery.
+      console.error('[harness/v1] cancelled terminal turn settlement failed; recovery will settle it:', err);
       this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+      if (this._state !== 'live' && this._state !== 'closing') return;
+      this._emitter.emit({
+        type: 'storage_error',
+        operation: 'message_log',
+        retryable: true,
+        error: { code: 'harness.storage', message: 'cancelled terminal turn settlement failed' },
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        harnessName: this._record.harnessName,
+      } as EmitInput);
     }
   }
 

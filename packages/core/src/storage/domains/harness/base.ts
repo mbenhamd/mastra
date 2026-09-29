@@ -199,10 +199,12 @@ export interface WriteMessageResultEvidenceOptions {
   /**
    * Write only while the session is open and its lease still names this
    * owner, judged when the write commits; otherwise throw
-   * `HarnessStorageLeaseConflictError` and write nothing. A lease that expired
-   * without another owner taking it still names this owner (as `saveSession`
-   * treats it): no other process can have recovered or closed the session.
-   * Adapters without dispatch recovery may ignore it.
+   * `HarnessStorageSessionClosedError` (closed) or
+   * `HarnessStorageLeaseConflictError` (another owner) and write nothing. A
+   * lease that expired without another owner taking it still names this owner
+   * (as `saveSession` treats it): no other process can have recovered or
+   * closed the session. The fence is ownership, not liveness. Adapters without
+   * dispatch recovery may ignore it.
    */
   leaseOwner?: HarnessSessionLeasePrecondition;
 }
@@ -457,6 +459,18 @@ export class HarnessStorageAttachmentByteOwnerError extends HarnessStorageDomain
     public readonly attachmentId: string,
   ) {
     super(`Attachment "${attachmentId}" for session "${sessionId}" has no verified external byte owner`);
+  }
+}
+
+/**
+ * Thrown by an owner-fenced write (a message reservation) when the targeted
+ * session is already closed.
+ */
+export class HarnessStorageSessionClosedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageSessionClosedError';
+  readonly code = 'harness.storage.session_closed' as const;
+  constructor(public readonly sessionId: string) {
+    super(`Session "${sessionId}" is closed`);
   }
 }
 

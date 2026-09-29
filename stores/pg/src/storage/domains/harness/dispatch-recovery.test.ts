@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
-import { HarnessStorageLeaseConflictError, TABLE_HARNESS_MESSAGE_RESULTS } from '@mastra/core/storage';
+import {
+  HarnessStorageLeaseConflictError,
+  HarnessStorageSessionClosedError,
+  TABLE_HARNESS_MESSAGE_RESULTS,
+} from '@mastra/core/storage';
 import type {
   AgentSignalDispatchState,
   AgentSignalResultEvidence,
@@ -472,7 +476,7 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       { harnessName: HARNESS, ownerId: 'owner-closed', ifVersion: closed.version },
     );
     await expect(reserve(pendingMessage(closed, 'closed'), 'owner-closed')).rejects.toBeInstanceOf(
-      HarnessStorageLeaseConflictError,
+      HarnessStorageSessionClosedError,
     );
 
     const remaining = await harness().listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });

@@ -17,6 +17,7 @@ import {
   HarnessStorageChannelOutboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
+  HarnessStorageSessionClosedError,
   HarnessStorageParentSessionUnavailableError,
   HarnessStoragePlanTaskNotFoundError,
   HarnessStoragePlanTaskVersionConflictError,
@@ -1575,7 +1576,8 @@ export class InMemoryHarness extends HarnessStorage {
     };
     if (options.leaseOwner !== undefined) {
       const session = this.db.harnessSessions.get(sessionKey(namespacedRecord.harnessName, namespacedRecord.sessionId));
-      if (session === undefined || session.closedAt !== undefined || session.ownerId !== options.leaseOwner.ownerId) {
+      if (session?.closedAt !== undefined) throw new HarnessStorageSessionClosedError(namespacedRecord.sessionId);
+      if (session === undefined || session.ownerId !== options.leaseOwner.ownerId) {
         throw new HarnessStorageLeaseConflictError(
           namespacedRecord.sessionId,
           session?.ownerId ?? '',

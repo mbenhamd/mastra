@@ -18,6 +18,7 @@ import {
   HarnessStorageChannelOutboxTransitionError,
   HarnessStorageDeleteGuardConflictError,
   HarnessStorageLeaseConflictError,
+  HarnessStorageSessionClosedError,
   HarnessStorageParentSessionUnavailableError,
   HarnessStoragePlanTaskNotFoundError,
   HarnessStoragePlanTaskVersionConflictError,
@@ -4908,9 +4909,12 @@ export class HarnessPG extends HarnessStorage {
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
         args: [id],
       });
+      if (options.leaseOwner !== undefined && leaseRow?.closed_at != null) {
+        throw new HarnessStorageSessionClosedError(namespacedRecord.sessionId);
+      }
       if (
         options.leaseOwner !== undefined &&
-        (leaseRow === undefined || leaseRow.closed_at != null || leaseRow.owner_id !== options.leaseOwner.ownerId)
+        (leaseRow === undefined || leaseRow.owner_id !== options.leaseOwner.ownerId)
       ) {
         throw new HarnessStorageLeaseConflictError(
           namespacedRecord.sessionId,
