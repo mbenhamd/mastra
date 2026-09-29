@@ -1,6 +1,6 @@
 {
   "name": "@mastra/deployer",
-  "version": "1.67.0-alpha.3",
+  "version": "1.72.0-alpha.3",
   "description": "",
   "type": "module",
   "files": [
@@ -109,10 +109,11 @@
     "empathic": "^2.0.0",
     "esbuild": "^0.28.0",
     "execa": "^9.6.1",
+    "find-up-simple": "^1.0.1",
     "find-workspaces": "^0.3.1",
     "fs-extra": "^11.3.5",
     "gray-matter": "^4.0.3",
-    "hono": "^4.12.8",
+    "hono": "^4.13.7",
     "ignore": "^7.0.5",
     "local-pkg": "^1.1.2",
     "resolve.exports": "^2.0.3",
@@ -122,7 +123,7 @@
     "strip-json-comments": "^5.0.3",
     "tinyglobby": "^0.2.17",
     "typescript-paths": "^1.5.2",
-    "ws": "^8.21.0",
+    "ws": "^8.21.3",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
@@ -152,7 +153,7 @@
     "zod": "catalog:"
   },
   "peerDependencies": {
-    "@mastra/core": ">=1.50.0-0 <2.0.0-0"
+    "@mastra/core": ">=1.58.0-0 <2.0.0-0"
   },
   "homepage": "https://mastra.ai",
   "repository": {

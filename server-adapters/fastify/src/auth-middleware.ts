@@ -87,6 +87,10 @@ export function createAuthMiddleware({
       buildAuthorizeContext: getWebRequest,
     });
 
+    for (const [key, value] of Object.entries(result.headers ?? {})) {
+      reply.header(key, value);
+    }
+
     if (result.action === 'error') {
       return reply.status(result.status).send(result.body);
     }

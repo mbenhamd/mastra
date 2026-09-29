@@ -760,8 +760,8 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
           suspendedToolName: '',
         };
         const memory = {
-          thread: randomUUID(),
-          resource: randomUUID(),
+          thread: globalThis.crypto.randomUUID(),
+          resource: globalThis.crypto.randomUUID(),
         };
         const stream = await agentOne.stream('Find the name, age and profession of the user - Dero Israel', {
           memory,
@@ -871,8 +871,8 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
           suspendedToolName: '',
         };
         const memory = {
-          thread: randomUUID(),
-          resource: randomUUID(),
+          thread: globalThis.crypto.randomUUID(),
+          resource: globalThis.crypto.randomUUID(),
         };
         const stream = await agentOne.stream('Find the name, email, age and profession of the user - Dero Israel', {
           memory,
@@ -969,8 +969,8 @@ export function toolApprovalAndSuspensionTests(version: 'v1' | 'v2') {
         const agentOne = mastra.getAgent('userAgent');
 
         const memory = {
-          thread: randomUUID(),
-          resource: randomUUID(),
+          thread: globalThis.crypto.randomUUID(),
+          resource: globalThis.crypto.randomUUID(),
         };
         const output = await agentOne.generate('Find the name, age and profession of the user - Dero Israel', {
           memory,

@@ -371,11 +371,11 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
       expect((span as any).type).toBe(SpanType.MEMORY_OPERATION);
       expect((span as any).attributes?.operationType).toBe('recall');
       expect((span as any).entityId).toBe('declaring-stream');
-      // The executor's own pipeline facts still survive the retyping. These
-      // spans come from the processor workflow, so the executor reads
-      // 'workflow'; the legacy ProcessorState path is covered by a unit test
-      // in @mastra/core, since no agent-level run reaches it.
-      expect((span as any).attributes?.processorExecutor).toBe('workflow');
+      // The executor's own pipeline facts still survive the retyping. In this
+      // fork a lone processor is not wrapped in a synthetic processor workflow
+      // (PF-2236: ProcessorRunner dispatches it directly), so these spans come
+      // from the ProcessorState path and the executor reads 'legacy'.
+      expect((span as any).attributes?.processorExecutor).toBe('legacy');
     }
 
     // The default label must be gone, not merely supplemented.

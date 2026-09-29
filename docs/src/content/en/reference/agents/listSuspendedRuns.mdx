@@ -217,6 +217,8 @@ This core method provides neither an HTTP server route nor a client SDK method. 
 
 Run snapshots are only persisted while a run is waiting on input and are deleted when it finishes, so suspended runs are the only runs discoverable from storage. With the default in-memory store, snapshots are lost on restart.
 
+The `threadId` and `resourceId` filters are pushed down to the storage query where the adapter supports it. `@mastra/pg` and `@mastra/libsql` narrow matching runs inside the database instead of loading every suspended snapshot, and the in-memory store filters its in-memory records. Other storage adapters apply these filters in-process after fetching. Results are identical either way.
+
 ## Related
 
 - [Agent approval](/docs/agents/human-in-the-loop)

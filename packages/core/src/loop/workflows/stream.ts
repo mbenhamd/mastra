@@ -4,12 +4,14 @@ import { beginGoalActivity, stopGoalActivity } from '../../agent/goal';
 import type { MastraDBMessage } from '../../agent/message-list';
 import { readToolSurfaceFence } from '../../agent/tool-surface-fence';
 import { getErrorFromUnknown } from '../../error';
+import { validateModelTimeoutSettings } from '../../llm/model/model-settings';
 import { ConsoleLogger } from '../../logger';
 import { createObservabilityContext } from '../../observability';
 import { ProcessorRunner, outputProcessorsSupportStream } from '../../processors/runner';
 import type { ProcessorState } from '../../processors/runner';
 import { RequestContext } from '../../request-context';
 import { safeClose, safeEnqueue } from '../../stream/base';
+import { getChunkProducedAt, stampChunkProducedAt } from '../../stream/base/produced-at';
 import type { ChunkType } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
 import { hydrateRunScopeFromInternal } from '../hydrate-run-scope';
@@ -37,7 +39,19 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
   ...rest
 }: LoopRun<Tools, OUTPUT>) {
   return new ReadableStream<ChunkType<OUTPUT>>({
-    start: async controller => {
+    start: async streamController => {
+      // Stamp chunks when the loop produces them; consumers may read them much later.
+      const controller: ReadableStreamDefaultController<ChunkType<OUTPUT>> = {
+        enqueue: chunk => {
+          if (getChunkProducedAt(chunk) === undefined) stampChunkProducedAt(chunk, Date.now());
+          streamController.enqueue(chunk);
+        },
+        close: () => streamController.close(),
+        error: reason => streamController.error(reason),
+        get desiredSize() {
+          return streamController.desiredSize;
+        },
+      };
       // Normalize requestContext so data-chunk processors and the agentic loop share the same instance
       const requestContext = rest.requestContext ?? new RequestContext();
 
@@ -263,19 +277,34 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
       // Bound the whole run (every loop iteration, tool call and retry) by composing the
       // caller's abort signal with modelSettings.timeout.totalMs. Everything downstream
       // reads `options.abortSignal`, so injecting here covers the entire agentic loop.
+      const timeout = validateModelTimeoutSettings(modelSettings?.timeout);
       const {
         signal: totalTimeoutSignal,
         timeoutPromise: totalTimeoutPromise,
         cleanup: cleanupTotalTimeout,
       } = createTimeoutAbortSignal({
         parentSignal: rest.options?.abortSignal,
-        timeoutMs: modelSettings?.timeout?.totalMs,
+        timeoutMs: timeout?.totalMs,
         timeoutType: 'total',
       });
 
-      const restWithTimeoutSignal = totalTimeoutPromise
-        ? { ...rest, options: { ...rest.options, abortSignal: totalTimeoutSignal } }
-        : rest;
+      // A run-owned signal linked to the caller's. Callers often reuse one long-lived signal
+      // across many runs, so run internals listen here rather than on the caller's signal;
+      // the single link back is removed in the `finally` below. Tools and sub-agents still
+      // receive the caller's signal unchanged through `options.abortSignal`.
+      const upstreamAbortSignal = totalTimeoutPromise ? totalTimeoutSignal : rest.options?.abortSignal;
+      const runAbortController = upstreamAbortSignal ? new AbortController() : undefined;
+      const onUpstreamAbort = () => runAbortController?.abort(upstreamAbortSignal?.reason);
+      if (upstreamAbortSignal?.aborted) {
+        onUpstreamAbort();
+      } else {
+        upstreamAbortSignal?.addEventListener('abort', onUpstreamAbort, { once: true });
+      }
+
+      const restWithTimeoutSignal = {
+        ...(totalTimeoutPromise ? { ...rest, options: { ...rest.options, abortSignal: totalTimeoutSignal } } : rest),
+        runAbortSignal: runAbortController?.signal,
+      };
 
       const agenticLoopWorkflow = createAgenticLoopWorkflow<Tools, OUTPUT>({
         resumeContext,
@@ -569,6 +598,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
 
         safeClose(controller);
       } finally {
+        upstreamAbortSignal?.removeEventListener('abort', onUpstreamAbort);
         cleanupTotalTimeout();
         await stopGoalActivity({ agentId, runId, now: _internal?.now });
         if (!keepRegisteredForResume) {

@@ -12,6 +12,8 @@ import { TripWire } from '../agent/trip-wire';
 import { MastraFGAPermissions, getWorkflowFGAResourceId, requireFGA } from '../auth/ee';
 import type { ActorSignal } from '../auth/ee';
 import { MastraBase } from '../base';
+import type { ClassifierQuestions } from '../classifier';
+import { Classifier } from '../classifier';
 import { RequestContext } from '../di';
 import { ErrorCategory, ErrorDomain, MastraError, MastraNonRetryableError, getErrorFromUnknown } from '../error';
 import type { MastraScorers } from '../evals';
@@ -30,6 +32,7 @@ import {
   getRootExportSpan,
   resolveObservabilityContext,
 } from '../observability';
+import { initContextStorage } from '../observability/context-storage';
 import { executeWithContext } from '../observability/utils';
 import type {
   OutputResult,
@@ -38,7 +41,7 @@ import type {
   ProcessorStreamWriter,
   ProcessorStreamWriterOptions,
 } from '../processors';
-import { ProcessorRunner, ProcessorState } from '../processors/runner';
+import { OUTPUT_STREAM_HOOK_DURATION_KEY_PREFIX, ProcessorRunner, ProcessorState } from '../processors/runner';
 import { createProcessorSendSignal } from '../processors/send-signal';
 import {
   resolveProcessorSpanAttributes,
@@ -71,6 +74,7 @@ import type { DynamicArgument } from '../types';
 import { PROCESSOR_EXECUTION_SYMBOL, PUBSUB_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from './constants';
 import { DefaultExecutionEngine } from './default';
 import { getAdmittedJsonSchema } from './dynamic/admitted-schema-source';
+import type { ClassifierStepOutput } from './entry-executors';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
 import {
   createWorkflowExecutionGeneration,
@@ -98,8 +102,8 @@ import type {
   Step,
   SuspendOptions,
 } from './step';
-import { createMappingStep, createStepFromAgent, createStepFromTool } from './step-factories';
-import type { AgentStepOptions } from './step-factories';
+import { createMappingStep, createStepFromAgent, createStepFromClassifier, createStepFromTool } from './step-factories';
+import type { AgentStepOptions, ClassifierStepOptions } from './step-factories';
 import type {
   DefaultEngineType,
   DynamicMapping,
@@ -172,8 +176,9 @@ const transientProcessorPubSub = new TransientProcessorPubSub();
 // Re-exported so the public `@mastra/core/workflows` surface (and existing
 // `./workflow` imports) are unchanged; the factories live in `step-factories.ts`
 // so the execution engines can use them without importing this module.
-export { createMappingStep, createStepFromAgent, createStepFromTool } from './step-factories';
-export type { AgentStepOptions } from './step-factories';
+export { createMappingStep, createStepFromAgent, createStepFromClassifier, createStepFromTool } from './step-factories';
+export type { AgentStepOptions, ClassifierStepOptions } from './step-factories';
+export type { ClassifierStepOutput } from './entry-executors';
 
 /**
  * Extract the JSON-safe subset of an agent-step options bag for the in-process
@@ -244,6 +249,31 @@ function serializeToolStepFields(options: any): { options?: { retries?: number; 
   if (typeof options?.retries === 'number') opts.retries = options.retries;
   if (options?.metadata && typeof options.metadata === 'object') opts.metadata = options.metadata;
   return Object.keys(opts).length > 0 ? { options: opts } : {};
+}
+
+type SerializedClassifierStepFields = {
+  options?: {
+    retries?: number;
+    metadata?: StepMetadata;
+    maxRetries?: number;
+    providerOptions?: Record<string, Record<string, unknown>>;
+  };
+};
+
+function serializeClassifierStepFields(
+  options: ClassifierStepOptions<any> | undefined,
+): SerializedClassifierStepFields {
+  const out: SerializedClassifierStepFields = {};
+  const opts: NonNullable<SerializedClassifierStepFields['options']> = {};
+  if (typeof options?.retries === 'number') opts.retries = options.retries;
+  if (options?.metadata && typeof options.metadata === 'object') opts.metadata = options.metadata;
+  if (typeof options?.maxRetries === 'number') opts.maxRetries = options.maxRetries;
+  if (options?.providerOptions && typeof options.providerOptions === 'object') {
+    opts.providerOptions = options.providerOptions;
+  }
+  if (Object.keys(opts).length > 0) out.options = opts;
+
+  return out;
 }
 
 export function mapVariable<TStep extends Step<string, any, any, any, any, any>>({
@@ -445,6 +475,12 @@ export function createStep<
   },
 ): Step<TId, unknown, TSchemaIn, TSchemaOut, TSuspend, TResume, DefaultEngineType, TRequestContext>;
 
+/** Creates a workflow step from a configured Classifier. */
+export function createStep<const QUESTIONS extends ClassifierQuestions, TStepInput = unknown>(
+  classifier: Classifier<QUESTIONS>,
+  options?: ClassifierStepOptions<TStepInput>,
+): Step<string, unknown, TStepInput, ClassifierStepOutput<QUESTIONS>, unknown, unknown, DefaultEngineType>;
+
 /**
  * Creates a step from a Processor - wraps a Processor as a workflow step
  * Note: We require at least one processor method to distinguish from StepParams
@@ -510,6 +546,10 @@ export function createStep<
 export function createStep(params: any, agentOrToolOptions?: any): Step<any, any, any, any, any, any, any> {
   // Type assertions are needed because each branch returns a different Step type,
   // but the overloads ensure type safety for consumers
+  if (params instanceof Classifier) {
+    return createStepFromClassifier(params, agentOrToolOptions);
+  }
+
   if (isAgentCompatible(params)) {
     return createStepFromAgent(params, agentOrToolOptions);
   }
@@ -616,6 +656,8 @@ type StepWithRefMetadata = Step<string, any, any, any, any, any, any, any> & {
   __agentOptions?: unknown;
   __toolRef?: { id: string };
   __toolOptions?: unknown;
+  __classifierRef?: Classifier<any>;
+  __classifierOptions?: ClassifierStepOptions<any>;
 };
 
 /**
@@ -636,6 +678,15 @@ function toSingleStepEntry(step: StepWithRefMetadata): SingleStepEntry {
   }
   if (step?.component === 'TOOL' && step.__toolRef) {
     return { type: 'tool', id: step.id, toolId: step.__toolRef.id, tool: step.__toolRef, options: step.__toolOptions };
+  }
+  if (step?.component === 'CLASSIFIER' && step.__classifierRef) {
+    return {
+      type: 'classifier',
+      id: step.id,
+      classifierId: step.__classifierRef.id,
+      classifier: step.__classifierRef,
+      options: step.__classifierOptions,
+    };
   }
   return { type: 'step', step: step as unknown as Step };
 }
@@ -658,6 +709,14 @@ function toSerializedSingleStepEntry(step: StepWithRefMetadata): SerializedSingl
       toolId: step.__toolRef.id,
       description: step.description,
       ...serializeToolStepFields(step.__toolOptions),
+    };
+  }
+  if (step?.component === 'CLASSIFIER' && step.__classifierRef) {
+    return {
+      type: 'classifier',
+      id: step.id,
+      classifierId: step.__classifierRef.id,
+      ...serializeClassifierStepFields(step.__classifierOptions),
     };
   }
   if ((step as any)?.component === 'WORKFLOW') {
@@ -799,6 +858,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
       // we need access to all possible properties
       const input = inputData as ProcessorStepOutput & {
         processorStates?: Map<string, ProcessorState>;
+        llmRequestProcessorIds?: ReadonlySet<string>;
         abortSignal?: AbortSignal;
         agent?: Agent;
       };
@@ -838,6 +898,8 @@ export function createStepFromProcessor<TProcessorId extends string>(
         providerExecuted,
         // Shared processor states map for accessing persisted state
         processorStates,
+        // Processors whose processLLMRequest runs after this inputStep phase
+        llmRequestProcessorIds,
         // Abort signal for cancelling in-flight processor work (e.g. OM observations)
         abortSignal,
         // Agent reference so processors can access the running agent (e.g. on signal/schedule wake)
@@ -1048,7 +1110,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
               entityName: processor.name ?? processor.id,
               input: buildProcessorSpanInput(),
               attributes: {
-                ...resolveProcessorSpanAttributes(processor, toProcessorSpanPhase(phase)),
+                ...resolveProcessorSpanAttributes(processor, phase),
                 processorExecutor: 'workflow',
                 // Read processorIndex from processor (set in combineProcessorsIntoWorkflow)
                 processorIndex: processor.processorIndex,
@@ -1136,6 +1198,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
         streamParts,
         state: processorState,
         processorStates,
+        llmRequestProcessorIds,
         result: outputResult,
         finishReason,
         providerMetadata,
@@ -1166,17 +1229,30 @@ export function createStepFromProcessor<TProcessorId extends string>(
       // Uses executeWithContext to set the processor span as the active OTEL context,
       // so auto-instrumented operations inside processors nest correctly under the span.
       const executePhaseWithSpan = async <T>(fn: () => Promise<T>): Promise<T> => {
+        // Recorded around the phase rather than per branch below: every phase can
+        // mutate the list, and the legacy runner records the same log, so a trace
+        // would otherwise show or hide a processor's edits depending only on which
+        // executor ran it.
+        const recordingList = processorSpan ? processorMessageList : undefined;
+        if (recordingList) initContextStorage();
+        recordingList?.startRecording(processorSpan);
+        const takeMutations = () => {
+          const mutations = recordingList?.stopRecording(processorSpan) ?? [];
+          return mutations.length > 0 ? { messageListMutations: mutations } : undefined;
+        };
         try {
           const result = await executeWithContext({ span: processorSpan, fn });
-          processorSpan?.end({ output: buildProcessorSpanOutput(result) });
+          processorSpan?.end({ output: buildProcessorSpanOutput(result), attributes: takeMutations() });
           return result;
         } catch (error) {
+          const mutationAttributes = takeMutations();
           // TripWire errors should end span but bubble up to halt the workflow
           if (error instanceof TripWire) {
             processorSpan?.error({
               error,
               endSpan: true,
               attributes: {
+                ...mutationAttributes,
                 tripwireAbort: {
                   reason: error.message,
                   retry: error.options?.retry,
@@ -1185,7 +1261,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
               },
             });
           } else {
-            processorSpan?.error({ error: error as Error, endSpan: true });
+            processorSpan?.error({ error: error as Error, endSpan: true, attributes: mutationAttributes });
           }
           throw error;
         }
@@ -1302,6 +1378,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
                 steps: steps ?? [],
                 messageId: currentMessageId,
                 rotateResponseMessageId: rotateCurrentResponseMessageId,
+                llmRequestStage: llmRequestProcessorIds?.has(processor.id) || undefined,
               });
 
               const validatedResult = await ProcessorRunner.validateAndFormatProcessInputStepResult(result, {
@@ -1357,7 +1434,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
                   entityId: processor.id,
                   entityName: processor.name ?? processor.id,
                   attributes: {
-                    ...resolveProcessorSpanAttributes(processor, 'output'),
+                    ...resolveProcessorSpanAttributes(processor, 'outputStream'),
                     processorExecutor: 'workflow',
                     processorIndex: processor.processorIndex,
                   },
@@ -1372,16 +1449,24 @@ export function createStepFromProcessor<TProcessorId extends string>(
 
               // Handle outputStream span lifecycle explicitly (not via executePhaseWithSpan)
               // because outputStream uses a per-processor span stored in mutableState
+              // Accumulates time spent inside the hook across chunks, beside the span.
+              const hookDurationKey = `${OUTPUT_STREAM_HOOK_DURATION_KEY_PREFIX}${processor.id}`;
+              const readHookDurationMs = () => (mutableState[hookDurationKey] as number | undefined) ?? 0;
               let result: ChunkType | null | undefined;
               try {
-                result = await processor.processOutputStream({
-                  ...baseContext,
-                  ...processorObservabilityContext,
-                  part: part as ChunkType,
-                  streamParts: (streamParts ?? []) as ChunkType[],
-                  state: mutableState,
-                  messageList: passThrough.messageList, // Optional for stream processing
-                });
+                const hookStart = performance.now();
+                try {
+                  result = await processor.processOutputStream({
+                    ...baseContext,
+                    ...processorObservabilityContext,
+                    part: part as ChunkType,
+                    streamParts: (streamParts ?? []) as ChunkType[],
+                    state: mutableState,
+                    messageList: passThrough.messageList, // Optional for stream processing
+                  });
+                } finally {
+                  mutableState[hookDurationKey] = readHookDurationMs() + (performance.now() - hookStart);
+                }
 
                 // Shared runtime state owns a span across chunks. Without it,
                 // this invocation owns the span and must end it directly.
@@ -1399,6 +1484,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
                 } else {
                   processorSpan?.end({
                     output: { totalChunks: (streamParts ?? []).length },
+                    attributes: { hookDurationMs: readHookDurationMs() },
                   });
                 }
               } catch (error) {
@@ -1409,6 +1495,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
                     error,
                     endSpan: true,
                     attributes: {
+                      hookDurationMs: readHookDurationMs(),
                       tripwireAbort: {
                         reason: error.message,
                         retry: error.options?.retry,
@@ -1429,6 +1516,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
                   const spanError = {
                     error: error as Error,
                     endSpan: true,
+                    attributes: { hookDurationMs: readHookDurationMs() },
                   };
                   if (processorRuntimeState) {
                     processorRuntimeState.errorWorkflowOutputStreamSpan(processor.id, spanError);
@@ -1911,6 +1999,7 @@ export class Workflow<
       // in createRun(), so explicit and custom-generated IDs can fall back to
       // this configured policy.
       shouldPersistSnapshot: options.shouldPersistSnapshot ?? (this.type === 'processor' ? () => false : () => true),
+      evaluatePersistencePredicateBeforeDurableOperation: options.evaluatePersistencePredicateBeforeDurableOperation,
       allowUnclaimedResumes: options.allowUnclaimedResumes,
       pruneSnapshot: options.pruneSnapshot,
       tracingPolicy: options.tracingPolicy,
@@ -1997,6 +2086,9 @@ export class Workflow<
         case 'tool':
           this.steps[entry.id] = { id: entry.id, component: 'TOOL' } as any;
           return;
+        case 'classifier':
+          this.steps[entry.id] = { id: entry.id, component: 'CLASSIFIER' } as any;
+          return;
         case 'mapping':
           this.steps[entry.id] = createMappingStep(entry.id, entry.mapConfig as MappingConfig) as any;
           return;
@@ -2014,6 +2106,7 @@ export class Workflow<
       case 'step':
       case 'agent':
       case 'tool':
+      case 'classifier':
       case 'mapping':
         register(live);
         return;
@@ -2072,6 +2165,63 @@ export class Workflow<
       TRequestContext,
       TRawInput
     >;
+  }
+
+  /** Adds a configured classifier as a declarative workflow step. */
+  classifier<const QUESTIONS extends ClassifierQuestions>(
+    classifier: Classifier<QUESTIONS>,
+    options?: ClassifierStepOptions<TPrevSchema>,
+    stepOptions?: { id?: string },
+  ): Workflow<
+    TEngineType,
+    TSteps,
+    TWorkflowId,
+    TState,
+    TInput,
+    TOutput,
+    ClassifierStepOutput<QUESTIONS>,
+    TRequestContext
+  >;
+  classifier<const QUESTIONS extends ClassifierQuestions = ClassifierQuestions>(
+    classifierId: string,
+    options?: ClassifierStepOptions<TPrevSchema>,
+    stepOptions?: { id?: string },
+  ): Workflow<
+    TEngineType,
+    TSteps,
+    TWorkflowId,
+    TState,
+    TInput,
+    TOutput,
+    ClassifierStepOutput<QUESTIONS>,
+    TRequestContext
+  >;
+  classifier(
+    classifierOrId: Classifier<any> | string,
+    options?: ClassifierStepOptions<any>,
+    stepOptions?: { id?: string },
+  ): any {
+    const isId = typeof classifierOrId === 'string';
+    const classifierId = isId ? classifierOrId : classifierOrId.id;
+    const id = stepOptions?.id ?? options?.id ?? classifierId;
+    const entry = {
+      type: 'classifier' as const,
+      id,
+      classifierId,
+      classifier: isId ? undefined : classifierOrId,
+      options,
+    };
+    this.stepFlow.push(entry as any);
+    this.serializedStepFlow.push({
+      type: 'classifier',
+      id,
+      classifierId,
+      ...serializeClassifierStepFields(options),
+    });
+    this.steps[id] = isId
+      ? ({ id, component: 'CLASSIFIER' } as any)
+      : ({ ...createStepFromClassifier(classifierOrId, { ...options, id }), id } as any);
+    return this as any;
   }
 
   /**
@@ -5752,7 +5902,12 @@ export class Run<
     ).then(result => {
       if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
         this.workflowRunStatus = result.status;
-        if (!params.isVNext && result.status !== 'suspended') this.closeStreamAction?.().catch(() => {});
+        if (!params.isVNext && result.status !== 'suspended') {
+          this.closeStreamAction?.().catch(() => {});
+        }
+        if (result.status !== 'suspended') {
+          this.cleanup?.();
+        }
       }
       result.traceId = traceId;
       result.spanId = spanId;

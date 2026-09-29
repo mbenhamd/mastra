@@ -1,6 +1,14 @@
 import type { DurableAgenticWorkflowInput } from '../types';
 
-export function mapDurableIterationToLLMInput(state: DurableAgenticWorkflowInput & { iterationCount?: number }) {
+/** Accumulated step records threaded to processor hooks (#24293 parity with the main loop). */
+export type DurableAccumulatedStep = Record<string, unknown>;
+
+export function mapDurableIterationToLLMInput(
+  state: DurableAgenticWorkflowInput & {
+    iterationCount?: number;
+    accumulatedSteps?: DurableAccumulatedStep[];
+  },
+) {
   return {
     runId: state.runId,
     runtimeBindingId: state.runtimeBindingId,
@@ -19,6 +27,10 @@ export function mapDurableIterationToLLMInput(state: DurableAgenticWorkflowInput
     state: state.state,
     messageId: state.messageId,
     stepIndex: state.iterationCount ?? state.stepIndex,
+    // Processor hooks receive the running step list (#24293) — the
+    // llm-execution step reads this for stepNumber/steps parity with the
+    // main loop.
+    accumulatedSteps: state.accumulatedSteps,
     agentSpanData: state.agentSpanData,
     modelSpanData: state.modelSpanData,
     requestContextEntries: state.requestContextEntries,

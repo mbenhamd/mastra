@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { stepCountIs } from '@internal/ai-sdk-v5';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { UnixSocketPubSub } from '../../../../events/unix-socket-pubsub';
 import { createTool } from '../../../../tools';
@@ -27,6 +27,7 @@ describe('AIMock loop scenario: evented + UnixSocketPubSub', () => {
   const socketDirs: string[] = [];
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await Promise.allSettled(pubsubs.splice(0).map(p => p.close()));
     for (const dir of socketDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
@@ -64,12 +65,15 @@ describe('AIMock loop scenario: evented + UnixSocketPubSub', () => {
       }),
     });
 
+    // Plain-Agent evented route (prepare-stream RunScope plumbing): select the
+    // evented engine through MASTRA_EVENTED_EXECUTION rather than the shared
+    // `engine: 'evented'` leg, which now wraps the agent in EventedAgent.
+    vi.stubEnv('MASTRA_EVENTED_EXECUTION', 'true');
     const { output, requests } = await runLoopScenario({
       llm: getMock(),
       prompt: 'Look up the status for query alpha.',
       tools: { lookup_status: lookupTool },
       stopWhen: stepCountIs(5),
-      engine: 'evented',
       pubsub,
       fixtures: llm => {
         llm.on(

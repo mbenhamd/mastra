@@ -60,6 +60,7 @@ describe('output stream processor span teardown', () => {
     expect(legacyEnd).toHaveBeenCalledTimes(1);
     expect(legacyEnd).toHaveBeenCalledWith({
       output: { totalChunks: 2, accumulatedText: 'hello world' },
+      attributes: { hookDurationMs: expect.any(Number) },
     });
     expect(workflowEnd).toHaveBeenCalledTimes(1);
   });
@@ -130,7 +131,10 @@ describe('output stream processor span teardown', () => {
     expect(createChildSpan).toHaveBeenCalledTimes(2);
     for (const span of createChildSpan.mock.results.map(result => result.value)) {
       expect(span.end).toHaveBeenCalledTimes(1);
-      expect(span.end).toHaveBeenCalledWith({ output: { totalChunks: 1, accumulatedText: '' } });
+      expect(span.end).toHaveBeenCalledWith({
+        output: { totalChunks: 1, accumulatedText: '' },
+        attributes: { hookDurationMs: expect.any(Number) },
+      });
     }
     expect(processorStates.get(processor.id)?.customState.callCount).toBe(2);
     expect(streamPartCounts).toEqual([1, 2]);

@@ -15,10 +15,13 @@ import type {
   ThreadStateMutation,
 } from '@mastra/core/storage';
 
+import { schemaNamePrefix } from '../../../shared/schema-name';
 import type { DbClient, TxClient } from '../../client';
 import { PgDB, generateTableSQL, getSchemaName, resolvePgConfig } from '../../db';
 import type { PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
 import { resolveTargets, runPrune } from '../../retention';
+import { getTableName } from '../utils';
 
 type ThreadStateRow = { value: unknown };
 
@@ -64,8 +67,12 @@ export class ThreadStatePG extends ThreadStateStorage {
 
   async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
     if (policies.threadState) {
+      // Create the retention index on demand: only deployments that configure
+      // retention pay for the extra index. Best-effort — a failure here leaves
+      // pruning correct, just slower. The schema prefix is sanitized so it stays
+      // a safe identifier fragment (upstream schemaNamePrefix).
       try {
-        const prefix = this.#schema === 'public' ? '' : `${this.#schema}_`;
+        const prefix = this.#schema === 'public' ? '' : `${schemaNamePrefix(this.#schema)}_`;
         await this.#db.ensureIndex({
           indexName: `${prefix}mastra_thread_state_retention_idx`,
           tableName: TABLE_THREAD_STATE,
@@ -177,10 +184,15 @@ export class ThreadStatePG extends ThreadStateStorage {
          "value" = EXCLUDED."value",
          "updatedAt" = EXCLUDED."updatedAt",
          "updatedAtZ" = EXCLUDED."updatedAtZ"`,
-      [encodeThreadStateScope(args), args.type, JSON.stringify(value ?? null)],
+      [encodeThreadStateScope(args), args.type, toPgJson(value ?? null)],
     );
   }
 
+  // The fork's thread-state table reference: schema-qualified and quoted, with
+  // call sites using #table() so the fork's ThreadStateKey-scoped API keeps one
+  // resolution path. (Upstream switched to a get #table accessor and a
+  // threadId/type-only setState; the fork's mutateState advisory-lock contract
+  // and encoded scope stay authoritative here.)
   #table(): string {
     return `${getSchemaName(this.#schema)}."${TABLE_THREAD_STATE}"`;
   }

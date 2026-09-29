@@ -37,6 +37,7 @@ import type {
 } from '../types';
 import { safeClose, safeEnqueue } from './input';
 import { createJsonTextStreamTransformer, createObjectStreamTransformer } from './output-format-handlers';
+import { getChunkProducedAt, stampChunkProducedAt } from './produced-at';
 import { getTransformedSchema } from './schema';
 import { packStepMessageMirrors, unpackStepMessageMirrors } from './step-message-mirrors';
 import { dedupeStepRequests, rehydrateStepRequests } from './step-request-dedupe';
@@ -64,7 +65,17 @@ export function createDestructurableOutput<OUTPUT = undefined>(
   }) as MastraModelOutput<OUTPUT>;
 }
 
-function persistProcessorDataChunk(
+/**
+ * Persist a non-transient `data-*` chunk emitted by an output processor's
+ * `writer.custom()` onto the assistant message, so the chunk survives in
+ * thread history instead of being stream-only (#19375). Transient chunks
+ * and non-data chunks are left untouched.
+ *
+ * Exported for the durable engine, whose producer-side processor writers
+ * persist into the workflow-side MessageList (the one serialized into
+ * `messageListState` and flushed to memory at finalize).
+ */
+export function persistProcessorDataChunk(
   messageList: MessageList,
   messageId: string,
   chunk: { type: string; data?: unknown; transient?: boolean },
@@ -147,6 +158,12 @@ export type FullOutput<OUTPUT = undefined> = {
   totalUsage: PromiseResults<OUTPUT>['totalUsage'];
   /** The structured object output (when using structured output) */
   object: OUTPUT;
+  /**
+   * True when `object` is the configured `fallbackValue`, substituted because the model
+   * output failed schema validation — or the separate structuring model failed — under
+   * `errorStrategy: 'fallback'`.
+   */
+  usedFallbackValue: boolean;
   /** Error if the stream failed */
   error: Error | undefined;
   /** Tripwire data if content was blocked */
@@ -224,6 +241,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   };
   #bufferedText: LLMStepResult<OUTPUT>['text'][] = [];
   #bufferedObject: OUTPUT | undefined;
+  #usedFallbackValue = false;
   #bufferedTextChunks: Record<string, LLMStepResult<OUTPUT>['text'][]> = {};
   #bufferedSources: LLMStepResult<OUTPUT>['sources'] = [];
   #bufferedReasoning: LLMStepResult<OUTPUT>['reasoning'] = [];
@@ -237,6 +255,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       providerExecuted?: boolean;
       providerMetadata?: ProviderMetadata;
       dynamic?: boolean;
+      title?: string;
       observability?: ToolCallChunk['payload']['observability'];
     }
   > = {};
@@ -342,6 +361,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     initialState?: any;
   }) {
     super({ component: 'LLM', name: 'MastraModelOutput' });
+    if (options.logger) {
+      this.__setLogger(options.logger);
+    }
     this.#options = options;
     this.#transportRef = options.transportRef;
     this.#returnScorerData = !!options.returnScorerData;
@@ -615,6 +637,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               break;
             case 'object-result':
               self.#bufferedObject = chunk.object;
+              self.#usedFallbackValue = chunk.metadata?.fallback === true;
               // An output processor can still reject this attempt and ask for a retry,
               // which would make this object stale. A settled promise cannot be
               // un-settled, so when processors are in play the object is only buffered
@@ -648,6 +671,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 providerExecuted: chunk.payload.providerExecuted,
                 providerMetadata: chunk.payload.providerMetadata,
                 dynamic: chunk.payload.dynamic,
+                ...(chunk.payload.title ? { title: chunk.payload.title } : {}),
                 ...(chunk.payload.observability ? { observability: chunk.payload.observability } : {}),
               };
               break;
@@ -687,6 +711,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     providerExecuted: meta.providerExecuted,
                     providerMetadata: meta.providerMetadata,
                     dynamic: meta.dynamic,
+                    ...(meta.title ? { title: meta.title } : {}),
                     ...(meta.observability ? { observability: meta.observability } : {}),
                   },
                 };
@@ -926,6 +951,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               // the object promise now that the attempt has been accepted.
               if (stepTripwire?.retry) {
                 self.#bufferedObject = undefined;
+                self.#usedFallbackValue = false;
               } else if (self.#bufferedObject !== undefined && self.#delayedPromises.object.status.type === 'pending') {
                 self.#delayedPromises.object.resolve(self.#bufferedObject);
               }
@@ -1024,9 +1050,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               if (self.#status !== 'failed' && self.#status !== 'canceled') {
                 self.#status = 'success';
               }
-              // A provider/AI SDK may emit a synthetic stop finish while
-              // unwinding its aborted stream. The earlier abort chunk is the
-              // authoritative terminal and must remain visible in FullOutput.
+              // An aborted provider stream may finish with a synthetic stop or tripwire.
+              // The preceding abort remains authoritative: caller cancellation must not
+              // become a successful stop or a processor tripwire in FullOutput.
               if (self.#status === 'canceled') {
                 self.#finishReason = 'aborted';
               } else if (chunk.payload.stepResult.reason) {
@@ -1052,12 +1078,17 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 const outputSteps = chunk.payload.output?.steps;
                 const lastStep = outputSteps?.[outputSteps?.length - 1];
                 const stepTripwire = lastStep?.tripwire;
-                self.#tripwire = {
-                  reason: stepTripwire?.reason || 'Processor tripwire triggered',
-                  retry: stepTripwire?.retry,
-                  metadata: stepTripwire?.metadata,
-                  processorId: stepTripwire?.processorId,
-                };
+                // Don't synthesize a tripwire for a caller cancellation: aborts bail through this
+                // same 'tripwire' reason but carry no real step tripwire. Only surface a tripwire
+                // when an actual processor produced one (or when the run wasn't aborted).
+                if (self.#status !== 'canceled' || stepTripwire) {
+                  self.#tripwire = {
+                    reason: stepTripwire?.reason || 'Processor tripwire triggered',
+                    retry: stepTripwire?.retry,
+                    metadata: stepTripwire?.metadata,
+                    processorId: stepTripwire?.processorId,
+                  };
+                }
               }
 
               // Add structured output to the latest assistant message metadata
@@ -1123,6 +1154,22 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               const terminalProcessorChunks: ChunkType<OUTPUT>[] = [];
               let terminalDeliveryFailed = false;
               let terminalFailureReason: 'error' | 'other' = 'error';
+              // The onFinish writer runs after terminal commit, before the final finish chunk.
+              // Unlike the processor writer below, it must not buffer chunks for that commit.
+              // Emit to both fullStream/EventEmitter consumers and raw stream consumers.
+              const outputResultWriter = {
+                custom: async (
+                  data: { type: string; data?: unknown; transient?: boolean },
+                  writerOptions?: { messageId?: string },
+                ) => {
+                  if (data.type === 'data-terminal-tool-result') {
+                    throw new TypeError('data-terminal-tool-result is reserved for framework terminal delivery');
+                  }
+                  persistProcessorDataChunk(self.messageList, writerOptions?.messageId ?? self.messageId, data);
+                  self.#emitChunk(data as ChunkType<OUTPUT>);
+                  controller.enqueue(data as ChunkType<OUTPUT>);
+                },
+              };
               try {
                 const finishTerminalValue = (chunk.payload as { terminalToolResult?: unknown }).terminalToolResult;
                 const hasTerminalProtocol =
@@ -1575,6 +1622,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   ...(self.#terminalToolResult ? { terminalToolResult: self.#terminalToolResult } : {}),
                   // Custom properties (not part of standard callback)
                   ...(self.#model.modelId && self.#model.provider && self.#model.version ? { model: self.#model } : {}),
+                  usedFallbackValue: self.#usedFallbackValue,
                   object:
                     self.#delayedPromises.object.status.type === 'rejected'
                       ? undefined
@@ -1597,7 +1645,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   self.#finishCallbackSent = true;
                   if (self.#terminalToolResult) {
                     try {
-                      await options?.onFinish?.(onFinishPayload);
+                      await options?.onFinish?.(onFinishPayload, { writer: outputResultWriter });
                     } catch (callbackError) {
                       self.logger?.error?.('Terminal onFinish callback failed after commit', {
                         error: callbackError,
@@ -1605,7 +1653,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                       });
                     }
                   } else {
-                    await options?.onFinish?.(onFinishPayload);
+                    await options?.onFinish?.(onFinishPayload, { writer: outputResultWriter });
                   }
                 }
               }
@@ -2071,6 +2119,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       response: await this.response,
       totalUsage: await this.totalUsage,
       object: await this.object,
+      usedFallbackValue: this.#usedFallbackValue,
       error: this.error,
       tripwire: this.#tripwire,
       ...(scoringData ? { scoringData } : {}),
@@ -2234,6 +2283,18 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   _getImmediateObject() {
     return this.#bufferedObject;
   }
+
+  /**
+   * Whether the structured object is the configured `fallbackValue`, substituted because
+   * the model output failed schema validation — or the separate structuring model failed —
+   * under `errorStrategy: 'fallback'`.
+   *
+   * Starts `false` and reflects the most recently processed object. On a live stream, await
+   * `stream.object` or `stream.getFullOutput()` before reading it.
+   */
+  get usedFallbackValue(): boolean {
+    return this.#usedFallbackValue;
+  }
   /** @internal */
   _getImmediateUsage() {
     return this.#usageCount;
@@ -2368,6 +2429,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   }
 
   #emitChunk(chunk: ChunkType<OUTPUT>) {
+    if (getChunkProducedAt(chunk) === undefined) stampChunkProducedAt(chunk, Date.now());
     this.#bufferedChunks.push(chunk); // add to bufferedChunks for replay in new streams
     this.#emitter.emit('chunk', chunk); // emit chunk for existing listener streams
   }

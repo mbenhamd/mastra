@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../../../error';
 import type { PubSub } from '../../../../events/pubsub';
-import { ChunkFrom } from '../../../../stream/types';
+import { checkBackgroundTasks } from '../../../../loop/shared/steps/background-task-check-core';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { ensureRemoteAbortListener } from '../../abort-transport';
@@ -19,17 +19,22 @@ const bgCheckInputSchema = z.any();
 const bgCheckOutputSchema = z.any();
 
 /**
- * Create a durable background task check step.
+ * Create a durable background task check step. Behavior lives in the shared
+ * `checkBackgroundTasks` core; this glue owns registry/init-data access, the
+ * durable wait gate, and pubsub emission.
  *
- * Mirrors the regular agent's backgroundTaskCheckStep pattern:
- * - After tool calls complete, checks if any background tasks are still running
- * - If no running tasks: passes through unchanged
- * - If an explicit waitTimeoutMs is configured and retryCount === 0: returns
- *   immediately with backgroundTaskPending=true (caller drives continuation)
- * - Otherwise: waits for the next task to complete using the configured
- *   waitTimeoutMs or a 1 s default — this keeps the workflow (and its pubsub
- *   subscription) alive so background-task tool-result chunks are delivered
- * - When a task completes: sets isContinued=true so the LLM processes the result
+ * The durable wait gate differs from the main loop's on purpose: the regular
+ * agent can skip waiting because background tool-result chunks are pushed
+ * directly into the live ReadableStream controller — that works even after
+ * this step returns. The durable agent emits tool-result chunks via pubsub,
+ * and the subscription is torn down when the stream closes. If this step
+ * returned without waiting, the workflow would finish, FINISH would fire,
+ * cleanup would run, and the subscriber would be gone before the background
+ * task could deliver its result. Therefore the durable agent must always
+ * wait when tasks are running — using the configured waitTimeoutMs, or a 1 s
+ * default to keep the workflow (and pubsub) alive. It only signals pending
+ * without blocking on retryCount 0 when an explicit timeout is configured
+ * (meaning the caller drives continuation externally).
  */
 export function createDurableBackgroundTaskCheckStep() {
   return createStep({
@@ -78,114 +83,56 @@ export function createDurableBackgroundTaskCheckStep() {
       const registryEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
       const bgManager = registryEntry?.backgroundTaskManager;
 
-      if (!bgManager) {
-        return typedInput;
-      }
-
-      const runningResult = await bgManager.listTasks({
+      const outcome = await checkBackgroundTasks({
+        bgManager,
+        runId,
         agentId,
-        status: 'running',
         threadId: initData.state?.threadId,
         resourceId: initData.state?.resourceId,
+        skipWait: initData.options?.skipBgTaskWait,
+        retryCount,
+        resolveWaitMs: rc => {
+          const waitTimeoutMs = registryEntry?.backgroundTasksConfig?.waitTimeoutMs ?? bgManager?.config?.waitTimeoutMs;
+          return rc === 0 && waitTimeoutMs ? undefined : (waitTimeoutMs ?? 1000);
+        },
+        emitChunk: chunk => {
+          if (!pubsub) return;
+          return emitChunkEvent(pubsub, runId, chunk as any);
+        },
       });
-      const runningTasks = runningResult?.tasks;
 
-      if (!runningTasks || runningTasks.length === 0) {
-        return typedInput;
-      }
-
-      // Pending background work disqualifies a foreground terminal result.
-      // Its eventual output must remain observable and may require another
-      // provider turn after durable resume/replay.
-      const inputWithoutTerminal = { ...typedInput, terminalToolResult: undefined };
-
-      // When the outer caller drives continuation externally (e.g. streamUntilIdle),
-      // skip the in-loop wait. We still mark pending so ownstream knows.
-      if (initData.options?.skipBgTaskWait) {
-        return { ...inputWithoutTerminal, backgroundTaskPending: true };
-      }
-
-      const taskIds = runningTasks.map(task => task.id);
-
-      const bgConfig = registryEntry?.backgroundTasksConfig;
-      const managerConfig = bgManager.config;
-      const waitTimeoutMs = bgConfig?.waitTimeoutMs ?? managerConfig?.waitTimeoutMs;
-
-      // The regular agent gates on `retryCount === 0 || !waitTimeoutMs`
-      // and can afford to skip waiting because tool-result chunks from
-      // background tasks are pushed directly into the ReadableStream
-      // controller via safeEnqueue — that works even after this step
-      // returns.
-      //
-      // The durable agent emits tool-result chunks via pubsub.  The
-      // pubsub subscription is torn down when the stream closes and the
-      // consumer calls cleanup().  If this step returns without waiting,
-      // the workflow finishes, FINISH fires, the stream closes, cleanup
-      // runs, and the pubsub subscriber is gone before the background
-      // task can deliver its result.
-      //
-      // Therefore the durable agent must always wait when background
-      // tasks are running — using the configured waitTimeoutMs, or a
-      // sensible 1 s default to keep the workflow (and pubsub) alive.
-
-      // First invocation without explicit waitTimeoutMs — match the
-      // regular agent's "signal pending, don't block" on retryCount 0,
-      // but only when the caller provided an explicit timeout (meaning
-      // they'll drive continuation externally).
-      if (retryCount === 0 && waitTimeoutMs) {
-        return { ...inputWithoutTerminal, backgroundTaskPending: true };
-      }
-
-      // Use configured timeout, or default to 1 s so the workflow stays
-      // alive long enough for pubsub to deliver background-task results.
-      const effectiveWaitMs = waitTimeoutMs ?? 1000;
-
-      // Emit initial progress chunk
-      if (pubsub) {
-        try {
-          await emitChunkEvent(pubsub, runId, {
-            type: 'background-task-progress' as any,
-            runId,
-            from: ChunkFrom.AGENT,
-            payload: { taskIds, runningCount: runningTasks.length, elapsedMs: 0 },
-          });
-        } catch {
-          // PubSub may be closed
+      switch (outcome.status) {
+        case 'pass-through':
+          return typedInput;
+        // A previously dispatched background task is still part of this run's
+        // answer. Do not let an unrelated foreground success terminate while
+        // that task is pending or while its completion needs another model
+        // turn. The pending marker tells `isTaskCompleteStep` to skip scoring
+        // and the loop to keep the run open; dropping the terminal result
+        // prevents an unrelated foreground success from ending the answer
+        // early.
+        case 'timeout':
+        case 'pending': {
+          const inputWithoutTerminal = { ...typedInput, terminalToolResult: undefined };
+          // Timeout: keep the pending marker but do not set isContinued, so the
+          // foreground loop can end without misreporting the still-running
+          // background work (durable contract: pubsub teardown races a late
+          // task result, so the pending marker is what carries the lifecycle).
+          return { ...inputWithoutTerminal, backgroundTaskPending: true };
+        }
+        case 'completed': {
+          const inputWithoutTerminal = { ...typedInput, terminalToolResult: undefined };
+          // Force the loop to continue so the LLM processes the injected result
+          if (typedInput.stepResult) {
+            return {
+              ...inputWithoutTerminal,
+              backgroundTaskPending: true,
+              stepResult: { ...typedInput.stepResult, isContinued: true },
+            };
+          }
+          return { ...inputWithoutTerminal, backgroundTaskPending: true };
         }
       }
-
-      // Wait for the next task to complete (or until timeout)
-      try {
-        await bgManager.waitForNextTask(taskIds, {
-          timeoutMs: effectiveWaitMs,
-          onProgress: (elapsedMs: number) => {
-            if (!pubsub) return;
-            void emitChunkEvent(pubsub, runId, {
-              type: 'background-task-progress' as any,
-              runId,
-              from: ChunkFrom.AGENT,
-              payload: { taskIds, runningCount: runningTasks.length, elapsedMs },
-            }).catch(() => {});
-          },
-          progressIntervalMs: 3000,
-        });
-      } catch {
-        // Timeout elapsed — no task completed. Keep the pending marker while
-        // leaving isContinued unchanged so this foreground loop can end
-        // without misreporting the still-running background work.
-        return { ...inputWithoutTerminal, backgroundTaskPending: true };
-      }
-
-      // A task completed — force the loop to continue so the LLM processes the result
-      if (typedInput.stepResult) {
-        return {
-          ...inputWithoutTerminal,
-          backgroundTaskPending: true,
-          stepResult: { ...typedInput.stepResult, isContinued: true },
-        };
-      }
-
-      return { ...inputWithoutTerminal, backgroundTaskPending: true };
     },
   });
 }

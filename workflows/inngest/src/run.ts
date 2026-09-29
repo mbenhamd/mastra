@@ -1060,6 +1060,9 @@ export class InngestRun<
     this.hydrateFailedResult(result);
 
     this.workflowRunStatus = result.status;
+    if (result.status !== 'suspended') {
+      this.cleanup?.();
+    }
     return result;
   }
 

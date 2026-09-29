@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createObservabilityVNextTests, normalizeTraceQueryResponse } from '@internal/storage-test-utils';
+import { coreFeatures } from '@mastra/core/features';
 import { SpanType } from '@mastra/core/observability';
 import { parseTraceQueryRequest, planTraceQuery } from '@mastra/core/storage';
 import { Pool } from 'pg';
@@ -97,10 +98,51 @@ describe('PostgresStoreVNext', () => {
       });
     });
 
-    it('advertises metrics and logs independently of its constructor name', () => {
+    it('advertises trace query discovery and queries with or without delta polling', () => {
       const observability = store.stores.observability as ObservabilityStoragePostgresVNext;
+      const originalFeatures = new Set(coreFeatures);
 
-      expect(observability.getFeatures()).toEqual(expect.arrayContaining(['metrics', 'logs']));
+      try {
+        coreFeatures.add('observability-delta-polling');
+        expect(observability.getFeatures()).toEqual([
+          'metrics',
+          'logs',
+          'entity-type-discovery',
+          'entity-name-discovery',
+          'service-name-discovery',
+          'environment-discovery',
+          'tag-discovery',
+          'metric-discovery',
+          'delta-polling',
+          'trace-query',
+          'trace-query-root-duration',
+          'trace-query-discovery',
+          'thread-query',
+          'trace-query-tenant-scope',
+          'feedback',
+        ]);
+
+        coreFeatures.delete('observability-delta-polling');
+        expect(observability.getFeatures()).toEqual([
+          'metrics',
+          'logs',
+          'entity-type-discovery',
+          'entity-name-discovery',
+          'service-name-discovery',
+          'environment-discovery',
+          'tag-discovery',
+          'metric-discovery',
+          'trace-query',
+          'trace-query-root-duration',
+          'trace-query-discovery',
+          'thread-query',
+          'trace-query-tenant-scope',
+          'feedback',
+        ]);
+      } finally {
+        coreFeatures.clear();
+        for (const feature of originalFeatures) coreFeatures.add(feature);
+      }
     });
   });
 
@@ -245,6 +287,8 @@ describe.skipIf(!integrationEnabled)('PostgresStoreVNext / shared observability 
     sharedStorage = new ObservabilityStoragePostgresVNext({
       client: sharedClient,
       schemaName: sharedSchema,
+      // Shared conformance fixtures use fixed dates, outside the rolling discovery window.
+      discovery: { lookbackSeconds: 0 },
     });
     await sharedStorage.init();
   });
@@ -275,6 +319,8 @@ describe.skipIf(!integrationEnabled)('PostgresStoreVNext / shared observability 
       label: 'Postgres vNext',
       preferredStrategy: 'event-sourced',
       traceQuery: true,
+      traceQueryDiscovery: true,
+      threadQuery: true,
     },
     cleanup: async storage => {
       await storage.dangerouslyClearAll();

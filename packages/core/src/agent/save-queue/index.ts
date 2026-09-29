@@ -2,6 +2,7 @@ import type { IMastraLogger } from '../../logger';
 import type { MemoryConfigInternal } from '../../memory';
 import type { MastraMemory } from '../../memory/memory';
 import type { MessageList } from '../message-list';
+import { noteThreadMessagesSaved } from '../thread-saves';
 
 type UnsavedMessageSnapshot = ReturnType<MessageList['snapshotUnsavedMessages']>;
 
@@ -69,7 +70,7 @@ export class SaveQueueManager {
     const operation = prev.then(() =>
       options?.strictSnapshot
         ? this.persistUnsavedMessagesStrict(options.strictSnapshot, memoryConfig)
-        : this.persistUnsavedMessages(messageList, memoryConfig),
+        : this.persistUnsavedMessages(threadId, messageList, memoryConfig),
     );
     const next = operation
       .catch(err => {
@@ -104,13 +105,19 @@ export class SaveQueueManager {
    * @param messageList - The MessageList instance for the current thread.
    * @param memoryConfig - The memory configuration for saving.
    */
-  private async persistUnsavedMessages(messageList: MessageList, memoryConfig?: MemoryConfigInternal) {
+  private async persistUnsavedMessages(
+    threadId: string,
+    messageList: MessageList,
+    memoryConfig?: MemoryConfigInternal,
+  ) {
+    const savedAt = Date.now();
     const snapshot = messageList.snapshotUnsavedMessages({ detached: true });
     if (snapshot.messages.length > 0 && this.memory) {
       await this.memory.saveMessages({
         messages: snapshot.messages,
         memoryConfig,
       });
+      noteThreadMessagesSaved({ threadId, resourceId: snapshot.messages.find(m => m.resourceId)?.resourceId, savedAt });
     }
     snapshot.commit();
   }
@@ -127,6 +134,8 @@ export class SaveQueueManager {
     }
     await this.memory.saveMessages({ messages: snapshot.messages, memoryConfig });
     snapshot.commit();
+    // Strict snapshots are captured before waiting in the queue. Their write time
+    // is not a safe saved-through watermark for newer parts; do not announce it.
   }
 
   /**

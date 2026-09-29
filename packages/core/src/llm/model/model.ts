@@ -173,7 +173,9 @@ export class MastraLLMV1 extends MastraBase {
     if (tools && Object.keys(tools).length > 0) {
       for (const tool of Object.values(tools)) {
         if (tool.parameters) {
-          if ('validate' in tool.parameters) {
+          // PF-4402: zod >= 4.6 schemas expose their own `validate()`, so only an
+          // AI SDK Schema (which also carries `jsonSchema`) takes the re-wrap path.
+          if ('validate' in tool.parameters && 'jsonSchema' in tool.parameters) {
             tool.parameters = jsonSchema(tool.parameters.jsonSchema, { validate: tool.parameters.validate });
           } else if (isStandardSchemaWithJSON(tool.parameters)) {
             tool.parameters = jsonSchema(standardSchemaToJSONSchema(tool.parameters));
@@ -558,7 +560,9 @@ export class MastraLLMV1 extends MastraBase {
     if (tools && Object.keys(tools).length > 0) {
       for (const tool of Object.values(tools)) {
         if (tool.parameters) {
-          if ('validate' in tool.parameters) {
+          // PF-4402: zod >= 4.6 schemas expose their own `validate()`, so only an
+          // AI SDK Schema (which also carries `jsonSchema`) takes the re-wrap path.
+          if ('validate' in tool.parameters && 'jsonSchema' in tool.parameters) {
             tool.parameters = jsonSchema(tool.parameters.jsonSchema, { validate: tool.parameters.validate });
           } else if (isStandardSchemaWithJSON(tool.parameters)) {
             tool.parameters = jsonSchema(standardSchemaToJSONSchema(tool.parameters));

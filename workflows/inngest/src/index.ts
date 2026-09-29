@@ -10,6 +10,7 @@ import type { Processor, ProcessorStepOutput, ProcessorStepInputSchema, OutputRe
 import {
   copyProcessorWorkflowTraits,
   ProcessorRunner,
+  ProcessorState,
   ProcessorStepOutputSchema,
   ProcessorStepSchema,
 } from '@mastra/core/processors';
@@ -433,7 +434,7 @@ function createStepFromProcessor<TProcessorId extends string>(
       // Cast to output type for easier property access - the discriminated union
       // ensures type safety at the schema level, but inside the execute function
       // we need access to all possible properties
-      const input = inputData as ProcessorStepOutput;
+      const input = inputData as ProcessorStepOutput & { processorStates?: Map<string, ProcessorState> };
       const {
         phase,
         messages,
@@ -442,7 +443,7 @@ function createStepFromProcessor<TProcessorId extends string>(
         systemMessages,
         part,
         streamParts,
-        state,
+        processorStates,
         result,
         finishReason,
         toolCalls,
@@ -506,6 +507,19 @@ function createStepFromProcessor<TProcessorId extends string>(
         ? { currentSpan: processorSpan }
         : tracingContext;
 
+      // Resolve this processor's persistent state from the shared processorStates map.
+      // Each processor's state lives in the map keyed by processor id, so mutations
+      // persist across phases and across chained processor steps.
+      let processorState: Record<string, unknown> = {};
+      if (processorStates) {
+        let ps = processorStates.get(processor.id);
+        if (!ps) {
+          ps = new ProcessorState(processor.id);
+          processorStates.set(processor.id, ps);
+        }
+        processorState = ps.customState;
+      }
+
       // Base context for all processor methods - includes requestContext for memory processors
       // and tracingContext for proper span nesting when processors call internal agents
       const baseContext = {
@@ -531,7 +545,8 @@ function createStepFromProcessor<TProcessorId extends string>(
         stepNumber,
         systemMessages,
         streamParts,
-        state,
+        state: processorState,
+        processorStates,
         result,
         finishReason,
         toolCalls,
@@ -589,7 +604,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 messages: messages as MastraDBMessage[],
                 messageList: passThrough.messageList,
                 systemMessages: (systemMessages ?? []) as CoreMessage[],
-                state: {},
+                state: processorState,
               });
 
               if (result instanceof MessageList) {
@@ -669,7 +684,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 modelSettings,
                 structuredOutput,
                 steps: steps ?? [],
-                state: {},
+                state: processorState,
               });
 
               const validatedResult = await ProcessorRunner.validateAndFormatProcessInputStepResult(result, {
@@ -708,7 +723,7 @@ function createStepFromProcessor<TProcessorId extends string>(
               // Manage per-processor span lifecycle across stream chunks
               // Use unique key to store span on shared state object
               const spanKey = `__outputStreamSpan_${processor.id}`;
-              const mutableState = (state ?? {}) as Record<string, unknown>;
+              const mutableState = processorState;
               let processorSpan = mutableState[spanKey] as
                 | ReturnType<NonNullable<typeof parentSpan>['createChildSpan']>
                 | undefined;
@@ -804,7 +819,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 ...baseContext,
                 messages: messages as MastraDBMessage[],
                 messageList: passThrough.messageList,
-                state: passThrough.state ?? {},
+                state: processorState,
                 result: outputResult,
               });
 
@@ -886,7 +901,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 usage: (usage as LanguageModelUsage) ?? defaultUsage,
                 systemMessages: (systemMessages ?? []) as CoreMessage[],
                 steps: steps ?? [],
-                state: {},
+                state: processorState,
               });
 
               if (result instanceof MessageList) {

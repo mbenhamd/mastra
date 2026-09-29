@@ -1,10 +1,11 @@
+import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import { MockStore } from '@mastra/core/storage';
 import { Inngest } from 'inngest';
 import { describe, expect, it, vi, beforeEach, afterAll } from 'vitest';
 import { z } from 'zod';
 
-import { init, serve, createServe, connect } from './index';
+import { createInngestAgent, init, serve, createServe, connect } from './index';
 
 // Mock the inngest framework-specific serve functions using vi.hoisted to ensure
 // mocks are created before module imports capture the real functions
@@ -138,6 +139,42 @@ describe('Multi-framework serve', () => {
 
       const callArgs = honoServe.mock.calls[0][0];
       expect(callArgs.servePath).toBe('/custom/inngest');
+    });
+
+    it('should collect agent-owned durable workflows for serve and connect', async () => {
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model: {
+          provider: 'test',
+          modelId: 'test-model',
+          specificationVersion: 'v1',
+          supportsStructuredOutputs: true,
+          doGenerate: vi.fn(),
+          doStream: vi.fn(),
+        } as any,
+      });
+      const durableAgent = createInngestAgent({ agent, inngest });
+      const agentsOnlyMastra = new Mastra({
+        storage: new MockStore(),
+        agents: { testAgent: durableAgent },
+      });
+      const adapter = vi.fn(options => options);
+
+      const serveOptions = createServe(adapter)({ mastra: agentsOnlyMastra, inngest });
+      await connect({ mastra: agentsOnlyMastra, inngest });
+
+      const connectOptions = inngestConnect.mock.calls[0][0];
+      // Fork: durable workflow ids are agent-scoped and protocol-versioned, so
+      // compare against the agent's own workflow functions instead of upstream's
+      // shared `inngest:durable-agentic-*` ids.
+      const ownedFunctionIds = durableAgent
+        .getDurableWorkflows()
+        .flatMap((workflow: any) => workflow.getFunctions().map((fn: any) => fn.id()));
+      expect(ownedFunctionIds).toHaveLength(2);
+      expect(getFunctionIds(serveOptions.functions)).toEqual(ownedFunctionIds);
+      expect(getFunctionIds(connectOptions.apps[0].functions)).toEqual(getFunctionIds(serveOptions.functions));
     });
 
     it('should collect the same functions for serve and connect', async () => {

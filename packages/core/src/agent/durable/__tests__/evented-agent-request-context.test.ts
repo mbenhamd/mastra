@@ -40,8 +40,10 @@ describe('EventedAgent requestContext forwarding', () => {
   });
 
   it('passes requestContext to fire-and-forget workflow execution', async () => {
-    const startAsync = vi.fn(async () => ({ runId: 'evented-request-context-run', execution: Promise.resolve({}) }));
-    const createRun = vi.fn(async () => ({ startAsync }));
+    // Upstream re-enabled the evented engine, whose `startAsync()` returns only
+    // `{ runId }`; EventedAgent awaits the native `start()` receipt instead.
+    const startAsync = vi.fn(async () => ({ status: 'success' }));
+    const createRun = vi.fn(async () => ({ start: startAsync }));
     const emitError = vi.fn(async () => undefined);
     const pubsub = new EventEmitterPubSub();
     pubsubs.push(pubsub);
@@ -88,8 +90,8 @@ describe('EventedAgent requestContext forwarding', () => {
   });
 
   it('deletes terminal snapshots from the native workflow lifecycle but preserves suspended runs', async () => {
-    const startAsync = vi.fn(async () => ({ runId: 'evented-terminal-run', execution: Promise.resolve({}) }));
-    const createRun = vi.fn(async () => ({ startAsync }));
+    const startAsync = vi.fn(async () => ({ status: 'success' }));
+    const createRun = vi.fn(async () => ({ start: startAsync }));
     const deleteTerminalRunSnapshots = vi.fn(async () => undefined);
     const emitError = vi.fn(async () => undefined);
     const pubsub = new EventEmitterPubSub();
@@ -187,11 +189,10 @@ describe('EventedAgent requestContext forwarding', () => {
 
   it('reports rejected background execution once and releases its runtime pin', async () => {
     const executionError = new Error('background execution failed before lifecycle');
-    const startAsync = vi.fn(async () => ({
-      runId: 'evented-rejected-execution-run',
-      execution: Promise.reject(executionError),
-    }));
-    const createRun = vi.fn(async () => ({ startAsync }));
+    const startAsync = vi.fn(async () => {
+      throw executionError;
+    });
+    const createRun = vi.fn(async () => ({ start: startAsync }));
     const emitError = vi.fn(async () => undefined);
     const pubsub = new EventEmitterPubSub();
     pubsubs.push(pubsub);

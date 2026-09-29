@@ -1,6 +1,6 @@
-import type { AdapterTestContext } from '@internal/server-adapter-test-utils';
-import { createDefaultTestContext } from '@internal/server-adapter-test-utils';
 import type { ServerContext, ServerRoute } from '@mastra/server/server-adapter';
+import type { AdapterTestContext } from '@mastra/server-adapters-test-suite';
+import { createDefaultTestContext } from '@mastra/server-adapters-test-suite';
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';

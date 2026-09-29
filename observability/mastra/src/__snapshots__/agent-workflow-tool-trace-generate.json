@@ -1,17 +1,17 @@
 {
   "__structure__": [
     "agent_run: \"agent run: 'workflow-agent'\"",
-    "└── model_generation: \"llm: 'mock-model-id'\"",
-    "    ├── model_step: \"step: 0\"",
-    "    │   ├── model_inference: \"inference: 0\"",
-    "    │   │   ├── model_chunk: \"chunk: 'tool-call'\"",
-    "    │   │   └── model_chunk: \"chunk: 'tool-result'\"",
-    "    │   └── tool_call: \"tool: 'workflowExecutor'\"",
-    "    │       └── workflow_run: \"workflow run: 'simple-workflow'\"",
-    "    │           └── workflow_step: \"workflow step: 'simple-step'\"",
-    "    └── model_step: \"step: 1\"",
-    "        └── model_inference: \"inference: 1\"",
-    "            └── model_chunk: \"chunk: 'text'\""
+    "\u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
+    "    \u251c\u2500\u2500 model_step: \"step: 0\"",
+    "    \u2502   \u251c\u2500\u2500 model_inference: \"inference: 0\"",
+    "    \u2502   \u2502   \u251c\u2500\u2500 model_chunk: \"chunk: 'tool-call'\"",
+    "    \u2502   \u2502   \u2514\u2500\u2500 model_chunk: \"chunk: 'tool-result'\"",
+    "    \u2502   \u2514\u2500\u2500 tool_call: \"tool: 'workflowExecutor'\"",
+    "    \u2502       \u2514\u2500\u2500 workflow_run: \"workflow run: 'simple-workflow'\"",
+    "    \u2502           \u2514\u2500\u2500 workflow_step: \"workflow step: 'simple-step'\"",
+    "    \u2514\u2500\u2500 model_step: \"step: 1\"",
+    "        \u2514\u2500\u2500 model_inference: \"inference: 1\"",
+    "            \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\""
   ],
   "spans": [
     {
@@ -75,8 +75,15 @@
                         "type": ["string", "number", "integer", "boolean", "object", "null"]
                       },
                       "suspendedToolCallId": {
-                        "type": "string",
-                        "description": "The original toolCallId of the suspended tool"
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "description": "The toolCallId of the suspended tool to resume"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
                       },
                       "suspendedToolRunId": {
                         "anyOf": [
@@ -118,9 +125,9 @@
               "providerOtherMessageBytesTotal": 0,
               "providerInstructionBytesTotal": 176,
               "providerToolCountTotal": 2,
-              "providerToolSchemaBytesTotal": 1460,
+              "providerToolSchemaBytesTotal": 1518,
               "providerResponseSchemaBytesTotal": 0,
-              "providerRequestBytesTotal": 2541,
+              "providerRequestBytesTotal": 2599,
               "providerPreparationMsTotal": "<providerPreparationMsTotal>",
               "providerMeasurementMsTotal": "<providerMeasurementMsTotal>",
               "providerSucceededInferenceCount": 2,
@@ -170,7 +177,19 @@
               "reasoning": [],
               "sources": [],
               "text": "Mock V2 generate response",
-              "warnings": []
+              "warnings": [],
+              "toolCalls": [
+                {
+                  "toolCallId": "call-workflow-1",
+                  "toolName": "workflowExecutor",
+                  "args": {
+                    "workflowId": "simpleWorkflow",
+                    "input": {
+                      "input": "test input"
+                    }
+                  }
+                }
+              ]
             }
           },
           "children": [
@@ -259,7 +278,9 @@
                       "provider": "mock-provider",
                       "streaming": true,
                       "providerAttempt": 1,
-                      "parameters": {},
+                      "parameters": {
+                        "maxRetries": 0
+                      },
                       "availableTools": ["workflowExecutor"],
                       "toolChoice": "auto",
                       "measurementState": "measured",
@@ -278,11 +299,11 @@
                       "providerOtherMessageBytes": 0,
                       "providerInstructionBytes": 88,
                       "providerToolCount": 1,
-                      "providerToolSchemaBytes": 730,
+                      "providerToolSchemaBytes": 759,
                       "providerToolSchemaState": "measured",
                       "providerResponseSchemaState": "not_applicable",
                       "providerReasoningEffortState": "provider_default",
-                      "providerRequestBytes": 1047,
+                      "providerRequestBytes": 1076,
                       "providerMeasurementMs": "<providerMeasurementMs>",
                       "providerDispatchTimestampMs": "<providerDispatchTimestampMs>",
                       "providerPreparationMs": "<providerPreparationMs>",
@@ -370,7 +391,7 @@
                         "traceId": "<trace-1>",
                         "name": "chunk: 'tool-result'",
                         "type": "model_chunk",
-                        "completed": false,
+                        "completed": true,
                         "isEvent": true,
                         "isRootSpan": false,
                         "parentId": "<span-4>",
@@ -575,7 +596,9 @@
                       "provider": "mock-provider",
                       "streaming": true,
                       "providerAttempt": 1,
-                      "parameters": {},
+                      "parameters": {
+                        "maxRetries": 0
+                      },
                       "availableTools": ["workflowExecutor"],
                       "toolChoice": "auto",
                       "measurementState": "measured",
@@ -594,11 +617,11 @@
                       "providerOtherMessageBytes": 0,
                       "providerInstructionBytes": 88,
                       "providerToolCount": 1,
-                      "providerToolSchemaBytes": 730,
+                      "providerToolSchemaBytes": 759,
                       "providerToolSchemaState": "measured",
                       "providerResponseSchemaState": "not_applicable",
                       "providerReasoningEffortState": "provider_default",
-                      "providerRequestBytes": 1494,
+                      "providerRequestBytes": 1523,
                       "providerMeasurementMs": "<providerMeasurementMs>",
                       "providerDispatchTimestampMs": "<providerDispatchTimestampMs>",
                       "providerPreparationMs": "<providerPreparationMs>",

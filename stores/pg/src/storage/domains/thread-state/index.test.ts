@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { MastraError } from '@mastra/core/error';
-import type { ThreadStateKey, ThreadStateStorage } from '@mastra/core/storage';
+import { encodeThreadStateScope, type ThreadStateKey, type ThreadStateStorage } from '@mastra/core/storage';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { exportSchemas, PostgresStore } from '../..';
@@ -46,6 +46,37 @@ describe('ThreadStatePG', () => {
     const ddl = exportSchemas(SCHEMA);
     expect(ddl).toContain('mastra_thread_state');
     expect(ddl).toContain('PRIMARY KEY ("threadId", "type")');
+  });
+
+  // Upstream behavioral additions adapted to the fork's ThreadStateKey-scoped
+  // API: PG-safe JSON repair in stored values and createdAt/updatedAt upsert
+  // semantics.
+  it('repairs invalid characters while preserving literal escape text', async () => {
+    const value = { path: 'C:\\path\\\uD800-end', literal: String.raw`literal\uD800`, nul: 'a\0b' };
+    await stateA.setState({ ...KEY, value });
+    await expect(stateA.getState(KEY)).resolves.toEqual({
+      path: 'C:\\path\\\uFFFD-end',
+      literal: value.literal,
+      nul: 'ab',
+    });
+  });
+
+  it('preserves createdAt and advances updatedAt across an upsert', async () => {
+    await stateA.setState({ ...KEY, value: { version: 1 } });
+    const scopedThreadId = encodeThreadStateScope(KEY);
+    const readTimestamps = () =>
+      first.db.one<{ createdAt: Date; updatedAt: Date }>(
+        `SELECT "createdAt", "updatedAt" FROM "${SCHEMA}"."mastra_thread_state" WHERE "threadId" = $1 AND "type" = $2`,
+        [scopedThreadId, KEY.type],
+      );
+    const before = await readTimestamps();
+
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await stateA.setState({ ...KEY, value: { version: 2 } });
+
+    const after = await readTimestamps();
+    expect(after.createdAt.getTime()).toBe(before.createdAt.getTime());
+    expect(after.updatedAt.getTime()).toBeGreaterThan(before.updatedAt.getTime());
   });
 
   it('round-trips JSON and isolates resource, thread, and type', async () => {

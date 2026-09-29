@@ -23,7 +23,6 @@ import {
   INNGEST_DURABLE_AGENT_PROTOCOL_VERSION,
   InngestDurableStepIds,
 } from './create-inngest-agentic-workflow';
-
 /**
  * Regression coverage for #19317: the Inngest durable engine must honor
  * `toolCallConcurrency` instead of always running tool calls sequentially.
@@ -1161,9 +1160,10 @@ describe('createInngestDurableAgenticWorkflow terminal tool result', () => {
 
     await executeFinalWithBoundRuntime(params);
 
-    // The failed durable attempt may repeat the idempotent thread upsert; the
-    // message write and finish publication remain the transactional boundary.
-    expect(memory.createThread).toHaveBeenCalledTimes(2);
+    // The first attempt records the thread as existing before its flush fails,
+    // so the retry skips the upsert; the message write and finish publication
+    // remain the transactional boundary.
+    expect(memory.createThread).toHaveBeenCalledOnce();
     expect(memory.saveMessages).toHaveBeenCalledTimes(2);
     expect(persisted).toHaveLength(1);
     expect(persisted[0]?.content?.parts?.filter((part: any) => part.type === 'data-terminal-tool-result')).toHaveLength(
@@ -1353,12 +1353,12 @@ describe('createInngestDurableAgenticWorkflow tool-call tracing (#19842)', () =>
 });
 
 /**
- * `map-final-output` runs the finish side effects through `engine.step.run`. These tests
- * only care about how the spans are ended, so the fake engine returns the step's result
- * without invoking the callback. Mocking the module instead would leak across files,
- * because this package runs vitest with `--no-isolate`.
+ * `map-final-output` calls `runDurableFinishSideEffects` directly (no step tooling — the
+ * mapping already runs inside the engine's durable boundary). These tests only care about
+ * how spans are ended, so they pass an empty serialized MessageList; with no registry
+ * entry the helper's side-effect blocks (processors, persistence, title) are no-ops.
  */
-const skipFinishSideEffects = async () => ({ messageListState: undefined, outputText: undefined });
+const emptyMessageListState = () => new MessageList().serialize();
 
 describe('createInngestDurableAgenticWorkflow final span ends', () => {
   it('ends the model span with usage on attributes and the agent span with text only', async () => {
@@ -1404,8 +1404,8 @@ describe('createInngestDurableAgenticWorkflow final span ends', () => {
         lastStepResult: { reason: 'stop', isContinued: false, warnings: [] },
         modelSpanData: modelSpan.exportSpan(),
         agentSpanData: agentSpan.exportSpan(),
+        messageListState: emptyMessageListState(),
         state: {},
-        messageListState: new MessageList().serialize(),
       },
       getInitData: () => ({
         runId: 'run-1',
@@ -1413,7 +1413,6 @@ describe('createInngestDurableAgenticWorkflow final span ends', () => {
         state: {},
         modelConfig: { provider: 'test', modelId: 'test-model' },
       }),
-      engine: { step: { run: skipFinishSideEffects } },
       mastra: { observability, getLogger: () => undefined },
     });
 
@@ -1454,8 +1453,8 @@ describe('createInngestDurableAgenticWorkflow final span ends', () => {
         accumulatedSteps,
         accumulatedUsage: usage,
         lastStepResult: { reason: 'stop', isContinued: false, warnings: [] },
+        messageListState: emptyMessageListState(),
         state: {},
-        messageListState: new MessageList().serialize(),
       },
       getInitData: () => ({
         runId: 'run-1',
@@ -1463,10 +1462,40 @@ describe('createInngestDurableAgenticWorkflow final span ends', () => {
         state: {},
         modelConfig: { provider: 'test', modelId: 'test-model' },
       }),
-      engine: { step: { run: skipFinishSideEffects } },
       mastra: { getLogger: () => undefined },
     });
 
     expect(result.output).toEqual({ text: 'final answer', usage, steps: accumulatedSteps });
+  });
+});
+
+describe('createInngestDurableAgenticWorkflow bookkeeping (#24731)', () => {
+  it('configures both workflows to skip no-op durable bookkeeping', () => {
+    const inngest = new Inngest({ id: 'inngest-agentic-workflow-events-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
+    const iterationWorkflow = workflow.steps[InngestDurableStepIds.AGENTIC_EXECUTION];
+
+    expect(workflow.options.emitStepEvents).toBe(false);
+    expect(iterationWorkflow.options.emitStepEvents).toBe(false);
+    expect(workflow.options.evaluatePersistencePredicateBeforeDurableOperation).toBe(true);
+    expect(iterationWorkflow.options.evaluatePersistencePredicateBeforeDurableOperation).toBe(true);
+  });
+});
+
+describe('createInngestDurableAgenticWorkflow snapshot policy (#24796)', () => {
+  it('persists suspended and terminal snapshots so finished runs are not resumable', () => {
+    const inngest = new Inngest({ id: 'inngest-agentic-workflow-snapshot-tests' });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest }) as any;
+    const iterationWorkflow = workflow.steps[InngestDurableStepIds.AGENTIC_EXECUTION];
+
+    for (const wf of [workflow, iterationWorkflow]) {
+      const persist = (workflowStatus: string) => wf.options.shouldPersistSnapshot({ workflowStatus, stepResults: {} });
+      for (const status of ['suspended', 'success', 'failed', 'canceled', 'bailed', 'tripwire']) {
+        expect(persist(status)).toBe(true);
+      }
+      for (const status of ['running', 'waiting', 'pending']) {
+        expect(persist(status)).toBe(false);
+      }
+    }
   });
 });

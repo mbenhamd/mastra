@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageList } from '../message-list';
+import { onThreadMessagesSaved } from '../thread-saves';
 import type { MastraDBMessage } from '../types';
 import { SaveQueueManager } from './index';
 
@@ -39,6 +40,45 @@ describe('SaveQueueManager', () => {
     await new Promise(res => setTimeout(res, manager['debounceMs'] + 10));
     expect(saveCalls).toBe(1);
     expect(saved.length).toBe(2);
+  });
+
+  it.each([false, true])('announces only a confirmed snapshot watermark (write fails: %s)', async writeFails => {
+    const threadId = 'thread-save-watermark';
+    const list = new MessageList({ threadId });
+    list.add(makeTestMessage('captured', threadId, 'user', 'Captured input'), 'user');
+    let releaseWrite!: () => void;
+    let markStarted!: () => void;
+    const writeGate = new Promise<void>(resolve => {
+      releaseWrite = resolve;
+    });
+    const started = new Promise<void>(resolve => {
+      markStarted = resolve;
+    });
+    mockMemory.saveMessages.mockImplementation(async () => {
+      markStarted();
+      await writeGate;
+      if (writeFails) throw new Error('storage unavailable');
+    });
+    const notifications: number[] = [];
+    const unsubscribe = onThreadMessagesSaved({ threadId }, savedAt => notifications.push(savedAt));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(100);
+    try {
+      const flush = manager.flushMessages(list, threadId);
+      await started;
+      expect(notifications).toEqual([]);
+      clock.mockReturnValue(200);
+      list.add(makeTestMessage('later', threadId, 'user', 'Later input'), 'user');
+      releaseWrite();
+      await flush;
+      expect(notifications).toEqual(writeFails ? [] : [100]);
+      expect(list.snapshotUnsavedMessages().messages.map(message => message.id)).toEqual(
+        writeFails ? ['captured', 'later'] : ['later'],
+      );
+    } finally {
+      releaseWrite();
+      unsubscribe();
+      clock.mockRestore();
+    }
   });
 
   it('does nothing if no unsaved messages', async () => {

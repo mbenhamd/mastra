@@ -1,5 +1,5 @@
 import type { Agent } from '../agent';
-import type { MastraDBMessage } from '../agent/message-list/state/types';
+import type { MastraDBMessage, MastraMessagePart } from '../agent/message-list/state/types';
 import type { AgentInstructions, ToolsInput } from '../agent/types';
 import type { BackgroundTaskManagerConfig } from '../background-tasks';
 import type { MastraBrowser } from '../browser/browser';
@@ -787,11 +787,11 @@ export function defaultOMProgressState(): OMProgressState {
 /**
  * Events emitted by the controller that UIs can subscribe to.
  *
- * Streamed `message_start`, `message_update`, and `message_end` events for one
- * assistant turn intentionally share a live `MastraDBMessage`. Its content is
- * updated in place as later deltas arrive. `display_state_changed.currentMessage`
- * refers to that same live message. Consumers that retain an event across an
- * asynchronous or storage boundary must copy or serialize the value there.
+ * A logical message emits one `message_start` containing its initial
+ * `MastraDBMessage`, zero or more compact id-addressed `message_update` deltas,
+ * and one id-only `message_end` after terminal metadata has been applied.
+ * Consumers reconstruct streamed text, reasoning, and non-text message parts
+ * from ordered deltas, then use the id-only end to finalize the matching entry.
  */
 export type AgentControllerEvent =
   | { type: 'mode_changed'; modeId: string; previousModeId: string }
@@ -803,40 +803,75 @@ export type AgentControllerEvent =
   | { type: 'agent_start' }
   | { type: 'agent_end'; reason?: 'complete' | 'aborted' | 'error' | 'suspended' }
   | { type: 'message_start'; message: MastraDBMessage }
-  | { type: 'message_update'; message: MastraDBMessage }
-  | { type: 'message_end'; message: MastraDBMessage }
-  | { type: 'tool_start'; toolCallId: string; toolName: string; args: unknown }
-  | { type: 'tool_approval_required'; runId: string; toolCallId: string; toolName: string; args: unknown }
   | {
-      type: 'tool_suspended';
+      type: 'tool_approval_required';
+      runId: string;
+      threadId?: string;
       toolCallId: string;
       toolName: string;
       args: unknown;
-      suspendPayload: unknown;
-      resumeSchema?: string;
     }
-  | { type: 'tool_suspension_cancelled'; toolCallId: string; toolName: string; reason: string }
-  | { type: 'tool_update'; toolCallId: string; partialResult: unknown }
   | {
-      type: 'tool_end';
-      toolCallId: string;
-      result: unknown;
-      isError: boolean;
-      /**
-       * True when the tool call resolved without ever running because the user
-       * denied its approval gate or the run was aborted while it was parked
-       * waiting for approval. `isError` stays `false` in that case (the tool
-       * did not fail — it simply never executed), so subscribers that gate on
-       * "the tool actually did work" must exclude `denied === true`.
-       */
-      denied?: boolean;
-      providerMetadata?: Record<string, unknown>;
+      type: 'message_update';
+      id: string;
+      event:
+        | { type: 'text-delta'; delta: string }
+        | { type: 'reasoning-delta'; index: number; delta: string }
+        | { type: 'part'; index: number; part: MastraMessagePart };
     }
-  | { type: 'tool_input_start'; toolCallId: string; toolName: string }
-  | { type: 'tool_input_delta'; toolCallId: string; argsTextDelta: unknown; toolName?: string }
-  | { type: 'tool_input_end'; toolCallId: string }
-  | { type: 'shell_output'; toolCallId: string; output: string; stream: 'stdout' | 'stderr' }
-  | { type: 'command_exit'; toolCallId: string; exitCode: number; success: boolean }
+  | { type: 'message_end'; id: string }
+  | ({ threadId?: string } & (
+      | { type: 'tool_start'; toolCallId: string; toolName: string; args: unknown; title?: string }
+      | {
+          type: 'tool_suspended';
+          toolCallId: string;
+          toolName: string;
+          args: unknown;
+          suspendPayload: unknown;
+          resumeSchema?: string;
+        }
+      | { type: 'tool_suspension_cancelled'; toolCallId: string; toolName: string; reason: string }
+      | { type: 'tool_update'; toolCallId: string; partialResult: unknown }
+      | {
+          type: 'tool_end';
+          toolCallId: string;
+          result: unknown;
+          isError: boolean;
+          /**
+           * True when the tool call resolved without ever running because the user
+           * denied its approval gate or the run was aborted while it was parked
+           * waiting for approval. `isError` stays `false` in that case (the tool
+           * did not fail — it simply never executed), so subscribers that gate on
+           * "the tool actually did work" must exclude `denied === true`.
+           */
+          denied?: boolean;
+          providerMetadata?: Record<string, unknown>;
+        }
+      | {
+          type: 'tool_input_start';
+          toolCallId: string;
+          toolName: string;
+          title?: string;
+          /**
+           * Assistant message the tool call belongs to, so consumers can attribute
+           * streamed arguments to the model step that produced them. Tool-call chunks
+           * can precede this step's `message_start`, so the id is the only way to tell
+           * one step's arguments from the next step's.
+           */
+          messageId?: string;
+        }
+      | {
+          type: 'tool_input_delta';
+          toolCallId: string;
+          argsTextDelta: unknown;
+          toolName?: string;
+          /** Assistant message the tool call belongs to; see `tool_input_start.messageId`. */
+          messageId?: string;
+        }
+      | { type: 'tool_input_end'; toolCallId: string; messageId?: string }
+      | { type: 'shell_output'; toolCallId: string; output: string; stream: 'stdout' | 'stderr' }
+      | { type: 'command_exit'; toolCallId: string; exitCode: number; success: boolean }
+    ))
   | { type: 'usage_update'; usage: TokenUsage }
   | { type: 'info'; message: string }
   | {
@@ -1014,6 +1049,8 @@ export interface AgentControllerRequestState<TState = unknown> {
   get: () => Readonly<TState>;
   /** Update session-owned controller state. */
   set: (updates: Partial<TState>) => Promise<void>;
+  /** Apply an update only while a caller-owned identity still matches. */
+  setIf?: (updates: Partial<TState>, shouldApply: () => boolean) => Promise<boolean>;
   /** Update session-owned controller state from the latest snapshot in a serialized transaction. */
   update: <TResult>(updater: AgentControllerRequestStateUpdater<TState, TResult>) => Promise<TResult>;
 }
@@ -1060,7 +1097,16 @@ export interface AgentControllerRequestContext<TState = unknown> {
   /** Update controller state from the latest state snapshot in a serialized transaction. */
   updateState?: <TResult>(updater: AgentControllerRequestStateUpdater<TState, TResult>) => Promise<TResult>;
 
-  /** Current thread ID */
+  /** Read a setting from the thread captured for this request. */
+  getThreadSetting?: (key: string) => Promise<unknown>;
+
+  /** Persist a setting on the thread captured for this request. */
+  setThreadSetting?: (setting: { key: string; value: unknown }) => Promise<void>;
+
+  /** Whether the thread captured for this request is still active in the session. */
+  isThreadActive?: () => boolean;
+
+  /** Thread ID captured for this request. */
   threadId: string | null;
 
   /** Current resource ID */

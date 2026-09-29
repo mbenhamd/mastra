@@ -2,15 +2,18 @@ import { createOpenAI } from '@ai-sdk/openai-v5';
 import { LLMock } from '@copilotkit/aimock';
 import { afterAll, afterEach, beforeAll, describe } from 'vitest';
 import { Agent } from '../../../agent';
-import { createDurableAgent } from '../../../agent/durable';
+import { createDurableAgent, createEventedAgent } from '../../../agent/durable';
 import { assembleAgentFromFsEntry } from '../../../agent/fs-routing';
 import { isDurableAgentLike } from '../../../agent/types';
+import { EventEmitterPubSub } from '../../../events';
 import { Mastra } from '../../../mastra';
 import { InMemoryStore } from '../../../storage';
 import type { MastraModelOutput } from '../../../stream/base/output';
 import type { ChunkType } from '../../../stream/types';
 import type { EngineVariant, LoopScenarioResult, RunApprovalScenarioOptions, RunLoopScenarioOptions } from './types';
-import { ALL_ENGINE_VARIANTS, SCENARIO_MODEL_ID } from './types';
+import { ALL_ENGINE_VARIANTS, SCENARIO_MODEL_ID, isDurableEngineVariant } from './types';
+
+export { isDurableEngineVariant } from './types';
 
 /**
  * Start a shared AIMock server for the lifetime of a test suite and wire its
@@ -95,8 +98,9 @@ export async function createSharedAgent(
  * in-test AIMock server, registered on a {@link Mastra} instance with storage
  * so suspend/resume (tool approval) works.
  *
- * When `engine === 'durable'`, wraps the agent with `createDurableAgent` and
- * moves stream-level inputProcessors onto the agent constructor.
+ * When `engine` is `'durable'` or `'evented'`, wraps the agent with
+ * `createDurableAgent` / `createEventedAgent` and moves stream-level
+ * inputProcessors onto the agent constructor.
  */
 async function buildScenarioAgent({
   llm,
@@ -110,6 +114,7 @@ async function buildScenarioAgent({
   agentBackgroundTasks,
   goal,
   backgroundTasks,
+  startWorkers,
   model,
   errorProcessors,
   defaultOptions,
@@ -117,6 +122,7 @@ async function buildScenarioAgent({
   engine,
   inputProcessors,
   fsRouted,
+  maxRetries,
 }: Pick<
   RunLoopScenarioOptions,
   | 'llm'
@@ -130,6 +136,7 @@ async function buildScenarioAgent({
   | 'agentBackgroundTasks'
   | 'goal'
   | 'backgroundTasks'
+  | 'startWorkers'
   | 'model'
   | 'errorProcessors'
   | 'defaultOptions'
@@ -137,6 +144,7 @@ async function buildScenarioAgent({
   | 'engine'
   | 'inputProcessors'
   | 'fsRouted'
+  | 'maxRetries'
 >): Promise<{ agent: any; mastra: any }> {
   const openai = createOpenAI({
     apiKey: 'aimock-test-key',
@@ -181,6 +189,7 @@ async function buildScenarioAgent({
         ...(goal ? { goal } : {}),
         ...(errorProcessors ? { errorProcessors } : {}),
         ...(defaultOptions ? { defaultOptions } : {}),
+        ...(maxRetries === undefined ? {} : { maxRetries }),
       },
       instructionsMd: (instructions as string | undefined) ?? defaultInstructions,
       ...(fsTools ? { tools: fsTools } : {}),
@@ -201,15 +210,30 @@ async function buildScenarioAgent({
       ...(goal ? { goal } : {}),
       ...(errorProcessors ? { errorProcessors } : {}),
       ...(defaultOptions ? { defaultOptions } : {}),
-      // For durable engine, inputProcessors must be on the agent constructor
+      ...(maxRetries === undefined ? {} : { maxRetries }),
+      // For durable engines, inputProcessors must be on the agent constructor
       // (not yet supported as call-time options for durable); outputProcessors
       // are forwarded at call-time via preparation.ts.
-      ...(engine === 'durable' && inputProcessors ? { inputProcessors } : {}),
+      ...(isDurableEngineVariant(engine) && inputProcessors ? { inputProcessors } : {}),
     });
   }
 
-  // Wrap with DurableAgent for the durable engine variant
-  const registrableAgent = engine === 'durable' ? createDurableAgent({ agent }) : agent;
+  // The evented engine publishes on `mastra.pubsub` and the agent's stream
+  // follows it (source-follower wiring at registration). Share one bus between
+  // the agent and the Mastra host, mirroring the evented conformance leg.
+  const eventedPubsub = engine === 'evented' ? (pubsub ?? new EventEmitterPubSub()) : undefined;
+
+  // Wrap with the durable/evented wrapper for those engine variants. Only the
+  // two fork fixtures that assert the plain-Agent evented route
+  // (evented-sequential-approval, optional-stages-approval) omit the
+  // wrapper-selecting `engine` option and set MASTRA_EVENTED_EXECUTION
+  // themselves; every shared `engine: 'evented'` leg exercises EventedAgent.
+  const registrableAgent =
+    engine === 'durable'
+      ? createDurableAgent({ agent })
+      : engine === 'evented'
+        ? createEventedAgent({ agent, pubsub: eventedPubsub })
+        : agent;
 
   // Registering the agent on a Mastra instance with storage is required for the
   // suspended snapshot rows that approveToolCall/declineToolCall resume from.
@@ -221,15 +245,16 @@ async function buildScenarioAgent({
     logger: false,
     storage: new InMemoryStore(),
     ...(backgroundTasks ? { backgroundTasks } : {}),
-    ...(pubsub ? { pubsub } : {}),
+    ...(eventedPubsub ? { pubsub: eventedPubsub } : pubsub ? { pubsub } : {}),
   });
 
   if (isFs) {
     mastra.__registerFsAgents({ [agentId]: registrableAgent as any });
   }
 
-  // Start workers if background tasks are enabled
-  if (backgroundTasks?.enabled) {
+  // Start workers if background tasks are enabled (unless the scenario opts
+  // out to keep dispatched tasks deterministically pending).
+  if (backgroundTasks?.enabled && startWorkers !== false) {
     await mastra.startWorkers();
   }
 
@@ -277,6 +302,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     collectChunks,
     manualStreamConsumption,
     backgroundTasks,
+    startWorkers,
     streamUntilIdle,
     agentBackgroundTasks,
     goal,
@@ -289,6 +315,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     abortSignal,
     providerOptions,
     modelSettings,
+    maxRetries,
     toolsets,
     errorProcessors,
     onError,
@@ -307,11 +334,6 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
 
   fixtures(llm);
 
-  // For evented engine, set env var before building the agent.
-  if (engine === 'evented') {
-    process.env.MASTRA_EVENTED_EXECUTION = 'true';
-  }
-
   // Use shared agent/mastra if provided (for suspend/resume flows across calls),
   // otherwise build a fresh one.
   let agent: any;
@@ -322,13 +344,16 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     // wrapper by checking `agent.agent !== agent`. See `Mastra.addAgent`.
     const sharedIsRealDurableWrapper =
       isDurableAgentLike(sharedAgent.agent) && (sharedAgent.agent as any).agent !== sharedAgent.agent;
-    if (engine === 'durable' && !sharedIsRealDurableWrapper) {
+    if (isDurableEngineVariant(engine) && !sharedIsRealDurableWrapper) {
       // sharedAgent provides a regular Agent on the first call; wrap it for
-      // the durable engine and re-register on the Mastra instance so
-      // .getAgent() returns the DurableAgent wrapper.  On subsequent calls
+      // the durable/evented engine and re-register on the Mastra instance so
+      // .getAgent() returns the wrapper.  On subsequent calls
       // (e.g. resume), the agent is already wrapped — skip re-wrapping to
       // preserve the run registry across calls.
-      const durableWrapper = createDurableAgent({ agent: sharedAgent.agent as any });
+      const durableWrapper =
+        engine === 'evented'
+          ? createEventedAgent({ agent: sharedAgent.agent as any })
+          : createDurableAgent({ agent: sharedAgent.agent as any });
       const agentId = sharedAgent.agent.name;
       sharedAgent.mastra.removeAgent(agentId);
       sharedAgent.mastra.addAgent(durableWrapper as any, agentId);
@@ -353,6 +378,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
       agentBackgroundTasks,
       goal,
       backgroundTasks,
+      startWorkers,
       model,
       errorProcessors,
       defaultOptions,
@@ -360,6 +386,7 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
       engine,
       inputProcessors,
       fsRouted,
+      maxRetries,
     });
     agent = built.agent;
     mastra = built.mastra;
@@ -380,9 +407,10 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
       }
     : {};
 
-  // For durable engine, only pass options that DurableAgentStreamOptions supports.
-  // inputProcessors are on the agent constructor, not call-time options.
-  const isDurable = engine === 'durable';
+  // For durable engines (durable/evented), only pass options that
+  // DurableAgentStreamOptions supports. inputProcessors are on the agent
+  // constructor, not call-time options.
+  const isDurable = isDurableEngineVariant(engine);
 
   const streamOptions = {
     ...(runId ? { runId } : {}),
@@ -484,11 +512,6 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
     }
   }
 
-  // Clean up the per-scenario evented-engine selection.
-  if (engine === 'evented') {
-    delete process.env.MASTRA_EVENTED_EXECUTION;
-  }
-
   return {
     output,
     requests: llm.getRequests(),
@@ -566,10 +589,6 @@ export async function runApprovalScenario(
   } = options;
   fixtures(llm);
 
-  if (engine === 'evented') {
-    process.env.MASTRA_EVENTED_EXECUTION = 'true';
-  }
-
   const { agent } = await buildScenarioAgent({
     llm,
     tools,
@@ -600,9 +619,9 @@ export async function runApprovalScenario(
     ...(requireToolApproval !== false ? { requireToolApproval } : {}),
     ...(stopWhen ? { stopWhen } : {}),
     ...(options.maxSteps ? { maxSteps: options.maxSteps } : {}),
-    ...(!options.maxSteps && stopWhen && engine === 'durable' ? { maxSteps: 10 } : {}),
+    ...(!options.maxSteps && stopWhen && isDurableEngineVariant(engine) ? { maxSteps: 10 } : {}),
     ...(options.outputProcessors ? { outputProcessors: options.outputProcessors } : {}),
-    ...(options.inputProcessors && engine !== 'durable' ? { inputProcessors: options.inputProcessors } : {}),
+    ...(options.inputProcessors && !isDurableEngineVariant(engine) ? { inputProcessors: options.inputProcessors } : {}),
     ...(options.requestContext ? { requestContext: options.requestContext } : {}),
     ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
     ...(options.providerOptions ? { providerOptions: options.providerOptions } : {}),
@@ -625,7 +644,7 @@ export async function runApprovalScenario(
         chunks.push(chunk);
         if (chunk.type === 'tool-call-approval') {
           pendingApprovals.push((chunk.payload as { toolCallId: string }).toolCallId);
-          if (engine === 'durable') break;
+          if (isDurableEngineVariant(engine)) break;
         }
       }
 
@@ -643,9 +662,6 @@ export async function runApprovalScenario(
       output = (rawOutput.output ?? rawOutput) as MastraModelOutput<unknown>;
     }
   } finally {
-    if (engine === 'evented') {
-      delete process.env.MASTRA_EVENTED_EXECUTION;
-    }
     rawOutput.cleanup?.();
   }
 

@@ -1,5 +1,6 @@
 import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import { describe, expect, it, vi } from 'vitest';
+import { EntityType } from '../observability';
 import { ProcessorRunner } from './runner';
 import { TripWire } from './index';
 import type { Processor } from './index';
@@ -46,8 +47,9 @@ describe('runProcessLLMRequest span instrumentation', () => {
       },
     };
 
+    const canary = 'LLM_REQUEST_PROMPT_CANARY';
     await makeRunner(processor).runProcessLLMRequest({
-      prompt: makePrompt(),
+      prompt: [{ role: 'user', content: [{ type: 'text', text: canary }] }],
       model: {},
       stepNumber: 2,
       steps: [],
@@ -59,18 +61,24 @@ describe('runProcessLLMRequest span instrumentation', () => {
     expect(createChildSpan).toHaveBeenCalledWith(
       expect.objectContaining({
         name: 'llm request processor: prompt-pruner',
+        entityType: EntityType.INPUT_STEP_PROCESSOR,
         entityId: 'prompt-pruner',
         entityName: 'Prompt Pruner',
         attributes: expect.objectContaining({ processorIndex: 0 }),
-        input: expect.objectContaining({ stepNumber: 2, retryCount: 1 }),
       }),
     );
     expect(end).toHaveBeenCalledTimes(1);
     expect(end).toHaveBeenCalledWith(
       expect.objectContaining({
-        output: expect.objectContaining({ shortCircuited: false, prompt: expect.any(Array) }),
+        attributes: expect.objectContaining({ processorMeasurementState: 'measured' }),
       }),
     );
+    // The provider-bound prompt never reaches the span: no input/output payloads, no content.
+    const [startOptions] = createChildSpan.mock.calls[0] as unknown as [Record<string, unknown>];
+    const [endOptions] = end.mock.calls[0] as unknown as [Record<string, unknown>];
+    expect(startOptions.input).toBeUndefined();
+    expect(endOptions.output).toBeUndefined();
+    expect(JSON.stringify([startOptions, endOptions])).not.toContain(canary);
     // Processor sees the processor span as its current span
     expect(receivedTracingContext?.currentSpan).toBe(createChildSpan.mock.results[0]!.value);
   });

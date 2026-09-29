@@ -1,14 +1,14 @@
 {
   "__structure__": [
     "workflow_run: \"workflow run: 'testWorkflow'\"",
-    "├── workflow_step: \"workflow step: 'mapping_testWorkflow_0'\"",
-    "├── workflow_step: \"workflow step: 'workflow-agent'\"",
-    "│   └── agent_run: \"agent run: 'workflow-agent'\"",
-    "│       └── model_generation: \"llm: 'mock-model-id'\"",
-    "│           └── model_step: \"step: 0\"",
-    "│               └── model_inference: \"inference: 0\"",
-    "│                   └── model_chunk: \"chunk: 'text'\"",
-    "└── workflow_step: \"workflow step: 'mapping_testWorkflow_1'\""
+    "\u251c\u2500\u2500 workflow_step: \"workflow step: 'mapping_testWorkflow_0'\"",
+    "\u251c\u2500\u2500 workflow_step: \"workflow step: 'workflow-agent'\"",
+    "\u2502   \u2514\u2500\u2500 agent_run: \"agent run: 'workflow-agent'\"",
+    "\u2502       \u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
+    "\u2502           \u2514\u2500\u2500 model_step: \"step: 0\"",
+    "\u2502               \u2514\u2500\u2500 model_inference: \"inference: 0\"",
+    "\u2502                   \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\"",
+    "\u2514\u2500\u2500 workflow_step: \"workflow step: 'mapping_testWorkflow_1'\""
   ],
   "spans": [
     {
@@ -278,7 +278,9 @@
                               "provider": "mock-provider",
                               "streaming": true,
                               "providerAttempt": 1,
-                              "parameters": {},
+                              "parameters": {
+                                "maxRetries": 0
+                              },
                               "availableTools": [],
                               "toolChoice": "auto",
                               "measurementState": "measured",

@@ -11,7 +11,6 @@ import type {
   ExecutionClosurePayload,
   StorageDomains,
 } from '@mastra/core/storage';
-import { parseSqlIdentifier } from '@mastra/core/utils';
 import { Pool } from 'pg';
 import {
   validateConfig,
@@ -23,6 +22,7 @@ import {
 } from '../shared/config';
 import type { PostgresDomainKey, PostgresPoolTimeoutConfig, PostgresStoreConfig } from '../shared/config';
 import { buildConnectionStringPoolConfig } from '../shared/pool-config';
+import { parseSchemaName } from '../shared/schema-name';
 import { PinnedClientAdapter, PoolAdapter, RoutingDbClient } from './client';
 import type { DbClient, PoolClient } from './client';
 import type { PgDomainClientConfig } from './db';
@@ -274,7 +274,7 @@ export class PostgresStore extends MastraCompositeStore {
       validateConfig('PostgresStore', config);
       super({ id: config.id, name: 'PostgresStore', disableInit: config.disableInit, retention: config.retention });
       // Validate schema name to prevent SQL injection
-      this.schema = parseSqlIdentifier(config.schemaName || 'public', 'schema name');
+      this.schema = parseSchemaName(config.schemaName || 'public');
       this.#projectionMaxPayloadBytes = normalizeHarnessSessionRecordProjectionConfig(
         config.sessionRecordProjection,
       ).maxPayloadBytes;

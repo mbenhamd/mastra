@@ -32,6 +32,7 @@ export type {
   MastraMessageV1,
   MastraMessageContentV2,
   MastraMessagePart,
+  MastraErrorPart,
   MastraToolApproval,
   MastraToolInvocation,
   MastraToolInvocationPart,

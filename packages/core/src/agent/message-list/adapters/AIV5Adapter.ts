@@ -20,6 +20,7 @@ import type {
 } from '../state/types';
 import type { AIV5Type } from '../types';
 import { findToolCallArgs } from '../utils/provider-compat';
+import { preserveResponseItemIdsOnMerge } from '../utils/response-item-metadata';
 import { sanitizeToolName } from '../utils/tool-name';
 
 /**
@@ -533,6 +534,11 @@ export class AIV5Adapter {
               transformToolPayloads,
             ),
           });
+        } else if (part.type === 'error') {
+          // Mastra-only record of a terminal failure. Preserved for DB/UI history
+          // (see sanitizeV5UIMessages, which strips it from provider prompts).
+          parts.push(part as unknown as AIV5Type.UIMessage['parts'][number]);
+          hasNonToolReasoningParts = true;
         } else {
           // Other parts (step-start, etc.) can be pushed as-is
           parts.push(part);
@@ -704,8 +710,11 @@ export class AIV5Adapter {
         if (AIV5.isToolUIPart(p)) {
           const toolName = getToolName(p);
           const callProviderMetadata = 'callProviderMetadata' in p ? p.callProviderMetadata : undefined;
+          // Preserve provider-executed so a hosted tool (e.g. OpenAI tool_search)
+          // stays inline in the assistant message on replay, matching fromModelMessage.
+          const toolProviderExecuted = (p as { providerExecuted?: boolean }).providerExecuted;
           if (p.state === 'output-available') {
-            return {
+            const toolInvocationPart: MastraToolInvocationPart = {
               type: 'tool-invocation' as const,
               toolInvocation: {
                 toolCallId: p.toolCallId,
@@ -719,9 +728,32 @@ export class AIV5Adapter {
               },
               providerMetadata: callProviderMetadata,
               createdAt: getMastraCreatedAt(callProviderMetadata),
-            } satisfies MastraToolInvocationPart;
+            };
+            if (toolProviderExecuted !== undefined) {
+              (toolInvocationPart as { providerExecuted?: boolean }).providerExecuted = toolProviderExecuted;
+            }
+            return toolInvocationPart;
           }
-          return {
+          if (p.state === 'output-error') {
+            const toolInvocationPart: MastraToolInvocationPart = {
+              type: 'tool-invocation' as const,
+              toolInvocation: {
+                toolCallId: p.toolCallId,
+                toolName,
+                args: p.input,
+                state: 'output-error' as const,
+                errorText: p.errorText,
+                ...('rawInput' in p && p.rawInput !== undefined ? { rawInput: p.rawInput } : {}),
+              },
+              providerMetadata: callProviderMetadata,
+              createdAt: getMastraCreatedAt(callProviderMetadata),
+            };
+            if (toolProviderExecuted !== undefined) {
+              (toolInvocationPart as { providerExecuted?: boolean }).providerExecuted = toolProviderExecuted;
+            }
+            return toolInvocationPart;
+          }
+          const toolInvocationPart: MastraToolInvocationPart = {
             type: 'tool-invocation' as const,
             toolInvocation: {
               toolCallId: p.toolCallId,
@@ -731,7 +763,11 @@ export class AIV5Adapter {
             },
             providerMetadata: callProviderMetadata,
             createdAt: getMastraCreatedAt(callProviderMetadata),
-          } satisfies MastraToolInvocationPart;
+          };
+          if (toolProviderExecuted !== undefined) {
+            (toolInvocationPart as { providerExecuted?: boolean }).providerExecuted = toolProviderExecuted;
+          }
+          return toolInvocationPart;
         }
 
         if (p.type === 'reasoning') {
@@ -791,6 +827,14 @@ export class AIV5Adapter {
 
         if (p.type === 'step-start') {
           return p;
+        }
+
+        // Mastra-only record of a terminal failure. Round-trips through UI
+        // history unchanged; sanitizeV5UIMessages strips it from provider
+        // prompts. AIV6Adapter.fromUIMessage pairs its output with the incoming
+        // parts by index, so dropping it here would misalign every later part.
+        if ((p as { type: string }).type === 'error') {
+          return p as unknown as MastraMessagePart;
         }
 
         // Handle data-* parts (custom parts emitted by tools via writer.custom())
@@ -921,6 +965,14 @@ export class AIV5Adapter {
           toolInvocationPart.providerMetadata = part.providerOptions;
           toolInvocationPart.createdAt = getMastraCreatedAt(part.providerOptions);
         }
+        // Preserve provider-executed so the replayed part stays inline in the
+        // assistant message. Without it, convertToModelMessages moves the result
+        // into a `tool` role message, where @ai-sdk/openai re-serializes a hosted
+        // tool_search as a client-mode tool_search_output ("No tool call found").
+        const toolCallProviderExecuted = (part as { providerExecuted?: boolean }).providerExecuted;
+        if (toolCallProviderExecuted !== undefined) {
+          (toolInvocationPart as { providerExecuted?: boolean }).providerExecuted = toolCallProviderExecuted;
+        }
         mastraDBParts.push(toolInvocationPart);
         toolInvocations.push({
           toolCallId: toolCallPart.toolCallId,
@@ -973,10 +1025,22 @@ export class AIV5Adapter {
           toolInvocations.push(call);
         }
 
+        const resultProviderExecuted = (toolResultPart as { providerExecuted?: boolean }).providerExecuted;
+
         if (matchingV2Part && matchingV2Part.type === 'tool-invocation') {
           updateMatchingCallInvocationResult(toolResultPart, matchingV2Part.toolInvocation);
+          if (resultProviderExecuted !== undefined) {
+            (matchingV2Part as { providerExecuted?: boolean }).providerExecuted = resultProviderExecuted;
+          }
           if (toolResultPart.providerOptions) {
-            matchingV2Part.providerMetadata = toolResultPart.providerOptions;
+            // When the call and result carry different Responses item ids
+            // (e.g. OpenAI hosted tool_search: tsc_… call / tso_… output),
+            // keep both so next-turn replay can reference each item.
+            matchingV2Part.providerMetadata = preserveResponseItemIdsOnMerge(
+              matchingV2Part.providerMetadata as Record<string, unknown> | undefined,
+              toolResultPart.providerOptions as Record<string, unknown> | undefined,
+              toolResultPart.providerOptions as Record<string, unknown>,
+            ) as AIV5Type.ProviderMetadata;
             matchingV2Part.createdAt = getMastraCreatedAt(toolResultPart.providerOptions) ?? matchingV2Part.createdAt;
           }
         } else {
@@ -990,6 +1054,9 @@ export class AIV5Adapter {
             },
           };
           updateMatchingCallInvocationResult(toolResultPart, toolInvocationPart.toolInvocation);
+          if (resultProviderExecuted !== undefined) {
+            (toolInvocationPart as { providerExecuted?: boolean }).providerExecuted = resultProviderExecuted;
+          }
           if (toolResultPart.providerOptions) {
             toolInvocationPart.providerMetadata = toolResultPart.providerOptions;
             toolInvocationPart.createdAt = getMastraCreatedAt(toolResultPart.providerOptions);

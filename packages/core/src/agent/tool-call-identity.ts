@@ -26,10 +26,17 @@ export function parseToolApprovalDecision(value: unknown): ToolApprovalDecision 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   if (!Object.hasOwn(record, 'approved') || typeof record.approved !== 'boolean') return undefined;
-  if (Object.keys(record).some(key => !['approved', 'reason', 'toolName', 'toolCallId', 'editedArgs'].includes(key)))
+  // `message` is the display text of the public declineContext
+  // ({ reason, message }) that declineToolCall spreads into the decision.
+  if (
+    Object.keys(record).some(
+      key => !['approved', 'reason', 'message', 'toolName', 'toolCallId', 'editedArgs'].includes(key),
+    )
+  )
     return undefined;
   const hasReason = Object.hasOwn(record, 'reason');
   if (hasReason && typeof record.reason !== 'string') return undefined;
+  if (Object.hasOwn(record, 'message') && typeof record.message !== 'string') return undefined;
   let editedArgs: ToolApprovalDecision['editedArgs'];
   if (Object.hasOwn(record, 'editedArgs')) {
     if (!record.approved) return undefined;

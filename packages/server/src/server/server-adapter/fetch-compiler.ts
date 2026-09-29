@@ -70,6 +70,7 @@ import {
   getCustomHTTPExceptionResponse,
   normalizeQueryParams,
   parseComplexQueryParams,
+  parseRouteBody,
 } from './selected';
 import type { ParsedRequestParams, QueryParamValue } from './selected';
 import { serializeStreamChunk } from './serialize';
@@ -142,7 +143,8 @@ function loadHasPermission(): Promise<HasPermissionFn | undefined> {
 }
 
 function readQueryRequestContext(url: URL, method: string): Record<string, any> | undefined {
-  if (method !== 'GET') return undefined;
+  // Mirrors the adapters: query-encoded request context is read for GET and POST.
+  if (method !== 'GET' && method !== 'POST') return undefined;
   const encoded = url.searchParams.get('requestContext');
   if (typeof encoded !== 'string') return undefined;
   try {
@@ -469,7 +471,9 @@ function mapThrownError(mastra: Mastra, route: ServerRoute, error: unknown): Res
       ? statusCode
       : 500;
   if (status >= 500 || (typeof statusCode === 'number' && (statusCode < 100 || statusCode > 599))) {
-    mastra.getLogger()?.error('Error handling request', {
+    // 501 means an optional capability isn't provided by the configured storage or core: expected, not a server fault.
+    const logLevel = status === 501 ? 'warn' : 'error';
+    mastra.getLogger()?.[logLevel]('Error handling request', {
       error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
       path: route.path,
       method: route.method,
@@ -602,6 +606,8 @@ export function compileFetchRouteHandler(
           if (nested && typeof nested === 'object') {
             for (const [key, value] of Object.entries(nested)) {
               if (isReservedRequestContextKey(key)) continue;
+              // Mirrors mergeRequestContext: query-param context wins over body context.
+              if (paramsRequestContext && Object.hasOwn(paramsRequestContext, key)) continue;
               requestContext.set(key, value);
             }
           }
@@ -631,7 +637,7 @@ export function compileFetchRouteHandler(
 
       try {
         if (route.bodySchema) {
-          params.body = await route.bodySchema.parseAsync(params.body);
+          params.body = await parseRouteBody(route, params.body);
         }
       } catch (error) {
         if (isZodError(error)) {
@@ -729,7 +735,12 @@ export function compileFetchRouteHandler(
       const result = await route.handler(handlerParams);
       return await sendFetchResult(route, result, deps, pendingHeaders);
     } catch (error) {
-      return mapThrownError(deps.mastra, route, error);
+      // Mirrors the adapters, whose context headers (e.g. a refreshed session's
+      // Set-Cookie) persist onto error responses too.
+      const response = mapThrownError(deps.mastra, route, error);
+      const headers = new Headers(response.headers);
+      applyPendingHeaders(headers, pendingHeaders);
+      return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
     }
   };
 }

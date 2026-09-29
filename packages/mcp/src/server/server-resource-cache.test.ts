@@ -1,6 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 
+import { connectClient, serveHTTP } from './__tests__/harness.mock';
 import { MCPServer } from './server';
+
+vi.setConfig({ testTimeout: 20_000, hookTimeout: 20_000 });
 
 /**
  * Regression tests for cross-tenant resource leakage.
@@ -11,39 +14,27 @@ import { MCPServer } from './server';
  * per user/tenant this leaked one caller's resource index to the next caller.
  *
  * The provider must be invoked per request with the current `extra`, never served
- * from a shared cache.
+ * from a shared cache. These cases key tenancy on `extra.authInfo`; the
+ * requestContext-keyed variant lives in `__tests__/per-request-providers.test.ts`.
  *
  * @see https://github.com/mastra-ai/mastra/issues/17609
  */
 describe('MCPServer dynamic resource provider does not leak across callers', () => {
-  type Extra = {
-    authInfo?: { subject?: string };
-    signal: AbortSignal;
-    sendNotification: () => void;
-    sendRequest: () => void;
-  };
-
-  const makeExtra = (subject: string): Extra => ({
-    authInfo: { subject },
-    signal: new AbortController().signal,
-    sendNotification: vi.fn(),
-    sendRequest: vi.fn(),
-  });
+  const tenantOf = (extra: { authInfo?: { clientId?: string } } | undefined) =>
+    extra?.authInfo?.clientId ?? 'anonymous';
 
   /**
    * A tenant-scoped provider: the resource list and content depend entirely on
-   * `extra.authInfo.subject`, so each caller must see only their own resources.
+   * `extra.authInfo`, so each caller must see only their own resources.
    */
   const createTenantServer = () => {
-    const listResources = vi.fn(async ({ extra }: { extra: any }) => {
-      const tenant = extra?.authInfo?.subject ?? 'anonymous';
-      return [{ uri: `app://${tenant}/doc`, name: `Doc for ${tenant}`, mimeType: 'text/plain' }];
-    });
+    const listResources = vi.fn(async ({ extra }: { extra: any }) => [
+      { uri: `app://${tenantOf(extra)}/doc`, name: `Doc for ${tenantOf(extra)}`, mimeType: 'text/plain' },
+    ]);
     const getResourceContent = vi.fn(async ({ uri }: { uri: string }) => ({ text: uri }));
-    const resourceTemplates = vi.fn(async ({ extra }: { extra: any }) => {
-      const tenant = extra?.authInfo?.subject ?? 'anonymous';
-      return [{ uriTemplate: `app://${tenant}/{id}`, name: `Template for ${tenant}` }];
-    });
+    const resourceTemplates = vi.fn(async ({ extra }: { extra: any }) => [
+      { uriTemplate: `app://${tenantOf(extra)}/{id}`, name: `Template for ${tenantOf(extra)}` },
+    ]);
 
     const server = new MCPServer({
       name: 'tenant-server',
@@ -55,86 +46,73 @@ describe('MCPServer dynamic resource provider does not leak across callers', () 
     return { server, listResources, getResourceContent, resourceTemplates };
   };
 
+  const withTenants = async (
+    fixture: ReturnType<typeof createTenantServer>,
+    run: (clients: {
+      a: Awaited<ReturnType<typeof connectClient>>;
+      b: Awaited<ReturnType<typeof connectClient>>;
+    }) => Promise<void>,
+  ) => {
+    const served = await serveHTTP(fixture.server, {
+      auth: req => ({ token: 't', clientId: String(req.headers['x-tenant']), scopes: [] }),
+    });
+    try {
+      const a = await connectClient(served.url, {}, { 'x-tenant': 'tenant-A' });
+      const b = await connectClient(served.url, {}, { 'x-tenant': 'tenant-B' });
+      try {
+        await run({ a, b });
+      } finally {
+        await a.close();
+        await b.close();
+      }
+    } finally {
+      await served.close();
+    }
+  };
+
   it('serves each caller their own resources from resources/list', async () => {
-    const { server, listResources } = createTenantServer();
-    const handlers = (server.getServer() as any)._requestHandlers;
-    const listHandler = handlers.get('resources/list');
-
-    const tenantA = await listHandler({ method: 'resources/list' }, makeExtra('tenant-A'));
-    const tenantB = await listHandler({ method: 'resources/list' }, makeExtra('tenant-B'));
-
-    expect(tenantA.resources[0].name).toBe('Doc for tenant-A');
-    expect(tenantB.resources[0].name).toBe('Doc for tenant-B');
+    const fixture = createTenantServer();
+    await withTenants(fixture, async ({ a, b }) => {
+      expect((await a.listResources()).resources[0]?.name).toBe('Doc for tenant-A');
+      expect((await b.listResources()).resources[0]?.name).toBe('Doc for tenant-B');
+    });
     // Provider must be re-evaluated for each caller, not served from a shared cache.
-    expect(listResources).toHaveBeenCalledTimes(2);
+    expect(fixture.listResources).toHaveBeenCalledTimes(2);
   });
 
   it('resolves resources/read against the current caller, not a cached list', async () => {
-    const { server, getResourceContent } = createTenantServer();
-    const handlers = (server.getServer() as any)._requestHandlers;
-    const listHandler = handlers.get('resources/list');
-    const readHandler = handlers.get('resources/read');
-
-    // Tenant A populates any would-be cache via list, then tenant B reads its own resource.
-    await listHandler({ method: 'resources/list' }, makeExtra('tenant-A'));
-
-    const result = await readHandler(
-      { method: 'resources/read', params: { uri: 'app://tenant-B/doc' } },
-      makeExtra('tenant-B'),
-    );
-
-    expect(result.contents[0].uri).toBe('app://tenant-B/doc');
-    expect(getResourceContent).toHaveBeenCalledWith(expect.objectContaining({ uri: 'app://tenant-B/doc' }));
+    const fixture = createTenantServer();
+    await withTenants(fixture, async ({ a, b }) => {
+      // Tenant A populates any would-be cache via list, then tenant B reads its own resource.
+      await a.listResources();
+      const result = await b.readResource({ uri: 'app://tenant-B/doc' });
+      expect(result.contents[0]?.uri).toBe('app://tenant-B/doc');
+      // Tenant A's resource is not resolvable for tenant B.
+      await expect(b.readResource({ uri: 'app://tenant-A/doc' })).rejects.toThrow('Resource not found');
+    });
+    expect(fixture.getResourceContent).toHaveBeenCalledWith(expect.objectContaining({ uri: 'app://tenant-B/doc' }));
+    expect(fixture.getResourceContent).not.toHaveBeenCalledWith(expect.objectContaining({ uri: 'app://tenant-A/doc' }));
   });
 
   it('serves each caller their own resource templates from resources/templates/list', async () => {
-    const { server, resourceTemplates } = createTenantServer();
-    const handlers = (server.getServer() as any)._requestHandlers;
-    const templatesHandler = handlers.get('resources/templates/list');
-
-    const tenantA = await templatesHandler({ method: 'resources/templates/list' }, makeExtra('tenant-A'));
-    const tenantB = await templatesHandler({ method: 'resources/templates/list' }, makeExtra('tenant-B'));
-
-    expect(tenantA.resourceTemplates[0].name).toBe('Template for tenant-A');
-    expect(tenantB.resourceTemplates[0].name).toBe('Template for tenant-B');
+    const fixture = createTenantServer();
+    await withTenants(fixture, async ({ a, b }) => {
+      expect((await a.listResourceTemplates()).resourceTemplates[0]?.name).toBe('Template for tenant-A');
+      expect((await b.listResourceTemplates()).resourceTemplates[0]?.name).toBe('Template for tenant-B');
+    });
     // Provider must be re-evaluated for each caller, not served from a shared cache.
-    expect(resourceTemplates).toHaveBeenCalledTimes(2);
+    expect(fixture.resourceTemplates).toHaveBeenCalledTimes(2);
   });
 
-  it('does not cache the dynamic list on the public listResources() method', async () => {
-    // Mirrors the minimal reproduction from the issue.
-    let tenant = 'tenant-A';
-    const server = new MCPServer({
-      name: 'repro',
-      version: '1.0.0',
-      tools: {},
-      resources: {
-        listResources: async () => [{ uri: `app://${tenant}/doc`, name: `Doc for ${tenant}`, mimeType: 'text/plain' }],
-        getResourceContent: async ({ uri }) => ({ text: uri }),
-      },
-    });
+  it('never serves the dynamic provider through the public listResources() method', async () => {
+    // The public method has no caller identity, so it must not consult (or cache)
+    // the tenant-scoped provider: application resources are only reachable through
+    // an MCP request that carries the caller's auth.
+    const { server, listResources } = createTenantServer();
 
-    expect((await server.listResources()).resources[0].name).toBe('Doc for tenant-A');
-    tenant = 'tenant-B';
-    expect((await server.listResources()).resources[0].name).toBe('Doc for tenant-B');
-  });
+    await expect(server.listResources()).resolves.toEqual({ resources: [] });
+    await expect(server.listResources()).resolves.toEqual({ resources: [] });
 
-  it('invokes the listResources provider on every public listResources() call', async () => {
-    // Regression guard: the public method must re-run the provider each call rather than
-    // serving a cached result, otherwise the dynamic provider stops being consulted and
-    // stale/cross-tenant data is returned. Asserting the call count catches a silent
-    // reintroduction of the cache even if the returned shape happens to look correct.
-    const listResources = vi.fn(async () => [{ uri: 'app://doc', name: 'Doc', mimeType: 'text/plain' }]);
-    const server = new MCPServer({
-      name: 'regression',
-      version: '1.0.0',
-      tools: {},
-      resources: { listResources, getResourceContent: async ({ uri }) => ({ text: uri }) },
-    });
-
-    await server.listResources();
-    await server.listResources();
-
-    expect(listResources).toHaveBeenCalledTimes(2);
+    expect(listResources).not.toHaveBeenCalled();
   });
 });

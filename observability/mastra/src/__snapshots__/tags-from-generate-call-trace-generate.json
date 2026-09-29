@@ -1,10 +1,10 @@
 {
   "__structure__": [
     "agent_run: \"agent run: 'test-agent-tags-call'\"",
-    "└── model_generation: \"llm: 'mock-model-id'\"",
-    "    └── model_step: \"step: 0\"",
-    "        └── model_inference: \"inference: 0\"",
-    "            └── model_chunk: \"chunk: 'text'\""
+    "\u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
+    "    \u2514\u2500\u2500 model_step: \"step: 0\"",
+    "        \u2514\u2500\u2500 model_inference: \"inference: 0\"",
+    "            \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\""
   ],
   "spans": [
     {
@@ -195,7 +195,9 @@
                       "provider": "mock-provider",
                       "streaming": true,
                       "providerAttempt": 1,
-                      "parameters": {},
+                      "parameters": {
+                        "maxRetries": 0
+                      },
                       "availableTools": [],
                       "toolChoice": "auto",
                       "measurementState": "measured",

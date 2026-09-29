@@ -143,6 +143,8 @@ class RecordingDbClient extends RecordingDbClientBase {
 
   override async manyOrNone<T = any>(query: string): Promise<T[]> {
     if (query?.includes('information_schema.columns')) return [];
+    // cloneThread reads the destination thread back after copyThread; no messages were copied here.
+    if (query?.includes('thread_id IN')) return [];
     throw new Error('not implemented');
   }
 
@@ -375,6 +377,26 @@ describe('MemoryPG.saveThread', () => {
       updatedAt.toISOString(),
       updatedAt.toISOString(),
     ]);
+  });
+
+  it('returns the same repaired metadata that it writes', async () => {
+    const client = new RecordingDbClient();
+    const memory = new MemoryPG({ client });
+    const now = new Date();
+    const saved = await memory.saveThread({
+      thread: {
+        id: 'thread-1',
+        resourceId: 'resource-1',
+        title: 'Test thread',
+        metadata: { text: 'a\0b', path: String.raw`literal\u0000` },
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+
+    expect(saved.metadata).toEqual({ text: 'ab', path: String.raw`literal\u0000` });
+    // The fork writes threads inside a locked transaction (RETURNING *).
+    expect(JSON.parse(client.txClient.queries[0]!.values![3] as string)).toEqual(saved.metadata);
   });
 });
 

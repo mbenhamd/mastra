@@ -1544,4 +1544,38 @@ describe('Koa Server Adapter', () => {
       expect(data).toEqual({ message: 'Hello from custom route!' });
     });
   });
+
+  it('decodes percent-encoded route parameters', async () => {
+    const app = new Koa();
+    app.use(bodyParser());
+
+    const adapter = new MastraServer({
+      app,
+      mastra: new Mastra({}),
+    });
+
+    adapter.registerContextMiddleware();
+
+    await adapter.registerRoute(
+      app,
+      {
+        method: 'GET',
+        path: '/items/:id',
+        responseType: 'json',
+        handler: async ({ id }) => ({ id }),
+      },
+      { prefix: '' },
+    );
+
+    server = await new Promise(resolve => {
+      const s = app.listen(0, () => resolve(s));
+    });
+
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    const response = await fetch(`http://localhost:${port}/items/a%2520b`);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ id: 'a%20b' });
+  });
 });

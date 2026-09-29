@@ -264,7 +264,7 @@ ${hasEmptyWorkingMemoryTemplateObject ? JSON.stringify(emptyWorkingMemoryTemplat
 
 ${UNTRUSTED_WORKING_MEMORY_GUIDANCE}
 ${truncated ? 'The stored working-memory data exceeded the configured input limit and was truncated before this prompt.\n' : ''}<working_memory_data>
-${safeData}
+${safeData || (truncated ? '' : 'No working memory data available.')}
 </working_memory_data>
 
 Notes:
@@ -302,7 +302,7 @@ ${typeof template.content === 'string' ? template.content : JSON.stringify(templ
 
 ${UNTRUSTED_WORKING_MEMORY_GUIDANCE}
 ${truncated ? 'The stored working-memory data exceeded the configured input limit and was truncated before this prompt.\n' : ''}<working_memory_data>
-${safeData}
+${safeData || (truncated ? '' : 'No working memory data available.')}
 </working_memory_data>
 
 Notes:
@@ -339,7 +339,7 @@ The following is your working memory - persistent information about the user and
 
 ${UNTRUSTED_WORKING_MEMORY_GUIDANCE}
 ${truncated ? 'The stored working-memory data exceeded the configured input limit and was truncated before this prompt.\n' : ''}<working_memory_data>
-${safeData}
+${safeData || (truncated ? '' : 'No working memory data available.')}
 </working_memory_data>
 
 Guidelines:

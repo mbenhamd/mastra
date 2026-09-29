@@ -53,22 +53,32 @@ export function extractSuspendedToolsFromMessages(
   // Merge both metadata buckets — the same assistant turn can declare both
   // a suspended tool and a pending approval, and we should not lose one when
   // the other exists.
-  let suspendedToolObj: Record<string, unknown> | undefined =
+  const metadataEntries =
     metadata && (metadata.suspendedTools || metadata.pendingToolApprovals)
       ? { ...(metadata.suspendedTools ?? {}), ...(metadata.pendingToolApprovals ?? {}) }
       : undefined;
+  let suspendedToolObj: Record<string, unknown> | undefined = metadataEntries
+    ? Object.fromEntries(
+        Object.entries(metadataEntries).map(([toolCallId, entry]) => [
+          toolCallId,
+          entry && typeof entry === 'object' && !Array.isArray(entry)
+            ? { toolCallId, ...(entry as Record<string, unknown>) }
+            : entry,
+        ]),
+      )
+    : undefined;
 
   if (!suspendedToolObj) {
     suspendedToolObj = suspendedToolsMessage.content.parts
       ?.filter(part => part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval')
       ?.reduce(
-        (acc, part) => {
+        (acc, part, index) => {
           if (
             (part.type === 'data-tool-call-suspended' || part.type === 'data-tool-call-approval') &&
             !(part.data as { resumed?: boolean }).resumed
           ) {
-            const data = part.data as { toolName?: string };
-            if (data.toolName) acc[data.toolName] = data;
+            const data = part.data as { toolCallId?: string; toolName?: string };
+            if (data.toolName) acc[data.toolCallId ?? `${data.toolName}-${index}`] = data;
           }
           return acc;
         },
@@ -78,10 +88,9 @@ export function extractSuspendedToolsFromMessages(
 
   if (!suspendedToolObj) return [];
 
-  // The auto-resume directive tells the model to pass the entry's `runId` back
-  // as `suspendedToolRunId`, which the resume leg uses to resume the suspended
-  // (inner) run. Persisted metadata stores the OUTER resumable runId with the
-  // inner run as `delegatedRunId`, so surface the inner run under `runId` here.
+  // The original tool call identifies the framework-persisted suspension. The
+  // delegated run remains visible for diagnostics and backwards compatibility,
+  // but the resume leg derives it from the selected suspended tool call.
   return Object.values(suspendedToolObj).map(entry => {
     if (!entry || typeof entry !== 'object') return entry as Record<string, unknown>;
     const { delegatedRunId, parentToolName, parentArgs, ...rest } = entry as Record<string, unknown>;

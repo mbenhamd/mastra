@@ -118,7 +118,6 @@ async function resetInngest(endpoints: LocalTestEndpoints, expectedFnIds: string
 afterAll(async () => {
   await INNGEST_TEST_RUNTIME.stop();
 });
-
 describe('Inngest type regressions', () => {
   it('should correctly thread TRequestContext type without TS2416 errors', () => {
     // This is a compile-time test to ensure TS2416 doesn't regress when InngestWorkflow
@@ -3417,6 +3416,99 @@ describe('MastraInngestWorkflow', () => {
         expect((result.error as any).responseHeaders).toEqual({ 'retry-after': '60' });
         expect((result.error as any).isRetryable).toBe(true);
       }
+
+      srv.close();
+    });
+
+    it('should report the original error stack to Inngest for failed steps', async ctx => {
+      const inngest = new Inngest({
+        id: 'mastra',
+        baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
+      });
+
+      const { createWorkflow, createStep } = init(inngest);
+
+      const reportedStepErrors: any[] = [];
+
+      function readsThreadIdOfUndefined(input: any) {
+        return input.state.threadId;
+      }
+
+      const step1 = createStep({
+        id: 'step1',
+        execute: async () => readsThreadIdOfUndefined({}),
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      const workflow = createWorkflow({
+        id: 'test-error-stack-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      });
+
+      workflow.then(step1).commit();
+
+      const mastra = new Mastra({
+        storage: new DefaultStorage({
+          id: 'test-storage',
+          url: ':memory:',
+        }),
+        workflows: {
+          'test-error-stack-workflow': workflow,
+        },
+        server: {
+          apiRoutes: [
+            {
+              path: '/inngest/api',
+              method: 'ALL',
+              createHandler: async ({ mastra }) => {
+                const handler = inngestServe({ mastra, inngest, ...getDockerRegisterOptions() });
+                // Capture what the SDK reports to Inngest so we can assert on the StepFailed op.
+                return async (c: any) => {
+                  const res = await handler(c);
+                  const body = await res.clone().text();
+                  try {
+                    const parsed = JSON.parse(body);
+                    for (const op of Array.isArray(parsed) ? parsed : [parsed]) {
+                      if (op?.op === 'StepFailed' || op?.op === 'StepError') reportedStepErrors.push(op);
+                    }
+                  } catch {
+                    // Non-JSON responses (e.g. registration) are irrelevant here.
+                  }
+                  return res;
+                };
+              },
+            },
+          ],
+        },
+      });
+
+      const app = await createHonoServer(mastra);
+
+      const srv = (globServer = serve({
+        fetch: app.fetch,
+        port: getLocalTestEndpoints(ctx).ports.handlerPort,
+      }));
+      await resetInngest(getLocalTestEndpoints(ctx));
+
+      const run = await workflow.createRun();
+      const result = await run.start({ inputData: {} });
+
+      expect(result.status).toBe('failed');
+      const stepResult = result.steps.step1;
+      expect(stepResult.status).toBe('failed');
+      expect((stepResult.error as Error).name).toBe('TypeError');
+
+      // The error reported to Inngest for the failed step keeps the original frame and type
+      // Fork: every retry attempt runs under its own `.attempt.N` step id.
+      const reported = reportedStepErrors.find(op => /\.step\.step1(\.attempt\.\d+)?$/.test(String(op.name)));
+      expect(reported).toBeDefined();
+      expect(reported.error.message).toContain("reading 'threadId'");
+      expect(reported.error.stack).toMatch(/^TypeError: /);
+      expect(reported.error.name).toBe('TypeError');
+      expect(reported.error.stack).toContain('readsThreadIdOfUndefined');
+      expect(reported.error.cause.error.stack).toContain('readsThreadIdOfUndefined');
 
       srv.close();
     });
@@ -10064,7 +10156,7 @@ describe('MastraInngestWorkflow', () => {
         // tool calls become impossible to resume individually.
         const inngest = new Inngest({
           id: 'mastra',
-          baseUrl: `http://localhost:${(ctx as any).inngestPort}`,
+          baseUrl: getLocalTestEndpoints(ctx).clientBaseUrl,
         });
 
         const { createWorkflow, createStep } = init(inngest);
@@ -10118,8 +10210,8 @@ describe('MastraInngestWorkflow', () => {
         });
 
         const app = await createHonoServer(mastra);
-        const srv = (globServer = serve({ fetch: app.fetch, port: (ctx as any).handlerPort }));
-        await resetInngest();
+        const srv = (globServer = serve({ fetch: app.fetch, port: getLocalTestEndpoints(ctx).ports.handlerPort }));
+        await resetInngest(getLocalTestEndpoints(ctx));
 
         try {
           const run = await outerWorkflow.createRun();

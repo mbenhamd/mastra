@@ -200,12 +200,12 @@ export const toolCallOutputSchema = toolCallInputSchema.extend({
   resumeTargetToolCallId: z.string().optional(),
   // Set when execution was interrupted by request abort (not a model-visible tool error).
   // `abortError` is terminal-only metadata: downstream emits it to stream consumers while
-  // leaving the invocation incomplete in persisted model history. Both fields must be
-  // declared or Zod strips them at the evented workflow boundary.
+  // leaving the invocation incomplete in persisted model history. Declared for schema
+  // honesty — no engine validates step outputs today, but Zod would strip an undeclared
+  // field if validation is ever (re-)enabled (see schema.test.ts).
   aborted: z.boolean().optional(),
   abortError: z.any().optional(),
   // HITL approval decision, present when the tool required approval and was resumed.
-  // Without this field Zod would strip `approval` from the step output before persistence.
   approval: z
     .object({
       id: z.string(),

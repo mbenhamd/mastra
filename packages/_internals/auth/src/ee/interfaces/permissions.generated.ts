@@ -39,6 +39,7 @@ export const RESOURCES = [
   'stored-prompt-blocks',
   'stored-scorers',
   'stored-skills',
+  'stored-workflows',
   'stored-workspaces',
   'system',
   'tool-providers',
@@ -145,6 +146,8 @@ export const PERMISSION_PATTERNS = {
   'stored-scorers:*': 'stored-scorers:*',
   /** Full access to stored skills */
   'stored-skills:*': 'stored-skills:*',
+  /** Full access to stored-workflows */
+  'stored-workflows:*': 'stored-workflows:*',
   /** Full access to stored workspaces */
   'stored-workspaces:*': 'stored-workspaces:*',
   /** Full access to system info */
@@ -305,6 +308,10 @@ export const PERMISSION_PATTERNS = {
   'stored-skills:share': 'stored-skills:share',
   /** Create and modify stored skills */
   'stored-skills:write': 'stored-skills:write',
+  /** View stored-workflows */
+  'stored-workflows:read': 'stored-workflows:read',
+  /** Create and modify stored-workflows */
+  'stored-workflows:write': 'stored-workflows:write',
   /** Delete stored workspaces */
   'stored-workspaces:delete': 'stored-workspaces:delete',
   /** View stored workspaces */
@@ -441,6 +448,8 @@ export const PERMISSIONS = [
   'stored-skills:read',
   'stored-skills:share',
   'stored-skills:write',
+  'stored-workflows:read',
+  'stored-workflows:write',
   'stored-workspaces:delete',
   'stored-workspaces:read',
   'stored-workspaces:write',
@@ -623,6 +632,10 @@ export const MastraFGAPermissions = {
   STORED_SKILLS_SHARE: 'stored-skills:share',
   /** Create and modify stored skills */
   STORED_SKILLS_WRITE: 'stored-skills:write',
+  /** View stored-workflows */
+  STORED_WORKFLOWS_READ: 'stored-workflows:read',
+  /** Create and modify stored-workflows */
+  STORED_WORKFLOWS_WRITE: 'stored-workflows:write',
   /** Delete stored workspaces */
   STORED_WORKSPACES_DELETE: 'stored-workspaces:delete',
   /** View stored workspaces */

@@ -218,6 +218,7 @@ import type {
 } from '@mastra/core/storage';
 import { parseSqlIdentifier } from '@mastra/core/utils';
 
+import { parseSchemaName, schemaNamePrefix } from '../../../shared/schema-name';
 import type { DbClient, QueryValues, TxClient } from '../../client';
 import { PgDB, generateIndexSQL, generateTableSQL, resolvePgConfig } from '../../db';
 import type { PgDomainConfig } from '../../db';
@@ -425,7 +426,7 @@ function preparePgHarnessSql(sql: string, schemaName?: string): string {
 
 function qualifyHarnessTableNames(sql: string, schemaName?: string): string {
   if (!schemaName || schemaName === 'public') return sql;
-  const schema = `"${parseSqlIdentifier(schemaName, 'schema name')}"`;
+  const schema = `"${parseSchemaName(schemaName)}"`;
   let next = sql;
   for (const table of HARNESS_TABLE_NAMES) {
     const bare = parseSqlIdentifier(table, 'table name');
@@ -867,7 +868,7 @@ export class HarnessPG extends HarnessStorage {
 
   static getExportDDL(schemaName?: string): string[] {
     const statements: string[] = [];
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
     const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
 
     for (const tableName of HarnessPG.MANAGED_TABLES) {
@@ -9311,7 +9312,7 @@ export class HarnessPG extends HarnessStorage {
   }
 
   #schemaPrefix(): string {
-    return this.#schema !== 'public' ? `${this.#schema}_` : '';
+    return this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
   }
 
   async #createDefaultIndexes(indexNames?: readonly string[]): Promise<void> {

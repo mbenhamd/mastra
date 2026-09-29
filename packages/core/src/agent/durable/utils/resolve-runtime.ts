@@ -280,7 +280,11 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
         resourceId: input.state.resourceId,
       }).deserialize(input.messageListState);
 
-  let tools: Record<string, CoreTool> = globalEntry?.tools ?? {};
+  // Prefer the full toolset over `tools`: after the first step `tools` holds the
+  // per-step snapshot the model was shown (possibly narrowed by processors such
+  // as ToolSearchProcessor), and seeding from it would drop every tool the
+  // processors withheld on the previous step (issue #22933).
+  let tools: Record<string, CoreTool> = globalEntry?.baseTools ?? globalEntry?.tools ?? {};
   let model = globalEntry?.model as MastraLanguageModel;
   let modelList: RegistryModelListEntry[] | undefined = globalEntry?.modelList;
   let workspace: Workspace | undefined = globalEntry?.workspace;
@@ -447,6 +451,14 @@ export interface RebuiltRunTools {
   workspace?: Workspace;
   memory?: MastraMemory;
   saveQueueManager?: SaveQueueManager;
+  /**
+   * The restored RequestContext the rebuilt tools were BUILT with (their
+   * closures capture this instance, not the step's own). Exposed so the
+   * tool-call step can read back by-reference signals a tool wrapper writes
+   * to its build-time context — e.g. the delegation bail flag — which would
+   * otherwise be invisible cross-process.
+   */
+  requestContext: RequestContext;
 }
 
 /**
@@ -550,7 +562,7 @@ export async function rebuildRunToolsFromMastra(options: {
       globalRunRegistry.set(runId, { isPlaceholder: true, ...patch } as RunRegistryEntry);
     }
 
-    return { tools, workspace, memory, saveQueueManager };
+    return { tools, workspace, memory, saveQueueManager, requestContext: resolveRequestContext };
   } catch (error) {
     if (isRuntimeToolBindingMismatch(error)) throw error;
     logger?.debug?.(`[DurableAgent:${agentId}] Failed to rebuild tools from Mastra for run ${runId}: ${error}`);

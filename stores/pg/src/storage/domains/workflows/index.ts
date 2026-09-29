@@ -150,7 +150,6 @@ import type {
   RetentionTablesDescriptor,
   TableRetentionPolicy,
 } from '@mastra/core/storage';
-import { parseSqlIdentifier } from '@mastra/core/utils';
 import type {
   StepResult,
   WorkflowRunState,
@@ -166,11 +165,12 @@ import {
   validateWorkflowTerminalRecoveryEnvelopeIntegrity,
   validateWorkflowTerminalRecoveryParentFrameGraphBinding,
 } from '@mastra/core/workflows';
+import { parseSchemaName, schemaNamePrefix } from '../../../shared/schema-name';
 import type { DbClient, TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
-import { truncateIdentifierWithHash } from '../../db/constraint-utils';
-import { PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, sanitizeJsonForPg } from '../../db/sanitize-json';
+import { buildConstraintName, truncateIdentifierWithHash } from '../../db/constraint-utils';
+import { PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, sanitizeJsonForPg, toPgJson } from '../../db/sanitize-json';
 import { getSchemaSnapshot } from '../../db/schema-snapshot';
 import type { SchemaCheckConstraint } from '../../db/schema-snapshot';
 import { runPrune, resolveTargets } from '../../retention';
@@ -265,7 +265,6 @@ function isInvalidLegacyWorkflowSnapshotJsonError(error: unknown): boolean {
   return code === '22P02' || code === '22P05';
 }
 export { sanitizeJsonForPg };
-
 function getSchemaName(schema?: string) {
   return schema ? `"${schema}"` : '"public"';
 }
@@ -296,10 +295,17 @@ const WORKFLOW_SNAPSHOT_STATUS_INDEX = 'mastra_workflow_snapshot_name_status_cre
  * Schema-prefixed name of the status index, lowercased and truncated the same way Postgres
  * stores it, so the init snapshot's index set answers "does it exist?" without a probe or a
  * no-op `CREATE INDEX` (schema-prefixed names routinely exceed the 63-byte limit).
+ * Exported for tests.
  */
-function workflowSnapshotStatusIndexName(schemaName?: string): string {
-  const prefix = schemaName && schemaName !== 'public' ? `${schemaName}_` : '';
-  return truncateIdentifierWithHash(`${prefix}${WORKFLOW_SNAPSHOT_STATUS_INDEX}`.toLowerCase());
+export function workflowSnapshotStatusIndexName(schemaName?: string): string {
+  return buildConstraintName({
+    baseName: WORKFLOW_SNAPSHOT_STATUS_INDEX,
+    schemaName: schemaName && schemaName !== 'public' ? schemaName : undefined,
+    // Hash on truncation: plain truncation would make distinct long
+    // schema-prefixed names collide in PostgreSQL's silent prefix folding,
+    // which `CREATE INDEX IF NOT EXISTS` then skips silently.
+    hashWhenTruncated: true,
+  });
 }
 
 /**
@@ -309,6 +315,50 @@ function workflowSnapshotStatusIndexName(schemaName?: string): string {
 function workflowSnapshotStatusIndexSQL(indexName: string, schemaName?: string): string {
   const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(schemaName) });
   return `CREATE INDEX IF NOT EXISTS "${indexName}" ON ${tableName} (workflow_name, (snapshot ->> 'status'), "createdAt" DESC)`;
+}
+
+/** Base name (before any schema prefix) of the expression index backing the threadId filter. */
+const WORKFLOW_SNAPSHOT_THREAD_ID_INDEX = 'mastra_workflow_snapshot_threadid_idx';
+
+/**
+ * Schema-prefixed name of the threadId index (see workflowSnapshotStatusIndexName).
+ *
+ * Unlike the status index, truncation appends a collision hash: both index names share the
+ * long `<schema>_mastra_workflow_snapshot_` prefix, so with a schema name of 37+ bytes plain
+ * truncation collapses them to the same 63-byte identifier and `CREATE INDEX IF NOT EXISTS`
+ * silently skips this index. The status index keeps plain truncation because its truncated
+ * name already exists in deployed catalogs; this index is new and free to adopt the rule.
+ * Exported for tests.
+ */
+export function workflowSnapshotThreadIdIndexName(schemaName?: string): string {
+  return buildConstraintName({
+    baseName: WORKFLOW_SNAPSHOT_THREAD_ID_INDEX,
+    schemaName: schemaName && schemaName !== 'public' ? schemaName : undefined,
+    hashWhenTruncated: true,
+  });
+}
+
+/**
+ * Expression extracting the thread id embedded in a snapshot (jsonb columns only). Mirrors
+ * the canonical extraction in `@mastra/core` (`getSnapshotMemoryInfo`), which reads one of
+ * two layouts:
+ * 1. agentic-loop: `context.<suspended step>.suspendPayload.__streamState.messageList.memoryInfo.threadId`
+ * 2. durable loop: `context.input.messageListState.memoryInfo.threadId`
+ *
+ * `jsonb_path_query_first(jsonb, jsonpath)` is IMMUTABLE, so the expression is valid in an
+ * expression index. The WHERE clause in listWorkflowRuns() must use this exact expression
+ * text so the planner can match it against the index. If the snapshot layout changes in
+ * core, this expression must be updated in lockstep or it will wrongly exclude rows.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ID_EXPR = `COALESCE(jsonb_path_query_first(snapshot, '$.context.* ? (@.status == "suspended").suspendPayload.__streamState.messageList.memoryInfo.threadId') #>> '{}', snapshot #>> '{context,input,messageListState,memoryInfo,threadId}')`;
+
+/**
+ * Expression index on the snapshot-embedded thread id so listWorkflowRuns() threadId filters
+ * (Agent.listSuspendedRuns) can use an index instead of detoasting every snapshot.
+ */
+function workflowSnapshotThreadIdIndexSQL(indexName: string, schemaName?: string): string {
+  const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(schemaName) });
+  return `CREATE INDEX IF NOT EXISTS "${indexName}" ON ${tableName} ((${WORKFLOW_SNAPSHOT_THREAD_ID_EXPR}))`;
 }
 
 export class WorkflowsPG extends WorkflowsStorage {
@@ -3183,7 +3233,7 @@ export class WorkflowsPG extends WorkflowsStorage {
    */
   static getExportDDL(schemaName?: string): string[] {
     const statements: string[] = [];
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
     const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
 
     // Table (includes the UNIQUE constraint on workflow_name, run_id via generateTableSQL)
@@ -3213,8 +3263,17 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   private static getWorkflowSnapshotStatusIndexExportDDL(schemaName?: string): string {
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : 'public';
-    const indexSql = workflowSnapshotStatusIndexSQL(workflowSnapshotStatusIndexName(parsedSchema), parsedSchema);
+    const parsedSchema = schemaName ? parseSchemaName(schemaName) : 'public';
+    const indexSql = workflowSnapshotStatusIndexSQL(
+      workflowSnapshotStatusIndexName(schemaNamePrefix(parsedSchema)),
+      parsedSchema,
+    );
+    // The snapshot threadId expression index uses jsonb_path_query_first(), which only
+    // exists for jsonb, so it shares the status index's column-type guard.
+    const threadIdIndexSql = workflowSnapshotThreadIdIndexSQL(
+      workflowSnapshotThreadIdIndexName(schemaName ? schemaNamePrefix(schemaName) : ''),
+      schemaName,
+    );
     return `DO $mastra_workflow_snapshot_status_index$
     DECLARE
       snapshot_column_type text;
@@ -3233,6 +3292,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
       IF snapshot_column_type = 'jsonb' THEN
         EXECUTE $mastra_snapshot_status_index_sql$${indexSql}$mastra_snapshot_status_index_sql$;
+        EXECUTE $mastra_snapshot_thread_id_index_sql$${threadIdIndexSql}$mastra_snapshot_thread_id_index_sql$;
       ELSIF snapshot_column_type IN ('json', 'text') THEN
         NULL;
       ELSE
@@ -3456,7 +3516,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   private static getWorkflowParentRevisionExportDDL(schemaName?: string): string {
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : 'public';
+    const parsedSchema = schemaName ? parseSchemaName(schemaName) : 'public';
     const revisionRegclass = `${getSchemaName(parsedSchema)}."${TABLE_WORKFLOW_PARENT_REVISIONS}"`;
     const revisionTableName = getTableName({
       indexName: TABLE_WORKFLOW_PARENT_REVISIONS,
@@ -4638,7 +4698,7 @@ export class WorkflowsPG extends WorkflowsStorage {
    * Returns the workflow snapshot index plus the terminalization recovery and retention indexes.
    */
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    const schemaPrefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const schemaPrefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     return WorkflowsPG.getDefaultIndexDefs(schemaPrefix);
   }
 
@@ -4662,17 +4722,35 @@ export class WorkflowsPG extends WorkflowsStorage {
     // which cannot use an index anyway. Never ask information_schema: a warm init must
     // stay inside the catalog snapshot, and a cold init already knows the declared type.
     const indexName = workflowSnapshotStatusIndexName(this.#schema);
+    const threadIdIndexName = workflowSnapshotThreadIdIndexName(this.#schema);
     const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
-    if (snapshot?.indexes.has(indexName)) return;
+    const hasStatusIndex = snapshot?.indexes.has(indexName) ?? false;
+    const hasThreadIdIndex = snapshot?.indexes.has(threadIdIndexName) ?? false;
+    if (hasStatusIndex && hasThreadIdIndex) return;
     const recordedType = snapshot?.columnTypes.get(TABLE_WORKFLOW_SNAPSHOT)?.get('snapshot');
     const declaredType = TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT]?.snapshot?.type;
     const snapshotType = recordedType ?? declaredType;
     if (snapshotType !== 'jsonb') return;
+    if (!hasStatusIndex) {
+      try {
+        await this.#db.createIndexFromStatement(indexName, workflowSnapshotStatusIndexSQL(indexName, this.#schema));
+      } catch (error) {
+        if (this.#db.isExternalSchemaMode()) throw error;
+        this.logger?.warn?.(`Failed to create index ${indexName}:`, error);
+      }
+    }
+
+    // Expression index backing the threadId filter in listWorkflowRuns() — jsonb only, like
+    // the status index above. Checked independently of the status index so deployments
+    // that already carry the status index still gain this one on a warm init.
+    if (hasThreadIdIndex) return;
     try {
-      await this.#db.createIndexFromStatement(indexName, workflowSnapshotStatusIndexSQL(indexName, this.#schema));
+      await this.#db.createIndexFromStatement(
+        threadIdIndexName,
+        workflowSnapshotThreadIdIndexSQL(threadIdIndexName, this.#schema),
+      );
     } catch (error) {
-      if (this.#db.isExternalSchemaMode()) throw error;
-      this.logger?.warn?.(`Failed to create index ${indexName}:`, error);
+      this.logger?.warn?.(`Failed to create index ${threadIdIndexName}:`, error);
     }
   }
 
@@ -4720,7 +4798,7 @@ export class WorkflowsPG extends WorkflowsStorage {
    * so its supporting index is not part of the default index set.
    */
   private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
-    const prefix = this.#schema && this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const prefix = this.#schema && this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     for (const [key, entry] of Object.entries(WorkflowsPG.retentionTables)) {
       if (!entry.indexed || !policies[key]) continue;
       try {
@@ -5551,7 +5629,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
         // Upsert the snapshot within the same transaction
         const now = new Date();
-        const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
+        const sanitizedSnapshot = toPgJson(snapshot);
         await t.none(
           `INSERT INTO ${tableName}
            (workflow_name, run_id, snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
@@ -5681,7 +5759,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         }
 
         // Update the snapshot within the same transaction
-        const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(updatedSnapshot));
+        const sanitizedSnapshot = toPgJson(updatedSnapshot);
         const now = new Date();
         await t.none(
           `UPDATE ${tableName}
@@ -5732,18 +5810,20 @@ export class WorkflowsPG extends WorkflowsStorage {
       const now = new Date();
       const createdAtValue = createdAt ? createdAt : now;
       const updatedAtValue = updatedAt ? updatedAt : now;
-      // Sanitize the snapshot JSON to remove problematic Unicode sequences
-      const sanitizedSnapshot = sanitizeJsonForPg(JSON.stringify(snapshot));
       await this.#db.client.tx(async t => {
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
+        const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
+        // Sanitize the snapshot JSON so PostgreSQL accepts it. jsonb columns use
+        // the shared repair (unpaired surrogates -> U+FFFD, NUL dropped); legacy
+        // json/text columns keep the strip rule that mirrors the SQL-side
+        // PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN read expressions.
+        const sanitizedSnapshot =
+          snapshotColumnType === 'jsonb' ? toPgJson(snapshot) : sanitizeJsonForPg(JSON.stringify(snapshot));
         // `->>` exists only for json/jsonb; legacy text snapshots need the
         // same sanitized cast the status expressions use, or every persist —
         // guarded or not — fails on "operator does not exist".
-        const generationExpression = this.workflowSnapshotGenerationExpression(
-          await this.resolveWorkflowSnapshotColumnType(t),
-          'snapshot',
-        );
+        const generationExpression = this.workflowSnapshotGenerationExpression(snapshotColumnType, 'snapshot');
         const existingSnapshot = await t.oneOrNone<{ exists: boolean; generation: string | null }>(
           `SELECT TRUE AS exists, ${generationExpression} AS generation
            FROM ${this.workflowSnapshotTableName()}
@@ -5764,8 +5844,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
         await t.none(
-          `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })} AS t
-                 (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
+          `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })} AS t                 (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (workflow_name, run_id) DO UPDATE
                  SET "resourceId" = COALESCE($3, t."resourceId"), snapshot = $4, "updatedAt" = $6, "updatedAtZ" = $8`,
@@ -5981,7 +6060,9 @@ export class WorkflowsPG extends WorkflowsStorage {
     perPage,
     page,
     resourceId,
+    threadId,
     status,
+    summary,
   }: StorageListWorkflowRunsInput = {}): Promise<WorkflowRuns> {
     try {
       const conditions: string[] = [];
@@ -6021,6 +6102,21 @@ export class WorkflowsPG extends WorkflowsStorage {
         }
       }
 
+      if (threadId) {
+        // The thread id lives inside the snapshot JSON, not in a column. Push the filter
+        // down only on jsonb columns, where the expression (and its backing index) can be
+        // evaluated; legacy json/text snapshot columns skip it. Skipping only returns a
+        // superset — callers (Agent.listSuspendedRuns) re-verify the thread id in-process.
+        const snapshotType = await this.#db.getColumnType(TABLE_WORKFLOW_SNAPSHOT, 'snapshot');
+        if (snapshotType === 'jsonb') {
+          conditions.push(`${WORKFLOW_SNAPSHOT_THREAD_ID_EXPR} = $${paramIndex}`);
+          values.push(threadId);
+          paramIndex++;
+        } else {
+          this.logger?.warn?.(`[${TABLE_WORKFLOW_SNAPSHOT}] snapshot column is not jsonb. Skipping threadId filter.`);
+        }
+      }
+
       if (fromDate) {
         conditions.push(`"createdAt" >= $${paramIndex}`);
         values.push(fromDate);
@@ -6047,8 +6143,20 @@ export class WorkflowsPG extends WorkflowsStorage {
       const normalizedPerPage = usePagination ? normalizePerPage(perPage, Number.MAX_SAFE_INTEGER) : 0;
       const offset = usePagination ? page! * normalizedPerPage : undefined;
 
+      // In summary mode only read status/timestamp out of the snapshot so large snapshots aren't transferred.
+      // Legacy json/text columns get the same sanitizing path as the status filter so bad escapes can't fail the list.
+      let selectList = '*';
+      if (summary) {
+        const snapshotType = await this.#db.getColumnType(TABLE_WORKFLOW_SNAPSHOT, 'snapshot');
+        const snapshotJson =
+          snapshotType === 'jsonb'
+            ? 'snapshot'
+            : `regexp_replace(snapshot::text, '\\\\u(0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2})', '', 'g')::jsonb`;
+        selectList = `workflow_name, run_id, "resourceId", "createdAt", "createdAtZ", "updatedAt", "updatedAtZ", jsonb_build_object('status', ${snapshotJson} -> 'status', 'timestamp', ${snapshotJson} -> 'timestamp') AS snapshot`;
+      }
+
       const query = `
-          SELECT * FROM ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
+          SELECT ${selectList} FROM ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
           ${whereClause}
           ORDER BY "createdAt" DESC
           ${usePagination ? ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}` : ''}

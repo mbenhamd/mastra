@@ -193,7 +193,7 @@ describe('processWorkflowForEach concurrency resolution', () => {
       await Promise.all(
         [0, 1].map(index =>
           processor.completeIteration({
-            workflow: { id: 'wf', stepGraph: [makeForeachStep(2)] },
+            workflow: { id: 'wf', stepGraph: [makeForeachStep(2)], options: {} },
             workflowId: 'wf',
             runId: snapshot.runId,
             executionGeneration: 'retry-generation',

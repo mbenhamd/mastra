@@ -2053,9 +2053,9 @@ describe('Processor Tracing Tests', () => {
 
       // EXPECTED: Both memory processors and custom processors should have spans
       // Memory processors run first on input, last on output
-      // MessageHistory (input) + custom-input + custom-output + MessageHistory (output) = 4.
+      // MemoryInputFilter (input) + MessageHistory (input) + custom-input + custom-output + MessageHistory (output) = 5.
       // MessageHistory declares MEMORY_OPERATION, so count by processor entity type.
-      expect(processorPhaseSpans(testExporter).length).toBe(4);
+      expect(processorPhaseSpans(testExporter).length).toBe(5);
 
       // Should have custom processor spans with correct names
       const customInputSpan = processorSpans.find(s => s.name === 'input processor: custom-input');
@@ -2132,9 +2132,9 @@ describe('Processor Tracing Tests', () => {
 
       // EXPECTED: Memory processors run first on inputs, last on outputs
       // This ensures guardrails validate content before persistence
-      // Input order: memory -> guardrail
+      // Input order: MemoryInputFilter -> MessageHistory -> guardrail
       // Output order: filter -> memory
-      expect(inputSpans.length).toBe(2);
+      expect(inputSpans.length).toBe(3);
       expect(outputSpans.length).toBe(2);
 
       // FULL HIERARCHY VERIFICATION:
@@ -2688,10 +2688,12 @@ describe('Processor Tracing Tests', () => {
         processorId: 'aborting-stream',
       });
 
-      // The step the abort happened in gets its own span carrying the tripwire
+      // The step the abort happened in gets its own span carrying the tripwire.
+      // A lone processor runs directly on the ProcessorState path in this fork
+      // (PF-2236, no synthetic workflow), which names spans by processor name.
       const streamProcessorSpans = testExporter
         .getProcessorSpans()
-        .filter(span => span.name === 'output stream processor: aborting-stream');
+        .filter(span => span.name === 'output stream processor: Aborting Stream');
       expect(streamProcessorSpans.length).toBe(2);
 
       const tripwireSpans = streamProcessorSpans.filter(

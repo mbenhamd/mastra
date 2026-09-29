@@ -1530,7 +1530,7 @@ describe('createScorer', () => {
         const serialized = JSON.stringify(error);
         expect(JSON.parse(serialized)).not.toHaveProperty('result');
         expect(serialized).not.toContain('score this output');
-        expect(serialized).not.toContain('still not valid JSON');
+        expect(serialized).toContain('still not valid JSON');
       } finally {
         warnSpy.mockRestore();
       }

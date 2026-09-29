@@ -5,11 +5,12 @@ import { ObservabilityStorage } from '@mastra/core/storage';
 import type { MastraPackage, SystemPackagesResponse } from '../schemas/system';
 import {
   apiSchemaManifestResponseSchema,
-  observabilityStorageCapabilitiesSchema,
+  observabilityRuntimeCapabilitiesSchema,
   systemPackagesResponseSchema,
 } from '../schemas/system';
 import { createRoute } from '../server-adapter/routes/route-builder';
 import { handleError } from './error';
+import { getObservabilityStorageCapabilities } from './observability-shared';
 
 const SOURCE_PROVIDER_CAPABILITIES_TIMEOUT_MS = 3000;
 
@@ -145,9 +146,9 @@ export const GET_API_SCHEMA_ROUTE = createRoute({
   },
 });
 
-function getObservabilityStorageCapabilities(
+function getObservabilityRuntimeCapabilities(
   observabilityStorage: unknown,
-): SystemPackagesResponse['observabilityStorageCapabilities'] {
+): SystemPackagesResponse['observabilityRuntimeCapabilities'] {
   const candidate = observabilityStorage as
     | {
         getCapabilities?: () => unknown;
@@ -171,7 +172,7 @@ function getObservabilityStorageCapabilities(
     // that have not adopted the richer capability contract yet.
     if (owner && owner !== Object.prototype && owner !== ObservabilityStorage.prototype) {
       try {
-        const result = observabilityStorageCapabilitiesSchema.safeParse(candidate.getCapabilities());
+        const result = observabilityRuntimeCapabilitiesSchema.safeParse(candidate.getCapabilities());
         if (result.success) return result.data;
       } catch {
         // Fall through to the side-effect-free feature declaration below.
@@ -188,7 +189,7 @@ function getObservabilityStorageCapabilities(
     const supportedStrategies = candidate.observabilityStrategy?.supported ?? [preferredStrategy];
     const supportsLogs = features.includes('logs');
     const supportsMetrics = features.includes('metrics');
-    const normalized = observabilityStorageCapabilitiesSchema.safeParse({
+    const normalized = observabilityRuntimeCapabilitiesSchema.safeParse({
       tracing: {
         preferredStrategy,
         supportedStrategies,
@@ -244,7 +245,10 @@ export const GET_SYSTEM_PACKAGES_ROUTE = createRoute({
       const observabilityStorage = storage?.stores?.observability;
       const observabilityStorageType = observabilityStorage?.constructor.name;
       const observabilityRuntimeStrategy = observabilityStorage?.runtimeTracingStrategy;
-      const observabilityStorageCapabilities = getObservabilityStorageCapabilities(observabilityStorage);
+      const observabilityStorageCapabilities = observabilityStorage
+        ? getObservabilityStorageCapabilities(observabilityStorage)
+        : undefined;
+      const observabilityRuntimeCapabilities = getObservabilityRuntimeCapabilities(observabilityStorage);
       const observabilityEnabled = !!mastra.observability.getDefaultInstance();
 
       const editor = mastra.getEditor();
@@ -268,6 +272,7 @@ export const GET_SYSTEM_PACKAGES_ROUTE = createRoute({
         observabilityStorageType,
         observabilityRuntimeStrategy,
         ...(observabilityStorageCapabilities ? { observabilityStorageCapabilities } : {}),
+        ...(observabilityRuntimeCapabilities ? { observabilityRuntimeCapabilities } : {}),
       };
     } catch (error) {
       return handleError(error, 'Error getting system packages');

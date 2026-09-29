@@ -1,9 +1,8 @@
 import type { StepResult, ToolSet } from '@internal/ai-sdk-v5';
 import { z } from 'zod/v4';
-import type { MastraDBMessage, MessageList } from '../../../agent/message-list';
 import { sanitizeToolName } from '../../../agent/message-list/utils/tool-name';
 import { TripWire } from '../../../agent/trip-wire';
-import { createObservabilityContext, EntityType, SpanType } from '../../../observability';
+import { createObservabilityContext } from '../../../observability';
 import type { ProcessorState } from '../../../processors';
 import { ProcessorRunner, outputProcessorsSupportStream } from '../../../processors/runner';
 import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
@@ -20,34 +19,12 @@ import { createStep } from '../../../workflows/workflow';
 import { readScoped, writeScoped } from '../../run-scope-access';
 import type { RunScopeContext } from '../../run-scope-access';
 import { DELEGATION_BAILED_KEY, STEP_TOOLS_KEY, TOOL_PAYLOAD_TRANSFORM_KEY } from '../../run-scope-keys';
+import { readToolResultFromMessageList } from '../../shared/read-tool-result';
+import { computeModelOutputProviderMetadata } from '../../shared/steps/tool-result-commit-core';
 import { outputProcessorsAllowTerminalToolResult, resolveTerminalToolResult } from '../../shared/terminal-tool-result';
 import type { OuterLLMRun } from '../../types';
-import { deserializeToolError } from '../errors';
+import { deserializeToolError, getSubAgentErrorResult } from '../errors';
 import { llmIterationOutputSchema, toolCallOutputSchema } from '../schema';
-
-/**
- * Walk messageList backwards looking for a tool-invocation part with the given
- * toolCallId in result state. Used to read the post-processToolResult value back
- * from the message list so we can sync any processor mutations into the
- * downstream tool-result stream chunk.
- */
-function readToolResultFromMessageList(messageList: MessageList, toolCallId: string): unknown {
-  const messages: MastraDBMessage[] = messageList.get.all.db();
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (!msg || msg.role !== 'assistant' || !msg.content?.parts) continue;
-    for (const part of msg.content.parts) {
-      if (
-        part?.type === 'tool-invocation' &&
-        part.toolInvocation?.toolCallId === toolCallId &&
-        part.toolInvocation?.state === 'result'
-      ) {
-        return part.toolInvocation.result;
-      }
-    }
-  }
-  return undefined;
-}
 
 export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = undefined>(
   { models, _internal, ...rest }: OuterLLMRun<Tools, OUTPUT>,
@@ -282,52 +259,6 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
        * When toModelOutput is defined, the transform runs under a MAPPING child span so
        * traces can distinguish "never invoked" from "ran no-op" from "ran transforming."
        */
-      /**
-       * Normalize modelOutput from toModelOutput() into the AI SDK's
-       * LanguageModelV2ToolResultOutput shape.
-       *
-       * The AI SDK's content array only accepts type 'text' or 'media'.
-       * Mastra's createTool docs show type 'image-url' as a convenience shorthand,
-       * so we normalize that here into type 'media' with the correct structure.
-       *
-       * Previously this converted 'media' -> 'image-data'/'file-data' which was wrong
-       * (those types are not valid in LanguageModelV2ToolResultOutput).
-       * See: https://github.com/mastra-ai/mastra/issues/17876
-       */
-      function normalizeModelOutput(output: unknown): unknown {
-        if (output == null || typeof output !== 'object') return output;
-
-        const obj = output as Record<string, unknown>;
-        if (obj.type !== 'content' || !Array.isArray(obj.value)) return output;
-
-        return {
-          ...obj,
-          value: (obj.value as unknown[]).map(item => {
-            if (item == null || typeof item !== 'object') return item;
-            const part = item as Record<string, unknown>;
-            // Normalize 'image-url' convenience type -> 'media' as AI SDK expects
-            if (part.type === 'image-url' && typeof part.url === 'string') {
-              // Prefer caller-supplied mediaType; fall back to parsing data: URI or defaulting to image/jpeg
-              const mediaType =
-                typeof part.mediaType === 'string' && part.mediaType
-                  ? part.mediaType
-                  : part.url.startsWith('data:')
-                    ? part.url.slice(5, part.url.indexOf(';')) || 'image/jpeg'
-                    : 'image/jpeg';
-              return { type: 'media', data: part.url, mediaType };
-            }
-            // 'image-data'/'file-data' from old normalizeModelOutput — convert back to 'media'
-            if (part.type === 'image-data' && typeof part.data === 'string') {
-              return { type: 'media', data: part.data, mediaType: part.mediaType ?? 'image/jpeg' };
-            }
-            if (part.type === 'file-data' && typeof part.data === 'string') {
-              return { type: 'media', data: part.data, mediaType: part.mediaType ?? 'application/octet-stream' };
-            }
-            return part;
-          }),
-        };
-      }
-
       async function getProviderMetadataWithModelOutput(toolCall: {
         toolName: string;
         toolCallId?: string;
@@ -341,39 +272,18 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         )?.[toolCall.toolName] ?? rest.tools?.[toolCall.toolName]) as
           | { toModelOutput?: (output: unknown) => unknown }
           | undefined;
-        let modelOutput: unknown;
-        if (tool?.toModelOutput && toolCall.result != null) {
-          const parentSpan = observabilityContext?.tracingContext?.currentSpan;
-          const mappingSpan = parentSpan?.createChildSpan({
-            type: SpanType.MAPPING,
-            name: `tool output mapping: '${toolCall.toolName}'`,
-            entityType: EntityType.TOOL,
-            entityId: toolCall.toolName,
-            entityName: toolCall.toolName,
-            input: toolCall.result,
-            attributes: {
-              mappingType: 'toModelOutput',
-              toolCallId: toolCall.toolCallId,
-            },
-          });
-          try {
-            modelOutput = await tool.toModelOutput(toolCall.result);
-            // Normalize media parts to image-data/file-data as AI SDK expects
-            modelOutput = normalizeModelOutput(modelOutput);
-            mappingSpan?.end({ output: modelOutput });
-          } catch (err) {
-            mappingSpan?.error({ error: err as Error, endSpan: true });
-            throw err;
-          }
-        }
-
-        const existingMastra = (toolCall.providerMetadata as any)?.mastra;
-        const providerMetadata = {
-          ...toolCall.providerMetadata,
-          ...(modelOutput != null ? { mastra: { ...existingMastra, modelOutput } } : {}),
-        };
-        const hasMetadata = Object.keys(providerMetadata).length > 0;
-        return hasMetadata ? providerMetadata : undefined;
+        return computeModelOutputProviderMetadata({
+          tool,
+          toolName: toolCall.toolName,
+          toolCallId: toolCall.toolCallId,
+          result: toolCall.result,
+          existingProviderMetadata: toolCall.providerMetadata,
+          parentSpan: observabilityContext?.tracingContext?.currentSpan,
+          // No `onMappingError`: on the default engine a toModelOutput failure
+          // rethrows and fails the run — the released contract. The durable
+          // engine supplies a warn-and-continue handler instead (redelivery
+          // would re-run the mapper on every attempt).
+        });
       }
 
       async function transformToolChunk(
@@ -628,6 +538,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             // serializes (Error instances become `{}` over the pubsub bus). Reify here so
             // chunk consumers see a real Error with name/message/stack intact.
             const reifiedError = deserializeToolError(toolCall.error);
+            const subAgentResult = getSubAgentErrorResult(reifiedError);
             const chunk = await transformToolChunk(
               {
                 type: 'tool-error',
@@ -658,7 +569,12 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 // plain {name,message,stack} shape after the pubsub JSON round-trip).
                 // Without reification the `instanceof Error` check below falls through to
                 // `safeStringify`, dumping the whole stringified payload into the history.
-                errorText: reifiedError.message || 'Tool execution failed',
+                // A failed sub-agent's structured result rides along so the model can
+                // read what the delegate produced before it failed.
+                // Nullish, not truthy (upstream commitToolResult): an empty failure-hook
+                // replacement text must survive the commit.
+                errorText: reifiedError.message ?? 'Tool execution failed',
+                ...(subAgentResult != null ? { result: subAgentResult } : {}),
                 // Preserve the approval decision for an approved approval-gated tool that then
                 // threw, so the decision round-trips on recall.
                 ...(toolCall.approval ? { approval: toolCall.approval } : {}),
@@ -803,6 +719,12 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           initialResult.stepResult.isContinued = true;
           initialResult.stepResult.reason = 'tool-calls';
           refreshLatestStepResult();
+          // A delegation hook may still bail on a failed delegation (e.g. the sub-agent
+          // threw); honor it here too so the loop stops instead of retrying.
+          if (rest.requestContext?.get('__mastra_delegationBailed')) {
+            writeScoped(scopeCtx, DELEGATION_BAILED_KEY, '_delegationBailed', true);
+            rest.requestContext.set('__mastra_delegationBailed', false);
+          }
           return {
             ...initialResult,
             messages: {
@@ -895,6 +817,8 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
 
           // Provider-executed tools are handled by llm-execution-step; for client-executed
           // tools we patch state:'call' -> state:'result' here after processors have run.
+          // The approval decision for an approved approval-gated tool is preserved so it
+          // round-trips on recall as `approval: { approved: true }`.
           if (!toolCall.providerExecuted) {
             persistResolvedToolCall(toolCall, {
               type: 'tool-invocation' as const,

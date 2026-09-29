@@ -1,16 +1,16 @@
 {
   "__structure__": [
     "agent_run: \"agent run: 'child-span-agent'\"",
-    "└── model_generation: \"llm: 'mock-model-id'\"",
-    "    ├── model_step: \"step: 0\"",
-    "    │   ├── model_inference: \"inference: 0\"",
-    "    │   │   ├── model_chunk: \"chunk: 'tool-call'\"",
-    "    │   │   └── model_chunk: \"chunk: 'tool-result'\"",
-    "    │   └── tool_call: \"tool: 'childSpanTool'\"",
-    "    │       └── generic: \"tool-child-operation\"",
-    "    └── model_step: \"step: 1\"",
-    "        └── model_inference: \"inference: 1\"",
-    "            └── model_chunk: \"chunk: 'text'\""
+    "\u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
+    "    \u251c\u2500\u2500 model_step: \"step: 0\"",
+    "    \u2502   \u251c\u2500\u2500 model_inference: \"inference: 0\"",
+    "    \u2502   \u2502   \u251c\u2500\u2500 model_chunk: \"chunk: 'tool-call'\"",
+    "    \u2502   \u2502   \u2514\u2500\u2500 model_chunk: \"chunk: 'tool-result'\"",
+    "    \u2502   \u2514\u2500\u2500 tool_call: \"tool: 'childSpanTool'\"",
+    "    \u2502       \u2514\u2500\u2500 generic: \"tool-child-operation\"",
+    "    \u2514\u2500\u2500 model_step: \"step: 1\"",
+    "        \u2514\u2500\u2500 model_inference: \"inference: 1\"",
+    "            \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\""
   ],
   "spans": [
     {
@@ -143,7 +143,16 @@
               "reasoning": [],
               "sources": [],
               "text": "Mock V2 stream response",
-              "warnings": []
+              "warnings": [],
+              "toolCalls": [
+                {
+                  "toolCallId": "call-child-span-1",
+                  "toolName": "childSpanTool",
+                  "args": {
+                    "input": "test-data"
+                  }
+                }
+              ]
             }
           },
           "children": [
@@ -226,7 +235,9 @@
                       "provider": "mock-provider",
                       "streaming": true,
                       "providerAttempt": 1,
-                      "parameters": {},
+                      "parameters": {
+                        "maxRetries": 0
+                      },
                       "availableTools": ["childSpanTool"],
                       "toolChoice": "auto",
                       "measurementState": "measured",
@@ -326,7 +337,7 @@
                         "traceId": "<trace-1>",
                         "name": "chunk: 'tool-result'",
                         "type": "model_chunk",
-                        "completed": false,
+                        "completed": true,
                         "isEvent": true,
                         "isRootSpan": false,
                         "parentId": "<span-4>",
@@ -482,7 +493,9 @@
                       "provider": "mock-provider",
                       "streaming": true,
                       "providerAttempt": 1,
-                      "parameters": {},
+                      "parameters": {
+                        "maxRetries": 0
+                      },
                       "availableTools": ["childSpanTool"],
                       "toolChoice": "auto",
                       "measurementState": "measured",

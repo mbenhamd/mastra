@@ -48,7 +48,7 @@ import {
 } from './span-payload';
 import type { ProcessorStepOutput } from './step-schema';
 import { REPROCESS_PART_KEY } from './stream-reprocess';
-import { TrailingAssistantGuard } from './trailing-assistant-guard';
+import { needsTrailingAssistantGuard, TrailingAssistantGuard } from './trailing-assistant-guard';
 import type {
   CachedLLMStepChunk,
   CachedLLMStepResponse,
@@ -351,6 +351,13 @@ export class ProcessorState<OUTPUT = undefined> {
   private spanEnded = false;
   private readonly workflowOutputStreamSpans = new Map<string, Span<ProcessorSpanType>>();
   private readonly endedWorkflowOutputStreamSpans = new Set<string>();
+  /**
+   * Milliseconds spent inside `processOutputStream`, summed across every
+   * chunk. The span itself lasts for the whole stream, so its duration is
+   * dominated by the model's inter-chunk latency; this is the processor's own
+   * share of that window.
+   */
+  public hookDurationMs = 0;
 
   constructor(options?: ProcessorStateSpanOptions) {
     this.startSpan(options);
@@ -368,10 +375,17 @@ export class ProcessorState<OUTPUT = undefined> {
   }
 
   /** @internal */
-  endWorkflowOutputStreamSpan(processorId: string, options: { retain?: boolean; output?: unknown } = {}): void {
+  endWorkflowOutputStreamSpan(
+    processorId: string,
+    options: { retain?: boolean; output?: unknown; attributes?: Record<string, unknown> } = {},
+  ): void {
     const span = this.workflowOutputStreamSpans.get(processorId);
     if (span && !this.endedWorkflowOutputStreamSpans.has(processorId)) {
-      span.end(options.output === undefined ? undefined : { output: options.output });
+      span.end(
+        options.output === undefined && options.attributes === undefined
+          ? undefined
+          : { output: options.output, attributes: options.attributes },
+      );
     }
     if (options.retain && span) this.endedWorkflowOutputStreamSpans.add(processorId);
     else {
@@ -398,7 +412,15 @@ export class ProcessorState<OUTPUT = undefined> {
   /** @internal */
   endWorkflowOutputStreamSpans(): void {
     for (const processorId of this.workflowOutputStreamSpans.keys()) {
-      this.endWorkflowOutputStreamSpan(processorId);
+      // The workflow stream path accumulates hook time beside the span; attach
+      // it on teardown and drop the bookkeeping key with the span it belongs to.
+      const durationKey = OUTPUT_STREAM_HOOK_DURATION_KEY_PREFIX + processorId;
+      const hookDurationMs = this.customState[durationKey];
+      this.endWorkflowOutputStreamSpan(
+        processorId,
+        typeof hookDurationMs === 'number' ? { attributes: { hookDurationMs } } : {},
+      );
+      delete this.customState[durationKey];
     }
   }
 
@@ -423,7 +445,7 @@ export class ProcessorState<OUTPUT = undefined> {
       entityId: processor?.id,
       entityName: options.processorName,
       attributes: {
-        ...(processor ? resolveProcessorSpanAttributes(processor, 'output') : {}),
+        ...resolveProcessorSpanAttributes(processor, 'outputStream'),
         processorExecutor: 'legacy',
         processorIndex: options.processorIndex ?? 0,
       },
@@ -444,12 +466,12 @@ export class ProcessorState<OUTPUT = undefined> {
   }
 
   /** @internal End and detach the current segment span so a later segment can open a fresh one. */
-  endSpan(options: { retain?: boolean } = {}): void {
+  endSpan(options: { retain?: boolean; attributes?: Record<string, unknown> } = {}): void {
     const span = this.span;
     if (!span) return;
     try {
       if (!this.spanEnded) {
-        span.end({ output: this.getFinalOutput() });
+        span.end({ output: this.getFinalOutput(), ...(options.attributes ? { attributes: options.attributes } : {}) });
       }
     } finally {
       if (options.retain) {
@@ -536,7 +558,18 @@ export class ProcessorState<OUTPUT = undefined> {
     this.customState = snapshot.customState;
     this.streamParts = snapshot.streamParts;
   }
+
+  /** Attributes attached on every end path of the span. */
+  getFinalAttributes(): { hookDurationMs: number } {
+    return { hookDurationMs: this.hookDurationMs };
+  }
 }
+
+/**
+ * Key under which the workflow-processor stream path keeps its accumulated
+ * hook time on the shared processor state, next to `__outputStreamSpan_<id>`.
+ */
+export const OUTPUT_STREAM_HOOK_DURATION_KEY_PREFIX = '__outputStreamHookDurationMs_';
 
 /**
  * Union type for processor or workflow that can be used as a processor
@@ -1068,7 +1101,7 @@ export class ProcessorRunner {
    */
   private async executeWorkflowAsProcessor(
     workflow: ProcessorWorkflow,
-    input: ProcessorStepOutput,
+    input: ProcessorStepOutput & { llmRequestProcessorIds?: ReadonlySet<string> },
     observabilityContext?: ObservabilityContext,
     requestContext?: RequestContext,
     writer?: ProcessorStreamWriter,
@@ -1266,7 +1299,7 @@ export class ProcessorRunner {
         entityId: processor.id,
         entityName: processor.name,
         attributes: {
-          ...resolveProcessorSpanAttributes(processor, 'output'),
+          ...resolveProcessorSpanAttributes(processor, 'outputResult'),
           processorExecutor: 'legacy',
           processorIndex: index,
         },
@@ -1481,25 +1514,35 @@ export class ProcessorRunner {
               continue;
             }
 
-            const result = await processor.processOutputStream!({
-              part: processedPart as ChunkType,
-              streamParts: state.streamParts as ChunkType[],
-              state: state.customState,
-              agent: this.agent,
-              abort: <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
-                throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
-              },
-              ...createObservabilityContext({ currentSpan: state.span }),
-              requestContext,
-              messageList,
-              retryCount,
-              writer,
-              ...(messageList
-                ? {
-                    sendSignal: (directProcessorSendSignal ??= this.getStreamProcessorSendSignal(messageList, writer)),
-                  }
-                : {}),
-            });
+            // Timed in a finally so a tripwire or error still reports the time spent so far.
+            const hookStart = performance.now();
+            let result: ChunkType | null | undefined;
+            try {
+              result = await processor.processOutputStream!({
+                part: processedPart as ChunkType,
+                streamParts: state.streamParts as ChunkType[],
+                state: state.customState,
+                agent: this.agent,
+                abort: <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
+                  throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
+                },
+                ...createObservabilityContext({ currentSpan: state.span }),
+                requestContext,
+                messageList,
+                retryCount,
+                writer,
+                ...(messageList
+                  ? {
+                      sendSignal: (directProcessorSendSignal ??= this.getStreamProcessorSendSignal(
+                        messageList,
+                        writer,
+                      )),
+                    }
+                  : {}),
+              });
+            } finally {
+              state.hookDurationMs += performance.now() - hookStart;
+            }
 
             // Track output chunk and update processedPart
             processedPart = result as ChunkType<OUTPUT> | null | undefined;
@@ -1513,6 +1556,7 @@ export class ProcessorRunner {
               error,
               endSpan: true,
               attributes: {
+                ...state.getFinalAttributes(),
                 tripwireAbort: {
                   reason: error.message,
                   retry: error.options?.retry,
@@ -1531,7 +1575,7 @@ export class ProcessorRunner {
           }
           // End span with error
           const state = processorStates.get(processor.id);
-          state?.errorSpan({ error: error as Error, endSpan: true });
+          state?.errorSpan({ error: error as Error, endSpan: true, attributes: state.getFinalAttributes() });
           // Log error but continue with original part
           this.logger.error('Output processor failed', { agent: this.agentName, processorId: processor.id, error });
         }
@@ -1540,8 +1584,7 @@ export class ProcessorRunner {
       // If this was a finish chunk, end all processor spans AFTER processing
       if (isFinishChunk) {
         for (const state of processorStates.values()) {
-          // Set output with accumulated text and chunk count from processor's output.
-          state.endSpan({ retain: true });
+          state.endSpan({ retain: true, attributes: state.getFinalAttributes() });
         }
       }
 
@@ -1550,7 +1593,7 @@ export class ProcessorRunner {
       this.logger.error('Stream part processing failed', { agent: this.agentName, error });
       // End all spans on fatal error
       for (const state of processorStates.values()) {
-        state.errorSpan({ error: error as Error, endSpan: true });
+        state.errorSpan({ error: error as Error, endSpan: true, attributes: state.getFinalAttributes() });
       }
       return { part, blocked: false };
     }
@@ -1558,7 +1601,9 @@ export class ProcessorRunner {
 
   endStreamProcessorSpans<OUTPUT>(processorStates: Map<string, ProcessorState<OUTPUT>>): void {
     for (const state of processorStates.values()) {
-      state.endSpan();
+      state.endSpan({ attributes: state.getFinalAttributes() });
+      // Spans live on the runtime state, never in processor-owned customState,
+      // so processor keys that merely resemble span storage are left untouched.
       state.endWorkflowOutputStreamSpans();
     }
   }
@@ -1967,9 +2012,8 @@ export class ProcessorRunner {
       retryCount: args.retryCount ?? 0,
     };
 
-    // Append the trailing assistant guard when the resolved model does not support assistant prefill
     const processors =
-      stepInput.model && isMaybeAnthropicWithoutAssistantPrefill(stepInput.model)
+      stepInput.model && needsTrailingAssistantGuard(stepInput.model, this.inputProcessors)
         ? [...this.inputProcessors, new TrailingAssistantGuard()]
         : this.inputProcessors;
 
@@ -2011,6 +2055,7 @@ export class ProcessorRunner {
                   return nextMessageId;
                 }
               : undefined,
+            llmRequestProcessorIds: args.llmRequestProcessorIds,
           },
           observabilityContext,
           requestContext,
@@ -2066,6 +2111,13 @@ export class ProcessorRunner {
       // Handle regular processor
       const processor = processorOrWorkflow as Processor;
       const processMethod = processor.processInputStep?.bind(processor);
+
+      // The guard is attached speculatively whenever a processor could have swapped the
+      // model. Now that every user processor has run, `stepInput.model` is final: skip the
+      // guard before creating a span so a no-op never shows up in exported traces.
+      if (processorOrWorkflow instanceof TrailingAssistantGuard && !processorOrWorkflow.appliesTo(stepInput.model)) {
+        continue;
+      }
 
       const abort = <TMetadata = unknown>(reason?: string, options?: TripWireOptions<TMetadata>): never => {
         throw new TripWire(reason || `Tripwire triggered by ${processor.id}`, options, processor.id);
@@ -2145,6 +2197,7 @@ export class ProcessorRunner {
           messageList,
           ...inputData,
           state: processorState.customState,
+          llmRequestStage: args.llmRequestProcessorIds?.has(processor.id) || undefined,
           abort,
           ...(rotateResponseMessageId ? { rotateResponseMessageId } : {}),
           ...createObservabilityContext({ currentSpan: processorSpan }),
@@ -2273,6 +2326,18 @@ export class ProcessorRunner {
   }
 
   /**
+   * IDs of the processors that `runProcessLLMRequest` will call for these input processors.
+   * Pass the result to `runProcessInputStep` as `llmRequestProcessorIds`.
+   */
+  static getLLMRequestProcessorIds(processors: readonly ProcessorOrWorkflow[]): Set<string> {
+    const ids = new Set<string>();
+    for (const processor of processors) {
+      if (!isProcessorWorkflow(processor) && processor.processLLMRequest) ids.add(processor.id);
+    }
+    return ids;
+  }
+
+  /**
    * Run processLLMRequest for all processors that implement it.
    *
    * Called *after* `MessageList` has been converted to `LanguageModelV2Prompt`
@@ -2283,6 +2348,7 @@ export class ProcessorRunner {
   async runProcessLLMRequest(args: {
     prompt: LanguageModelV2Prompt;
     model: unknown;
+    messageList?: MessageList;
     stepNumber: number;
     steps: Array<StepResult<any>>;
     requestContext?: RequestContext;
@@ -2309,7 +2375,9 @@ export class ProcessorRunner {
         currentSpan?.createChildSpan({
           type: resolveProcessorSpanType(processor) ?? SpanType.PROCESSOR_RUN,
           name: resolveProcessorSpanName(processor, 'llmRequest', `llm request processor: ${processor.id}`),
-          entityType: EntityType.INPUT_PROCESSOR,
+          // Provider-bound prompts never enter span payloads: this span carries
+          // only content-free measurement attributes (PF-3243).
+          entityType: EntityType.INPUT_STEP_PROCESSOR,
           entityId: processor.id,
           entityName: processor.name,
           attributes: {
@@ -2317,11 +2385,6 @@ export class ProcessorRunner {
             processorExecutor: 'legacy',
             processorIndex: index,
             processorPhase: 'llm_request',
-          },
-          input: {
-            prompt: currentPrompt,
-            stepNumber: args.stepNumber,
-            retryCount: args.retryCount ?? 0,
           },
         }),
       );
@@ -2335,7 +2398,6 @@ export class ProcessorRunner {
 
       try {
         const processorState = this.getProcessorState(processor.id);
-        const promptBefore = currentPrompt;
 
         const result = await processMethod({
           prompt: currentPrompt,
@@ -2343,6 +2405,7 @@ export class ProcessorRunner {
           // the runner accepts the looser `unknown` to match other call paths
           // (e.g. unresolved string ids or function-typed dynamic models).
           model: args.model as never,
+          messageList: args.messageList,
           stepNumber: args.stepNumber,
           steps: args.steps,
           state: processorState.customState,
@@ -2375,10 +2438,6 @@ export class ProcessorRunner {
           const promptAfterProcessor = timedPromptMeasurement(currentPrompt);
           runProcessorSpanOperation(() =>
             processorSpan.end({
-              output: {
-                ...(currentPrompt !== promptBefore ? { prompt: currentPrompt } : {}),
-                shortCircuited: Boolean(result && typeof result === 'object' && result.response),
-              },
               attributes: promptProcessorMeasurements(
                 promptBeforeProcessor.snapshot,
                 promptAfterProcessor.snapshot,

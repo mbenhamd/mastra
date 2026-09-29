@@ -331,7 +331,10 @@ function nextTarget(graph: readonly SerializedStepFlowEntry[], index: number): W
     entry.type === 'agent' ||
     entry.type === 'tool' ||
     entry.type === 'mapping' ||
-    entry.type === 'workflow'
+    entry.type === 'workflow' ||
+    // Classifier is a single-step entry like agent/tool/mapping (see
+    // default.ts), not a container: it plans as a step target with its id.
+    entry.type === 'classifier'
   ) {
     return { kind: 'step', stepId: getSerializedEntryId(entry), executionPath: [index] };
   }
