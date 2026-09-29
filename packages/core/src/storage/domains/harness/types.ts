@@ -1863,6 +1863,97 @@ export interface ListDuePendingInteractionsResult {
   nextCursor?: PendingInteractionDueScanCursor;
 }
 
+export interface RecoverableSessionScanCursor {
+  sessionId: string;
+}
+
+export interface ListRecoverableSessionsInput {
+  harnessName?: string;
+  /** Caller clock (epoch ms) that leases and dispatch claims are judged by. */
+  now: number;
+  /** Positive page size; adapters cap it at the storage-wide maximum. */
+  limit: number;
+  /** Return sessions strictly after this session id. */
+  cursor?: RecoverableSessionScanCursor;
+}
+
+/**
+ * An open session whose lease has lapsed at the caller's clock while durable
+ * work that recovery can advance is still pending. Discovery evidence only: a
+ * recovery worker adopts an open session through `harness.session()`, or
+ * finishes a `closing` one through `harness.closeSession()`; in both the lease
+ * compare-and-set is the reservation. Work recovery cannot advance yet (a live
+ * dispatch claim, a parked resume, a queue behind an unexpired interaction)
+ * does not make a session discoverable, so a worker never loops on it.
+ */
+export interface RecoverableSession {
+  harnessName: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  /**
+   * An admitted `message()` turn needs recovery: it is pending with no live
+   * dispatch claim and is not the parked resume (adoption, or a resumed close,
+   * interrupts it), or it was interrupted and its completion is unpublished.
+   */
+  pendingMessageAdmission: boolean;
+  /** The durable queue holds items that are not parked behind an unexpired interaction. */
+  pendingQueue: boolean;
+  /**
+   * A close started and never finished, and none of its turns is still
+   * claimed by another process's live dispatch (the close would be refused
+   * until the claim expires). `harness.session()` rejects closing sessions;
+   * `harness.closeSession()` resumes the persisted close.
+   */
+  closing: boolean;
+}
+
+export interface ListRecoverableSessionsResult {
+  items: RecoverableSession[];
+  nextCursor?: RecoverableSessionScanCursor;
+}
+
+export interface PendingMessageAdmissionScanCursor {
+  signalId: string;
+}
+
+export interface ListPendingMessageAdmissionsInput {
+  harnessName?: string;
+  sessionId: string;
+  resourceId: string;
+  threadId: string;
+  /** Caller clock (epoch ms) that dispatch claims are judged by. */
+  now: number;
+  /**
+   * Also return the pending row of the turn parked for a user response
+   * (excluded by default: it is waiting, not orphaned). Close uses it so it
+   * never closes over a parked turn's pending admission.
+   */
+  includeParkedResume?: boolean;
+  /** Positive page size; adapters cap it at the storage-wide maximum. */
+  limit: number;
+  /** Return rows strictly after this signal id. */
+  cursor?: PendingMessageAdmissionScanCursor;
+}
+
+/**
+ * Dispatch-claim state of an admitted message at the caller's clock. `none`:
+ * no claim was stamped (a plain admitted `message()` is fenced by the session
+ * lease alone) or the row is already settled. `live`: a stamped `dispatching`
+ * claim has not expired. `expired`: it has.
+ */
+export type PendingMessageDispatchClaim = 'none' | 'live' | 'expired';
+
+export interface PendingMessageAdmission {
+  evidence: AgentSignalResultEvidence;
+  dispatchClaim: PendingMessageDispatchClaim;
+}
+
+export interface ListPendingMessageAdmissionsResult {
+  items: PendingMessageAdmission[];
+  nextCursor?: PendingMessageAdmissionScanCursor;
+}
+
 export interface WithThreadDeleteFenceInput {
   threadId: string;
   /** Unique acquisition token; only the current matching owner may release a fence. */

@@ -89,6 +89,10 @@ import type {
   ListChannelDiagnosticsInput,
   ListDuePendingInteractionsInput,
   ListDuePendingInteractionsResult,
+  ListPendingMessageAdmissionsInput,
+  ListPendingMessageAdmissionsResult,
+  ListRecoverableSessionsInput,
+  ListRecoverableSessionsResult,
   ListSessionsByThreadInput,
   ListSessionsInput,
   ListWorkspaceActionJournalInput,
@@ -152,6 +156,70 @@ export function normalizePendingInteractionDueScanInput(input: ListDuePendingInt
   };
 }
 
+/** Hard storage-side page ceiling for orphaned-dispatch recovery discovery. */
+export const HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT = 100;
+
+/**
+ * Error code recovery records when it settles an admitted `message()` turn
+ * whose owner died mid-run. Adapters use it to find settled turns whose
+ * completion has not been published yet.
+ */
+export const HARNESS_RUN_INTERRUPTED_ERROR_CODE = 'harness.run_interrupted';
+
+/**
+ * Validate and cap a recovery-discovery request before an adapter queries.
+ * `now` is the caller's clock: leases and dispatch claims are stamped with it,
+ * so they are judged by it too. Kept in the storage domain so every adapter
+ * enforces identical bounds.
+ */
+export function normalizeDispatchRecoveryScanInput(input: { now: number; limit: number }): {
+  now: number;
+  limit: number;
+} {
+  if (!Number.isSafeInteger(input.now) || input.now < 0) {
+    throw new RangeError('Dispatch recovery scan now must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(input.limit) || input.limit <= 0) {
+    throw new RangeError('Dispatch recovery scan limit must be a positive safe integer');
+  }
+  return { now: input.now, limit: Math.min(input.limit, HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT) };
+}
+
+/**
+ * Fence for writes that must only land while their writer owns the session:
+ * the adapter checks, when the write commits, that `ownerId` holds an
+ * unexpired lease by its own clock (the clock leases are stamped with). A
+ * lapsed or foreign lease rejects the write without changing anything.
+ */
+export interface HarnessSessionLeasePrecondition {
+  ownerId: string;
+}
+
+export interface WriteMessageResultEvidenceOptions {
+  /**
+   * Write only while the session is open and its lease still names this
+   * owner, judged when the write commits; otherwise throw
+   * `HarnessStorageSessionClosedError` (closed) or
+   * `HarnessStorageLeaseConflictError` (another owner) and write nothing. A
+   * lease that expired without another owner taking it still names this owner
+   * (as `saveSession` treats it): no other process can have recovered or
+   * closed the session. The fence is ownership, not liveness. Adapters without
+   * dispatch recovery may ignore it.
+   */
+  leaseOwner?: HarnessSessionLeasePrecondition;
+}
+
+/**
+ * Recovery-only preconditions for committing an interrupted terminal outcome.
+ * The canonical evidence must still be pending with exactly the dispatch state
+ * recovery observed (`null`: no dispatch stamped), and the lease must be held.
+ * Otherwise the adapter returns a `conflict` receipt and changes nothing.
+ */
+export interface HarnessTerminalRecoveryPrecondition {
+  expectedDispatch: AgentSignalDispatchState | null;
+  leaseOwner: HarnessSessionLeasePrecondition;
+}
+
 export interface WriteMessageResultEvidenceResult {
   created: boolean;
   /** True only when this write changed the durable evidence row. */
@@ -192,7 +260,21 @@ export interface CompareAndSwapSignalTerminalInput {
   signalId: string;
   admissionId: string;
   admissionHash: string;
+  /**
+   * Durable operation discriminator of the admitted row. `'signal'` (the
+   * default) keeps the admitted-signal contract. `'message'` settles an
+   * admitted `message()` row: an unstamped row matches `expected: reserved`
+   * and settles against the run id it was admitted with. The stored row's
+   * operation kind must match.
+   */
+  operationKind?: 'message' | 'signal';
   expected: AgentSignalDispatchState;
+  /**
+   * Recovery-only: also require the caller to hold the session lease. For an
+   * admitted message, the settlement is also refused while a pending native
+   * terminal admission owns the run — only its finalizer commit may settle it.
+   */
+  leaseOwner?: HarnessSessionLeasePrecondition;
   terminal:
     | {
         status: 'completed';
@@ -381,6 +463,18 @@ export class HarnessStorageAttachmentByteOwnerError extends HarnessStorageDomain
 }
 
 /**
+ * Thrown by an owner-fenced write (a message reservation) when the targeted
+ * session is already closed.
+ */
+export class HarnessStorageSessionClosedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageSessionClosedError';
+  readonly code = 'harness.storage.session_closed' as const;
+  constructor(public readonly sessionId: string) {
+    super(`Session "${sessionId}" is closed`);
+  }
+}
+
+/**
  * Thrown by lease/attachment operations when the targeted session record
  * does not exist in storage.
  */
@@ -528,6 +622,14 @@ export class HarnessStorageSignalDispatchUnsupportedError extends HarnessStorage
   readonly code = 'harness.storage.signal_dispatch_unsupported' as const;
   constructor() {
     super('Harness storage adapter does not support durable signal dispatch fencing');
+  }
+}
+
+export class HarnessStorageDispatchRecoveryUnsupportedError extends HarnessStorageDomainError {
+  readonly name = 'HarnessStorageDispatchRecoveryUnsupportedError';
+  readonly code = 'harness.storage.dispatch_recovery_unsupported' as const;
+  constructor() {
+    super('Harness storage adapter does not support orphaned dispatch recovery discovery');
   }
 }
 
@@ -789,6 +891,16 @@ export abstract class HarnessStorage extends StorageDomain {
     return false;
   }
 
+  /**
+   * Native adapters override this after implementing `listRecoverableSessions`,
+   * `listPendingMessageAdmissions`, the `'message'` terminal CAS with its lease
+   * precondition, the recovery precondition of `commitTerminalHandoff`, and
+   * run summaries. Session adoption skips orphaned-dispatch recovery when false.
+   */
+  get supportsDispatchRecovery(): boolean {
+    return false;
+  }
+
   constructor(
     options: {
       terminalHandoff?: HarnessTerminalHandoffOption;
@@ -877,6 +989,40 @@ export abstract class HarnessStorage extends StorageDomain {
    * session CAS so a response/new pending generation can win safely.
    */
   abstract listDuePendingInteractions(opts: ListDuePendingInteractionsInput): Promise<ListDuePendingInteractionsResult>;
+
+  /**
+   * Discover open sessions whose lease has lapsed at the caller's `now`
+   * (unowned or expired) while durable work that recovery can advance is still
+   * pending: an admitted `message()` turn to interrupt or whose interrupted
+   * completion is unpublished, a queue not parked behind an unexpired
+   * interaction, or an unfinished close. Keyset-paginated by session id.
+   * Discovery evidence only — a recovery worker adopts an open session through
+   * `harness.session()` and finishes a closing one through
+   * `harness.closeSession()`; the lease compare-and-set is the reservation.
+   *
+   * Deploy compatibility: a turn whose pending native terminal admission names
+   * a finalizer id and version the recovering process does not register is
+   * left pending (only that finalizer may settle it), so its session is listed
+   * again each time its lease lapses until a process registering that exact
+   * finalizer version recovers it.
+   */
+  async listRecoverableSessions(_opts: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
+    throw new HarnessStorageDispatchRecoveryUnsupportedError();
+  }
+
+  /**
+   * List a session's admitted `message()` result rows that recovery must act
+   * on: pending rows, each with its dispatch-claim state at the caller's `now`,
+   * and rows settled `harness.run_interrupted` whose completion has not been
+   * published (no run summary yet). Keyset-paginated by signal id. Session
+   * adoption uses it to find dispatches orphaned by a dead owner; it never
+   * grants authority to settle a row (settlement is a CAS).
+   */
+  async listPendingMessageAdmissions(
+    _opts: ListPendingMessageAdmissionsInput,
+  ): Promise<ListPendingMessageAdmissionsResult> {
+    throw new HarnessStorageDispatchRecoveryUnsupportedError();
+  }
 
   /**
    * Run a small critical section while new active-session admission for this
@@ -1148,7 +1294,10 @@ export abstract class HarnessStorage extends StorageDomain {
     signalId: string;
   }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null>;
 
-  abstract writeMessageResultEvidence(record: AgentSignalResultEvidence): Promise<WriteMessageResultEvidenceResult>;
+  abstract writeMessageResultEvidence(
+    record: AgentSignalResultEvidence,
+    options?: WriteMessageResultEvidenceOptions,
+  ): Promise<WriteMessageResultEvidenceResult>;
 
   // -------------------------------------------------------------------------
   // Native chat terminal handoff
@@ -1159,7 +1308,17 @@ export abstract class HarnessStorage extends StorageDomain {
    * serialize this against the grant cancellation tombstone, so a missing
    * session or missing admission can never be interpreted as refundable work.
    */
-  async admitTerminalHandoff(_input: HarnessTerminalAdmissionInput): Promise<HarnessTerminalAdmissionReceipt> {
+  async admitTerminalHandoff(
+    _input: HarnessTerminalAdmissionInput,
+    _opts?: {
+      /**
+       * Refuse (`fenced`, nothing written) unless this owner holds the lease
+       * and the admitted turn's result evidence is not already terminal, so a
+       * stalled owner cannot admit a turn recovery has taken over.
+       */
+      leaseOwner?: HarnessSessionLeasePrecondition;
+    },
+  ): Promise<HarnessTerminalAdmissionReceipt> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }
 
@@ -1168,12 +1327,18 @@ export abstract class HarnessStorage extends StorageDomain {
    * with the exact finalizer bytes and durable delivery intent in one adapter
    * transaction. This replaces the ordinary completed-evidence write on the
    * opted-in path; there is no completed → prepare → commit sequence.
+   *
+   * `resultEvidence` may instead be `failed` when `terminalResult` is not
+   * `completed` — the interrupted outcome of a dispatch orphaned by a dead
+   * owner, which never produced provider output. That recovery write passes
+   * `recovery` so it can never overwrite a dispatch that changed meanwhile.
    */
   async commitTerminalHandoff(_input: {
     admission: HarnessTerminalAdmissionInput;
     resultEvidence: AgentSignalResultEvidence;
     terminalResult: HarnessTerminalResult;
     projection: HarnessTerminalProjection;
+    recovery?: HarnessTerminalRecoveryPrecondition;
   }): Promise<HarnessTerminalCommitReceipt> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }

@@ -1045,6 +1045,8 @@ export class Harness {
   private readonly _sessionMaterializationsInFlight = new Map<string, Promise<Session>>();
   /** In-process close de-dupe by any session id currently covered by a close tree. */
   private readonly _closePromises = new Map<string, Promise<void>>();
+  /** Close refusals over a turn parked for a response, which reopen what the close marked. */
+  private readonly _parkedCloseRefusals = new WeakSet<object>();
   private readonly _shutdownEvictedSessionIds = new Set<string>();
   /** Workspace registry — owns lifecycle across `shared`/`per-resource`/`per-session`. */
   readonly _workspaceRegistry: WorkspaceRegistry;
@@ -3706,9 +3708,16 @@ export class Harness {
       throw new Error('Harness is shut down');
     }
     let admission!: Promise<Session>;
-    admission = this._resolveSession(opts).finally(() => {
-      this._sessionAdmissionsInFlight.delete(admission);
-    });
+    admission = this._resolveSession(opts)
+      .then(async session => {
+        // A live session keeps its lease, so discovery never lists it: a turn
+        // its adoption had to leave is recovered here once it is due.
+        await session._recheckOrphanedDispatchesIfDue();
+        return session;
+      })
+      .finally(() => {
+        this._sessionAdmissionsInFlight.delete(admission);
+      });
     this._sessionAdmissionsInFlight.add(admission);
     return admission;
   }
@@ -4499,9 +4508,14 @@ export class Harness {
     const adoptedHere = existing === undefined;
     try {
       // Reconcile before publishing readiness. An overdue durable interaction
-      // is terminalized first, then lost delegation hooks are repaired. Queue
-      // replay cannot start until both recovery barriers have succeeded.
+      // is terminalized first, then orphaned message dispatches are
+      // interrupted, then lost delegation hooks are repaired. Queue replay
+      // cannot start until every recovery barrier has succeeded.
       await session._reconcilePendingInteractionExpiryOnHydrate();
+      // Admitted message dispatches orphaned by a dead owner are interrupted
+      // (never re-run) while this process holds the adopted lease. A dispatch
+      // another process still claims is left for a later recovery.
+      await session._recoverOrphanedMessageDispatches();
       await session._reconcileDelegationsOnHydrate();
       if (this._shutdown) throw new Error('Harness is shut down');
       session._emit({ type: 'session_hydrated' });
@@ -5754,10 +5768,60 @@ export class Harness {
       }
 
       await this._drainCloseTree(tree, subtreeCloseDeadlineAt);
+      // The drain can leave admitted turns pending (a starter that failed
+      // closed on a lapsed claim, a run whose result write failed) or parked
+      // for a response. Re-check before `closedAt`: a closed session is never
+      // recovered again.
+      for (const node of tree) {
+        const blocked = await node.live?._pendingAdmissionBlockingClose('after-drain');
+        if (blocked !== undefined) throw this._closeRefusedOverAdmission(node.record.id, blocked);
+      }
       await this._terminalizeCloseTree(storage, tree, closedLiveSessions);
     } catch (err) {
+      if (this._parkedCloseRefusals.has(err as object)) {
+        await this._reopenRefusedCloseTree(storage, tree, persistedCloseIds);
+      }
       await this._releaseCloseTreeLeases(storage, tree);
       throw err;
+    }
+  }
+
+  private _closeRefusedOverAdmission(
+    sessionId: string,
+    blocked: { holder: string; retryAt: number; parked?: true },
+  ): HarnessSessionLockedError {
+    const err = new HarnessSessionLockedError(sessionId, blocked.holder, blocked.retryAt);
+    if (blocked.parked) this._parkedCloseRefusals.add(err);
+    return err;
+  }
+
+  /**
+   * A close refused over a turn parked for a response does not leave the
+   * subtree closing: a closing session rejects the response the turn waits
+   * for. Each marker is cleared under the lease and version it was written
+   * with; one that cannot be stays closing, recoverable by close. Any other
+   * refusal keeps the markers — durable close intent — and the close resumes
+   * once what blocks it settles or expires.
+   */
+  private async _reopenRefusedCloseTree(
+    storage: HarnessStorage,
+    tree: CloseTreeNode[],
+    persistedCloseIds: Set<string>,
+  ): Promise<void> {
+    for (const node of tree) {
+      try {
+        if (node.live) {
+          await node.live._flushClearClosingMarker();
+        } else if (node.record.closingAt !== undefined && node.record.closedAt === undefined) {
+          await storage.saveSession(
+            { ...node.record, closingAt: undefined, closeDeadlineAt: undefined, lastActivityAt: Date.now() },
+            { harnessName: node.record.harnessName, ownerId: this.ownerId, ifVersion: node.record.version },
+          );
+        }
+        persistedCloseIds.delete(node.record.id);
+      } catch {
+        // Preserve the refusal; the marker stays and the close can resume.
+      }
     }
   }
 
@@ -5773,6 +5837,7 @@ export class Harness {
       if (scope.resourceId !== undefined && ready.resourceId !== scope.resourceId) {
         throw new HarnessSessionNotFoundError(record.id);
       }
+      await this._settleOrphanedDispatchesBeforeClose(ready);
       return {
         record: ready.getRecord(),
         depth,
@@ -5785,6 +5850,7 @@ export class Harness {
       if (scope.resourceId !== undefined && live.resourceId !== scope.resourceId) {
         throw new HarnessSessionNotFoundError(record.id);
       }
+      await this._settleOrphanedDispatchesBeforeClose(live);
       return {
         record: live.getRecord(),
         depth,
@@ -5795,11 +5861,27 @@ export class Harness {
 
     const lease = await this._acquireLease(storage, record.harnessName, record.id);
     let latest: SessionRecord | null;
+    // A cold record with admitted messages to recover may be resuming a close
+    // its crashed owner started: it is adopted like a queued record (below) so
+    // the orphaned dispatches are settled (never re-run) before terminalizing.
+    let hasPendingMessageAdmissions = false;
     try {
       latest = await storage.loadSession({ harnessName: record.harnessName, sessionId: record.id });
       if (!latest) throw new HarnessSessionNotFoundError(record.id);
       if (scope.resourceId !== undefined && latest.resourceId !== scope.resourceId) {
         throw new HarnessSessionNotFoundError(record.id);
+      }
+      if (storage.supportsDispatchRecovery) {
+        const pending = await storage.listPendingMessageAdmissions({
+          harnessName: latest.harnessName,
+          sessionId: latest.id,
+          resourceId: latest.resourceId,
+          threadId: latest.threadId,
+          now: Date.now(),
+          limit: 1,
+          includeParkedResume: true,
+        });
+        hasPendingMessageAdmissions = pending.items.length > 0;
       }
     } catch (err) {
       try {
@@ -5820,12 +5902,20 @@ export class Harness {
       leaseExpiresAt: lease.expiresAt,
       version: lease.version,
     };
-    if ((leasedRecord.pendingQueue?.length ?? 0) > 0) {
+    if ((leasedRecord.pendingQueue?.length ?? 0) > 0 || hasPendingMessageAdmissions) {
       const recovered = this._adoptSession(storage, leasedRecord, {
         emitCreated: false,
         kickQueueDrain: false,
         eventReplaySeed: await this._eventReplaySeedFor(storage, leasedRecord),
       });
+      if (hasPendingMessageAdmissions) {
+        try {
+          await this._settleOrphanedDispatchesBeforeClose(recovered);
+        } catch (err) {
+          await this._discardFailedMaterialization(storage, recovered);
+          throw err;
+        }
+      }
       return {
         record: recovered.getRecord(),
         depth,
@@ -5838,6 +5928,27 @@ export class Harness {
       depth,
       leaseAcquired: true,
     };
+  }
+
+  /**
+   * A close must not hide an admitted turn: orphaned dispatches are settled
+   * first, and the close is refused (retry after `retryAt`) while a turn is
+   * still pending — another process's dispatch claim is live, its settlement
+   * did not commit, or it is parked for a user response whose interaction is
+   * not yet due (a due one is expired first). Once a session is closed no
+   * recovery would ever look at that turn again.
+   */
+  private async _settleOrphanedDispatchesBeforeClose(session: Session): Promise<void> {
+    const blockedBy = await session._pendingAdmissionBlockingClose('before-drain');
+    if (blockedBy === undefined) return;
+    // A closing marker this node already carries (a close that crashed, or
+    // failed after persisting it) is cleared when a turn is parked: a closing
+    // session rejects the response it waits for. One that cannot be cleared
+    // stays, and the close can resume.
+    if (blockedBy.parked && session.getRecord().closingAt !== undefined) {
+      await session._flushClearClosingMarker().catch(() => undefined);
+    }
+    throw this._closeRefusedOverAdmission(session.id, blockedBy);
   }
 
   private async _markCloseNodeClosing(

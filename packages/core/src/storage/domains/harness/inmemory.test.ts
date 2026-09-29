@@ -4344,3 +4344,53 @@ describe('InMemoryHarness pending-interaction expiry discovery', () => {
     );
   });
 });
+
+describe('InMemoryHarness orphaned-dispatch recovery scans', () => {
+  it('pages both recovery scans by cursor and rejects invalid scan input, like the PG adapter', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const pendingMessage = (session: SessionRecord, tag: string) => ({
+      status: 'pending' as const,
+      signalId: `signal-${tag}`,
+      runId: `run-${tag}`,
+      operationKind: 'message' as const,
+      admissionId: `admission-${tag}`,
+      admissionHash: `admission-hash-${tag}`,
+      harnessName: 'default',
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+    const sessions: SessionRecord[] = [];
+    for (const tag of ['page-a', 'page-b', 'page-c']) {
+      const session = sampleSession({ id: tag, resourceId: `resource-${tag}`, threadId: `thread-${tag}` });
+      await storage.createOrLoadActiveSession(session, { initialLease: { ownerId: `owner-${tag}`, ttlMs: 60_000 } });
+      await storage.writeMessageResultEvidence(pendingMessage(session, tag));
+      await storage.releaseSessionLease({ sessionId: tag, ownerId: `owner-${tag}` });
+      sessions.push(session);
+    }
+    const now = Date.now();
+    const first = await storage.listRecoverableSessions({ now, limit: 2 });
+    expect(first.items.map(item => item.sessionId)).toEqual(['page-a', 'page-b']);
+    expect(first.nextCursor).toEqual({ sessionId: 'page-b' });
+    await expect(storage.listRecoverableSessions({ now, limit: 2, cursor: first.nextCursor })).resolves.toEqual({
+      items: [expect.objectContaining({ sessionId: 'page-c' })],
+    });
+
+    const owner = sessions[0]!;
+    const scope = { sessionId: owner.id, resourceId: owner.resourceId, threadId: owner.threadId };
+    for (const tag of ['page-a-2', 'page-a-3']) await storage.writeMessageResultEvidence(pendingMessage(owner, tag));
+    const rows = await storage.listPendingMessageAdmissions({ ...scope, now, limit: 2 });
+    expect(rows.items.map(item => item.evidence.signalId)).toEqual(['signal-page-a', 'signal-page-a-2']);
+    expect(rows.nextCursor).toEqual({ signalId: 'signal-page-a-2' });
+    const rest = await storage.listPendingMessageAdmissions({ ...scope, now, limit: 2, cursor: rows.nextCursor });
+    expect(rest.items.map(item => item.evidence.signalId)).toEqual(['signal-page-a-3']);
+    expect(rest.nextCursor).toBeUndefined();
+
+    await expect(storage.listRecoverableSessions({ now, limit: 0 })).rejects.toBeInstanceOf(RangeError);
+    await expect(storage.listPendingMessageAdmissions({ ...scope, now: -1, limit: 2 })).rejects.toBeInstanceOf(
+      RangeError,
+    );
+  });
+});

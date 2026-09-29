@@ -67,7 +67,11 @@ export interface HarnessTerminalFinalizerInput {
   finalizerId: string;
   finalizerVersion: string;
   result: HarnessTerminalResult;
-  /** The live full output is available only to the registered finalizer. */
+  /**
+   * The live full output is available only to the registered finalizer. It is
+   * `undefined` for an `aborted` result whose dispatch was orphaned by a dead
+   * owner and interrupted on session adoption: no output was ever observed.
+   */
   fullOutput: unknown;
 }
 
