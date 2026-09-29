@@ -888,6 +888,53 @@ describe('Session adoption — orphaned message dispatch', () => {
     },
   );
 
+  it('never recovers a resume still running here as stale when close finds it past its recovery deadline', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-1', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    let finishResume!: () => void;
+    agent.enqueueRun({ holdUntil: new Promise<void>(resolve => (finishResume = resolve)), text: 'resumed' });
+    const owner = harnessProcess(db, agent, true, finalizer, undefined, { lockTtlMs: 10 * 60_000 });
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const target = { sessionId: session.id, resourceId: 'u1' };
+    const admission = {
+      harnessName: 'default',
+      sessionId: session.id,
+      admissionId: 'orphaned-turn',
+      executionGrant: grant,
+    };
+    try {
+      await expect(session.message({ ...terminalHandoffMessage.message } as never)).resolves.toMatchObject({
+        finishReason: 'suspended',
+      });
+      const resumed = session.respondToToolApproval({ approved: true });
+      void resumed.catch(() => {});
+      await vi.waitFor(() => expect(agent.resumeCalls).toHaveLength(1));
+
+      // The resume is slow, not abandoned: its recovery deadline passes while
+      // it still runs in this process.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+      await expect(owner.harness.closeSession(target)).rejects.toBeInstanceOf(HarnessSessionLockedError);
+      await expect(owner.storage.loadTerminalAdmission(admission)).resolves.toMatchObject({ status: 'pending' });
+      expect((await owner.storage.loadSession({ sessionId: session.id }))?.pendingResume?.resumedAt).toBeDefined();
+
+      finishResume();
+      await resumed;
+      await vi.waitFor(() =>
+        expect(owner.storage.loadTerminalAdmission(admission)).resolves.toMatchObject({ status: 'committed' }),
+      );
+      await owner.harness.closeSession(target);
+      expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeDefined();
+    } finally {
+      finishResume();
+      await owner.harness.shutdown().catch(() => {});
+    }
+  });
+
   it('closes at once after abortActiveWork() cancels a parked terminal turn', async () => {
     const db = new InMemoryDB();
     const agent = new MockAgent({ id: 'default' });
@@ -949,6 +996,9 @@ describe('Session adoption — orphaned message dispatch', () => {
           return settle(input);
         };
       }
+      const events: HarnessEvent[] = [];
+      owner.harness.subscribe(event => events.push(event));
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
       const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
       const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
       const admission = {
@@ -979,6 +1029,15 @@ describe('Session adoption — orphaned message dispatch', () => {
           } as never),
         ).rejects.toMatchObject({ name: 'HarnessTerminalHandoffError:harness.terminal_cancelled' });
         expect(failures).toMatchObject([{ name: 'HarnessTerminalHandoffError:harness.terminal_cancelled' }]);
+        // A failed settlement is reported; recovery settles the turn later.
+        const storageErrors = events.filter(event => event.type === 'storage_error');
+        if (settlement === 'fails') {
+          expect(storageErrors).toMatchObject([
+            { operation: 'message_log', retryable: true, error: { code: 'harness.storage' } },
+          ]);
+        } else {
+          expect(storageErrors).toEqual([]);
+        }
         if (settlement === 'fails') {
           // Left pending under its dispatch claim until the claim expires.
           vi.useFakeTimers({ toFake: ['Date'] });
@@ -993,6 +1052,7 @@ describe('Session adoption — orphaned message dispatch', () => {
         const rows = [...db.harnessMessageResultEvidence.values()].filter(row => row.sessionId === session.id);
         expect(rows).toMatchObject([{ status: 'failed', error: { code } }]);
       } finally {
+        consoleError.mockRestore();
         await owner.harness.shutdown().catch(() => {});
       }
     },
@@ -1064,47 +1124,62 @@ describe('Session adoption — orphaned message dispatch', () => {
     }
   });
 
-  it('never lands a stalled reservation on a session another process closed', async () => {
-    const db = new InMemoryDB();
-    const ownerAgent = new MockAgent({ id: 'default' });
-    const owner = harnessProcess(db, ownerAgent, false);
-    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
-    // The owner's reservation is in flight, not yet committed, when it stalls.
-    let sending!: () => void;
-    const reservationSent = new Promise<void>(resolve => (sending = resolve));
-    let land!: () => void;
-    const landed = new Promise<void>(resolve => (land = resolve));
-    const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
-    owner.storage.writeMessageResultEvidence = async (record, options) => {
-      if (record.status === 'pending') {
-        sending();
-        await landed;
+  it.each([
+    { elsewhere: 'closed', rejection: HarnessSessionClosedError },
+    { elsewhere: 'adopted', rejection: HarnessSessionLockedError },
+  ] as const)(
+    'never lands a stalled reservation on a session another process $elsewhere',
+    async ({ elsewhere, rejection }) => {
+      const db = new InMemoryDB();
+      const ownerAgent = new MockAgent({ id: 'default' });
+      const owner = harnessProcess(db, ownerAgent, false);
+      const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+      // The owner's reservation is in flight, not yet committed, when it stalls.
+      let sending!: () => void;
+      const reservationSent = new Promise<void>(resolve => (sending = resolve));
+      let land!: () => void;
+      const landed = new Promise<void>(resolve => (land = resolve));
+      const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
+      owner.storage.writeMessageResultEvidence = async (record, options) => {
+        if (record.status === 'pending') {
+          sending();
+          await landed;
+        }
+        return write(record, options);
+      };
+      const turn = session.message({ content: 'hi', admissionId: 'late', stream: true } as never);
+      void turn.catch(() => {});
+      await reservationSent;
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+      const other = harnessProcess(db, new MockAgent({ id: 'default', defaultOutput: { text: 'x' } }), false);
+      try {
+        if (elsewhere === 'closed') {
+          await other.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
+        } else {
+          await other.harness.session({ sessionId: session.id, resourceId: 'u1' });
+        }
+        land();
+
+        await expect(turn).rejects.toBeInstanceOf(rejection);
+        expect(ownerAgent.streamCalls).toHaveLength(0);
+        await expect(
+          other.storage.listPendingMessageAdmissions({
+            ...scope,
+            now: Date.now(),
+            limit: 10,
+            includeParkedResume: true,
+          }),
+        ).resolves.toEqual({ items: [] });
+      } finally {
+        land();
+        await other.harness.shutdown().catch(() => {});
+        await owner.harness.shutdown().catch(() => {});
       }
-      return write(record, options);
-    };
-    const turn = session.message({ content: 'hi', admissionId: 'late', stream: true } as never);
-    void turn.catch(() => {});
-    await reservationSent;
-
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
-    const other = harnessProcess(db, new MockAgent({ id: 'default', defaultOutput: { text: 'x' } }), false);
-    try {
-      await other.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
-      land();
-
-      await expect(turn).rejects.toBeInstanceOf(HarnessSessionClosedError);
-      expect(ownerAgent.streamCalls).toHaveLength(0);
-      await expect(
-        other.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10, includeParkedResume: true }),
-      ).resolves.toEqual({ items: [] });
-    } finally {
-      land();
-      await other.harness.shutdown().catch(() => {});
-      await owner.harness.shutdown().catch(() => {});
-    }
-  });
+    },
+  );
 
   it('keeps a recheck scheduled while a recovery runs', async () => {
     const db = new InMemoryDB();

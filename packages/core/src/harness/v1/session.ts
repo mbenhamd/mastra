@@ -3568,14 +3568,14 @@ export class Session {
    * it, before `closedAt` is persisted; a closed session is never recovered
    * again. Recovery first settles what it can. Before the drain, a turn
    * parked for a user response then blocks too, until its interaction is due
-   * (it is then expired, or its stale resume recovered, and its turn settled):
-   * close would keep its record
-   * but close over its pending admission. After the drain — which can leave
-   * turns pending (a starter that failed closed on a lapsed claim, a run
-   * whose result write failed) and which does not wait for the turns it
-   * aborts at its deadline — in-flight turns get a bounded chance to settle,
-   * then a result write still in flight, or any admitted turn still pending,
-   * blocks, and recovery is left due.
+   * (it is then expired, or its stale resume recovered, and its turn
+   * settled): close would keep its record but close over its pending
+   * admission. After the drain — which can leave turns pending (a starter
+   * that failed closed on a lapsed claim, a run whose result write failed)
+   * and which does not wait for the turns it aborts at its deadline —
+   * in-flight turns get a bounded chance to settle, then a result write still
+   * in flight, or any admitted turn still pending, blocks, and recovery is
+   * left due.
    */
   async _pendingAdmissionBlockingClose(
     phase: 'before-drain' | 'after-drain',
