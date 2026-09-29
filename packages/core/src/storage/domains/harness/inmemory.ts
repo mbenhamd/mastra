@@ -408,15 +408,18 @@ export class InMemoryHarness extends HarnessStorage {
       const pendingMessageAdmission = admissions.some(
         admission => admission.evidence.status !== 'pending' || admission.dispatchClaim !== 'live',
       );
-      // A close is refused while any of its turns is still claimed.
-      const claimed = admissions.some(admission => admission.dispatchClaim === 'live');
+      // A close is refused while any of its turns is still claimed, and
+      // `harness.session()` rejects a closing session: nothing can advance it.
+      if (record.closingAt !== undefined && admissions.some(admission => admission.dispatchClaim === 'live')) {
+        continue;
+      }
       // A queue parked behind an interaction that has not expired cannot drain.
       const pendingResume = record.pendingResume;
       const pendingQueue =
         record.pendingQueue.length > 0 &&
         (pendingResume === undefined ||
           (isDueScannablePendingResume(pendingResume) && pendingResumeDueAt(pendingResume) <= now));
-      const closing = record.closingAt !== undefined && !claimed;
+      const closing = record.closingAt !== undefined;
       if (!pendingMessageAdmission && !pendingQueue && !closing) continue;
       recoverable.push({
         harnessName: record.harnessName,

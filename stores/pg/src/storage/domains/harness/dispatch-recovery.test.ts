@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
+import { TABLE_HARNESS_MESSAGE_RESULTS } from '@mastra/core/storage';
 import type {
   AgentSignalDispatchState,
   AgentSignalResultEvidence,
@@ -130,9 +131,11 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: blocked.id, ownerId: 'owner-blocked' });
     // A closing session whose only turn is still claimed by another process
     // cannot be closed yet, so it is not discoverable until the claim expires.
+    // Its queued work must not list it (as not closing) either.
     const closingClaimed = await createSession(harness(), 'closing-claimed', 'owner-closing', {
       closingAt: Date.now(),
       closeDeadlineAt: Date.now() + 60_000,
+      pendingQueue: [{ id: 'queued-closing', enqueuedAt: Date.now(), content: 'later', attachments: [] }],
     });
     const claimedEvidence = pendingMessage(closingClaimed, 'closing-claimed');
     await harness().writeMessageResultEvidence(claimedEvidence);
@@ -201,12 +204,29 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
         leaseOwner: { ownerId },
         updatedAt: Date.now(),
       });
-    // Settlement is fenced by the recovering owner's lease, judged when the
-    // settlement commits.
+    // Settlement is fenced by the recovering owner's lease, judged right
+    // before the write — after any lock wait, not before it.
     await expect(settle('not-the-owner')).resolves.toMatchObject({ applied: false });
-    vi.spyOn(Date, 'now').mockReturnValue(lease.expiresAt + 1);
-    await expect(settle('adopter')).resolves.toMatchObject({ applied: false });
-    vi.restoreAllMocks();
+    const locker = await (
+      store.db as unknown as {
+        connect(): Promise<{ query(sql: string, values?: unknown[]): Promise<unknown>; release(): void }>;
+      }
+    ).connect();
+    try {
+      await locker.query('BEGIN');
+      await locker.query(
+        `SELECT 1 FROM "${schemaName}"."${TABLE_HARNESS_MESSAGE_RESULTS}" WHERE signal_id = $1 FOR UPDATE`,
+        [orphanEvidence.signalId],
+      );
+      const waiting = settle('adopter');
+      await new Promise(resolve => setTimeout(resolve, 250));
+      vi.spyOn(Date, 'now').mockReturnValue(lease.expiresAt + 1);
+      await locker.query('ROLLBACK');
+      await expect(waiting).resolves.toMatchObject({ applied: false });
+    } finally {
+      vi.restoreAllMocks();
+      locker.release();
+    }
     await expect(settle('adopter')).resolves.toMatchObject({ applied: true });
     await expect(
       harness().loadMessageResultEvidence({ ...scope, signalId: orphanEvidence.signalId }),
@@ -365,5 +385,43 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       ['signal-late', 'failed', 'none'],
       ['signal-live', 'pending', 'live'],
     ]);
+  });
+
+  it('pages both recovery scans by cursor and rejects invalid scan input', async () => {
+    const sessions: SessionRecord[] = [];
+    for (const tag of ['page-a', 'page-b', 'page-c']) {
+      const session = await createSession(harness(), tag, `owner-${tag}`);
+      await harness().writeMessageResultEvidence(pendingMessage(session, tag));
+      await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: session.id, ownerId: `owner-${tag}` });
+      sessions.push(session);
+    }
+    const now = Date.now();
+    const first = await harness().listRecoverableSessions({ harnessName: HARNESS, now, limit: 2 });
+    expect(first.items.map(item => item.sessionId)).toEqual(['page-a', 'page-b']);
+    expect(first.nextCursor).toEqual({ sessionId: 'page-b' });
+    const last = await harness().listRecoverableSessions({
+      harnessName: HARNESS,
+      now,
+      limit: 2,
+      cursor: first.nextCursor,
+    });
+    expect(last).toEqual({ items: [expect.objectContaining({ sessionId: 'page-c' })] });
+
+    const owner = sessions[0]!;
+    const scope = { harnessName: HARNESS, sessionId: owner.id, resourceId: owner.resourceId, threadId: owner.threadId };
+    for (const tag of ['page-a-2', 'page-a-3']) await harness().writeMessageResultEvidence(pendingMessage(owner, tag));
+    const rows = await harness().listPendingMessageAdmissions({ ...scope, now, limit: 2 });
+    expect(rows.items.map(item => item.evidence.signalId)).toEqual(['signal-page-a', 'signal-page-a-2']);
+    expect(rows.nextCursor).toEqual({ signalId: 'signal-page-a-2' });
+    const rest = await harness().listPendingMessageAdmissions({ ...scope, now, limit: 2, cursor: rows.nextCursor });
+    expect(rest.items.map(item => item.evidence.signalId)).toEqual(['signal-page-a-3']);
+    expect(rest.nextCursor).toBeUndefined();
+
+    await expect(harness().listRecoverableSessions({ harnessName: HARNESS, now, limit: 0 })).rejects.toBeInstanceOf(
+      RangeError,
+    );
+    await expect(harness().listPendingMessageAdmissions({ ...scope, now: -1, limit: 2 })).rejects.toBeInstanceOf(
+      RangeError,
+    );
   });
 });

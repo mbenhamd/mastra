@@ -1359,18 +1359,21 @@ export class HarnessPG extends HarnessStorage {
     };
   }
 
-  async #holdsSessionLeaseTx(
+  /**
+   * Share-lock the session row so its lease cannot move until the write
+   * commits; the lease itself is judged later, right before the write.
+   */
+  async #lockSessionLeaseRowTx(
     tx: PgHarnessClient,
     harnessName: string,
     sessionId: string,
-    lease: HarnessSessionLeasePrecondition,
-  ): Promise<boolean> {
+  ): Promise<Record<string, unknown> | undefined> {
     const result = await tx.execute({
       sql: `SELECT owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
             WHERE harness_name = ? AND id = ? LIMIT 1 FOR SHARE`,
       args: [harnessName, sessionId],
     });
-    return rowHoldsSessionLease(result.rows[0] as Record<string, unknown> | undefined, lease);
+    return result.rows[0] as Record<string, unknown> | undefined;
   }
 
   async listRecoverableSessions(input: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
@@ -1393,14 +1396,16 @@ export class HarnessPG extends HarnessStorage {
     // Leases and claims are stamped with the caller's clock, so `now` judges
     // them. Only work recovery can advance makes a session discoverable: a
     // recoverable admitted message whose claim is not live, a queue not parked
-    // behind an unexpired interaction, or an unfinished close none of whose
-    // turns is still claimed (the close would be refused until then).
+    // behind an unexpired interaction, or an unfinished close. A closing
+    // session one of whose turns is still claimed is excluded entirely: its
+    // close is refused until then and `harness.session()` rejects it.
     const result = await this.#client.execute({
       sql: `SELECT * FROM (
               SELECT s.harness_name, s.id, s.resource_id, s.thread_id,
+                     s.closing_at IS NOT NULL AS closing,
                      (
                        s.closing_at IS NOT NULL
-                       AND NOT EXISTS (
+                       AND EXISTS (
                          SELECT 1 FROM ${TABLE_HARNESS_MESSAGE_RESULTS} m
                          WHERE m.harness_name = s.harness_name
                            AND m.session_id = s.id
@@ -1409,7 +1414,7 @@ export class HarnessPG extends HarnessStorage {
                            AND ${PG_RECOVERABLE_MESSAGE_SQL}
                            AND ${PG_MESSAGE_DISPATCH_CLAIM_SQL} = 'live'
                        )
-                     ) AS closing,
+                     ) AS closing_claimed,
                      (
                        s.pending_queue <> '[]'::jsonb
                        AND (
@@ -1432,7 +1437,7 @@ export class HarnessPG extends HarnessStorage {
                 AND (s.owner_id IS NULL OR s.lease_expires_at IS NULL OR s.lease_expires_at <= ?)
                 ${cursorCondition}
             ) candidates
-            WHERE closing OR pending_queue OR pending_message_admission
+            WHERE NOT closing_claimed AND (closing OR pending_queue OR pending_message_admission)
             ORDER BY id ASC
             LIMIT ?`,
       args,
@@ -5106,6 +5111,15 @@ export class HarnessPG extends HarnessStorage {
         };
       }
 
+      // Judged again after the admission-row waits, immediately before writing.
+      if (
+        opts.leaseOwner !== undefined &&
+        !rowHoldsSessionLease(session.rows[0] as Record<string, unknown>, opts.leaseOwner)
+      ) {
+        await tx.commit();
+        return { status: 'fenced', admission: { ...admission, status: 'fenced' } };
+      }
+
       await tx.execute({
         sql: `INSERT INTO ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
               (id, harness_name, session_id, resource_id, thread_id, session_incarnation,
@@ -5365,6 +5379,14 @@ export class HarnessPG extends HarnessStorage {
       const pressure = existingIntent
         ? { pendingIntents: 0, pendingBytes: 0 }
         : await this.#lockTerminalPressure(tx, harnessName, Date.now());
+      // Judged again after the pressure-lock wait, immediately before writing.
+      if (
+        input.recovery !== undefined &&
+        !rowHoldsSessionLease(session.rows[0] as Record<string, unknown> | undefined, input.recovery.leaseOwner)
+      ) {
+        await tx.rollback();
+        return { status: 'conflict', admission: stored };
+      }
       const pendingIntents = pressure.pendingIntents;
       const pendingBytes = pressure.pendingBytes;
       if (
@@ -6086,9 +6108,10 @@ export class HarnessPG extends HarnessStorage {
     try {
       // A recovery settlement also requires the lease. The session row is
       // locked before the evidence row, the order `commitTerminalHandoff` uses.
-      const leaseHeld =
-        input.leaseOwner === undefined ||
-        (await this.#holdsSessionLeaseTx(tx, harnessName, input.sessionId, input.leaseOwner));
+      const leaseRow =
+        input.leaseOwner === undefined
+          ? undefined
+          : await this.#lockSessionLeaseRowTx(tx, harnessName, input.sessionId);
       const selected = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
         args: [id],
@@ -6110,7 +6133,7 @@ export class HarnessPG extends HarnessStorage {
       if (!messageEvidenceMatchesDispatchKind(current, operationKind)) {
         throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
       }
-      if (isTerminalMessageEvidence(current) || !signalDispatchMatches(current, input.expected) || !leaseHeld) {
+      if (isTerminalMessageEvidence(current) || !signalDispatchMatches(current, input.expected)) {
         await tx.commit();
         return { applied: false, evidence: current };
       }
@@ -6124,6 +6147,11 @@ export class HarnessPG extends HarnessStorage {
           : input.expected.runId;
       if (runId === undefined || (input.terminal.runId !== undefined && input.terminal.runId !== runId)) {
         throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      // Judged after the evidence-row wait, immediately before the write.
+      if (input.leaseOwner !== undefined && !rowHoldsSessionLease(leaseRow, input.leaseOwner)) {
+        await tx.commit();
+        return { applied: false, evidence: current };
       }
       const terminal = input.terminal;
       await tx.execute({

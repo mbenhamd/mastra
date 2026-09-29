@@ -3542,9 +3542,15 @@ export class Session {
    */
   async _recoverOrphanedMessageDispatches(): Promise<{ blockedBy?: { holder: string; retryAt: number } }> {
     if (this._orphanRecovery !== undefined) return this._orphanRecovery;
-    const recovery = this._recoverOrphanedMessageDispatchesOnce().finally(() => {
-      if (this._orphanRecovery === recovery) this._orphanRecovery = undefined;
-    });
+    const recovery = this._recoverOrphanedMessageDispatchesOnce()
+      .catch(error => {
+        // A failed attempt stays due, so the next resolution or close retries it.
+        this._orphanRecheckAt = Date.now();
+        throw error;
+      })
+      .finally(() => {
+        if (this._orphanRecovery === recovery) this._orphanRecovery = undefined;
+      });
     this._orphanRecovery = recovery;
     return recovery;
   }
@@ -3592,6 +3598,7 @@ export class Session {
         if (state === 'claimed' && evidence.dispatch?.state === 'dispatching') {
           block(evidence.dispatch.attemptId, evidence.dispatch.claimExpiresAt);
         }
+        if (state === 'finished') block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
       }
       cursor = page.nextCursor;
     } while (cursor !== undefined);
@@ -3625,14 +3632,18 @@ export class Session {
   }
 
   /**
-   * `active`: a run for it is live here, it awaits a response, or the row is
-   * malformed — left alone. `claimed`: another process's dispatch claim is
-   * still live — left alone until it expires. `orphaned`: interrupt it.
+   * `active`: a run for it is in flight in this process (close drains it and
+   * its own abort settles the turn), it awaits a response, or the row is
+   * malformed — left alone. `finished`: its run finished here but the result
+   * was never recorded — never interrupted (a same-admission retry completes
+   * it from this process's cache), but it blocks a close. `claimed`: another
+   * process's dispatch claim is still live — left alone until it expires.
+   * `orphaned`: interrupt it.
    */
   private _classifyPendingMessageDispatch({
     evidence,
     dispatchClaim,
-  }: PendingMessageAdmission): 'active' | 'claimed' | 'orphaned' {
+  }: PendingMessageAdmission): 'active' | 'finished' | 'claimed' | 'orphaned' {
     const runId = evidence.runId;
     if (
       evidence.status !== 'pending' ||
@@ -3645,12 +3656,8 @@ export class Session {
     }
     // A suspension parked for resume is waiting on a response, not orphaned.
     if (this._record.pendingResume?.runId === runId) return 'active';
-    // Any in-process trace of the run means it is live (or settling) here.
-    if (
-      this._messageAdmissionStarts.has(evidence.admissionId) ||
-      this._runCompletionPromises.has(runId) ||
-      this._completedRuns.has(runId)
-    ) {
+    // A run in flight here is live (or settling) in this process.
+    if (this._messageAdmissionStarts.has(evidence.admissionId) || this._runCompletionPromises.has(runId)) {
       return 'active';
     }
     let agent: Agent | undefined;
@@ -3661,7 +3668,19 @@ export class Session {
       if (!(error instanceof HarnessConfigError)) throw error;
     }
     if (agent?.getRunOutput(runId)) return 'active';
+    if (this._completedRuns.has(runId)) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
+  }
+
+  /** A dispatch claim this process stamped may still be dispatched on (fresh clock). */
+  private _dispatchClaimStillHeld(claimExpiresAt: number): boolean {
+    const now = Date.now();
+    return (
+      claimExpiresAt > now &&
+      this._state === 'live' &&
+      this._record.ownerId === this._harness.ownerId &&
+      (this._record.leaseExpiresAt ?? 0) > now
+    );
   }
 
   /** Returns true when this process's settlement committed. */
@@ -8573,6 +8592,7 @@ export class Session {
         // dispatching a turn recovery already interrupted.
         if (terminalHandoffTurn || (terminalIdentity === undefined && this._storage.supportsDispatchRecovery)) {
           if (admissionIdentity !== undefined && admissionHash !== undefined) {
+            const claimExpiresAt = Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS;
             const stamped = await this._storage.compareAndSwapSignalDispatch({
               harnessName: this._record.harnessName,
               sessionId: this.id,
@@ -8586,7 +8606,7 @@ export class Session {
               next: {
                 state: 'dispatching',
                 attemptId: `${terminalHandoffTurn ? 'terminal' : 'message'}-dispatch-${randomUUID()}`,
-                claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
+                claimExpiresAt,
                 delivery: terminalHandoffTurn || sub.activeRunId() === null ? 'idle' : 'active',
                 runId: admissionIdentity.runId,
               },
@@ -8602,6 +8622,36 @@ export class Session {
               } finally {
                 finishOwnedMessageTurn();
               }
+            }
+            // The claim's acknowledgement may arrive after the claim or this
+            // session's lease lapsed, when recovery elsewhere may already have
+            // interrupted the turn. Never dispatch on a lapsed claim: re-read
+            // the turn and fail closed. A turn still pending is left for the
+            // recovery made due here.
+            if (!this._dispatchClaimStillHeld(claimExpiresAt)) {
+              if (this._state === 'deleted') {
+                throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
+              }
+              this._orphanRecheckAt = Date.now();
+              const latest = await this._storage.loadMessageResultEvidence({
+                harnessName: this._record.harnessName,
+                sessionId: this.id,
+                resourceId: this.resourceId,
+                threadId: this.threadId,
+                signalId: admissionIdentity.signalId,
+              });
+              if (latest !== null && 'status' in latest && latest.status !== 'pending') {
+                const registeredStart = this._messageAdmissionStarts.get(opts.admissionId!);
+                if (registeredStart !== undefined) registeredStart.duplicate = true;
+                this._messageAdmissionStarts.delete(opts.admissionId!);
+                admissionStart.resolve(latest);
+                try {
+                  return await this._returnDuplicateMessageResult(latest, opts);
+                } finally {
+                  finishOwnedMessageTurn();
+                }
+              }
+              throw new HarnessConfigError('message()', 'durable message dispatch claim lapsed before dispatch');
             }
           }
         }
