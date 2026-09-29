@@ -195,6 +195,18 @@ export interface HarnessSessionLeasePrecondition {
   ownerId: string;
 }
 
+export interface WriteMessageResultEvidenceOptions {
+  /**
+   * Write only while the session is open and its lease still names this
+   * owner, judged when the write commits; otherwise throw
+   * `HarnessStorageLeaseConflictError` and write nothing. A lease that expired
+   * without another owner taking it still names this owner (as `saveSession`
+   * treats it): no other process can have recovered or closed the session.
+   * Adapters without dispatch recovery may ignore it.
+   */
+  leaseOwner?: HarnessSessionLeasePrecondition;
+}
+
 /**
  * Recovery-only preconditions for committing an interrupted terminal outcome.
  * The canonical evidence must still be pending with exactly the dispatch state
@@ -973,6 +985,12 @@ export abstract class HarnessStorage extends StorageDomain {
    * Discovery evidence only — a recovery worker adopts an open session through
    * `harness.session()` and finishes a closing one through
    * `harness.closeSession()`; the lease compare-and-set is the reservation.
+   *
+   * Deploy compatibility: a turn whose pending native terminal admission names
+   * a finalizer id and version the recovering process does not register is
+   * left pending (only that finalizer may settle it), so its session is listed
+   * again each time its lease lapses until a process registering that exact
+   * finalizer version recovers it.
    */
   async listRecoverableSessions(_opts: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
     throw new HarnessStorageDispatchRecoveryUnsupportedError();
@@ -1262,7 +1280,10 @@ export abstract class HarnessStorage extends StorageDomain {
     signalId: string;
   }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null>;
 
-  abstract writeMessageResultEvidence(record: AgentSignalResultEvidence): Promise<WriteMessageResultEvidenceResult>;
+  abstract writeMessageResultEvidence(
+    record: AgentSignalResultEvidence,
+    options?: WriteMessageResultEvidenceOptions,
+  ): Promise<WriteMessageResultEvidenceResult>;
 
   // -------------------------------------------------------------------------
   // Native chat terminal handoff

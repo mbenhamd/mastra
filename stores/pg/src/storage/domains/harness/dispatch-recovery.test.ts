@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
-import { TABLE_HARNESS_MESSAGE_RESULTS } from '@mastra/core/storage';
+import { HarnessStorageLeaseConflictError, TABLE_HARNESS_MESSAGE_RESULTS } from '@mastra/core/storage';
 import type {
   AgentSignalDispatchState,
   AgentSignalResultEvidence,
@@ -214,6 +214,16 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     // Leases and claims are judged by the caller's clock, like `_flushUpdate`.
     await expect(listed(realNow + 10 * 60_000)).resolves.toEqual([
       closingClaimed.id,
+      live.id,
+      orphan.id,
+      summarized.id,
+    ]);
+    // Once the parked interactions are due, close (or adoption) can expire
+    // them: the closing session and the parked queue are listed.
+    await expect(listed(realNow + 61 * 60_000)).resolves.toEqual([
+      blocked.id,
+      closingClaimed.id,
+      closingParked.id,
       live.id,
       orphan.id,
       summarized.id,
@@ -449,11 +459,28 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       }),
     ).resolves.toBeNull();
 
+    // A reservation lands only under the lease of the open session.
+    const reserve = (evidence: AgentSignalResultEvidence, ownerId: string) =>
+      harness().writeMessageResultEvidence(evidence, { leaseOwner: { ownerId } });
+    const fenced = pendingMessage(session, 'fenced');
+    await expect(reserve(fenced, 'not-the-owner')).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    await expect(harness().loadMessageResultEvidence({ ...scope, signalId: fenced.signalId })).resolves.toBeNull();
+    await expect(reserve(pendingMessage(session, 'reserved'), 'owner-dead')).resolves.toMatchObject({ created: true });
+    const closed = await createSession(harness(), 'closed', 'owner-closed');
+    await harness().saveSession(
+      { ...closed, closedAt: Date.now() },
+      { harnessName: HARNESS, ownerId: 'owner-closed', ifVersion: closed.version },
+    );
+    await expect(reserve(pendingMessage(closed, 'closed'), 'owner-closed')).rejects.toBeInstanceOf(
+      HarnessStorageLeaseConflictError,
+    );
+
     const remaining = await harness().listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
     expect(remaining.items.map(item => [item.evidence.signalId, item.evidence.status, item.dispatchClaim])).toEqual([
       ['signal-expired', 'failed', 'none'],
       ['signal-late', 'failed', 'none'],
       ['signal-live', 'pending', 'live'],
+      ['signal-reserved', 'pending', 'none'],
     ]);
   });
 

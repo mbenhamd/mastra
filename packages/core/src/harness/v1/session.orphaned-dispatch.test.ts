@@ -60,6 +60,7 @@ function harnessProcess(
   terminal: boolean,
   terminalFinalizer: HarnessTerminalFinalizer = finalizer,
   closeTimeoutMs?: number,
+  sessionOptions: { lockTtlMs?: number; pendingInteractionTtlMs?: number } = {},
 ) {
   const storage = new InMemoryHarness({
     db,
@@ -71,6 +72,7 @@ function harnessProcess(
     defaultModeId: 'default',
     sessions: {
       storage,
+      ...sessionOptions,
       ...(closeTimeoutMs !== undefined ? { closeTimeoutMs } : {}),
       ...(terminal ? { terminalHandoff: { finalizer: terminalFinalizer } } : {}),
     },
@@ -800,11 +802,144 @@ describe('Session adoption — orphaned message dispatch', () => {
       await expect(owner.storage.listRecoverableSessions({ now: Date.now(), limit: 10 })).resolves.toEqual({
         items: [],
       });
+      // Resuming that close is refused too, and its marker is cleared: the
+      // parked turn can be answered again.
+      await expect(adopter.harness.closeSession(target)).rejects.toBeInstanceOf(HarnessSessionLockedError);
+      expect((await owner.storage.loadSession({ sessionId: session.id }))?.closingAt).toBeUndefined();
+      await expect(adopter.harness.session(target)).resolves.toMatchObject({ id: session.id });
     } finally {
       await adopter.harness.shutdown().catch(() => {});
       await owner.harness.shutdown().catch(() => {});
     }
   });
+
+  it('expires an overdue parked turn when it resumes a crashed close, then closes', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-1', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const owner = harnessProcess(db, agent, true);
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+    const target = { sessionId: session.id, resourceId: 'u1' };
+    await expect(session.message({ ...terminalHandoffMessage.message } as never)).resolves.toMatchObject({
+      finishReason: 'suspended',
+    });
+    // The owner crashes mid-close, after persisting its marker.
+    const record = (await owner.storage.loadSession({ sessionId: session.id }))!;
+    await owner.storage.saveSession(
+      { ...record, closingAt: Date.now(), closeDeadlineAt: Date.now() + 60_000 },
+      { ownerId: owner.harness.ownerId, ifVersion: record.version },
+    );
+    await owner.storage.releaseSessionLease({ sessionId: session.id, ownerId: owner.harness.ownerId });
+    await owner.harness.shutdown().catch(() => {});
+
+    // Its interaction is due by the time a recovery worker finds the close.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 2 * 60 * 60_000);
+    const adopter = harnessProcess(db, new MockAgent({ id: 'default', defaultOutput: { text: 'x' } }), true);
+    try {
+      await expect(adopter.storage.listRecoverableSessions({ now: Date.now(), limit: 10 })).resolves.toMatchObject({
+        items: [{ sessionId: session.id, closing: true }],
+      });
+      await adopter.harness.closeSession(target);
+
+      expect((await adopter.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeDefined();
+      await expect(
+        adopter.storage.loadTerminalAdmission({
+          harnessName: 'default',
+          sessionId: session.id,
+          admissionId: 'orphaned-turn',
+          executionGrant: grant,
+        }),
+      ).resolves.toMatchObject({ status: 'cancelled' });
+      const settled = await adopter.storage.listPendingMessageAdmissions({
+        ...scope,
+        now: Date.now(),
+        limit: 10,
+        includeParkedResume: true,
+      });
+      expect(settled.items).toEqual([]);
+      await expect(adopter.storage.listRecoverableSessions({ now: Date.now(), limit: 10 })).resolves.toEqual({
+        items: [],
+      });
+    } finally {
+      await adopter.harness.shutdown().catch(() => {});
+    }
+  });
+
+  it.each([
+    { settlement: 'commits', code: 'harness.terminal_cancelled' },
+    { settlement: 'fails', code: 'harness.run_interrupted' },
+  ])(
+    'settles a parked terminal turn whose approval expired, so its session closes (settlement $settlement)',
+    async ({ settlement, code }) => {
+      const db = new InMemoryDB();
+      const agent = new MockAgent({ id: 'default' });
+      agent.enqueueRun({
+        finishReason: 'suspended',
+        suspendPayload: { toolCallId: 'tc-1', toolName: 'shell', args: { cmd: 'ls' } },
+      });
+      const owner = harnessProcess(db, agent, true, finalizer, undefined, {
+        lockTtlMs: 10 * 60_000,
+        pendingInteractionTtlMs: 300,
+      });
+      if (settlement === 'fails') {
+        // The expiry's settlement of the turn fails once: recovery settles it.
+        const settle = owner.storage.compareAndSwapSignalTerminal.bind(owner.storage);
+        let failed = false;
+        owner.storage.compareAndSwapSignalTerminal = async input => {
+          if (!failed) {
+            failed = true;
+            throw new Error('settlement write failed');
+          }
+          return settle(input);
+        };
+      }
+      const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+      const admission = {
+        harnessName: 'default',
+        sessionId: session.id,
+        admissionId: 'orphaned-turn',
+        executionGrant: grant,
+      };
+      try {
+        await expect(session.message({ ...terminalHandoffMessage.message } as never)).resolves.toMatchObject({
+          finishReason: 'suspended',
+        });
+        await vi.waitFor(() =>
+          expect(owner.storage.loadTerminalAdmission(admission)).resolves.toMatchObject({
+            status: 'cancelled',
+          }),
+        );
+        await vi.waitFor(async () =>
+          expect((await owner.storage.loadSession({ sessionId: session.id }))?.pendingResume).toBeUndefined(),
+        );
+        // A same-admission retry reports the cancellation.
+        await expect(session.message({ ...terminalHandoffMessage.message } as never)).rejects.toMatchObject({
+          name: 'HarnessTerminalHandoffError:harness.terminal_cancelled',
+        });
+        if (settlement === 'fails') {
+          // Left pending under its dispatch claim until the claim expires.
+          vi.useFakeTimers({ toFake: ['Date'] });
+          vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+        }
+
+        await owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
+        expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeDefined();
+        await expect(
+          owner.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 }),
+        ).resolves.toEqual({ items: [] });
+        const rows = [...db.harnessMessageResultEvidence.values()].filter(row => row.sessionId === session.id);
+        expect(rows).toMatchObject([{ status: 'failed', error: { code } }]);
+      } finally {
+        await owner.harness.shutdown().catch(() => {});
+      }
+    },
+  );
 
   it('reopens a session whose turn parks during the close drain, so the turn stays answerable', async () => {
     const db = new InMemoryDB();
@@ -868,6 +1003,117 @@ describe('Session adoption — orphaned message dispatch', () => {
       expect(parent.lifecycleState).toBe('live');
       expect(child.lifecycleState).toBe('live');
     } finally {
+      await owner.harness.shutdown().catch(() => {});
+    }
+  });
+
+  it('never lands a stalled reservation on a session another process closed', async () => {
+    const db = new InMemoryDB();
+    const ownerAgent = new MockAgent({ id: 'default' });
+    const owner = harnessProcess(db, ownerAgent, false);
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+    // The owner's reservation is in flight, not yet committed, when it stalls.
+    let sending!: () => void;
+    const reservationSent = new Promise<void>(resolve => (sending = resolve));
+    let land!: () => void;
+    const landed = new Promise<void>(resolve => (land = resolve));
+    const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
+    owner.storage.writeMessageResultEvidence = async (record, options) => {
+      if (record.status === 'pending') {
+        sending();
+        await landed;
+      }
+      return write(record, options);
+    };
+    const turn = session.message({ content: 'hi', admissionId: 'late', stream: true } as never);
+    void turn.catch(() => {});
+    await reservationSent;
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+    const other = harnessProcess(db, new MockAgent({ id: 'default', defaultOutput: { text: 'x' } }), false);
+    try {
+      await other.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
+      land();
+
+      await expect(turn).rejects.toBeInstanceOf(HarnessSessionLockedError);
+      expect(ownerAgent.streamCalls).toHaveLength(0);
+      await expect(
+        other.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10, includeParkedResume: true }),
+      ).resolves.toEqual({ items: [] });
+    } finally {
+      land();
+      await other.harness.shutdown().catch(() => {});
+      await owner.harness.shutdown().catch(() => {});
+    }
+  });
+
+  it('keeps a recheck scheduled while a recovery runs', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    const owner = harnessProcess(db, agent, false, finalizer, undefined, { lockTtlMs: 10 * 60_000 });
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+    const target = { sessionId: session.id, resourceId: 'u1' };
+    // An orphaned turn whose first settlement fails leaves recovery due.
+    const orphan = orphanedAdmission(scope, 'orphan');
+    await owner.storage.writeMessageResultEvidence(orphan);
+    const settle = owner.storage.compareAndSwapSignalTerminal.bind(owner.storage);
+    let settlements = 0;
+    let settling!: () => void;
+    const secondSettlement = new Promise<void>(resolve => (settling = resolve));
+    let finishSettlement!: () => void;
+    const settlementFinished = new Promise<void>(resolve => (finishSettlement = resolve));
+    owner.storage.compareAndSwapSignalTerminal = async input => {
+      settlements++;
+      if (settlements === 1) throw new Error('settlement write failed');
+      const settled = await settle(input);
+      if (settlements === 2) {
+        settling();
+        await settlementFinished;
+      }
+      return settled;
+    };
+    // A turn whose dispatch claim is acknowledged only after it lapsed.
+    const claim = owner.storage.compareAndSwapSignalDispatch.bind(owner.storage);
+    let claimed!: () => void;
+    const claimStamped = new Promise<void>(resolve => (claimed = resolve));
+    let acknowledge!: () => void;
+    const acknowledged = new Promise<void>(resolve => (acknowledge = resolve));
+    owner.storage.compareAndSwapSignalDispatch = async input => {
+      const stamped = await claim(input);
+      if (input.next.state === 'dispatching') {
+        claimed();
+        await acknowledged;
+      }
+      return stamped;
+    };
+    try {
+      await expect(owner.harness.closeSession(target)).rejects.toThrow('settlement write failed');
+      const lapsing = session.message({ content: 'hi', admissionId: 'lapsing', stream: true } as never);
+      void lapsing.catch(() => {});
+      await claimStamped;
+
+      // Resolving the session runs the due recovery. While it settles the
+      // orphan, the claim lapses and schedules a recheck for the lapsed turn.
+      const resolved = owner.harness.session(target);
+      await secondSettlement;
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+      acknowledge();
+      await expect(lapsing).rejects.toThrow('claim lapsed');
+      finishSettlement();
+      await resolved;
+
+      // The next resolution still recovers the lapsed turn.
+      await owner.harness.session(target);
+      const lapsed = [...db.harnessMessageResultEvidence.values()].find(row => row.admissionId === 'lapsing');
+      expect(lapsed).toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
+      expect(agent.streamCalls).toHaveLength(0);
+    } finally {
+      acknowledge();
+      finishSettlement();
       await owner.harness.shutdown().catch(() => {});
     }
   });

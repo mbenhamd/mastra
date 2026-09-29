@@ -1045,8 +1045,8 @@ export class Harness {
   private readonly _sessionMaterializationsInFlight = new Map<string, Promise<Session>>();
   /** In-process close de-dupe by any session id currently covered by a close tree. */
   private readonly _closePromises = new Map<string, Promise<void>>();
-  /** Close refusals over an admitted turn, which reopen what the close marked. */
-  private readonly _admissionCloseRefusals = new WeakSet<object>();
+  /** Close refusals over a turn parked for a response, which reopen what the close marked. */
+  private readonly _parkedCloseRefusals = new WeakSet<object>();
   private readonly _shutdownEvictedSessionIds = new Set<string>();
   /** Workspace registry — owns lifecycle across `shared`/`per-resource`/`per-session`. */
   readonly _workspaceRegistry: WorkspaceRegistry;
@@ -5778,7 +5778,7 @@ export class Harness {
       }
       await this._terminalizeCloseTree(storage, tree, closedLiveSessions);
     } catch (err) {
-      if (this._admissionCloseRefusals.has(err as object)) {
+      if (this._parkedCloseRefusals.has(err as object)) {
         await this._reopenRefusedCloseTree(storage, tree, persistedCloseIds);
       }
       await this._releaseCloseTreeLeases(storage, tree);
@@ -5788,18 +5788,20 @@ export class Harness {
 
   private _closeRefusedOverAdmission(
     sessionId: string,
-    blocked: { holder: string; retryAt: number },
+    blocked: { holder: string; retryAt: number; parked?: true },
   ): HarnessSessionLockedError {
     const err = new HarnessSessionLockedError(sessionId, blocked.holder, blocked.retryAt);
-    this._admissionCloseRefusals.add(err);
+    if (blocked.parked) this._parkedCloseRefusals.add(err);
     return err;
   }
 
   /**
-   * A close refused over an admitted turn does not leave the subtree it
-   * already marked closing: that would reject the parked turn's response and
-   * every later turn. Each marker is cleared under the lease and version it
-   * was written with; one that cannot be stays closing, recoverable by close.
+   * A close refused over a turn parked for a response does not leave the
+   * subtree closing: a closing session rejects the response the turn waits
+   * for. Each marker is cleared under the lease and version it was written
+   * with; one that cannot be stays closing, recoverable by close. Any other
+   * refusal keeps the markers — durable close intent — and the close resumes
+   * once what blocks it settles or expires.
    */
   private async _reopenRefusedCloseTree(
     storage: HarnessStorage,
@@ -5930,14 +5932,23 @@ export class Harness {
 
   /**
    * A close must not hide an admitted turn: orphaned dispatches are settled
-   * first, and the close is refused (retry after `expiresAt`) while a turn is
+   * first, and the close is refused (retry after `retryAt`) while a turn is
    * still pending — another process's dispatch claim is live, its settlement
-   * did not commit, or it is parked for a user response. Once a session is
-   * closed no recovery would ever look at that turn again.
+   * did not commit, or it is parked for a user response whose interaction is
+   * not yet due (a due one is expired first). Once a session is closed no
+   * recovery would ever look at that turn again.
    */
   private async _settleOrphanedDispatchesBeforeClose(session: Session): Promise<void> {
     const blockedBy = await session._pendingAdmissionBlockingClose('before-drain');
-    if (blockedBy !== undefined) throw this._closeRefusedOverAdmission(session.id, blockedBy);
+    if (blockedBy === undefined) return;
+    // A closing marker this node already carries (a close that crashed, or
+    // failed after persisting it) is cleared when a turn is parked: a closing
+    // session rejects the response it waits for. One that cannot be cleared
+    // stays, and the close can resume.
+    if (blockedBy.parked && session.getRecord().closingAt !== undefined) {
+      await session._flushClearClosingMarker().catch(() => undefined);
+    }
+    throw this._closeRefusedOverAdmission(session.id, blockedBy);
   }
 
   private async _markCloseNodeClosing(

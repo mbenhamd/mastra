@@ -182,6 +182,7 @@ import type {
   CompareAndSwapSignalTerminalResult,
   HarnessSessionLeasePrecondition,
   HarnessTerminalRecoveryPrecondition,
+  WriteMessageResultEvidenceOptions,
   WriteMessageResultEvidenceResult,
   HarnessTerminalAckReceipt,
   HarnessTerminalAdmissionInput,
@@ -1369,7 +1370,7 @@ export class HarnessPG extends HarnessStorage {
     sessionId: string,
   ): Promise<Record<string, unknown> | undefined> {
     const result = await tx.execute({
-      sql: `SELECT owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+      sql: `SELECT owner_id, lease_expires_at, closed_at FROM ${TABLE_HARNESS_SESSIONS}
             WHERE harness_name = ? AND id = ? LIMIT 1 FOR SHARE`,
       args: [harnessName, sessionId],
     });
@@ -4874,7 +4875,10 @@ export class HarnessPG extends HarnessStorage {
     return row ? rowToTombstone(row as Record<string, unknown>) : null;
   }
 
-  async writeMessageResultEvidence(record: AgentSignalResultEvidence): Promise<WriteMessageResultEvidenceResult> {
+  async writeMessageResultEvidence(
+    record: AgentSignalResultEvidence,
+    options: WriteMessageResultEvidenceOptions = {},
+  ): Promise<WriteMessageResultEvidenceResult> {
     await this.#ensureMessageResultsTable();
     const namespacedRecord = { ...record, harnessName: this.#resolveHarnessName(record.harnessName) };
     if (namespacedRecord.status === 'completed') completedMessageEvidenceRunId(namespacedRecord);
@@ -4892,10 +4896,28 @@ export class HarnessPG extends HarnessStorage {
     const tx = await this.#client.transaction('write');
     let created = false;
     try {
+      // A fenced write takes the session row before the evidence row, the
+      // order the recovery settlement uses, and judges the owner after both.
+      // A lease that expired untaken still names its owner (as `saveSession`
+      // treats it).
+      const leaseRow =
+        options.leaseOwner === undefined
+          ? undefined
+          : await this.#lockSessionLeaseRowTx(tx, namespacedRecord.harnessName, namespacedRecord.sessionId);
       const existing = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
         args: [id],
       });
+      if (
+        options.leaseOwner !== undefined &&
+        (leaseRow === undefined || leaseRow.closed_at != null || leaseRow.owner_id !== options.leaseOwner.ownerId)
+      ) {
+        throw new HarnessStorageLeaseConflictError(
+          namespacedRecord.sessionId,
+          typeof leaseRow?.owner_id === 'string' ? leaseRow.owner_id : '',
+          leaseRow?.lease_expires_at == null ? 0 : Number(leaseRow.lease_expires_at),
+        );
+      }
       if (existing.rows[0]) {
         const current = rowToMessageResultEvidence(existing.rows[0] as Record<string, unknown>);
         if (!sameMessageEvidenceIdentity(current, namespacedRecord)) {
@@ -5043,7 +5065,7 @@ export class HarnessPG extends HarnessStorage {
       }
 
       const session = await tx.execute({
-        sql: `SELECT session_incarnation, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+        sql: `SELECT session_incarnation, owner_id, lease_expires_at, closed_at FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ? LIMIT 1 FOR UPDATE`,
         args: [harnessName, admission.sessionId],
       });
@@ -5279,7 +5301,7 @@ export class HarnessPG extends HarnessStorage {
         args: [tombstoneId],
       });
       const session = await tx.execute({
-        sql: `SELECT session_incarnation, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+        sql: `SELECT session_incarnation, owner_id, lease_expires_at, closed_at FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ? LIMIT 1 FOR UPDATE`,
         args: [harnessName, admissionInput.sessionId],
       });
@@ -11906,13 +11928,17 @@ function isTerminalMessageEvidence(record: AgentSignalResultEvidence): boolean {
   return record.status === 'completed' || record.status === 'failed';
 }
 
-/** Judged when the guarded write commits, by the clock leases are stamped with. */
+/**
+ * Judged when the guarded write commits, by the clock leases are stamped
+ * with. A closed session has no lease holder.
+ */
 function rowHoldsSessionLease(
   row: Record<string, unknown> | undefined,
   lease: HarnessSessionLeasePrecondition,
 ): boolean {
   return (
     row !== undefined &&
+    row.closed_at == null &&
     row.owner_id === lease.ownerId &&
     row.lease_expires_at != null &&
     Number(row.lease_expires_at) > Date.now()

@@ -42,6 +42,7 @@ import type {
   CompareAndSwapSignalTerminalResult,
   HarnessSessionLeasePrecondition,
   HarnessTerminalRecoveryPrecondition,
+  WriteMessageResultEvidenceOptions,
   WriteMessageResultEvidenceResult,
 } from './base';
 import {
@@ -507,11 +508,15 @@ export class InMemoryHarness extends HarnessStorage {
     return admissions;
   }
 
-  /** Judged when the guarded write commits, by the clock leases are stamped with. */
+  /**
+   * Judged when the guarded write commits, by the clock leases are stamped
+   * with. A closed session has no lease holder.
+   */
   private holdsSessionLease(namespace: string, sessionId: string, lease: HarnessSessionLeasePrecondition): boolean {
     const record = this.db.harnessSessions.get(sessionKey(namespace, sessionId));
     return (
       record !== undefined &&
+      record.closedAt === undefined &&
       record.ownerId === lease.ownerId &&
       record.leaseExpiresAt !== undefined &&
       record.leaseExpiresAt > Date.now()
@@ -1560,11 +1565,24 @@ export class InMemoryHarness extends HarnessStorage {
     return tombstone ? cloneJson(tombstone) : null;
   }
 
-  async writeMessageResultEvidence(record: AgentSignalResultEvidence): Promise<WriteMessageResultEvidenceResult> {
+  async writeMessageResultEvidence(
+    record: AgentSignalResultEvidence,
+    options: WriteMessageResultEvidenceOptions = {},
+  ): Promise<WriteMessageResultEvidenceResult> {
     const namespacedRecord = {
       ...record,
       harnessName: resolveHarnessName(record.harnessName, this.harnessName),
     };
+    if (options.leaseOwner !== undefined) {
+      const session = this.db.harnessSessions.get(sessionKey(namespacedRecord.harnessName, namespacedRecord.sessionId));
+      if (session === undefined || session.closedAt !== undefined || session.ownerId !== options.leaseOwner.ownerId) {
+        throw new HarnessStorageLeaseConflictError(
+          namespacedRecord.sessionId,
+          session?.ownerId ?? '',
+          session?.leaseExpiresAt ?? 0,
+        );
+      }
+    }
     const key = messageEvidenceKey(namespacedRecord.harnessName, namespacedRecord.sessionId, namespacedRecord.signalId);
     const existing = this.db.harnessMessageResultEvidence.get(key);
     if (existing === undefined && namespacedRecord.admissionId !== undefined) {

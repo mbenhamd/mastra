@@ -1664,6 +1664,8 @@ export class Session {
    * the session's next resolution. Cleared once nothing is blocked.
    */
   private _orphanRecheckAt?: number;
+  /** Counts rechecks scheduled, so a finishing recovery never clears a newer one. */
+  private _orphanRecheckSchedules = 0;
   /**
    * Durable resume-usage fence. `_recordTurnCompletion` applies a resumed run's
    * usage delta to the live counter immediately, and every flush persists the
@@ -3528,9 +3530,12 @@ export class Session {
    * leases are stamped with). Interruption settles it
    * `failed{harness.run_interrupted}` — through the native terminal commit
    * (with an aborted terminal intent) when a pending terminal admission owns
-   * it, otherwise through the dispatch CAS; both are fenced on the dispatch
-   * state recovery observed and on this lease, so a claim a stalled owner
-   * stamps meanwhile is never overwritten. Provider work is never re-run; a
+   * it, otherwise through the dispatch CAS. A turn that died before its
+   * terminal admission was written has no admission to commit against, so it
+   * gets no intent; one whose admitted finalizer id and version this process
+   * does not register is left pending. Both settlements are fenced on the
+   * dispatch state recovery observed and on this lease, so a claim a stalled
+   * owner stamps meanwhile is never overwritten. Provider work is never re-run; a
    * retry must be a new admission.
    *
    * Completion is published after settlement: `agent_end` (aborted) and the
@@ -3547,7 +3552,7 @@ export class Session {
     const recovery = this._recoverOrphanedMessageDispatchesOnce()
       .catch(error => {
         // A failed attempt stays due, so the next resolution or close retries it.
-        this._orphanRecheckAt = Date.now();
+        this._scheduleOrphanRecheck(Date.now());
         throw error;
       })
       .finally(() => {
@@ -3561,7 +3566,8 @@ export class Session {
    * @internal — what blocks a close, checked before its drain and again after
    * it, before `closedAt` is persisted; a closed session is never recovered
    * again. Recovery first settles what it can. Before the drain, a turn
-   * parked for a user response then blocks too: close would keep its record
+   * parked for a user response then blocks too, until its interaction is due
+   * (it is then expired and its turn settled): close would keep its record
    * but close over its pending admission. After the drain — which can leave
    * turns pending (a starter that failed closed on a lapsed claim, a run
    * whose result write failed) and which does not wait for the turns it
@@ -3571,14 +3577,23 @@ export class Session {
    */
   async _pendingAdmissionBlockingClose(
     phase: 'before-drain' | 'after-drain',
-  ): Promise<{ holder: string; retryAt: number } | undefined> {
+  ): Promise<{ holder: string; retryAt: number; parked?: true } | undefined> {
     if (!this._storage.supportsDispatchRecovery) return undefined;
     // A write that has not landed is invisible to the scan below: closing now
     // would let it land pending on a closed session.
     if (phase === 'after-drain' && !(await this._awaitInFlightTurnsSettled())) {
       const blocked = { holder: 'in-flight-result-write', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
-      this._orphanRecheckAt = blocked.retryAt;
+      this._scheduleOrphanRecheck(blocked.retryAt);
       return blocked;
+    }
+    // An interaction already due is expired first — its terminal admission is
+    // cancelled and its turn settled — so it no longer blocks the close.
+    const due = this._record.pendingResume;
+    if (due !== undefined && due.resumedAt === undefined && this._pendingInteractionDueAt(due) <= Date.now()) {
+      await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(due), {
+        drainQueue: false,
+        whileClosing: true,
+      });
     }
     const { blockedBy } = await this._recoverOrphanedMessageDispatches();
     if (blockedBy !== undefined) return blockedBy;
@@ -3599,8 +3614,14 @@ export class Session {
         if (evidence.status !== 'pending') continue;
         const parked = evidence.runId !== undefined && evidence.runId === parkedRunId;
         if (parked) {
-          const expiresAt = this._record.pendingResume!.expiresAt;
-          return { holder: 'parked-admission', retryAt: Math.max(expiresAt, Date.now()) };
+          // Answerable until it is due; one that could not be expired above
+          // is retried shortly.
+          const dueAt = this._pendingInteractionDueAt(this._record.pendingResume!);
+          return {
+            holder: 'parked-admission',
+            retryAt: dueAt > Date.now() ? dueAt : Date.now() + ORPHANED_DISPATCH_RETRY_MS,
+            parked: true,
+          };
         }
         if (phase === 'before-drain') continue;
         const claim = evidence.dispatch;
@@ -3608,7 +3629,7 @@ export class Session {
           claim?.state === 'dispatching' && dispatchClaim === 'live'
             ? { holder: claim.attemptId, retryAt: claim.claimExpiresAt }
             : { holder: 'pending-admission', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
-        this._orphanRecheckAt = blocked.retryAt;
+        this._scheduleOrphanRecheck(blocked.retryAt);
         return blocked;
       }
       cursor = page.nextCursor;
@@ -3669,10 +3690,17 @@ export class Session {
     await this._recoverOrphanedMessageDispatches();
   }
 
+  /** Keep the earliest pending recheck. */
+  private _scheduleOrphanRecheck(at: number): void {
+    this._orphanRecheckAt = this._orphanRecheckAt === undefined ? at : Math.min(this._orphanRecheckAt, at);
+    this._orphanRecheckSchedules++;
+  }
+
   private async _recoverOrphanedMessageDispatchesOnce(): Promise<{
     blockedBy?: { holder: string; retryAt: number };
   }> {
     if (!this._storage.supportsDispatchRecovery) return {};
+    const schedulesAtStart = this._orphanRecheckSchedules;
     const orphaned: AgentSignalResultEvidence[] = [];
     const unpublished: AgentSignalResultEvidence[] = [];
     let blockedBy: { holder: string; retryAt: number } | undefined;
@@ -3730,7 +3758,13 @@ export class Session {
     for (const evidence of unpublished) {
       await this._publishInterruptedRunCompletion(evidence);
     }
-    this._orphanRecheckAt = blockedBy?.retryAt;
+    // This recovery replaces the recheck it ran for, but a recheck scheduled
+    // while it ran is for a turn it may not have seen: keep the earliest.
+    if (this._orphanRecheckSchedules === schedulesAtStart) {
+      this._orphanRecheckAt = blockedBy?.retryAt;
+    } else if (blockedBy !== undefined) {
+      this._scheduleOrphanRecheck(blockedBy.retryAt);
+    }
     return blockedBy !== undefined ? { blockedBy } : {};
   }
 
@@ -3739,8 +3773,10 @@ export class Session {
    * its own abort settles the turn), it awaits a response, or the row is
    * malformed — left alone. `finished`: its run finished here but the result
    * was never recorded — never interrupted (a same-admission retry completes
-   * it from this process's cache), but it blocks a close. `claimed`: another
-   * process's dispatch claim is still live — left alone until it expires.
+   * it from this process's cache), but it blocks a close. A suspended output
+   * is not a result: once its interaction is gone the turn is settled like
+   * any other. `claimed`: another process's dispatch claim is still live —
+   * left alone until it expires.
    * `orphaned`: interrupt it.
    */
   private _classifyPendingMessageDispatch({
@@ -3771,7 +3807,8 @@ export class Session {
       if (!(error instanceof HarnessConfigError)) throw error;
     }
     if (agent?.getRunOutput(runId)) return 'active';
-    if (this._completedRuns.has(runId)) return 'finished';
+    const completed = this._completedRuns.get(runId);
+    if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
   }
 
@@ -3990,7 +4027,7 @@ export class Session {
 
   private async _reconcilePendingInteractionDeadlineGeneration(
     expected: PendingInteractionExpiryGeneration,
-    opts: { drainQueue?: boolean } = {},
+    opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
   ): Promise<boolean> {
     if (expected.resumedAt !== undefined) {
       return this._recoverStaleResumeAdmission(expected, opts);
@@ -4017,9 +4054,11 @@ export class Session {
       requestedAt: number;
       expiresAt: number;
     },
-    opts: { drainQueue?: boolean } = {},
+    opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
   ): Promise<boolean> {
-    if (this._state !== 'live') return false;
+    // A close may expire an overdue interaction: the parked turn could never
+    // be answered once the session closes.
+    if (this._state !== 'live' && !(opts.whileClosing === true && this._state === 'closing')) return false;
     const expiredAt = Date.now();
     if (expiredAt < expected.expiresAt) {
       this._syncPendingInteractionExpiryTimer();
@@ -8593,7 +8632,10 @@ export class Session {
               admissionId: opts.admissionId!,
               admissionHash,
             },
-            { compatibleAdmissionHashes },
+            // A reservation lands only while the open session's lease still
+            // names this process: a stalled one never lands pending on a
+            // session another process has since adopted or closed.
+            { compatibleAdmissionHashes, leaseOwner: { ownerId: this._harness.ownerId } },
           ),
           activeTurnWaiter.promise,
         ]);
@@ -8741,7 +8783,7 @@ export class Session {
               if (this._state === 'deleted') {
                 throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
               }
-              this._orphanRecheckAt = Date.now();
+              this._scheduleOrphanRecheck(Date.now());
               const latest = await this._storage.loadMessageResultEvidence({
                 harnessName: this._record.harnessName,
                 sessionId: this.id,
@@ -8765,11 +8807,15 @@ export class Session {
           }
         }
       } catch (err) {
-        failOwnedMessageTurnBeforeDispatch(err);
+        const rejection =
+          err instanceof HarnessStorageLeaseConflictError
+            ? new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt)
+            : err;
+        failOwnedMessageTurnBeforeDispatch(rejection);
         // §13.3f.1 — message() is a public §4.2b boundary; the admission
         // reservation write can reject with a raw storage error. Redact before
         // rejecting the caller (the conflict/deleted Harness errors pass through).
-        throw redactPublicBoundaryRejection(err);
+        throw redactPublicBoundaryRejection(rejection);
       }
       assertOwnedMessageTurnNotDeleted();
     }
@@ -9506,6 +9552,15 @@ export class Session {
   ): Promise<AgentResult | AgentStream | unknown> {
     return this._withActiveDeletedWaiter(async activeDeleted => {
       if ('status' in evidence) {
+        // A cancelled terminal admission settles its turn with this code; a
+        // same-admission retry keeps reporting the cancellation.
+        if (
+          evidence.status === 'failed' &&
+          evidence.error.code === 'harness.terminal_cancelled' &&
+          opts.executionAuthorityGrant !== undefined
+        ) {
+          throw new HarnessTerminalHandoffCancelledError(opts.executionAuthorityGrant.key);
+        }
         if (opts.stream === true) {
           if (evidence.status === 'pending') {
             const duplicateModeId = this._messageDuplicateModeId(evidence, opts);
@@ -9931,6 +9986,7 @@ export class Session {
     const admission = await this._probeResumeAdmissionByRun(pending);
     if (!admission) return;
     if (admission.status === 'cancelled') {
+      await this._settleCancelledTerminalMessage(admission, error.message);
       this._drainTerminalObservers(
         pending.runId,
         new HarnessTerminalHandoffCancelledError(admission.executionGrant.key),
@@ -9980,10 +10036,66 @@ export class Session {
     } else if (finalStatus === 'fenced') {
       this._drainTerminalObservers(pending.runId, new HarnessTerminalHandoffFencedError(this.id));
     } else {
+      await this._settleCancelledTerminalMessage(admission, error.message);
       this._drainTerminalObservers(
         pending.runId,
         new HarnessTerminalHandoffCancelledError(admission.executionGrant.key),
       );
+    }
+  }
+
+  /**
+   * A cancelled terminal admission leaves its admitted message row pending,
+   * which would block every close. Settle the row failed with the
+   * cancellation, under this lease and the dispatch the row shows — the same
+   * preconditions as recovery. A row this cannot settle stays pending, and
+   * recovery interrupts it once its claim has expired.
+   */
+  private async _settleCancelledTerminalMessage(
+    admission: HarnessTerminalAdmissionRecord,
+    message: string,
+  ): Promise<void> {
+    if (!this._storage.supportsDispatchRecovery) return;
+    const scope = {
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+    };
+    try {
+      const evidence = await this._storage.loadMessageResultEvidence({ ...scope, signalId: admission.signalId });
+      if (
+        evidence === null ||
+        !('status' in evidence) ||
+        evidence.status !== 'pending' ||
+        evidence.operationKind !== 'message' ||
+        evidence.admissionId !== admission.admissionId ||
+        evidence.admissionHash !== admission.admissionHash
+      ) {
+        return;
+      }
+      const swapped = await this._storage.compareAndSwapSignalTerminal({
+        ...scope,
+        signalId: evidence.signalId,
+        admissionId: admission.admissionId,
+        admissionHash: admission.admissionHash,
+        operationKind: 'message',
+        expected: evidence.dispatch ?? { state: 'reserved' },
+        leaseOwner: { ownerId: this._harness.ownerId },
+        terminal: {
+          status: 'failed',
+          signalId: evidence.signalId,
+          runId: admission.runId,
+          error: { code: 'harness.terminal_cancelled', message },
+          ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
+          ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
+        },
+        updatedAt: Date.now(),
+      });
+      if (!swapped.applied) this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+    } catch {
+      // The admission is already cancelled; its row is left to recovery.
+      this._scheduleOrphanRecheck(Date.now() + ORPHANED_DISPATCH_RETRY_MS);
     }
   }
 
@@ -10592,6 +10704,10 @@ export class Session {
           cancelledAt: Date.now(),
         });
         if (receipt.status === 'cancelled' || receipt.status === 'duplicate') {
+          await this._settleCancelledTerminalMessage(
+            admission,
+            'suspension was not durably parked; the deferred terminal admission cannot be settled by a resume',
+          );
           const cancelledError = new HarnessTerminalHandoffCancelledError(admission.executionGrant.key);
           try {
             options.onFailure?.(cancelledError);
@@ -10733,7 +10849,7 @@ export class Session {
 
   private async _writeMessageResultEvidence(
     status: AgentSignalResultStatus & { admissionId?: string; admissionHash?: string },
-    options?: { compatibleAdmissionHashes?: readonly string[] },
+    options?: { compatibleAdmissionHashes?: readonly string[]; leaseOwner?: { ownerId: string } },
   ): Promise<{
     created: boolean;
     applied: boolean;
@@ -10756,7 +10872,10 @@ export class Session {
         createdAt: now,
         updatedAt: now,
       };
-      const write = this._storage.writeMessageResultEvidence(evidence);
+      const write = this._storage.writeMessageResultEvidence(
+        evidence,
+        options?.leaseOwner !== undefined ? { leaseOwner: options.leaseOwner } : undefined,
+      );
       // A turn's result write can outlive the turn (an aborted turn does not
       // await it); close waits for these before judging what is pending.
       this._resultEvidenceWrites.add(write);
