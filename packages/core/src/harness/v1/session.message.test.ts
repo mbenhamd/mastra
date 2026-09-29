@@ -35,6 +35,7 @@ import {
   HarnessBusyError,
   HarnessConfigError,
   HarnessOutputGenerationError,
+  HarnessSessionLockedError,
   HarnessValidationError,
 } from './errors';
 import { Harness } from './harness';
@@ -1425,7 +1426,7 @@ describe('Session.message() — default path', () => {
     expect(stillParked?.toolCallId).toBe('tc-B');
   });
 
-  it('drains retained terminal observers with an indeterminate outcome when the session closes', async () => {
+  it('keeps a suspended turn and its terminal observers pending while it blocks close', async () => {
     const storage = new InMemoryHarness({
       db: new InMemoryDB(),
       terminalHandoff: { enabled: true },
@@ -1465,10 +1466,20 @@ describe('Session.message() — default path', () => {
     });
     expect(result.finishReason).toBe('suspended');
 
-    await session.close();
+    // PF-4598: close never closes over a pending admission. The parked turn
+    // stays answerable, so its observers are not drained and it is not
+    // reported indeterminate.
+    await expect(session.close()).rejects.toBeInstanceOf(HarnessSessionLockedError);
 
-    expect(failures).toHaveLength(1);
-    expect(failures[0]!.name).toBe('HarnessTerminalHandoffError:harness.terminal_pending');
+    expect(failures).toHaveLength(0);
+    await expect(
+      storage.loadTerminalAdmission({
+        harnessName: 'default',
+        sessionId: session.id,
+        admissionId: 'teardown-admission',
+        executionGrant: grant,
+      }),
+    ).resolves.toMatchObject({ status: 'pending' });
   });
 
   it('keeps resume recovery state when resumed terminal settlement fails', async () => {

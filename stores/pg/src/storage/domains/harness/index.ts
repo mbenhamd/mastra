@@ -1466,12 +1466,13 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureMessageResultsTable();
     await this.#ensureRunSummariesTable();
     const cursorCondition = input.cursor !== undefined ? 'AND m.signal_id > ?' : '';
-    const args: (string | number)[] = [
+    const args: (string | number | boolean)[] = [
       now,
       this.#resolveHarnessName(input.harnessName),
       input.sessionId,
       input.resourceId,
       input.threadId,
+      input.includeParkedResume === true,
       HARNESS_RUN_INTERRUPTED_ERROR_CODE,
       ...(input.cursor !== undefined ? [input.cursor.signalId] : []),
       limit + 1,
@@ -1482,7 +1483,13 @@ export class HarnessPG extends HarnessStorage {
             FROM ${TABLE_HARNESS_MESSAGE_RESULTS} m
             JOIN ${TABLE_HARNESS_SESSIONS} s ON s.harness_name = m.harness_name AND s.id = m.session_id
             WHERE m.harness_name = ? AND m.session_id = ? AND m.resource_id = ? AND m.thread_id = ?
-              AND ${PG_RECOVERABLE_MESSAGE_SQL}
+              AND (
+                (
+                  ? AND m.status = 'pending' AND m.operation_kind = 'message' AND m.admission_id IS NOT NULL
+                  AND m.admission_hash IS NOT NULL AND m.run_id IS NOT NULL
+                )
+                OR ${PG_RECOVERABLE_MESSAGE_SQL}
+              )
               ${cursorCondition}
             ORDER BY m.signal_id ASC
             LIMIT ?`,
@@ -6147,6 +6154,21 @@ export class HarnessPG extends HarnessStorage {
           : input.expected.runId;
       if (runId === undefined || (input.terminal.runId !== undefined && input.terminal.runId !== runId)) {
         throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+      }
+      // A recovery settlement never lands over a pending native terminal
+      // admission: only its finalizer commit may settle that run. Admission
+      // creation takes the session row lock this settlement shares.
+      if (input.leaseOwner !== undefined && operationKind === 'message' && this.terminalHandoff.enabled) {
+        await this.#ensureTerminalHandoffTables();
+        const pendingAdmission = await tx.execute({
+          sql: `SELECT 1 FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+                WHERE harness_name = ? AND session_id = ? AND run_id = ? AND status = 'pending' LIMIT 1`,
+          args: [harnessName, input.sessionId, runId],
+        });
+        if (pendingAdmission.rows[0]) {
+          await tx.commit();
+          return { applied: false, evidence: current };
+        }
       }
       // Judged after the evidence-row wait, immediately before the write.
       if (input.leaseOwner !== undefined && !rowHoldsSessionLease(leaseRow, input.leaseOwner)) {

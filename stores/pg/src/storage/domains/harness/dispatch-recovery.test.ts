@@ -128,7 +128,27 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
         expiresAt: Date.now() + 60 * 60_000,
       },
     });
+    // Its parked turn is waiting for a response: never listed for adoption,
+    // but visible to close through `includeParkedResume`.
+    await harness().writeMessageResultEvidence(pendingMessage(blocked, 'blocked'));
     await harness().releaseSessionLease({ harnessName: HARNESS, sessionId: blocked.id, ownerId: 'owner-blocked' });
+    const blockedScope = {
+      harnessName: HARNESS,
+      sessionId: blocked.id,
+      resourceId: blocked.resourceId,
+      threadId: blocked.threadId,
+    };
+    await expect(
+      harness().listPendingMessageAdmissions({ ...blockedScope, now: Date.now(), limit: 10 }),
+    ).resolves.toEqual({ items: [] });
+    await expect(
+      harness().listPendingMessageAdmissions({
+        ...blockedScope,
+        now: Date.now(),
+        limit: 10,
+        includeParkedResume: true,
+      }),
+    ).resolves.toMatchObject({ items: [{ evidence: { signalId: 'signal-blocked', status: 'pending' } }] });
     // A closing session whose only turn is still claimed by another process
     // cannot be closed yet, so it is not discoverable until the claim expires.
     // Its queued work must not list it (as not closing) either.
@@ -293,7 +313,22 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       return { evidence, admission, dispatch };
     };
     const expired = await stamp('expired', Date.now() - 1_000);
-    await stamp('live', Date.now() + 60_000);
+    const live = await stamp('live', Date.now() + 60_000);
+    // Recovery's fallback settlement never lands over a pending terminal
+    // admission, even when the dispatch it expects still matches.
+    await expect(
+      harness().compareAndSwapSignalTerminal({
+        ...scope,
+        signalId: live.evidence.signalId,
+        admissionId: live.evidence.admissionId!,
+        admissionHash: live.evidence.admissionHash!,
+        operationKind: 'message',
+        expected: live.dispatch,
+        leaseOwner: { ownerId: 'owner-dead' },
+        terminal: { status: 'failed', signalId: live.evidence.signalId, error: INTERRUPTED },
+        updatedAt: Date.now(),
+      }),
+    ).resolves.toMatchObject({ applied: false });
 
     const claims = (now: number) =>
       harness()

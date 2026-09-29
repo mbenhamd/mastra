@@ -5770,7 +5770,7 @@ export class Harness {
       // closed on a lapsed claim, a run whose result write failed). Re-check
       // before `closedAt`: a closed session is never recovered again.
       for (const node of tree) {
-        const blocked = await node.live?._pendingAdmissionBlockingClose();
+        const blocked = await node.live?._pendingAdmissionBlockingClose('after-drain');
         if (blocked !== undefined) {
           throw new HarnessSessionLockedError(node.record.id, blocked.holder, blocked.retryAt);
         }
@@ -5836,6 +5836,7 @@ export class Harness {
           threadId: latest.threadId,
           now: Date.now(),
           limit: 1,
+          includeParkedResume: true,
         });
         hasPendingMessageAdmissions = pending.items.length > 0;
       }
@@ -5889,12 +5890,12 @@ export class Harness {
   /**
    * A close must not hide an admitted turn: orphaned dispatches are settled
    * first, and the close is refused (retry after `expiresAt`) while a turn is
-   * still pending — another process's dispatch claim is live, or its
-   * settlement did not commit. Once a session is closed no recovery would
-   * ever look at that turn again.
+   * still pending — another process's dispatch claim is live, its settlement
+   * did not commit, or it is parked for a user response. Once a session is
+   * closed no recovery would ever look at that turn again.
    */
   private async _settleOrphanedDispatchesBeforeClose(session: Session): Promise<void> {
-    const { blockedBy } = await session._recoverOrphanedMessageDispatches();
+    const blockedBy = await session._pendingAdmissionBlockingClose('before-drain');
     if (blockedBy !== undefined) {
       throw new HarnessSessionLockedError(session.id, blockedBy.holder, blockedBy.retryAt);
     }

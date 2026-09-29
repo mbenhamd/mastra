@@ -601,16 +601,28 @@ describe('Session adoption — orphaned message dispatch', () => {
     },
   );
 
-  it.each([plainAdmittedMessage, terminalHandoffMessage])(
-    'still closes after aborting an in-flight turn at the close deadline: $name',
-    async shape => {
+  it.each([
+    { shape: plainAdmittedMessage, stream: true, resultWriteDelayMs: 0 },
+    { shape: terminalHandoffMessage, stream: true, resultWriteDelayMs: 0 },
+    { shape: plainAdmittedMessage, stream: false, resultWriteDelayMs: 50 },
+  ])(
+    'still closes after aborting an in-flight turn at the close deadline: $shape.name (stream: $stream)',
+    async ({ shape, stream, resultWriteDelayMs }) => {
       const db = new InMemoryDB();
       const agent = new MockAgent({ id: 'default' });
       agent.enqueueRun({ holdUntil: new Promise<void>(() => {}) });
       const owner = harnessProcess(db, agent, shape.terminal, finalizer, 100);
+      if (resultWriteDelayMs > 0) {
+        // The aborted turn's result write lands a little after the drain ends.
+        const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
+        owner.storage.writeMessageResultEvidence = async record => {
+          if (record.status !== 'pending') await new Promise(resolve => setTimeout(resolve, resultWriteDelayMs));
+          return write(record);
+        };
+      }
       const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
       try {
-        const turn = session.message({ ...shape.message, stream: true } as never);
+        const turn = session.message({ ...shape.message, ...(stream ? { stream: true } : {}) } as never);
         void turn.catch(() => {});
         await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
 
@@ -622,6 +634,166 @@ describe('Session adoption — orphaned message dispatch', () => {
       }
     },
   );
+
+  it('does not interrupt a same-admission retry while it re-drives its terminal admission', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    const owner = harnessProcess(db, agent, true);
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+    // The first attempt reserves the turn, then its terminal admission fails
+    // transiently; the retry re-drives the admission and stalls inside it.
+    const admit = owner.storage.admitTerminalHandoff.bind(owner.storage);
+    let admissions = 0;
+    let admitting!: () => void;
+    const retryAdmitting = new Promise<void>(resolve => (admitting = resolve));
+    let releaseAdmit!: () => void;
+    const admitReleased = new Promise<void>(resolve => (releaseAdmit = resolve));
+    let admitted!: () => void;
+    const admissionInserted = new Promise<void>(resolve => (admitted = resolve));
+    let releaseAck!: () => void;
+    const ackReleased = new Promise<void>(resolve => (releaseAck = resolve));
+    owner.storage.admitTerminalHandoff = async (input, opts) => {
+      admissions += 1;
+      if (admissions === 1) throw new Error('transient terminal admission failure');
+      admitting();
+      await admitReleased;
+      const receipt = await admit(input, opts);
+      admitted();
+      await ackReleased;
+      return receipt;
+    };
+    // Recovery that finds no admission yet lets the retry insert it, then
+    // settles before the retry's acknowledgement (and its claim) returns.
+    const lookup = owner.storage.loadTerminalAdmissionByRun.bind(owner.storage);
+    owner.storage.loadTerminalAdmissionByRun = async input => {
+      const found = await lookup(input);
+      if (found === null) {
+        releaseAdmit();
+        await admissionInserted;
+      }
+      return found;
+    };
+    const settle = owner.storage.compareAndSwapSignalTerminal.bind(owner.storage);
+    owner.storage.compareAndSwapSignalTerminal = async input => {
+      const settled = await settle(input);
+      releaseAck();
+      return settled;
+    };
+    try {
+      await expect(session.message({ ...terminalHandoffMessage.message } as never)).rejects.toThrow();
+      const retry = session.message({ ...terminalHandoffMessage.message, stream: true } as never);
+      void retry.catch(() => {});
+      await retryAdmitting;
+      const close = owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
+      void close.catch(() => {});
+      // Resume the retry only once close's pre-drain recovery has run.
+      await vi.waitFor(async () =>
+        expect((await owner.storage.loadSession({ sessionId: session.id }))?.closingAt).toBeDefined(),
+      );
+      releaseAdmit();
+      releaseAck();
+
+      // The retry owned its turn, so recovery never interrupted it under the
+      // retry: its evidence and its terminal admission stay pending together
+      // (it fails closed on the closing session), and close refuses rather
+      // than closing over them.
+      await expect(close).rejects.toBeInstanceOf(HarnessSessionLockedError);
+      await expect(retry).rejects.toThrow();
+      const [pending] = (await owner.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 }))
+        .items;
+      expect(pending?.evidence.status).toBe('pending');
+      await expect(
+        owner.storage.loadTerminalAdmission({
+          harnessName: 'default',
+          sessionId: session.id,
+          admissionId: 'orphaned-turn',
+          executionGrant: grant,
+        }),
+      ).resolves.toMatchObject({ status: 'pending' });
+      expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeUndefined();
+
+      // Recovery's fallback settlement never lands over a pending terminal
+      // admission, atomically in the adapter.
+      const extra = orphanedAdmission(scope, 'admitted-extra');
+      await owner.storage.writeMessageResultEvidence(extra);
+      const record = (await owner.storage.loadSession({ sessionId: session.id }))!;
+      await admit(
+        {
+          ...scope,
+          sessionIncarnation: record.sessionIncarnation!,
+          admissionId: extra.admissionId!,
+          admissionHash: extra.admissionHash!,
+          signalId: extra.signalId,
+          runId: extra.runId!,
+          executionGrant: { key: 'grant-admitted-extra', generation: 1 },
+          finalizerId: finalizer.id,
+          finalizerVersion: finalizer.version,
+          seed: { v: 1 },
+        },
+        {},
+      );
+      await expect(
+        owner.storage.compareAndSwapSignalTerminal({
+          ...scope,
+          signalId: extra.signalId,
+          admissionId: extra.admissionId!,
+          admissionHash: extra.admissionHash!,
+          operationKind: 'message',
+          expected: { state: 'reserved' },
+          leaseOwner: { ownerId: record.ownerId! },
+          terminal: {
+            status: 'failed',
+            signalId: extra.signalId,
+            error: { code: 'harness.run_interrupted', message: 'x' },
+          },
+          updatedAt: Date.now(),
+        }),
+      ).resolves.toMatchObject({ applied: false });
+    } finally {
+      releaseAdmit();
+      releaseAck();
+      await owner.harness.shutdown().catch(() => {});
+    }
+  });
+
+  it('refuses to close, warm or cold, while a suspended turn is parked for a response', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-1', toolName: 'shell', args: { cmd: 'ls' } },
+    });
+    const owner = harnessProcess(db, agent, true);
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const target = { sessionId: session.id, resourceId: 'u1' };
+    const adopter = harnessProcess(db, new MockAgent({ id: 'default' }), true);
+    try {
+      const result = (await session.message({ ...terminalHandoffMessage.message } as never)) as {
+        finishReason: string;
+      };
+      expect(result.finishReason).toBe('suspended');
+
+      // Its admission waits for the user's response: closing now would close
+      // over pending evidence and a pending terminal admission.
+      await expect(owner.harness.closeSession(target)).rejects.toBeInstanceOf(HarnessSessionLockedError);
+      await owner.storage.releaseSessionLease({ sessionId: session.id, ownerId: owner.harness.ownerId });
+      await expect(adopter.harness.closeSession(target)).rejects.toBeInstanceOf(HarnessSessionLockedError);
+
+      expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeUndefined();
+      await expect(
+        owner.storage.loadTerminalAdmission({
+          harnessName: 'default',
+          sessionId: session.id,
+          admissionId: 'orphaned-turn',
+          executionGrant: grant,
+        }),
+      ).resolves.toMatchObject({ status: 'pending' });
+    } finally {
+      await adopter.harness.shutdown().catch(() => {});
+      await owner.harness.shutdown().catch(() => {});
+    }
+  });
 
   it.each([plainAdmittedMessage, terminalHandoffMessage])(
     'refuses to close over a turn whose claim acknowledgement arrives after close started: $name',

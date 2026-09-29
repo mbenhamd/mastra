@@ -1654,6 +1654,8 @@ export class Session {
    * `run_completed` so it reports the admitted mode/model, not the session's.
    */
   private readonly _recoveredRunIdentities = new Map<string, RunSpanIdentity>();
+  /** Message result-evidence writes in flight (awaited by close before its pending check). */
+  private readonly _resultEvidenceWrites = new Set<Promise<unknown>>();
   /** Orphaned-dispatch recovery in flight (one per session at a time). */
   private _orphanRecovery?: Promise<{ blockedBy?: { holder: string; retryAt: number } }>;
   /**
@@ -3556,40 +3558,55 @@ export class Session {
   }
 
   /**
-   * @internal — the check a close runs after its drain, before `closedAt` is
-   * persisted. Admissions can still be pending once the drain is done (a
-   * starter that failed closed on a lapsed claim, a run whose result write
-   * failed during the drain), and a closed session is never recovered again.
-   * In-flight turns get a bounded chance to settle first; recovery then
-   * settles what it can, and a re-read returns what still blocks — any
-   * admitted turn still pending other than a response-parked one — and
-   * leaves recovery due.
+   * @internal — what blocks a close, checked before its drain and again after
+   * it, before `closedAt` is persisted; a closed session is never recovered
+   * again. Recovery first settles what it can. Before the drain, a turn
+   * parked for a user response then blocks too: close would keep its record
+   * but close over its pending admission. After the drain — which can leave
+   * turns pending (a starter that failed closed on a lapsed claim, a run
+   * whose result write failed) and which does not wait for the turns it
+   * aborts at its deadline — in-flight turns get a bounded chance to settle,
+   * then any admitted turn still pending blocks, and recovery is left due.
    */
-  async _pendingAdmissionBlockingClose(): Promise<{ holder: string; retryAt: number } | undefined> {
+  async _pendingAdmissionBlockingClose(
+    phase: 'before-drain' | 'after-drain',
+  ): Promise<{ holder: string; retryAt: number } | undefined> {
     if (!this._storage.supportsDispatchRecovery) return undefined;
-    // A drain that reached its deadline aborted its in-flight turns and did
-    // not wait for them; give them a bounded chance to record their own
-    // result before judging what is still pending.
-    await this._awaitInFlightTurnsSettled();
+    if (phase === 'after-drain') await this._awaitInFlightTurnsSettled();
     const { blockedBy } = await this._recoverOrphanedMessageDispatches();
     if (blockedBy !== undefined) return blockedBy;
-    const page = await this._storage.listPendingMessageAdmissions({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      now: Date.now(),
-      limit: 1,
-    });
-    const pending = page.items.find(admission => admission.evidence.status === 'pending');
-    if (pending === undefined) return undefined;
-    const claim = pending.evidence.dispatch;
-    const blocked =
-      claim?.state === 'dispatching' && pending.dispatchClaim === 'live'
-        ? { holder: claim.attemptId, retryAt: claim.claimExpiresAt }
-        : { holder: 'pending-admission', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
-    this._orphanRecheckAt = blocked.retryAt;
-    return blocked;
+    const parkedRunId = this._record.pendingResume?.runId;
+    let cursor: PendingMessageAdmissionScanCursor | undefined;
+    do {
+      const page = await this._storage.listPendingMessageAdmissions({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        now: Date.now(),
+        limit: HARNESS_DISPATCH_RECOVERY_SCAN_MAX_LIMIT,
+        includeParkedResume: true,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
+      for (const { evidence, dispatchClaim } of page.items) {
+        if (evidence.status !== 'pending') continue;
+        const parked = evidence.runId !== undefined && evidence.runId === parkedRunId;
+        if (parked) {
+          const expiresAt = this._record.pendingResume!.expiresAt;
+          return { holder: 'parked-admission', retryAt: Math.max(expiresAt, Date.now()) };
+        }
+        if (phase === 'before-drain') continue;
+        const claim = evidence.dispatch;
+        const blocked =
+          claim?.state === 'dispatching' && dispatchClaim === 'live'
+            ? { holder: claim.attemptId, retryAt: claim.claimExpiresAt }
+            : { holder: 'pending-admission', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
+        this._orphanRecheckAt = blocked.retryAt;
+        return blocked;
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    return undefined;
   }
 
   private async _awaitInFlightTurnsSettled(): Promise<void> {
@@ -3598,11 +3615,16 @@ export class Session {
       if (
         this._currentTurnAbortController === undefined &&
         this._backgroundTurnCompletions.size === 0 &&
-        this._messageAdmissionStarts.size === 0
+        this._messageAdmissionStarts.size === 0 &&
+        this._resultEvidenceWrites.size === 0
       ) {
         return;
       }
-      await Promise.race([Promise.allSettled(Array.from(this._backgroundTurnCompletions)), delay(pollMs)]);
+      // Non-streaming turns are not background completions, and an aborted
+      // turn's result write is not awaited by the turn: wait on the tracked
+      // work, or poll the turn controller and admission markers.
+      const tracked = [...this._backgroundTurnCompletions, ...this._resultEvidenceWrites];
+      await (tracked.length > 0 ? Promise.race([Promise.allSettled(tracked), delay(pollMs)]) : delay(pollMs));
     }
   }
 
@@ -8546,9 +8568,14 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
         if (!reservation.created) {
+          // The start marker stays until this attempt knows it is a
+          // duplicate: an attempt that re-drives a stranded terminal
+          // admission owns the turn, and recovery must see it as in flight.
           const registeredStart = this._messageAdmissionStarts.get(opts.admissionId!);
-          if (registeredStart !== undefined) registeredStart.duplicate = true;
-          this._messageAdmissionStarts.delete(opts.admissionId!);
+          const releaseDuplicateStart = () => {
+            if (registeredStart !== undefined) registeredStart.duplicate = true;
+            this._messageAdmissionStarts.delete(opts.admissionId!);
+          };
           const existing =
             reservation.evidence ??
             (await this._resolveMessageAdmissionDuplicate({
@@ -8607,6 +8634,7 @@ export class Session {
               (probedTerminalAdmission === null ||
                 (probedTerminalAdmission.status === 'pending' && dispatchNotStarted));
             if (!strandedPendingTerminal) {
+              releaseDuplicateStart();
               try {
                 return await this._returnDuplicateMessageResult(existing, opts);
               } finally {
@@ -10698,7 +10726,16 @@ export class Session {
         createdAt: now,
         updatedAt: now,
       };
-      const result = await this._storage.writeMessageResultEvidence(evidence);
+      const write = this._storage.writeMessageResultEvidence(evidence);
+      // A turn's result write can outlive the turn (an aborted turn does not
+      // await it); close waits for these before judging what is pending.
+      this._resultEvidenceWrites.add(write);
+      void write
+        .finally(() => {
+          this._resultEvidenceWrites.delete(write);
+        })
+        .catch(() => {});
+      const result = await write;
       await this._cleanupOperationEvidenceIfDeleted(status);
       return result.created ? { created: true, applied: result.applied, evidence } : result;
     } catch (err) {

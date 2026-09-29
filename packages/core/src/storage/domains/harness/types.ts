@@ -1924,6 +1924,12 @@ export interface ListPendingMessageAdmissionsInput {
   threadId: string;
   /** Caller clock (epoch ms) that dispatch claims are judged by. */
   now: number;
+  /**
+   * Also return the pending row of the turn parked for a user response
+   * (excluded by default: it is waiting, not orphaned). Close uses it so it
+   * never closes over a parked turn's pending admission.
+   */
+  includeParkedResume?: boolean;
   /** Positive page size; adapters cap it at the storage-wide maximum. */
   limit: number;
   /** Return rows strictly after this signal id. */

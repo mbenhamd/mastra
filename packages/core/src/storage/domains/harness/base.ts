@@ -255,7 +255,11 @@ export interface CompareAndSwapSignalTerminalInput {
    */
   operationKind?: 'message' | 'signal';
   expected: AgentSignalDispatchState;
-  /** Recovery-only: also require the caller to hold the session lease. */
+  /**
+   * Recovery-only: also require the caller to hold the session lease. For an
+   * admitted message, the settlement is also refused while a pending native
+   * terminal admission owns the run — only its finalizer commit may settle it.
+   */
   leaseOwner?: HarnessSessionLeasePrecondition;
   terminal:
     | {

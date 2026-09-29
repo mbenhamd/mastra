@@ -446,7 +446,9 @@ export class InMemoryHarness extends HarnessStorage {
     const { now, limit } = normalizeDispatchRecoveryScanInput(input);
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
     const record = this.db.harnessSessions.get(sessionKey(namespace, input.sessionId));
-    const admissions = (record ? this.recoverableMessageAdmissions(namespace, record, now) : []).filter(
+    const admissions = (
+      record ? this.recoverableMessageAdmissions(namespace, record, now, input.includeParkedResume === true) : []
+    ).filter(
       admission =>
         admission.evidence.resourceId === input.resourceId &&
         admission.evidence.threadId === input.threadId &&
@@ -470,6 +472,7 @@ export class InMemoryHarness extends HarnessStorage {
     namespace: string,
     record: SessionRecord,
     now: number,
+    includeParkedResume = false,
   ): PendingMessageAdmission[] {
     const admissions: PendingMessageAdmission[] = [];
     for (const evidence of this.db.harnessMessageResultEvidence.values()) {
@@ -484,7 +487,7 @@ export class InMemoryHarness extends HarnessStorage {
         continue;
       }
       if (evidence.status === 'pending') {
-        if (evidence.runId === record.pendingResume?.runId) continue;
+        if (!includeParkedResume && evidence.runId === record.pendingResume?.runId) continue;
         admissions.push({ evidence: cloneJson(evidence), dispatchClaim: pendingMessageDispatchClaim(evidence, now) });
       } else if (
         evidence.status === 'failed' &&
@@ -2411,6 +2414,21 @@ export class InMemoryHarness extends HarnessStorage {
         : input.expected.runId;
     if (runId === undefined || (input.terminal.runId !== undefined && input.terminal.runId !== runId)) {
       throw new HarnessStorageAdmissionConflictError(input.sessionId, 'signal', input.admissionId);
+    }
+    // A recovery settlement never lands over a pending native terminal
+    // admission: only its finalizer commit may settle that run.
+    if (
+      input.leaseOwner !== undefined &&
+      operationKind === 'message' &&
+      [...this.db.harnessTerminalAdmissions.values()].some(
+        admission =>
+          admission.harnessName === harnessName &&
+          admission.sessionId === input.sessionId &&
+          admission.runId === runId &&
+          admission.status === 'pending',
+      )
+    ) {
+      return { applied: false, evidence: cloneJson(existing) };
     }
     const terminal: AgentSignalResultEvidence = {
       ...existing,
