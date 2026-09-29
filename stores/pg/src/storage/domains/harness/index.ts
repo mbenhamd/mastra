@@ -1385,6 +1385,7 @@ export class HarnessPG extends HarnessStorage {
       HARNESS_RUN_INTERRUPTED_ERROR_CODE,
       now,
       now,
+      now,
       HARNESS_RUN_INTERRUPTED_ERROR_CODE,
       now,
       this.#resolveHarnessName(input.harnessName),
@@ -1397,8 +1398,9 @@ export class HarnessPG extends HarnessStorage {
     // them. Only work recovery can advance makes a session discoverable: a
     // recoverable admitted message whose claim is not live, a queue not parked
     // behind an unexpired interaction, or an unfinished close. A closing
-    // session one of whose turns is still claimed is excluded entirely: its
-    // close is refused until then and `harness.session()` rejects it.
+    // session one of whose turns is still claimed, or parked behind an
+    // interaction that has not expired, is excluded entirely: its close is
+    // refused until then and `harness.session()` rejects it.
     const result = await this.#client.execute({
       sql: `SELECT * FROM (
               SELECT s.harness_name, s.id, s.resource_id, s.thread_id,
@@ -1415,6 +1417,22 @@ export class HarnessPG extends HarnessStorage {
                            AND ${PG_MESSAGE_DISPATCH_CLAIM_SQL} = 'live'
                        )
                      ) AS closing_claimed,
+                     (
+                       s.closing_at IS NOT NULL
+                       AND (s.pending_resume_expires_at IS NULL OR s.pending_resume_expires_at > ?)
+                       AND EXISTS (
+                         SELECT 1 FROM ${TABLE_HARNESS_MESSAGE_RESULTS} m
+                         WHERE m.harness_name = s.harness_name
+                           AND m.session_id = s.id
+                           AND m.resource_id = s.resource_id
+                           AND m.thread_id = s.thread_id
+                           AND m.operation_kind = 'message'
+                           AND m.admission_id IS NOT NULL
+                           AND m.admission_hash IS NOT NULL
+                           AND m.status = 'pending'
+                           AND m.run_id = s.pending_resume->>'runId'
+                       )
+                     ) AS closing_parked,
                      (
                        s.pending_queue <> '[]'::jsonb
                        AND (
@@ -1437,7 +1455,7 @@ export class HarnessPG extends HarnessStorage {
                 AND (s.owner_id IS NULL OR s.lease_expires_at IS NULL OR s.lease_expires_at <= ?)
                 ${cursorCondition}
             ) candidates
-            WHERE NOT closing_claimed AND (closing OR pending_queue OR pending_message_admission)
+            WHERE NOT closing_claimed AND NOT closing_parked AND (closing OR pending_queue OR pending_message_admission)
             ORDER BY id ASC
             LIMIT ?`,
       args,
@@ -6109,6 +6127,10 @@ export class HarnessPG extends HarnessStorage {
     input: CompareAndSwapSignalTerminalInput,
   ): Promise<CompareAndSwapSignalTerminalResult> {
     await this.#ensureMessageResultsTable();
+    const recoverySettlement = input.leaseOwner !== undefined && input.operationKind === 'message';
+    // Another store sharing this schema may admit native terminal handoffs even
+    // when this one does not, so a recovery settlement always checks for them.
+    if (recoverySettlement) await this.#ensureTerminalHandoffTables();
     const harnessName = this.#resolveHarnessName(input.harnessName);
     const id = messageEvidenceId({ harnessName, sessionId: input.sessionId, signalId: input.signalId });
     const tx = await this.#client.transaction('write');
@@ -6158,8 +6180,7 @@ export class HarnessPG extends HarnessStorage {
       // A recovery settlement never lands over a pending native terminal
       // admission: only its finalizer commit may settle that run. Admission
       // creation takes the session row lock this settlement shares.
-      if (input.leaseOwner !== undefined && operationKind === 'message' && this.terminalHandoff.enabled) {
-        await this.#ensureTerminalHandoffTables();
+      if (recoverySettlement) {
         const pendingAdmission = await tx.execute({
           sql: `SELECT 1 FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
                 WHERE harness_name = ? AND session_id = ? AND run_id = ? AND status = 'pending' LIMIT 1`,

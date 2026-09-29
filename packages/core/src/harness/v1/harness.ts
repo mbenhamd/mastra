@@ -1045,6 +1045,8 @@ export class Harness {
   private readonly _sessionMaterializationsInFlight = new Map<string, Promise<Session>>();
   /** In-process close de-dupe by any session id currently covered by a close tree. */
   private readonly _closePromises = new Map<string, Promise<void>>();
+  /** Close refusals over an admitted turn, which reopen what the close marked. */
+  private readonly _admissionCloseRefusals = new WeakSet<object>();
   private readonly _shutdownEvictedSessionIds = new Set<string>();
   /** Workspace registry — owns lifecycle across `shared`/`per-resource`/`per-session`. */
   readonly _workspaceRegistry: WorkspaceRegistry;
@@ -5767,18 +5769,57 @@ export class Harness {
 
       await this._drainCloseTree(tree, subtreeCloseDeadlineAt);
       // The drain can leave admitted turns pending (a starter that failed
-      // closed on a lapsed claim, a run whose result write failed). Re-check
-      // before `closedAt`: a closed session is never recovered again.
+      // closed on a lapsed claim, a run whose result write failed) or parked
+      // for a response. Re-check before `closedAt`: a closed session is never
+      // recovered again.
       for (const node of tree) {
         const blocked = await node.live?._pendingAdmissionBlockingClose('after-drain');
-        if (blocked !== undefined) {
-          throw new HarnessSessionLockedError(node.record.id, blocked.holder, blocked.retryAt);
-        }
+        if (blocked !== undefined) throw this._closeRefusedOverAdmission(node.record.id, blocked);
       }
       await this._terminalizeCloseTree(storage, tree, closedLiveSessions);
     } catch (err) {
+      if (this._admissionCloseRefusals.has(err as object)) {
+        await this._reopenRefusedCloseTree(storage, tree, persistedCloseIds);
+      }
       await this._releaseCloseTreeLeases(storage, tree);
       throw err;
+    }
+  }
+
+  private _closeRefusedOverAdmission(
+    sessionId: string,
+    blocked: { holder: string; retryAt: number },
+  ): HarnessSessionLockedError {
+    const err = new HarnessSessionLockedError(sessionId, blocked.holder, blocked.retryAt);
+    this._admissionCloseRefusals.add(err);
+    return err;
+  }
+
+  /**
+   * A close refused over an admitted turn does not leave the subtree it
+   * already marked closing: that would reject the parked turn's response and
+   * every later turn. Each marker is cleared under the lease and version it
+   * was written with; one that cannot be stays closing, recoverable by close.
+   */
+  private async _reopenRefusedCloseTree(
+    storage: HarnessStorage,
+    tree: CloseTreeNode[],
+    persistedCloseIds: Set<string>,
+  ): Promise<void> {
+    for (const node of tree) {
+      try {
+        if (node.live) {
+          await node.live._flushClearClosingMarker();
+        } else if (node.record.closingAt !== undefined && node.record.closedAt === undefined) {
+          await storage.saveSession(
+            { ...node.record, closingAt: undefined, closeDeadlineAt: undefined, lastActivityAt: Date.now() },
+            { harnessName: node.record.harnessName, ownerId: this.ownerId, ifVersion: node.record.version },
+          );
+        }
+        persistedCloseIds.delete(node.record.id);
+      } catch {
+        // Preserve the refusal; the marker stays and the close can resume.
+      }
     }
   }
 
@@ -5896,9 +5937,7 @@ export class Harness {
    */
   private async _settleOrphanedDispatchesBeforeClose(session: Session): Promise<void> {
     const blockedBy = await session._pendingAdmissionBlockingClose('before-drain');
-    if (blockedBy !== undefined) {
-      throw new HarnessSessionLockedError(session.id, blockedBy.holder, blockedBy.retryAt);
-    }
+    if (blockedBy !== undefined) throw this._closeRefusedOverAdmission(session.id, blockedBy);
   }
 
   private async _markCloseNodeClosing(

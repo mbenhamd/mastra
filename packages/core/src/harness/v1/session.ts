@@ -3566,13 +3566,20 @@ export class Session {
    * turns pending (a starter that failed closed on a lapsed claim, a run
    * whose result write failed) and which does not wait for the turns it
    * aborts at its deadline — in-flight turns get a bounded chance to settle,
-   * then any admitted turn still pending blocks, and recovery is left due.
+   * then a result write still in flight, or any admitted turn still pending,
+   * blocks, and recovery is left due.
    */
   async _pendingAdmissionBlockingClose(
     phase: 'before-drain' | 'after-drain',
   ): Promise<{ holder: string; retryAt: number } | undefined> {
     if (!this._storage.supportsDispatchRecovery) return undefined;
-    if (phase === 'after-drain') await this._awaitInFlightTurnsSettled();
+    // A write that has not landed is invisible to the scan below: closing now
+    // would let it land pending on a closed session.
+    if (phase === 'after-drain' && !(await this._awaitInFlightTurnsSettled())) {
+      const blocked = { holder: 'in-flight-result-write', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
+      this._orphanRecheckAt = blocked.retryAt;
+      return blocked;
+    }
     const { blockedBy } = await this._recoverOrphanedMessageDispatches();
     if (blockedBy !== undefined) return blockedBy;
     const parkedRunId = this._record.pendingResume?.runId;
@@ -3609,23 +3616,46 @@ export class Session {
     return undefined;
   }
 
-  private async _awaitInFlightTurnsSettled(): Promise<void> {
+  /** Whether no result write is still in flight once the bounded wait ends. */
+  private async _awaitInFlightTurnsSettled(): Promise<boolean> {
     const pollMs = 25;
-    for (let waited = 0; waited < MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS; waited += pollMs) {
-      if (
-        this._currentTurnAbortController === undefined &&
-        this._backgroundTurnCompletions.size === 0 &&
-        this._messageAdmissionStarts.size === 0 &&
-        this._resultEvidenceWrites.size === 0
-      ) {
-        return;
-      }
+    const deadline = Date.now() + MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS;
+    while (
+      (this._currentTurnAbortController !== undefined ||
+        this._backgroundTurnCompletions.size > 0 ||
+        this._messageAdmissionStarts.size > 0 ||
+        this._resultEvidenceWrites.size > 0) &&
+      Date.now() < deadline
+    ) {
       // Non-streaming turns are not background completions, and an aborted
       // turn's result write is not awaited by the turn: wait on the tracked
-      // work, or poll the turn controller and admission markers.
+      // work or the turn ending, and poll the admission markers.
       const tracked = [...this._backgroundTurnCompletions, ...this._resultEvidenceWrites];
-      await (tracked.length > 0 ? Promise.race([Promise.allSettled(tracked), delay(pollMs)]) : delay(pollMs));
+      const transition = this._nextStateTransition(pollMs);
+      await (tracked.length > 0 ? Promise.race([Promise.allSettled(tracked), transition]) : transition);
     }
+    return this._resultEvidenceWrites.size === 0;
+  }
+
+  /** Resolves at the next idle/drain state transition (a turn ending), or after `timeoutMs`. */
+  private _nextStateTransition(timeoutMs: number): Promise<void> {
+    return new Promise<void>(resolve => {
+      const done = () => {
+        clearTimeout(timer);
+        this._idleWaiters.delete(waiter);
+        resolve();
+      };
+      const waiter: IdleWaiter = {
+        check: () => {
+          done();
+          return true;
+        },
+        reject: done,
+        cleanup: done,
+      };
+      const timer = setTimeout(done, timeoutMs);
+      this._idleWaiters.add(waiter);
+    });
   }
 
   /**
@@ -19921,6 +19951,37 @@ export class Session {
         ...this._record,
         closingAt,
         closeDeadlineAt,
+        tokenUsage: { ...this._tokenUsage },
+        lastActivityAt: Date.now(),
+      };
+      const saved = await this._storage.saveSession(next, {
+        harnessName: this._record.harnessName,
+        ownerId: this._ownerId,
+        ifVersion: this._record.version,
+      });
+      this._record = { ...next, version: saved.version };
+      return this._record;
+    };
+    const next = this._flushChain.then(run, run);
+    this._flushChain = next.then(
+      () => {},
+      () => {},
+    );
+    return next;
+  }
+
+  /**
+   * @internal — used by the Harness when a close is refused over a pending
+   * admission after its marker committed: the marker is cleared under the
+   * same lease and version, so a parked turn stays answerable.
+   */
+  _flushClearClosingMarker(): Promise<SessionRecord> {
+    const run = async (): Promise<SessionRecord> => {
+      if (this._record.closingAt === undefined || this._record.closedAt !== undefined) return this._record;
+      const next: SessionRecord = {
+        ...this._record,
+        closingAt: undefined,
+        closeDeadlineAt: undefined,
         tokenUsage: { ...this._tokenUsage },
         lastActivityAt: Date.now(),
       };

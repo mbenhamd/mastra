@@ -183,6 +183,27 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
       sessionId: closingClaimed.id,
       ownerId: 'owner-closing',
     });
+    // Nor is a closing session whose turn is parked for a response that has
+    // not expired: its close is refused until then.
+    const closingParked = await createSession(harness(), 'closing-parked', 'owner-parked', {
+      closingAt: Date.now(),
+      closeDeadlineAt: Date.now() + 60_000,
+      pendingResume: {
+        kind: 'tool-approval',
+        itemId: 'approval-parked',
+        runId: 'run-closing-parked',
+        toolCallId: 'tool-call-parked',
+        source: 'parent',
+        requestedAt: Date.now(),
+        expiresAt: Date.now() + 60 * 60_000,
+      },
+    });
+    await harness().writeMessageResultEvidence(pendingMessage(closingParked, 'closing-parked'));
+    await harness().releaseSessionLease({
+      harnessName: HARNESS,
+      sessionId: closingParked.id,
+      ownerId: 'owner-parked',
+    });
 
     const realNow = Date.now();
     const listed = (now: number) =>
@@ -315,20 +336,34 @@ describe('HarnessPG orphaned-dispatch recovery', () => {
     const expired = await stamp('expired', Date.now() - 1_000);
     const live = await stamp('live', Date.now() + 60_000);
     // Recovery's fallback settlement never lands over a pending terminal
-    // admission, even when the dispatch it expects still matches.
-    await expect(
-      harness().compareAndSwapSignalTerminal({
-        ...scope,
-        signalId: live.evidence.signalId,
-        admissionId: live.evidence.admissionId!,
-        admissionHash: live.evidence.admissionHash!,
-        operationKind: 'message',
-        expected: live.dispatch,
-        leaseOwner: { ownerId: 'owner-dead' },
-        terminal: { status: 'failed', signalId: live.evidence.signalId, error: INTERRUPTED },
-        updatedAt: Date.now(),
-      }),
-    ).resolves.toMatchObject({ applied: false });
+    // admission, even when the dispatch it expects still matches — nor from
+    // a store sharing the schema that does not admit terminal handoffs.
+    const plainStore = new PostgresStore({
+      ...TEST_CONFIG,
+      id: 'pg-harness-dispatch-recovery-plain-store',
+      schemaName,
+      enabledDomains: ['harness'],
+    });
+    try {
+      await plainStore.init();
+      for (const candidate of [harness(), plainStore.stores.harness!]) {
+        await expect(
+          candidate.compareAndSwapSignalTerminal({
+            ...scope,
+            signalId: live.evidence.signalId,
+            admissionId: live.evidence.admissionId!,
+            admissionHash: live.evidence.admissionHash!,
+            operationKind: 'message',
+            expected: live.dispatch,
+            leaseOwner: { ownerId: 'owner-dead' },
+            terminal: { status: 'failed', signalId: live.evidence.signalId, error: INTERRUPTED },
+            updatedAt: Date.now(),
+          }),
+        ).resolves.toMatchObject({ applied: false });
+      }
+    } finally {
+      await plainStore.close();
+    }
 
     const claims = (now: number) =>
       harness()

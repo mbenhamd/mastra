@@ -408,17 +408,24 @@ export class InMemoryHarness extends HarnessStorage {
       const pendingMessageAdmission = admissions.some(
         admission => admission.evidence.status !== 'pending' || admission.dispatchClaim !== 'live',
       );
-      // A close is refused while any of its turns is still claimed, and
-      // `harness.session()` rejects a closing session: nothing can advance it.
-      if (record.closingAt !== undefined && admissions.some(admission => admission.dispatchClaim === 'live')) {
+      const pendingResume = record.pendingResume;
+      const pendingResumeDue = isDueScannablePendingResume(pendingResume) && pendingResumeDueAt(pendingResume) <= now;
+      // A close is refused while any of its turns is still claimed, or parked
+      // behind an interaction that has not expired, and `harness.session()`
+      // rejects a closing session: nothing can advance it.
+      if (
+        record.closingAt !== undefined &&
+        (admissions.some(admission => admission.dispatchClaim === 'live') ||
+          (pendingResume !== undefined &&
+            !pendingResumeDue &&
+            this.recoverableMessageAdmissions(namespace, record, now, true).some(
+              admission => admission.evidence.status === 'pending' && admission.evidence.runId === pendingResume.runId,
+            )))
+      ) {
         continue;
       }
       // A queue parked behind an interaction that has not expired cannot drain.
-      const pendingResume = record.pendingResume;
-      const pendingQueue =
-        record.pendingQueue.length > 0 &&
-        (pendingResume === undefined ||
-          (isDueScannablePendingResume(pendingResume) && pendingResumeDueAt(pendingResume) <= now));
+      const pendingQueue = record.pendingQueue.length > 0 && (pendingResume === undefined || pendingResumeDue);
       const closing = record.closingAt !== undefined;
       if (!pendingMessageAdmission && !pendingQueue && !closing) continue;
       recoverable.push({
