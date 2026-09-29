@@ -549,35 +549,25 @@ describe('Session adoption — orphaned message dispatch', () => {
     },
   );
 
-  it('records a finished turn’s own result when its result write failed, then closes', async () => {
+  it('refuses to close over a finished turn whose result write failed', async () => {
     const db = new InMemoryDB();
-    const agent = new MockAgent({ id: 'default', defaultOutput: { text: 'the real answer' } });
+    const agent = new MockAgent({ id: 'default' });
     const owner = harnessProcess(db, agent, false);
     const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
     const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
-    let resultWriteFailed = false;
     owner.storage.writeMessageResultEvidence = async record => {
-      if (record.status === 'completed' && !resultWriteFailed) {
-        resultWriteFailed = true;
-        throw new Error('transient completed result write failure');
-      }
+      if (record.status === 'completed') throw new Error('completed result write failed');
       return write(record);
     };
     try {
       await expect(session.message({ content: 'hi', admissionId: 'finished-turn' })).rejects.toThrow();
-      const [finished] = (await owner.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 }))
-        .items;
 
-      // The run finished here: close records its real result from this
-      // process instead of refusing or interrupting it.
-      await owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
-
-      await expect(
-        owner.storage.loadMessageResultEvidence({ ...scope, signalId: finished!.evidence.signalId }),
-      ).resolves.toMatchObject({ status: 'completed', result: { text: 'the real answer' } });
-      expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeDefined();
-      expect(agent.streamCalls).toHaveLength(1);
+      // The run finished here, but its admission is still pending: closing
+      // now would hide it from every later recovery.
+      await expect(owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' })).rejects.toBeInstanceOf(
+        HarnessSessionLockedError,
+      );
+      expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeUndefined();
     } finally {
       await owner.harness.shutdown().catch(() => {});
     }

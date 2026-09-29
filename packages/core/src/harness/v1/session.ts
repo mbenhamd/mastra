@@ -3571,7 +3571,6 @@ export class Session {
   }> {
     if (!this._storage.supportsDispatchRecovery) return {};
     const orphaned: AgentSignalResultEvidence[] = [];
-    const finished: AgentSignalResultEvidence[] = [];
     const unpublished: AgentSignalResultEvidence[] = [];
     let blockedBy: { holder: string; retryAt: number } | undefined;
     const block = (holder: string, retryAt: number) => {
@@ -3599,7 +3598,7 @@ export class Session {
         if (state === 'claimed' && evidence.dispatch?.state === 'dispatching') {
           block(evidence.dispatch.attemptId, evidence.dispatch.claimExpiresAt);
         }
-        if (state === 'finished') finished.push(evidence);
+        if (state === 'finished') block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
       }
       cursor = page.nextCursor;
     } while (cursor !== undefined);
@@ -3625,11 +3624,6 @@ export class Session {
         block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
       }
     }
-    for (const evidence of finished) {
-      if (!(await this._recordFinishedRunResult(evidence))) {
-        block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
-      }
-    }
     for (const evidence of unpublished) {
       await this._publishInterruptedRunCompletion(evidence);
     }
@@ -3641,8 +3635,8 @@ export class Session {
    * `active`: a run for it is in flight in this process (close drains it and
    * its own abort settles the turn), it awaits a response, or the row is
    * malformed — left alone. `finished`: its run finished here but the result
-   * was never recorded — never interrupted; recovery records the result from
-   * this process's cache (and a close blocks until it is recorded). `claimed`: another
+   * was never recorded — never interrupted (a same-admission retry completes
+   * it from this process's cache), but it blocks a close. `claimed`: another
    * process's dispatch claim is still live — left alone until it expires.
    * `orphaned`: interrupt it.
    */
@@ -3676,68 +3670,6 @@ export class Session {
     if (agent?.getRunOutput(runId)) return 'active';
     if (this._completedRuns.has(runId)) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
-  }
-
-  /**
-   * Record the result of a turn whose run finished in this process but whose
-   * result write failed, from the run cached here — the output the
-   * same-admission retry path records — never as interrupted. The write is
-   * the recovery settlement: fenced on the dispatch recovery observed and on
-   * this lease (judged by the adapter when it commits). Its completion is then
-   * published at least once, acknowledged by the run summary. Returns false
-   * when it stays pending: nothing terminal is cached, the turn is owned by a
-   * native terminal admission (only its finalizer may commit that result,
-   * together with its projection and delivery intent), or the write lost.
-   */
-  private async _recordFinishedRunResult(evidence: AgentSignalResultEvidence): Promise<boolean> {
-    const runId = evidence.runId!;
-    const cached = this._completedRuns.get(runId);
-    if (cached === undefined) return false;
-    if (cached.ok ? cached.full.finishReason === 'suspended' : !this._shouldWriteTurnFailureEvidence(cached.err)) {
-      return false;
-    }
-    const sessionIncarnation = this._record.sessionIncarnation;
-    if (
-      this._storage.supportsTerminalHandoff &&
-      sessionIncarnation !== undefined &&
-      (await this._storage.loadTerminalAdmissionByRun({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        runId,
-        sessionIncarnation,
-      })) !== null
-    ) {
-      return false;
-    }
-    const identity = {
-      signalId: evidence.signalId,
-      runId,
-      ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
-      ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
-    };
-    const swapped = await this._storage.compareAndSwapSignalTerminal({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: evidence.signalId,
-      admissionId: evidence.admissionId!,
-      admissionHash: evidence.admissionHash!,
-      operationKind: 'message',
-      expected: evidence.dispatch ?? { state: 'reserved' },
-      leaseOwner: { ownerId: this._harness.ownerId },
-      terminal: cached.ok
-        ? { status: 'completed', ...identity, result: cached.full }
-        : { status: 'failed', ...identity, error: projectHarnessPublicError(cached.err) },
-      updatedAt: Date.now(),
-    });
-    if (!swapped.applied) return swapped.evidence.status !== 'pending';
-    await this._publishRunCompletion(
-      evidence,
-      cached.ok ? this._agentEndReasonForFullOutput(cached.full) : 'error',
-      this._runUsage(cached.ok ? cached.full : undefined),
-    );
-    return true;
   }
 
   /** A dispatch claim this process stamped may still be dispatched on (fresh clock). */
@@ -3794,19 +3726,6 @@ export class Session {
    * recovery, so the next recovery publishes again.
    */
   private async _publishInterruptedRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
-    await this._publishRunCompletion(evidence, 'aborted', this._runUsage());
-  }
-
-  /**
-   * Publish a recovered turn's completion at least once: `agent_end` and the
-   * `run_completed` it finalizes, acknowledged by the durable run summary.
-   * Nothing is emitted when a summary already exists.
-   */
-  private async _publishRunCompletion(
-    evidence: AgentSignalResultEvidence,
-    finishReason: string,
-    usage: TokenUsage,
-  ): Promise<void> {
     const runId = evidence.runId!;
     const summary = { harnessName: this._record.harnessName, runId };
     if ((await this._storage.loadRunSummary(summary)) !== null) return;
@@ -3826,13 +3745,13 @@ export class Session {
     // An earlier attempt on this session may have emitted it but failed to
     // persist the summary; finalize again so persistence is retried.
     this._finalizedRunIds.delete(runId);
-    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
+    this._emitTurnEvent({ type: 'agent_end', runId, finishReason: 'aborted', usage: this._runUsage() });
     await this._runSummaryPersistence;
     if ((await this._storage.loadRunSummary(summary)) === null) {
       throw new HarnessStorageError({
         operation: 'message_log',
         sessionId: this.id,
-        cause: new Error(`recovered run "${runId}" completion was not acknowledged by its run summary`),
+        cause: new Error(`interrupted run "${runId}" completion was not acknowledged by its run summary`),
       });
     }
   }
