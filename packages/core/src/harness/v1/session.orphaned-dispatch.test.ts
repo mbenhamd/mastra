@@ -59,6 +59,7 @@ function harnessProcess(
   agent: MockAgent,
   terminal: boolean,
   terminalFinalizer: HarnessTerminalFinalizer = finalizer,
+  closeTimeoutMs?: number,
 ) {
   const storage = new InMemoryHarness({
     db,
@@ -68,7 +69,11 @@ function harnessProcess(
     agents: { default: agent } as any,
     modes: [{ id: 'default', agentId: 'default' }],
     defaultModeId: 'default',
-    sessions: { storage, ...(terminal ? { terminalHandoff: { finalizer: terminalFinalizer } } : {}) },
+    sessions: {
+      storage,
+      ...(closeTimeoutMs !== undefined ? { closeTimeoutMs } : {}),
+      ...(terminal ? { terminalHandoff: { finalizer: terminalFinalizer } } : {}),
+    },
   });
   return { harness, storage };
 }
@@ -549,29 +554,117 @@ describe('Session adoption — orphaned message dispatch', () => {
     },
   );
 
-  it('refuses to close over a finished turn whose result write failed', async () => {
-    const db = new InMemoryDB();
-    const agent = new MockAgent({ id: 'default' });
-    const owner = harnessProcess(db, agent, false);
-    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
-    owner.storage.writeMessageResultEvidence = async record => {
-      if (record.status === 'completed') throw new Error('completed result write failed');
-      return write(record);
-    };
-    try {
-      await expect(session.message({ content: 'hi', admissionId: 'finished-turn' })).rejects.toThrow();
+  it.each(['before the close', 'during the close drain'] as const)(
+    'refuses to close over a turn that finished %s but whose result write failed',
+    async finishes => {
+      const db = new InMemoryDB();
+      const agent = new MockAgent({ id: 'default' });
+      let finishRun!: () => void;
+      if (finishes === 'during the close drain') {
+        agent.enqueueRun({ holdUntil: new Promise<void>(resolve => (finishRun = resolve)) });
+      }
+      const owner = harnessProcess(db, agent, false);
+      const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+      const write = owner.storage.writeMessageResultEvidence.bind(owner.storage);
+      owner.storage.writeMessageResultEvidence = async record => {
+        if (record.status === 'completed') throw new Error('completed result write failed');
+        return write(record);
+      };
+      const target = { sessionId: session.id, resourceId: 'u1' };
+      try {
+        const turn = session.message({ content: 'hi', admissionId: 'finished-turn' });
+        void turn.catch(() => {});
+        let close: Promise<void>;
+        if (finishes === 'before the close') {
+          await expect(turn).rejects.toThrow();
+          close = owner.harness.closeSession(target);
+        } else {
+          // The run is still in flight when close starts, and finishes while
+          // close drains it.
+          await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
+          close = owner.harness.closeSession(target);
+          await vi.waitFor(() => expect(session.isClosing).toBe(true));
+          finishRun();
+          await expect(turn).rejects.toThrow();
+        }
 
-      // The run finished here, but its admission is still pending: closing
-      // now would hide it from every later recovery.
-      await expect(owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' })).rejects.toBeInstanceOf(
-        HarnessSessionLockedError,
-      );
-      expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeUndefined();
-    } finally {
-      await owner.harness.shutdown().catch(() => {});
-    }
-  });
+        // The run finished here, but its admission is still pending: closing
+        // now would hide it from every later recovery.
+        await expect(close).rejects.toBeInstanceOf(HarnessSessionLockedError);
+        expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeUndefined();
+        const pending = await owner.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
+        expect(pending.items).toMatchObject([{ evidence: { status: 'pending' } }]);
+      } finally {
+        await owner.harness.shutdown().catch(() => {});
+      }
+    },
+  );
+
+  it.each([plainAdmittedMessage, terminalHandoffMessage])(
+    'still closes after aborting an in-flight turn at the close deadline: $name',
+    async shape => {
+      const db = new InMemoryDB();
+      const agent = new MockAgent({ id: 'default' });
+      agent.enqueueRun({ holdUntil: new Promise<void>(() => {}) });
+      const owner = harnessProcess(db, agent, shape.terminal, finalizer, 100);
+      const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      try {
+        const turn = session.message({ ...shape.message, stream: true } as never);
+        void turn.catch(() => {});
+        await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
+
+        // The aborted turn records its own result; close does not refuse it.
+        await owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
+        expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeDefined();
+      } finally {
+        await owner.harness.shutdown().catch(() => {});
+      }
+    },
+  );
+
+  it.each([plainAdmittedMessage, terminalHandoffMessage])(
+    'refuses to close over a turn whose claim acknowledgement arrives after close started: $name',
+    async shape => {
+      const db = new InMemoryDB();
+      const ownerAgent = new MockAgent({ id: 'default' });
+      const owner = harnessProcess(db, ownerAgent, shape.terminal);
+      const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const scope = { harnessName: 'default', sessionId: session.id, resourceId: 'u1', threadId: session.threadId };
+      let stalled!: () => void;
+      const claimCommitted = new Promise<void>(resolve => (stalled = resolve));
+      let resume!: () => void;
+      const resumed = new Promise<void>(resolve => (resume = resolve));
+      const claim = owner.storage.compareAndSwapSignalDispatch.bind(owner.storage);
+      owner.storage.compareAndSwapSignalDispatch = async input => {
+        const claimed = await claim(input);
+        if (input.next.state === 'dispatching') {
+          stalled();
+          await resumed;
+        }
+        return claimed;
+      };
+      try {
+        const turn = session.message({ ...shape.message, stream: true } as never);
+        void turn.catch(() => {});
+        await claimCommitted;
+        const close = owner.harness.closeSession({ sessionId: session.id, resourceId: 'u1' });
+        void close.catch(() => {});
+        await vi.waitFor(() => expect(session.isClosing).toBe(true));
+        resume();
+
+        await expect(turn).rejects.toThrow();
+        expect(ownerAgent.streamCalls).toHaveLength(0);
+        await expect(close).rejects.toBeInstanceOf(HarnessSessionLockedError);
+        expect((await owner.storage.loadSession({ sessionId: session.id }))?.closedAt).toBeUndefined();
+        const pending = await owner.storage.listPendingMessageAdmissions({ ...scope, now: Date.now(), limit: 10 });
+        expect(pending.items).toMatchObject([{ evidence: { status: 'pending' } }]);
+      } finally {
+        resume();
+        await owner.harness.shutdown().catch(() => {});
+      }
+    },
+  );
 
   it('does not commit an interruption after its lease expired while the finalizer ran', async () => {
     const db = new InMemoryDB();

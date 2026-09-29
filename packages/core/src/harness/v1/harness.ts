@@ -5766,6 +5766,15 @@ export class Harness {
       }
 
       await this._drainCloseTree(tree, subtreeCloseDeadlineAt);
+      // The drain can leave admitted turns pending (a starter that failed
+      // closed on a lapsed claim, a run whose result write failed). Re-check
+      // before `closedAt`: a closed session is never recovered again.
+      for (const node of tree) {
+        const blocked = await node.live?._pendingAdmissionBlockingClose();
+        if (blocked !== undefined) {
+          throw new HarnessSessionLockedError(node.record.id, blocked.holder, blocked.retryAt);
+        }
+      }
       await this._terminalizeCloseTree(storage, tree, closedLiveSessions);
     } catch (err) {
       await this._releaseCloseTreeLeases(storage, tree);

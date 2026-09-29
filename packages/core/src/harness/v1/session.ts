@@ -3556,6 +3556,57 @@ export class Session {
   }
 
   /**
+   * @internal — the check a close runs after its drain, before `closedAt` is
+   * persisted. Admissions can still be pending once the drain is done (a
+   * starter that failed closed on a lapsed claim, a run whose result write
+   * failed during the drain), and a closed session is never recovered again.
+   * In-flight turns get a bounded chance to settle first; recovery then
+   * settles what it can, and a re-read returns what still blocks — any
+   * admitted turn still pending other than a response-parked one — and
+   * leaves recovery due.
+   */
+  async _pendingAdmissionBlockingClose(): Promise<{ holder: string; retryAt: number } | undefined> {
+    if (!this._storage.supportsDispatchRecovery) return undefined;
+    // A drain that reached its deadline aborted its in-flight turns and did
+    // not wait for them; give them a bounded chance to record their own
+    // result before judging what is still pending.
+    await this._awaitInFlightTurnsSettled();
+    const { blockedBy } = await this._recoverOrphanedMessageDispatches();
+    if (blockedBy !== undefined) return blockedBy;
+    const page = await this._storage.listPendingMessageAdmissions({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      now: Date.now(),
+      limit: 1,
+    });
+    const pending = page.items.find(admission => admission.evidence.status === 'pending');
+    if (pending === undefined) return undefined;
+    const claim = pending.evidence.dispatch;
+    const blocked =
+      claim?.state === 'dispatching' && pending.dispatchClaim === 'live'
+        ? { holder: claim.attemptId, retryAt: claim.claimExpiresAt }
+        : { holder: 'pending-admission', retryAt: Date.now() + ORPHANED_DISPATCH_RETRY_MS };
+    this._orphanRecheckAt = blocked.retryAt;
+    return blocked;
+  }
+
+  private async _awaitInFlightTurnsSettled(): Promise<void> {
+    const pollMs = 25;
+    for (let waited = 0; waited < MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS; waited += pollMs) {
+      if (
+        this._currentTurnAbortController === undefined &&
+        this._backgroundTurnCompletions.size === 0 &&
+        this._messageAdmissionStarts.size === 0
+      ) {
+        return;
+      }
+      await Promise.race([Promise.allSettled(Array.from(this._backgroundTurnCompletions)), delay(pollMs)]);
+    }
+  }
+
+  /**
    * @internal — re-run recovery on a resolved live session once a turn it had
    * to leave (a claim that has since expired, or a settlement that did not
    * commit) is due. A failure keeps it due, so the next resolution retries.
