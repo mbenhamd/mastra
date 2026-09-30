@@ -1,6 +1,13 @@
 import type { ToolSet } from '@internal/ai-sdk-v5';
 import type { ToolPermissionPolicy } from '../../../agent/tool-permission-prefilter';
+import type { IMastraLogger } from '../../../logger';
+import type { RequestContext } from '../../../request-context';
 import type { RequireToolApproval } from '../../../tools';
+import { resolveToolApprovalRequirement } from '../../../tools/approval';
+import type { ResolvedToolApproval } from '../../../tools/approval';
+import { findProviderToolByName } from '../../../tools/provider-tool-utils';
+import { getNeedsApprovalFn } from '../../../tools/toolchecks';
+import type { ToolApprovalContext } from '../../../tools/types';
 import type { ToolCallConcurrency, ToolCallConcurrencyStrategy } from '../../types';
 
 export type ToolCallForeachOptions = {
@@ -41,6 +48,7 @@ export function effectiveToolSetRequiresSequentialExecution({
   permissionPolicy,
   strategy = 'available',
   calledToolNames,
+  dynamicApprovalEvaluated = false,
 }: {
   // A function-valued global approval policy is evaluated per call at execution time;
   // before args are known we conservatively treat it like `true` and force sequential
@@ -54,8 +62,12 @@ export function effectiveToolSetRequiresSequentialExecution({
   // `'called'` strategy; when omitted there, nothing forces sequential (a batch
   // that called no suspend/approval tool cannot suspend this step).
   calledToolNames?: readonly string[];
+  // Set when the caller evaluates function approval policies per emitted call itself.
+  // Function-valued policies (run-wide or a tool's `needsApprovalFn`) are then skipped here;
+  // static approval flags and suspend schemas still apply.
+  dynamicApprovalEvaluated?: boolean;
 }): boolean {
-  if (requireToolApproval) {
+  if (requireToolApproval === true || (requireToolApproval && !dynamicApprovalEvaluated)) {
     return true;
   }
 
@@ -95,9 +107,16 @@ export function effectiveToolSetRequiresSequentialExecution({
       needsApproval?: unknown;
       needsApprovalFn?: unknown;
     };
-    return Boolean(
-      maybeTool.hasSuspendSchema || maybeTool.requireApproval || maybeTool.needsApproval || maybeTool.needsApprovalFn,
-    );
+    if (maybeTool.hasSuspendSchema) {
+      return true;
+    }
+    // Function-valued policies the caller already evaluated per emitted call
+    // (with the call's actual arguments) do not force sequential execution
+    // here; their verdicts are applied at the tool-call step instead.
+    if (dynamicApprovalEvaluated && getNeedsApprovalFn(tool)) {
+      return false;
+    }
+    return Boolean(maybeTool.requireApproval || maybeTool.needsApproval || maybeTool.needsApprovalFn);
   });
 }
 
@@ -180,4 +199,105 @@ export function resolveCalledBatchToolCallConcurrency({
     permissionPolicy,
     configuredConcurrency,
   });
+}
+
+/**
+ * Resolves concurrency for a step once the model's tool calls are known.
+ *
+ * Each called tool's approval policy is evaluated with the call's actual arguments (the same rule
+ * the tool-call step applies), so a function policy that returns `false` does not force sequential
+ * execution. Called tools with a suspend schema, or whose policy requires approval for this call,
+ * still force sequential execution. Under `'available'`, any active tool with a static approval
+ * flag or suspend schema also forces sequential execution, as before.
+ */
+export async function resolveEmittedToolCallConcurrency({
+  toolCalls,
+  approvalVerdicts,
+  approvalRequirements,
+  requestContext,
+  workspace,
+  logger,
+  ...args
+}: Parameters<typeof resolveToolCallConcurrency>[0] & {
+  toolCalls: readonly { toolCallId?: string; toolName: string; args?: unknown }[];
+  approvalVerdicts?: Map<string, boolean>;
+  /**
+   * Fork: the full `{ required, reasons }` requirement per emitted call, so the
+   * tool-call step can reuse both the verdict and its reasons without evaluating
+   * a (possibly stateful) approval policy a second time.
+   */
+  approvalRequirements?: Map<string, ResolvedToolApproval>;
+  requestContext?: RequestContext;
+  workspace?: ToolApprovalContext['workspace'];
+  logger?: IMastraLogger;
+}): Promise<number> {
+  // Under 'available', static approval flags and suspend schemas on any active tool still
+  // force sequential execution; only function policies are resolved per emitted call below.
+  if (
+    args.strategy !== 'called' &&
+    effectiveToolSetRequiresSequentialExecution({ ...args, dynamicApprovalEvaluated: true })
+  ) {
+    return 1;
+  }
+
+  // The Harness permission resolver's `ask` makes the whole batch sequential so a
+  // sibling side effect cannot start before the approval suspends. It is checked per
+  // emitted call under every strategy (the `'available'` scan above also covers
+  // uncalled active tools) and fails closed when the resolver throws. The verdict is
+  // deliberately NOT cached with the approval verdicts below: the tool-call step
+  // re-applies the policy itself so a per-turn yolo can still clear it.
+  let permissionAsk = false;
+  if (args.permissionPolicy) {
+    for (const toolCall of toolCalls) {
+      try {
+        if (args.permissionPolicy(toolCall.toolName) === 'ask') permissionAsk = true;
+      } catch {
+        permissionAsk = true;
+      }
+    }
+  }
+
+  const verdicts = await Promise.all(
+    toolCalls.map(async toolCall => {
+      // Mirror the tool-call step's lookup (key, provider name, then tool id).
+      const tool =
+        args.tools?.[toolCall.toolName] ||
+        findProviderToolByName(args.tools, toolCall.toolName) ||
+        Object.values(args.tools || {}).find(t => 'id' in t && t.id === toolCall.toolName);
+      if (!tool) {
+        return true;
+      }
+      if ((tool as { hasSuspendSchema?: unknown }).hasSuspendSchema) {
+        return true;
+      }
+      // Same argument view the tool-call step evaluates: model-authored resume
+      // control fields are stripped before any policy sees the call.
+      const toolArgs =
+        typeof toolCall.args === 'object' && toolCall.args !== null
+          ? (({
+              resumeData: _resumeData,
+              suspendedToolCallId: _suspendedToolCallId,
+              suspendedToolRunId: _suspendedToolRunId,
+              ...rest
+            }) => rest)(toolCall.args as Record<string, unknown>)
+          : (toolCall.args as Record<string, unknown> | undefined);
+      const requirement = await resolveToolApprovalRequirement({
+        tool,
+        args: toolArgs,
+        requireToolApproval: args.requireToolApproval,
+        requestContext,
+        workspace: workspace as object | undefined,
+        logger,
+        toolName: toolCall.toolName,
+      });
+      const verdict = requirement.required;
+      if (toolCall.toolCallId) {
+        approvalVerdicts?.set(toolCall.toolCallId, verdict);
+        approvalRequirements?.set(toolCall.toolCallId, requirement);
+      }
+      return verdict;
+    }),
+  );
+
+  return permissionAsk || verdicts.some(Boolean) ? 1 : args.configuredConcurrency;
 }

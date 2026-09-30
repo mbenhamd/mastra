@@ -1,8 +1,38 @@
 import { parseMemoryRequestContext } from '@mastra/core/memory';
+import { toStandardSchema } from '@mastra/core/schema';
+import type { PublicSchema } from '@mastra/core/schema';
+import { standardSchemaToJSONSchema } from '@mastra/schema-compat/schema';
 import { z } from 'zod';
 
+import { resolveNullableBranch, stripNullsFromOptional } from '../../tools/working-memory';
 import { Extractor } from './extractor';
 import type { ExtractorRuntimeContext } from './extractor';
+
+/**
+ * The structured-output schema for this extractor stays generic because every structured extractor shares one
+ * response object: a strict working-memory schema there would make one invalid document fail every sibling
+ * extractor. The configured schema is enforced here instead, with its own validator, before anything is stored.
+ * Like the working memory tool, nulls in optional fields are treated as "not provided" rather than as invalid.
+ */
+async function validateAgainstConfiguredSchema(
+  schema: PublicSchema,
+  value: unknown,
+): Promise<{ value: unknown; jsonSchema: Record<string, unknown> }> {
+  const standardSchema = toStandardSchema(schema);
+  const jsonSchema = standardSchemaToJSONSchema(standardSchema, { io: 'input' }) as Record<string, unknown>;
+  const result = await standardSchema['~standard'].validate(stripNullsFromOptional(value, jsonSchema));
+  if (!result.issues) {
+    return { value: result.value, jsonSchema };
+  }
+
+  const details = result.issues
+    .map(issue => {
+      const path = issue.path?.map(segment => String(typeof segment === 'object' ? segment.key : segment)).join('.');
+      return path ? `${path}: ${issue.message}` : issue.message;
+    })
+    .join('; ');
+  throw new Error(`Working memory update does not match the configured schema, so it was not saved: ${details}`);
+}
 
 async function getWorkingMemoryDetails(context: ExtractorRuntimeContext): Promise<{
   template?: string;
@@ -46,25 +76,51 @@ function isZodLikeSchema(value: unknown): value is z.ZodType<Record<string, unkn
   );
 }
 
+function isFactlessValue(value: unknown): boolean {
+  return (
+    value === null ||
+    value === undefined ||
+    (typeof value === 'string' && !value.trim()) ||
+    (Array.isArray(value) && value.length === 0)
+  );
+}
+
 /**
- * Strip null, empty-string, empty-array, and empty-object members recursively.
- * Schema-required-but-nullable fields make provider constrained decoding emit
- * every key; the stored document should only carry the keys with facts.
+ * Drop factless members of schema-REQUIRED declared properties, recursively.
+ * Required-but-nullable schema fields make provider constrained decoding emit
+ * every key, so a null, blank string, or empty array there means "no fact";
+ * the stored document should only carry the keys with facts. Optional
+ * properties already had their nulls stripped before validation, and
+ * undeclared (record) entries keep every value the schema allowed, including
+ * null.
  */
-function pruneEmptyDeep(value: unknown): unknown {
-  if (value === null || value === undefined) return undefined;
-  if (typeof value === 'string') return value.trim() ? value : undefined;
+function pruneFactlessRequired(value: unknown, rawSchema: Record<string, unknown>): unknown {
+  const schema = resolveNullableBranch(value, rawSchema);
+
   if (Array.isArray(value)) {
-    const pruned = value.map(pruneEmptyDeep).filter(entry => entry !== undefined);
-    return pruned.length > 0 ? pruned : undefined;
+    const itemSchema = (schema.items as Record<string, unknown>) ?? {};
+    return value.map(item => pruneFactlessRequired(item, itemSchema));
   }
-  if (typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .map(([key, entry]) => [key, pruneEmptyDeep(entry)] as const)
-      .filter(([, entry]) => entry !== undefined);
-    return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+
+  if (typeof value !== 'object' || value === null) {
+    return value;
   }
-  return value;
+
+  const properties = (schema.properties as Record<string, Record<string, unknown>>) ?? {};
+  const required = (schema.required as string[]) ?? [];
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!Object.hasOwn(properties, key)) {
+      result[key] = entry;
+      continue;
+    }
+    const pruned = pruneFactlessRequired(entry, properties[key]!);
+    if (required.includes(key) && isFactlessValue(pruned)) {
+      continue;
+    }
+    result[key] = pruned;
+  }
+  return result;
 }
 
 function buildWorkingMemoryInstructions(details: Awaited<ReturnType<typeof getWorkingMemoryDetails>>): string {
@@ -113,32 +169,54 @@ export class WorkingMemoryExtractor extends Extractor<string | Record<string, un
         // output) only emit properties the schema declares, so a
         // properties-less record schema decodes as {} and durable facts are
         // silently dropped. Null stays the no-update sentinel.
+        // All structured extractors share one response object, so an invalid
+        // working-memory document must not fail the shared parse and drop
+        // sibling extractors: `catch` keeps the configured JSON Schema for
+        // decoding but passes the raw document through, and `onExtracted`
+        // enforces the configured schema before anything is stored.
         if (isZodLikeSchema(details.configuredSchema)) {
-          return details.configuredSchema.nullable() as z.ZodType<Record<string, unknown> | null>;
+          // `ctx` is undefined only when zod probes the catch value for JSON Schema `default`;
+          // returning undefined there keeps the emitted decoding schema free of a default.
+          return details.configuredSchema
+            .nullable()
+            .catch(ctx => (ctx === undefined ? undefined : ctx.input) as Record<string, unknown> | null);
         }
         return z.union([z.record(z.string(), z.unknown()), z.null()]);
       },
       onExtracted: async ({ current, memory, threadId, resourceId, requestContext, observationalMemoryRecordId }) => {
         const memoryConfig = parseMemoryRequestContext(requestContext)?.memoryConfig;
         const config = memory!.getMergedThreadConfig(memoryConfig ?? {});
-        const isSchemaWorkingMemory = Boolean(config.workingMemory?.schema);
+        const configuredSchema = config.workingMemory?.schema;
 
-        if (isSchemaWorkingMemory && current === null) {
-          return undefined;
+        let document: unknown = current;
+        let configuredJsonSchema: Record<string, unknown> | undefined;
+        if (configuredSchema) {
+          if (current === null) {
+            return undefined;
+          }
+          ({ value: document, jsonSchema: configuredJsonSchema } = await validateAgainstConfiguredSchema(
+            configuredSchema,
+            current,
+          ));
         }
 
         let workingMemory: string;
-        if (isSchemaWorkingMemory && typeof current === 'object') {
+        if (configuredJsonSchema && typeof document === 'object' && document !== null) {
           // Required-but-nullable schema fields force constrained decoding to
           // emit every key; persist only the keys that carry facts, and never
           // overwrite the stored document with a factless one.
-          const pruned = pruneEmptyDeep(current);
-          if (pruned === undefined) {
+          const pruned = pruneFactlessRequired(document, configuredJsonSchema);
+          if (
+            typeof pruned === 'object' &&
+            pruned !== null &&
+            !Array.isArray(pruned) &&
+            Object.keys(pruned).length === 0
+          ) {
             return undefined;
           }
           workingMemory = JSON.stringify(pruned);
         } else {
-          workingMemory = typeof current === 'string' ? current : (JSON.stringify(current) ?? '');
+          workingMemory = typeof document === 'string' ? document : (JSON.stringify(document) ?? '');
         }
         if (!workingMemory.trim()) {
           return undefined;
@@ -152,7 +230,7 @@ export class WorkingMemoryExtractor extends Extractor<string | Record<string, un
           observationalMemoryRecordId,
         });
 
-        return current;
+        return document as Record<string, unknown> | string;
       },
     });
   }

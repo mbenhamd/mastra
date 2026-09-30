@@ -37,6 +37,7 @@ export interface DurableFinishSideEffectsOptions {
 export interface DurableFinishSideEffectsResult {
   messageListState: SerializedMessageListState;
   outputText: string;
+  titleGeneration?: Promise<void>;
 }
 
 function resolveOutputText(messageList: MessageList): string {
@@ -235,6 +236,8 @@ export async function runDurableFinishSideEffects({
           resourceId: durableState.resourceId,
           memoryConfig: durableState.memoryConfig,
         });
+        // Fork: a retried strict terminal flush must not re-create the thread.
+        durableState.threadExists = true;
       }
 
       await (terminalEnvelope
@@ -249,6 +252,8 @@ export async function runDurableFinishSideEffects({
       if (terminalEnvelope) throw error;
     }
   }
+
+  let titleGeneration: Promise<void> | undefined;
 
   // Same exclusions as the persistence block above: an observational-memory run writes no
   // messages here, and titling it would create a thread row holding a title and nothing else.
@@ -267,9 +272,10 @@ export async function runDurableFinishSideEffects({
       tracingContext,
     };
 
-    try {
-      if (registryEntry?.generateThreadTitle) {
-        await registryEntry.generateThreadTitle(titleArgs);
+    const generateThreadTitle = registryEntry?.generateThreadTitle;
+    titleGeneration = (async () => {
+      if (generateThreadTitle) {
+        await generateThreadTitle(titleArgs);
       } else if (mastra) {
         const agent = mastra.getAgentById(initData.agentId);
         const titleMemory = memory ?? (await agent.getMemory({ requestContext: effectiveRequestContext }));
@@ -277,14 +283,15 @@ export async function runDurableFinishSideEffects({
           await generateDurableThreadTitle({ agent, memory: titleMemory, ...titleArgs });
         }
       }
-    } catch (error) {
+    })().catch(error => {
       effectiveLogger.warn('[DurableAgent] Error generating thread title', { runId, error });
-    }
+    });
   }
 
   return {
     messageListState: messageList.serialize(),
     outputText,
+    titleGeneration,
   };
 }
 

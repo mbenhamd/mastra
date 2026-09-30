@@ -8,6 +8,7 @@ import { PosthogExporter } from './tracing';
 // Mock PostHog client
 const mockCapture = vi.fn();
 const mockCaptureExceptionImmediate = vi.fn();
+const mockLegacyCapture = vi.fn();
 const mockShutdown = vi.fn();
 const mockPostHogConstructor = vi.fn();
 
@@ -17,7 +18,8 @@ vi.mock('posthog-node', () => {
       constructor(...args: any[]) {
         mockPostHogConstructor(...args);
       }
-      capture = mockCapture;
+      captureAi = mockCapture;
+      capture = mockLegacyCapture;
       captureExceptionImmediate = mockCaptureExceptionImmediate;
       shutdown = mockShutdown;
     },
@@ -168,6 +170,22 @@ describe('PosthogExporter', () => {
           }),
         }),
       );
+    });
+
+    it('sends events through the dedicated AI capture endpoint, never the analytics endpoint', async () => {
+      exporter = new TestPosthogExporter(validConfig);
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: mockSpan,
+      });
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_ENDED,
+        exportedSpan: mockSpan,
+      });
+
+      expect(mockCapture).toHaveBeenCalledTimes(1);
+      expect(mockLegacyCapture).not.toHaveBeenCalled();
     });
 
     it('should cleanup span from cache after capture', async () => {

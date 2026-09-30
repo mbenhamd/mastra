@@ -512,6 +512,8 @@ describe('agent-controller routes', () => {
 
     it('forwards requestContext to session.respondToToolApproval', async () => {
       const session = await getRouteSession('user-rc');
+      vi.spyOn(session.approval, 'isArmed').mockReturnValue(true);
+      vi.spyOn(session.approval, 'getToolCallId').mockReturnValue('call-1');
       const spy = vi.spyOn(session, 'respondToToolApproval').mockReturnValue(undefined);
       const requestContext = makeRequestContext();
 
@@ -529,6 +531,33 @@ describe('agent-controller routes', () => {
         runId: 'run-1',
         toolCallId: 'call-1',
         decision: 'approve',
+        requestContext,
+      });
+    });
+
+    it('answers an approval with no parked gate through the stored suspended run', async () => {
+      const session = await getRouteSession('user-rc');
+      const gate = vi.spyOn(session, 'respondToToolApproval');
+      const persisted = vi.spyOn(session, 'respondToPersistedToolApproval').mockResolvedValue(undefined);
+      const requestContext = makeRequestContext();
+
+      await AGENT_CONTROLLER_TOOL_APPROVAL_ROUTE.handler({
+        mastra,
+        controllerId: 'code',
+        resourceId: 'user-rc',
+        runId: 'run-restored',
+        toolCallId: 'restored-call',
+        approved: false,
+        requestContext,
+      } as any);
+
+      expect(gate).not.toHaveBeenCalled();
+      // The route forwards the request's mandatory runId so the session can
+      // reject a stale or reused-call-id approval against the exact run.
+      expect(persisted).toHaveBeenCalledWith({
+        runId: 'run-restored',
+        toolCallId: 'restored-call',
+        approved: false,
         requestContext,
       });
     });

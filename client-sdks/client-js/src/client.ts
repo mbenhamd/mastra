@@ -1,82 +1,8 @@
-import type { ListScoresResponse, Trajectory } from '@mastra/core/evals';
-import type { ServerDetailInfo } from '@mastra/core/mcp';
 import type { RequestContext } from '@mastra/core/request-context';
-import type {
-  PaginationInfo,
-  TraceRecord,
-  GetTraceLightResponse,
-  GetSpanResponse,
-  ListTracesArgs,
-  ListTracesResponse,
-  ListTracesLightResponse,
-  TraceQueryRequest,
-  TraceQueryResponse,
-  ListBranchesArgs,
-  ListBranchesResponse,
-  GetBranchArgs,
-  GetBranchResponse,
-  // Logs
-  ListLogsArgs,
-  ListLogsResponse,
-  // Scores (observability)
-  ListScoresArgs,
-  ListScoresResponse as ListScoresResponseNew,
-  CreateScoreBody,
-  CreateScoreResponse,
-  DeleteScoresArgs,
-  DeleteScoresResponse,
-  GetScoreAggregateArgs,
-  GetScoreAggregateResponse,
-  GetScoreBreakdownArgs,
-  GetScoreBreakdownResponse,
-  GetScoreTimeSeriesArgs,
-  GetScoreTimeSeriesResponse,
-  GetScorePercentilesArgs,
-  GetScorePercentilesResponse,
-  // Feedback
-  ListFeedbackArgs,
-  CreateFeedbackBody,
-  CreateFeedbackResponse,
-  DeleteFeedbackArgs,
-  DeleteFeedbackResponse,
-  UpdateFeedbackReviewStatusArgs,
-  FeedbackRecord,
-  GetFeedbackAggregateArgs,
-  GetFeedbackAggregateResponse,
-  GetFeedbackBreakdownArgs,
-  GetFeedbackBreakdownResponse,
-  GetFeedbackTimeSeriesArgs,
-  GetFeedbackTimeSeriesResponse,
-  GetFeedbackPercentilesArgs,
-  GetFeedbackPercentilesResponse,
-  // Metrics OLAP
-  GetMetricAggregateArgs,
-  GetMetricAggregateResponse,
-  GetMetricBreakdownArgs,
-  GetMetricBreakdownResponse,
-  GetMetricTimeSeriesArgs,
-  GetMetricTimeSeriesResponse,
-  GetMetricPercentilesArgs,
-  GetMetricPercentilesResponse,
-  // Discovery
-  GetMetricNamesArgs,
-  GetMetricNamesResponse,
-  GetMetricLabelKeysArgs,
-  GetMetricLabelKeysResponse,
-  GetMetricLabelValuesArgs,
-  GetMetricLabelValuesResponse,
-  GetEntityTypesResponse,
-  GetEntityNamesArgs,
-  GetEntityNamesResponse,
-  GetServiceNamesResponse,
-  GetEnvironmentsResponse,
-  GetTagsArgs,
-  GetTagsResponse,
-} from '@mastra/core/storage';
-import type { WorkflowInfo } from '@mastra/core/workflows';
 import {
   Agent,
   MemoryThread,
+  memoryMessagesQuery,
   Tool,
   Processor,
   Workflow,
@@ -103,10 +29,99 @@ import {
   AgentController,
 } from './resources';
 import type {
-  ListScoresBySpanParams,
-  LegacyTracesPaginatedArg,
   LegacyGetTracesResponse,
+  LegacyTracesPaginatedArg,
+  ListScoresBySpanParams,
+  QueryTraceThreadsInput,
+  QueryTraceThreadsResult,
+  QueryTracesGroupedInput,
+  QueryTracesInput,
+  QueryTracesDeltaInput,
+  QueryTracesKeysetInput,
+  QueryTracesPaginatedInput,
 } from './resources/observability';
+import type {
+  TraceRecord,
+  GetTraceLightResponse,
+  GetSpanResponse,
+  ListTracesArgs,
+  ListTracesResponse,
+  ListTracesLightResponse,
+  TraceQueryGroupResponse,
+  TraceQueryKeysetTraceResponse,
+  TraceQueryResponse,
+  GetTraceQueryFieldsArgs,
+  GetTraceQueryFieldsResponse,
+  GetTraceQueryValuesArgs,
+  GetTraceQueryValuesResponse,
+  ListBranchesArgs,
+  ListBranchesResponse,
+  GetBranchArgs,
+  GetBranchResponse,
+  SpanIds,
+  PaginationArgs,
+  SpanRecord,
+  PaginationInfo,
+  ScoreTracesRequest,
+  ScoreTracesResponse,
+  DeleteTracesRequest,
+  DeleteTracesResponse,
+  ListScoresResponse,
+  Trajectory,
+  ListLogsArgs,
+  ListLogsResponse,
+  ListScoresArgs,
+  ListScoresResponseNew,
+  CreateScoreBody,
+  CreateScoreResponse,
+  DeleteScoresArgs,
+  DeleteScoresResponse,
+  GetScoreAggregateArgs,
+  GetScoreAggregateResponse,
+  GetScoreBreakdownArgs,
+  GetScoreBreakdownResponse,
+  GetScoreTimeSeriesArgs,
+  GetScoreTimeSeriesResponse,
+  GetScorePercentilesArgs,
+  GetScorePercentilesResponse,
+  ListFeedbackArgs,
+  CreateFeedbackBody,
+  CreateFeedbackResponse,
+  DeleteFeedbackArgs,
+  DeleteFeedbackResponse,
+  UpdateFeedbackReviewStatusArgs,
+  FeedbackRecord,
+  GetFeedbackAggregateArgs,
+  GetFeedbackAggregateResponse,
+  GetFeedbackBreakdownArgs,
+  GetFeedbackBreakdownResponse,
+  GetFeedbackTimeSeriesArgs,
+  GetFeedbackTimeSeriesResponse,
+  GetFeedbackPercentilesArgs,
+  GetFeedbackPercentilesResponse,
+  GetMetricAggregateArgs,
+  GetMetricAggregateResponse,
+  GetMetricBreakdownArgs,
+  GetMetricBreakdownResponse,
+  GetMetricTimeSeriesArgs,
+  GetMetricTimeSeriesResponse,
+  GetMetricPercentilesArgs,
+  GetMetricPercentilesResponse,
+  GetMetricNamesArgs,
+  GetMetricNamesResponse,
+  GetMetricLabelKeysArgs,
+  GetMetricLabelKeysResponse,
+  GetMetricLabelValuesArgs,
+  GetMetricLabelValuesResponse,
+  GetEntityTypesResponse,
+  GetEntityNamesArgs,
+  GetEntityNamesResponse,
+  GetServiceNamesResponse,
+  GetEnvironmentsResponse,
+  GetTagsArgs,
+  GetTagsResponse,
+} from './resources/observability-route-types.js';
+import type { Body, PathParams, QueryParams, RouteResponse } from './route-types.generated.js';
 import type {
   ListFeedbackResponse,
   ClientOptions,
@@ -126,6 +141,8 @@ import type {
   McpServerListResponse,
   McpServerToolListResponse,
   GetScorerResponse,
+  GetScorersResponse,
+  ListDatasetExperimentResultsResponse,
   ListScoresByScorerIdParams,
   ListScoresByRunIdParams,
   ListScoresByEntityIdParams,
@@ -133,9 +150,11 @@ import type {
   SaveScoreResponse,
   GetMemoryConfigParams,
   GetMemoryConfigResponse,
+  ListMemoryThreadMessagesParams,
   ListMemoryThreadMessagesResponse,
   MemorySearchResponse,
   ListAgentsModelProvidersResponse,
+  GetAgentBuilderActionsResponse,
   ListMemoryThreadsParams,
   ListMemoryThreadsResponse,
   ListStoredAgentsParams,
@@ -146,6 +165,7 @@ import type {
   ListDynamicWorkflowsResponse,
   UpsertDynamicWorkflowParams,
   UpsertDynamicWorkflowResponse,
+  WorkflowBuilderSettingsResponse,
   ListStoredPromptBlocksParams,
   ListStoredPromptBlocksResponse,
   CreateStoredPromptBlockParams,
@@ -163,6 +183,7 @@ import type {
   CreateStoredSkillParams,
   StoredSkillResponse,
   GetSystemPackagesResponse,
+  GetObservabilityCapabilitiesResponse,
   BuilderSettingsResponse,
   BuilderAvailableModelsResponse,
   PermissionPatternsResponse,
@@ -191,6 +212,7 @@ import type {
   DatasetExperimentResult,
   DatasetExperimentResultRow,
   ListExperimentsParams,
+  ListDatasetsParams,
   ExperimentReviewCounts,
   CreateDatasetParams,
   UpdateDatasetParams,
@@ -228,6 +250,7 @@ import type {
   UpdateScheduleInput,
   RunScheduleResponse,
   AgentControllerInfo,
+  SerializedRouteResponse,
 } from './types';
 import { base64RequestContext, buildTenancyQuery, parseClientRequestContext, requestContextQueryString } from './utils';
 import { createSseJsonTransform } from './utils/stream-transforms';
@@ -299,8 +322,8 @@ export class MastraClient extends BaseResource {
    * @param version - Optional version selector for stored agent overrides
    * @returns Agent instance
    */
-  public getAgent(agentId: string, version?: AgentVersionIdentifier) {
-    return new Agent(this.options, agentId, version);
+  public getAgent(agentId: string, version?: AgentVersionIdentifier, routeOverrides?: { stream?: string }) {
+    return new Agent(this.options, agentId, version, routeOverrides);
   }
 
   /**
@@ -315,7 +338,7 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing one record per agent controller, carrying its id
    */
   public async listAgentControllers(): Promise<AgentControllerInfo[]> {
-    const body = await this.request<{ agentControllers: AgentControllerInfo[] }>('/agent-controller');
+    const body = await this.request<RouteResponse<'GET /agent-controller'>>('/agent-controller');
     return body.agentControllers;
   }
 
@@ -422,33 +445,24 @@ export class MastraClient extends BaseResource {
    */
   public listThreadMessages(
     threadId: string,
-    opts: {
-      agentId?: string;
-      networkId?: string;
-      requestContext?: RequestContext | Record<string, any>;
-      includeSystemReminders?: boolean;
-    } = {},
+    opts: ListMemoryThreadMessagesParams = {},
   ): Promise<ListMemoryThreadMessagesResponse> {
-    let url = '';
-    const includeSystemRemindersQuery =
-      opts.includeSystemReminders === undefined ? '' : `includeSystemReminders=${opts.includeSystemReminders}`;
-
     if (opts.networkId) {
-      url = `/memory/network/threads/${threadId}/messages?networkId=${opts.networkId}${includeSystemRemindersQuery ? `&${includeSystemRemindersQuery}` : ''}${requestContextQueryString(opts.requestContext, includeSystemRemindersQuery ? '&' : '&')}`;
-    } else if (opts.agentId) {
-      url = `/memory/threads/${threadId}/messages?agentId=${opts.agentId}${includeSystemRemindersQuery ? `&${includeSystemRemindersQuery}` : ''}${requestContextQueryString(opts.requestContext, '&')}`;
-    } else {
-      url = `/memory/threads/${threadId}/messages${includeSystemRemindersQuery ? `?${includeSystemRemindersQuery}` : ''}${requestContextQueryString(opts.requestContext, includeSystemRemindersQuery ? '&' : '?')}`;
+      const query = memoryMessagesQuery(opts);
+      query.set('networkId', opts.networkId);
+      return this.request(
+        `/memory/network/threads/${threadId}/messages?${query.toString()}${requestContextQueryString(opts.requestContext, '&')}`,
+      );
     }
-    return this.request(url);
+    return this.getMemoryThread({ threadId, agentId: opts.agentId }).listMessages(opts);
   }
 
   public deleteThread(
-    threadId: string,
+    threadId: PathParams<'DELETE /memory/threads/:threadId'>['threadId'],
     opts:
       | { agentId: string; networkId?: never; requestContext?: RequestContext | Record<string, any> }
       | { networkId: string; agentId?: never; requestContext?: RequestContext | Record<string, any> },
-  ): Promise<{ success: boolean; message: string }> {
+  ): Promise<RouteResponse<'DELETE /memory/threads/:threadId'>> {
     if (!opts || !!opts.agentId === !!opts.networkId) {
       throw new Error(
         'MastraClient.deleteThread() requires exactly one of agentId or networkId. ' +
@@ -656,7 +670,7 @@ export class MastraClient extends BaseResource {
    * Gets all available agent builder actions
    * @returns Promise containing map of action IDs to action details
    */
-  public getAgentBuilderActions(): Promise<Record<string, WorkflowInfo>> {
+  public getAgentBuilderActions(): Promise<GetAgentBuilderActionsResponse> {
     return this.request('/agent-builder');
   }
 
@@ -775,7 +789,7 @@ export class MastraClient extends BaseResource {
    * List of all log transports
    * @returns Promise containing list of log transports
    */
-  public listLogTransports(): Promise<{ transports: string[] }> {
+  public listLogTransports(): Promise<RouteResponse<'GET /logs/transports'>> {
     return this.request('/logs/transports');
   }
 
@@ -816,7 +830,10 @@ export class MastraClient extends BaseResource {
    * @param params - Optional parameters, e.g., specific version.
    * @returns Promise containing the detailed MCP server information.
    */
-  public getMcpServerDetails(serverId: string, params?: { version?: string }): Promise<ServerDetailInfo> {
+  public getMcpServerDetails(
+    serverId: PathParams<'GET /mcp/v0/servers/:id'>['id'],
+    params?: QueryParams<'GET /mcp/v0/servers/:id'>,
+  ): Promise<RouteResponse<'GET /mcp/v0/servers/:id'>> {
     const searchParams = new URLSearchParams();
     if (params?.version) {
       searchParams.set('version', params.version);
@@ -850,15 +867,9 @@ export class MastraClient extends BaseResource {
    * @param serverId - The ID of the MCP server.
    * @returns Promise containing the list of resources.
    */
-  public getMcpServerResources(serverId: string): Promise<{
-    resources: Array<{
-      uri: string;
-      name: string;
-      description?: string;
-      mimeType?: string;
-      _meta?: Record<string, unknown>;
-    }>;
-  }> {
+  public getMcpServerResources(
+    serverId: PathParams<'GET /mcp/:serverId/resources'>['serverId'],
+  ): Promise<RouteResponse<'GET /mcp/:serverId/resources'>> {
     return this.request(`/mcp/${encodeURIComponent(serverId)}/resources`);
   }
 
@@ -870,9 +881,9 @@ export class MastraClient extends BaseResource {
    * @returns Promise containing the resource content.
    */
   public readMcpServerResource(
-    serverId: string,
-    uri: string,
-  ): Promise<{ contents: Array<{ uri: string; text?: string; blob?: string }> }> {
+    serverId: PathParams<'POST /mcp/:serverId/resources/read'>['serverId'],
+    uri: Body<'POST /mcp/:serverId/resources/read'>['uri'],
+  ): Promise<RouteResponse<'POST /mcp/:serverId/resources/read'>> {
     return this.request(`/mcp/${encodeURIComponent(serverId)}/resources/read`, {
       method: 'POST',
       body: { uri },
@@ -988,9 +999,7 @@ export class MastraClient extends BaseResource {
    * @param requestContext - Optional request context to pass as query parameter
    * @returns Promise containing list of available scorers
    */
-  public listScorers(
-    requestContext?: RequestContext | Record<string, any>,
-  ): Promise<Record<string, GetScorerResponse>> {
+  public listScorers(requestContext?: RequestContext | Record<string, any>): Promise<GetScorersResponse> {
     return this.request(`/scores/scorers${requestContextQueryString(requestContext)}`);
   }
 
@@ -1121,9 +1130,38 @@ export class MastraClient extends BaseResource {
     return this.observability.listTraces(params);
   }
 
-  /** Queries completed logical traces using recursive trace and related-record predicates. */
-  queryTraces(params: TraceQueryRequest): Promise<TraceQueryResponse> {
+  /**
+   * Queries completed logical traces using recursive trace and related-record predicates.
+   * Grouped results remain supported but are deprecated. Use `queryTraceThreads()` to retrieve thread identities.
+   */
+  queryTraces(params: QueryTracesGroupedInput): Promise<TraceQueryGroupResponse>;
+  queryTraces(params: QueryTracesDeltaInput): Promise<Extract<TraceQueryResponse, { delta: unknown }>>;
+  queryTraces(params: QueryTracesPaginatedInput): Promise<Extract<TraceQueryResponse, { pagination: unknown }>>;
+  queryTraces(params: QueryTracesKeysetInput): Promise<TraceQueryKeysetTraceResponse>;
+  queryTraces(params: QueryTracesInput): Promise<TraceQueryResponse>;
+  queryTraces(params: QueryTracesInput): Promise<TraceQueryResponse> {
     return this.observability.queryTraces(params);
+  }
+
+  /** Returns canonical and observed fields available to the advanced trace-query grammar. */
+  getTraceQueryFields(
+    params: GetTraceQueryFieldsArgs,
+    options?: { signal?: AbortSignal },
+  ): Promise<GetTraceQueryFieldsResponse> {
+    return this.observability.getTraceQueryFields(params, options);
+  }
+
+  /** Returns bounded string suggestions for one eligible trace-query field. */
+  getTraceQueryValues(
+    params: GetTraceQueryValuesArgs,
+    options?: { signal?: AbortSignal },
+  ): Promise<GetTraceQueryValuesResponse> {
+    return this.observability.getTraceQueryValues(params, options);
+  }
+
+  /** Queries thread identities using eligible-trace and cross-trace predicates. */
+  queryTraceThreads(params: QueryTraceThreadsInput): Promise<QueryTraceThreadsResult> {
+    return this.observability.queryTraceThreads(params);
   }
 
   /**
@@ -1166,15 +1204,12 @@ export class MastraClient extends BaseResource {
    * are untouched. On ClickHouse-backed stores, reads may briefly return
    * deleted rows until the delete is fully applied.
    */
-  deleteTraces(params: { traceIds: string[] }): Promise<{ success: true }> {
+  deleteTraces(params: DeleteTracesRequest): Promise<DeleteTracesResponse> {
     return this.observability.deleteTraces(params);
   }
 
   /** Scores one or more traces using a specified scorer (fire-and-forget). */
-  score(params: {
-    scorerName: string;
-    targets: Array<{ traceId: string; spanId?: string }>;
-  }): Promise<{ status: string; message: string }> {
+  score(params: ScoreTracesRequest): Promise<ScoreTracesResponse> {
     return this.observability.score(params);
   }
 
@@ -1338,6 +1373,11 @@ export class MastraClient extends BaseResource {
     return this.observability.getTags(params);
   }
 
+  /** Returns which optional observability APIs the configured observability storage supports. */
+  getObservabilityCapabilities(): Promise<GetObservabilityCapabilitiesResponse> {
+    return this.observability.getCapabilities();
+  }
+
   // ============================================================================
   // Stored Agents
   // ============================================================================
@@ -1448,6 +1488,13 @@ export class MastraClient extends BaseResource {
    */
   public getDynamicWorkflow(dynamicWorkflowId: string): DynamicWorkflow {
     return new DynamicWorkflow(this.options, dynamicWorkflowId);
+  }
+
+  /**
+   * Retrieves workflow builder settings for UI gating.
+   */
+  public getWorkflowBuilderSettings(): Promise<WorkflowBuilderSettingsResponse> {
+    return this.request('/editor/workflow-builder/settings');
   }
 
   // ============================================================================
@@ -1938,13 +1985,16 @@ export class MastraClient extends BaseResource {
   /**
    * Lists all datasets with optional pagination
    */
-  public listDatasets(pagination?: {
-    page?: number;
-    perPage?: number;
-  }): Promise<{ datasets: DatasetRecord[]; pagination: PaginationInfo }> {
+  public listDatasets(params?: ListDatasetsParams): Promise<SerializedRouteResponse<'GET /datasets'>> {
     const searchParams = new URLSearchParams();
-    if (pagination?.page !== undefined) searchParams.set('page', String(pagination.page));
-    if (pagination?.perPage !== undefined) searchParams.set('perPage', String(pagination.perPage));
+    if (params?.page !== undefined) searchParams.set('page', String(params.page));
+    if (params?.perPage !== undefined) searchParams.set('perPage', String(params.perPage));
+    if (params?.targetType !== undefined) searchParams.set('targetType', params.targetType);
+    for (const id of params?.targetIds ?? []) searchParams.append('targetIds', id);
+    if (params?.orderBy) {
+      searchParams.set('orderBy[field]', params.orderBy.field);
+      searchParams.set('orderBy[direction]', params.orderBy.direction);
+    }
     const qs = searchParams.toString();
     return this.request(`/datasets${qs ? `?${qs}` : ''}`);
   }
@@ -1955,9 +2005,9 @@ export class MastraClient extends BaseResource {
    * not belong to the given tenant.
    */
   public getDataset(
-    datasetId: string,
-    tenancy?: { organizationId?: string; projectId?: string },
-  ): Promise<DatasetRecord> {
+    datasetId: PathParams<'GET /datasets/:datasetId'>['datasetId'],
+    tenancy?: QueryParams<'GET /datasets/:datasetId'>,
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId'>> {
     const qs = buildTenancyQuery(tenancy);
     return this.request(`/datasets/${encodeURIComponent(datasetId)}${qs}`);
   }
@@ -1965,7 +2015,7 @@ export class MastraClient extends BaseResource {
   /**
    * Creates a new dataset
    */
-  public createDataset(params: CreateDatasetParams): Promise<DatasetRecord> {
+  public createDataset(params: CreateDatasetParams): Promise<SerializedRouteResponse<'POST /datasets'>> {
     return this.request('/datasets', { method: 'POST', body: params });
   }
 
@@ -1974,7 +2024,7 @@ export class MastraClient extends BaseResource {
    * check on the server side so that a caller can only update datasets that
    * belong to the given tenant.
    */
-  public updateDataset(params: UpdateDatasetParams): Promise<DatasetRecord> {
+  public updateDataset(params: UpdateDatasetParams): Promise<SerializedRouteResponse<'PATCH /datasets/:datasetId'>> {
     const { datasetId, organizationId, projectId, ...body } = params;
     const qs = buildTenancyQuery({ organizationId, projectId });
     return this.request(`/datasets/${encodeURIComponent(datasetId)}${qs}`, {
@@ -1989,9 +2039,9 @@ export class MastraClient extends BaseResource {
    * otherwise).
    */
   public deleteDataset(
-    datasetId: string,
-    tenancy?: { organizationId?: string; projectId?: string },
-  ): Promise<{ success: boolean }> {
+    datasetId: PathParams<'DELETE /datasets/:datasetId'>['datasetId'],
+    tenancy?: QueryParams<'DELETE /datasets/:datasetId'>,
+  ): Promise<SerializedRouteResponse<'DELETE /datasets/:datasetId'>> {
     const qs = buildTenancyQuery(tenancy);
     return this.request(`/datasets/${encodeURIComponent(datasetId)}${qs}`, {
       method: 'DELETE',
@@ -2006,15 +2056,19 @@ export class MastraClient extends BaseResource {
    * Lists items in a dataset with optional pagination, search, and version filter
    */
   public listDatasetItems(
-    datasetId: string,
-    params?: { page?: number; perPage?: number; search?: string; version?: number | null },
-  ): Promise<{ items: DatasetItem[]; pagination: PaginationInfo }> {
+    datasetId: PathParams<'GET /datasets/:datasetId/items'>['datasetId'],
+    params?: QueryParams<'GET /datasets/:datasetId/items'>,
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId/items'>> {
     const searchParams = new URLSearchParams();
     if (params?.page !== undefined) searchParams.set('page', String(params.page));
     if (params?.perPage !== undefined) searchParams.set('perPage', String(params.perPage));
     if (params?.search) searchParams.set('search', params.search);
     if (params?.version != null) {
       searchParams.set('version', String(params.version));
+    }
+    if (params?.orderBy) {
+      searchParams.set('orderBy[field]', params.orderBy.field);
+      searchParams.set('orderBy[direction]', params.orderBy.direction);
     }
     const qs = searchParams.toString();
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items${qs ? `?${qs}` : ''}`);
@@ -2023,14 +2077,19 @@ export class MastraClient extends BaseResource {
   /**
    * Gets a single dataset item by ID
    */
-  public getDatasetItem(datasetId: string, itemId: string): Promise<DatasetItem> {
+  public getDatasetItem(
+    datasetId: PathParams<'GET /datasets/:datasetId/items/:itemId'>['datasetId'],
+    itemId: PathParams<'GET /datasets/:datasetId/items/:itemId'>['itemId'],
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId/items/:itemId'>> {
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items/${encodeURIComponent(itemId)}`);
   }
 
   /**
    * Adds an item to a dataset
    */
-  public addDatasetItem(params: AddDatasetItemParams): Promise<DatasetItem> {
+  public addDatasetItem(
+    params: AddDatasetItemParams,
+  ): Promise<SerializedRouteResponse<'POST /datasets/:datasetId/items'>> {
     const { datasetId, ...body } = params;
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items`, {
       method: 'POST',
@@ -2041,7 +2100,9 @@ export class MastraClient extends BaseResource {
   /**
    * Updates a dataset item
    */
-  public updateDatasetItem(params: UpdateDatasetItemParams): Promise<DatasetItem> {
+  public updateDatasetItem(
+    params: UpdateDatasetItemParams,
+  ): Promise<SerializedRouteResponse<'PATCH /datasets/:datasetId/items/:itemId'>> {
     const { datasetId, itemId, ...body } = params;
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items/${encodeURIComponent(itemId)}`, {
       method: 'PATCH',
@@ -2052,7 +2113,10 @@ export class MastraClient extends BaseResource {
   /**
    * Deletes a dataset item
    */
-  public deleteDatasetItem(datasetId: string, itemId: string): Promise<{ success: boolean }> {
+  public deleteDatasetItem(
+    datasetId: PathParams<'DELETE /datasets/:datasetId/items/:itemId'>['datasetId'],
+    itemId: PathParams<'DELETE /datasets/:datasetId/items/:itemId'>['itemId'],
+  ): Promise<SerializedRouteResponse<'DELETE /datasets/:datasetId/items/:itemId'>> {
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items/${encodeURIComponent(itemId)}`, {
       method: 'DELETE',
     });
@@ -2062,10 +2126,10 @@ export class MastraClient extends BaseResource {
    * Permanently scrubs a dataset item's data from all versions and linked experiment results
    */
   public purgeDatasetItem(
-    datasetId: string,
-    itemId: string,
-    tenancy?: { organizationId?: string; projectId?: string },
-  ): Promise<{ success: boolean }> {
+    datasetId: PathParams<'DELETE /datasets/:datasetId/items/:itemId/purge'>['datasetId'],
+    itemId: PathParams<'DELETE /datasets/:datasetId/items/:itemId/purge'>['itemId'],
+    tenancy?: QueryParams<'DELETE /datasets/:datasetId/items/:itemId/purge'>,
+  ): Promise<SerializedRouteResponse<'DELETE /datasets/:datasetId/items/:itemId/purge'>> {
     const qs = buildTenancyQuery(tenancy);
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items/${encodeURIComponent(itemId)}/purge${qs}`, {
       method: 'DELETE',
@@ -2077,7 +2141,7 @@ export class MastraClient extends BaseResource {
    */
   public batchInsertDatasetItems(
     params: BatchInsertDatasetItemsParams,
-  ): Promise<{ items: DatasetItem[]; count: number }> {
+  ): Promise<SerializedRouteResponse<'POST /datasets/:datasetId/items/batch'>> {
     const { datasetId, ...body } = params;
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items/batch`, {
       method: 'POST',
@@ -2090,7 +2154,7 @@ export class MastraClient extends BaseResource {
    */
   public batchDeleteDatasetItems(
     params: BatchDeleteDatasetItemsParams,
-  ): Promise<{ success: boolean; deletedCount: number }> {
+  ): Promise<SerializedRouteResponse<'DELETE /datasets/:datasetId/items/batch'>> {
     const { datasetId, ...body } = params;
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items/batch`, {
       method: 'DELETE',
@@ -2101,7 +2165,9 @@ export class MastraClient extends BaseResource {
   /**
    * Generates synthetic dataset items using AI. Items are returned for review, not auto-saved.
    */
-  public generateDatasetItems(params: GenerateDatasetItemsParams): Promise<{ items: GeneratedItem[] }> {
+  public generateDatasetItems(
+    params: GenerateDatasetItemsParams,
+  ): Promise<SerializedRouteResponse<'POST /datasets/:datasetId/generate-items'>> {
     const { datasetId, ...body } = params;
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/generate-items`, {
       method: 'POST',
@@ -2112,22 +2178,9 @@ export class MastraClient extends BaseResource {
   /**
    * Cluster experiment failures using AI to identify common failure patterns.
    */
-  public clusterFailures(params: {
-    modelId: string;
-    items: Array<{
-      id: string;
-      input: unknown;
-      output?: unknown;
-      error?: string;
-      scores?: Record<string, number>;
-      existingTags?: string[];
-    }>;
-    availableTags?: string[];
-    prompt?: string;
-  }): Promise<{
-    clusters: Array<{ id: string; label: string; description: string; itemIds: string[] }>;
-    proposedTags?: Array<{ itemId: string; tags: string[]; reason: string }>;
-  }> {
+  public clusterFailures(
+    params: Body<'POST /datasets/cluster-failures'>,
+  ): Promise<SerializedRouteResponse<'POST /datasets/cluster-failures'>> {
     return this.request(`/datasets/cluster-failures`, {
       method: 'POST',
       body: params,
@@ -2141,7 +2194,10 @@ export class MastraClient extends BaseResource {
   /**
    * Lists versions for a dataset item
    */
-  public getItemHistory(datasetId: string, itemId: string): Promise<{ history: DatasetItemVersionResponse[] }> {
+  public getItemHistory(
+    datasetId: PathParams<'GET /datasets/:datasetId/items/:itemId/history'>['datasetId'],
+    itemId: PathParams<'GET /datasets/:datasetId/items/:itemId/history'>['itemId'],
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId/items/:itemId/history'>> {
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/items/${encodeURIComponent(itemId)}/history`);
   }
 
@@ -2149,10 +2205,10 @@ export class MastraClient extends BaseResource {
    * Gets a specific version of a dataset item
    */
   public getDatasetItemVersion(
-    datasetId: string,
-    itemId: string,
-    datasetVersion: number,
-  ): Promise<DatasetItemVersionResponse> {
+    datasetId: PathParams<'GET /datasets/:datasetId/items/:itemId/versions/:datasetVersion'>['datasetId'],
+    itemId: PathParams<'GET /datasets/:datasetId/items/:itemId/versions/:datasetVersion'>['itemId'],
+    datasetVersion: PathParams<'GET /datasets/:datasetId/items/:itemId/versions/:datasetVersion'>['datasetVersion'],
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId/items/:itemId/versions/:datasetVersion'>> {
     return this.request(
       `/datasets/${encodeURIComponent(datasetId)}/items/${encodeURIComponent(itemId)}/versions/${datasetVersion}`,
     );
@@ -2166,9 +2222,9 @@ export class MastraClient extends BaseResource {
    * Lists versions for a dataset
    */
   public listDatasetVersions(
-    datasetId: string,
-    pagination?: { page?: number; perPage?: number },
-  ): Promise<{ versions: DatasetVersionResponse[]; pagination: PaginationInfo }> {
+    datasetId: PathParams<'GET /datasets/:datasetId/versions'>['datasetId'],
+    pagination?: QueryParams<'GET /datasets/:datasetId/versions'>,
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId/versions'>> {
     const searchParams = new URLSearchParams();
     if (pagination?.page !== undefined) searchParams.set('page', String(pagination.page));
     if (pagination?.perPage !== undefined) searchParams.set('perPage', String(pagination.perPage));
@@ -2183,9 +2239,7 @@ export class MastraClient extends BaseResource {
   /**
    * Lists all experiments across all datasets
    */
-  public listExperiments(
-    params?: ListExperimentsParams,
-  ): Promise<{ experiments: DatasetExperiment[]; pagination: PaginationInfo }> {
+  public listExperiments(params?: ListExperimentsParams): Promise<SerializedRouteResponse<'GET /experiments'>> {
     const searchParams = new URLSearchParams();
     if (params?.page !== undefined) searchParams.set('page', String(params.page));
     if (params?.perPage !== undefined) searchParams.set('perPage', String(params.perPage));
@@ -2193,6 +2247,12 @@ export class MastraClient extends BaseResource {
     if (params?.comparisonId !== undefined) searchParams.set('comparisonId', params.comparisonId);
     if (params?.variantId !== undefined) searchParams.set('variantId', params.variantId);
     if (params?.trialIndex !== undefined) searchParams.set('trialIndex', String(params.trialIndex));
+    if (params?.targetType !== undefined) searchParams.set('targetType', params.targetType);
+    if (params?.targetId !== undefined) searchParams.set('targetId', params.targetId);
+    if (params?.orderBy) {
+      searchParams.set('orderBy[field]', params.orderBy.field);
+      searchParams.set('orderBy[direction]', params.orderBy.direction);
+    }
     const qs = searchParams.toString();
     return this.request(`/experiments${qs ? `?${qs}` : ''}`);
   }
@@ -2200,7 +2260,7 @@ export class MastraClient extends BaseResource {
   /**
    * Gets review status counts aggregated per experiment
    */
-  public getExperimentReviewSummary(): Promise<{ counts: ExperimentReviewCounts[] }> {
+  public getExperimentReviewSummary(): Promise<SerializedRouteResponse<'GET /experiments/review-summary'>> {
     return this.request(`/experiments/review-summary`);
   }
 
@@ -2208,9 +2268,9 @@ export class MastraClient extends BaseResource {
    * Lists experiments for a dataset
    */
   public listDatasetExperiments(
-    datasetId: string,
-    params?: ListExperimentsParams,
-  ): Promise<{ experiments: DatasetExperiment[]; pagination: PaginationInfo }> {
+    datasetId: PathParams<'GET /datasets/:datasetId/experiments'>['datasetId'],
+    params?: QueryParams<'GET /datasets/:datasetId/experiments'>,
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId/experiments'>> {
     const searchParams = new URLSearchParams();
     if (params?.page !== undefined) searchParams.set('page', String(params.page));
     if (params?.perPage !== undefined) searchParams.set('perPage', String(params.perPage));
@@ -2218,6 +2278,12 @@ export class MastraClient extends BaseResource {
     if (params?.comparisonId !== undefined) searchParams.set('comparisonId', params.comparisonId);
     if (params?.variantId !== undefined) searchParams.set('variantId', params.variantId);
     if (params?.trialIndex !== undefined) searchParams.set('trialIndex', String(params.trialIndex));
+    if (params?.targetType !== undefined) searchParams.set('targetType', params.targetType);
+    if (params?.targetId !== undefined) searchParams.set('targetId', params.targetId);
+    if (params?.orderBy) {
+      searchParams.set('orderBy[field]', params.orderBy.field);
+      searchParams.set('orderBy[direction]', params.orderBy.direction);
+    }
     const qs = searchParams.toString();
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/experiments${qs ? `?${qs}` : ''}`);
   }
@@ -2225,7 +2291,10 @@ export class MastraClient extends BaseResource {
   /**
    * Gets a single dataset experiment by ID
    */
-  public getDatasetExperiment(datasetId: string, experimentId: string): Promise<DatasetExperiment> {
+  public getDatasetExperiment(
+    datasetId: PathParams<'GET /datasets/:datasetId/experiments/:experimentId'>['datasetId'],
+    experimentId: PathParams<'GET /datasets/:datasetId/experiments/:experimentId'>['experimentId'],
+  ): Promise<SerializedRouteResponse<'GET /datasets/:datasetId/experiments/:experimentId'>> {
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}`);
   }
 
@@ -2238,10 +2307,10 @@ export class MastraClient extends BaseResource {
    * observability or trace deletion support leave the traces in place.
    */
   public deleteDatasetExperiment(
-    datasetId: string,
-    experimentId: string,
-    tenancy?: { organizationId?: string; projectId?: string },
-  ): Promise<{ success: boolean }> {
+    datasetId: PathParams<'DELETE /datasets/:datasetId/experiments/:experimentId'>['datasetId'],
+    experimentId: PathParams<'DELETE /datasets/:datasetId/experiments/:experimentId'>['experimentId'],
+    tenancy?: QueryParams<'DELETE /datasets/:datasetId/experiments/:experimentId'>,
+  ): Promise<SerializedRouteResponse<'DELETE /datasets/:datasetId/experiments/:experimentId'>> {
     const qs = buildTenancyQuery(tenancy);
     return this.request(
       `/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}${qs}`,
@@ -2262,9 +2331,9 @@ export class MastraClient extends BaseResource {
    * observability or trace deletion support leave the traces in place.
    */
   public deleteExperiment(
-    experimentId: string,
-    options?: { organizationId?: string; projectId?: string },
-  ): Promise<{ success: boolean }> {
+    experimentId: PathParams<'DELETE /experiments/:experimentId'>['experimentId'],
+    options?: QueryParams<'DELETE /experiments/:experimentId'>,
+  ): Promise<SerializedRouteResponse<'DELETE /experiments/:experimentId'>> {
     const qs = buildTenancyQuery(options);
     return this.request(`/experiments/${encodeURIComponent(experimentId)}${qs}`, {
       method: 'DELETE',
@@ -2274,7 +2343,9 @@ export class MastraClient extends BaseResource {
   /**
    * Updates a dataset experiment's name, description or metadata
    */
-  public updateDatasetExperiment(params: UpdateDatasetExperimentParams): Promise<DatasetExperiment> {
+  public updateDatasetExperiment(
+    params: UpdateDatasetExperimentParams,
+  ): Promise<SerializedRouteResponse<'PATCH /datasets/:datasetId/experiments/:experimentId'>> {
     const { datasetId, experimentId, ...body } = params;
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}`, {
       method: 'PATCH',
@@ -2287,14 +2358,18 @@ export class MastraClient extends BaseResource {
    * `tags` restricts the list to results that have all of the given tags.
    */
   public listDatasetExperimentResults(
-    datasetId: string,
-    experimentId: string,
-    options?: { page?: number; perPage?: number; tags?: string[] },
-  ): Promise<{ results: DatasetExperimentResult[]; pagination: PaginationInfo }> {
+    datasetId: PathParams<'GET /datasets/:datasetId/experiments/:experimentId/results'>['datasetId'],
+    experimentId: PathParams<'GET /datasets/:datasetId/experiments/:experimentId/results'>['experimentId'],
+    options?: QueryParams<'GET /datasets/:datasetId/experiments/:experimentId/results'>,
+  ): Promise<ListDatasetExperimentResultsResponse> {
     const searchParams = new URLSearchParams();
     if (options?.page !== undefined) searchParams.set('page', String(options.page));
     if (options?.perPage !== undefined) searchParams.set('perPage', String(options.perPage));
     for (const tag of options?.tags ?? []) searchParams.append('tags', tag);
+    if (options?.orderBy) {
+      searchParams.set('orderBy[field]', options.orderBy.field);
+      searchParams.set('orderBy[direction]', options.orderBy.direction);
+    }
     const qs = searchParams.toString();
     return this.request(
       `/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}/results${qs ? `?${qs}` : ''}`,
@@ -2304,7 +2379,9 @@ export class MastraClient extends BaseResource {
   /**
    * Updates an experiment result's status, tags, and/or comment
    */
-  public updateDatasetExperimentResult(params: UpdateExperimentResultParams): Promise<DatasetExperimentResult> {
+  public updateDatasetExperimentResult(
+    params: UpdateExperimentResultParams,
+  ): Promise<SerializedRouteResponse<'PATCH /datasets/:datasetId/experiments/:experimentId/results/:resultId'>> {
     const { datasetId, experimentId, resultId, ...body } = params;
     return this.request(
       `/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}/results/${encodeURIComponent(resultId)}`,
@@ -2318,34 +2395,9 @@ export class MastraClient extends BaseResource {
   /**
    * Triggers a new dataset experiment
    */
-  public triggerDatasetExperiment(params: TriggerDatasetExperimentParams): Promise<{
-    experimentId: string;
-    status: 'pending' | 'running' | 'completed' | 'failed';
-    totalItems: number;
-    succeededCount: number;
-    failedCount: number;
-    startedAt: string | Date;
-    completedAt: string | Date | null;
-    results: Array<{
-      itemId: string;
-      itemDatasetVersion: number | null;
-      input: unknown;
-      output: unknown | null;
-      groundTruth: unknown | null;
-      metadata?: Record<string, unknown> | null;
-      error: string | null;
-      startedAt: string | Date;
-      completedAt: string | Date;
-      retryCount: number;
-      scores: Array<{
-        scorerId: string;
-        scorerName: string;
-        score: number | null;
-        reason: string | null;
-        error: string | null;
-      }>;
-    }>;
-  }> {
+  public triggerDatasetExperiment(
+    params: TriggerDatasetExperimentParams,
+  ): Promise<SerializedRouteResponse<'POST /datasets/:datasetId/experiments'>> {
     const { datasetId, ...body } = params;
     return this.request(`/datasets/${encodeURIComponent(datasetId)}/experiments`, {
       method: 'POST',
@@ -2387,7 +2439,9 @@ export class MastraClient extends BaseResource {
    * Submits (or re-submits) one item result for a target-less (ingestion) experiment.
    * Upsert semantics on (experimentId, itemId, attempt) — safe to retry.
    */
-  public submitExperimentResult(params: SubmitExperimentResultParams): Promise<DatasetExperimentResultRow> {
+  public submitExperimentResult(
+    params: SubmitExperimentResultParams,
+  ): Promise<SerializedRouteResponse<'POST /datasets/:datasetId/experiments/:experimentId/results'>> {
     const { datasetId, experimentId, ...body } = params;
     return this.request(
       `/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}/results`,
@@ -2401,7 +2455,9 @@ export class MastraClient extends BaseResource {
   /**
    * Finalizes an external experiment. The server computes counts from persisted results. Idempotent.
    */
-  public finalizeExperiment(params: FinalizeExperimentParams): Promise<DatasetExperiment> {
+  public finalizeExperiment(
+    params: FinalizeExperimentParams,
+  ): Promise<SerializedRouteResponse<'POST /datasets/:datasetId/experiments/:experimentId/finalize'>> {
     const { datasetId, experimentId } = params;
     return this.request(
       `/datasets/${encodeURIComponent(datasetId)}/experiments/${encodeURIComponent(experimentId)}/finalize`,
@@ -2552,7 +2608,9 @@ export class MastraClient extends BaseResource {
   /**
    * Deletes a schedule.
    */
-  public deleteSchedule(scheduleId: string): Promise<{ message: string }> {
+  public deleteSchedule(
+    scheduleId: PathParams<'DELETE /schedules/:scheduleId'>['scheduleId'],
+  ): Promise<RouteResponse<'DELETE /schedules/:scheduleId'>> {
     return this.request(`/schedules/${encodeURIComponent(scheduleId)}`, {
       method: 'DELETE',
     });

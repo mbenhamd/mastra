@@ -25,6 +25,7 @@ interface StreamStepOptions<OUTPUT = undefined> {
   returnScorerData?: boolean;
   requireToolApproval?: RequireToolApproval;
   toolCallConcurrency?: ToolCallConcurrency;
+  eagerToolExecution?: boolean;
   resumeContext?: {
     resumeData: any;
     snapshot: any;
@@ -60,6 +61,7 @@ export function createStreamStep<OUTPUT = undefined>({
   returnScorerData,
   requireToolApproval,
   toolCallConcurrency,
+  eagerToolExecution,
   resumeContext,
   agentId,
   agentVersionId,
@@ -115,6 +117,7 @@ export function createStreamStep<OUTPUT = undefined>({
         ...resolveObservabilityContext(observabilityContext),
         requireToolApproval,
         toolCallConcurrency,
+        eagerToolExecution,
         resumeContext,
         _internal: {
           generateId: capabilities.generateMessageId,

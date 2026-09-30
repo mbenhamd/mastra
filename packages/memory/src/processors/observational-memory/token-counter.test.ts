@@ -17,6 +17,12 @@ function createMessage(content: any) {
   } as any;
 }
 
+function getCachedEstimateByKind(part: any, kind: string) {
+  const cache = part.providerMetadata.mastra.tokenEstimate;
+  const entries = cache.key ? [cache] : Object.values(cache);
+  return entries.filter((entry: any) => entry.key.includes(kind)).at(-1);
+}
+
 const TOOL_NAME = 'findUserTool';
 const TOOL_ARGS = { name: 'Dero Israel' };
 
@@ -1050,6 +1056,7 @@ describe('TokenCounter', () => {
           state: 'result',
           toolCallId: 'tool-1',
           toolName: 'lookup',
+          args: { q: 'weather in sf' },
           result: { answer: 'sunny' },
         },
       });
@@ -1139,7 +1146,7 @@ describe('TokenCounter', () => {
       });
 
       const tokens = counter.countMessage(message);
-      const estimate = message.content.parts[0].providerMetadata.mastra.tokenEstimate;
+      const estimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-multimodal-content');
 
       expect(tokens).toBeLessThan(2_000);
       expect(estimate.key).toContain('tool-result-multimodal-content');
@@ -1239,7 +1246,7 @@ describe('TokenCounter', () => {
 
       const tokens = counter.countMessage(message);
       const tokensWithoutMalformed = counter.countMessage(messageWithoutMalformed);
-      const estimate = message.content.parts[0].providerMetadata.mastra.tokenEstimate;
+      const estimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-multimodal-content');
 
       expect(tokens).toBeGreaterThan(tokensWithoutMalformed);
       expect(tokens).toBeLessThan(2_000);
@@ -1302,7 +1309,7 @@ describe('TokenCounter', () => {
 
       const estimatedTokens = counter.countMessage(withClientEstimates);
       const fallbackTokens = counter.countMessage(withoutClientEstimates);
-      const estimate = withClientEstimates.content.parts[0].providerMetadata.mastra.tokenEstimate;
+      const estimate = getCachedEstimateByKind(withClientEstimates.content.parts[0], 'tool-result-multimodal-content');
 
       expect(estimatedTokens).toBeGreaterThanOrEqual(12_000);
       expect(estimatedTokens).toBeGreaterThan(fallbackTokens);
@@ -1333,7 +1340,7 @@ describe('TokenCounter', () => {
       });
 
       const first = counter.countMessage(message);
-      const firstEstimate = message.content.parts[0].providerMetadata.mastra.tokenEstimate;
+      const firstEstimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-model-output-json');
 
       message.content.parts[0].providerMetadata.mastra.modelOutput = {
         type: 'text',
@@ -1341,7 +1348,7 @@ describe('TokenCounter', () => {
       };
 
       const second = counter.countMessage(message);
-      const secondEstimate = message.content.parts[0].providerMetadata.mastra.tokenEstimate;
+      const secondEstimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-model-output-json');
 
       expect(second).toBeGreaterThan(first);
       expect(secondEstimate.key).not.toBe(firstEstimate.key);
@@ -1369,7 +1376,7 @@ describe('TokenCounter', () => {
       });
 
       const tokens = counter.countMessage(message);
-      const estimate = message.content.parts[0].providerMetadata?.mastra?.tokenEstimate;
+      const estimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-json');
 
       expect(tokens).toBeGreaterThan(0);
       expect(estimate?.key).toContain('tool-result-json');
@@ -1394,7 +1401,7 @@ describe('TokenCounter', () => {
       const message = createDeniedMessage({ id: 'tool-1', approved: false, reason });
 
       const tokens = counter.countMessage(message);
-      const estimate = message.content.parts[0].providerMetadata?.mastra?.tokenEstimate;
+      const estimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-denied');
 
       expect(tokens).toBeGreaterThan(0);
       expect(estimate?.key).toContain('tool-result-denied');
@@ -1406,7 +1413,7 @@ describe('TokenCounter', () => {
       const message = createDeniedMessage({ id: 'tool-1', approved: false });
 
       const tokens = counter.countMessage(message);
-      const estimate = message.content.parts[0].providerMetadata?.mastra?.tokenEstimate;
+      const estimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-denied');
 
       expect(tokens).toBeGreaterThan(0);
       expect(estimate?.key).toContain('tool-result-denied');
@@ -1418,7 +1425,7 @@ describe('TokenCounter', () => {
       const message = createDeniedMessage();
 
       expect(() => counter.countMessage(message)).not.toThrow();
-      const estimate = message.content.parts[0].providerMetadata?.mastra?.tokenEstimate;
+      const estimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-denied');
       expect(estimate?.key).toContain('tool-result-denied');
       expect(estimate?.tokens).toBe(counter.countString(DEFAULT_DECLINE_REASON));
     });
@@ -1436,7 +1443,7 @@ describe('TokenCounter', () => {
 
       await expect(counter.countMessagesAsync([message])).resolves.toBeGreaterThan(0);
       expect(counter.countMessage(message)).toBeGreaterThan(0);
-      const estimate = message.content.parts[0].providerMetadata?.mastra?.tokenEstimate;
+      const estimate = getCachedEstimateByKind(message.content.parts[0], 'tool-result-error');
       expect(estimate?.key).toContain('tool-result-error');
       expect(estimate?.tokens).toBe(counter.countString(errorText));
     });

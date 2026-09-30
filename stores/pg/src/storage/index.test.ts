@@ -37,6 +37,15 @@ createTestSuite(
     attachmentByteOwner: new InMemoryHarnessAttachmentByteOwner({ providerId: 'pg-conformance-my-schema' }),
   }),
 );
+// Schema names that are only valid when quoted, e.g. one schema per tenant (upstream #24790).
+// parseSchemaName accepts them and schemaNamePrefix() maps them to identifier-safe prefixes.
+createTestSuite(
+  new PostgresStore({
+    ...TEST_CONFIG,
+    schemaName: 'my-tenant',
+    attachmentByteOwner: new InMemoryHarnessAttachmentByteOwner({ providerId: 'pg-conformance-my-tenant' }),
+  }),
+);
 
 describe('PostgresStore workspace authorIds filtering', () => {
   it('lists owned and legacy unowned workspaces without returning other authors', async () => {

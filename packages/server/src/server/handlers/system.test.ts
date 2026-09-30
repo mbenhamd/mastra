@@ -468,7 +468,7 @@ describe('System Handlers', () => {
         }),
       } as any);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         packages: [],
         isDev: false,
         cmsEnabled: false,
@@ -478,8 +478,8 @@ describe('System Handlers', () => {
         observabilityStorageType: 'MockObservabilityStore',
         observabilityRuntimeStrategy: 'realtime',
       });
+      expect(result).not.toHaveProperty('observabilityRuntimeCapabilities');
     });
-
     it('should return observability storage capabilities when the store exposes them', async () => {
       const result = await GET_SYSTEM_PACKAGES_ROUTE.handler({
         mastra: createMockMastra(false, {
@@ -494,7 +494,7 @@ describe('System Handlers', () => {
         }),
       } as any);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         packages: [],
         isDev: false,
         cmsEnabled: false,
@@ -502,7 +502,7 @@ describe('System Handlers', () => {
         storageType: 'mock-storage',
         observabilityStorageType: 'MockObservabilityStore',
         observabilityRuntimeStrategy: 'realtime',
-        observabilityStorageCapabilities: mockObservabilityStorageCapabilities,
+        observabilityRuntimeCapabilities: mockObservabilityStorageCapabilities,
       });
     });
 
@@ -522,7 +522,7 @@ describe('System Handlers', () => {
 
       expect(result).toMatchObject({
         observabilityStorageType: '_ObservabilityStoragePostgresVNext',
-        observabilityStorageCapabilities: {
+        observabilityRuntimeCapabilities: {
           tracing: {
             preferredStrategy: 'insert-only',
             supportedStrategies: ['insert-only'],
@@ -557,7 +557,7 @@ describe('System Handlers', () => {
         }),
       } as any);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         packages: [],
         isDev: false,
         cmsEnabled: false,
@@ -566,8 +566,8 @@ describe('System Handlers', () => {
         observabilityStorageType: 'LegacyObservabilityStorage',
         observabilityRuntimeStrategy: 'realtime',
       });
+      expect(result).not.toHaveProperty('observabilityRuntimeCapabilities');
     });
-
     it('should return inherited explicit observability storage capabilities', async () => {
       class SupportedObservabilityStorage extends ObservabilityStorage {
         getCapabilities() {
@@ -588,7 +588,7 @@ describe('System Handlers', () => {
         }),
       } as any);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         packages: [],
         isDev: false,
         cmsEnabled: false,
@@ -596,7 +596,7 @@ describe('System Handlers', () => {
         storageType: 'mock-storage',
         observabilityStorageType: 'WrappedObservabilityStorage',
         observabilityRuntimeStrategy: 'realtime',
-        observabilityStorageCapabilities: mockObservabilityStorageCapabilities,
+        observabilityRuntimeCapabilities: mockObservabilityStorageCapabilities,
       });
     });
 
@@ -614,7 +614,7 @@ describe('System Handlers', () => {
         }),
       } as any);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         packages: [],
         isDev: false,
         cmsEnabled: false,
@@ -623,8 +623,8 @@ describe('System Handlers', () => {
         observabilityStorageType: 'MockObservabilityStore',
         observabilityRuntimeStrategy: 'realtime',
       });
+      expect(result).not.toHaveProperty('observabilityRuntimeCapabilities');
     });
-
     it('should omit observability storage capabilities when capability inspection throws', async () => {
       const result = await GET_SYSTEM_PACKAGES_ROUTE.handler({
         mastra: createMockMastra(false, {
@@ -641,7 +641,7 @@ describe('System Handlers', () => {
         }),
       } as any);
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         packages: [],
         isDev: false,
         cmsEnabled: false,
@@ -650,6 +650,7 @@ describe('System Handlers', () => {
         observabilityStorageType: 'MockObservabilityStore',
         observabilityRuntimeStrategy: 'realtime',
       });
+      expect(result).not.toHaveProperty('observabilityRuntimeCapabilities');
     });
   });
 });

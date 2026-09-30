@@ -47,6 +47,17 @@ vi.mock('../../stream-adapter', () => ({
   emitSuspendedEvent: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../../../../background-tasks/create', () => ({
+  createBackgroundTask: vi.fn(),
+}));
+
+vi.mock('../../../../background-tasks/resolve-config', () => ({
+  resolveBackgroundConfig: vi.fn(),
+}));
+
+const { createBackgroundTask } = await import('../../../../background-tasks/create');
+const { resolveBackgroundConfig } = await import('../../../../background-tasks/resolve-config');
+
 const RUN_ID = 'run-approval-1';
 const RUNTIME_BINDING_ID = 'binding-approval-1';
 const AGENT_ID = 'agent-1';
@@ -419,7 +430,9 @@ describe('issue #17218 (durable engine): tool-call step records the approval dec
     const result = await runToolCallStep({ approved: true }, makeSuspendEnvelope({ approvalSource: 'tool-execution' }));
 
     expect(execute).toHaveBeenCalledWith(TOOL_ARGS, expect.objectContaining({ resumeData: { approved: true } }));
-    expect(result).toEqual({
+    // Upstream's tool-call output also carries execution provenance
+    // (`serverExecuted`, `providerMetadata`, `modelOutputComputed`).
+    expect(result).toMatchObject({
       toolCallId: TOOL_CALL_ID,
       toolName: TOOL_NAME,
       args: TOOL_ARGS,
@@ -677,6 +690,74 @@ describe('issue #17218 (durable engine): mapping step round-trips approvals on r
     expect(stored?.result).toEqual(TOOL_RESULT);
     expect(stored?.approval).toMatchObject({ approved: true });
 
+    expect(v6).toBeDefined();
+    expect(v6?.state).toBe('output-available');
+    expect(v6?.approval).toMatchObject({ approved: true });
+  });
+
+  it('an awaited approval-resumed background result carries its grant through mapping and recalls it', async () => {
+    // An approved in-tool suspension resumed as an AWAITED background task:
+    // the resumed leg must return the grant on the step output (finding: the
+    // awaited return kept it only for a fresh `started` dispatch), and the
+    // mapping step must persist it so it round-trips on recall — mapping
+    // deserializes the pre-tool LLM snapshot and commits approval from
+    // `toolResult.approval`, so a grant dropped here is lost on recall.
+    const messageList = seedPendingApprovalMessageList();
+    setupRegistry(vi.fn().mockResolvedValue(TOOL_RESULT), messageList);
+    Object.assign(globalRunRegistry.get(RUN_ID) as object, { backgroundTaskManager: {} as any });
+
+    vi.mocked(resolveBackgroundConfig).mockReturnValue({
+      runInBackground: true,
+      disposition: 'awaited',
+      timeoutMs: 30_000,
+      maxRetries: 0,
+    } as any);
+
+    let capturedOnResult: any;
+    const resume = vi.fn().mockResolvedValue({ id: 'task-resumed-await' });
+    const waitForCompletion = vi.fn(async () => {
+      await capturedOnResult({
+        runId: RUN_ID,
+        taskId: 'task-resumed-await',
+        toolCallId: TOOL_CALL_ID,
+        toolName: TOOL_NAME,
+        agentId: AGENT_ID,
+        result: TOOL_RESULT,
+        status: 'completed',
+        startedAt: new Date(),
+        completedAt: new Date(),
+      });
+      return { id: 'task-resumed-await', status: 'completed', result: TOOL_RESULT };
+    });
+    vi.mocked(createBackgroundTask).mockImplementation((_mgr: any, opts: any) => {
+      capturedOnResult = opts.context.onResult;
+      return {
+        dispatch: vi.fn(),
+        resume,
+        checkIfExisting: vi.fn().mockResolvedValue(undefined),
+        checkIfSuspended: vi.fn().mockResolvedValue(true),
+        checkIfRunning: vi.fn().mockResolvedValue(false),
+        restart: vi.fn(),
+        task: { id: 'task-resumed-await' },
+        cancel: vi.fn(),
+        waitForCompletion,
+      } as any;
+    });
+
+    const stepOutput = await runToolCallStep(
+      { approved: true, reason: 'Reviewed by admin' },
+      makeSuspendEnvelope({ approvalSource: 'tool-execution' }),
+    );
+
+    expect(resume).toHaveBeenCalledWith({ approved: true, reason: 'Reviewed by admin' });
+    expect(stepOutput.result).toEqual(TOOL_RESULT);
+    expect(stepOutput.approval).toEqual({ id: TOOL_CALL_ID, approved: true, reason: 'Reviewed by admin' });
+
+    const { stored, v6 } = await runMappingStep([stepOutput]);
+    expect(stored).toBeDefined();
+    expect(stored?.state).toBe('result');
+    expect(stored?.result).toEqual(TOOL_RESULT);
+    expect(stored?.approval).toMatchObject({ approved: true });
     expect(v6).toBeDefined();
     expect(v6?.state).toBe('output-available');
     expect(v6?.approval).toMatchObject({ approved: true });

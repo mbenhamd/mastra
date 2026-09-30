@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { ActorSignal } from '../../auth/ee';
 import type { RequestContext } from '../../di';
 import { MastraError, ErrorDomain, ErrorCategory, getErrorFromUnknown } from '../../error';
@@ -150,7 +149,9 @@ export async function executeStep(
       }).state;
   const stepCallId = lifecycleStepState.stepCallId;
   const nestedRunId =
-    step.component === 'WORKFLOW' && executionContext.foreachIndex !== undefined ? randomUUID() : undefined;
+    step.component === 'WORKFLOW' && executionContext.foreachIndex !== undefined
+      ? globalThis.crypto.randomUUID()
+      : undefined;
 
   const { inputData, validationError: inputValidationError } = await validateStepInput({
     prevOutput,
@@ -435,6 +436,7 @@ export async function executeStep(
         pubsub,
         suppressLifecycleEvents,
         emitLegacy: false,
+        iterationCount,
         phase: 'nested-step-result',
       });
       if (nestedPublicationBlocked) {
@@ -784,6 +786,7 @@ export async function executeStep(
     suppressLifecycleEvents,
     emitLegacy: !skipEmits,
     deferLifecycleResult,
+    iterationCount,
     phase: 'step-result',
   });
   if (publicationBlocked) {
@@ -1073,6 +1076,47 @@ function collectStepResultLifecycleEvents(params: {
   return events;
 }
 
+/**
+ * The step results and execution context persisted with a step's result write.
+ *
+ * A loop or foreach body shares its step id with the enclosing entry, so a
+ * successful iteration persisted as a finished `success` would make a restart
+ * treat the whole entry as finished (`getRestartStartIndex`) and skip the
+ * remaining iterations, the loop condition, or the foreach aggregation. Until
+ * the entry itself finishes (its entry-end write), persist a successful
+ * iteration in the same shape as its start write: `running` and still in
+ * `activeStepsPath`, so a restart re-enters the entry (and restarts, rather
+ * than re-starts, a nested workflow body). The in-memory result and the
+ * lifecycle events keep the real iteration outcome.
+ */
+function iterationWriteView(params: {
+  stepResults: Record<string, StepResult<any, any, any, any>>;
+  executionContext: ExecutionContext;
+  stepId: string;
+  execResults: StepResult<any, any, any, any>;
+  iterationCount?: number;
+}): { stepResults: Record<string, StepResult<any, any, any, any>>; executionContext: ExecutionContext } {
+  const { executionContext, stepId, execResults } = params;
+  const isIteration = executionContext.foreachIndex !== undefined || params.iterationCount !== undefined;
+  if (!isIteration) return { stepResults: params.stepResults, executionContext };
+  if (execResults.status !== 'success') {
+    return { stepResults: { ...params.stepResults, [stepId]: execResults }, executionContext };
+  }
+  return {
+    stepResults: {
+      ...params.stepResults,
+      [stepId]: {
+        ...omitPriorCompletionFields(execResults as unknown as Record<string, unknown>),
+        status: 'running',
+      } as unknown as StepResult<any, any, any, any>,
+    },
+    executionContext: {
+      ...executionContext,
+      activeStepsPath: { ...executionContext.activeStepsPath, [stepId]: executionContext.executionPath },
+    },
+  };
+}
+
 async function persistThenPublishStepResult(params: {
   engine: DefaultExecutionEngine;
   workflowId: string;
@@ -1095,6 +1139,8 @@ async function persistThenPublishStepResult(params: {
   suppressLifecycleEvents: boolean;
   emitLegacy: boolean;
   deferLifecycleResult?: (emission: Promise<void>) => void;
+  /** Set when this step is the body of a loop iteration. */
+  iterationCount?: number;
   phase: string;
 }): Promise<boolean> {
   // Sibling branches share this map. Record the local result before awaiting
@@ -1111,16 +1157,14 @@ async function persistThenPublishStepResult(params: {
   const workflowStatus =
     !isCompositeChild && (stepStatus === 'suspended' || stepStatus === 'paused') ? stepStatus : 'running';
   if (!params.executionContext.transientExecution) {
+    const writeView = iterationWriteView(params);
     const persistenceParams: PersistStepUpdateParams = {
       workflowId: params.workflowId,
       runId: params.runId,
       resourceId: params.resourceId,
       serializedStepGraph: params.serializedStepGraph,
-      stepResults:
-        params.executionContext.foreachIndex === undefined
-          ? params.stepResults
-          : { ...params.stepResults, [params.stepId]: params.execResults },
-      executionContext: params.executionContext,
+      stepResults: writeView.stepResults,
+      executionContext: writeView.executionContext,
       workflowStatus,
       requestContext: params.requestContext,
       tracingContext: params.tracingContext,

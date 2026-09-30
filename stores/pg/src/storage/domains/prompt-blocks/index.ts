@@ -22,10 +22,11 @@ import type {
   ListPromptBlockVersionsInput,
   ListPromptBlockVersionsOutput,
 } from '@mastra/core/storage/domains/prompt-blocks';
-import { parseSqlIdentifier } from '@mastra/core/utils';
+import { schemaNamePrefix } from '../../../shared/schema-name';
 import { PgDB, resolvePgConfig, generateTableSQL, generateIndexSQL } from '../../db';
 import type { DbClient, PgDomainConfig } from '../../db';
 import { truncateIdentifierWithHash } from '../../db/constraint-utils';
+import { toPgJson } from '../../db/sanitize-json';
 import { getTableName, getSchemaName, parseJsonResilient } from '../utils';
 
 const SNAPSHOT_FIELDS = ['name', 'description', 'content', 'rules', 'requestContextSchema'] as const;
@@ -68,7 +69,7 @@ export class PromptBlocksPG extends PromptBlocksStorage {
    */
   static getExportDDL(schemaName?: string): string[] {
     const statements: string[] = [];
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
     const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
 
     // Tables
@@ -92,7 +93,7 @@ export class PromptBlocksPG extends PromptBlocksStorage {
   }
 
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    const schemaPrefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const schemaPrefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     return PromptBlocksPG.getDefaultIndexDefs(schemaPrefix);
   }
 
@@ -198,7 +199,7 @@ export class PromptBlocksPG extends PromptBlocksStorage {
           'draft',
           null,
           promptBlock.authorId ?? null,
-          promptBlock.metadata ? JSON.stringify(promptBlock.metadata) : null,
+          promptBlock.metadata ? toPgJson(promptBlock.metadata) : null,
           nowIso,
           nowIso,
           nowIso,
@@ -293,7 +294,7 @@ export class PromptBlocksPG extends PromptBlocksStorage {
       if (metadata !== undefined) {
         const mergedMetadata = { ...(existingBlock.metadata || {}), ...metadata };
         setClauses.push(`metadata = $${paramIndex++}`);
-        values.push(JSON.stringify(mergedMetadata));
+        values.push(toPgJson(mergedMetadata));
       }
 
       // Always update timestamps
@@ -391,7 +392,7 @@ export class PromptBlocksPG extends PromptBlocksStorage {
 
       if (metadata && Object.keys(metadata).length > 0) {
         conditions.push(`metadata @> $${paramIdx++}::jsonb`);
-        queryParams.push(JSON.stringify(metadata));
+        queryParams.push(toPgJson(metadata));
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -475,9 +476,9 @@ export class PromptBlocksPG extends PromptBlocksStorage {
           input.name,
           input.description ?? null,
           input.content,
-          input.rules ? JSON.stringify(input.rules) : null,
-          input.requestContextSchema ? JSON.stringify(input.requestContextSchema) : null,
-          input.changedFields ? JSON.stringify(input.changedFields) : null,
+          input.rules ? toPgJson(input.rules) : null,
+          input.requestContextSchema ? toPgJson(input.requestContextSchema) : null,
+          input.changedFields ? toPgJson(input.changedFields) : null,
           input.changeMessage ?? null,
           nowIso,
           nowIso,

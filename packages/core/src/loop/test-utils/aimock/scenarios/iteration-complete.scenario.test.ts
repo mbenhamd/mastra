@@ -2,7 +2,12 @@ import { it, expect } from 'vitest';
 import { z } from 'zod/v4';
 import type { OutputProcessor, Processor } from '../../../../processors';
 import { createTool } from '../../../../tools';
-import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
+import {
+  runLoopScenario,
+  useLoopScenarioAimock,
+  describeForAllEngines,
+  isDurableEngineVariant,
+} from '../aimock-scenario';
 import type { IterationCompleteContext } from '../../../../agent';
 import {
   AGENT_RESPONSE_RECOVERY_CONTINUATION,
@@ -787,9 +792,11 @@ describeForAllEngines(
 
       expect(toolExecutions).toBe(1);
       expect(requests).toHaveLength(2);
-      if (engine === 'durable') {
-        // Durable terminalizes the tripwire before a second iteration callback;
-        // there is therefore no callback opportunity to reopen the run.
+      if (isDurableEngineVariant(engine)) {
+        // Durable (and the evented engine, which now runs EventedAgent on the
+        // durable loop builder) terminalizes the tripwire before a second
+        // iteration callback; there is therefore no callback opportunity to
+        // reopen the run.
         expect(iterations).toHaveLength(1);
       } else {
         expect(iterations).toHaveLength(2);
@@ -799,7 +806,7 @@ describeForAllEngines(
           finishReason: 'tripwire',
         });
       }
-      expect(await output.finishReason).toBe(engine === 'durable' ? 'other' : 'tripwire');
+      expect(await output.finishReason).toBe(isDurableEngineVariant(engine) ? 'other' : 'tripwire');
       expect(await output.text).not.toContain('UNEXPECTED_REOPENED_GENERATION');
     });
   },

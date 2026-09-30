@@ -452,6 +452,7 @@ export class GoogleCloudPubSub extends PubSub {
       try {
         await cb(
           event,
+
           async () => {},
           async () => {},
         );

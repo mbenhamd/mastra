@@ -55,7 +55,11 @@ describe.each(['normal', 'evented'] as const)('AIMock optional stages approval r
         return workflow;
       });
 
-      shared = await createSharedAgent(llm, { tools: { approvalTool }, engine });
+      // Plain-Agent evented route: MASTRA_EVENTED_EXECUTION is set from
+      // `engine` above, so no wrapper-selecting `engine` option is passed
+      // here. Shared `engine: 'evented'` legs exercise EventedAgent; this
+      // fixture keeps the historical-graph plain-Agent contract it asserts.
+      shared = await createSharedAgent(llm, { tools: { approvalTool } });
       const mastra: Mastra = shared.mastra;
       const workflowsStore = (await mastra.getStorage()!.getStore('workflows'))!;
       const persist = workflowsStore.persistWorkflowSnapshot.bind(workflowsStore);

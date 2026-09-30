@@ -14,6 +14,7 @@ import {
   DatasetsStorage,
   calculatePagination,
   normalizePerPage,
+  resolveListOrderBy,
   safelyParseJSON,
   ensureDate,
   hasErrorCode,
@@ -44,12 +45,28 @@ import type {
 import type { TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { DbClient, PgDomainConfig } from '../../db';
+import { toPgJson } from '../../db/sanitize-json';
 import { getTableName, getSchemaName, tenancyWhere } from '../utils';
 
 /** Serialize a value for a jsonb column. Returns null for null/undefined. */
 function jsonbArg(value: unknown): string | null {
-  return value === undefined || value === null ? null : JSON.stringify(value);
+  return value === undefined || value === null ? null : toPgJson(value);
 }
+
+/** Preserve JSON null as data, rather than converting it to an absent SQL value. */
+function jsonDataArg(value: unknown): string | null {
+  return value === undefined ? null : JSON.stringify(value);
+}
+
+// Read arbitrary JSON as text so pg cannot collapse JSON null into SQL NULL or
+// cause JSON-looking strings to be parsed a second time by the row transformers.
+const ITEM_SELECT_COLUMNS = [...Object.keys(DATASET_ITEMS_SCHEMA), 'createdAtZ', 'updatedAtZ']
+  .map(column =>
+    ['input', 'groundTruth', 'expectedTrajectory'].includes(column)
+      ? `"${column}"::text AS "${column}"`
+      : `"${column}"`,
+  )
+  .join(', ');
 
 function parseStoredJSON<T>(value: unknown): T {
   if (typeof value === 'string') {
@@ -250,9 +267,9 @@ export class DatasetsPG extends DatasetsStorage {
       groundTruthSchema: row.groundTruthSchema ? safelyParseJSON(row.groundTruthSchema) : undefined,
       requestContextSchema: row.requestContextSchema ? safelyParseJSON(row.requestContextSchema) : undefined,
       tags: row.tags ? safelyParseJSON(row.tags) : undefined,
-      targetType: (row.targetType as TargetType) || null,
-      targetIds: row.targetIds || null,
-      scorerIds: row.scorerIds || null,
+      targetType: (row.targetType as TargetType) || undefined,
+      targetIds: row.targetIds ?? undefined,
+      scorerIds: row.scorerIds ?? undefined,
       organizationId: (row.organizationId as string | null) ?? null,
       projectId: (row.projectId as string | null) ?? null,
       candidateKey: (row.candidateKey as string | null) ?? null,
@@ -362,9 +379,9 @@ export class DatasetsPG extends DatasetsStorage {
         inputSchema: input.inputSchema ?? undefined,
         groundTruthSchema: input.groundTruthSchema ?? undefined,
         requestContextSchema: input.requestContextSchema ?? undefined,
-        targetType: input.targetType ?? null,
-        targetIds: input.targetIds ?? null,
-        scorerIds: input.scorerIds ?? null,
+        targetType: input.targetType ?? undefined,
+        targetIds: input.targetIds ?? undefined,
+        scorerIds: input.scorerIds ?? undefined,
         organizationId: input.organizationId ?? null,
         projectId: input.projectId ?? null,
         candidateKey: input.candidateKey ?? null,
@@ -459,23 +476,23 @@ export class DatasetsPG extends DatasetsStorage {
       }
       if (args.metadata !== undefined) {
         setClauses.push(`"metadata" = $${paramIndex++}`);
-        values.push(JSON.stringify(args.metadata));
+        values.push(toPgJson(args.metadata));
       }
       if (args.inputSchema !== undefined) {
         setClauses.push(`"inputSchema" = $${paramIndex++}`);
-        values.push(args.inputSchema === null ? null : JSON.stringify(args.inputSchema));
+        values.push(args.inputSchema === null ? null : toPgJson(args.inputSchema));
       }
       if (args.groundTruthSchema !== undefined) {
         setClauses.push(`"groundTruthSchema" = $${paramIndex++}`);
-        values.push(args.groundTruthSchema === null ? null : JSON.stringify(args.groundTruthSchema));
+        values.push(args.groundTruthSchema === null ? null : toPgJson(args.groundTruthSchema));
       }
       if (args.requestContextSchema !== undefined) {
         setClauses.push(`"requestContextSchema" = $${paramIndex++}`);
-        values.push(args.requestContextSchema === null ? null : JSON.stringify(args.requestContextSchema));
+        values.push(args.requestContextSchema === null ? null : toPgJson(args.requestContextSchema));
       }
       if (args.tags !== undefined) {
         setClauses.push(`"tags" = $${paramIndex++}`);
-        values.push(args.tags === null ? null : JSON.stringify(args.tags));
+        values.push(args.tags === null ? null : toPgJson(args.tags));
       }
       if (args.targetType !== undefined) {
         setClauses.push(`"targetType" = $${paramIndex++}`);
@@ -483,11 +500,11 @@ export class DatasetsPG extends DatasetsStorage {
       }
       if (args.targetIds !== undefined) {
         setClauses.push(`"targetIds" = $${paramIndex++}`);
-        values.push(args.targetIds === null ? null : JSON.stringify(args.targetIds));
+        values.push(args.targetIds === null ? null : toPgJson(args.targetIds));
       }
       if (args.scorerIds !== undefined) {
         setClauses.push(`"scorerIds" = $${paramIndex++}`);
-        values.push(args.scorerIds === null ? null : JSON.stringify(args.scorerIds));
+        values.push(args.scorerIds === null ? null : toPgJson(args.scorerIds));
       }
       // Tenancy (organizationId, projectId) and candidate identity (candidateKey,
       // candidateId) are immutable after creation — they're not part of UpdateDatasetInput.
@@ -510,9 +527,9 @@ export class DatasetsPG extends DatasetsStorage {
           (args.requestContextSchema !== undefined ? args.requestContextSchema : existing.requestContextSchema) ??
           undefined,
         tags: (args.tags !== undefined ? args.tags : existing.tags) ?? undefined,
-        targetType: (args.targetType !== undefined ? args.targetType : existing.targetType) ?? null,
-        targetIds: (args.targetIds !== undefined ? args.targetIds : existing.targetIds) ?? null,
-        scorerIds: (args.scorerIds !== undefined ? args.scorerIds : existing.scorerIds) ?? null,
+        targetType: (args.targetType !== undefined ? args.targetType : existing.targetType) ?? undefined,
+        targetIds: (args.targetIds !== undefined ? args.targetIds : existing.targetIds) ?? undefined,
+        scorerIds: (args.scorerIds !== undefined ? args.scorerIds : existing.scorerIds) ?? undefined,
         organizationId: existing.organizationId ?? null,
         projectId: existing.projectId ?? null,
         candidateKey: existing.candidateKey ?? null,
@@ -599,6 +616,10 @@ export class DatasetsPG extends DatasetsStorage {
 
   async listDatasets(args: ListDatasetsInput): Promise<ListDatasetsOutput> {
     try {
+      const orderBy = resolveListOrderBy(args.orderBy, ['createdAt', 'updatedAt', 'name'], {
+        field: 'createdAt',
+        direction: 'DESC',
+      });
       const { page, perPage: perPageInput } = args.pagination;
       const tableName = getTableName({ indexName: TABLE_DATASETS, schemaName: getSchemaName(this.#schema) });
 
@@ -656,7 +677,7 @@ export class DatasetsPG extends DatasetsStorage {
       const limitValue = perPageInput === false ? total : perPage;
 
       const rows = await this.#db.readClient.manyOrNone(
-        `SELECT * FROM ${tableName} ${whereClause} ORDER BY "createdAt" DESC, "id" ASC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+        `SELECT * FROM ${tableName} ${whereClause} ORDER BY "${orderBy.field}" ${orderBy.direction}, "id" ASC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
         [...queryParams, limitValue, offset],
       );
 
@@ -720,8 +741,8 @@ export class DatasetsPG extends DatasetsStorage {
             parentOrganizationId,
             parentProjectId,
             JSON.stringify(args.input),
-            jsonbArg(args.groundTruth),
-            jsonbArg(args.expectedTrajectory),
+            jsonDataArg(args.groundTruth),
+            jsonDataArg(args.expectedTrajectory),
             jsonbArg(args.toolMocks),
             args.unmockedToolPolicy ?? null,
             jsonbArg(args.scorerIds),
@@ -850,8 +871,8 @@ export class DatasetsPG extends DatasetsStorage {
             parentOrganizationId,
             parentProjectId,
             JSON.stringify(mergedInput),
-            jsonbArg(mergedGroundTruth),
-            jsonbArg(mergedExpectedTrajectory),
+            jsonDataArg(mergedGroundTruth),
+            jsonDataArg(mergedExpectedTrajectory),
             jsonbArg(mergedToolMocks),
             mergedUnmockedToolPolicy ?? null,
             jsonbArg(mergedScorerIds),
@@ -945,8 +966,8 @@ export class DatasetsPG extends DatasetsStorage {
             parentOrganizationId,
             parentProjectId,
             JSON.stringify(existing.input),
-            jsonbArg(existing.groundTruth),
-            jsonbArg(existing.expectedTrajectory),
+            jsonDataArg(existing.groundTruth),
+            jsonDataArg(existing.expectedTrajectory),
             jsonbArg(existing.toolMocks),
             existing.unmockedToolPolicy ?? null,
             jsonbArg(existing.scorerIds),
@@ -987,7 +1008,7 @@ export class DatasetsPG extends DatasetsStorage {
         schemaName: getSchemaName(this.#schema),
       });
       const purgedAt = new Date().toISOString();
-      const purgedMetadata = JSON.stringify({ __purged: true, purgedAt });
+      const purgedMetadata = toPgJson({ __purged: true, purgedAt });
 
       await this.#db.client.tx(async t => {
         const dataset = await t.oneOrNone(`SELECT "id" FROM ${datasetsTable} WHERE "id" = $1 FOR UPDATE`, [datasetId]);
@@ -1054,7 +1075,7 @@ export class DatasetsPG extends DatasetsStorage {
         const externalIds = [...new Set(input.items.flatMap(item => (item.externalId ? [item.externalId] : [])))];
         const historyRows = externalIds.length
           ? await t.manyOrNone(
-              `SELECT * FROM ${itemsTable} WHERE "datasetId" = $1 AND "externalId" = ANY($2::text[]) ORDER BY "datasetVersion"`,
+              `SELECT ${ITEM_SELECT_COLUMNS} FROM ${itemsTable} WHERE "datasetId" = $1 AND "externalId" = ANY($2::text[]) ORDER BY "datasetVersion"`,
               [input.datasetId, externalIds],
             )
           : [];
@@ -1082,8 +1103,8 @@ export class DatasetsPG extends DatasetsStorage {
                 dataset.organizationId ?? null,
                 dataset.projectId ?? null,
                 JSON.stringify(item.input),
-                jsonbArg(item.groundTruth),
-                jsonbArg(item.expectedTrajectory),
+                jsonDataArg(item.groundTruth),
+                jsonDataArg(item.expectedTrajectory),
                 jsonbArg(item.toolMocks),
                 item.unmockedToolPolicy ?? null,
                 jsonbArg(item.scorerIds),
@@ -1163,7 +1184,7 @@ export class DatasetsPG extends DatasetsStorage {
 
         // Fetch current items after taking the dataset lock, skipping missing or mismatched items.
         const currentRows = await t.manyOrNone(
-          `SELECT * FROM ${itemsTable} WHERE "id" = ANY($1::text[]) AND "datasetId" = $2 AND "validTo" IS NULL AND "isDeleted" = false`,
+          `SELECT ${ITEM_SELECT_COLUMNS} FROM ${itemsTable} WHERE "id" = ANY($1::text[]) AND "datasetId" = $2 AND "validTo" IS NULL AND "isDeleted" = false`,
           [input.itemIds, input.datasetId],
         );
         const currentItems = currentRows.map(row => this.transformItemRow(row));
@@ -1195,8 +1216,8 @@ export class DatasetsPG extends DatasetsStorage {
               parentOrganizationId,
               parentProjectId,
               JSON.stringify(item.input),
-              jsonbArg(item.groundTruth),
-              jsonbArg(item.expectedTrajectory),
+              jsonDataArg(item.groundTruth),
+              jsonDataArg(item.expectedTrajectory),
               jsonbArg(item.toolMocks),
               item.unmockedToolPolicy ?? null,
               jsonbArg(item.scorerIds),
@@ -1246,12 +1267,12 @@ export class DatasetsPG extends DatasetsStorage {
 
       if (args.datasetVersion !== undefined) {
         result = await client.oneOrNone(
-          `SELECT * FROM ${tableName} WHERE "id" = $1 AND "datasetVersion" <= $2 AND ("validTo" IS NULL OR "validTo" > $2) AND "isDeleted" = false ORDER BY "datasetVersion" DESC LIMIT 1`,
+          `SELECT ${ITEM_SELECT_COLUMNS} FROM ${tableName} WHERE "id" = $1 AND "datasetVersion" <= $2 AND ("validTo" IS NULL OR "validTo" > $2) AND "isDeleted" = false ORDER BY "datasetVersion" DESC LIMIT 1`,
           [args.id, args.datasetVersion],
         );
       } else {
         result = await client.oneOrNone(
-          `SELECT * FROM ${tableName} WHERE "id" = $1 AND "validTo" IS NULL AND "isDeleted" = false`,
+          `SELECT ${ITEM_SELECT_COLUMNS} FROM ${tableName} WHERE "id" = $1 AND "validTo" IS NULL AND "isDeleted" = false`,
           [args.id],
         );
       }
@@ -1273,7 +1294,7 @@ export class DatasetsPG extends DatasetsStorage {
     try {
       const tableName = getTableName({ indexName: TABLE_DATASET_ITEMS, schemaName: getSchemaName(this.#schema) });
       const rows = await this.#db.readClient.manyOrNone(
-        `SELECT * FROM ${tableName} WHERE "datasetId" = $1 AND "datasetVersion" <= $2 AND ("validTo" IS NULL OR "validTo" > $3) AND "isDeleted" = false ORDER BY "createdAt" DESC, "id" ASC`,
+        `SELECT ${ITEM_SELECT_COLUMNS} FROM ${tableName} WHERE "datasetId" = $1 AND "datasetVersion" <= $2 AND ("validTo" IS NULL OR "validTo" > $3) AND "isDeleted" = false ORDER BY "createdAt" DESC, "id" ASC`,
         [datasetId, version, version],
       );
       return (rows || []).map(row => this.transformItemRow(row));
@@ -1293,7 +1314,7 @@ export class DatasetsPG extends DatasetsStorage {
     try {
       const tableName = getTableName({ indexName: TABLE_DATASET_ITEMS, schemaName: getSchemaName(this.#schema) });
       const rows = await this.#db.readClient.manyOrNone(
-        `SELECT * FROM ${tableName} WHERE "id" = $1 ORDER BY "datasetVersion" DESC`,
+        `SELECT ${ITEM_SELECT_COLUMNS} FROM ${tableName} WHERE "id" = $1 ORDER BY "datasetVersion" DESC`,
         [itemId],
       );
       return (rows || []).map(row => this.transformItemRowFull(row));
@@ -1319,6 +1340,10 @@ export class DatasetsPG extends DatasetsStorage {
    */
   async #listItems(client: DbClient, args: ListDatasetItemsInput): Promise<ListDatasetItemsOutput> {
     try {
+      const orderBy = resolveListOrderBy(args.orderBy, ['createdAt', 'updatedAt'], {
+        field: 'createdAt',
+        direction: 'DESC',
+      });
       const { page, perPage: perPageInput } = args.pagination;
       const tableName = getTableName({ indexName: TABLE_DATASET_ITEMS, schemaName: getSchemaName(this.#schema) });
 
@@ -1375,7 +1400,7 @@ export class DatasetsPG extends DatasetsStorage {
       const limitValue = perPageInput === false ? total : perPage;
 
       const rows = await client.manyOrNone(
-        `SELECT * FROM ${tableName} ${whereClause} ORDER BY "createdAt" DESC, "id" ASC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+        `SELECT ${ITEM_SELECT_COLUMNS} FROM ${tableName} ${whereClause} ORDER BY "${orderBy.field}" ${orderBy.direction}, "id" ASC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
         [...queryParams, limitValue, offset],
       );
 

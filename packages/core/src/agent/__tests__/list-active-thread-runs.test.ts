@@ -38,6 +38,8 @@ function createFakeRun(runId: string) {
   };
 }
 
+// registerRun installs the run record synchronously; its returned promise
+// tracks terminal delivery, so these in-flight runs never await it.
 describe('listActiveThreadRuns', () => {
   const pubsub = new EventEmitterPubSub();
 
@@ -50,14 +52,14 @@ describe('listActiveThreadRuns', () => {
     expect(runtime.listActiveThreadRuns(pubsub)).toEqual([]);
 
     const runA = createFakeRun('run-a');
-    await runtime.registerRun(
+    void runtime.registerRun(
       fakeAgent,
       runA.output,
       { memory: { thread: 'thread-a', resource: 'resource-a' } },
       pubsub,
     );
     const runB = createFakeRun('run-b');
-    await runtime.registerRun(
+    void runtime.registerRun(
       fakeAgent,
       runB.output,
       { memory: { thread: 'thread-b', resource: 'resource-b' } },
@@ -100,13 +102,13 @@ describe('AgentController.listActiveThreadRuns', () => {
     const buildRun = createFakeRun('run-build');
     const planRun = createFakeRun('run-plan');
     try {
-      await agentThreadStreamRuntime.registerRun(
+      void agentThreadStreamRuntime.registerRun(
         buildAgent,
         buildRun.output,
         { memory: { thread: 'thread-build', resource: 'resource-build' } },
         buildPubSub,
       );
-      await agentThreadStreamRuntime.registerRun(
+      void agentThreadStreamRuntime.registerRun(
         planAgent,
         planRun.output,
         { memory: { thread: 'thread-plan', resource: 'resource-plan' } },

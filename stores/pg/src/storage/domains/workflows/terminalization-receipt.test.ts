@@ -552,8 +552,9 @@ describe('WorkflowsPG terminal destination receipts', () => {
     await pool.query(
       `UPDATE mastra_workflow_terminalizations
        SET phase = 'complete', owner_id = NULL, claim_token = NULL, lease_expires_at = NULL,
-           updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint,
-           completed_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+           updated_at = clock.now_ms,
+           completed_at = clock.now_ms
+       FROM (SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS now_ms) AS clock
        WHERE workflow_name = $1 AND run_id = $2`,
       [workflowName, ready.run.runId],
     );

@@ -1,7 +1,9 @@
 import { ReadableStream } from 'node:stream/web';
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod/v4';
 import { createTerminalToolResultPartId, MessageList } from '../../agent/message-list';
 import { TripWire } from '../../agent/trip-wire';
+import { ConsoleLogger } from '../../logger';
 import type { Processor, ProcessorStreamWriter } from '../../processors';
 import { ProcessorRunner, ProcessorState } from '../../processors/runner';
 import { ChunkFrom } from '../types';
@@ -213,6 +215,87 @@ describe('MastraModelOutput', () => {
       }
     },
   );
+
+  it.each([true, false])('uses the configured logger or preserves the default (injected: %s)', async injectLogger => {
+    const logger = new ConsoleLogger({ level: 'debug' });
+    vi.spyOn(logger, 'child').mockReturnValue(logger);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => {});
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const runId = 'logger-run';
+      const output = new MastraModelOutput({
+        model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+        stream: createChunkStream([
+          createTextDeltaChunk(runId, '[1,2,3]'),
+          { type: 'text-end', runId, from: ChunkFrom.AGENT, payload: { id: 'text-1' } },
+          createStepFinishChunk(runId),
+          createFinishChunk(runId),
+        ]),
+        messageList: new MessageList({ threadId: 'test-thread' }),
+        messageId: 'msg-1',
+        options: {
+          runId,
+          ...(injectLogger ? { logger } : {}),
+          isLLMExecutionStep: true,
+          structuredOutput: { schema: z.object({ name: z.string() }), errorStrategy: 'warn' },
+        },
+      });
+
+      const chunks = [];
+      for await (const chunk of output.fullStream) chunks.push(chunk);
+      expect(chunks.some(chunk => chunk.type === 'error')).toBe(false);
+
+      if (injectLogger) {
+        expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('Structured output validation failed'));
+      } else {
+        expect(warn).not.toHaveBeenCalled();
+      }
+      expect(error).not.toHaveBeenCalled();
+      expect(consoleWarn).not.toHaveBeenCalled();
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleWarn.mockRestore();
+      consoleError.mockRestore();
+    }
+  });
+
+  it('resolves the fallback object and usedFallbackValue before the finish callback in direct mode', async () => {
+    const runId = 'fallback-consistency-run';
+    const fallbackValue = { name: 'fallback-name' };
+    let onFinishPayload: any;
+    const output = new MastraModelOutput({
+      model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+      stream: createChunkStream([
+        createTextDeltaChunk(runId, '{"name":'),
+        createTextDeltaChunk(runId, ' 123}'),
+        { type: 'text-end', runId, from: ChunkFrom.AGENT, payload: { id: 'text-1' } },
+        createStepFinishChunk(runId),
+        createFinishChunk(runId),
+      ]),
+      messageList: new MessageList({ threadId: 'test-thread' }),
+      messageId: 'msg-1',
+      options: {
+        runId,
+        isLLMExecutionStep: true,
+        structuredOutput: { schema: z.object({ name: z.string() }), errorStrategy: 'fallback', fallbackValue },
+        onFinish: async payload => {
+          onFinishPayload = payload;
+        },
+      },
+    });
+
+    await output.consumeStream();
+
+    // The completion callback must observe the same final structured result the stream
+    // resolves to: the schema-invalid text (name is a number) falls back to the configured
+    // value, and the fallback flag is set before the finish chunk reaches the callback.
+    expect(onFinishPayload?.object).toEqual(fallbackValue);
+    expect(onFinishPayload?.usedFallbackValue).toBe(true);
+    expect(await output.object).toEqual(fallbackValue);
+    expect(onFinishPayload?.object).toEqual(await output.object);
+  });
 
   describe('writer in output processors (outer context)', () => {
     it.each([true, false])('materializes only the aborted step after buffer reset (partial: %s)', async partial => {
@@ -923,6 +1006,114 @@ describe('MastraModelOutput', () => {
       expect(finishPayload.content).toEqual([]);
     });
 
+    it('reports finishReason "aborted" and no tripwire when a caller abort bails through the tripwire path', async () => {
+      const runId = 'test-run';
+      const messageList = new MessageList({ threadId: 'test-thread' });
+
+      // A caller `abortSignal` cancellation enqueues an `abort` chunk and then bails through the
+      // shared execution-bail path, which emits a `finish` chunk with `reason: 'tripwire'` and no
+      // real step tripwire. The result must be reported as a cancellation, not a processor block.
+      const stream = createChunkStream([
+        {
+          type: 'text-delta',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: { text: 'partial answer' },
+        },
+        {
+          type: 'abort',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {},
+        },
+        {
+          type: 'finish',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            id: 'finish-1',
+            output: {
+              steps: [],
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+            stepResult: {
+              reason: 'tripwire',
+              warnings: [],
+              isContinued: false,
+            },
+            metadata: {},
+            messages: { nonUser: [], all: [] },
+          },
+        },
+      ] as ChunkType[]);
+
+      const output = new MastraModelOutput({
+        model: { modelId: '__GATEWAY_OPENAI_MODEL__', provider: 'test', version: 'v3' },
+        stream,
+        messageList,
+        messageId: 'msg-1',
+        options: { runId },
+      });
+
+      await output.consumeStream();
+
+      expect(await output.finishReason).toBe('aborted');
+      expect(output.tripwire).toBeUndefined();
+    });
+
+    it('still surfaces a real processor tripwire on the finish chunk (no abort)', async () => {
+      const runId = 'test-run';
+      const messageList = new MessageList({ threadId: 'test-thread' });
+
+      // A genuine processor tripwire bails with `reason: 'tripwire'` and carries real tripwire data
+      // on the last step. Without a preceding abort, the tripwire must still be surfaced.
+      const stream = createChunkStream([
+        {
+          type: 'finish',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            id: 'finish-1',
+            output: {
+              steps: [
+                {
+                  tripwire: {
+                    reason: 'Blocked by moderation processor',
+                    processorId: 'moderation',
+                  },
+                },
+              ],
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+            stepResult: {
+              reason: 'tripwire',
+              warnings: [],
+              isContinued: false,
+            },
+            metadata: {},
+            messages: { nonUser: [], all: [] },
+          },
+        },
+      ] as ChunkType[]);
+
+      const output = new MastraModelOutput({
+        model: { modelId: '__GATEWAY_OPENAI_MODEL__', provider: 'test', version: 'v3' },
+        stream,
+        messageList,
+        messageId: 'msg-1',
+        options: { runId },
+      });
+
+      await output.consumeStream();
+
+      expect(output.tripwire).toEqual({
+        reason: 'Blocked by moderation processor',
+        processorId: 'moderation',
+        retry: undefined,
+        metadata: undefined,
+      });
+    });
+
     it('should keep the latest step raw usage across multiple steps', async () => {
       const runId = 'test-run';
       const firstRaw = {
@@ -1492,6 +1683,139 @@ describe('MastraModelOutput', () => {
   });
 
   describe('terminal tool-result transaction', () => {
+    it.each([false, true])(
+      'keeps callback writes postcommit and rejects reserved writes (reserved: %s)',
+      async reserved => {
+        for (const surface of ['evented', 'raw'] as const) {
+          const runId = `callback-writer-${surface}-${reserved}`;
+          const messageId = `assistant-${runId}`;
+          const terminalToolResult = {
+            status: 'success' as const,
+            items: [
+              {
+                toolName: 'spawn_subagent',
+                toolCallId: 'child-call',
+                status: 'success' as const,
+                value: { text: 'Authentic answer' },
+              },
+            ],
+          };
+          const messageList = new MessageList({ threadId: runId });
+          messageList.add(
+            {
+              id: messageId,
+              role: 'assistant',
+              createdAt: new Date(),
+              content: { format: 2, parts: [{ type: 'text', text: 'Original answer' }] },
+            },
+            'response',
+          );
+          const terminalDataChunk = {
+            type: 'data-terminal-tool-result',
+            id: createTerminalToolResultPartId(runId, 0),
+            data: terminalToolResult,
+          } as ChunkType;
+          const stepChunk = createStepFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+          stepChunk.payload.messageId = messageId;
+          stepChunk.payload.stepResult.reason = 'tool-calls';
+          stepChunk.payload.terminalToolResult = terminalToolResult;
+          const finishChunk = createFinishChunk(runId) as ChunkType & { payload: Record<string, any> };
+          finishChunk.payload.stepResult.reason = 'tool-calls';
+          finishChunk.payload.terminalToolResult = terminalToolResult;
+          let enterPersistence!: () => void;
+          let releasePersistence!: () => void;
+          const entered = new Promise<void>(resolve => {
+            enterPersistence = resolve;
+          });
+          const release = new Promise<void>(resolve => {
+            releasePersistence = resolve;
+          });
+          let committed = false;
+          const observer: Processor = {
+            id: 'callback-writer-observer',
+            terminalToolResultPolicy: 'pass-through',
+            processOutputResult: async ({ messages, writer }) => {
+              await writer!.custom({ type: 'data-processor-proof', data: { staged: true } });
+              return messages;
+            },
+          };
+          const owner: Processor = {
+            id: 'callback-writer-owner',
+            terminalToolResultPolicy: 'pass-through',
+            terminalToolResultPersistence: 'owner',
+            processOutputResult: async ({ messages }) => {
+              enterPersistence();
+              await release;
+              committed = true;
+              return messages;
+            },
+          };
+          const logger = new ConsoleLogger({ level: 'debug' });
+          vi.spyOn(logger, 'child').mockReturnValue(logger);
+          const logged = vi.spyOn(logger, 'error').mockImplementation(() => {});
+          const onFinish = vi.fn(async (_payload, context) => {
+            expect(committed).toBe(true);
+            await context.writer.custom({
+              type: reserved ? 'data-terminal-tool-result' : 'data-callback-proof',
+              data: { value: 'CALLBACK_SENTINEL' },
+            });
+          });
+          const output = new MastraModelOutput({
+            model: { modelId: 'test-model', provider: 'test', version: 'v3' },
+            stream: createChunkStream([terminalDataChunk, stepChunk, finishChunk]),
+            messageList,
+            messageId,
+            options: { runId, logger, outputProcessors: [observer, owner], onFinish },
+          });
+          const chunks: ChunkType[] = [];
+          // The raw fixture owns the drain. Finish-payload getters must not start
+          // the normal automatic drain against its already locked stream.
+          const automaticDrain =
+            surface === 'raw' ? vi.spyOn(output, 'consumeStream').mockResolvedValue(undefined) : undefined;
+          const stream = surface === 'raw' ? output._getBaseStream() : output.fullStream;
+          const consumed = (async () => {
+            for await (const chunk of stream) chunks.push(chunk);
+          })();
+          try {
+            await entered;
+            expect(chunks).toHaveLength(0);
+            expect(onFinish).not.toHaveBeenCalled();
+          } finally {
+            releasePersistence();
+            try {
+              await consumed;
+            } finally {
+              automaticDrain?.mockRestore();
+            }
+          }
+          expect(onFinish).toHaveBeenCalledOnce();
+          expect(output.terminalToolResult).toEqual(terminalToolResult);
+          expect(chunks.filter(chunk => chunk.type === 'data-processor-proof')).toHaveLength(1);
+          expect(chunks.filter(chunk => chunk.type === 'data-terminal-tool-result')).toEqual([
+            expect.objectContaining({ data: terminalToolResult }),
+          ]);
+          expect(chunks.filter(chunk => chunk.type === 'finish')).toHaveLength(1);
+          expect(chunks.at(-1)?.type).toBe('finish');
+          const parts = messageList.get.all.db().flatMap(message => message.content.parts);
+          expect(parts.filter(part => part.type === 'data-terminal-tool-result')).toHaveLength(1);
+          if (reserved) {
+            expect(logged).toHaveBeenCalledWith(
+              'Terminal onFinish callback failed after commit',
+              expect.objectContaining({ runId, error: expect.any(TypeError) }),
+            );
+            expect(JSON.stringify({ chunks, parts })).not.toContain('CALLBACK_SENTINEL');
+          } else {
+            expect(logged).not.toHaveBeenCalled();
+            expect(chunks.filter(chunk => chunk.type === 'data-callback-proof')).toHaveLength(1);
+            expect(chunks.findIndex(chunk => chunk.type === 'data-callback-proof')).toBeGreaterThan(
+              chunks.findIndex(chunk => chunk.type === 'data-terminal-tool-result'),
+            );
+            expect(parts.filter(part => part.type === 'data-callback-proof')).toHaveLength(1);
+          }
+        }
+      },
+    );
+
     it('reports a terminal processor TripWire consistently across every completion surface', async () => {
       const runId = 'terminal-tripwire';
       const messageId = 'assistant-terminal-tripwire';

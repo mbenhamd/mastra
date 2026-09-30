@@ -5,7 +5,12 @@ import { z } from 'zod';
 import { Agent } from '../../../../agent';
 import type { ChunkType } from '../../../../stream/types';
 import { createTool } from '../../../../tools';
-import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
+import {
+  runLoopScenario,
+  useLoopScenarioAimock,
+  describeForAllEngines,
+  isDurableEngineVariant,
+} from '../aimock-scenario';
 import { SCENARIO_MODEL_ID } from '../types';
 
 /**
@@ -48,7 +53,7 @@ describeForAllEngines('background-task-agent-level scenario', engine => {
       stopWhen: stepCountIs(3),
       backgroundTasks: { enabled: true },
       collectChunks: true,
-      ...(engine !== 'durable'
+      ...(!isDurableEngineVariant(engine)
         ? {
             onChunk: (chunk: ChunkType) => {
               onChunks.push(chunk);
@@ -72,7 +77,7 @@ describeForAllEngines('background-task-agent-level scenario', engine => {
       toolName: 'plain-work',
     });
 
-    if (engine !== 'durable') {
+    if (!isDurableEngineVariant(engine)) {
       const onChunkStarted = onChunks.find(c => c.type === 'background-task-started');
       expect(onChunkStarted).toBeDefined();
       expect(onChunkStarted?.payload).toMatchObject({
@@ -172,7 +177,7 @@ describeForAllEngines(
       expect(await output.text).toContain('Parent received the leaf result.');
       expect(leafExecutions).toBe(1);
       const tasks = (await mastra?.backgroundTaskManager?.listTasks({}))?.tasks ?? [];
-      const leafTasks = tasks.filter(task => task.toolName === 'nested-leaf');
+      const leafTasks = tasks.filter((task: { toolName: string }) => task.toolName === 'nested-leaf');
       expect(leafTasks).toHaveLength(expectedLeafTasks);
       if (expectedLeafTasks === 1) {
         expect(leafTasks[0]?.status).toBe('completed');

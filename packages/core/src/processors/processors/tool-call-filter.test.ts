@@ -38,6 +38,13 @@ function toolResultPart(toolCallId: string, toolName: string, output: any = { ty
   return { type: 'tool-result' as const, toolCallId, toolName, output };
 }
 
+function explicitModelOutputPart(toolCallId: string, toolName: string, output: any) {
+  return {
+    ...toolResultPart(toolCallId, toolName, output),
+    providerOptions: { mastra: { modelOutput: output } },
+  };
+}
+
 function toolCallIdsIn(prompt: LanguageModelV2Prompt): string[] {
   return prompt.flatMap(message =>
     typeof message.content === 'string'
@@ -184,7 +191,7 @@ describe('ToolCallFilter', () => {
       },
       {
         role: 'tool',
-        content: [toolResultPart('call-search', 'search', { type: 'text', value: 'Compact search summary' })],
+        content: [explicitModelOutputPart('call-search', 'search', { type: 'text', value: 'Compact search summary' })],
       },
     ];
 
@@ -206,11 +213,104 @@ describe('ToolCallFilter', () => {
       expect(result.map(message => message.role)).toEqual(['user', 'assistant']);
     });
 
+    it('does not preserve a raw fallback result without explicit model output provenance', async () => {
+      const prompt: LanguageModelV2Prompt = [
+        { role: 'assistant', content: [toolCallPart('call-raw', 'rawTool')] },
+        {
+          role: 'tool',
+          content: [toolResultPart('call-raw', 'rawTool', { type: 'json', value: { secret: 'RAW_RESULT' } })],
+        },
+      ];
+
+      const result = await runFilter(new ToolCallFilter({ preserveModelOutput: true }), prompt);
+
+      expect(JSON.stringify(result)).not.toContain('RAW_RESULT');
+      expect(result).toEqual([]);
+    });
+
+    it('does not preserve a raw result when explicit model output is nullish', async () => {
+      const prompt: LanguageModelV2Prompt = [
+        { role: 'assistant', content: [toolCallPart('call-nullish', 'nullishTool')] },
+        {
+          role: 'tool',
+          content: [
+            {
+              ...toolResultPart('call-nullish', 'nullishTool', {
+                type: 'json',
+                value: { secret: 'NULLISH_RAW_RESULT' },
+              }),
+              providerOptions: { mastra: { modelOutput: null } },
+            },
+          ],
+        },
+      ];
+
+      const result = await runFilter(new ToolCallFilter({ preserveModelOutput: true }), prompt);
+
+      expect(JSON.stringify(result)).not.toContain('NULLISH_RAW_RESULT');
+      expect(result).toEqual([]);
+    });
+
+    it('distinguishes equal outputs by explicit model output provenance', async () => {
+      const output = { type: 'text' as const, value: 'SAME_OUTPUT' };
+      const prompt: LanguageModelV2Prompt = [
+        {
+          role: 'assistant',
+          content: [toolCallPart('call-explicit', 'explicitTool'), toolCallPart('call-raw', 'rawTool')],
+        },
+        {
+          role: 'tool',
+          content: [
+            explicitModelOutputPart('call-explicit', 'explicitTool', output),
+            toolResultPart('call-raw', 'rawTool', output),
+          ],
+        },
+      ];
+
+      const result = await runFilter(new ToolCallFilter({ preserveModelOutput: true }), prompt);
+
+      expect(textsIn(result)).toEqual(['explicitTool result:\nSAME_OUTPUT']);
+      expect(JSON.stringify(result)).not.toContain('rawTool result');
+    });
+
+    it('preserves explicit model output after an earlier processor clones the prompt', async () => {
+      const cloneProcessor: Processor = {
+        id: 'clone-prompt',
+        name: 'ClonePrompt',
+        processLLMRequest: async ({ prompt }) => ({ prompt: structuredClone(prompt) }),
+      };
+      const clonedPrompt = await runFilter(cloneProcessor, searchPrompt());
+      const result = await runFilter(new ToolCallFilter({ preserveModelOutput: true }), clonedPrompt);
+
+      expect(textsIn(result)).toContain('search result:\nCompact search summary');
+      expect(toolCallIdsIn(result)).toEqual([]);
+    });
+
+    it('requires modelOutput to be an own property', async () => {
+      const inheritedMetadata = Object.create({ modelOutput: { type: 'text', value: 'INHERITED_OUTPUT' } });
+      const prompt: LanguageModelV2Prompt = [
+        { role: 'assistant', content: [toolCallPart('call-inherited', 'inheritedTool')] },
+        {
+          role: 'tool',
+          content: [
+            {
+              ...toolResultPart('call-inherited', 'inheritedTool', { type: 'text', value: 'INHERITED_OUTPUT' }),
+              providerOptions: { mastra: inheritedMetadata },
+            },
+          ],
+        },
+      ];
+
+      const result = await runFilter(new ToolCallFilter({ preserveModelOutput: true }), prompt);
+
+      expect(result).toEqual([]);
+    });
+
     it('preserves model output only for the tools being filtered', async () => {
       const prompt: LanguageModelV2Prompt = [
         ...searchPrompt(),
         { role: 'assistant', content: [toolCallPart('call-calc', 'calculator')] },
-        { role: 'tool', content: [toolResultPart('call-calc', 'calculator', { type: 'text', value: '42' })] },
+        { role: 'tool', content: [explicitModelOutputPart('call-calc', 'calculator', { type: 'text', value: '42' })] },
       ];
 
       const result = await runFilter(new ToolCallFilter({ exclude: ['search'], preserveModelOutput: true }), prompt);
@@ -225,7 +325,9 @@ describe('ToolCallFilter', () => {
         { role: 'assistant', content: [toolCallPart('call-private', 'private-file', { path: 'PRIVATE_PATH' })] },
         {
           role: 'tool',
-          content: [toolResultPart('call-private', 'private-file', { type: 'text', value: 'PRIVATE_COMPACT_RESULT' })],
+          content: [
+            explicitModelOutputPart('call-private', 'private-file', { type: 'text', value: 'PRIVATE_COMPACT_RESULT' }),
+          ],
         },
       ];
 
@@ -252,7 +354,7 @@ describe('ToolCallFilter', () => {
         { role: 'assistant', content: [toolCallPart('call-search', 'search')] },
         {
           role: 'tool',
-          content: [toolResultPart('call-search', 'search', { type: 'text', value: 'A'.repeat(500) })],
+          content: [explicitModelOutputPart('call-search', 'search', { type: 'text', value: 'A'.repeat(500) })],
         },
       ];
 
@@ -281,9 +383,9 @@ describe('ToolCallFilter', () => {
         {
           role: 'tool',
           content: [
-            toolResultPart('call-text', 'textTool', { type: 'text', value: 'plain text' }),
-            toolResultPart('call-json', 'jsonTool', { type: 'json', value: { total: 7 } }),
-            toolResultPart('call-content', 'contentTool', {
+            explicitModelOutputPart('call-text', 'textTool', { type: 'text', value: 'plain text' }),
+            explicitModelOutputPart('call-json', 'jsonTool', { type: 'json', value: { total: 7 } }),
+            explicitModelOutputPart('call-content', 'contentTool', {
               type: 'content',
               value: [
                 { type: 'text', text: 'first' },
@@ -308,7 +410,7 @@ describe('ToolCallFilter', () => {
         {
           role: 'tool',
           content: [
-            toolResultPart('call-content', 'screenshotTool', {
+            explicitModelOutputPart('call-content', 'screenshotTool', {
               type: 'content',
               value: [
                 { type: 'text', text: 'visible summary' },
@@ -332,7 +434,7 @@ describe('ToolCallFilter', () => {
         {
           role: 'tool',
           content: [
-            toolResultPart('call-unknown', 'providerTool', {
+            explicitModelOutputPart('call-unknown', 'providerTool', {
               type: 'provider-defined-blob',
               value: { raw: 'UNSAFE_RESULT' },
             }),
@@ -353,7 +455,7 @@ describe('ToolCallFilter', () => {
         {
           role: 'tool',
           content: [
-            toolResultPart('call-hook', 'hookTool', {
+            explicitModelOutputPart('call-hook', 'hookTool', {
               type: 'json',
               value: { toJSON: () => 'UNSAFE_RESULT' },
             }),
@@ -375,7 +477,7 @@ describe('ToolCallFilter', () => {
 
       const prompt: LanguageModelV2Prompt = [
         { role: 'assistant', content: [toolCallPart('call-deep', 'deepTool')] },
-        { role: 'tool', content: [toolResultPart('call-deep', 'deepTool', { type: 'json', value: deep })] },
+        { role: 'tool', content: [explicitModelOutputPart('call-deep', 'deepTool', { type: 'json', value: deep })] },
       ];
 
       const result = await runFilter(new ToolCallFilter({ preserveModelOutput: true }), prompt);
@@ -390,7 +492,10 @@ describe('ToolCallFilter', () => {
 
       const prompt: LanguageModelV2Prompt = [
         { role: 'assistant', content: [toolCallPart('call-circular', 'circularTool')] },
-        { role: 'tool', content: [toolResultPart('call-circular', 'circularTool', { type: 'json', value: circular })] },
+        {
+          role: 'tool',
+          content: [explicitModelOutputPart('call-circular', 'circularTool', { type: 'json', value: circular })],
+        },
       ];
 
       const result = await runFilter(new ToolCallFilter({ preserveModelOutput: true }), prompt);
@@ -454,7 +559,7 @@ describe('ToolCallFilter', () => {
       { role: 'assistant', content: [toolCallPart('call-search', 'search', { query: 'SECRET_QUERY' })] },
       {
         role: 'tool',
-        content: [toolResultPart('call-search', 'search', { type: 'text', value: 'Compact search summary' })],
+        content: [explicitModelOutputPart('call-search', 'search', { type: 'text', value: 'Compact search summary' })],
       },
     ];
 

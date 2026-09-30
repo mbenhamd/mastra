@@ -16,11 +16,19 @@ class RecordingTxClient implements TxClient {
     return null;
   }
 
-  async one<T = any>(): Promise<T> {
+  constructor(private readonly threads: Map<string, Record<string, unknown>>) {}
+
+  async one<T = any>(query: string): Promise<T> {
+    // Rollback receipt generation read after the copy.
+    if (query.includes('xmin::text')) return { storageGeneration: 'clone-generation' } as T;
     throw new Error('not implemented');
   }
 
-  async oneOrNone<T = any>(): Promise<T | null> {
+  async oneOrNone<T = any>(query: string, values?: QueryValues): Promise<T | null> {
+    // Source/destination thread rows are read under FOR UPDATE inside the copy transaction.
+    if (query.includes('SELECT * FROM') && query.includes('FOR UPDATE')) {
+      return (this.threads.get(String(values?.[0])) as T | undefined) ?? null;
+    }
     throw new Error('not implemented');
   }
 
@@ -53,8 +61,8 @@ class RecordingTxClient implements TxClient {
 }
 
 class RecordingDbClient extends RecordingDbClientBase {
-  readonly txClient = new RecordingTxClient();
   readonly threads = new Map<string, Record<string, unknown>>();
+  readonly txClient = new RecordingTxClient(this.threads);
 
   constructor(sourceMessages: Record<string, any>[]) {
     super();

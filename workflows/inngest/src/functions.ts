@@ -14,19 +14,24 @@ export function collectInngestFunctions({
     ...Object.values(mastra.listWorkflows()),
     // Durable backing workflows are hidden from the public workflow listing,
     // but their Inngest functions must still be served with the owning agents.
+    // Workflow IDs are agent-scoped (createInngestDurableAgenticWorkflowIds),
+    // so every inngest agent's functions must be served, not just one
+    // representative agent. The Map below dedupes shared function IDs.
     ...Object.values(mastra.listAgents()).flatMap(agent => (isInngestAgent(agent) ? agent.getDurableWorkflows() : [])),
   ];
-  const workflowFunctions = Array.from(
-    new Set(
-      workflows.flatMap(workflow => {
-        if (workflow instanceof InngestWorkflow) {
-          workflow.__registerMastra(mastra);
-          return workflow.getFunctions();
-        }
-        return [];
-      }),
-    ),
-  );
+  const workflowFunctions = new Map<string, InngestFunction.Like>();
 
-  return [...workflowFunctions, ...userFunctions];
+  for (const workflow of workflows) {
+    if (!(workflow instanceof InngestWorkflow)) continue;
+
+    workflow.__registerMastra(mastra);
+    for (const fn of workflow.getFunctions()) {
+      const functionId = fn.id();
+      if (!workflowFunctions.has(functionId)) {
+        workflowFunctions.set(functionId, fn);
+      }
+    }
+  }
+
+  return [...workflowFunctions.values(), ...userFunctions];
 }

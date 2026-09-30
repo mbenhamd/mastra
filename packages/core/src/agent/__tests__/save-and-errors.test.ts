@@ -315,7 +315,7 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
       });
     }, 500000);
 
-    it('should not save any message if interrupted before any part is emitted', async () => {
+    it('should handle interruption before any part is emitted', async () => {
       const mockMemory = new MockMemory();
       let saveCallCount = 0;
 
@@ -355,9 +355,26 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
         resourceId: 'resource-3-generate',
       });
 
-      // Input-only failed turns remain excluded by MessageHistory's orphan guard.
-      expect(result.messages.length).toBe(0);
-      expect(saveCallCount).toBe(0);
+      if (version === 'v1') {
+        // Input-only failed turns remain excluded by MessageHistory's orphan guard.
+        expect(result.messages.length).toBe(0);
+        expect(saveCallCount).toBe(0);
+      } else {
+        // v2 records the terminal failure as a first-class `error` part, so the
+        // failed turn becomes a real user/assistant pair instead of an input-only
+        // turn the orphan guard has to drop. It persists through MessageHistory's
+        // ordinary storage path, which is why the Memory-level save spy stays at 0.
+        expect(result.messages.length).toBe(2);
+        expect(result.messages.map(message => message.role)).toEqual(['user', 'assistant']);
+        expect(result.messages[1].content.parts).toEqual([
+          {
+            type: 'error',
+            error: { name: 'Error', message: 'Immediate interruption' },
+            createdAt: expect.any(Number),
+          },
+        ]);
+        expect(saveCallCount).toBe(0);
+      }
     });
 
     it('should save thread but not messages if error occurs during LLM generation', async () => {
@@ -429,6 +446,208 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
   });
 
   if (version === 'v2') {
+    describe('terminal error persistence', () => {
+      /** Streams one text part, then fails terminally with no recovery available. */
+      function createPartialThenErrorModel(errorMessage: string) {
+        const error = new Error(errorMessage);
+        return new MockLanguageModelV2({
+          doGenerate: async () => {
+            throw error;
+          },
+          doStream: async () => ({
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+              { type: 'text-start', id: 'text-1' },
+              { type: 'text-delta', id: 'text-1', delta: 'partial answer' },
+              { type: 'text-end', id: 'text-1' },
+              { type: 'error' as const, error },
+            ]),
+          }),
+        });
+      }
+
+      function errorPartsIn(messages: MastraDBMessage[]) {
+        return messages.flatMap(message => (message.content?.parts ?? []).filter(part => part.type === 'error'));
+      }
+
+      async function recallAll(mockMemory: MockMemory, thread: string, resource: string) {
+        const result = await mockMemory.recall({ threadId: thread, resourceId: resource });
+        return result?.messages ?? [];
+      }
+
+      it('appends the error part after the partial parts of the same assistant message', async () => {
+        const mockMemory = new MockMemory();
+        const agent = new Agent({
+          id: 'partial-terminal-error-agent',
+          name: 'Partial Terminal Error Agent',
+          instructions: 'test',
+          model: createPartialThenErrorModel('stream broke'),
+          memory: mockMemory,
+        });
+
+        const result = await agent.stream('tell me something', {
+          memory: { thread: 'thread-partial-error', resource: 'resource-partial-error' },
+          modelSettings: { maxRetries: 0 },
+        });
+        for await (const _chunk of result.fullStream) {
+          // drain so the run reaches its terminal error path
+        }
+
+        const messages = await recallAll(mockMemory, 'thread-partial-error', 'resource-partial-error');
+
+        expect(messages.map(message => message.role)).toEqual(['user', 'assistant']);
+        expect(messages[1].content.parts.map(part => part.type)).toEqual(['text', 'error']);
+        expect(messages[1].content.parts.find(part => part.type === 'text')).toMatchObject({
+          text: 'partial answer',
+        });
+        expect(errorPartsIn(messages)).toEqual([
+          { type: 'error', error: { name: 'Error', message: 'stream broke' }, createdAt: expect.any(Number) },
+        ]);
+      });
+
+      it('persists the original terminal error when an output processor transforms its streamed chunk', async () => {
+        const mockMemory = new MockMemory();
+        const agent = new Agent({
+          id: 'processed-terminal-error-agent',
+          name: 'Processed Terminal Error Agent',
+          instructions: 'test',
+          model: createPartialThenErrorModel('original failure'),
+          memory: mockMemory,
+          outputProcessors: [
+            {
+              id: 'replace-terminal-error-chunk',
+              processOutputStream: ({ part }: { part: ChunkType }) =>
+                part.type === 'error'
+                  ? { ...part, payload: { ...part.payload, error: new Error('processor replacement') } }
+                  : part,
+            },
+          ],
+        });
+
+        const result = await agent.stream('tell me something', {
+          memory: { thread: 'thread-processed-error', resource: 'resource-processed-error' },
+          modelSettings: { maxRetries: 0 },
+        });
+        for await (const _chunk of result.fullStream) {
+          // drain so the run reaches its terminal error path
+        }
+
+        const messages = await recallAll(mockMemory, 'thread-processed-error', 'resource-processed-error');
+        expect(errorPartsIn(messages)).toEqual([
+          { type: 'error', error: { name: 'Error', message: 'original failure' }, createdAt: expect.any(Number) },
+        ]);
+      });
+
+      it('keeps partial parts and the error part on one record after a retry-budget-exhausted id rotation', async () => {
+        const mockMemory = new MockMemory();
+        let rotations = 0;
+
+        const agent = new Agent({
+          id: 'rotating-terminal-error-agent',
+          name: 'Rotating Terminal Error Agent',
+          instructions: 'test',
+          model: createPartialThenErrorModel('stream broke'),
+          memory: mockMemory,
+          maxProcessorRetries: 2,
+          errorProcessors: [
+            {
+              id: 'rotate-then-exhaust',
+              name: 'Rotate then exhaust the budget',
+              processAPIError: async ({ rotateResponseMessageId, retryCount }) => {
+                rotations += 1;
+                rotateResponseMessageId();
+                // Retry once, then run out of budget so the turn terminates.
+                return { retry: retryCount < 1 };
+              },
+            },
+          ],
+        });
+
+        const result = await agent.stream('tell me something', {
+          memory: { thread: 'thread-rotate-error', resource: 'resource-rotate-error' },
+          modelSettings: { maxRetries: 0 },
+        });
+        for await (const _chunk of result.fullStream) {
+          // drain
+        }
+
+        expect(rotations).toBeGreaterThanOrEqual(1);
+
+        const messages = await recallAll(mockMemory, 'thread-rotate-error', 'resource-rotate-error');
+        const errorParts = errorPartsIn(messages);
+
+        // Exactly one terminal record, and the rotation did not split it from the
+        // partial output of the attempt it belongs to.
+        expect(errorParts).toHaveLength(1);
+        expect(errorParts[0]).toMatchObject({ error: { name: 'Error', message: 'stream broke' } });
+
+        const carrier = messages.find(message => (message.content?.parts ?? []).some(part => part.type === 'error'))!;
+        expect(carrier.role).toBe('assistant');
+        expect(carrier.content.parts.map(part => part.type)).toEqual(['text', 'error']);
+      });
+
+      it('records no error part when an ordinary model retry recovers the turn', async () => {
+        const mockMemory = new MockMemory();
+        let streamCalls = 0;
+
+        const recoveringModel = new MockLanguageModelV2({
+          doGenerate: async () => {
+            throw new Error('first attempt failed');
+          },
+          doStream: async () => {
+            streamCalls += 1;
+            if (streamCalls === 1) {
+              throw new Error('first attempt failed');
+            }
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              warnings: [],
+              stream: convertArrayToReadableStream([
+                { type: 'stream-start', warnings: [] },
+                { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+                { type: 'text-start', id: 'text-1' },
+                { type: 'text-delta', id: 'text-1', delta: 'recovered answer' },
+                { type: 'text-end', id: 'text-1' },
+                {
+                  type: 'finish' as const,
+                  finishReason: 'stop' as const,
+                  usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                },
+              ]),
+            };
+          },
+        });
+
+        const agent = new Agent({
+          id: 'recovered-retry-agent',
+          name: 'Recovered Retry Agent',
+          instructions: 'test',
+          model: recoveringModel,
+          memory: mockMemory,
+        });
+
+        const result = await agent.stream('tell me something', {
+          memory: { thread: 'thread-recovered', resource: 'resource-recovered' },
+          modelSettings: { maxRetries: 1 },
+        });
+        for await (const _chunk of result.fullStream) {
+          // drain
+        }
+
+        expect(streamCalls).toBe(2);
+
+        const messages = await recallAll(mockMemory, 'thread-recovered', 'resource-recovered');
+        expect(errorPartsIn(messages)).toEqual([]);
+        expect(messages.map(message => message.role)).toEqual(['user', 'assistant']);
+        expect(messages[1].content.parts).toEqual([
+          { type: 'text', text: 'recovered answer', createdAt: expect.any(Number) },
+        ]);
+      });
+    });
+
     describe('error handling consistency', () => {
       it('should preserve full APICallError in fullStream chunk, onError callback, and result.error', async () => {
         let onErrorCallbackError: any = null;
@@ -953,7 +1172,13 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
             threadId: 'partial-failure-thread',
             resourceId: 'partial-failure-resource',
           });
-          expect(recalled.messages).toEqual([]);
+          expect(recalled.messages.map(message => message.role)).toEqual(['user', 'assistant']);
+          expect(new Set(recalled.messages.map(message => message.id)).size).toBe(2);
+          expect(
+            recalled.messages[1]?.content.parts
+              ?.filter(part => part.type === 'text')
+              .map(part => ({ type: part.type, text: part.text })),
+          ).toEqual([{ type: 'text', text: 'partial' }]);
         });
 
         it('should call onError in generate when error chunk has non-error finishReason', async () => {
@@ -1402,7 +1627,9 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
         expect(abortEvent).toBeDefined();
       });
 
-      it('should run output processors but not persist an immediate abort', async () => {
+      // PF-4402 user decision: adopts upstream #23867 (supersedes PF-3759's no-commit rule for
+      // failed/aborted turns in MessageHistory).
+      it('should persist an immediate abort and recall it on the next turn', async () => {
         const abortController = new AbortController();
         const prompts: unknown[] = [];
         let streamCallCount = 0;
@@ -1504,11 +1731,25 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
           threadId: memory.thread,
           resourceId: memory.resource,
         });
-        expect(afterAbort.messages).toEqual([]);
-        expect(saveMessagesSpy).not.toHaveBeenCalled();
+        expect(afterAbort.messages).toHaveLength(1);
+        expect(afterAbort.messages[0]).toMatchObject({
+          role: 'user',
+          content: { parts: [{ type: 'text', text: 'message before abort' }] },
+        });
+        expect(afterAbort.messages[0]?.id).toBeTruthy();
+        expect(saveMessagesSpy).toHaveBeenCalledTimes(1);
+        expect(saveMessagesSpy.mock.calls[0]?.[0].messages.map(message => message.id)).toEqual([
+          afterAbort.messages[0]?.id,
+        ]);
         expect(outputProcessorCalls).toBe(1);
         expect(onAbortCalls).toBe(1);
         expect(onFinishCalls).toBe(0);
+
+        // Abort exits before the terminal-error branch, so the failed turn must
+        // not gain a persisted `error` part.
+        expect(
+          afterAbort.messages.flatMap(message => message.content?.parts ?? []).filter(part => part.type === 'error'),
+        ).toEqual([]);
 
         const nextStream = await agent.stream('message after abort', {
           memory,
@@ -1517,17 +1758,23 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
         await nextStream.consumeStream();
 
         expect(streamCallCount).toBe(2);
-        expect(JSON.stringify(prompts[1])).not.toContain('message before abort');
+        expect(JSON.stringify(prompts[1])).toContain('message before abort');
         expect(JSON.stringify(prompts[1])).toContain('message after abort');
         const afterNextTurn = await mockMemory.recall({
           threadId: memory.thread,
           resourceId: memory.resource,
         });
-        expect(afterNextTurn.messages.map(message => message.role)).toEqual(['user', 'assistant']);
-        expect(new Set(afterNextTurn.messages.map(message => message.id)).size).toBe(2);
+        expect(afterNextTurn.messages.map(message => message.role)).toEqual(['user', 'user', 'assistant']);
+        expect(new Set(afterNextTurn.messages.map(message => message.id)).size).toBe(3);
+        expect(afterNextTurn.messages[0]?.id).toBe(afterAbort.messages[0]?.id);
+        expect(
+          afterNextTurn.messages.flatMap(message => message.content?.parts ?? []).filter(part => part.type === 'error'),
+        ).toEqual([]);
       });
 
-      it('should not persist partial assistant text from an aborted stream', async () => {
+      // PF-4402 user decision: adopts upstream #23867 (supersedes PF-3759's no-commit rule for
+      // failed/aborted turns in MessageHistory).
+      it('should persist the assistant text available when the abort is saved', async () => {
         const abortController = new AbortController();
         const totalChunks = 20;
         const abortAfterChunks = 5;
@@ -1633,8 +1880,28 @@ function saveAndErrorTests(version: 'v1' | 'v2') {
           threadId: 'bounded-abort-thread',
           resourceId: 'bounded-abort-resource',
         });
-        expect(recalled.messages).toEqual([]);
-        expect(saveMessagesSpy).not.toHaveBeenCalled();
+        expect(recalled.messages.map(message => message.role)).toEqual(['user', 'assistant']);
+        expect(new Set(recalled.messages.map(message => message.id)).size).toBe(2);
+        expect(
+          recalled.messages[0]?.content.parts
+            ?.filter(part => part.type === 'text')
+            .map(part => ({ type: part.type, text: part.text })),
+        ).toEqual([{ type: 'text', text: 'Write a very long essay' }]);
+        expect(
+          recalled.messages[1]?.content.parts
+            ?.filter(part => part.type === 'text')
+            .map(part => ({ type: part.type, text: part.text })),
+        ).toEqual([{ type: 'text', text: 'chunk-1 chunk-2 chunk-3 chunk-4 ' }]);
+        expect(saveMessagesSpy).toHaveBeenCalledTimes(1);
+        expect(saveMessagesSpy.mock.calls[0]?.[0].messages.map(message => message.id)).toEqual(
+          recalled.messages.map(message => message.id),
+        );
+
+        // The aborted turn persists its partial assistant text, but abort exits
+        // before the terminal-error branch so it must not gain an `error` part.
+        expect(
+          recalled.messages.flatMap(message => message.content?.parts ?? []).filter(part => part.type === 'error'),
+        ).toEqual([]);
       });
     });
   }
@@ -1773,11 +2040,13 @@ describe('message persistence across completed steps', () => {
     expect(persistedAssistantText).toContain('Response after tool');
   });
 
-  it('does not commit an aborted turn to MessageHistory after completed tool steps', async () => {
+  // PF-4402 user decision: adopts upstream #23867 (supersedes PF-3759's no-commit rule for
+  // failed/aborted turns in MessageHistory).
+  it('should persist messages from completed steps when stream is aborted', async () => {
     let doStreamCallCount = 0;
 
-    // Completed tools remain observable in workflow/product history. ADR 0023
-    // keeps the separate MessageHistory continuity copy free of canceled turns.
+    // Cancellation cannot erase submitted history or completed tool calls/results: they are
+    // historical facts, and the tool may already have caused an irreversible external side effect.
     // Model that produces a tool call on first invocation, then text on second
     const toolCallModel = new MockLanguageModelV2({
       doStream: async () => {
@@ -1884,6 +2153,7 @@ describe('message persistence across completed steps', () => {
       // Expected: stream may error on abort
     }
 
+    // Fork: the aborted step also reports its finish (unchanged by #23867).
     expect(stepFinishReasons).toEqual(['tool-calls', 'abort']);
     expect(outputProcessorCalls).toBe(1);
 
@@ -1891,9 +2161,32 @@ describe('message persistence across completed steps', () => {
       threadId: 'thread-save-per-step-abort',
       resourceId: 'resource-save-per-step-abort',
     });
-    expect(doStreamCallCount).toBe(2);
-    expect(recalled.messages).toEqual([]);
-    expect(saveMessagesSpy).not.toHaveBeenCalled();
+    expect(recalled.messages.map(message => message.role)).toEqual(['user', 'assistant', 'assistant']);
+    expect(new Set(recalled.messages.map(message => message.id)).size).toBe(3);
+    expect(saveMessagesSpy).toHaveBeenCalledTimes(1);
+    expect(saveMessagesSpy.mock.calls[0]?.[0].messages.map(message => message.id)).toEqual(
+      recalled.messages.map(message => message.id),
+    );
+
+    const toolInvocationParts = recalled.messages
+      .flatMap(message => message.content.parts ?? [])
+      .filter(part => part.type === 'tool-invocation');
+    expect(toolInvocationParts).toHaveLength(1);
+    expect(toolInvocationParts[0]).toMatchObject({
+      toolInvocation: {
+        toolCallId: 'call-1',
+        toolName: 'echo-tool',
+        state: 'result',
+        args: { input: 'hello' },
+        result: { output: 'hello' },
+      },
+    });
+    expect(
+      recalled.messages
+        .flatMap(message => message.content.parts ?? [])
+        .filter(part => part.type === 'text')
+        .map(part => part.text),
+    ).toEqual(['test message', 'Response after tool', 'Response after tool']);
   });
 
   it('should preserve savePerStep persistence when aborting after a completed step', async () => {

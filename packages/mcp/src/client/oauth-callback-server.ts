@@ -6,7 +6,7 @@
  * with MCPOAuthClientProvider to complete the authorization-code flow for
  * OAuth-protected MCP servers.
  *
- * @see https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization
+ * @see https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization
  */
 
 import { timingSafeEqual } from 'node:crypto';
@@ -89,6 +89,11 @@ export interface OAuthCallbackResult {
    * The state parameter echoed back by the authorization server.
    */
   state: string;
+
+  /**
+   * RFC 9207 authorization-server issuer returned with the callback, when present.
+   */
+  iss?: string;
 }
 
 /**
@@ -344,7 +349,7 @@ export async function createOAuthCallbackServer(options: OAuthCallbackServerOpti
     }
 
     respond(200, SUCCESS_HTML);
-    settle({ result: { code, state } });
+    settle({ result: { code, state, iss: url.searchParams.get('iss') ?? undefined } });
   });
 
   let boundUrl: URL | undefined;

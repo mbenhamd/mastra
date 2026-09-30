@@ -310,6 +310,30 @@ function normalizeSerializedStepOptions(value: unknown, field: string, state: Gr
 }
 
 /**
+ * Classifier step options (upstream #24747). `retries`, `maxRetries` and
+ * `providerOptions` change execution, so they participate in the fingerprint;
+ * `metadata` is descriptive only, mirroring agent/tool step options.
+ */
+function normalizeSerializedClassifierStepOptions(value: unknown, field: string, state: GraphState): string {
+  if (value === undefined) return '';
+  const descriptors = getDataDescriptors(value, field);
+  validateKeys(descriptors, ['retries', 'metadata', 'maxRetries', 'providerOptions'], [], field);
+  const semantic: Record<string, unknown> = {};
+  for (const key of ['retries', 'maxRetries'] as const) {
+    const count = descriptors[key]?.value;
+    if (count === undefined) continue;
+    if (!Number.isSafeInteger(count) || (count as number) < 0) {
+      throw new TypeError(`${field}.${key} must be a non-negative safe integer`);
+    }
+    semantic[key] = count;
+  }
+  const providerOptions = descriptors.providerOptions?.value;
+  if (providerOptions !== undefined) semantic.providerOptions = providerOptions;
+  if (Object.keys(semantic).length === 0) return '';
+  return hashCanonicalData('mastra.workflow-terminal-parent-graph.classifier-options.v1', semantic, field, state);
+}
+
+/**
  * Normalizes one {@link SerializedSingleStepEntry} (or a legacy bare
  * {@link SerializedStep}, which pre-#20471 graphs stored for loop/foreach
  * bodies). Implicit `mapping` entries intentionally emit the exact part
@@ -389,6 +413,16 @@ function normalizeSingleStepEntry(
     }
     return id;
   }
+  if (type === 'classifier') {
+    validateKeys(descriptors, ['type', 'id', 'classifierId', 'options'], ['type', 'id', 'classifierId'], field);
+    const id = validateWorkflowTerminalStructuralString(descriptors.id!.value, `${field}.id`);
+    if (scopeStepIds.has(id)) throw new TypeError(`serialized workflow graph contains duplicate step id ${id}`);
+    scopeStepIds.add(id);
+    const ref = validateWorkflowTerminalStructuralString(descriptors.classifierId!.value, `${field}.classifierId`);
+    const options = normalizeSerializedClassifierStepOptions(descriptors.options?.value, `${field}.options`, state);
+    append(state, parts, 'classifier', id, ref, options);
+    return id;
+  }
   if (type === 'workflow') {
     validateKeys(
       descriptors,
@@ -433,6 +467,7 @@ function normalizeGraph(
         'step',
         'agent',
         'tool',
+        'classifier',
         'mapping',
         'workflow',
         'sleep',
@@ -449,7 +484,14 @@ function normalizeGraph(
     // dedicated `mapping` variant identically so unchanged graphs keep their
     // pre-upgrade fingerprint.
     append(state, parts, 'entry', String(index), type === 'mapping' ? 'step' : (type as string));
-    if (type === 'step' || type === 'agent' || type === 'tool' || type === 'mapping' || type === 'workflow') {
+    if (
+      type === 'step' ||
+      type === 'agent' ||
+      type === 'tool' ||
+      type === 'classifier' ||
+      type === 'mapping' ||
+      type === 'workflow'
+    ) {
       normalizeSingleStepEntry(entries[index], parts, state, scopeStepIds, depth, entryField);
     } else if (type === 'sleep' || type === 'sleepUntil') {
       validateKeys(
@@ -670,7 +712,7 @@ export function readWorkflowTerminalSingleEntryStepId(value: unknown, field: str
   if (type === 'step') {
     return readStepId(descriptors.step?.value as SerializedStep, `${field}.step`);
   }
-  if (type === 'agent' || type === 'tool' || type === 'mapping' || type === 'workflow') {
+  if (type === 'agent' || type === 'tool' || type === 'classifier' || type === 'mapping' || type === 'workflow') {
     return validateWorkflowTerminalStructuralString(descriptors.id?.value, `${field}.id`);
   }
   throw new TypeError(`${field}.type is invalid`);
@@ -719,7 +761,7 @@ export function resolveWorkflowTerminalGraphCoordinate(
   if (type === 'step') {
     return { kind: 'step', stepId: readStepId(entryDescriptors.step?.value as SerializedStep, `${entryField}.step`) };
   }
-  if (type === 'agent' || type === 'tool' || type === 'mapping' || type === 'workflow') {
+  if (type === 'agent' || type === 'tool' || type === 'classifier' || type === 'mapping' || type === 'workflow') {
     return {
       kind: 'step',
       stepId: validateWorkflowTerminalStructuralString(entryDescriptors.id?.value, `${entryField}.id`),

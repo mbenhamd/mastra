@@ -119,7 +119,6 @@ function parseTopic(topic: string, workflowId: string): TopicRoute | null {
       }
     }
   }
-
   // Try workflow format first
   const workflowMatch = topic.match(/^workflow\.events\.v2\.(.+)$/);
   if (workflowMatch && workflowMatch[1]) {
@@ -173,6 +172,20 @@ function parseTopic(topic: string, workflowId: string): TopicRoute | null {
 }
 
 /**
+ * Warn once per unrecognized topic family so a missing topic mapping never fails
+ * silently again (dropped `agent.control.*` aborts shipped invisibly — see #22543).
+ * Deduped on the topic's leading two segments so run-scoped topics neither spam
+ * the logs nor grow the set unboundedly.
+ */
+const warnedUnrecognizedTopics = new Set<string>();
+function warnUnrecognizedTopic(topic: string): void {
+  const family = topic.split('.').slice(0, 2).join('.');
+  if (warnedUnrecognizedTopics.has(family)) return;
+  warnedUnrecognizedTopics.add(family);
+  console.warn(`InngestPubSub: ignoring unrecognized topic format "${topic}"`);
+}
+
+/**
  * PubSub implementation for Inngest workflows.
  *
  * This bridges the PubSub abstract class interface with Inngest's realtime system:
@@ -188,6 +201,8 @@ function parseTopic(topic: string, workflowId: string): TopicRoute | null {
  *   -> Inngest channel: "workflow:{workflowId}:{runId}", topic: "watch"
  * - "agent.stream.{runId}" - agent stream events (for InngestAgent)
  *   -> Inngest channel: "agent:{runId}", topic: "agent-stream"
+ * - "agent.control.{runId}" - agent control events (cross-process abort)
+ *   -> Inngest channel: "agent:{runId}", topic: "agent-control"
  */
 export class InngestPubSub extends PubSub {
   private inngest: Inngest;
@@ -239,6 +254,7 @@ export class InngestPubSub extends PubSub {
   async publish(topic: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void> {
     const parsed = parseTopic(topic, this.workflowId);
     if (!parsed) {
+      warnUnrecognizedTopic(topic);
       return; // Ignore unrecognized topic formats
     }
 
@@ -304,6 +320,7 @@ export class InngestPubSub extends PubSub {
   async subscribe(topic: string, cb: EventCallback, _options?: SubscribeOptions): Promise<void> {
     const parsed = parseTopic(topic, this.workflowId);
     if (!parsed) {
+      warnUnrecognizedTopic(topic);
       return; // Ignore unrecognized topic formats
     }
 
@@ -329,7 +346,6 @@ export class InngestPubSub extends PubSub {
       ready: Promise<void>;
     };
     this.subscriptions.set(topic, subscription);
-
     // Await the subscribe call to ensure the WebSocket connection is established
     // before we consider the subscription "ready". This prevents race conditions
     // where the workflow triggers before the subscription can receive events.
@@ -343,7 +359,6 @@ export class InngestPubSub extends PubSub {
           if (event.runId !== runId) {
             throw new TypeError(`Inngest event runId ${event.runId} does not match topic runId ${runId}`);
           }
-
           // Inngest Realtime does not expose per-message ack/nack handles. Await
           // every callback and contain rejection here so async subscriber errors
           // never become unhandled rejections in the websocket listener.

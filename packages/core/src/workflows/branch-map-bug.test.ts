@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../mastra';
 import { MockStore } from '../storage/mock';
@@ -6,6 +6,15 @@ import { createWorkflow } from './create';
 import { createStep } from './workflow';
 
 describe('Branch with Map Bug - Issue #10407', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    let counter = 0;
+    vi.spyOn(globalThis.crypto, 'randomUUID').mockImplementation(() => {
+      return `00000000-0000-4000-8000-${(++counter).toString().padStart(12, '0')}`;
+    });
+  });
+
   it('should pass inputData to nested workflow with map inside branch', async () => {
     const commonInputSchema = z.object({
       value: z.number(),

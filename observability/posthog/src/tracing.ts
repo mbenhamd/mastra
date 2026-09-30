@@ -225,7 +225,9 @@ export class PosthogExporter extends TrackingExporter<
     const distinctId = this.getDistinctId(span, traceData);
     const properties = this.buildEventProperties(span, 0);
 
-    this.#client?.capture(
+    // captureAi() targets PostHog's dedicated AI endpoint (8 MiB per event, oversized events
+    // dropped individually). Plain capture() uses /batch/, which returns 413 for large spans.
+    this.#client?.captureAi(
       this.withGroups({
         distinctId,
         event: eventName,
@@ -266,7 +268,7 @@ export class PosthogExporter extends TrackingExporter<
     const mergedSpan = !span.input && cachedSpan?.input ? { ...span, input: cachedSpan.input } : span;
 
     const eventMessage = this.buildEventMessage({ span: mergedSpan, traceData });
-    this.#client?.capture(this.withGroups(eventMessage));
+    this.#client?.captureAi(this.withGroups(eventMessage));
   }
 
   protected override async _abortSpan(args: {
@@ -280,7 +282,7 @@ export class PosthogExporter extends TrackingExporter<
     span.errorInfo = reason;
 
     const eventMessage = this.buildEventMessage({ span, traceData });
-    this.#client?.capture(this.withGroups(eventMessage));
+    this.#client?.captureAi(this.withGroups(eventMessage));
   }
 
   /**
@@ -317,7 +319,7 @@ export class PosthogExporter extends TrackingExporter<
     if (feedback.metadata?.sessionId) properties.$ai_session_id = feedback.metadata.sessionId;
 
     try {
-      this.#client.capture(
+      this.#client.captureAi(
         this.withGroups({
           distinctId: this.getFeedbackDistinctId(feedback),
           event: '$ai_feedback',

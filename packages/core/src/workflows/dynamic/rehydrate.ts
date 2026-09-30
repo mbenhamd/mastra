@@ -5,7 +5,7 @@
  * missing — better to surface the failure at load time than at run time.
  */
 import type { Mastra } from '../../mastra';
-import { cloneWorkflow, createWorkflow } from '../create';
+import { cloneWorkflow, createEventedWorkflow, createWorkflow } from '../create';
 import { derivePredicateLabel } from '../predicate';
 import type { WorkflowScheduleConfig } from '../scheduler/types';
 import type { Step } from '../step';
@@ -53,12 +53,30 @@ export interface RehydratedWorkflow {
   workflow: any;
 }
 
-export async function rehydrateWorkflow(def: DynamicWorkflowGraph, mastra: Mastra): Promise<RehydratedWorkflow> {
+/**
+ * Options controlling how `rehydrateWorkflow` rehydrates dynamic workflow
+ * definitions. Schema conversion itself is admission-gated: `jsonSchemaToZod`
+ * throws `UnsupportedJsonSchemaError` for schemas outside the storable dialect
+ * (see `json-schema-to-zod.ts`). These options only control engine selection
+ * and how an invalid stored `schedule` degrades.
+ */
+export type RehydrateWorkflowOptions = {
+  /** Selects the execution engine for the rehydrated workflow. */
+  engineType?: 'default' | 'evented';
+  /** Degrade-invalid-schedule behavior: throw (default) or warn and continue unscheduled. */
+  onUnsupportedSchema?: 'throw' | 'warn';
+  onUnsupported?: (message: string) => void;
+};
+
+export async function rehydrateWorkflow(
+  def: DynamicWorkflowGraph,
+  mastra: Mastra,
+  opts?: RehydrateWorkflowOptions,
+): Promise<RehydratedWorkflow> {
   const inputSchema = jsonSchemaToZod(def.inputSchema);
   const outputSchema = jsonSchemaToZod(def.outputSchema);
-  const stateSchema = def.stateSchema === undefined ? undefined : jsonSchemaToZod(def.stateSchema);
-  const requestContextSchema =
-    def.requestContextSchema === undefined ? undefined : jsonSchemaToZod(def.requestContextSchema);
+  const stateSchema = def.stateSchema ? jsonSchemaToZod(def.stateSchema) : undefined;
+  const requestContextSchema = def.requestContextSchema ? jsonSchemaToZod(def.requestContextSchema) : undefined;
 
   const baseParams = {
     id: def.id,
@@ -70,11 +88,24 @@ export async function rehydrateWorkflow(def: DynamicWorkflowGraph, mastra: Mastr
     requestContextSchema: requestContextSchema as any,
   };
 
-  // Presence of `schedule` promotes the workflow to the evented engine,
-  // which validates the cron expression(s) at construction time. Invalid
-  // persisted schedules fail closed instead of silently changing behavior.
-  const wf =
-    def.schedule === undefined ? createWorkflow(baseParams) : createWorkflow({ ...baseParams, schedule: def.schedule });
+  let wf;
+  if (def.schedule === undefined) {
+    wf = opts?.engineType === 'evented' ? createEventedWorkflow(baseParams) : createWorkflow(baseParams);
+  } else {
+    try {
+      // Presence of `schedule` promotes the workflow to the evented engine,
+      // which validates the cron expression(s) at construction time.
+      wf = createWorkflow({ ...baseParams, schedule: def.schedule as any });
+    } catch (error) {
+      // A bad stored schedule shouldn't sink the whole workflow: degrade to
+      // an unscheduled workflow and surface the problem.
+      if (opts?.onUnsupportedSchema !== 'warn') throw error;
+      opts.onUnsupported?.(
+        `Ignoring invalid stored schedule config: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      wf = opts.engineType === 'evented' ? createEventedWorkflow(baseParams) : createWorkflow(baseParams);
+    }
+  }
 
   for (const entry of def.graph) {
     applyGraphEntry(wf, entry, mastra, def.id);
@@ -88,6 +119,7 @@ function applyGraphEntry(wf: any, entry: ValidatableStepFlowEntry, mastra: Mastr
   switch (entry.type) {
     case 'agent':
     case 'tool':
+    case 'classifier':
       wf.__pushStepFlowEntry(rehydrateSingleEntry(entry, mastra), entry);
       return;
     case 'mapping': {
@@ -287,6 +319,23 @@ function rehydrateSingleEntry(entry: SerializedSingleStepEntry, mastra: Mastra):
         );
       }
       return { type: 'tool', id: entry.id, toolId: entry.toolId, tool, options: rebuildToolOptions(entry) };
+    }
+    case 'classifier': {
+      let classifier;
+      try {
+        classifier = mastra.getClassifierById(entry.classifierId);
+      } catch {
+        throw new Error(
+          `Dynamic workflow references classifier "${entry.classifierId}" which is not registered on this Mastra instance.`,
+        );
+      }
+      return {
+        type: 'classifier',
+        id: entry.id,
+        classifierId: entry.classifierId,
+        classifier,
+        options: entry.options,
+      };
     }
     case 'step': {
       const { id } = entry.step;

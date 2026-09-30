@@ -8,7 +8,7 @@ import type { ZodType, PublicSchema, StandardSchemaWithJSON } from '../../schema
 import { toStandardSchema, standardSchemaToJSONSchema } from '../../schema';
 import type { ValidationResult } from '../aisdk/v5/compat';
 import { ChunkFrom } from '../types';
-import type { ChunkType } from '../types';
+import type { ChunkType, MastraFinishReason } from '../types';
 import { getCompatValidationSchema, getTransformedSchema } from './schema';
 import type { SchemaModelInfo, ZodLikePartialSchema } from './schema';
 
@@ -213,7 +213,7 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
   /**
    * Validates a value against the schema using StandardSchemaWithJSON's validate method.
    */
-  protected async validateValue(value: unknown): Promise<ValidationResult<OUTPUT>> {
+  protected async validateValue(value: unknown, diagnosticValue: unknown = value): Promise<ValidationResult<OUTPUT>> {
     const schema = this.validationSchema ?? this.schema;
     if (!schema) {
       return {
@@ -250,7 +250,7 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
               id: 'STRUCTURED_OUTPUT_SCHEMA_VALIDATION_FAILED',
               text: `Structured output validation failed: ${errorMessages}`,
               details: {
-                value: typeof value === 'object' ? JSON.stringify(value) : String(value),
+                value: typeof diagnosticValue === 'object' ? JSON.stringify(diagnosticValue) : String(diagnosticValue),
               },
             },
             zodError,
@@ -287,7 +287,7 @@ abstract class BaseFormatHandler<OUTPUT = undefined> {
           id: 'STRUCTURED_OUTPUT_SCHEMA_VALIDATION_FAILED',
           text: `Structured output validation failed: ${errorMessages}`,
           details: {
-            value: typeof value === 'object' ? JSON.stringify(value) : String(value),
+            value: typeof diagnosticValue === 'object' ? JSON.stringify(diagnosticValue) : String(diagnosticValue),
           },
         }),
       };
@@ -420,7 +420,7 @@ class ObjectFormatHandler<OUTPUT = undefined> extends BaseFormatHandler<OUTPUT> 
     const rawValue = this.preprocessText(finalRawValue);
     const { value } = await parsePartialJson(rawValue);
 
-    return this.validateValue(value);
+    return this.validateValue(value, value === undefined ? rawValue : value);
   }
 }
 
@@ -455,21 +455,19 @@ class ArrayFormatHandler<OUTPUT = undefined> extends BaseFormatHandler<OUTPUT> {
           : [];
       const filteredElements: Partial<OUTPUT>[] = [];
 
-      // Filter out incomplete elements (like empty objects {})
       for (let i = 0; i < rawElements.length; i++) {
         const element = rawElements[i];
 
-        // Skip the last element if it's incomplete (unless this is the final parse)
         if (i === rawElements.length - 1 && parseState !== 'successful-parse') {
-          // Only include the last element if it has meaningful content
+          // The last element may still be streaming. Partial objects are emitted
+          // once they have content; primitives (e.g. a truncated string or number)
+          // are withheld until the parse completes.
           if (element && typeof element === 'object' && Object.keys(element).length > 0) {
             filteredElements.push(element as Partial<OUTPUT>);
           }
-        } else {
-          // Include all non-last elements that have content
-          if (element && typeof element === 'object' && Object.keys(element).length > 0) {
-            filteredElements.push(element as Partial<OUTPUT>);
-          }
+        } else if (element !== undefined) {
+          // Non-last elements are complete: include them regardless of type
+          filteredElements.push(element as Partial<OUTPUT>);
         }
       }
 
@@ -500,15 +498,21 @@ class ArrayFormatHandler<OUTPUT = undefined> extends BaseFormatHandler<OUTPUT> {
     return { shouldEmit: false };
   }
 
-  async validateAndTransformFinal(_finalValue: string): Promise<ValidateAndTransformFinalResult<OUTPUT>> {
-    const resultValue = this.textPreviousFilteredArray;
-
-    if (!resultValue) {
+  async validateAndTransformFinal(finalRawValue: string): Promise<ValidateAndTransformFinalResult<OUTPUT>> {
+    if (!finalRawValue) {
       return {
         success: false,
         error: new Error('No object generated: could not parse the response.'),
       };
     }
+
+    // Validate the elements from the final text rather than the streaming-filtered
+    // array so nothing withheld during partial parsing is lost at the end.
+    const { value } = await parsePartialJson(this.preprocessText(finalRawValue));
+    const resultValue =
+      value && typeof value === 'object' && 'elements' in value && Array.isArray(value.elements)
+        ? value.elements
+        : this.textPreviousFilteredArray;
 
     return this.validateValue(resultValue);
   }
@@ -675,6 +679,7 @@ export function createObjectStreamTransformer<OUTPUT = undefined>({
   let previousObject: unknown = undefined;
   let currentRunId: string | undefined;
   let finalResult: ValidateAndTransformFinalResult<OUTPUT> | undefined;
+  let finishReason: MastraFinishReason | undefined;
 
   return new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
     async transform(chunk, controller) {
@@ -704,20 +709,19 @@ export function createObjectStreamTransformer<OUTPUT = undefined>({
         }
       }
 
-      // Validate and resolve object when text generation completes
-      if (chunk.type === 'text-end') {
+      // Capture the terminal reason and finalize before the finish chunk is forwarded:
+      // completion callbacks observe the finish chunk and must see the validated or
+      // fallback object-result (and its fallback flag), not an unvalidated parse of
+      // the raw text. Providers that omit finish are handled by the flush fallback below.
+      if (chunk.type === 'finish') {
+        finishReason = chunk.payload.stepResult.reason;
+        const deferredError = await finalize(controller, { deferStrictError: true });
         controller.enqueue(chunk);
-
-        if (accumulatedText?.trim() && !finalResult) {
-          finalResult = await handler.validateAndTransformFinal(accumulatedText);
-          if (finalResult.success) {
-            controller.enqueue({
-              from: ChunkFrom.AGENT,
-              runId: currentRunId ?? '',
-              type: 'object-result',
-              object: finalResult.value,
-            });
-          }
+        // A strict-mode validation error is emitted after finish so the step keeps
+        // its real finish reason and usage; only a validated or fallback
+        // object-result must precede the finish chunk.
+        if (deferredError) {
+          handleValidationError(deferredError, controller);
         }
         return;
       }
@@ -727,26 +731,54 @@ export function createObjectStreamTransformer<OUTPUT = undefined>({
     },
 
     async flush(controller) {
-      if (finalResult && !finalResult.success) {
-        handleValidationError(finalResult.error, controller);
-      }
-      // Safety net: If text-end was never emitted, validate now as fallback
-      // This handles edge cases where providers might not emit text-end
-      if (accumulatedText?.trim() && !finalResult) {
-        finalResult = await handler.validateAndTransformFinal(accumulatedText);
-        if (finalResult.success) {
-          controller.enqueue({
-            from: ChunkFrom.AGENT,
-            runId: currentRunId ?? '',
-            type: 'object-result',
-            object: finalResult.value,
-          });
-        } else {
-          handleValidationError(finalResult.error, controller);
-        }
-      }
+      await finalize(controller);
     },
   });
+
+  async function finalize(
+    controller: TransformStreamDefaultController<ChunkType<OUTPUT>>,
+    options?: { deferStrictError?: boolean },
+  ): Promise<Error | undefined> {
+    if (!accumulatedText?.trim() || finalResult) {
+      return undefined;
+    }
+
+    if (finishReason === 'length' || finishReason === 'content-filter') {
+      finalResult = {
+        success: false,
+        error: new MastraError({
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.SYSTEM,
+          id: 'STRUCTURED_OUTPUT_TRUNCATED',
+          text: `Structured output was truncated because the model finished with reason "${finishReason}".`,
+          details: {
+            finishReason,
+            value: accumulatedText,
+          },
+        }),
+      };
+    } else {
+      finalResult = await handler.validateAndTransformFinal(accumulatedText);
+    }
+
+    if (finalResult.success) {
+      controller.enqueue({
+        from: ChunkFrom.AGENT,
+        runId: currentRunId ?? '',
+        type: 'object-result',
+        object: finalResult.value,
+      });
+    } else if (
+      options?.deferStrictError &&
+      structuredOutput?.errorStrategy !== 'warn' &&
+      structuredOutput?.errorStrategy !== 'fallback'
+    ) {
+      return finalResult.error;
+    } else {
+      handleValidationError(finalResult.error, controller);
+    }
+    return undefined;
+  }
 
   /**
    * Handle validation errors based on error strategy
@@ -760,6 +792,7 @@ export function createObjectStreamTransformer<OUTPUT = undefined>({
         runId: currentRunId ?? '',
         type: 'object-result',
         object: structuredOutput.fallbackValue as OUTPUT,
+        metadata: { fallback: true },
       });
     } else {
       controller.enqueue({

@@ -60,10 +60,13 @@ describe('AIMock loop scenario: evented sequential delegation approvals', () => 
       { content: 'Both items processed.' },
     );
 
+    // Plain-Agent evented route: MASTRA_EVENTED_EXECUTION is stubbed above,
+    // so no wrapper-selecting `engine` option is passed here. Shared
+    // `engine: 'evented'` legs exercise EventedAgent; this fixture keeps the
+    // finite-stream plain-Agent contract it asserts.
     const { agent, mastra } = await createSharedAgent(llm, {
-      engine: 'evented',
       agents: { worker },
-      model: openai.chat(SCENARIO_MODEL_ID),
+      model: openai.chat(SCENARIO_MODEL_ID) as any,
     });
     try {
       let output = await agent.stream('Delegate two approvals.', { maxSteps: 5 });
@@ -96,7 +99,7 @@ describe('AIMock loop scenario: evented sequential delegation approvals', () => 
       const toolMessages = llm
         .getRequests()
         .at(-1)
-        ?.body.messages?.filter(message => message.role === 'tool');
+        ?.body?.messages?.filter(message => message.role === 'tool');
       expect(toolMessages).toEqual([
         expect.objectContaining({
           tool_call_id: 'delegate_alpha',

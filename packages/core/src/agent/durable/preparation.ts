@@ -1,6 +1,8 @@
+import type { StandardSchemaWithJSON } from '@mastra/schema-compat/schema';
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import { validateMaxSteps, validateRecoveryMaxSteps } from '../../llm/model/max-steps';
+import { validateModelTimeoutSettings } from '../../llm/model/model-settings';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
@@ -19,7 +21,9 @@ import {
   mergeVersionOverrides,
 } from '../../request-context';
 import type { VersionOverrides } from '../../request-context';
+import { getRequestContextInputValues } from '../../request-context/input-source';
 import { toStandardSchema } from '../../schema';
+import { asJsonSchema } from '../../stream/base/schema';
 import { normalizeToolPayloadTransformPolicy } from '../../tools/payload-transform';
 import type { CoreTool, ToolHooks, ToolPayloadTransformPolicy } from '../../tools/types';
 import { boundedStringify } from '../../utils';
@@ -267,6 +271,8 @@ function getInitialSignalEchoes(messageList: MessageList): CreatedAgentSignal[] 
 interface DurablePreparationAgent {
   id: string;
   name?: string;
+  maxRetries?: number;
+  requestContextSchema?: StandardSchemaWithJSON<unknown>;
   getDefaultOptions(opts: { requestContext: RequestContext }): AgentDefaultOptions | Promise<AgentDefaultOptions>;
   getInstructions(opts: { requestContext: RequestContext }): AgentInstructions | Promise<AgentInstructions>;
   getModel(opts: { requestContext: RequestContext }): MastraLanguageModel | Promise<MastraLanguageModel>;
@@ -325,6 +331,7 @@ interface DurablePreparationAgent {
   getToolPayloadTransform?(): ToolPayloadTransformPolicy | undefined;
   __getDrainPendingSignals(): (runId: string, scope?: 'pending' | 'pre-run') => CreatedAgentSignal[];
   __getGoalConfig(): GoalConfig | undefined;
+  __getMaxRetriesConfigured?(): boolean;
   __listLLMRequestProcessors(
     requestContext?: RequestContext,
     resolvedMemory?: ResolvedAgentMemory,
@@ -500,7 +507,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 2. Get request context
   let requestContext = providedRequestContext ?? new RequestContext();
 
-  // 2b. Merge the wrapped agent's defaultOptions under the per-request options,
+  // 2a. Merge the wrapped agent's defaultOptions under the per-request options,
   // mirroring the non-durable Agent.stream()/generate() paths. Without this the
   // agent's configured defaults (maxSteps, providerOptions, etc.) are silently
   // dropped and durable runs fall back to DurableAgentDefaults.MAX_STEPS.
@@ -531,10 +538,45 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   requestContext = providedRequestContext ?? execOptions.requestContext ?? requestContext;
   execOptions.requestContext = requestContext;
 
+  // 2b. Validate the request context against the agent's requestContextSchema,
+  // using the effective context (a dynamic-default context replaces the empty
+  // bootstrap one — fork contract),
+  // mirroring Agent.stream()/generate(). Without this, schema violations are
+  // silently ignored on the durable path.
+  if (typedAgent.requestContextSchema) {
+    const contextValues = getRequestContextInputValues(requestContext);
+    const validation = await typedAgent.requestContextSchema['~standard'].validate(contextValues);
+
+    if (validation.issues) {
+      const errorMessages = validation.issues
+        .map(e => {
+          const pathStr = e.path?.map((p: any) => (typeof p === 'object' ? p.key : p)).join('.');
+          return `- ${pathStr}: ${e.message}`;
+        })
+        .join('\n');
+      throw new MastraError({
+        id: 'AGENT_REQUEST_CONTEXT_VALIDATION_FAILED',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Request context validation failed for agent '${publicAgentId}':\n${errorMessages}`,
+        details: {
+          agentId: publicAgentId,
+          agentName: publicAgentName,
+        },
+      });
+    }
+  }
+
+  validateModelTimeoutSettings(execOptions.modelSettings?.timeout);
+
+  if (execOptions.eagerToolExecution) {
+    throw new Error('eagerToolExecution is not supported by durable agents');
+  }
+
   // Snapshot the effective external context before preparation adds internal
   // version or memory keys. Dynamic-default context is part of the execution
   // contract and must survive cold recovery just like caller context.
-  const requestContextEntriesSnapshot = snapshotDurableRequestContextEntries(
+  let requestContextEntriesSnapshot = snapshotDurableRequestContextEntries(
     requestContext,
     options.durableRequestContextKeys,
   );
@@ -551,7 +593,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const { runId, mergedVersions } = preflight;
   const messageId = crypto.randomUUID();
   const runtimeBindingId = crypto.randomUUID();
-
   // 4. Resolve thread/memory context
   const requestedThread =
     typeof execOptions?.memory?.thread === 'string' ? { id: execOptions.memory.thread } : execOptions?.memory?.thread;
@@ -792,6 +833,14 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         ? undefined
         : mastra?.backgroundTaskManager;
 
+    // Snapshot the request context AFTER input processors have run so their
+    // writes reach the durable run (#23904 parity) — re-take the fork's
+    // allowlist-gated snapshot so the persistence boundary still applies.
+    requestContextEntriesSnapshot = snapshotDurableRequestContextEntries(
+      requestContext,
+      options.durableRequestContextKeys,
+    );
+
     // 7. Convert tools to CoreTool format for execution
     let tools: Record<string, CoreTool> = {};
     const perExecutionToolHooks =
@@ -877,6 +926,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     }
 
     const modelList = resolvedModels.modelList;
+    for (const modelConfig of modelList ?? []) {
+      validateModelTimeoutSettings(modelConfig.modelSettings?.timeout);
+    }
 
     // 8b. Get scorers configuration
     const overrideScorers = (execOptions as any)?.scorers;
@@ -905,19 +957,26 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
 
     // 10. Serialize structured output if provided
     let serializedStructuredOutput: SerializableStructuredOutput | undefined;
+    const structuredOutputSchema = execOptions?.structuredOutput?.schema
+      ? toStandardSchema(execOptions.structuredOutput.schema)
+      : undefined;
     if (execOptions?.structuredOutput) {
       const so = execOptions.structuredOutput as any;
-      if (so.schema) {
+      if (structuredOutputSchema) {
         serializedStructuredOutput = {
           jsonPromptInjection: so.jsonPromptInjection,
+          // `instructions` means two different things depending on `model`: structuring-agent
+          // instructions when a separate structuring pass runs, injected prompt text when it
+          // does not. The durable path has no structuring pass (`structuringModelConfig` is
+          // never populated, so `llm-execution.ts` always takes the direct branch), so carrying
+          // the field when `model` is set would inject structuring-agent prose as the model's
+          // only output guidance. Withhold it there and let the generated schema instruction stand.
+          instructions: so.model ? undefined : so.instructions,
           useAgent: so.useAgent,
+          // Always convert to plain JSON Schema: this crosses step boundaries as JSON, and a
+          // live Zod/standard-schema instance does not survive that round trip.
+          schema: asJsonSchema(structuredOutputSchema),
         };
-        // Convert Zod schema to JSON Schema if possible
-        if (typeof so.schema === 'object' && 'type' in so.schema) {
-          serializedStructuredOutput.schema = so.schema;
-        } else if (typeof so.schema === 'object' && 'jsonSchema' in so.schema) {
-          serializedStructuredOutput.schema = so.schema.jsonSchema;
-        }
       }
     }
 
@@ -961,6 +1020,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       runtimeBindingId,
       agentId: publicAgentId,
       agentName: publicAgentName,
+      // Pin the exact stored version this run resolved to (if any) so a resume
+      // after a newer publish still re-resolves to the started version.
+      agentVersionId: resolvedVersionId,
       versions: mergedVersions,
       hasProcessors: inputProcessors.length > 0 || outputProcessors.length > 0 || errorProcessors.length > 0,
       runtimeBindings: {
@@ -980,6 +1042,13 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         toolSurfaceFence,
         toolHookPolicy,
         modelSettings: execOptions?.modelSettings as any,
+        // Agent-level retry config for the llm-execution step's retry ladder.
+        // Single-model agents have no modelList entry to carry maxRetries, so
+        // it rides on options; the flag preserves the in-process precedence
+        // rule (an explicitly configured agent value — including 0 — beats
+        // call-time modelSettings.maxRetries).
+        agentMaxRetries: typedAgent.maxRetries,
+        agentMaxRetriesConfigured: typedAgent.__getMaxRetriesConfigured?.() ?? false,
         // Function-form approval policies are closures that can't ride on the
         // serialized workflow input — the live closure is parked on the run
         // registry below. This boolean shadow is the cross-process fallback:
@@ -1198,6 +1267,11 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       // Retain the call-time flag for warm resume/observe paths that rebuild
       // scoring data without rereading the persisted workflow input.
       returnScorerData: execOptions?.returnScorerData,
+      // Run-level execution budget (#21724). Parked on the registry so the
+      // abort-controller install sites (stream/resume) can arm a session
+      // timer without re-deriving it from options or the snapshot.
+      timeoutTotalMs: (execOptions?.modelSettings as { timeout?: { totalMs?: number } } | undefined)?.timeout?.totalMs,
+      cleanup: () => {},
     };
 
     return {

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { Server as HttpServer } from 'node:http';
 import * as https from 'node:https';
@@ -406,6 +407,8 @@ export async function createHonoServer(
 
   const serverOptions = mastra.getServer();
   const studioBasePath = normalizeStudioBase(serverOptions?.studioBase ?? '/');
+  // Production replicas must not be mistaken for dev-server restarts.
+  const devServerInstanceId = options?.isDev ? randomUUID() : undefined;
 
   if (options?.studio) {
     const studioControlRoutes: ServerRoute[] = [
@@ -413,7 +416,7 @@ export async function createHonoServer(
         method: 'GET',
         path: '/refresh-events',
         responseType: 'datastream-response',
-        handler: async ({ abortSignal }) => handleClientsRefreshRequest(abortSignal),
+        handler: async ({ abortSignal }) => handleClientsRefreshRequest(abortSignal, devServerInstanceId),
       },
       {
         method: 'POST',
@@ -543,6 +546,7 @@ export async function createHonoServer(
         platformProjectId: `'${escapeStudioHtmlValue(platformProjectId)}'`,
         platformObservabilityEndpoint: `'${escapeStudioHtmlValue(platformObservabilityEndpoint)}'`,
         autoDetectUrl: `'${autoDetectUrl}'`,
+        devServerInstanceId: JSON.stringify(devServerInstanceId ?? ''),
       });
 
       return c.newResponse(indexHtml, 200, { 'Content-Type': 'text/html' });

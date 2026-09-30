@@ -14,6 +14,8 @@ function baseArgs() {
     ...lifecycleExecution,
     workflow: {
       stepGraph: [{ type: 'step', step: { id: 'waiting-step' } }],
+      // Upstream #21529 gates step-lifecycle watch events on workflow.options.
+      options: {},
     },
     workflowId: 'sleep-workflow',
     runId: 'sleep-run',

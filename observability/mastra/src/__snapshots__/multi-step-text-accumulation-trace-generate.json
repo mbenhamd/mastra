@@ -1,16 +1,16 @@
 {
   "__structure__": [
     "agent_run: \"agent run: 'multi-step-agent'\"",
-    "└── model_generation: \"llm: 'mock-model-id'\"",
-    "    ├── model_step: \"step: 0\"",
-    "    │   ├── model_inference: \"inference: 0\"",
-    "    │   │   ├── model_chunk: \"chunk: 'text'\"",
-    "    │   │   ├── model_chunk: \"chunk: 'tool-call'\"",
-    "    │   │   └── model_chunk: \"chunk: 'tool-result'\"",
-    "    │   └── tool_call: \"tool: 'calculator'\"",
-    "    └── model_step: \"step: 1\"",
-    "        └── model_inference: \"inference: 1\"",
-    "            └── model_chunk: \"chunk: 'text'\""
+    "\u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
+    "    \u251c\u2500\u2500 model_step: \"step: 0\"",
+    "    \u2502   \u251c\u2500\u2500 model_inference: \"inference: 0\"",
+    "    \u2502   \u2502   \u251c\u2500\u2500 model_chunk: \"chunk: 'text'\"",
+    "    \u2502   \u2502   \u251c\u2500\u2500 model_chunk: \"chunk: 'tool-call'\"",
+    "    \u2502   \u2502   \u2514\u2500\u2500 model_chunk: \"chunk: 'tool-result'\"",
+    "    \u2502   \u2514\u2500\u2500 tool_call: \"tool: 'calculator'\"",
+    "    \u2514\u2500\u2500 model_step: \"step: 1\"",
+    "        \u2514\u2500\u2500 model_inference: \"inference: 1\"",
+    "            \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\""
   ],
   "spans": [
     {
@@ -149,7 +149,18 @@
               "reasoning": [],
               "sources": [],
               "text": "Let me calculate that for you. The result of 5 + 3 is 8.",
-              "warnings": []
+              "warnings": [],
+              "toolCalls": [
+                {
+                  "toolCallId": "call-calc-1",
+                  "toolName": "calculator",
+                  "args": {
+                    "operation": "add",
+                    "a": 5,
+                    "b": 3
+                  }
+                }
+              ]
             }
           },
           "children": [
@@ -235,7 +246,9 @@
                       "provider": "mock-provider",
                       "streaming": true,
                       "providerAttempt": 1,
-                      "parameters": {},
+                      "parameters": {
+                        "maxRetries": 0
+                      },
                       "availableTools": ["calculator"],
                       "toolChoice": "auto",
                       "measurementState": "measured",
@@ -365,7 +378,7 @@
                         "traceId": "<trace-1>",
                         "name": "chunk: 'tool-result'",
                         "type": "model_chunk",
-                        "completed": false,
+                        "completed": true,
                         "isEvent": true,
                         "isRootSpan": false,
                         "parentId": "<span-4>",
@@ -499,7 +512,9 @@
                       "provider": "mock-provider",
                       "streaming": true,
                       "providerAttempt": 1,
-                      "parameters": {},
+                      "parameters": {
+                        "maxRetries": 0
+                      },
                       "availableTools": ["calculator"],
                       "toolChoice": "auto",
                       "measurementState": "measured",

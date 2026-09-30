@@ -555,7 +555,7 @@ function cloneProcessorPrototype(prototype: object | null, state: ProcessorClone
   if (prototype === null || INTRINSIC_PROTOTYPES.has(prototype) || OPAQUE_INTRINSIC_PROTOTYPES.has(prototype)) {
     return prototype;
   }
-  return cloneProcessorObject(prototype, state);
+  return cloneProcessorObject(prototype, state, undefined, undefined, true);
 }
 
 function cloneProcessorBuiltIn(target: object, state: ProcessorCloneState): object | undefined {
@@ -621,6 +621,7 @@ function cloneProcessorObject(
   state: ProcessorCloneState,
   trackedKeys?: readonly PropertyKey[],
   deepKeys?: ReadonlySet<PropertyKey>,
+  isPrototype = false,
 ): object {
   const existing = state.seen.get(target);
   if (existing) return existing;
@@ -670,6 +671,17 @@ function cloneProcessorObject(
       processorDescriptor = {
         ...descriptor,
         value: processorValue,
+      };
+    } else if (isPrototype && (descriptor.get || descriptor.set)) {
+      // Prototype accessors are shared class code (e.g. zod 4's
+      // `ZodType.prototype._def` getter), not per-tool definition state:
+      // evaluating them against the bare prototype throws. Keep them as
+      // accessors on the cloned prototype, isolated like prototype methods, so
+      // they bind to (and read from) the cloned instance.
+      processorDescriptor = {
+        ...descriptor,
+        get: descriptor.get && (cloneProcessorValue(descriptor.get, state) as () => unknown),
+        set: descriptor.set && (cloneProcessorValue(descriptor.set, state) as (value: unknown) => void),
       };
     } else if (
       descriptor.get &&

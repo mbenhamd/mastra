@@ -500,6 +500,12 @@ export class ToolCallFilter implements Processor {
         if (part.type !== 'tool-result') continue;
         if (!excludedToolCallIds.has(part.toolCallId)) continue;
         if (preserveFor !== 'all' && !preserveFor.includes(part.toolName)) continue;
+        // Only an own, non-nullish `providerOptions.mastra.modelOutput` proves the
+        // prompt output came from the tool's `toModelOutput` mapping.
+        const mastraMetadata = part.providerOptions?.mastra;
+        if (!mastraMetadata || !Object.hasOwn(mastraMetadata, 'modelOutput') || mastraMetadata.modelOutput == null) {
+          continue;
+        }
 
         const text = this.toPreservedText((part as ToolResultPart).output, maxTextCodeUnits);
         if (!text) continue;

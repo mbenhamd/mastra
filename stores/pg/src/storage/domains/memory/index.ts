@@ -42,6 +42,12 @@ import {
  */
 const OM_TABLE = 'mastra_observational_memory' as const;
 const OM_LOOKUP_INDEX = 'idx_om_lookup_key';
+/**
+ * Newest generation first. Databases written before generation creation was
+ * serialized can hold several rows with the same generation; the earliest-created
+ * one wins so the active record stays stable across reads.
+ */
+const OM_GENERATION_ORDER = `"generationCount" DESC, "createdAt" ASC, id ASC`;
 const POSTGRES_MAX_BIND_PARAMETERS = 65535;
 // Keep in sync with the message INSERT column list in saveMessages.
 const MESSAGE_INSERT_BIND_PARAMETERS = 8;
@@ -166,7 +172,7 @@ import type {
   StorageMutateThreadWithWorkingMemoryInput,
   StorageMutateThreadWithWorkingMemoryOutput,
 } from '@mastra/core/storage';
-import { parseSqlIdentifier } from '@mastra/core/utils';
+import { schemaNamePrefix } from '../../../shared/schema-name';
 import type { TxClient } from '../../client';
 import {
   PgDB,
@@ -178,6 +184,7 @@ import {
 } from '../../db';
 import type { DbClient, PgDomainConfig } from '../../db';
 import { truncateIdentifierWithHash } from '../../db/constraint-utils';
+import { toPgJson } from '../../db/sanitize-json';
 import { runPrune, runBatchedDelete, resolveTargets } from '../../retention';
 
 // Database row type that includes timezone-aware columns
@@ -502,7 +509,7 @@ export class MemoryPG extends MemoryStorage {
    * so its supporting index is not part of the default index set.
    */
   private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
-    const prefix = this.#schema && this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const prefix = this.#schema && this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     for (const [key, entry] of Object.entries(MemoryPG.retentionTables)) {
       if (!entry.indexed || !policies[key]) continue;
       try {
@@ -543,7 +550,7 @@ export class MemoryPG extends MemoryStorage {
    */
   static getExportDDL(schemaName?: string): string[] {
     const statements: string[] = [];
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
     const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
     const quotedSchemaName = dbGetSchemaName(schemaName);
 
@@ -588,7 +595,7 @@ export class MemoryPG extends MemoryStorage {
    * Returns default index definitions for this instance's schema.
    */
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    const schemaPrefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const schemaPrefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     return MemoryPG.getDefaultIndexDefs(schemaPrefix);
   }
 
@@ -923,7 +930,7 @@ export class MemoryPG extends MemoryStorage {
           // Use JSONB containment operator - no key interpolation needed
           whereClauses.push(`metadata::jsonb @> $${paramIndex}::jsonb`);
           // Build a small JSON object for each key-value pair
-          queryParams.push(JSON.stringify({ [key]: value }));
+          queryParams.push(toPgJson({ [key]: value }));
           paramIndex++;
         }
       }
@@ -947,7 +954,7 @@ export class MemoryPG extends MemoryStorage {
 
       const limitValue = perPageInput === false ? total : perPage;
       // Select both standard and timezone-aware columns (*Z) for proper UTC timestamp handling
-      const dataQuery = `SELECT id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ" ${baseQuery} ORDER BY COALESCE("${field}Z", "${field}") ${direction} LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+      const dataQuery = `SELECT id, "resourceId", title, metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ" ${baseQuery} ORDER BY COALESCE("${field}Z", "${field}") ${direction}, "id" ${direction} LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
       const rows = await this.#db.readClient.manyOrNone<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
         dataQuery,
         [...queryParams, limitValue, offset],
@@ -1024,16 +1031,7 @@ export class MemoryPG extends MemoryStorage {
             "updatedAt" = EXCLUDED."updatedAt",
             "updatedAtZ" = EXCLUDED."updatedAtZ"
           RETURNING *`,
-          [
-            thread.id,
-            thread.resourceId,
-            thread.title,
-            JSON.stringify(metadata),
-            createdAt,
-            createdAt,
-            updatedAt,
-            updatedAt,
-          ],
+          [thread.id, thread.resourceId, thread.title, toPgJson(metadata), createdAt, createdAt, updatedAt, updatedAt],
         );
         return {
           id: row.id,
@@ -1249,12 +1247,14 @@ export class MemoryPG extends MemoryStorage {
       const aValue = field === 'createdAt' ? new Date(a.createdAt).getTime() : (a as any)[field];
       const bValue = field === 'createdAt' ? new Date(b.createdAt).getTime() : (b as any)[field];
 
-      if (aValue == null && bValue == null) return a.id.localeCompare(b.id);
+      const idOrder = direction === 'ASC' ? a.id.localeCompare(b.id) : b.id.localeCompare(a.id);
+
+      if (aValue == null && bValue == null) return idOrder;
       if (aValue == null) return 1;
       if (bValue == null) return -1;
 
       if (aValue === bValue) {
-        return a.id.localeCompare(b.id);
+        return idOrder;
       }
 
       if (typeof aValue === 'number' && typeof bValue === 'number') {
@@ -1701,7 +1701,7 @@ export class MemoryPG extends MemoryStorage {
       // instead of materializing/seq-scanning the whole thread. createdAt and createdAtZ
       // always store the same instant (createdAtZ is a TIMESTAMPTZ copy), so row selection
       // under LIMIT is identical. This mirrors the index-safe ordering in _getIncludedMessages.
-      const orderByStatement = `ORDER BY "${field}" ${direction}`;
+      const orderByStatement = `ORDER BY "${field}" ${direction}, "id" ${direction}`;
 
       const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
       const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
@@ -1905,7 +1905,7 @@ export class MemoryPG extends MemoryStorage {
       // instead of materializing/seq-scanning the whole thread. createdAt and createdAtZ
       // always store the same instant (createdAtZ is a TIMESTAMPTZ copy), so row selection
       // under LIMIT is identical. This mirrors the index-safe ordering in _getIncludedMessages.
-      const orderByStatement = `ORDER BY "${field}" ${direction}`;
+      const orderByStatement = `ORDER BY "${field}" ${direction}, "id" ${direction}`;
 
       const selectStatement = `SELECT id, content, role, type, "createdAt", "createdAtZ", thread_id AS "threadId", "resourceId"`;
       const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
@@ -2580,7 +2580,7 @@ export class MemoryPG extends MemoryStorage {
         [
           resource.id,
           governed ? current?.workingMemory : resource.workingMemory,
-          JSON.stringify(metadata),
+          toPgJson(metadata),
           createdAt,
           createdAt,
           updatedAt,
@@ -3548,7 +3548,7 @@ export class MemoryPG extends MemoryStorage {
             newThread.id,
             newThread.resourceId,
             newThread.title,
-            newThread.metadata ? JSON.stringify(newThread.metadata) : null,
+            newThread.metadata ? toPgJson(newThread.metadata) : null,
             nowStr,
             nowStr,
             nowStr,
@@ -3826,13 +3826,35 @@ export class MemoryPG extends MemoryStorage {
     const current = await t.oneOrNone<{ id: string }>(
       `SELECT id FROM ${tableName}
        WHERE "lookupKey" = $1
-       ORDER BY "generationCount" DESC
+       ORDER BY ${OM_GENERATION_ORDER}
        LIMIT 1`,
       [this.getOMKey(guard.threadId, guard.resourceId)],
     );
     if (current?.id !== guard.recordId) {
       throw new ObservationalMemoryGenerationConflictError();
     }
+  }
+
+  /**
+   * Runs `fn` in a transaction that holds an advisory lock for one OM lookup key.
+   *
+   * The table has no unique constraint on ("lookupKey", "generationCount"), and
+   * adding one would fail on databases that already contain duplicates. The lock
+   * serializes generation creation across processes instead. It is
+   * transaction-scoped so it also works behind transaction-pooling proxies.
+   */
+  async #withOMLookupKeyLock<T>(tableName: string, lookupKey: string, fn: (t: TxClient) => Promise<T>): Promise<T> {
+    return this.#db.client.tx(async t => {
+      await t.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${tableName}:${lookupKey}`]);
+      return fn(t);
+    });
+  }
+
+  async #getLatestOMRow(client: Pick<TxClient, 'oneOrNone'>, tableName: string, lookupKey: string): Promise<any> {
+    return client.oneOrNone(
+      `SELECT * FROM ${tableName} WHERE "lookupKey" = $1 ORDER BY ${OM_GENERATION_ORDER} LIMIT 1`,
+      [lookupKey],
+    );
   }
 
   private parseOMRow(row: any): ObservationalMemoryRecord {
@@ -3897,11 +3919,9 @@ export class MemoryPG extends MemoryStorage {
         schemaName: getSchemaName(this.#schema),
       });
       // Observation and reflection mutations build on this live record, so a
-      // lagging replica could cause a later write to discard completed work.
-      const result = await this.#db.client.oneOrNone(
-        `SELECT * FROM ${tableName} WHERE "lookupKey" = $1 ORDER BY "generationCount" DESC LIMIT 1`,
-        [lookupKey],
-      );
+      // lagging replica could cause a later write to discard completed work. Read
+      // from the primary client with the shared stable generation ordering.
+      const result = await this.#getLatestOMRow(this.#db.client, tableName, lookupKey);
       if (!result) return null;
       return this.parseOMRow(result);
     } catch (error) {
@@ -3946,7 +3966,7 @@ export class MemoryPG extends MemoryStorage {
       }
 
       params.push(limit);
-      let sql = `SELECT * FROM ${tableName} WHERE ${conditions.join(' AND ')} ORDER BY "generationCount" DESC LIMIT $${paramIndex}`;
+      let sql = `SELECT * FROM ${tableName} WHERE ${conditions.join(' AND ')} ORDER BY ${OM_GENERATION_ORDER} LIMIT $${paramIndex}`;
       paramIndex++;
 
       if (options?.offset != null) {
@@ -4007,13 +4027,10 @@ export class MemoryPG extends MemoryStorage {
       const nowStr = now.toISOString();
       const storedRecord = await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, input.resourceId);
-        const existing = await t.oneOrNone(
-          `SELECT * FROM ${tableName}
-           WHERE "lookupKey" = $1
-           ORDER BY "generationCount" DESC
-           LIMIT 1`,
-          [lookupKey],
-        );
+        // Another caller (possibly in another process) may have created the record
+        // while this one was waiting for the lock. Return theirs instead of adding
+        // a duplicate, using the shared stable generation ordering.
+        const existing = await this.#getLatestOMRow(t, tableName, lookupKey);
         if (existing !== null) return this.parseOMRow(existing);
         await t.none(
           `INSERT INTO ${tableName} (
@@ -4033,7 +4050,7 @@ export class MemoryPG extends MemoryStorage {
             '',
             null,
             'initial',
-            JSON.stringify(input.config),
+            toPgJson(input.config),
             0,
             null, // lastObservedAt
             null, // lastObservedAtZ
@@ -4112,7 +4129,7 @@ export class MemoryPG extends MemoryStorage {
             record.activeObservations || '',
             null,
             record.originType || 'initial',
-            record.config ? JSON.stringify(record.config) : null,
+            record.config ? toPgJson(record.config) : null,
             record.generationCount || 0,
             lastObservedAtStr,
             lastObservedAtStr,
@@ -4121,8 +4138,8 @@ export class MemoryPG extends MemoryStorage {
             record.pendingMessageTokens || 0,
             record.totalTokensObserved || 0,
             record.observationTokenCount || 0,
-            record.observedMessageIds ? JSON.stringify(record.observedMessageIds) : null,
-            record.bufferedObservationChunks ? JSON.stringify(record.bufferedObservationChunks) : null,
+            record.observedMessageIds ? toPgJson(record.observedMessageIds) : null,
+            record.bufferedObservationChunks ? toPgJson(record.bufferedObservationChunks) : null,
             record.bufferedReflection || null,
             record.bufferedReflectionTokens ?? null,
             record.bufferedReflectionInputTokens ?? null,
@@ -4134,7 +4151,7 @@ export class MemoryPG extends MemoryStorage {
             record.lastBufferedAtTokens || 0,
             lastBufferedAtTimeStr,
             record.observedTimezone || null,
-            record.metadata ? JSON.stringify(record.metadata) : null,
+            record.metadata ? toPgJson(record.metadata) : null,
             record.createdAt.toISOString(),
             record.createdAt.toISOString(),
             record.updatedAt.toISOString(),
@@ -4172,7 +4189,7 @@ export class MemoryPG extends MemoryStorage {
 
       const lastObservedAtStr = input.lastObservedAt.toISOString();
       const nowStr = now.toISOString();
-      const observedMessageIdsJson = input.observedMessageIds ? JSON.stringify(input.observedMessageIds) : null;
+      const observedMessageIdsJson = input.observedMessageIds ? toPgJson(input.observedMessageIds) : null;
       const result = await this.#db.client.query(
         `UPDATE ${tableName} SET
           "activeObservations" = $1,
@@ -4225,92 +4242,36 @@ export class MemoryPG extends MemoryStorage {
 
   async createReflectionGeneration(input: CreateReflectionGenerationInput): Promise<ObservationalMemoryRecord> {
     try {
-      const id = crypto.randomUUID();
-      const now = new Date();
       const lookupKey = this.getOMKey(input.currentRecord.threadId, input.currentRecord.resourceId);
-
-      const record: ObservationalMemoryRecord = {
-        id,
-        scope: input.currentRecord.scope,
-        threadId: input.currentRecord.threadId,
-        resourceId: input.currentRecord.resourceId,
-        createdAt: now,
-        updatedAt: now,
-        lastObservedAt: input.currentRecord.lastObservedAt,
-        originType: 'reflection',
-        generationCount: input.currentRecord.generationCount + 1,
-        activeObservations: input.reflection,
-        totalTokensObserved: input.currentRecord.totalTokensObserved,
-        observationTokenCount: input.tokenCount,
-        pendingMessageTokens: 0,
-        isReflecting: false,
-        isObserving: false,
-        isBufferingObservation: false,
-        isBufferingReflection: false,
-        lastBufferedAtTokens: 0,
-        lastBufferedAtTime: null,
-        config: input.currentRecord.config,
-        metadata: input.currentRecord.metadata,
-        observedTimezone: input.currentRecord.observedTimezone,
-      };
-
       const tableName = getTableName({
         indexName: OM_TABLE,
         schemaName: getSchemaName(this.#schema),
       });
-      const nowStr = now.toISOString();
-      const lastObservedAtStr = record.lastObservedAt?.toISOString() || null;
-      await this.#db.client.tx(async t => {
+      // Fork contract: reflection creation runs under the observational-memory
+      // resource lock and fails loudly when the guarded generation is no longer
+      // current. The shared insert helper keeps the record shape and PG-safe
+      // JSON serialization in one place.
+      return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, input.currentRecord.resourceId);
+        // Upstream #22188: concurrent callers reflecting the same record all get
+        // the one generation the first caller created. Only a newer generation
+        // that descends from a still-present caller record qualifies; a record
+        // removed by retraction/clear still fails the guard below.
+        const newer = await this.#getNewerOMGeneration(t, tableName, lookupKey, input.currentRecord.generationCount);
+        if (newer) {
+          const source = await t.oneOrNone<{ id: string }>(
+            `SELECT id FROM ${tableName} WHERE id = $1 AND "lookupKey" = $2`,
+            [input.currentRecord.id, lookupKey],
+          );
+          if (source) return newer;
+        }
         await this.assertCurrentObservationalMemoryGeneration(t, {
           recordId: input.currentRecord.id,
           threadId: input.currentRecord.threadId,
           resourceId: input.currentRecord.resourceId,
         });
-        await t.none(
-          `INSERT INTO ${tableName} (
-          id, "lookupKey", scope, "resourceId", "threadId",
-          "activeObservations", "activeObservationsPendingUpdate",
-          "originType", config, "generationCount", "lastObservedAt", "lastObservedAtZ", "lastReflectionAt", "lastReflectionAtZ",
-          "pendingMessageTokens", "totalTokensObserved", "observationTokenCount",
-          "isObserving", "isReflecting", "isBufferingObservation", "isBufferingReflection", "lastBufferedAtTokens", "lastBufferedAtTime",
-          "observedTimezone", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)`,
-          [
-            id,
-            lookupKey,
-            record.scope,
-            record.resourceId,
-            record.threadId || null,
-            input.reflection,
-            null,
-            'reflection',
-            JSON.stringify(record.config),
-            input.currentRecord.generationCount + 1,
-            lastObservedAtStr, // lastObservedAt
-            lastObservedAtStr, // lastObservedAtZ
-            nowStr, // lastReflectionAt
-            nowStr, // lastReflectionAtZ
-            record.pendingMessageTokens,
-            Math.round(record.totalTokensObserved),
-            Math.round(record.observationTokenCount),
-            false, // isObserving
-            false, // isReflecting
-            false, // isBufferingObservation
-            false, // isBufferingReflection
-            0, // lastBufferedAtTokens
-            null, // lastBufferedAtTime
-            record.observedTimezone || null,
-            record.metadata ? JSON.stringify(record.metadata) : null,
-            nowStr, // createdAt
-            nowStr, // createdAtZ
-            nowStr, // updatedAt
-            nowStr, // updatedAtZ
-          ],
-        );
+        return this.#insertReflectionGeneration(t, tableName, lookupKey, input);
       });
-
-      return record;
     } catch (error) {
       throw new MastraError(
         {
@@ -4322,6 +4283,102 @@ export class MemoryPG extends MemoryStorage {
         error,
       );
     }
+  }
+
+  /**
+   * Returns the active record when another writer already created a generation
+   * after `generationCount`. Reflecting from the older generation again would
+   * add a second record with the same generation.
+   */
+  async #getNewerOMGeneration(
+    t: TxClient,
+    tableName: string,
+    lookupKey: string,
+    generationCount: number,
+  ): Promise<ObservationalMemoryRecord | null> {
+    const latest = await this.#getLatestOMRow(t, tableName, lookupKey);
+    return latest && Number(latest.generationCount) > generationCount ? this.parseOMRow(latest) : null;
+  }
+
+  async #insertReflectionGeneration(
+    t: TxClient,
+    tableName: string,
+    lookupKey: string,
+    input: CreateReflectionGenerationInput,
+  ): Promise<ObservationalMemoryRecord> {
+    const id = crypto.randomUUID();
+    const now = new Date();
+
+    const record: ObservationalMemoryRecord = {
+      id,
+      scope: input.currentRecord.scope,
+      threadId: input.currentRecord.threadId,
+      resourceId: input.currentRecord.resourceId,
+      createdAt: now,
+      updatedAt: now,
+      lastObservedAt: input.currentRecord.lastObservedAt,
+      originType: 'reflection',
+      generationCount: input.currentRecord.generationCount + 1,
+      activeObservations: input.reflection,
+      totalTokensObserved: input.currentRecord.totalTokensObserved,
+      observationTokenCount: input.tokenCount,
+      pendingMessageTokens: 0,
+      isReflecting: false,
+      isObserving: false,
+      isBufferingObservation: false,
+      isBufferingReflection: false,
+      lastBufferedAtTokens: 0,
+      lastBufferedAtTime: null,
+      config: input.currentRecord.config,
+      metadata: input.currentRecord.metadata,
+      observedTimezone: input.currentRecord.observedTimezone,
+    };
+
+    const nowStr = now.toISOString();
+    const lastObservedAtStr = record.lastObservedAt?.toISOString() || null;
+    await t.none(
+      `INSERT INTO ${tableName} (
+        id, "lookupKey", scope, "resourceId", "threadId",
+        "activeObservations", "activeObservationsPendingUpdate",
+        "originType", config, "generationCount", "lastObservedAt", "lastObservedAtZ", "lastReflectionAt", "lastReflectionAtZ",
+        "pendingMessageTokens", "totalTokensObserved", "observationTokenCount",
+        "isObserving", "isReflecting", "isBufferingObservation", "isBufferingReflection", "lastBufferedAtTokens", "lastBufferedAtTime",
+        "observedTimezone", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)`,
+      [
+        id,
+        lookupKey,
+        record.scope,
+        record.resourceId,
+        record.threadId || null,
+        input.reflection,
+        null,
+        'reflection',
+        toPgJson(record.config),
+        input.currentRecord.generationCount + 1,
+        lastObservedAtStr, // lastObservedAt
+        lastObservedAtStr, // lastObservedAtZ
+        nowStr, // lastReflectionAt
+        nowStr, // lastReflectionAtZ
+        record.pendingMessageTokens,
+        Math.round(record.totalTokensObserved),
+        Math.round(record.observationTokenCount),
+        false, // isObserving
+        false, // isReflecting
+        false, // isBufferingObservation
+        false, // isBufferingReflection
+        0, // lastBufferedAtTokens
+        null, // lastBufferedAtTime
+        record.observedTimezone || null,
+        record.metadata ? toPgJson(record.metadata) : null,
+        nowStr, // createdAt
+        nowStr, // createdAtZ
+        nowStr, // updatedAt
+        nowStr, // updatedAtZ
+      ],
+    );
+
+    return record;
   }
 
   async setReflectingFlag(id: string, isReflecting: boolean): Promise<void> {
@@ -4832,7 +4889,7 @@ export class MemoryPG extends MemoryStorage {
 
       await this.#db.client.query(
         `UPDATE ${tableName} SET config = $1, "updatedAt" = $2, "updatedAtZ" = $3 WHERE id = $4`,
-        [JSON.stringify(merged), nowStr, nowStr, input.id],
+        [toPgJson(merged), nowStr, nowStr, input.id],
       );
     } catch (error) {
       if (error instanceof MastraError) {
@@ -4895,7 +4952,7 @@ export class MemoryPG extends MemoryStorage {
           "updatedAt" = $4,
           "updatedAtZ" = $5
         WHERE id = $6`,
-        [JSON.stringify([newChunk]), input.chunk.cycleId, lastBufferedAtTime, nowStr, nowStr, input.id],
+        [toPgJson([newChunk]), input.chunk.cycleId, lastBufferedAtTime, nowStr, nowStr, input.id],
       );
 
       if (result.rowCount === 0) {
@@ -5080,7 +5137,7 @@ export class MemoryPG extends MemoryStorage {
           activatedContent,
           activatedTokens,
           activatedMessageTokens,
-          remainingChunks.length > 0 ? JSON.stringify(remainingChunks) : null,
+          remainingChunks.length > 0 ? toPgJson(remainingChunks) : null,
           lastObservedAtStr,
           lastObservedAtStr,
           nowStr,
@@ -5202,59 +5259,63 @@ export class MemoryPG extends MemoryStorage {
         indexName: OM_TABLE,
         schemaName: getSchemaName(this.#schema),
       });
+      const lookupKey = this.getOMKey(input.currentRecord.threadId, input.currentRecord.resourceId);
 
-      // Get current record to calculate split
-      const record = await this.#db.client.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [
-        input.currentRecord.id,
-      ]);
-      if (!record) {
-        throw new MastraError({
-          id: createStorageErrorId('PG', 'SWAP_BUFFERED_REFLECTION_TO_ACTIVE', 'NOT_FOUND'),
-          text: `Observational memory record not found: ${input.currentRecord.id}`,
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: { id: input.currentRecord.id },
+      return await this.#withOMLookupKeyLock(tableName, lookupKey, async t => {
+        // Another writer already activated a reflection for this generation.
+        const newer = await this.#getNewerOMGeneration(t, tableName, lookupKey, input.currentRecord.generationCount);
+        if (newer) return newer;
+
+        // Get current record to calculate split
+        const record = await t.oneOrNone(`SELECT * FROM ${tableName} WHERE id = $1`, [input.currentRecord.id]);
+        if (!record) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'SWAP_BUFFERED_REFLECTION_TO_ACTIVE', 'NOT_FOUND'),
+            text: `Observational memory record not found: ${input.currentRecord.id}`,
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.THIRD_PARTY,
+            details: { id: input.currentRecord.id },
+          });
+        }
+
+        const bufferedReflection = record.bufferedReflection || '';
+        const reflectedLineCount = Number(record.reflectedObservationLineCount || 0);
+
+        if (!bufferedReflection) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'SWAP_BUFFERED_REFLECTION_TO_ACTIVE', 'NO_CONTENT'),
+            text: 'No buffered reflection to swap',
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            details: { id: input.currentRecord.id },
+          });
+        }
+
+        // Split current activeObservations by the recorded boundary.
+        // Lines 0..reflectedLineCount were reflected on → replaced by bufferedReflection.
+        // Lines after reflectedLineCount were added after reflection started → kept as-is.
+        const currentObservations = (record.activeObservations as string) || '';
+        const allLines = currentObservations.split('\n');
+        const unreflectedLines = allLines.slice(reflectedLineCount);
+        const unreflectedContent = unreflectedLines.join('\n').trim();
+
+        // New activeObservations = bufferedReflection + unreflected observations
+        const newObservations = unreflectedContent
+          ? `${bufferedReflection}\n\n${unreflectedContent}`
+          : bufferedReflection;
+
+        // Create new generation with the merged content.
+        // tokenCount is computed by the processor using its token counter on the combined content.
+        const newRecord = await this.#insertReflectionGeneration(t, tableName, lookupKey, {
+          currentRecord: input.currentRecord,
+          reflection: newObservations,
+          tokenCount: input.tokenCount,
         });
-      }
 
-      const bufferedReflection = record.bufferedReflection || '';
-      const reflectedLineCount = Number(record.reflectedObservationLineCount || 0);
-
-      if (!bufferedReflection) {
-        throw new MastraError({
-          id: createStorageErrorId('PG', 'SWAP_BUFFERED_REFLECTION_TO_ACTIVE', 'NO_CONTENT'),
-          text: 'No buffered reflection to swap',
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.USER,
-          details: { id: input.currentRecord.id },
-        });
-      }
-
-      // Split current activeObservations by the recorded boundary.
-      // Lines 0..reflectedLineCount were reflected on → replaced by bufferedReflection.
-      // Lines after reflectedLineCount were added after reflection started → kept as-is.
-      const currentObservations = (record.activeObservations as string) || '';
-      const allLines = currentObservations.split('\n');
-      const unreflectedLines = allLines.slice(reflectedLineCount);
-      const unreflectedContent = unreflectedLines.join('\n').trim();
-
-      // New activeObservations = bufferedReflection + unreflected observations
-      const newObservations = unreflectedContent
-        ? `${bufferedReflection}\n\n${unreflectedContent}`
-        : bufferedReflection;
-
-      // Create new generation with the merged content.
-      // tokenCount is computed by the processor using its token counter on the combined content.
-      const newRecord = await this.createReflectionGeneration({
-        currentRecord: input.currentRecord,
-        reflection: newObservations,
-        tokenCount: input.tokenCount,
-      });
-
-      // Clear buffered state on old record
-      const nowStr = new Date().toISOString();
-      await this.#db.client.query(
-        `UPDATE ${tableName} SET
+        // Clear buffered state on old record
+        const nowStr = new Date().toISOString();
+        await t.query(
+          `UPDATE ${tableName} SET
           "bufferedReflection" = NULL,
           "bufferedReflectionTokens" = NULL,
           "bufferedReflectionInputTokens" = NULL,
@@ -5262,10 +5323,11 @@ export class MemoryPG extends MemoryStorage {
           "updatedAt" = $1,
           "updatedAtZ" = $2
         WHERE id = $3`,
-        [nowStr, nowStr, input.currentRecord.id],
-      );
+          [nowStr, nowStr, input.currentRecord.id],
+        );
 
-      return newRecord;
+        return newRecord;
+      });
     } catch (error) {
       if (error instanceof MastraError) {
         throw error;

@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MastraDBMessage } from '../../agent';
 import { MessageList } from '../../agent';
+import { getLogicalMessageId } from '../../agent/message-list';
 import { createSignal, isUserAuthoredMessage } from '../../agent/signals';
+import { onThreadMessagesSaved } from '../../agent/thread-saves';
+import { recordTerminalErrorMessage } from '../../loop/shared/record-terminal-error-message';
 import { MemoryRunState } from '../../memory';
 import type { MemoryRuntimeContext } from '../../memory';
 import { RequestContext } from '../../request-context';
@@ -340,12 +343,107 @@ describe('MessageHistory', () => {
       });
 
       const resultMessages = result instanceof MessageList ? result.get.all.db() : result;
-      // msg-1 from history, msg-2 from new (duplicate filtered), msg-3 from new
+      // msg-1 from history, msg-2 once (stored copy is the base), msg-3 from new
       expect(resultMessages).toHaveLength(3);
       expect(resultMessages[0].id).toBe('msg-1');
       expect(resultMessages[1].id).toBe('msg-2');
-      expect(resultMessages[1].content.content).toBe('Message 2 (new)'); // New version kept
+      // An input copy of a stored assistant message only fills in pending tool calls; its text
+      // doesn't replace or add to the stored text.
+      expect(resultMessages[1].content.content).toBe('Message 2');
+      expect(resultMessages[1].content.parts).toEqual([{ type: 'text', text: 'Message 2' }]);
       expect(resultMessages[2].id).toBe('msg-3');
+    });
+
+    it('keeps an admitted input reserved logicalMessageId when a legacy stored row reloads with the same id', () => {
+      // User variant: admission stamped the run's reserved input identity, then a legacy
+      // row (predating identity stamping) reloads from memory with the same physical id.
+      const userList = new MessageList({
+        logicalMessageIdentity: { input: 'admitted-input-1', response: 'admitted-response-1' },
+      });
+      userList.add(
+        {
+          id: 'dup-user',
+          role: 'user',
+          createdAt: new Date(2000),
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+        },
+        'input',
+      );
+      userList.add(
+        {
+          id: 'dup-user',
+          role: 'user',
+          createdAt: new Date(1000),
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+        },
+        'memory',
+      );
+
+      const userRows = userList.get.all.db();
+      expect(userRows).toHaveLength(1);
+      expect(getLogicalMessageId(userRows[0]?.content.metadata)).toBe('admitted-input-1');
+
+      // Signal variant: admission accepted the signal's nested steer identity; the
+      // reloaded legacy row must not discard that accepted identity either.
+      const signalList = new MessageList({
+        logicalMessageIdentity: { input: 'admitted-input-2', response: 'admitted-response-2' },
+      });
+      signalList.add(
+        createSignal({
+          id: 'dup-signal',
+          type: 'user-message',
+          contents: 'steer',
+          metadata: { logicalMessageId: 'admitted-steer-1' },
+        }),
+        'input',
+      );
+      signalList.add(
+        {
+          id: 'dup-signal',
+          role: 'signal',
+          createdAt: new Date(1000),
+          content: { format: 2, parts: [{ type: 'text', text: 'steer' }] },
+        },
+        'memory',
+      );
+
+      const signalRows = signalList.get.all.db();
+      expect(signalRows).toHaveLength(1);
+      expect(getLogicalMessageId(signalRows[0]?.content.metadata)).toBe('admitted-steer-1');
+
+      // Already-stamped DB signal variant: the row was stamped by an earlier run, so its
+      // reserved identity is its top-level scalar with no nested signal metadata id, and
+      // this run's constructor identity differs. Admission preserves that top-level id,
+      // so the reloaded legacy row must not replace it with missing/older lineage.
+      const stampedSignalList = new MessageList({
+        logicalMessageIdentity: { input: 'different-input-3', response: 'different-response-3' },
+      });
+      stampedSignalList.add(
+        {
+          id: 'dup-stamped-signal',
+          role: 'signal',
+          createdAt: new Date(2000),
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'steer' }],
+            metadata: { logicalMessageId: 'original-steer-1', signal: { type: 'user-message' } },
+          },
+        },
+        'input',
+      );
+      stampedSignalList.add(
+        {
+          id: 'dup-stamped-signal',
+          role: 'signal',
+          createdAt: new Date(1000),
+          content: { format: 2, parts: [{ type: 'text', text: 'steer' }] },
+        },
+        'memory',
+      );
+
+      const stampedSignalRows = stampedSignalList.get.all.db();
+      expect(stampedSignalRows).toHaveLength(1);
+      expect(getLogicalMessageId(stampedSignalRows[0]?.content.metadata)).toBe('original-steer-1');
     });
 
     it('should handle empty storage', async () => {
@@ -679,7 +777,9 @@ describe('MessageHistory', () => {
       expect(mockStorage.saveMessages).not.toHaveBeenCalled();
     });
 
-    it.each(['error', 'aborted'])('should not persist a %s run that produced output', async finishReason => {
+    // PF-4402 user decision: adopts upstream #23867 — failed and aborted turns that
+    // produced output are persisted (superseding PF-3759's decline-all rule).
+    it.each(['error', 'aborted'])('should persist a %s run that produced output', async finishReason => {
       const mockStorage = {
         saveMessages: vi.fn().mockResolvedValue(undefined),
         getThreadById: vi.fn().mockResolvedValue({
@@ -724,7 +824,138 @@ describe('MessageHistory', () => {
         requestContext: createRuntimeContextWithMemory('thread-1'),
       });
 
-      expect(mockStorage.saveMessages).not.toHaveBeenCalled();
+      expect(mockStorage.saveMessages).toHaveBeenCalledTimes(1);
+      const saved = (mockStorage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(saved.map(message => message.id)).toEqual(['msg-2', 'msg-3']);
+    });
+
+    it('should persist a user plus error-only assistant through the ordinary path', async () => {
+      const mockStorage = {
+        saveMessages: vi.fn().mockResolvedValue(undefined),
+        getThreadById: vi.fn().mockResolvedValue({
+          id: 'thread-1',
+          title: 'Test Thread',
+          metadata: {},
+        }),
+        listMessages: vi.fn().mockResolvedValue({ messages: [], total: 0 }),
+        updateThread: vi.fn().mockResolvedValue(undefined),
+      } as unknown as MemoryStorage;
+
+      const processor = new MessageHistory({
+        storage: mockStorage,
+      });
+
+      const userMessage: MastraDBMessage = {
+        role: 'user',
+        content: { format: 2, parts: [{ type: 'text', text: 'User message' }] },
+        id: 'msg-2',
+        createdAt: new Date(),
+      };
+      const messageList = new MessageList().add([userMessage], `input`);
+
+      // A terminal failure recorded as an `error` part produces a real assistant
+      // response message, so the input-only orphan guard above no longer applies
+      // and no special empty-message rule is needed.
+      recordTerminalErrorMessage({
+        messageList,
+        attemptId: 'msg-3',
+        activeId: 'msg-3',
+        error: new Error('provider exploded'),
+      });
+
+      await processor.processOutputResult({
+        messageList,
+        messages: messageList.get.all.db(),
+        result: {
+          text: '',
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          finishReason: 'error',
+          steps: [],
+        },
+        abort: ((reason?: string) => {
+          throw new Error(reason || 'Aborted');
+        }) as (reason?: string) => never,
+        requestContext: createRuntimeContextWithMemory('thread-1'),
+      });
+
+      expect(mockStorage.saveMessages).toHaveBeenCalledTimes(1);
+      const saved = (mockStorage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+      expect(saved.map(message => message.role)).toEqual(['user', 'assistant']);
+      expect(saved[1]?.id).toBe('msg-3');
+      expect(saved[1]?.content.parts).toEqual([
+        {
+          type: 'error',
+          error: { name: 'Error', message: 'provider exploded' },
+          createdAt: expect.any(Number),
+        },
+      ]);
+    });
+
+    it('should preserve partial parts alongside the persisted error part', async () => {
+      const mockStorage = {
+        saveMessages: vi.fn().mockResolvedValue(undefined),
+        getThreadById: vi.fn().mockResolvedValue({
+          id: 'thread-1',
+          title: 'Test Thread',
+          metadata: {},
+        }),
+        listMessages: vi.fn().mockResolvedValue({ messages: [], total: 0 }),
+        updateThread: vi.fn().mockResolvedValue(undefined),
+      } as unknown as MemoryStorage;
+
+      const processor = new MessageHistory({
+        storage: mockStorage,
+      });
+
+      const userMessage: MastraDBMessage = {
+        role: 'user',
+        content: { format: 2, parts: [{ type: 'text', text: 'User message' }] },
+        id: 'msg-2',
+        createdAt: new Date(),
+      };
+      const partialAssistant: MastraDBMessage = {
+        role: 'assistant',
+        content: { format: 2, parts: [{ type: 'text', text: 'Partial response' }] },
+        id: 'msg-3',
+        createdAt: new Date(),
+      };
+      const messageList = new MessageList().add([userMessage], `input`).add([partialAssistant], `response`);
+
+      // The response id rotated after the partial output was stored, so the
+      // error part has to land on the attempt's record instead of a new one.
+      recordTerminalErrorMessage({
+        messageList,
+        attemptId: 'msg-3',
+        activeId: 'msg-rotated',
+        error: new Error('stream broke'),
+      });
+
+      await processor.processOutputResult({
+        messageList,
+        messages: messageList.get.all.db(),
+        result: {
+          text: 'Partial response',
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          finishReason: 'error',
+          steps: [],
+        },
+        abort: ((reason?: string) => {
+          throw new Error(reason || 'Aborted');
+        }) as (reason?: string) => never,
+        requestContext: createRuntimeContextWithMemory('thread-1'),
+      });
+
+      expect(mockStorage.saveMessages).toHaveBeenCalledTimes(1);
+      const saved = (mockStorage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+
+      expect(saved.map(message => message.role)).toEqual(['user', 'assistant']);
+      const assistant = saved.find(message => message.role === 'assistant');
+      expect(assistant?.id).toBe('msg-3');
+      expect(assistant?.content.parts.map(part => part.type)).toEqual(['text', 'error']);
+      expect(assistant?.content.parts.find(part => part.type === 'text')).toMatchObject({ text: 'Partial response' });
+      expect(assistant?.content.parts.find(part => part.type === 'error')).toMatchObject({
+        error: { name: 'Error', message: 'stream broke' },
+      });
     });
 
     it('should filter out ONLY system messages', async () => {
@@ -878,6 +1109,71 @@ describe('MessageHistory', () => {
       expect(serialized).not.toContain('PRIVATE_APPROVAL_DIGEST');
       expect(serialized).not.toContain('RAW_SUSPENSION_PAYLOAD');
     });
+
+    it.each([false, true])(
+      'drops stripped working-memory reasoning while preserving a sealed boundary (sealed: %s)',
+      async sealed => {
+        const mockStorage = {
+          saveMessages: vi.fn().mockResolvedValue(undefined),
+          getThreadById: vi.fn().mockResolvedValue({ id: 'thread-1', title: 'Test Thread', metadata: {} }),
+        } as unknown as MemoryStorage;
+        const processor = new MessageHistory({
+          storage: mockStorage,
+          ...(sealed ? { toolCallFilter: { exclude: ['updateWorkingMemory'] } } : {}),
+        });
+
+        const reasoning = (signature: string) => ({
+          type: 'reasoning' as const,
+          reasoning: '',
+          details: [{ type: 'text' as const, text: `thinking ${signature}`, signature }],
+          providerMetadata: { anthropic: { signature } },
+        });
+        const workingMemoryCall = {
+          state: 'result' as const,
+          toolCallId: 'wm-1',
+          toolName: 'updateWorkingMemory',
+          args: { memory: '# User\n- Lives in Paris' },
+          result: { success: true },
+        };
+
+        await processor.persistMessages({
+          threadId: 'thread-1',
+          messages: [
+            {
+              id: 'assistant-1',
+              role: 'assistant',
+              createdAt: new Date(),
+              content: {
+                format: 2,
+                parts: [
+                  { type: 'step-start' },
+                  reasoning('SIG_A'),
+                  {
+                    type: 'tool-invocation',
+                    toolInvocation: workingMemoryCall,
+                    ...(sealed ? { metadata: { mastra: { sealedAt: 123 } } } : {}),
+                  },
+                  { type: 'step-start' },
+                  reasoning('SIG_B'),
+                  { type: 'text', text: 'Noted.' },
+                ],
+                toolInvocations: [workingMemoryCall],
+                ...(sealed ? { metadata: { mastra: { sealed: true } } } : {}),
+              },
+            },
+          ],
+        });
+
+        const [saved] = (mockStorage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+        expect(saved!.content.parts).toEqual([
+          ...(sealed ? [{ type: 'text', text: '', metadata: { mastra: { sealedAt: 123 } } }] : []),
+          { type: 'step-start' },
+          reasoning('SIG_B'),
+          { type: 'text', text: 'Noted.' },
+        ]);
+        expect(saved!.content.toolInvocations).toBeUndefined();
+      },
+    );
 
     it('should drop transient signals but keep normal signals when persisting', async () => {
       const mockStorage = {
@@ -1839,20 +2135,62 @@ describe('MessageHistory', () => {
       expect(JSON.stringify(savedMessages)).not.toContain('search result');
     });
 
-    it('filters legacy messages that store tool payloads only in content.toolInvocations', async () => {
+    it.each(['private_tool', 'updateWorkingMemory'])(
+      'filters legacy-only %s payloads and their provider metadata',
+      async toolName => {
+        const storage = createPersistenceStorage();
+        const processor = new MessageHistory({ storage, toolCallFilter: {} });
+        const message = createToolResultMessage();
+        message.content.parts = [{ type: 'text', text: 'Final answer' }];
+        message.content.toolInvocations = message.content.toolInvocations!.map(invocation => ({
+          ...invocation,
+          toolName,
+        }));
+        message.content.providerMetadata = { private: { payload: 'RAW_PROVIDER_METADATA_SENTINEL' } };
+        const sourceBefore = structuredClone(message);
+
+        await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
+
+        const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+        const serialized = JSON.stringify(savedMessages);
+        expect(serialized).toContain('Final answer');
+        expect(serialized).not.toContain('TOP_LEVEL_ARGS_SENTINEL');
+        expect(serialized).not.toContain('TOP_LEVEL_RESULT_SENTINEL');
+        expect(serialized).not.toContain('RAW_PROVIDER_METADATA_SENTINEL');
+        expect(savedMessages[0]!.content.toolInvocations).toBeUndefined();
+        expect(savedMessages[0]!.content.providerMetadata).toBeUndefined();
+        expect(message).toEqual(sourceBefore);
+      },
+    );
+
+    it('does not announce a whole-thread save for an old-row update while newer output is unsaved', async () => {
       const storage = createPersistenceStorage();
-      const processor = new MessageHistory({ storage, toolCallFilter: {} });
-      const message = createToolResultMessage();
-      message.content.parts = [{ type: 'text', text: 'Final answer' }];
-
-      await processor.persistMessages({ messages: [message], threadId: 'thread-1' });
-
-      const savedMessages = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
-      const serialized = JSON.stringify(savedMessages);
-      expect(serialized).toContain('Final answer');
-      expect(serialized).not.toContain('TOP_LEVEL_ARGS_SENTINEL');
-      expect(serialized).not.toContain('TOP_LEVEL_RESULT_SENTINEL');
-      expect(savedMessages[0]!.content.toolInvocations).toBeUndefined();
+      const processor = new MessageHistory({ storage });
+      const oldRow: MastraDBMessage = {
+        id: 'old-assistant-row',
+        role: 'assistant',
+        createdAt: new Date(1),
+        content: { format: 2, parts: [{ type: 'text', text: 'Updated historical row' }] },
+      };
+      const newerOutput: MastraDBMessage = {
+        id: 'newer-unsaved-output',
+        role: 'assistant',
+        createdAt: new Date(2),
+        content: { format: 2, parts: [{ type: 'text', text: 'New live output' }] },
+      };
+      const liveMessages = new MessageList().add(newerOutput, 'response');
+      const onSaved = vi.fn();
+      const unsubscribe = onThreadMessagesSaved({ threadId: 'thread-1', resourceId: 'resource-1' }, onSaved);
+      try {
+        await processor.persistMessages({ messages: [oldRow], threadId: 'thread-1', resourceId: 'resource-1' });
+        expect(storage.saveMessages).toHaveBeenCalledTimes(1);
+        const saved = (storage.saveMessages as any).mock.calls[0][0].messages as MastraDBMessage[];
+        expect(saved.map(message => message.id)).toEqual(['old-assistant-row']);
+        expect(liveMessages.get.response.db().map(message => message.id)).toEqual(['newer-unsaved-output']);
+        expect(onSaved).not.toHaveBeenCalled();
+      } finally {
+        unsubscribe();
+      }
     });
 
     it.each([

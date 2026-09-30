@@ -8,7 +8,12 @@
 
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { RequestContext, MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY } from '@mastra/core/request-context';
+import {
+  RequestContext,
+  MASTRA_AUTH_TOKEN_KEY,
+  MASTRA_RESOURCE_ID_KEY,
+  MASTRA_THREAD_ID_KEY,
+} from '@mastra/core/request-context';
 import { createTool } from '@mastra/core/tools';
 import type { DurableAgentTestContext } from '../types';
 import { createTextStreamModel, createToolCallModel } from '../mock-models';
@@ -144,7 +149,11 @@ export function createRequestContextTests({ createAgent }: DurableAgentTestConte
     });
 
     describe('RequestContext serialization', () => {
-      it('should not include requestContext in serialized workflow input', async () => {
+      // Fork contract (diverges from upstream): durable agents persist caller
+      // request-context entries only through the explicit
+      // `durableRequestContextKeys` allowlist, so an unlisted entry is not
+      // snapshotted by default. The auth-token invariant is unchanged.
+      it('should not snapshot unlisted caller entries or the framework-managed auth token', async () => {
         const mockModel = createTextStreamModel('Hello!');
 
         const agent = await createAgent({
@@ -155,16 +164,21 @@ export function createRequestContextTests({ createAgent }: DurableAgentTestConte
         });
 
         const requestContext = new RequestContext();
-        requestContext.set('sensitiveData', 'should-not-serialize');
+        requestContext.set('userId', 'user-123');
+        requestContext.set(MASTRA_AUTH_TOKEN_KEY, 'super-secret-bearer-token');
 
         const result = await agent.prepare('Hello', {
           requestContext,
         });
 
+        const entries = (result.workflowInput as { requestContextEntries?: Record<string, unknown> })
+          .requestContextEntries;
+        expect(entries).toBeUndefined();
+        expect(JSON.stringify(result.workflowInput)).not.toContain('user-123');
+
+        // The framework-managed auth token must never be persisted.
         const serialized = JSON.stringify(result.workflowInput);
-        expect(serialized).toBeDefined();
-        expect(serialized).not.toContain('sensitiveData');
-        expect(serialized).not.toContain('should-not-serialize');
+        expect(serialized).not.toContain('super-secret-bearer-token');
       });
     });
   });

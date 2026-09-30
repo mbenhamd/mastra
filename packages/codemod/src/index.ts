@@ -27,7 +27,10 @@ program
   .option(...jscodeshiftOptionArgs, [])
   .action(async (codemod, source, options) => {
     try {
-      await transform(codemod, source, options);
+      const { errors } = await transform(codemod, source, options);
+      if (errors.length > 0) {
+        process.exitCode = 1;
+      }
     } catch (err: any) {
       error(`Error transforming: ${err}`);
       process.exit(1);
@@ -43,7 +46,10 @@ program
   .option(...jscodeshiftOptionArgs, [])
   .action(async options => {
     try {
-      await upgradeV1(options);
+      const { errors } = await upgradeV1(options);
+      if (errors.length > 0) {
+        process.exitCode = 1;
+      }
     } catch (err: any) {
       error(`Error transforming: ${err}`);
       process.exit(1);

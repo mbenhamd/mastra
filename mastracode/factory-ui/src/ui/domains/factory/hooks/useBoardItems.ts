@@ -17,14 +17,6 @@ import { createWorkItemComment } from '../services/comments';
 import { inferredParentWorkItemId } from '../services/relationships';
 import type { WorkItem } from '../services/workItems';
 
-/**
- * Column order, stated here rather than inherited from the list endpoint: a
- * card must keep its place when a sync or a run touches it, and the board is
- * the surface that decides what "first" means.
- */
-const byNewest = (left: WorkItem, right: WorkItem) =>
-  right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id);
-
 interface MoveOptions {
   /** What the server records as the reason for the move; a drag says so, a card button does not. */
   cause?: string;
@@ -36,10 +28,12 @@ interface MoveOptions {
 export function useBoardItems({
   factoryProjectId,
   kind,
+  currentUserId,
   onFailure,
 }: {
   factoryProjectId: string | undefined;
   kind: BoardKind;
+  currentUserId?: string;
   /** Where a failure goes when no card is on screen to carry it, e.g. the search palette. */
   onFailure?: (message: string) => void;
 }) {
@@ -48,7 +42,7 @@ export function useBoardItems({
   const catalog = useBoardCatalog(factoryProjectId);
   const upsert = useUpsertWorkItemMutation(factoryProjectId);
   const update = useUpdateWorkItemMutation(factoryProjectId);
-  const transition = useTransitionWorkItemMutation(factoryProjectId);
+  const transition = useTransitionWorkItemMutation(factoryProjectId, currentUserId);
   const remove = useDeleteWorkItemMutation(factoryProjectId);
   const [transitionReasons, setTransitionReasons] = useState<Record<string, string>>({});
   const [dropError, setDropError] = useState<Error>();
@@ -58,7 +52,7 @@ export function useBoardItems({
   const knownSourceKeys = useMemo(() => persistedSourceKeys(all), [all]);
   // Sources whose card sits on another board: the only withheld feed items worth explaining.
   const elsewhereSourceKeys = persistedSourceKeys(all.filter(item => !belongsToBoard(item, kind)));
-  const visible = all.filter(item => belongsToBoard(item, kind)).sort(byNewest);
+  const visible = all.filter(item => belongsToBoard(item, kind));
 
   const requestTransition = (item: WorkItem, toStage: string, options: MoveOptions = {}, onSettled?: () => void) => {
     setTransitionReasons(current => {
@@ -129,7 +123,8 @@ export function useBoardItems({
     // rather than guessing a phase the board may not declare.
     const initialPhase = catalog.data?.find(board => board.id === kind)?.initialPhase;
     const { source, sourceKey, title, url, metadata, customPrompt } = payload.candidate;
-    const parentWorkItemId = source === 'github-pr' ? inferredParentWorkItemId(metadata, all) : undefined;
+    const parentWorkItemId =
+      source === 'github-pr' || source === 'gitlab-pr' ? inferredParentWorkItemId(metadata, all) : undefined;
     void (async () => {
       const item = await upsert.mutateAsync({
         board: kind,

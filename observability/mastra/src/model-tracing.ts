@@ -48,7 +48,8 @@ function supportsModelInference(): boolean {
   return coreFeatures.has('model-inference-span');
 }
 
-import { extractUsageMetrics } from './usage';
+import { extractOpenRouterCost, extractUsageMetrics } from './usage';
+import type { OpenRouterCostResult } from './usage';
 
 type StepInputPreview = ModelStepInput | undefined;
 
@@ -526,6 +527,38 @@ function preparedRequestAggregateFromAttributes(
   };
 }
 
+function getOpenRouterCostContext({ providerMetadata, stepProviderMetadata }: EndGenerationOptions, model?: string) {
+  const metadata = stepProviderMetadata ?? (providerMetadata ? [providerMetadata] : undefined);
+  if (!metadata?.some(step => step?.openrouter !== undefined)) return undefined;
+
+  const results = metadata.map(extractOpenRouterCost);
+  if (results.some(result => result === undefined)) return undefined;
+
+  const costs = results as OpenRouterCostResult[];
+  const estimatedCost = costs.reduce((total, result) => total + result.total, 0);
+  if (!Number.isFinite(estimatedCost)) return undefined;
+
+  const sdkCostFields: string[] = [];
+  if (costs.some(result => result.usedCost)) sdkCostFields.push('openrouter.usage.cost');
+  if (costs.some(result => result.usedUpstreamCost)) {
+    sdkCostFields.push('openrouter.usage.costDetails.upstreamInferenceCost');
+  }
+
+  return {
+    provider: 'openrouter',
+    model,
+    estimatedCost,
+    costUnit: 'USD',
+    costMetadata: {
+      source: 'provider_reported',
+      sdkProvider: 'openrouter',
+      sdkCostField: sdkCostFields.join('+'),
+      scope: 'query_total',
+      reportedStepCount: costs.length,
+    },
+  };
+}
+
 function formatPreviewLabel(label: unknown, fallback: string): string {
   return typeof label === 'string' && label.length > 0 ? label : fallback;
 }
@@ -994,6 +1027,23 @@ export class ModelSpanTracker {
    * If usage is provided, it will be converted to UsageStats with cache token details.
    */
   endGeneration(options?: EndGenerationOptions): void {
+    // Upstream: prefer provider-reported OpenRouter cost when present. Inject it
+    // into `options.attributes` so the shared end-span aggregation below — which
+    // re-reads `options` — prefers it over the gateway-reported fallback.
+    if (options) {
+      const model =
+        options.attributes?.responseModel ??
+        this.#modelSpan?.attributes?.responseModel ??
+        this.#modelSpan?.attributes?.model;
+      const providerCostContext = getOpenRouterCostContext(
+        { providerMetadata: options.providerMetadata, stepProviderMetadata: options.stepProviderMetadata },
+        model,
+      );
+      if (providerCostContext) {
+        options.attributes = { ...options.attributes, costContext: providerCostContext };
+      }
+    }
+
     if (this.#currentStepSpan) {
       const finishReason = runSpanOperation(() => options?.attributes?.finishReason);
       const pendingInferenceFinish = this.#pendingInferenceFinishPayload;

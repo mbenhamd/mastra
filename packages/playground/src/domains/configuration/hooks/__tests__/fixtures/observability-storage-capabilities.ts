@@ -31,7 +31,7 @@ const makeObservabilityCapabilities = (supportsMetrics: boolean) => ({
 export const renamedPostgresWithMetrics: GetSystemPackagesResponse = {
   ...baseSystemPackages,
   observabilityStorageType: '_ObservabilityStoragePostgresVNext',
-  observabilityStorageCapabilities: makeObservabilityCapabilities(true),
+  observabilityRuntimeCapabilities: makeObservabilityCapabilities(true),
 };
 
 export const legacyPostgresWithoutCapabilities: GetSystemPackagesResponse = {
@@ -42,5 +42,5 @@ export const legacyPostgresWithoutCapabilities: GetSystemPackagesResponse = {
 export const storageWithoutMetrics: GetSystemPackagesResponse = {
   ...baseSystemPackages,
   observabilityStorageType: 'ObservabilityStoragePostgresVNext',
-  observabilityStorageCapabilities: makeObservabilityCapabilities(false),
+  observabilityRuntimeCapabilities: makeObservabilityCapabilities(false),
 };

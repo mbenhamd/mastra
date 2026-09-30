@@ -42,6 +42,19 @@ import type { Inngest } from 'inngest';
 import { z } from 'zod';
 
 import { init } from '../index';
+import type { InngestFlowControlConfig } from '../types';
+
+// Suspended snapshots back human-in-the-loop resume. Terminal statuses are also
+// persisted so a finished run's snapshot replaces its stale suspended one and
+// resume() rejects it instead of re-running the suspended tool.
+const PERSISTED_SNAPSHOT_STATUSES = new Set<string>([
+  'suspended',
+  'success',
+  'failed',
+  'canceled',
+  'bailed',
+  'tripwire',
+]);
 
 /**
  * Input schema for the durable agentic workflow.
@@ -88,6 +101,8 @@ export interface InngestDurableAgenticWorkflowOptions {
    * registered Inngest worker and is never serialized into workflow state.
    */
   resolveToolPermission?: DurableToolPermissionResolver;
+  /** Inngest function-level retries for the agentic loop and iteration functions (defaults to 0) */
+  retries?: InngestFlowControlConfig['retries'];
 }
 
 /**
@@ -200,6 +215,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
     maxSteps = DurableAgentDefaults.MAX_STEPS,
     workflowIds = InngestDurableStepIds,
     resolveToolPermission,
+    retries,
   } = options;
   const { createWorkflow } = init(inngest);
 
@@ -222,6 +238,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
   // Create the single iteration workflow (LLM -> Tool Calls -> Mapping)
   const singleIterationWorkflow = createWorkflow({
     id: workflowIds.AGENTIC_EXECUTION,
+    retries,
     inputSchema: iterationStateSchema,
     outputSchema: iterationStateSchema,
     options: {
@@ -230,8 +247,10 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
         // This makes the trace structure match regular agents (agent_run -> model_generation -> tool_call)
         internal: InternalSpans.WORKFLOW,
       },
-      shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+      shouldPersistSnapshot: ({ workflowStatus }) => PERSISTED_SNAPSHOT_STATUSES.has(workflowStatus),
+      evaluatePersistencePredicateBeforeDurableOperation: true,
       validateInputs: false,
+      emitStepEvents: false,
     },
     steps: [],
   })
@@ -350,6 +369,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
   return (
     createWorkflow({
       id: workflowIds.AGENTIC_LOOP,
+      retries,
       inputSchema: durableAgenticInputSchema,
       outputSchema: durableAgenticOutputSchema,
       options: {
@@ -358,8 +378,10 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
           // This makes the trace structure match regular agents (agent_run -> model_generation -> tool_call)
           internal: InternalSpans.WORKFLOW,
         },
-        shouldPersistSnapshot: ({ workflowStatus }) => workflowStatus === 'suspended',
+        shouldPersistSnapshot: ({ workflowStatus }) => PERSISTED_SNAPSHOT_STATUSES.has(workflowStatus),
+        evaluatePersistencePredicateBeforeDurableOperation: true,
         validateInputs: false,
+        emitStepEvents: false,
       },
       steps: [],
     })
@@ -429,6 +451,13 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
           return false;
         }
 
+        // bail() from a delegation hook is a hard stop. The flag travels on
+        // serialized iteration state (set by the tool-call step, aggregated by
+        // llm-mapping), so it survives the wire to this cross-process predicate.
+        if (state.delegationBailed) {
+          return false;
+        }
+
         // Check if we should continue
         const shouldContinue = state.lastStepResult?.isContinued === true;
         // Use maxSteps from options (per-request), falling back to workflow-level default
@@ -491,6 +520,13 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
           // This map callback already runs inside the execution engine's
           // durable step. Nesting another Inngest step.run here is rejected by
           // connect workers and can strand the caller before the finish event.
+
+          // Run finish side effects directly. This mapping already executes inside the
+          // engine's durable step boundary (`inngestStep.run`), so
+          // wrapping this call in `params.engine.step.run(...)` would create a nested
+          // Inngest step, which the Inngest protocol does not support: the nested step's
+          // callback never executes and its promise never settles, hanging the run and
+          // silently skipping output processors, memory persistence, and title generation.
           const finishResult = await runDurableFinishSideEffects({
             runId: state.runId,
             initData,

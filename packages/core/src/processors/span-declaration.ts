@@ -8,6 +8,7 @@
  * one executor would apply or not depending on how the agent happened to run
  * its processors.
  */
+import type { ProcessorSpanPayloadPhase } from '../observability';
 import type { Processor, ProcessorSpanPhase } from './index';
 
 /**
@@ -62,19 +63,34 @@ export function resolveProcessorSpanName(
   }
 }
 
-/** Resolve a processor's declared span attributes for this phase. */
+/**
+ * Resolve a processor's declared span attributes for this phase, with the phase
+ * itself recorded alongside them.
+ *
+ * The phase is applied last so a declaration cannot misreport which phase ran:
+ * readers narrow a processor span's payloads on this attribute, and a processor
+ * naming itself into another phase would hand them the wrong shape.
+ */
 export function resolveProcessorSpanAttributes(
-  processor: Pick<Processor, 'spanAttributes'>,
-  phase: ProcessorSpanPhase,
+  processor: Pick<Processor, 'spanAttributes'> | undefined,
+  phase: ProcessorSpanPayloadPhase,
 ) {
   try {
-    const declared = processor.spanAttributes;
-    const resolved = typeof declared === 'function' ? declared(phase) : declared;
-    if (!resolved || typeof resolved !== 'object') return undefined;
+    const declared = processor?.spanAttributes;
+    // The declaration callback keeps seeing the coarser phase it was written
+    // against; only the recorded attribute distinguishes the two output hooks.
+    const declarationPhase = toProcessorSpanPhase(phase);
+    const resolved = typeof declared === 'function' ? declared(declarationPhase) : declared;
     // Materialize inside the guard so hostile getters/proxies cannot defer a
     // throw until the caller spreads the attributes into a span declaration.
-    return { ...resolved };
+    const base = resolved && typeof resolved === 'object' ? { ...resolved } : {};
+    // The phase is applied last (and even when nothing is declared) so a
+    // declaration cannot misreport which phase ran: readers narrow a processor
+    // span's payloads on this attribute.
+    return { ...base, processorPhase: phase };
   } catch {
-    return undefined;
+    // Observability metadata is advisory. It must never bypass a processor
+    // whose body may enforce filtering, moderation, or persistence policy.
+    return { processorPhase: phase };
   }
 }

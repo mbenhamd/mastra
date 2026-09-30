@@ -20,10 +20,11 @@ import {
   TABLE_SCHEMAS,
   transformScoreRow as coreTransformScoreRow,
 } from '@mastra/core/storage';
-import { parseSqlIdentifier } from '@mastra/core/utils';
+import { schemaNamePrefix } from '../../../shared/schema-name';
 import { PgDB, resolvePgConfig, generateTableSQL, generateIndexSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
 import { truncateIdentifierWithHash } from '../../db/constraint-utils';
+import { toPgJson } from '../../db/sanitize-json';
 import { runPrune, resolveTargets } from '../../retention';
 
 /**
@@ -119,7 +120,7 @@ export class ScoresPG extends ScoresStorage {
    * so its supporting index is not part of the default index set.
    */
   private async ensureRetentionIndexes(policies: Record<string, TableRetentionPolicy>): Promise<void> {
-    const prefix = this.#schema && this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const prefix = this.#schema && this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     for (const [key, entry] of Object.entries(ScoresPG.retentionTables)) {
       if (!entry.indexed || !policies[key]) continue;
       try {
@@ -155,7 +156,7 @@ export class ScoresPG extends ScoresStorage {
    */
   static getExportDDL(schemaName?: string): string[] {
     const statements: string[] = [];
-    const parsedSchema = schemaName ? parseSqlIdentifier(schemaName, 'schema name') : '';
+    const parsedSchema = schemaName ? schemaNamePrefix(schemaName) : '';
     const schemaPrefix = parsedSchema && parsedSchema !== 'public' ? `${parsedSchema}_` : '';
 
     // Table
@@ -180,7 +181,7 @@ export class ScoresPG extends ScoresStorage {
    * Returns default index definitions for this instance's schema.
    */
   getDefaultIndexDefinitions(): CreateIndexOptions[] {
-    const schemaPrefix = this.#schema !== 'public' ? `${this.#schema}_` : '';
+    const schemaPrefix = this.#schema !== 'public' ? `${schemaNamePrefix(this.#schema)}_` : '';
     return ScoresPG.getDefaultIndexDefs(schemaPrefix);
   }
 
@@ -399,15 +400,15 @@ export class ScoresPG extends ScoresStorage {
         record: {
           id,
           ...rest,
-          input: JSON.stringify(input) || '',
-          output: JSON.stringify(output) || '',
-          scorer: scorer ? JSON.stringify(scorer) : null,
-          preprocessStepResult: preprocessStepResult ? JSON.stringify(preprocessStepResult) : null,
-          analyzeStepResult: analyzeStepResult ? JSON.stringify(analyzeStepResult) : null,
-          metadata: metadata ? JSON.stringify(metadata) : null,
-          additionalContext: additionalContext ? JSON.stringify(additionalContext) : null,
-          requestContext: requestContext ? JSON.stringify(requestContext) : null,
-          entity: entity ? JSON.stringify(entity) : null,
+          input: toPgJson(input) || '',
+          output: toPgJson(output) || '',
+          scorer: scorer ? toPgJson(scorer) : null,
+          preprocessStepResult: preprocessStepResult ? toPgJson(preprocessStepResult) : null,
+          analyzeStepResult: analyzeStepResult ? toPgJson(analyzeStepResult) : null,
+          metadata: metadata ? toPgJson(metadata) : null,
+          additionalContext: additionalContext ? toPgJson(additionalContext) : null,
+          requestContext: requestContext ? toPgJson(requestContext) : null,
+          entity: entity ? toPgJson(entity) : null,
           createdAt: now.toISOString(),
           updatedAt: now.toISOString(),
         },

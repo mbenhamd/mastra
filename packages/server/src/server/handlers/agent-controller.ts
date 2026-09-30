@@ -530,9 +530,8 @@ function carriesError(event: AgentControllerEvent): event is ErrorCarryingAgentC
 
 /**
  * An `Error`'s `message`/`name` are non-enumerable, so flatten it before JSON
- * serialization. Streamed message events intentionally retain the controller's
- * live accumulated message; consumers requiring temporal isolation must copy or
- * serialize the value there.
+ * serialization. Compact message updates and ends are already JSON-safe and
+ * pass through unchanged; only `message_start` carries a message snapshot.
  */
 function toWireEvent(event: AgentControllerEvent): JsonReadyAgentControllerEvent {
   if ('displayState' in event) {
@@ -709,14 +708,29 @@ export const AGENT_CONTROLLER_TOOL_APPROVAL_ROUTE = createRoute({
       // continuation and emits its events to subscribers (the open SSE stream).
       // Calling approveToolCall/declineToolCall directly would bypass the gate,
       // leaving the run loop hung and duplicating the resumed stream.
-      // Match the full parked identity so a stale request cannot resolve a
-      // different gate even when a provider reuses a tool-call id.
-      session.respondToToolApproval({
-        runId,
-        toolCallId,
-        decision: approved ? 'approve' : 'decline',
-        requestContext,
-      });
+      const gated = session.approval.isArmed() && session.approval.getToolCallId() === toolCallId;
+      if (gated) {
+        // Match the full parked identity so a stale request cannot resolve a
+        // different gate even when a provider reuses a tool-call id.
+        session.respondToToolApproval({
+          runId,
+          toolCallId,
+          decision: approved ? 'approve' : 'decline',
+          requestContext,
+        });
+      } else {
+        // Nothing parked for this call (e.g. a card restored from history after a
+        // restart): resume the stored suspended run that owns it. The request's
+        // runId is mandatory and must match the stored run exactly — providers
+        // reuse tool-call ids across runs, so the tool-call id alone cannot
+        // identify which suspended run this approval answers.
+        ackBackgroundSessionWork({
+          work: session.respondToPersistedToolApproval({ runId, toolCallId, approved, requestContext }),
+          session,
+          mastra,
+          operation: 'respondToPersistedToolApproval',
+        });
+      }
       return { ok: true };
     } catch (error) {
       return handleError(error, 'error responding to controller tool approval');

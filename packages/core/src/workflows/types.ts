@@ -197,6 +197,18 @@ export type StepSkipped<P, R, S, T> = {
   metadata?: StepMetadata;
 };
 
+export type StepCanceled<P, R, S, T> = {
+  status: 'canceled';
+  payload?: P;
+  resumePayload?: R;
+  suspendPayload?: S;
+  suspendOutput?: T;
+  output?: T;
+  startedAt?: number;
+  endedAt?: number;
+  metadata?: StepMetadata;
+};
+
 export type StepResult<P, R, S, T> =
   | StepSuccess<P, R, S, T>
   | StepFailure<P, R, S, T>
@@ -204,7 +216,8 @@ export type StepResult<P, R, S, T> =
   | StepRunning<P, R, S, T>
   | StepWaiting<P, R, S, T>
   | StepPaused<P, R, S, T>
-  | StepSkipped<P, R, S, T>;
+  | StepSkipped<P, R, S, T>
+  | StepCanceled<P, R, S, T>;
 
 /**
  * Serialized version of StepFailure where error is a SerializedError
@@ -225,7 +238,8 @@ export type SerializedStepResult<P, R, S, T> =
   | StepRunning<P, R, S, T>
   | StepWaiting<P, R, S, T>
   | StepPaused<P, R, S, T>
-  | StepSkipped<P, R, S, T>;
+  | StepSkipped<P, R, S, T>
+  | StepCanceled<P, R, S, T>;
 
 export type TimeTravelContext<P, R, S, T> = Record<
   string,
@@ -771,6 +785,15 @@ export interface WorkflowErrorCallbackInfo {
   stepExecutionPath?: string[];
 }
 
+/**
+ * Predicate deciding whether a workflow run snapshot is persisted for a given
+ * status transition. Returning false skips the storage write entirely.
+ */
+export type ShouldPersistSnapshotFn = (params: {
+  stepResults: Record<string, StepResult<any, any, any, any>>;
+  workflowStatus: WorkflowRunStatus;
+}) => boolean;
+
 export interface WorkflowOptions {
   tracingPolicy?: TracingPolicy;
   validateInputs?: boolean;
@@ -802,10 +825,15 @@ export interface WorkflowOptions {
    * dedicated opt-in path (`recovery.durableAgents: 'auto'`).
    */
   autoRestartActiveRuns?: boolean;
-  shouldPersistSnapshot?: (params: {
-    stepResults: Record<string, StepResult<any, any, any, any>>;
-    workflowStatus: WorkflowRunStatus;
-  }) => boolean;
+  shouldPersistSnapshot?: ShouldPersistSnapshotFn;
+  /**
+   * Evaluates `shouldPersistSnapshot` before entering the durable operation so a
+   * false verdict does not consume a durable step.
+   *
+   * @internal Only enable this for framework-owned predicates that depend solely
+   * on serialized workflow state and are guaranteed deterministic across replay.
+   */
+  evaluatePersistencePredicateBeforeDurableOperation?: boolean;
 
   /**
    * Suppresses the warning when storage cannot atomically claim resumes.
@@ -916,10 +944,24 @@ export type StepFlowEntryOptions = {
  * (`any`) because the public type-safety for these entries is enforced by the
  * `Workflow` builder method overloads, not by this internal union.
  */
+export type SerializableClassifierStepOptions = {
+  maxRetries?: number;
+  providerOptions?: Record<string, Record<string, unknown>>;
+  retries?: number;
+  metadata?: StepMetadata;
+};
+
 export type SingleStepEntry<TEngineType = DefaultEngineType> =
   | { type: 'step'; step: Step }
   | { type: 'agent'; id: string; agentId: string; agent?: any; options?: any }
   | { type: 'tool'; id: string; toolId: string; tool?: any; options?: any }
+  | {
+      type: 'classifier';
+      id: string;
+      classifierId: string;
+      classifier?: any;
+      options?: SerializableClassifierStepOptions;
+    }
   | {
       type: 'mapping';
       id: string;
@@ -934,6 +976,8 @@ export type StepEntry = Extract<SingleStepEntry, { type: 'step' }>;
 export type AgentStepEntry = Extract<SingleStepEntry, { type: 'agent' }>;
 /** The `{ type: 'tool' }` variant of {@link SingleStepEntry}. */
 export type ToolStepEntry = Extract<SingleStepEntry, { type: 'tool' }>;
+/** The `{ type: 'classifier' }` variant of {@link SingleStepEntry}. */
+export type ClassifierStepEntry = Extract<SingleStepEntry, { type: 'classifier' }>;
 /** The `{ type: 'mapping' }` variant of {@link SingleStepEntry}. */
 export type MappingStepEntry<TEngineType = DefaultEngineType> = Extract<
   SingleStepEntry<TEngineType>,
@@ -1124,6 +1168,12 @@ export type SerializedSingleStepEntry =
       // No outputSchema: a tool's output shape lives on the tool itself and is
       // looked up from the live Mastra instance at rehydration time.
       options?: SerializedStepOptions;
+    }
+  | {
+      type: 'classifier';
+      id: string;
+      classifierId: string;
+      options?: SerializableClassifierStepOptions;
     }
   | {
       type: 'mapping';
