@@ -60,6 +60,7 @@ import {
   projectHarnessSessionRecordProjectionFence,
 } from './session-record-projection';
 import {
+  HarnessTerminalHandoffCancelledError,
   HarnessTerminalHandoffClaimConflictError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
@@ -1675,6 +1676,30 @@ export class InMemoryHarness extends HarnessStorage {
     const admission = prepareHarnessTerminalAdmission(normalizedInput, this.terminalHandoff);
     const tombstone = this.db.harnessTerminalTombstones.get(harnessTerminalGrantTombstoneId(normalizedInput));
     if (tombstone) {
+      // A revoked or cancelled grant is refused, and the lease holder's
+      // undispatched reservation of the turn is settled with the cancellation
+      // in the same step, so a refused turn never stays pending for recovery
+      // to report as interrupted.
+      if (opts.leaseOwner !== undefined && this.holdsSessionLease(namespace, input.sessionId, opts.leaseOwner)) {
+        const key = messageEvidenceKey(namespace, input.sessionId, input.signalId);
+        const evidence = this.db.harnessMessageResultEvidence.get(key);
+        if (
+          evidence !== undefined &&
+          evidence.status === 'pending' &&
+          evidence.operationKind === 'message' &&
+          evidence.admissionId === input.admissionId &&
+          evidence.admissionHash === input.admissionHash &&
+          (evidence.dispatch === undefined || evidence.dispatch.state === 'reserved')
+        ) {
+          const cancelled = new HarnessTerminalHandoffCancelledError(input.executionGrant.key);
+          this.db.harnessMessageResultEvidence.set(key, {
+            ...cloneJson(evidence),
+            status: 'failed',
+            error: { code: cancelled.code, message: cancelled.message },
+            updatedAt: Date.now(),
+          });
+        }
+      }
       return { status: 'cancelled', admission: { ...admission, status: 'cancelled' } };
     }
     const currentSession = this.db.harnessSessions.get(sessionKey(namespace, input.sessionId));

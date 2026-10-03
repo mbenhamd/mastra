@@ -1330,6 +1330,12 @@ export abstract class HarnessStorage extends StorageDomain {
    * Atomically insert-or-read the bounded terminal admission. The adapter must
    * serialize this against the grant cancellation tombstone, so a missing
    * session or missing admission can never be interpreted as refundable work.
+   *
+   * A tombstoned (revoked or cancelled) grant answers `cancelled`. With
+   * `leaseOwner`, an adapter that supports grant revocation also settles the
+   * lease holder's undispatched pending reservation of the turn as failed
+   * `harness.terminal_cancelled` in the same step, so a refused turn never
+   * stays pending for recovery to report as interrupted.
    */
   async admitTerminalHandoff(
     _input: HarnessTerminalAdmissionInput,

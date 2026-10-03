@@ -1213,6 +1213,34 @@ describe('native chat terminal handoff', () => {
       ).resolves.toMatchObject({ status: 'duplicate', tombstoneId: revoked.tombstoneId });
     });
 
+    it("settles the lease holder's undispatched reservation in the same step that refuses the grant", async () => {
+      const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+      await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+      await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 30_000 });
+      const input = admission();
+      await storage.revokeTerminalGrant(revocation(input));
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      const load = () =>
+        storage.loadMessageResultEvidence({
+          harnessName: input.harnessName,
+          sessionId: input.sessionId,
+          resourceId: input.resourceId,
+          threadId: input.threadId,
+          signalId: input.signalId,
+        });
+
+      // Without the lease fence nothing is settled.
+      await expect(storage.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'cancelled' });
+      await expect(load()).resolves.toMatchObject({ status: 'pending' });
+      await expect(storage.admitTerminalHandoff(input, { leaseOwner: { ownerId: 'owner-1' } })).resolves.toMatchObject({
+        status: 'cancelled',
+      });
+      await expect(load()).resolves.toMatchObject({
+        status: 'failed',
+        error: { code: 'harness.terminal_cancelled' },
+      });
+    });
+
     it('returns an existing admission unchanged instead of revoking it', async () => {
       const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
       await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });

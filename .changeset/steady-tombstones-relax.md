@@ -13,4 +13,5 @@ ALTER TABLE mastra_harness_terminal_tombstones
   ALTER COLUMN admission_hash DROP NOT NULL;
 ```
 
+- A refused admission of a revoked or cancelled grant settles the lease holder's undispatched reservation in the same transaction.
 - A dispatch stamp with `leaseOwner` locks the session row before the evidence row and is refused when another owner holds the lease or the session is closed.

@@ -35,6 +35,7 @@ import {
   HarnessStorageWakeupTransitionError,
   DEFAULT_HARNESS_ATTACHMENT_MAX_BYTES,
   HarnessTerminalHandoffClaimConflictError,
+  HarnessTerminalHandoffCancelledError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
   HarnessTerminalHandoffNotFoundError,
@@ -5073,6 +5074,14 @@ export class HarnessPG extends HarnessStorage {
         args: [tombstoneId],
       });
       if (tombstone.rows[0]) {
+        // A revoked or cancelled grant is refused, and the lease holder's
+        // undispatched reservation of the turn is settled with the
+        // cancellation in the same transaction, so a refused turn never stays
+        // pending for recovery to report as interrupted. Lock order: grant ->
+        // session -> evidence, as below.
+        if (opts.leaseOwner !== undefined) {
+          await this.#settleRefusedReservationTx(tx, harnessName, admission, opts.leaseOwner);
+        }
         await tx.commit();
         return { status: 'cancelled', admission: { ...admission, status: 'cancelled' } };
       }
@@ -5219,6 +5228,43 @@ export class HarnessPG extends HarnessStorage {
       if (!tx.closed) await tx.rollback();
       throw err;
     }
+  }
+
+  async #settleRefusedReservationTx(
+    tx: PgHarnessClient,
+    harnessName: string,
+    admission: HarnessTerminalAdmissionRecord,
+    leaseOwner: HarnessSessionLeasePrecondition,
+  ): Promise<void> {
+    const session = await tx.execute({
+      sql: `SELECT owner_id, lease_expires_at, closed_at FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ? LIMIT 1 FOR UPDATE`,
+      args: [harnessName, admission.sessionId],
+    });
+    if (!rowHoldsSessionLease(session.rows[0] as Record<string, unknown> | undefined, leaseOwner)) return;
+    const evidenceId = messageEvidenceId({ harnessName, sessionId: admission.sessionId, signalId: admission.signalId });
+    const row = await tx.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+      args: [evidenceId],
+    });
+    if (!row.rows[0]) return;
+    const current = rowToMessageResultEvidence(row.rows[0] as Record<string, unknown>);
+    if (
+      current.status !== 'pending' ||
+      current.operationKind !== 'message' ||
+      current.admissionId !== admission.admissionId ||
+      current.admissionHash !== admission.admissionHash ||
+      (current.dispatch !== undefined && current.dispatch.state !== 'reserved')
+    ) {
+      return;
+    }
+    const cancelled = new HarnessTerminalHandoffCancelledError(admission.executionGrant.key);
+    await tx.execute({
+      sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+            SET status = 'failed', error = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'`,
+      args: [JSON.stringify({ code: cancelled.code, message: cancelled.message }), Date.now(), evidenceId],
+    });
   }
 
   async loadTerminalAdmission(

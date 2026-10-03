@@ -4746,12 +4746,25 @@ export class Session {
       onReceipt?: (receipt: HarnessTerminalCommitReceipt) => void;
       onFailure?: (error: HarnessTerminalHandoffError) => void;
     },
+    activeTurnWaiter: Promise<never>,
   ): Promise<{ committed: boolean; failure: unknown }> {
+    const commit = this._commitTerminalHandoff(identity, new RejectedTerminalRun(err), options);
+    void commit.catch(() => {});
     try {
-      await this._commitTerminalHandoff(identity, new RejectedTerminalRun(err), options);
+      await this._raceActiveTurnWaiter(commit, activeTurnWaiter);
       return { committed: true, failure: err };
-    } catch (commitError) {
-      return { committed: false, failure: commitError };
+    } catch (error) {
+      // A failed commit already reported its terminal error. An aborted or
+      // deleted turn stops waiting, as a completed turn's commit does: the
+      // caller gets the indeterminate outcome and the detached commit still
+      // settles the durable result for its observers and reconciliation.
+      return {
+        committed: false,
+        failure:
+          error instanceof HarnessTerminalHandoffError
+            ? error
+            : this._terminalFailure(error, options.onFailure, identity.runId),
+      };
     }
   }
 
@@ -9321,6 +9334,7 @@ export class Session {
                   onReceipt: opts.onTerminalCommit,
                   onFailure: opts.onTerminalCommitError,
                 },
+                activeTurnWaiter.promise,
               ));
             } else {
               failure = this._terminalFailure(err, opts.onTerminalCommitError, terminalIdentity.runId);
@@ -9451,12 +9465,17 @@ export class Session {
       let failure: unknown = err;
       if (terminalIdentity !== undefined && !agentEndEmitted) {
         if (this._isRejectedTerminalRun(signal.runId, err, turnAbortSignal)) {
-          ({ committed: terminalCommitted, failure } = await this._settleRejectedTerminalRun(terminalIdentity, err, {
-            modeId: effectiveModeId,
-            modelId: effectiveModelId,
-            onReceipt: opts.onTerminalCommit,
-            onFailure: opts.onTerminalCommitError,
-          }));
+          ({ committed: terminalCommitted, failure } = await this._settleRejectedTerminalRun(
+            terminalIdentity,
+            err,
+            {
+              modeId: effectiveModeId,
+              modelId: effectiveModelId,
+              onReceipt: opts.onTerminalCommit,
+              onFailure: opts.onTerminalCommitError,
+            },
+            activeTurnWaiter.promise,
+          ));
         } else {
           failure = this._terminalFailure(err, opts.onTerminalCommitError, terminalIdentity.runId);
         }

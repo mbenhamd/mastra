@@ -160,6 +160,50 @@ describe('pre-admission grant revocation', () => {
     }
   });
 
+  it('keeps a revoked turn cancelled through adoption even when the follow-up settlement fails', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    const owner = harnessProcess(db, agent);
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      await owner.storage.revokeTerminalGrant({
+        harnessName: 'default',
+        sessionId: session.id,
+        admissionId: 'turn-1',
+        executionGrant: grant,
+        reason: { code: 'doxa.turn_released', message: 'released before admission' },
+      });
+      // Any later settlement write fails: the refusal itself must already have
+      // settled the reservation.
+      vi.spyOn(owner.storage, 'compareAndSwapSignalTerminal').mockRejectedValue(new Error('storage unavailable'));
+      await expect(session.message(terminalMessage() as never)).rejects.toBeInstanceOf(
+        HarnessTerminalHandoffCancelledError,
+      );
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+      const adopterAgent = new MockAgent({ id: 'default' });
+      const adopter = harnessProcess(db, adopterAgent);
+      const events: HarnessEvent[] = [];
+      adopter.harness.subscribe(event => events.push(event));
+      try {
+        await adopter.harness.session({ sessionId: session.id, resourceId: 'u1' });
+        expect(events.filter(event => event.type === 'run_completed')).toEqual([]);
+        await expect(evidenceFor(adopter.storage, session.id, session.threadId)).resolves.toMatchObject({
+          status: 'failed',
+          error: { code: 'harness.terminal_cancelled' },
+        });
+        expect(agent.streamCalls).toHaveLength(0);
+        expect(adopterAgent.streamCalls).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+        await adopter.harness.shutdown();
+      }
+    } finally {
+      await owner.harness.shutdown();
+    }
+  });
+
   it('settles the undispatched reservation of a grant cancelled after admission when a retry finds it', async () => {
     const db = new InMemoryDB();
     const agent = new MockAgent({ id: 'default' });
@@ -401,6 +445,62 @@ describe('rejected provider runs commit a durable failed terminal', () => {
       }
     },
   );
+
+  it('releases the caller when the turn is aborted while the failed terminal commit is stalled', async () => {
+    const db = new InMemoryDB();
+    const { agent } = rejectingProviderAgent();
+    const calls: HarnessTerminalFinalizerInput[] = [];
+    const recording = recordingFinalizer(calls);
+    let releaseFinalizer!: () => void;
+    const finalizerReleased = new Promise<void>(resolve => (releaseFinalizer = resolve));
+    let finalizerEntered!: () => void;
+    const entered = new Promise<void>(resolve => (finalizerEntered = resolve));
+    const finalizer: HarnessTerminalFinalizer = {
+      ...recording,
+      finalize: async input => {
+        finalizerEntered();
+        await finalizerReleased;
+        return recording.finalize(input);
+      },
+    };
+    const { harness, storage } = harnessProcess(db, agent, finalizer);
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const receipts: HarnessTerminalCommitReceipt[] = [];
+      const settled = session
+        .message(
+          terminalMessage({
+            onTerminalCommit: (receipt: HarnessTerminalCommitReceipt) => receipts.push(receipt),
+          }) as never,
+        )
+        .then(
+          () => ({ ok: true as const }),
+          (err: unknown) => ({ ok: false as const, err }),
+        );
+      await entered;
+      session.abort();
+      const outcome = await Promise.race([
+        settled,
+        new Promise<'still-waiting'>(resolve => setTimeout(() => resolve('still-waiting'), 2_000)),
+      ]);
+      expect(outcome).toMatchObject({
+        ok: false,
+        err: { name: 'HarnessTerminalHandoffError:harness.terminal_pending' },
+      });
+
+      // The detached commit still settles the durable failure.
+      releaseFinalizer();
+      await vi.waitFor(() => expect(receipts).toHaveLength(1));
+      await expect(evidenceFor(storage, session.id, session.threadId)).resolves.toMatchObject({ status: 'failed' });
+      await expect(admissionFor(storage, session.id)).resolves.toMatchObject({
+        status: 'committed',
+        terminalResult: { status: 'failed' },
+      });
+    } finally {
+      releaseFinalizer();
+      await harness.shutdown();
+    }
+  });
 
   it('keeps a failed commit indeterminate, then lets a same-admission retry commit it without re-running', async () => {
     const db = new InMemoryDB();

@@ -169,6 +169,16 @@ describe('HarnessPG pre-admission grant revocation', () => {
     await expect(
       harness().admitTerminalHandoff(input, { leaseOwner: { ownerId: session.ownerId! } }),
     ).resolves.toMatchObject({ status: 'cancelled' });
+    // The lease holder's undispatched reservation was settled in the same transaction.
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'failed', error: { code: 'harness.terminal_cancelled' } });
     const admissions = await store.db.one<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_ADMISSIONS}"`,
     );
