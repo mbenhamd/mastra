@@ -93,6 +93,8 @@ import type {
   HarnessTerminalCommitReceipt,
   HarnessTerminalError,
   HarnessTerminalFailReceipt,
+  HarnessTerminalGrantRevocationInput,
+  HarnessTerminalGrantRevocationReceipt,
   HarnessTerminalHandoffOption,
   HarnessTerminalIdentity,
   HarnessTerminalIntent,
@@ -232,6 +234,10 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   override get supportsTerminalHandoff(): boolean {
+    return this.terminalHandoff.enabled;
+  }
+
+  override get supportsTerminalGrantRevocation(): boolean {
     return this.terminalHandoff.enabled;
   }
 
@@ -2057,6 +2063,52 @@ export class InMemoryHarness extends HarnessStorage {
     };
   }
 
+  async revokeTerminalGrant(
+    input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt> {
+    this.assertTerminalHandoffEnabled();
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    validateHarnessTerminalExecutionGrant(input.executionGrant);
+    if (!input.sessionId || !input.admissionId) {
+      throw new HarnessTerminalHandoffValidationError('revoke', 'session and admission ids are required');
+    }
+    const now = input.revokedAt ?? Date.now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new HarnessTerminalHandoffValidationError('revokedAt', 'must be a non-negative safe integer');
+    }
+    // No await below: the lookups and the tombstone write are one atomic step,
+    // as the grant lock makes them in the Postgres adapter.
+    const grant = { ...input.executionGrant };
+    const tombstoneId = harnessTerminalGrantTombstoneId({ harnessName: namespace, executionGrant: grant });
+    const existing = [...this.db.harnessTerminalAdmissions.values()].find(
+      candidate =>
+        candidate.harnessName === namespace &&
+        candidate.executionGrant.key === grant.key &&
+        candidate.executionGrant.generation === grant.generation,
+    );
+    if (existing) {
+      if (existing.sessionId !== input.sessionId || existing.admissionId !== input.admissionId) {
+        throw new HarnessTerminalHandoffIdentityConflictError(grant.key);
+      }
+      return { status: 'admitted', grant, tombstoneId, admission: cloneHarnessTerminal(existing) };
+    }
+    const prior = this.db.harnessTerminalTombstones.get(tombstoneId);
+    if (prior) {
+      return { status: 'duplicate', grant, tombstoneId, revokedAt: prior.createdAt };
+    }
+    // A revocation has no admission identity: no incarnation and no hash.
+    this.db.harnessTerminalTombstones.set(tombstoneId, {
+      id: tombstoneId,
+      harnessName: namespace,
+      grant: { ...grant },
+      sessionId: input.sessionId,
+      admissionId: input.admissionId,
+      reason: cloneHarnessTerminal(input.reason),
+      createdAt: now,
+    });
+    return { status: 'revoked', grant, tombstoneId, revokedAt: now };
+  }
+
   async claimTerminalIntents(input: HarnessTerminalClaimInput): Promise<HarnessTerminalClaimReceipt> {
     this.assertTerminalHandoffEnabled();
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
@@ -2390,6 +2442,19 @@ export class InMemoryHarness extends HarnessStorage {
     }
     if (!signalDispatchMatches(existing, input.expected)) {
       return { applied: false, evidence: cloneJson(existing) };
+    }
+    if (input.leaseOwner !== undefined) {
+      // Ownership, as the reservation fence judges it: a lease that expired
+      // untaken still names its owner. Liveness is the caller's last check.
+      const session = this.db.harnessSessions.get(sessionKey(harnessName, input.sessionId));
+      if (session?.closedAt !== undefined) throw new HarnessStorageSessionClosedError(input.sessionId);
+      if (session === undefined || session.ownerId !== input.leaseOwner.ownerId) {
+        throw new HarnessStorageLeaseConflictError(
+          input.sessionId,
+          session?.ownerId ?? '',
+          session?.leaseExpiresAt ?? 0,
+        );
+      }
     }
     const pending = existing as Extract<AgentSignalResultEvidence, { status: 'pending' }>;
     const next: AgentSignalResultEvidence = {

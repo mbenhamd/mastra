@@ -20,6 +20,8 @@ import {
   type HarnessTerminalCommitReceipt,
   type HarnessTerminalError,
   type HarnessTerminalFailReceipt,
+  type HarnessTerminalGrantRevocationInput,
+  type HarnessTerminalGrantRevocationReceipt,
   type HarnessTerminalHandoffOption,
   type HarnessTerminalIntent,
   type HarnessTerminalIntentLoadInput,
@@ -244,6 +246,21 @@ export interface CompareAndSwapSignalDispatchInput {
   operationKind?: 'message' | 'signal';
   expected: AgentSignalDispatchState;
   next: AgentSignalDispatchState;
+  /**
+   * Swap only while the session is open and its lease still names this owner,
+   * judged when the swap commits, so an owner whose session another process
+   * adopted (and may be recovering) can never stamp `dispatching`. A row that
+   * is already terminal or no longer matches `expected` still returns
+   * `{ applied: false }` first. Otherwise a refused swap writes nothing and
+   * throws `HarnessStorageSessionClosedError` (closed) or
+   * `HarnessStorageLeaseConflictError` (another owner). As for the
+   * reservation fence of `writeMessageResultEvidence`, a lease that expired
+   * without another owner taking it still names this owner: the fence is
+   * ownership; the caller checks liveness as its last step before dispatch.
+   * Adapters that support terminal handoff or dispatch recovery must honor
+   * it; others may ignore it, and Harness passes it only to those.
+   */
+  leaseOwner?: HarnessSessionLeasePrecondition;
   updatedAt: number;
 }
 
@@ -887,6 +904,11 @@ export abstract class HarnessStorage extends StorageDomain {
     return false;
   }
 
+  /** Native adapters override this after implementing `revokeTerminalGrant`. */
+  get supportsTerminalGrantRevocation(): boolean {
+    return false;
+  }
+
   get supportsSessionRecordProjection(): boolean {
     return false;
   }
@@ -894,8 +916,9 @@ export abstract class HarnessStorage extends StorageDomain {
   /**
    * Native adapters override this after implementing `listRecoverableSessions`,
    * `listPendingMessageAdmissions`, the `'message'` terminal CAS with its lease
-   * precondition, the recovery precondition of `commitTerminalHandoff`, and
-   * run summaries. Session adoption skips orphaned-dispatch recovery when false.
+   * precondition, the lease precondition of `compareAndSwapSignalDispatch`, the
+   * recovery precondition of `commitTerminalHandoff`, and run summaries.
+   * Session adoption skips orphaned-dispatch recovery when false.
    */
   get supportsDispatchRecovery(): boolean {
     return false;
@@ -1366,6 +1389,28 @@ export abstract class HarnessStorage extends StorageDomain {
   }
 
   async cancelTerminalHandoff(_input: HarnessTerminalCancelInput): Promise<HarnessTerminalCancelReceipt> {
+    throw new HarnessTerminalHandoffUnsupportedError();
+  }
+
+  /**
+   * Fence a grant that may not be admitted yet. Serialized with
+   * `admitTerminalHandoff`, `commitTerminalHandoff` and `cancelTerminalHandoff`
+   * for the same grant: an existing admission is returned unchanged
+   * (`admitted`), an existing tombstone answers `duplicate`, and otherwise a
+   * durable grant tombstone is written (`revoked`). A later admission of the
+   * grant then answers `cancelled`, so `message()` fails before dispatch.
+   *
+   * An admission for the grant whose session or admission id differs from the
+   * input throws `HarnessTerminalHandoffIdentityConflictError`. An adapter
+   * that can hand a session off to another store (execution-closure export)
+   * serializes the revocation with that hand-off and throws
+   * `HarnessTerminalHandoffFencedError` once the session was handed off: the
+   * fence must then be written where the session now lives. Adapters that
+   * implement it override `supportsTerminalGrantRevocation`.
+   */
+  async revokeTerminalGrant(
+    _input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }
 

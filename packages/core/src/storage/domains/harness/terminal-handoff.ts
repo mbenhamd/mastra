@@ -69,8 +69,10 @@ export interface HarnessTerminalFinalizerInput {
   result: HarnessTerminalResult;
   /**
    * The live full output is available only to the registered finalizer. It is
-   * `undefined` for an `aborted` result whose dispatch was orphaned by a dead
-   * owner and interrupted on session adoption: no output was ever observed.
+   * `undefined` when no output was ever observed: an `aborted` result whose
+   * dispatch was orphaned by a dead owner and interrupted on session adoption,
+   * and a `failed` result whose run output rejected (a provider or agent
+   * error) before it produced a full output.
    */
   fullOutput: unknown;
 }
@@ -213,6 +215,46 @@ export interface HarnessTerminalCancelReceipt {
   admission?: HarnessTerminalAdmissionRecord;
 }
 
+/**
+ * Revoke a grant before it is admitted. Unlike `HarnessTerminalCancelInput`, it
+ * needs no admission identity (`sessionIncarnation`, `admissionHash`): a
+ * recovery worker that finds no admission for a turn can fence the grant
+ * without knowing how the turn would have been admitted.
+ */
+export interface HarnessTerminalGrantRevocationInput {
+  harnessName: string;
+  /** Session the grant was issued for; recorded on the tombstone and checked against an existing admission. */
+  sessionId: string;
+  /** Caller admission id the grant was issued for; checked against an existing admission. */
+  admissionId: string;
+  executionGrant: HarnessTerminalExecutionGrant;
+  reason: HarnessTerminalError;
+  revokedAt?: number;
+}
+
+/**
+ * - `admitted`: the grant was already admitted. Nothing changed; the stored
+ *   admission (any status) is returned as is, and settling or cancelling it is
+ *   the caller's next step.
+ * - `revoked`: no admission existed, and a durable grant tombstone now fences
+ *   it. A later `admitTerminalHandoff` for the grant answers `cancelled`.
+ * - `duplicate`: the grant was already tombstoned (by an earlier revocation or
+ *   cancellation) and has no admission.
+ */
+export type HarnessTerminalGrantRevocationReceipt =
+  | {
+      status: 'admitted';
+      grant: HarnessTerminalExecutionGrant;
+      tombstoneId: string;
+      admission: HarnessTerminalAdmissionRecord;
+    }
+  | {
+      status: 'revoked' | 'duplicate';
+      grant: HarnessTerminalExecutionGrant;
+      tombstoneId: string;
+      revokedAt: number;
+    };
+
 export interface HarnessTerminalAdmissionLoadInput {
   harnessName: string;
   sessionId: string;
@@ -290,9 +332,11 @@ export interface HarnessTerminalTombstone {
   harnessName: string;
   grant: HarnessTerminalExecutionGrant;
   sessionId: string;
-  sessionIncarnation: string;
+  /** Absent on a pre-admission revocation (`revokeTerminalGrant`), which has no admission identity. */
+  sessionIncarnation?: string;
   admissionId: string;
-  admissionHash: string;
+  /** Absent on a pre-admission revocation (`revokeTerminalGrant`), which has no admission identity. */
+  admissionHash?: string;
   reason: HarnessTerminalError;
   createdAt: number;
 }
