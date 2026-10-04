@@ -11,6 +11,13 @@ import { createObservabilityContext, resolveExportedSpanId } from '../observabil
 import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_AUTH_TOKEN_KEY } from '../request-context';
 import type { PersistWorkflowStepUpdateResult } from '../storage/types';
 import { deepEqual } from '../utils/deep-equal';
+import {
+  WorkflowCancelRequestedError,
+  commitWorkflowLineageCancellation,
+  isTerminalWorkflowRunStatus,
+  isWorkflowCancelRequestAbort,
+  workflowCancelRequestFor,
+} from './cancel-request';
 import type { ExecutionGraph } from './execution-engine';
 import { ExecutionEngine } from './execution-engine';
 import type {
@@ -55,6 +62,7 @@ import type {
   StepResult,
   StepTripwireInfo,
   TimeTravelExecutionParams,
+  WorkflowCancelRequestV1,
   WorkflowRunStatus,
 } from './types';
 // Used by the per-type execute methods (executeAgent/executeTool/executeMapping)
@@ -155,32 +163,101 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     transientExecution?: boolean;
     executionGeneration: string;
   }): Promise<WorkflowRunStatus | 'superseded' | undefined> {
-    if (params.transientExecution) return undefined;
+    return (await this.readExecutionAuthority(params)).disposition;
+  }
+
+  /**
+   * Reads durable lifecycle authority for one execution lineage.
+   *
+   * `disposition` names a terminal outcome or successor generation another
+   * owner already settled. `cancelRequest` is set when the lineage has not
+   * ended and `Run.requestCancel()` recorded a request for exactly this
+   * generation and resume attempt; the caller honours it by stopping at this
+   * boundary and committing `canceled` itself. `status` is the stored status
+   * of this lineage, present whenever it has not ended.
+   */
+  async readExecutionAuthority(params: {
+    workflowId: string;
+    runId: string;
+    transientExecution?: boolean;
+    executionGeneration: string;
+    /** Required to observe a cancel request; when omitted, `cancelRequest` stays unset. */
+    lifecycleResumeAttempt?: number;
+  }): Promise<{
+    disposition: WorkflowRunStatus | 'superseded' | undefined;
+    cancelRequest?: WorkflowCancelRequestV1;
+    status?: WorkflowRunStatus;
+  }> {
+    if (params.transientExecution) return { disposition: undefined };
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const executionState = await workflowsStore?.getWorkflowExecutionState({
       workflowName: params.workflowId,
       runId: params.runId,
     });
-    if (!executionState) return undefined;
-    if (executionState.executionGeneration !== params.executionGeneration) return 'superseded';
-    if (
-      executionState.status === 'success' ||
-      executionState.status === 'failed' ||
-      executionState.status === 'canceled' ||
-      executionState.status === 'tripwire' ||
-      executionState.status === 'bailed' ||
-      executionState.status === 'skipped'
-    ) {
+    if (!executionState) return { disposition: undefined };
+    if (executionState.executionGeneration !== params.executionGeneration) return { disposition: 'superseded' };
+    if (isTerminalWorkflowRunStatus(executionState.status)) {
       // executeEntry persists this execution's own step result before control
       // returns here. Do not mistake that local write for an independently
       // settled owner: doing so skips bail normalization, workflow callbacks,
       // and the canonical workflow terminal sequence. A remote terminal write
       // remains distinguishable because it did not update this engine-local
       // persisted-status marker.
-      if (this.getLastPersistedStatus(params.runId) === executionState.status) return undefined;
-      return executionState.status;
+      if (this.getLastPersistedStatus(params.runId) === executionState.status) return { disposition: undefined };
+      return { disposition: executionState.status };
     }
-    return undefined;
+    if (params.lifecycleResumeAttempt === undefined) {
+      return { disposition: undefined, status: executionState.status };
+    }
+    return {
+      disposition: undefined,
+      status: executionState.status,
+      cancelRequest: workflowCancelRequestFor(executionState.cancelRequest, {
+        executionGeneration: params.executionGeneration,
+        lifecycleResumeAttempt: params.lifecycleResumeAttempt,
+      }),
+    };
+  }
+
+  /**
+   * The entry already persisted `suspended` or `paused` for this lineage, and a
+   * resumed lineage's step writes cannot move it from there. Cancel it with the
+   * same lineage compare-and-set `Run.requestCancel()` uses for settled runs.
+   */
+  private async commitSettledLineageCancellation(params: {
+    workflowId: string;
+    runId: string;
+    settledStatus: 'suspended' | 'paused';
+    executionGeneration: string;
+    lifecycleResumeAttempt: number;
+  }): Promise<PersistWorkflowStepUpdateResult> {
+    return this.wrapDurableOperation(
+      `workflow.${params.workflowId}.run.${params.runId}.cancel-request.${params.settledStatus}`,
+      async (): Promise<PersistWorkflowStepUpdateResult> => {
+        const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+        if (!workflowsStore) return { status: 'stale_execution' };
+        const canceled = await commitWorkflowLineageCancellation({
+          workflowsStore,
+          workflowName: params.workflowId,
+          runId: params.runId,
+          expectedStatus: params.settledStatus,
+          executionGeneration: params.executionGeneration,
+          lifecycleResumeAttempt: params.lifecycleResumeAttempt,
+        });
+        if (canceled) return { status: 'persisted' };
+        // Report a terminal state this lineage already reached — for example
+        // a Run.cancel() on this handle that won the race — as a finalized
+        // write, so an admitted cancellation is still published here.
+        const current = await workflowsStore.getWorkflowExecutionState({
+          workflowName: params.workflowId,
+          runId: params.runId,
+        });
+        return current?.executionGeneration === params.executionGeneration &&
+          isTerminalWorkflowRunStatus(current.status)
+          ? { status: 'finalized', disposition: current.status }
+          : { status: 'stale_execution' };
+      },
+    );
   }
 
   private async isAuthoritativelyCanceled(params: {
@@ -962,15 +1039,123 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     let lastState: Record<string, any> = normalizeStateRoot(timeTravel?.state ?? restart?.state ?? initialState ?? {});
     let lastExecutionContext: ExecutionContext | undefined;
     let currentRequestContext = params.requestContext;
-    for (let i = startIdx; i < steps.length; i++) {
-      if (params.abortController.signal.aborted) {
-        const terminalWrite = await this.persistStepUpdate({
+    // Commits `canceled` for this lineage: a local abort stops at the next
+    // entry, and a durable cancel request stops at the entry boundary that
+    // observed it. The write is the lineage-fenced step write, or, for a
+    // lineage already persisted as suspended or paused, the lineage
+    // compare-and-set.
+    const commitCanceledExecution = async (
+      executionContext: ExecutionContext,
+      settledStatus?: 'suspended' | 'paused',
+    ): Promise<TOutput> => {
+      const terminalWrite = settledStatus
+        ? await this.commitSettledLineageCancellation({
+            workflowId,
+            runId,
+            settledStatus,
+            executionGeneration,
+            lifecycleResumeAttempt,
+          })
+        : await this.persistStepUpdate({
+            workflowId,
+            runId,
+            resourceId,
+            stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext,
+            workflowStatus: 'canceled',
+            requestContext: currentRequestContext,
+            phase: 'workflow-canceled',
+          });
+
+      const rejected = await this.resolveRejectedTerminalWrite(
+        terminalWrite,
+        { workflowId, runId, executionGeneration, lifecycleResumeAttempt },
+        terminalWrite?.status === 'finalized'
+          ? ((await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt)) ?? false)
+          : false,
+        { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
+      );
+      if (rejected) {
+        workflowSpan?.end({ attributes: { status: rejected.status } });
+        this.clearLastPersistedStatus(runId);
+        return {
+          ...rejected,
+          runId,
+        } as unknown as TOutput;
+      }
+
+      workflowSpan?.end({
+        attributes: {
+          status: 'canceled',
+        },
+      });
+
+      const formattedResult = await this.fmtReturnValue<any>(
+        params.pubsub,
+        stepResults,
+        { status: 'canceled' },
+        undefined,
+        stepExecutionPath,
+      );
+
+      await this.invokeLifecycleCallbacks({
+        status: 'canceled',
+        result: undefined,
+        error: undefined,
+        steps: formattedResult.steps,
+        tripwire: undefined,
+        runId,
+        workflowId,
+        resourceId,
+        input,
+        requestContext: currentRequestContext,
+        state: lastState,
+        stepExecutionPath,
+      });
+
+      // Run.cancel() leaves terminal ownership to an active engine. Commit
+      // synchronously before lifecycle publication so cancellation cannot be
+      // replaced by another terminal result while transport awaits yield.
+      params.commitTerminalStatus?.('canceled');
+
+      if (!suppressLifecycleEvents) {
+        await publishWorkflowLifecycleEvent({
+          pubsub: params.pubsub,
           workflowId,
           runId,
-          resourceId,
-          stepResults,
-          serializedStepGraph: params.serializedStepGraph,
-          executionContext: lastExecutionContext || {
+          executionGeneration,
+          event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+        });
+        await publishWorkflowLifecycleEvent({
+          pubsub: params.pubsub,
+          workflowId,
+          runId,
+          executionGeneration,
+          event: { type: 'workflow.finished', resumeAttempt: lifecycleResumeAttempt, status: 'canceled' },
+        });
+      }
+
+      this.clearLastPersistedStatus(runId);
+
+      return {
+        ...formattedResult,
+        runId,
+        ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+      } as any;
+    };
+    // After a settle write, a cancel request no longer relabels the outcome in
+    // memory: one that arrives after the lineage persisted another outcome
+    // leaves that outcome standing. Other aborts keep their existing effect —
+    // Run.cancel() commits `canceled` durably first, and a step's own abort()
+    // stays local as before.
+    const isRunCancelAbort = () =>
+      params.abortController.signal.aborted && !isWorkflowCancelRequestAbort(params.abortController.signal);
+
+    for (let i = startIdx; i < steps.length; i++) {
+      if (params.abortController.signal.aborted) {
+        return await commitCanceledExecution(
+          lastExecutionContext || {
             workflowId,
             runId,
             transientExecution: params.transientExecution,
@@ -988,86 +1173,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             state: lastState ?? initialState,
             tracingIds: params.tracingIds,
           },
-          workflowStatus: 'canceled',
-          requestContext: currentRequestContext,
-          phase: 'workflow-canceled',
-        });
-
-        const rejected = await this.resolveRejectedTerminalWrite(
-          terminalWrite,
-          { workflowId, runId, executionGeneration, lifecycleResumeAttempt },
-          terminalWrite?.status === 'finalized'
-            ? ((await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt)) ?? false)
-            : false,
-          { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
         );
-        if (rejected) {
-          workflowSpan?.end({ attributes: { status: rejected.status } });
-          this.clearLastPersistedStatus(runId);
-          return {
-            ...rejected,
-            runId,
-          } as unknown as TOutput;
-        }
-
-        workflowSpan?.end({
-          attributes: {
-            status: 'canceled',
-          },
-        });
-
-        const formattedResult = await this.fmtReturnValue<any>(
-          params.pubsub,
-          stepResults,
-          { status: 'canceled' },
-          undefined,
-          stepExecutionPath,
-        );
-
-        await this.invokeLifecycleCallbacks({
-          status: 'canceled',
-          result: undefined,
-          error: undefined,
-          steps: formattedResult.steps,
-          tripwire: undefined,
-          runId,
-          workflowId,
-          resourceId,
-          input,
-          requestContext: currentRequestContext,
-          state: lastState,
-          stepExecutionPath,
-        });
-
-        // Run.cancel() leaves terminal ownership to an active engine. Commit
-        // synchronously before lifecycle publication so cancellation cannot be
-        // replaced by another terminal result while transport awaits yield.
-        params.commitTerminalStatus?.('canceled');
-
-        if (!suppressLifecycleEvents) {
-          await publishWorkflowLifecycleEvent({
-            pubsub: params.pubsub,
-            workflowId,
-            runId,
-            executionGeneration,
-            event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
-          });
-          await publishWorkflowLifecycleEvent({
-            pubsub: params.pubsub,
-            workflowId,
-            runId,
-            executionGeneration,
-            event: { type: 'workflow.finished', resumeAttempt: lifecycleResumeAttempt, status: 'canceled' },
-          });
-        }
-
-        this.clearLastPersistedStatus(runId);
-
-        return {
-          ...formattedResult,
-          runId,
-          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
-        } as any;
       }
 
       const entry = steps[i]!;
@@ -1125,11 +1231,24 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       }
 
       const persistOutcome = lastOutput.persistOutcome as PersistWorkflowStepUpdateResult | void | undefined;
-      const authoritativeDisposition = params.transientExecution
-        ? undefined
-        : persistOutcome && persistOutcome.status !== 'persisted'
-          ? (persistOutcome.disposition ?? 'canceled')
-          : await this.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
+      let authoritativeDisposition: WorkflowRunStatus | 'superseded' | undefined;
+      let cancelRequest: WorkflowCancelRequestV1 | undefined;
+      let storedStatus: WorkflowRunStatus | undefined;
+      if (persistOutcome && persistOutcome.status !== 'persisted') {
+        authoritativeDisposition = params.transientExecution ? undefined : (persistOutcome.disposition ?? 'canceled');
+      } else {
+        ({
+          disposition: authoritativeDisposition,
+          cancelRequest,
+          status: storedStatus,
+        } = await this.readExecutionAuthority({
+          workflowId,
+          runId,
+          transientExecution: params.transientExecution,
+          executionGeneration,
+          lifecycleResumeAttempt,
+        }));
+      }
       if (
         authoritativeDisposition &&
         !(
@@ -1166,6 +1285,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             runId,
           } as unknown as TOutput;
         }
+      }
+
+      // A durable cancel request for this lineage stops the run at this entry
+      // boundary, whatever the entry returned: the request was recorded while
+      // the lineage was running, so it takes precedence over a later outcome.
+      if (cancelRequest) {
+        params.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
+        // The stored status, not the entry result, decides how to cancel: an
+        // entry whose suspension was persisted can no longer be moved by a
+        // step write.
+        const settledStatus = storedStatus === 'suspended' || storedStatus === 'paused' ? storedStatus : undefined;
+        return await commitCanceledExecution(executionContext, settledStatus);
       }
 
       // if step result is not success, stop and return
@@ -1235,7 +1366,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           !params.transientExecution &&
           (terminalWrite?.status !== 'persisted' || (await this.shouldReconcilePersistedTerminal()));
         if (
-          params.abortController.signal.aborted ||
+          isRunCancelAbort() ||
           (shouldCheckTerminalAuthority &&
             (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
         ) {
@@ -1264,9 +1395,42 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         // A lifecycle callback can yield while Run.cancel() wins ownership of
         // the terminal transition. Reconcile before committing any terminal
         // status or publishing the lifecycle sequence for it.
-        if (params.abortController.signal.aborted) {
+        if (isRunCancelAbort()) {
           result = { ...result, status: 'canceled', result: undefined, error: undefined };
           lastOutput.result.status = 'canceled';
+        }
+
+        // Another process can settle a suspended or paused lineage while this
+        // engine unwinds (requestCancel() or cancel() on a run no engine there
+        // executes). That owner published the terminal sequence, so return the
+        // durable outcome rather than publish a suspension after it.
+        if (
+          (result.status === 'suspended' || result.status === 'paused') &&
+          !params.transientExecution &&
+          !isRunCancelAbort()
+        ) {
+          const settledElsewhere = await this.getAuthoritativeExecutionDisposition({
+            workflowId,
+            runId,
+            executionGeneration,
+          });
+          const durableOutcome =
+            settledElsewhere &&
+            settledElsewhere !== 'superseded' &&
+            !(
+              settledElsewhere === 'canceled' &&
+              (await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt))
+            )
+              ? await this.resolveRejectedTerminalWrite({ status: 'stale_execution' }, executionContext, false, {
+                  pubsub: params.pubsub,
+                  includeState: params.outputOptions?.includeState,
+                })
+              : undefined;
+          if (durableOutcome) {
+            workflowSpan?.end({ attributes: { status: durableOutcome.status } });
+            this.clearLastPersistedStatus(runId);
+            return { ...durableOutcome, runId } as unknown as TOutput;
+          }
         }
 
         if (result.error) {
@@ -1291,7 +1455,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             runId,
             data: { type: 'workflow-paused', payload: {} },
           });
-          if (params.abortController.signal.aborted) {
+          if (isRunCancelAbort()) {
             result = { ...result, status: 'canceled', result: undefined, error: undefined };
             lastOutput.result.status = 'canceled';
           }
@@ -1310,7 +1474,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
                 suspendedStepIds: Object.keys(lastOutput.mutableContext.suspendedPaths),
               },
             });
-            if (params.abortController.signal.aborted) {
+            if (isRunCancelAbort()) {
               result = { ...result, status: 'canceled', result: undefined, error: undefined };
               lastOutput.result.status = 'canceled';
             }
@@ -1498,7 +1662,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       !params.transientExecution &&
       (terminalWrite?.status !== 'persisted' || (await this.shouldReconcilePersistedTerminal()));
     if (
-      params.abortController.signal.aborted ||
+      isRunCancelAbort() ||
       (shouldCheckTerminalAuthority &&
         (await this.isAuthoritativelyCanceled({ workflowId, runId, executionGeneration })))
     ) {
@@ -1523,7 +1687,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     // Cancellation remains authoritative until every awaited terminal hook has
     // completed. A hook may yield long enough for Run.cancel() to abort this
     // execution after the earlier terminal-state check.
-    if (params.abortController.signal.aborted) {
+    if (isRunCancelAbort()) {
       result = { ...result, status: 'canceled', result: undefined, error: undefined };
     }
 
