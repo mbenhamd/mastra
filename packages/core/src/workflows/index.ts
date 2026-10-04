@@ -29,5 +29,6 @@ export * from './state-reader';
 export * from './terminal-recovery';
 export * from './create';
 export * from './lifecycle-events';
+export * from './cancel-request';
 export * from './dynamic';
 export * from './predicate';

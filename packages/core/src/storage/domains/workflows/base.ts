@@ -311,6 +311,7 @@ export abstract class WorkflowsStorage extends StorageDomain {
     return {
       status: snapshot.status,
       ...(snapshot.executionGeneration === undefined ? {} : { executionGeneration: snapshot.executionGeneration }),
+      ...(snapshot.cancelRequest === undefined ? {} : { cancelRequest: snapshot.cancelRequest }),
     };
   }
 

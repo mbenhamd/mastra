@@ -2486,12 +2486,13 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     if (!stored) return null;
 
     // In-memory workflow rows already hold the snapshot object. Read only the
-    // two authority fields so lifecycle checks do not clone the full state.
+    // authority fields so lifecycle checks do not clone the full state.
     const snapshot = typeof stored.snapshot === 'string' ? JSON.parse(stored.snapshot) : stored.snapshot;
     if (!snapshot) return null;
     return {
       status: snapshot.status,
       ...(snapshot.executionGeneration === undefined ? {} : { executionGeneration: snapshot.executionGeneration }),
+      ...(snapshot.cancelRequest === undefined ? {} : { cancelRequest: cloneRunData(snapshot.cancelRequest) }),
     };
   }
 

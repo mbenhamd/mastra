@@ -44,7 +44,9 @@ describe('step-result lifecycle fence', () => {
       .commit();
 
     const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { [workflow.id]: workflow } });
-    const authority = vi.spyOn(DefaultExecutionEngine.prototype, 'getAuthoritativeExecutionDisposition');
+    // Every authority check, including the cancel-request-aware start and
+    // post-entry reads, goes through readExecutionAuthority.
+    const authority = vi.spyOn(DefaultExecutionEngine.prototype, 'readExecutionAuthority');
     const run = await workflow.createRun();
 
     try {

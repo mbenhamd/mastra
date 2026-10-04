@@ -185,7 +185,7 @@ export interface ListWorkflowSnapshotHandoffsResult {
  * other potentially large execution data. Storage adapters may implement the
  * corresponding read directly against their status/generation columns.
  */
-export type WorkflowExecutionState = Pick<WorkflowRunState, 'status' | 'executionGeneration'>;
+export type WorkflowExecutionState = Pick<WorkflowRunState, 'status' | 'executionGeneration' | 'cancelRequest'>;
 
 export interface PersistWorkflowStepUpdateInput {
   workflowName: string;
@@ -3223,6 +3223,8 @@ export interface UpdateWorkflowStateOptions {
   expectedExecutionGeneration?: string | null;
   /** Require the persisted snapshot to be at this exact resume cycle. Guard only. */
   expectedLifecycleResumeAttempt?: number;
+  /** Lineage-bound cancellation request written by `Run.requestCancel()`. */
+  cancelRequest?: WorkflowRunState['cancelRequest'];
 }
 
 /**

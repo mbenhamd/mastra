@@ -604,6 +604,22 @@ export interface WorkflowResumeOperationReplayContextV1 {
 }
 
 /** Storage-owned immutable copy of the last policy-approved pre-resume state. */
+/**
+ * A durable request to cancel one execution lineage. `Run.requestCancel()`
+ * writes it with a compare-and-set on the lineage it names, so a successor
+ * generation or a later resume attempt never honours it. The engine executing
+ * that lineage honours it at its next step boundary, and `restart()` or
+ * `resume()` commit `canceled` instead of executing the lineage again.
+ */
+export interface WorkflowCancelRequestV1 {
+  version: 1;
+  /** Caller idempotency key, for example a product abort operation id. */
+  requestId: string;
+  executionGeneration: string;
+  lifecycleResumeAttempt: number;
+  requestedAt: number;
+}
+
 export interface WorkflowResumeCheckpointV1 extends WorkflowLifecycleFenceV1 {
   version: 1;
   runId: string;
@@ -682,6 +698,8 @@ export interface WorkflowRunState {
   resumeResultReceipt?: WorkflowResumeResultReceiptV1;
   /** Exact idempotency evidence for a completed checkpoint rollback. */
   resumeRollbackReceipt?: WorkflowResumeRollbackReceiptV1;
+  /** Lineage-bound cancellation request, retained across step writes. */
+  cancelRequest?: WorkflowCancelRequestV1;
   /** Tripwire data when status is 'tripwire' */
   tripwire?: StepTripwireInfo;
   stepExecutionPath?: string[];
