@@ -244,7 +244,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           executionGeneration: params.executionGeneration,
           lifecycleResumeAttempt: params.lifecycleResumeAttempt,
         });
-        return canceled ? { status: 'persisted' } : { status: 'stale_execution' };
+        if (canceled) return { status: 'persisted' };
+        // Report a terminal state this lineage already reached — for example
+        // a Run.cancel() on this handle that won the race — as a finalized
+        // write, so an admitted cancellation is still published here.
+        const current = await workflowsStore.getWorkflowExecutionState({
+          workflowName: params.workflowId,
+          runId: params.runId,
+        });
+        return current?.executionGeneration === params.executionGeneration &&
+          isTerminalWorkflowRunStatus(current.status)
+          ? { status: 'finalized', disposition: current.status }
+          : { status: 'stale_execution' };
       },
     );
   }

@@ -435,6 +435,59 @@ describe('Run.requestCancel()', () => {
     expect((await execution).status).toBe('canceled');
   });
 
+  it('returns the cancellation when the owner honours the request while a restart is committing it', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const owner = createProcess(storage, probe);
+    const survivor = createProcess(storage, probe);
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const ownerRun = await owner.workflow.createRun();
+    const execution = ownerRun.start({ inputData: { topic: 'aspirin' } });
+    await probe.stageOneStarted.promise;
+    const remoteRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
+    await remoteRun.requestCancel({ requestId: 'abort-op-1', ...(await lineageOf(storage, ownerRun.runId)) });
+
+    // The owner wakes and commits `canceled` after the restart read the
+    // requested lineage and before the restart's own compare-and-set.
+    const updateWorkflowState = workflowsStore.updateWorkflowState.bind(workflowsStore);
+    const spy = vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(async args => {
+      if (args.opts.status === 'canceled') {
+        probe.releaseStageOne.resolve();
+        await vi.waitFor(async () => {
+          expect((await loadSnapshot(storage, ownerRun.runId))?.status).toBe('canceled');
+        });
+      }
+      return updateWorkflowState(args);
+    });
+    const restarted = await (await survivor.workflow.createRun({ runId: ownerRun.runId })).restart();
+    spy.mockRestore();
+
+    expect(restarted.status).toBe('canceled');
+    expect((await execution).status).toBe('canceled');
+    expect(probe.stageOneExecutions).toBe(1);
+    expect(probe.stageTwoExecutions).toBe(0);
+  });
+
+  it('refuses storage whose step writes could drop the request, writing nothing', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const owner = createProcess(storage, probe);
+    const workflowsStore = (await storage.getStore('workflows'))!;
+    vi.spyOn(workflowsStore, 'getWorkflowResumeCapabilities').mockReturnValue({});
+
+    const run = await owner.workflow.createRun();
+    const execution = run.start({ inputData: { topic: 'aspirin' } });
+    await probe.stageOneStarted.promise;
+
+    await expect(run.requestCancel({ requestId: 'abort-op-1' })).rejects.toThrow(
+      'requestCancel() requires workflow storage with compare-and-set updates and fenced step writes',
+    );
+    expect((await loadSnapshot(storage, run.runId))?.cancelRequest).toBeUndefined();
+    probe.releaseStageOne.resolve();
+    expect((await execution).status).toBe('success');
+  });
+
   it('makes resume commit canceled when the request lost the race with suspension', async () => {
     const storage = new InMemoryStore();
     let approvalExecutions = 0;

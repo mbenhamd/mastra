@@ -4577,7 +4577,7 @@ export class Run<
     if (this.transientExecution) throw new Error('Transient workflow runs cannot record a cancel request');
     // Other engines notify their own runtime on cancel() and do not read the
     // request at their step boundaries.
-    if (this.workflowEngineType !== 'default') {
+    if (this.workflowEngineType !== 'default' || !(this.executionEngine instanceof DefaultExecutionEngine)) {
       throw new Error(`requestCancel() is not supported on ${this.workflowEngineType} workflows`);
     }
     const executionGeneration = expectedExecutionGeneration ?? this.#executionGeneration;
@@ -4599,8 +4599,8 @@ export class Run<
     }
     const lineage = { executionGeneration, lifecycleResumeAttempt };
     // start() persists `running` only once its first step starts, so a run
-    // this handle is already starting can still read `pending`.
-    const executedHere =
+    // whose execution this handle has begun can still read `pending`.
+    const executedHere = () =>
       this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt) &&
       this.hasActiveLifecycleExecution(executionGeneration);
 
@@ -4623,7 +4623,7 @@ export class Run<
 
       const executing =
         WORKFLOW_CANCEL_REQUEST_EXECUTING_STATUSES.includes(snapshot.status) ||
-        (snapshot.status === 'pending' && executedHere);
+        (snapshot.status === 'pending' && executedHere());
       if (executing) {
         const existing = workflowCancelRequestFor(snapshot.cancelRequest, lineage);
         if (existing) {
@@ -4648,6 +4648,9 @@ export class Run<
           },
         });
         if (!written) continue;
+        // A local execution that ended before its first write leaves the run
+        // pending, where nothing would observe the request; cancel it instead.
+        if (snapshot.status === 'pending' && !executedHere()) continue;
         this.abortLocalLineageForRequest(cancelRequest);
         return { status: 'requested', cancelRequest };
       }

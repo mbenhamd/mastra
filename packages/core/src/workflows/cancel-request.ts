@@ -50,8 +50,8 @@ export type WorkflowCancelRequestOutcome =
   | { status: 'already_requested'; cancelRequest: WorkflowCancelRequestV1 }
   /**
    * A pending, suspended or paused lineage no engine was executing: it is
-   * canceled now. A pending run this handle is already starting is treated
-   * as running instead.
+   * canceled now. A pending run whose execution this handle has already
+   * begun is treated as running instead.
    */
   | { status: 'canceled' }
   /** The run already ended. */
