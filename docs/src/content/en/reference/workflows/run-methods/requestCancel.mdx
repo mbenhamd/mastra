@@ -7,7 +7,7 @@ packages:
 
 # Run.requestCancel()
 
-The `.requestCancel()` method asks one execution of a workflow run to stop. Use it when the run may be executing in another process, or when a late cancellation must not stop a run that was restarted or resumed in the meantime. For a run that your process owns and that cannot be restarted or resumed concurrently, [`Run.cancel()`](./cancel) is simpler.
+The `.requestCancel()` method asks one execution of a workflow run to stop. Use it when the run may be executing in another process, or when a late cancellation must not stop a run that was restarted or resumed in the meantime. For a run that your process owns and that can't be restarted or resumed concurrently, [`Run.cancel()`](./cancel) is simpler.
 
 Each execution of a run is identified by its execution generation and its resume attempt. A request names one of them and is stored with the run. The request is written only while that execution still owns the run. The process executing the run stops at its next step and marks the run `canceled`. `restart()` and `resume()` mark a run with a request as `canceled` instead of running it.
 
@@ -27,7 +27,7 @@ if (outcome.status === 'lineage_moved') {
 }
 ```
 
-Read the execution to target from the stored run state (`executionGeneration` and `lifecycleResumeAttempt`). A `Run` that is executing the run itself can omit both fields to target its own execution.
+Read the execution to target from the stored run state (`executionGeneration` and `lifecycleResumeAttempt`). A `Run` that's executing the run itself can omit both fields to target its own execution.
 
 ## Parameters
 
@@ -75,20 +75,20 @@ Read the execution to target from the stored run state (`executionGeneration` an
 | `canceled` | The run was pending, suspended or paused, and no process was executing it, so it was canceled immediately. |
 | `terminal` | The run had already finished. `runStatus` holds its status. |
 | `lineage_moved` | A restart or resume created a newer execution. Nothing was written. The current `executionGeneration` and `lifecycleResumeAttempt` are returned. |
-| `not_found` | The run does not exist in storage. |
+| `not_found` | The run doesn't exist in storage. |
 
 ## Errors
 
 `requestCancel()` throws when:
 
-- the workflow uses an engine other than the default engine;
-- the storage adapter cannot store the request reliably. In-memory, PostgreSQL and LibSQL storage are supported;
-- the run is a transient run;
-- the inputs are invalid, or the `Run` has no execution of its own and no execution was named.
+- The workflow uses an engine other than the default engine.
+- The storage adapter can't store the request reliably. In-memory, PostgreSQL and LibSQL storage are supported.
+- The run is a transient run.
+- The inputs are invalid, or the `Run` has no execution of its own and no execution was named.
 
 ## Abort signal behavior
 
-When the `Run` that sends the request is executing that execution, its steps receive the abort at once. `abortSignal.reason` is a `WorkflowCancelRequestedError`. Other processes stop at their next step. Steps that honor `abortSignal` stop sooner; see [Run.cancel()](./cancel#abort-signal-behavior).
+When the `Run` that sends the request is executing that execution, its steps receive the abort at once. `abortSignal.reason` is a `WorkflowCancelRequestedError`. Other processes stop at their next step. Steps that honor `abortSignal` stop sooner. See [Run.cancel()](./cancel#abort-signal-behavior).
 
 ## Related
 
