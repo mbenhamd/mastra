@@ -4606,10 +4606,12 @@ export class Run<
     }
     const lineage = { executionGeneration, lifecycleResumeAttempt };
     // start() persists `running` only once its first step starts, so a run
-    // whose execution this handle has begun can still read `pending`.
+    // whose execution this handle has begun can still read `pending`. That
+    // includes the onStart preflight, after start() claimed the lineage and
+    // before the engine is entered.
     const executedHere = () =>
       this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt) &&
-      this.hasActiveLifecycleExecution(executionGeneration);
+      (this.hasActiveLifecycleExecution(executionGeneration) || this.workflowRunStatus === 'running');
 
     // Each failed compare-and-set means the row changed under this call; the
     // next read reports where it went.
@@ -4679,11 +4681,14 @@ export class Run<
     );
   }
 
-  /** Fires this handle's abort signal when it is executing the requested lineage. */
+  /**
+   * Fires this handle's abort signal when it is executing the requested
+   * lineage, or has claimed it in start()'s onStart preflight.
+   */
   private abortLocalLineageForRequest(cancelRequest: WorkflowCancelRequestV1): void {
     if (
       this.isCurrentLifecycleAttempt(cancelRequest.executionGeneration, cancelRequest.lifecycleResumeAttempt) &&
-      this.hasActiveLifecycleExecution(cancelRequest.executionGeneration)
+      (this.hasActiveLifecycleExecution(cancelRequest.executionGeneration) || this.workflowRunStatus === 'running')
     ) {
       this.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
     }

@@ -596,6 +596,52 @@ describe('Run.requestCancel()', () => {
     expect((await loadSnapshot(storage, run.runId))?.status).toBe('canceled');
   });
 
+  it('stops a run its own handle is still preparing in onStart', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const preparing = deferred();
+    const finishPreparing = deferred();
+    const stage = createStep({
+      id: 'stage-one',
+      inputSchema: z.object({ topic: z.string() }),
+      outputSchema: z.object({ topic: z.string() }),
+      execute: async ({ inputData }) => {
+        probe.stageOneExecutions++;
+        return inputData;
+      },
+    });
+    const workflow = registerProcess(
+      storage,
+      createWorkflow({
+        id: WORKFLOW_ID,
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ topic: z.string() }),
+        steps: [stage],
+        options: {
+          validateInputs: false,
+          onStart: async () => {
+            preparing.resolve();
+            await finishPreparing.promise;
+          },
+        },
+      })
+        .then(stage)
+        .commit(),
+    );
+
+    const run = await workflow.createRun();
+    const execution = run.start({ inputData: { topic: 'aspirin' } });
+    await preparing.promise;
+    const outcome = await run.requestCancel({ requestId: 'abort-op-1' });
+    finishPreparing.resolve();
+    const result = await execution;
+
+    expect(outcome.status).toBe('requested');
+    expect(result.status).toBe('canceled');
+    expect(probe.stageOneExecutions).toBe(0);
+    expect((await loadSnapshot(storage, run.runId))?.status).toBe('canceled');
+  });
+
   it('makes resume commit canceled when the request lost the race with suspension', async () => {
     const storage = new InMemoryStore();
     let approvalExecutions = 0;
