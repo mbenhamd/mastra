@@ -555,10 +555,12 @@ export function prepareStepSnapshot(engine: DefaultExecutionEngine, params: Pers
 }
 
 /**
- * Reads durable authority at a boundary that has no other check, and aborts
- * the run when a cancel request targets this exact lineage.
+ * Reads durable authority at a boundary that has no other check. Returns true
+ * when the lineage must not continue into the boundary: another owner settled
+ * it or a successor replaced it, or a cancel request targets this exact
+ * lineage, in which case the run is also aborted.
  */
-async function abortForCancelRequest(
+async function stopForDurableAuthority(
   engine: DefaultExecutionEngine,
   params: {
     workflowId: string;
@@ -569,15 +571,14 @@ async function abortForCancelRequest(
 ): Promise<boolean> {
   const { executionContext } = params;
   if (executionContext.transientExecution || executionContext.executionGeneration === undefined) return false;
-  const { cancelRequest } = await engine.readExecutionAuthority({
+  const { disposition, cancelRequest } = await engine.readExecutionAuthority({
     workflowId: params.workflowId,
     runId: params.runId,
     executionGeneration: executionContext.executionGeneration,
     lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
   });
-  if (!cancelRequest) return false;
-  params.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
-  return true;
+  if (cancelRequest) params.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
+  return disposition !== undefined || cancelRequest !== undefined;
 }
 
 export async function persistStepUpdate(
@@ -1150,16 +1151,16 @@ export async function executeEntry(
       });
     }
 
-    // A cancel request recorded before or with the waiting write stops the
-    // sleep before it starts, including a dynamic duration function.
-    const sleepCancelRequested = await abortForCancelRequest(engine, {
+    // A lineage that another owner settled, or that a cancel request
+    // targets, does not start the sleep or its dynamic duration function.
+    const sleepStopped = await stopForDurableAuthority(engine, {
       workflowId,
       runId,
       executionContext,
       abortController,
     });
 
-    if (!sleepCancelRequested)
+    if (!sleepStopped)
       await engine.executeSleep({
         workflowId,
         runId,
@@ -1182,7 +1183,7 @@ export async function executeEntry(
     // An abort during the sleep must not be overwritten by a success terminal
     // for the sleep entry; upstream fix, kept behind the fork's transient and
     // lifecycle-suppression guards.
-    if (abortController?.signal?.aborted) {
+    if (sleepStopped || abortController?.signal?.aborted) {
       execResults = { status: 'canceled' };
     } else {
       if (!executionContext.transientExecution) {
@@ -1283,16 +1284,16 @@ export async function executeEntry(
       });
     }
 
-    // A cancel request recorded before or with the waiting write stops the
-    // sleep before it starts, including a dynamic duration function.
-    const sleepCancelRequested = await abortForCancelRequest(engine, {
+    // A lineage that another owner settled, or that a cancel request
+    // targets, does not start the sleep or its dynamic duration function.
+    const sleepStopped = await stopForDurableAuthority(engine, {
       workflowId,
       runId,
       executionContext,
       abortController,
     });
 
-    if (!sleepCancelRequested)
+    if (!sleepStopped)
       await engine.executeSleepUntil({
         workflowId,
         runId,
@@ -1315,7 +1316,7 @@ export async function executeEntry(
     // An abort during the sleep must not be overwritten by a success terminal
     // for the sleep entry; upstream fix, kept behind the fork's transient and
     // lifecycle-suppression guards.
-    if (abortController?.signal?.aborted) {
+    if (sleepStopped || abortController?.signal?.aborted) {
       execResults = { status: 'canceled' };
     } else {
       if (!executionContext.transientExecution) {

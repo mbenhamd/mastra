@@ -185,6 +185,8 @@ describe('Run.requestCancel()', () => {
       expectedLifecycleResumeAttempt: observed!.lifecycleResumeAttempt!,
     });
     expect(outcome).toMatchObject({ status: 'requested', cancelRequest: { requestId: 'abort-op-1' } });
+    // The controller-only handle never executes, so it is released at once.
+    expect(await controller.workflow.createRun({ runId: ownerRun.runId })).not.toBe(remoteRun);
     // The request does not settle the run: its owner is still executing.
     expect(await controller.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] })).toMatchObject({
       status: 'running',
@@ -544,6 +546,60 @@ describe('Run.requestCancel()', () => {
     expect(result.status).toBe('canceled');
     expect(sleepDurationReads).toBe(0);
     expect((await loadSnapshot(storage, run.runId))?.status).toBe('canceled');
+  });
+
+  it('does not start a sleep on a lineage another owner settled after its waiting write', async () => {
+    const storage = new InMemoryStore();
+    let sleepDurationReads = 0;
+    const prepare = createStep({
+      id: 'prepare',
+      inputSchema: z.object({ topic: z.string() }),
+      outputSchema: z.object({ topic: z.string() }),
+      execute: async ({ inputData }) => inputData,
+    });
+    const workflow = registerProcess(
+      storage,
+      createWorkflow({
+        id: WORKFLOW_ID,
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ topic: z.string() }),
+        steps: [prepare],
+        options: { validateInputs: false },
+      })
+        .then(prepare)
+        .sleep(async () => {
+          sleepDurationReads++;
+          return 60_000;
+        })
+        .commit(),
+    );
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const run = await workflow.createRun();
+    // A recovery restart elsewhere honours a request and commits `canceled`
+    // right after the owner's waiting write.
+    const persist = workflowsStore.persistWorkflowStepUpdate.bind(workflowsStore);
+    vi.spyOn(workflowsStore, 'persistWorkflowStepUpdate').mockImplementation(async input => {
+      const written = await persist(input);
+      if (input.snapshot.status === 'waiting') {
+        await workflowsStore.updateWorkflowState({
+          workflowName: WORKFLOW_ID,
+          runId: run.runId,
+          opts: {
+            status: 'canceled',
+            expectedStatus: 'waiting',
+            expectedExecutionGeneration: input.snapshot.executionGeneration!,
+            expectedLifecycleResumeAttempt: input.snapshot.lifecycleResumeAttempt ?? 0,
+          },
+        });
+      }
+      return written;
+    });
+
+    const result = await run.start({ inputData: { topic: 'aspirin' } });
+
+    expect(result.status).toBe('canceled');
+    expect(sleepDurationReads).toBe(0);
   });
 
   it('returns the settled outcome when another process cancels a suspension while the owner unwinds', async () => {

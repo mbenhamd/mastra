@@ -4560,6 +4560,22 @@ export class Run<
    * LibSQL), where step writes cannot drop the request.
    */
   async requestCancel(input: WorkflowCancelRequestInput): Promise<WorkflowCancelRequestOutcome> {
+    const outcome = await this.recordCancelRequest(input);
+    // A handle created only to send the request never executes, so nothing
+    // else would release it from the workflow's run cache.
+    if (!this.isExecutingLifecycle()) this.cleanup?.();
+    return outcome;
+  }
+
+  /** True while this handle executes, or has claimed in start(), its current lineage. */
+  private isExecutingLifecycle(): boolean {
+    return (
+      this.#executionGeneration !== undefined &&
+      (this.hasActiveLifecycleExecution(this.#executionGeneration) || this.workflowRunStatus === 'running')
+    );
+  }
+
+  private async recordCancelRequest(input: WorkflowCancelRequestInput): Promise<WorkflowCancelRequestOutcome> {
     const { requestId, expectedExecutionGeneration, expectedLifecycleResumeAttempt } = input;
     if (typeof requestId !== 'string' || requestId.length === 0) {
       throw new TypeError('requestCancel() requires a non-empty requestId');
