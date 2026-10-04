@@ -455,12 +455,14 @@ describe('HarnessPG lease-fenced dispatch compare-and-swap', () => {
     const rowReleased = new Promise<void>(resolve => (releaseRow = resolve));
     let rowLocked!: () => void;
     const locked = new Promise<void>(resolve => (rowLocked = resolve));
+    let holderPid = 0;
     const holder = store.db.tx(async t => {
       await t.one(
         `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_MESSAGE_RESULTS}"
           WHERE harness_name = $1 AND session_id = $2 AND signal_id = $3 FOR UPDATE`,
         [HARNESS, session.id, input.signalId],
       );
+      holderPid = (await t.one<{ pid: number }>('SELECT pg_backend_pid() AS pid')).pid;
       rowLocked();
       await rowReleased;
     });
@@ -471,22 +473,26 @@ describe('HarnessPG lease-fenced dispatch compare-and-swap', () => {
       order.push('stamp');
       return result;
     });
-    const waitForLockWaiters = async (count: number) => {
+    // The backend this test's own lock holder blocks, polled by PID so other
+    // sessions on the database cannot satisfy the wait.
+    const waitForBlockedBy = async (blockerPid: number): Promise<number> => {
       for (let attempt = 0; attempt < 300; attempt++) {
-        const waiting = await store.db.one<{ count: number }>(
-          `SELECT COUNT(*)::int AS count FROM pg_stat_activity
-            WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+        const blocked = await store.db.oneOrNone<{ pid: number }>(
+          `SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1`,
+          [blockerPid],
         );
-        if (waiting.count >= count) return;
+        if (blocked) return blocked.pid;
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      throw new Error(`expected ${count} lock waiters`);
+      throw new Error(`expected a backend blocked by ${blockerPid}`);
     };
-    await waitForLockWaiters(1);
+    // The stamp holds the session row and waits on the evidence row.
+    const stampPid = await waitForBlockedBy(holderPid);
     const adopted = harness()
       .acquireSessionLease({ sessionId: session.id, ownerId: 'adopter', ttlMs: 60_000 })
       .then(() => order.push('adopt'));
-    await waitForLockWaiters(2);
+    // The adoption waits on the session row the stamp holds.
+    await waitForBlockedBy(stampPid);
     releaseRow();
     await holder;
 

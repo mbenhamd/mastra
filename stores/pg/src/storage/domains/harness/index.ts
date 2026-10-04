@@ -9571,9 +9571,20 @@ export class HarnessPG extends HarnessStorage {
     for (const row of required.rows) {
       const column = String(row.column_name);
       if (column !== 'session_incarnation' && column !== 'admission_hash') continue;
-      await this.#client.execute(
-        `ALTER TABLE ${TABLE_HARNESS_TERMINAL_TOMBSTONES} ALTER COLUMN ${column} DROP NOT NULL`,
-      );
+      try {
+        await this.#client.execute(
+          `ALTER TABLE ${TABLE_HARNESS_TERMINAL_TOMBSTONES} ALTER COLUMN ${column} DROP NOT NULL`,
+        );
+      } catch (error) {
+        // A least-privilege runtime role cannot alter a table it does not own.
+        // Initialization still succeeds; revocations fail closed on the
+        // constraint until the table owner applies the migration.
+        if ((error as { code?: unknown }).code !== '42501') throw error;
+        this.logger?.warn?.(
+          `Cannot make ${TABLE_HARNESS_TERMINAL_TOMBSTONES}.${column} nullable (insufficient privilege); terminal grant revocation fails until the table owner drops its NOT NULL constraint`,
+        );
+        return;
+      }
     }
   }
 

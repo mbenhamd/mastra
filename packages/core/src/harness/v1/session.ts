@@ -1875,6 +1875,8 @@ export class Session {
     | { ok: true; full: FullOutput<unknown>; resumeAccountingKey?: string }
     | { ok: false; err: unknown; runFailed?: true }
   >();
+  /** Runs of aborted native terminal turns whose output had not settled yet (bounded). */
+  private readonly _abortedTerminalRunIds = new Set<string>();
   /**
    * Message admission retries can observe `_completedRuns` before the original
    * message continuation has accounted usage. Track run ids accounted through
@@ -4719,13 +4721,32 @@ export class Session {
    * failure is demoted so a later same-admission retry does not commit it.
    */
   private _isRejectedTerminalRun(runId: string, err: unknown, turnAbortSignal: AbortSignal): boolean {
-    const cached = this._completedRuns.get(runId);
-    if (cached === undefined || cached.ok || cached.runFailed !== true || cached.err !== err) return false;
     if (turnAbortSignal.aborted) {
-      delete cached.runFailed;
+      this._noteAbortedTerminalRun(runId);
       return false;
     }
-    return true;
+    const cached = this._completedRuns.get(runId);
+    return cached !== undefined && !cached.ok && cached.runFailed === true && cached.err === err;
+  }
+
+  /**
+   * An aborted turn's run is never a run failure, whichever settles first: the
+   * cached failure is demoted, or — when the abort released the caller before
+   * the run's output failed — the run is remembered so its later failure is
+   * not marked, and a same-admission retry never commits it as failed.
+   */
+  private _noteAbortedTerminalRun(runId: string): void {
+    const cached = this._completedRuns.get(runId);
+    if (cached !== undefined) {
+      if (!cached.ok) delete cached.runFailed;
+      return;
+    }
+    this._abortedTerminalRunIds.add(runId);
+    while (this._abortedTerminalRunIds.size > 64) {
+      const oldest = this._abortedTerminalRunIds.values().next().value;
+      if (oldest === undefined) return;
+      this._abortedTerminalRunIds.delete(oldest);
+    }
   }
 
   /**
@@ -7900,12 +7921,14 @@ export class Session {
       // that same error. A collector that closed without a terminal chunk, or a
       // stream consumption failure, rejects with another error and leaves the
       // run's outcome unknown.
-      const runFailed = out.status === 'failed' && out.error !== undefined && out.error === err;
+      const aborted = this._abortedTerminalRunIds.delete(runId);
+      const runFailed = !aborted && out.status === 'failed' && out.error !== undefined && out.error === err;
       this._runToolReceipts.delete(runId);
       this._rememberCompletedRun(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
       if (waiter) waiter.reject(err);
       return;
     }
+    this._abortedTerminalRunIds.delete(runId);
     try {
       // Close dangling tools while their receipt state can still be attached to
       // this run's output. Suspended tools remain parked for their real terminal.
@@ -8770,26 +8793,24 @@ export class Session {
                     executionGrant: opts.executionAuthorityGrant!,
                   })
                 : undefined;
+            const dispatch = (existing as AgentSignalResultEvidence).dispatch;
+            const dispatchNotStarted = dispatch === undefined || dispatch.state === 'reserved';
             // A stored admission that is already cancelled or fenced can never
             // produce completed evidence — surface the durable outcome now
-            // instead of waiting out the generic duplicate path.
+            // instead of waiting out the generic duplicate path. An
+            // undispatched turn of a cancelled grant instead goes through the
+            // admission below, whose refusal settles its reservation with the
+            // cancellation in the same step.
             if (
               probedTerminalAdmission !== undefined &&
               probedTerminalAdmission !== null &&
-              (probedTerminalAdmission.status === 'cancelled' || probedTerminalAdmission.status === 'fenced')
+              (probedTerminalAdmission.status === 'fenced' ||
+                (probedTerminalAdmission.status === 'cancelled' && !dispatchNotStarted))
             ) {
               const terminalError =
                 probedTerminalAdmission.status === 'cancelled'
                   ? new HarnessTerminalHandoffCancelledError(probedTerminalAdmission.executionGrant.key)
                   : new HarnessTerminalHandoffFencedError(this.id);
-              // A cancelled grant's undispatched reservation is settled with
-              // the cancellation so it neither blocks close nor is later
-              // published as an interrupted run.
-              if (probedTerminalAdmission.status === 'cancelled') {
-                await this._settleCancelledTerminalMessage(probedTerminalAdmission, terminalError.message, {
-                  requireUndispatched: true,
-                });
-              }
               try {
                 opts.onTerminalCommitError?.(terminalError);
               } catch {
@@ -8797,12 +8818,11 @@ export class Session {
               }
               throw terminalError;
             }
-            const dispatch = (existing as AgentSignalResultEvidence).dispatch;
-            const dispatchNotStarted = dispatch === undefined || dispatch.state === 'reserved';
             const strandedPendingTerminal =
               probedTerminalAdmission !== undefined &&
               (probedTerminalAdmission === null ||
-                (probedTerminalAdmission.status === 'pending' && dispatchNotStarted));
+                ((probedTerminalAdmission.status === 'pending' || probedTerminalAdmission.status === 'cancelled') &&
+                  dispatchNotStarted));
             if (!strandedPendingTerminal) {
               releaseDuplicateStart();
               try {

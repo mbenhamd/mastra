@@ -550,6 +550,56 @@ describe('rejected provider runs commit a durable failed terminal', () => {
     }
   });
 
+  it('never commits an aborted turn as failed when its run fails after the abort released the caller', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    const providerError = new Error('provider failed after abort');
+    let releaseOutput!: () => void;
+    const outputReleased = new Promise<void>(resolve => (releaseOutput = resolve));
+    let outputEntered!: () => void;
+    const entered = new Promise<void>(resolve => (outputEntered = resolve));
+    // The run's output reports an explicit failure, but only after the turn
+    // was aborted and the caller released.
+    const buildOutput = (agent as any).buildOutput.bind(agent);
+    vi.spyOn(agent as any, 'buildOutput').mockImplementation((...args: unknown[]) => {
+      const out = buildOutput(...args);
+      let failed = false;
+      Object.defineProperty(out, 'status', { get: () => (failed ? 'failed' : 'running') });
+      out.getFullOutput = async () => {
+        outputEntered();
+        await outputReleased;
+        failed = true;
+        out.error = providerError;
+        throw providerError;
+      };
+      return out;
+    });
+    const { harness, storage } = harnessProcess(db, agent);
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const turn = session.message(terminalMessage() as never).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      await entered;
+      session.abort();
+      await expect(turn).resolves.toMatchObject({ name: 'HarnessTerminalHandoffError:harness.terminal_pending' });
+      releaseOutput();
+      await vi.waitFor(() => expect((session as any)._completedRuns.size).toBeGreaterThan(0));
+
+      // A same-admission retry reports the failure but leaves the aborted
+      // turn's outcome to reconciliation instead of committing it as failed.
+      await expect(session.message(terminalMessage() as never)).rejects.toThrow();
+      await expect(admissionFor(storage, session.id)).resolves.toMatchObject({ status: 'pending' });
+      await expect(storage.getTerminalQueuePressure({ harnessName: 'default' })).resolves.toMatchObject({
+        pendingIntents: 0,
+      });
+    } finally {
+      releaseOutput();
+      await harness.shutdown();
+    }
+  });
+
   it('keeps a run whose output closed without an explicit failure indeterminate', async () => {
     const db = new InMemoryDB();
     const agent = new MockAgent({ id: 'default' });
