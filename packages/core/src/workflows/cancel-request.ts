@@ -25,13 +25,34 @@ export interface WorkflowCancelRequestInput {
   expectedLifecycleResumeAttempt?: number;
 }
 
-/** Typed outcome of `Run.requestCancel()`. */
+/**
+ * Typed outcome of `Run.requestCancel()`.
+ *
+ * A request binds to one execution lineage. Once that lineage is gone — a
+ * restart minted a new generation, a resume moved to the next attempt, or a
+ * checkpointed resume rolled back to its suspension — the request no longer
+ * applies, and a caller that still wants the run stopped requests again for
+ * the lineage it now observes.
+ */
 export type WorkflowCancelRequestOutcome =
-  /** The running lineage carries the request; its engine honours it at the next step boundary. */
+  /**
+   * The running or waiting lineage carries the request; its engine honours it
+   * at the next step boundary, or `restart()` does after the engine is gone.
+   * The lineage may still settle another way when the request lands after its
+   * last boundary, so callers confirm the outcome from the durable run.
+   */
   | { status: 'requested'; cancelRequest: WorkflowCancelRequestV1 }
-  /** That lineage already carries a request; the first one stands. */
+  /**
+   * That lineage already carries a request, which is kept. Two callers racing
+   * to record the first request can both see `requested`; the later write's
+   * `requestId` is the one stored, and either way the same lineage stops.
+   */
   | { status: 'already_requested'; cancelRequest: WorkflowCancelRequestV1 }
-  /** No engine executes the lineage (pending, suspended, waiting or paused): it is canceled now. */
+  /**
+   * A pending, suspended or paused lineage no engine was executing: it is
+   * canceled now. A pending run this handle is already starting is treated
+   * as running instead.
+   */
   | { status: 'canceled' }
   /** The run already ended. */
   | { status: 'terminal'; runStatus: WorkflowRunStatus }
@@ -47,6 +68,12 @@ export type WorkflowCancelRequestOutcome =
  */
 export class WorkflowCancelRequestedError extends Error {
   readonly cancelRequest: WorkflowCancelRequestV1;
+  /**
+   * Set when `Run.cancel()` later committed `canceled` durably for the same
+   * execution. An abort signal keeps its first reason, so this records that
+   * the stronger, already-durable cancellation now owns the outcome.
+   */
+  durableCancelCommitted = false;
 
   constructor(cancelRequest: WorkflowCancelRequestV1) {
     super(`Workflow cancellation requested (${cancelRequest.requestId})`);
@@ -55,9 +82,21 @@ export class WorkflowCancelRequestedError extends Error {
   }
 }
 
-/** True when the signal was aborted by a durable cancel request rather than `Run.cancel()`. */
+/**
+ * True when a durable cancel request, and nothing that committed `canceled`
+ * durably since, aborted the signal.
+ */
 export function isWorkflowCancelRequestAbort(signal: AbortSignal | undefined): boolean {
-  return signal?.aborted === true && signal.reason instanceof WorkflowCancelRequestedError;
+  return (
+    signal?.aborted === true &&
+    signal.reason instanceof WorkflowCancelRequestedError &&
+    !signal.reason.durableCancelCommitted
+  );
+}
+
+/** Records that `Run.cancel()` committed `canceled` durably on a signal a request already aborted. */
+export function markDurableCancelCommitted(signal: AbortSignal): void {
+  if (signal.reason instanceof WorkflowCancelRequestedError) signal.reason.durableCancelCommitted = true;
 }
 
 export function isTerminalWorkflowRunStatus(status: WorkflowRunStatus | undefined): boolean {

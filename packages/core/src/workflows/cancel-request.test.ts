@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { Mastra } from '../mastra';
 import { InMemoryStore } from '../storage/mock';
@@ -75,6 +75,81 @@ function createProcess(storage: InMemoryStore, probe: Probe) {
   const workflow = createStagedWorkflow(probe);
   const mastra = new Mastra({ storage, workflows: { [WORKFLOW_ID]: workflow }, logger: false });
   return { mastra, workflow };
+}
+
+/**
+ * A chunked stage: a `dountil` loop whose body runs once per chunk. Only the
+ * first chunk waits for release, so later chunks would run straight through.
+ */
+function createChunkedWorkflow(probe: Probe) {
+  const chunk = createStep({
+    id: 'chunk',
+    inputSchema: z.object({ chunks: z.number() }),
+    outputSchema: z.object({ chunks: z.number() }),
+    execute: async ({ inputData }) => {
+      probe.stageOneExecutions++;
+      if (inputData.chunks === 0) {
+        probe.stageOneStarted.resolve();
+        await probe.releaseStageOne.promise;
+      }
+      return { chunks: inputData.chunks + 1 };
+    },
+  });
+  const report = createStep({
+    id: 'report',
+    inputSchema: z.object({ chunks: z.number() }),
+    outputSchema: z.object({ chunks: z.number() }),
+    execute: async ({ inputData }) => {
+      probe.stageTwoExecutions++;
+      return inputData;
+    },
+  });
+  return createWorkflow({
+    id: WORKFLOW_ID,
+    inputSchema: z.object({ chunks: z.number() }),
+    outputSchema: z.object({ chunks: z.number() }),
+    steps: [chunk, report],
+    options: { validateInputs: false },
+  })
+    .dountil(chunk, async ({ inputData }) => inputData.chunks >= 5)
+    .then(report)
+    .commit();
+}
+
+/**
+ * A review step that suspends for approval, and on resume works until
+ * released, then suspends again for the next round.
+ */
+function createReviewWorkflow(probe: Probe) {
+  const review = createStep({
+    id: 'review',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+    resumeSchema: z.object({ round: z.number() }),
+    suspendSchema: z.object({ round: z.number() }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      probe.stageOneExecutions++;
+      if (!resumeData) return suspend({ round: 1 });
+      probe.stageOneStarted.resolve();
+      await probe.releaseStageOne.promise;
+      await suspend({ round: resumeData.round + 1 });
+      return inputData;
+    },
+  });
+  return createWorkflow({
+    id: WORKFLOW_ID,
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+    steps: [review],
+    options: { validateInputs: false },
+  })
+    .then(review)
+    .commit();
+}
+
+function registerProcess<TWorkflow extends { id: string }>(storage: InMemoryStore, workflow: TWorkflow) {
+  new Mastra({ storage, workflows: { [WORKFLOW_ID]: workflow as never }, logger: false });
+  return workflow;
 }
 
 async function loadSnapshot(storage: InMemoryStore, runId: string) {
@@ -243,6 +318,121 @@ describe('Run.requestCancel()', () => {
     probe.releaseStageOne.resolve();
     expect((await abandoned).status).toBe('canceled');
     expect(probe.stageTwoExecutions).toBe(0);
+  });
+
+  it('stops a chunked loop before its next iteration starts', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const owner = registerProcess(storage, createChunkedWorkflow(probe));
+    const controller = registerProcess(storage, createChunkedWorkflow(probe));
+
+    const ownerRun = await owner.createRun();
+    const execution = ownerRun.start({ inputData: { chunks: 0 } });
+    await probe.stageOneStarted.promise;
+    const remoteRun = await controller.createRun({ runId: ownerRun.runId });
+    expect(
+      (await remoteRun.requestCancel({ requestId: 'abort-op-1', ...(await lineageOf(storage, ownerRun.runId)) }))
+        .status,
+    ).toBe('requested');
+
+    probe.releaseStageOne.resolve();
+    const result = await execution;
+
+    // The loop is one entry; without a check at each iteration it would run
+    // all five chunks before the entry boundary saw the request.
+    expect(result.status).toBe('canceled');
+    expect(probe.stageOneExecutions).toBe(1);
+    expect(probe.stageTwoExecutions).toBe(0);
+    expect((await loadSnapshot(storage, ownerRun.runId))?.status).toBe('canceled');
+  });
+
+  it('cancels a resumed attempt that suspends again after the request', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const owner = registerProcess(storage, createReviewWorkflow(probe));
+    const controller = registerProcess(storage, createReviewWorkflow(probe));
+
+    const run = await owner.createRun();
+    expect((await run.start({ inputData: { topic: 'aspirin' } })).status).toBe('suspended');
+    const resumed = run.resume({ resumeData: { round: 1 } });
+    await probe.stageOneStarted.promise;
+    const resumedLineage = await lineageOf(storage, run.runId);
+    expect(resumedLineage.expectedLifecycleResumeAttempt).toBe(1);
+    const remoteRun = await controller.createRun({ runId: run.runId });
+    expect((await remoteRun.requestCancel({ requestId: 'abort-op-1', ...resumedLineage })).status).toBe('requested');
+
+    probe.releaseStageOne.resolve();
+    const result = await resumed;
+
+    expect(result.status).toBe('canceled');
+    expect((await loadSnapshot(storage, run.runId))?.status).toBe('canceled');
+    await expect(run.resume({ resumeData: { round: 2 } })).rejects.toThrow('This workflow run was not suspended');
+    expect(probe.stageOneExecutions).toBe(2);
+  });
+
+  it('reports a lineage a restart claimed between its read and its write, and writes nothing', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const deadOwner = createProcess(storage, probe);
+    const survivor = createProcess(storage, probe);
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const ownerRun = await deadOwner.workflow.createRun();
+    const abandoned = ownerRun.start({ inputData: { topic: 'aspirin' } });
+    await probe.stageOneStarted.promise;
+    const strandedLineage = await lineageOf(storage, ownerRun.runId);
+
+    // The survivor's recovery restart claims the run after requestCancel()
+    // read the stranded lineage and before its compare-and-set.
+    let recovery: Promise<unknown> | undefined;
+    const updateWorkflowState = workflowsStore.updateWorkflowState.bind(workflowsStore);
+    const spy = vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(async args => {
+      if (args.opts.cancelRequest && recovery === undefined) {
+        recovery = (await survivor.workflow.createRun({ runId: ownerRun.runId })).restart();
+        await vi.waitFor(async () => {
+          expect((await loadSnapshot(storage, ownerRun.runId))?.executionGeneration).not.toBe(
+            strandedLineage.expectedExecutionGeneration,
+          );
+        });
+      }
+      return updateWorkflowState(args);
+    });
+
+    const lateRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
+    const outcome = await lateRun.requestCancel({ requestId: 'stale-abort', ...strandedLineage });
+    spy.mockRestore();
+
+    const successor = await loadSnapshot(storage, ownerRun.runId);
+    expect(outcome).toEqual({
+      status: 'lineage_moved',
+      executionGeneration: successor?.executionGeneration,
+      lifecycleResumeAttempt: 0,
+    });
+    expect(successor?.cancelRequest).toBeUndefined();
+    probe.releaseStageOne.resolve();
+    expect(((await recovery) as { status: string }).status).toBe('success');
+    expect((await abandoned).status).toBe('canceled');
+    expect((await loadSnapshot(storage, ownerRun.runId))?.status).toBe('success');
+  });
+
+  it('keeps the first request for a lineage', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const owner = createProcess(storage, probe);
+    const controller = createProcess(storage, probe);
+
+    const ownerRun = await owner.workflow.createRun();
+    const execution = ownerRun.start({ inputData: { topic: 'aspirin' } });
+    await probe.stageOneStarted.promise;
+    const remoteRun = await controller.workflow.createRun({ runId: ownerRun.runId });
+    const lineage = await lineageOf(storage, ownerRun.runId);
+    await remoteRun.requestCancel({ requestId: 'abort-op-1', ...lineage });
+
+    const repeated = await remoteRun.requestCancel({ requestId: 'abort-op-2', ...lineage });
+
+    expect(repeated).toMatchObject({ status: 'already_requested', cancelRequest: { requestId: 'abort-op-1' } });
+    probe.releaseStageOne.resolve();
+    expect((await execution).status).toBe('canceled');
   });
 
   it('makes resume commit canceled when the request lost the race with suspension', async () => {

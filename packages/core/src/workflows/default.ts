@@ -170,10 +170,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * Reads durable lifecycle authority for one execution lineage.
    *
    * `disposition` names a terminal outcome or successor generation another
-   * owner already settled. `cancelRequest` is set when the lineage is still
-   * active and `Run.requestCancel()` recorded a request for exactly this
+   * owner already settled. `cancelRequest` is set when the lineage has not
+   * ended and `Run.requestCancel()` recorded a request for exactly this
    * generation and resume attempt; the caller honours it by stopping at this
-   * boundary and committing `canceled` itself.
+   * boundary and committing `canceled` itself. `status` is the stored status
+   * of this lineage, present whenever it has not ended.
    */
   async readExecutionAuthority(params: {
     workflowId: string;
@@ -182,7 +183,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     executionGeneration: string;
     /** Required to observe a cancel request; when omitted, `cancelRequest` stays unset. */
     lifecycleResumeAttempt?: number;
-  }): Promise<{ disposition: WorkflowRunStatus | 'superseded' | undefined; cancelRequest?: WorkflowCancelRequestV1 }> {
+  }): Promise<{
+    disposition: WorkflowRunStatus | 'superseded' | undefined;
+    cancelRequest?: WorkflowCancelRequestV1;
+    status?: WorkflowRunStatus;
+  }> {
     if (params.transientExecution) return { disposition: undefined };
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const executionState = await workflowsStore?.getWorkflowExecutionState({
@@ -201,9 +206,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       if (this.getLastPersistedStatus(params.runId) === executionState.status) return { disposition: undefined };
       return { disposition: executionState.status };
     }
-    if (params.lifecycleResumeAttempt === undefined) return { disposition: undefined };
+    if (params.lifecycleResumeAttempt === undefined) {
+      return { disposition: undefined, status: executionState.status };
+    }
     return {
       disposition: undefined,
+      status: executionState.status,
       cancelRequest: workflowCancelRequestFor(executionState.cancelRequest, {
         executionGeneration: params.executionGeneration,
         lifecycleResumeAttempt: params.lifecycleResumeAttempt,
@@ -223,17 +231,22 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     executionGeneration: string;
     lifecycleResumeAttempt: number;
   }): Promise<PersistWorkflowStepUpdateResult> {
-    const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
-    if (!workflowsStore) return { status: 'stale_execution' };
-    const canceled = await commitWorkflowLineageCancellation({
-      workflowsStore,
-      workflowName: params.workflowId,
-      runId: params.runId,
-      expectedStatus: params.settledStatus,
-      executionGeneration: params.executionGeneration,
-      lifecycleResumeAttempt: params.lifecycleResumeAttempt,
-    });
-    return canceled ? { status: 'persisted' } : { status: 'stale_execution' };
+    return this.wrapDurableOperation(
+      `workflow.${params.workflowId}.run.${params.runId}.cancel-request.${params.settledStatus}`,
+      async (): Promise<PersistWorkflowStepUpdateResult> => {
+        const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+        if (!workflowsStore) return { status: 'stale_execution' };
+        const canceled = await commitWorkflowLineageCancellation({
+          workflowsStore,
+          workflowName: params.workflowId,
+          runId: params.runId,
+          expectedStatus: params.settledStatus,
+          executionGeneration: params.executionGeneration,
+          lifecycleResumeAttempt: params.lifecycleResumeAttempt,
+        });
+        return canceled ? { status: 'persisted' } : { status: 'stale_execution' };
+      },
+    );
   }
 
   private async isAuthoritativelyCanceled(params: {
@@ -1015,9 +1028,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     let lastState: Record<string, any> = normalizeStateRoot(timeTravel?.state ?? restart?.state ?? initialState ?? {});
     let lastExecutionContext: ExecutionContext | undefined;
     let currentRequestContext = params.requestContext;
-    // Commits `canceled` for this lineage through the lineage-fenced step
-    // write: a local abort stops at the next entry, and a durable cancel request
-    // stops at the entry boundary that observed it.
+    // Commits `canceled` for this lineage: a local abort stops at the next
+    // entry, and a durable cancel request stops at the entry boundary that
+    // observed it. The write is the lineage-fenced step write, or, for a
+    // lineage already persisted as suspended or paused, the lineage
+    // compare-and-set.
     const commitCanceledExecution = async (
       executionContext: ExecutionContext,
       settledStatus?: 'suspended' | 'paused',
@@ -1118,9 +1133,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         ...(params.outputOptions?.includeState ? { state: lastState } : {}),
       } as any;
     };
-    // After a settle write, only Run.cancel() relabels the outcome in memory:
-    // it committed `canceled` durably first. A cancel request that arrives
-    // after the lineage persisted another outcome leaves that outcome standing.
+    // After a settle write, a cancel request no longer relabels the outcome in
+    // memory: one that arrives after the lineage persisted another outcome
+    // leaves that outcome standing. Other aborts keep their existing effect —
+    // Run.cancel() commits `canceled` durably first, and a step's own abort()
+    // stays local as before.
     const isRunCancelAbort = () =>
       params.abortController.signal.aborted && !isWorkflowCancelRequestAbort(params.abortController.signal);
 
@@ -1205,10 +1222,15 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       const persistOutcome = lastOutput.persistOutcome as PersistWorkflowStepUpdateResult | void | undefined;
       let authoritativeDisposition: WorkflowRunStatus | 'superseded' | undefined;
       let cancelRequest: WorkflowCancelRequestV1 | undefined;
+      let storedStatus: WorkflowRunStatus | undefined;
       if (persistOutcome && persistOutcome.status !== 'persisted') {
         authoritativeDisposition = params.transientExecution ? undefined : (persistOutcome.disposition ?? 'canceled');
       } else {
-        ({ disposition: authoritativeDisposition, cancelRequest } = await this.readExecutionAuthority({
+        ({
+          disposition: authoritativeDisposition,
+          cancelRequest,
+          status: storedStatus,
+        } = await this.readExecutionAuthority({
           workflowId,
           runId,
           transientExecution: params.transientExecution,
@@ -1259,10 +1281,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       // the lineage was running, so it takes precedence over a later outcome.
       if (cancelRequest) {
         params.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
-        const settledStatus =
-          lastOutput.result.status === 'suspended' || lastOutput.result.status === 'paused'
-            ? lastOutput.result.status
-            : undefined;
+        // The stored status, not the entry result, decides how to cancel: an
+        // entry whose suspension was persisted can no longer be moved by a
+        // step write.
+        const settledStatus = storedStatus === 'suspended' || storedStatus === 'paused' ? storedStatus : undefined;
         return await commitCanceledExecution(executionContext, settledStatus);
       }
 

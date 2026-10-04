@@ -603,7 +603,6 @@ export interface WorkflowResumeOperationReplayContextV1 {
   label?: string;
 }
 
-/** Storage-owned immutable copy of the last policy-approved pre-resume state. */
 /**
  * A durable request to cancel one execution lineage. `Run.requestCancel()`
  * writes it with a compare-and-set on the lineage it names, so a successor
@@ -620,6 +619,7 @@ export interface WorkflowCancelRequestV1 {
   requestedAt: number;
 }
 
+/** Storage-owned immutable copy of the last policy-approved pre-resume state. */
 export interface WorkflowResumeCheckpointV1 extends WorkflowLifecycleFenceV1 {
   version: 1;
   runId: string;
