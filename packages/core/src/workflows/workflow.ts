@@ -3865,6 +3865,13 @@ export class Workflow<
 
       // Execution state
       status: snapshotState.status,
+      ...(snapshotState.executionGeneration === undefined
+        ? {}
+        : {
+            executionGeneration: snapshotState.executionGeneration,
+            lifecycleResumeAttempt: snapshotState.lifecycleResumeAttempt ?? 0,
+          }),
+      ...(snapshotState.cancelRequest === undefined ? {} : { cancelRequest: snapshotState.cancelRequest }),
       initialState: Object.keys(snapshotState.value).length > 0 ? snapshotState.value : undefined,
       result: includeAllFields || fieldsSet.has('result') ? snapshotState.result : undefined,
       error: includeAllFields || fieldsSet.has('error') ? snapshotState.error : undefined,

@@ -1400,6 +1400,39 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           lastOutput.result.status = 'canceled';
         }
 
+        // Another process can settle a suspended or paused lineage while this
+        // engine unwinds (requestCancel() or cancel() on a run no engine there
+        // executes). That owner published the terminal sequence, so return the
+        // durable outcome rather than publish a suspension after it.
+        if (
+          (result.status === 'suspended' || result.status === 'paused') &&
+          !params.transientExecution &&
+          !isRunCancelAbort()
+        ) {
+          const settledElsewhere = await this.getAuthoritativeExecutionDisposition({
+            workflowId,
+            runId,
+            executionGeneration,
+          });
+          const durableOutcome =
+            settledElsewhere &&
+            settledElsewhere !== 'superseded' &&
+            !(
+              settledElsewhere === 'canceled' &&
+              (await params.isCancellationAdmitted?.(executionGeneration, lifecycleResumeAttempt))
+            )
+              ? await this.resolveRejectedTerminalWrite({ status: 'stale_execution' }, executionContext, false, {
+                  pubsub: params.pubsub,
+                  includeState: params.outputOptions?.includeState,
+                })
+              : undefined;
+          if (durableOutcome) {
+            workflowSpan?.end({ attributes: { status: durableOutcome.status } });
+            this.clearLastPersistedStatus(runId);
+            return { ...durableOutcome, runId } as unknown as TOutput;
+          }
+        }
+
         if (result.error) {
           workflowSpan?.error({
             error: result.error,

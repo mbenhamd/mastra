@@ -176,14 +176,20 @@ describe('Run.requestCancel()', () => {
     const execution = ownerRun.start({ inputData: { topic: 'aspirin' } });
     await probe.stageOneStarted.promise;
 
+    // The public run state names the execution to target.
+    const observed = await controller.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] });
     const remoteRun = await controller.workflow.createRun({ runId: ownerRun.runId });
     const outcome = await remoteRun.requestCancel({
       requestId: 'abort-op-1',
-      ...(await lineageOf(storage, ownerRun.runId)),
+      expectedExecutionGeneration: observed!.executionGeneration!,
+      expectedLifecycleResumeAttempt: observed!.lifecycleResumeAttempt!,
     });
     expect(outcome).toMatchObject({ status: 'requested', cancelRequest: { requestId: 'abort-op-1' } });
     // The request does not settle the run: its owner is still executing.
-    expect((await loadSnapshot(storage, ownerRun.runId))?.status).toBe('running');
+    expect(await controller.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] })).toMatchObject({
+      status: 'running',
+      cancelRequest: { requestId: 'abort-op-1' },
+    });
 
     probe.releaseStageOne.resolve();
     const result = await execution;
@@ -486,6 +492,108 @@ describe('Run.requestCancel()', () => {
     expect((await loadSnapshot(storage, run.runId))?.cancelRequest).toBeUndefined();
     probe.releaseStageOne.resolve();
     expect((await execution).status).toBe('success');
+  });
+
+  it('stops before a sleep starts when the request lands with the waiting write', async () => {
+    const storage = new InMemoryStore();
+    let sleepDurationReads = 0;
+    const makeWorkflow = () => {
+      const prepare = createStep({
+        id: 'prepare',
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ topic: z.string() }),
+        execute: async ({ inputData }) => inputData,
+      });
+      return createWorkflow({
+        id: WORKFLOW_ID,
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ topic: z.string() }),
+        steps: [prepare],
+        options: { validateInputs: false },
+      })
+        .then(prepare)
+        .sleep(async () => {
+          sleepDurationReads++;
+          return 60_000;
+        })
+        .commit();
+    };
+    const owner = registerProcess(storage, makeWorkflow());
+    const controller = registerProcess(storage, makeWorkflow());
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const run = await owner.createRun();
+    // The request commits just before the owner persists the sleep's waiting
+    // boundary, after the boundary that followed the previous step.
+    const persist = workflowsStore.persistWorkflowStepUpdate.bind(workflowsStore);
+    let requested: Promise<unknown> | undefined;
+    vi.spyOn(workflowsStore, 'persistWorkflowStepUpdate').mockImplementation(async input => {
+      if (input.snapshot.status === 'waiting' && requested === undefined) {
+        requested = (async () =>
+          (await controller.createRun({ runId: run.runId })).requestCancel({
+            requestId: 'abort-op-1',
+            ...(await lineageOf(storage, run.runId)),
+          }))();
+        expect(await requested).toMatchObject({ status: 'requested' });
+      }
+      return persist(input);
+    });
+
+    const result = await run.start({ inputData: { topic: 'aspirin' } });
+
+    expect(result.status).toBe('canceled');
+    expect(sleepDurationReads).toBe(0);
+    expect((await loadSnapshot(storage, run.runId))?.status).toBe('canceled');
+  });
+
+  it('returns the settled outcome when another process cancels a suspension while the owner unwinds', async () => {
+    const storage = new InMemoryStore();
+    const unwinding = deferred();
+    const finishUnwinding = deferred();
+    const makeWorkflow = (onFinish?: (result: { status: string }) => Promise<void>) => {
+      const approval = createStep({
+        id: 'approval',
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ topic: z.string() }),
+        resumeSchema: z.object({ approved: z.boolean() }),
+        execute: async ({ inputData, resumeData, suspend }) => {
+          if (!resumeData) return suspend({});
+          return inputData;
+        },
+      });
+      return createWorkflow({
+        id: WORKFLOW_ID,
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ topic: z.string() }),
+        steps: [approval],
+        options: { validateInputs: false, ...(onFinish ? { onFinish } : {}) },
+      })
+        .then(approval)
+        .commit();
+    };
+    const owner = registerProcess(
+      storage,
+      makeWorkflow(async ({ status }) => {
+        if (status !== 'suspended') return;
+        unwinding.resolve();
+        await finishUnwinding.promise;
+      }),
+    );
+    const controller = registerProcess(storage, makeWorkflow());
+
+    const run = await owner.createRun();
+    const execution = run.start({ inputData: { topic: 'aspirin' } });
+    await unwinding.promise;
+    const remoteRun = await controller.createRun({ runId: run.runId });
+    expect(
+      await remoteRun.requestCancel({ requestId: 'abort-op-1', ...(await lineageOf(storage, run.runId)) }),
+    ).toEqual({ status: 'canceled' });
+
+    finishUnwinding.resolve();
+    const result = await execution;
+
+    expect(result.status).toBe('canceled');
+    expect((await loadSnapshot(storage, run.runId))?.status).toBe('canceled');
   });
 
   it('makes resume commit canceled when the request lost the race with suspension', async () => {

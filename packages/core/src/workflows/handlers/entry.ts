@@ -7,6 +7,7 @@ import { resolveObservabilityContext } from '../../observability';
 import type { ObservabilityContext } from '../../observability';
 import { WORKFLOW_LIFECYCLE_OUTBOX_LIMIT } from '../../storage/domains/workflows/resume';
 import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
+import { WorkflowCancelRequestedError } from '../cancel-request';
 import type { DefaultExecutionEngine } from '../default';
 import { requireWorkflowExecutionGeneration, workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
 import type { WorkflowLifecycleEvent } from '../lifecycle-events';
@@ -551,6 +552,32 @@ export function prepareStepSnapshot(engine: DefaultExecutionEngine, params: Pers
   })();
 
   return { snapshot, snapshotForPersistence, prunedLifecycleEvents };
+}
+
+/**
+ * Reads durable authority at a boundary that has no other check, and aborts
+ * the run when a cancel request targets this exact lineage.
+ */
+async function abortForCancelRequest(
+  engine: DefaultExecutionEngine,
+  params: {
+    workflowId: string;
+    runId: string;
+    executionContext: ExecutionContext;
+    abortController: AbortController;
+  },
+): Promise<boolean> {
+  const { executionContext } = params;
+  if (executionContext.transientExecution || executionContext.executionGeneration === undefined) return false;
+  const { cancelRequest } = await engine.readExecutionAuthority({
+    workflowId: params.workflowId,
+    runId: params.runId,
+    executionGeneration: executionContext.executionGeneration,
+    lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+  });
+  if (!cancelRequest) return false;
+  params.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
+  return true;
 }
 
 export async function persistStepUpdate(
@@ -1123,22 +1150,32 @@ export async function executeEntry(
       });
     }
 
-    await engine.executeSleep({
+    // A cancel request recorded before or with the waiting write stops the
+    // sleep before it starts, including a dynamic duration function.
+    const sleepCancelRequested = await abortForCancelRequest(engine, {
       workflowId,
       runId,
-      entry,
-      prevStep,
-      prevOutput,
-      stepResults,
-      serializedStepGraph,
-      resume,
       executionContext,
-      ...observabilityContext,
-      pubsub,
       abortController,
-      requestContext,
-      outputWriter,
     });
+
+    if (!sleepCancelRequested)
+      await engine.executeSleep({
+        workflowId,
+        runId,
+        entry,
+        prevStep,
+        prevOutput,
+        stepResults,
+        serializedStepGraph,
+        resume,
+        executionContext,
+        ...observabilityContext,
+        pubsub,
+        abortController,
+        requestContext,
+        outputWriter,
+      });
 
     delete executionContext.activeStepsPath[entry.id];
 
@@ -1246,22 +1283,32 @@ export async function executeEntry(
       });
     }
 
-    await engine.executeSleepUntil({
+    // A cancel request recorded before or with the waiting write stops the
+    // sleep before it starts, including a dynamic duration function.
+    const sleepCancelRequested = await abortForCancelRequest(engine, {
       workflowId,
       runId,
-      entry,
-      prevStep,
-      prevOutput,
-      stepResults,
-      serializedStepGraph,
-      resume,
       executionContext,
-      ...observabilityContext,
-      pubsub,
       abortController,
-      requestContext,
-      outputWriter,
     });
+
+    if (!sleepCancelRequested)
+      await engine.executeSleepUntil({
+        workflowId,
+        runId,
+        entry,
+        prevStep,
+        prevOutput,
+        stepResults,
+        serializedStepGraph,
+        resume,
+        executionContext,
+        ...observabilityContext,
+        pubsub,
+        abortController,
+        requestContext,
+        outputWriter,
+      });
 
     delete executionContext.activeStepsPath[entry.id];
 

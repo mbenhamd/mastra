@@ -14,11 +14,12 @@ Each execution of a run is identified by its execution generation and its resume
 ## Usage example
 
 ```typescript
+const state = await workflow.getWorkflowRunById(runId)
 const run = await workflow.createRun({ runId })
 const outcome = await run.requestCancel({
   requestId: 'abort-1',
-  expectedExecutionGeneration,
-  expectedLifecycleResumeAttempt,
+  expectedExecutionGeneration: state.executionGeneration,
+  expectedLifecycleResumeAttempt: state.lifecycleResumeAttempt,
 })
 
 if (outcome.status === 'lineage_moved') {
@@ -27,7 +28,7 @@ if (outcome.status === 'lineage_moved') {
 }
 ```
 
-Read the execution to target from the stored run state (`executionGeneration` and `lifecycleResumeAttempt`). A `Run` that's executing the run itself can omit both fields to target its own execution.
+Read the execution to target from `workflow.getWorkflowRunById()`, which returns `executionGeneration`, `lifecycleResumeAttempt` and any stored `cancelRequest`. A `Run` that's executing the run itself can omit both fields to target its own execution.
 
 ## Parameters
 
@@ -88,7 +89,7 @@ Read the execution to target from the stored run state (`executionGeneration` an
 
 ## Abort signal behavior
 
-When the `Run` that sends the request is executing that execution, its steps receive the abort at once. `abortSignal.reason` is a `WorkflowCancelRequestedError`. Other processes stop at their next step. Steps that honor `abortSignal` stop sooner. See [Run.cancel()](./cancel#abort-signal-behavior).
+When the `Run` that sends the request is executing that execution, its steps receive the abort at once. `abortSignal.reason` is a `WorkflowCancelRequestedError`. Other processes stop at their next step, or before a sleep starts. A sleep already in progress finishes first. Steps that honor `abortSignal` stop sooner. See [Run.cancel()](./cancel#abort-signal-behavior).
 
 ## Related
 

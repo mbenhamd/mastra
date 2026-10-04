@@ -392,6 +392,11 @@ export interface WorkflowState {
 
   // Execution State
   status: WorkflowRunStatus;
+  /** Execution lineage the stored run belongs to; `Run.requestCancel()` targets it. */
+  executionGeneration?: string;
+  lifecycleResumeAttempt?: number;
+  /** Cancel request recorded by `Run.requestCancel()`, if any. */
+  cancelRequest?: WorkflowCancelRequestV1;
   initialState?: Record<string, any>;
   stepExecutionPath?: string[];
   // Optional detailed fields (can be excluded for performance)

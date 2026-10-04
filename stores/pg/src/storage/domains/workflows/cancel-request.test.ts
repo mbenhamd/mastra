@@ -111,13 +111,19 @@ describe('Run.requestCancel() on PostgreSQL', () => {
     const execution = ownerRun.start({ inputData: { topic: 'aspirin' } });
     await probe.stageOneStarted.promise;
 
+    // The public run state names the execution to target.
+    const observed = await controller.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] });
     const remoteRun = await controller.workflow.createRun({ runId: ownerRun.runId });
     const outcome = await remoteRun.requestCancel({
       requestId: 'abort-op-1',
-      ...(await lineageOf(controller.storage, ownerRun.runId)),
+      expectedExecutionGeneration: observed!.executionGeneration!,
+      expectedLifecycleResumeAttempt: observed!.lifecycleResumeAttempt!,
     });
     expect(outcome.status).toBe('requested');
-    expect((await loadSnapshot(owner.storage, ownerRun.runId))?.status).toBe('running');
+    expect(await owner.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] })).toMatchObject({
+      status: 'running',
+      cancelRequest: { requestId: 'abort-op-1' },
+    });
 
     probe.releaseStageOne.resolve();
     const result = await execution;
