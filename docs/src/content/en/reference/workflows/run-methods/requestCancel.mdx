@@ -15,11 +15,15 @@ Each execution of a run is identified by its execution generation and its resume
 
 ```typescript
 const state = await workflow.getWorkflowRunById(runId)
+if (state?.executionGeneration === undefined) {
+  throw new Error(`Workflow run ${runId} was not found or has no execution to cancel`)
+}
+
 const run = await workflow.createRun({ runId })
 const outcome = await run.requestCancel({
   requestId: 'abort-1',
   expectedExecutionGeneration: state.executionGeneration,
-  expectedLifecycleResumeAttempt: state.lifecycleResumeAttempt,
+  expectedLifecycleResumeAttempt: state.lifecycleResumeAttempt ?? 0,
 })
 
 if (outcome.status === 'lineage_moved') {
