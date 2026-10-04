@@ -2,28 +2,28 @@
 '@mastra/core': minor
 ---
 
-Added pre-admission grant revocation and closed two gaps in native terminal handoff for Harness `message()` turns.
+Added a way to cancel a Harness `message()` turn before it starts, and fixed two cases where a turn could run or end in the wrong state.
 
-**Revoke a grant before it is admitted.** `HarnessStorage.revokeTerminalGrant()` fences a grant without knowing how its turn would be admitted. When the grant is already admitted, it returns `{ status: 'admitted', admission }` and changes nothing. Otherwise it writes a durable tombstone and returns `revoked` (or `duplicate` when one exists). A later `message()` with that grant then rejects with `HarnessTerminalHandoffCancelledError` before the provider is called. While the session's lease is live, the refusal settles the turn's reservation with `harness.terminal_cancelled` in the same step, so the turn neither blocks closing the session nor is later reported as interrupted. Check `supportsTerminalGrantRevocation` before calling it.
+**Cancel a turn before it starts.** Call `revokeTerminalGrant()` on the harness storage. A later `message()` with that grant fails with `HarnessTerminalHandoffCancelledError` and never calls the model. If the turn already started, nothing changes and you get `{ status: 'admitted' }` back. Check `supportsTerminalGrantRevocation` first.
 
 ```ts
-const sessions = store.stores.harness!;
-if (sessions.supportsTerminalGrantRevocation) {
-  const receipt = await sessions.revokeTerminalGrant({
+const harnessStorage = store.stores.harness!;
+if (harnessStorage.supportsTerminalGrantRevocation) {
+  const result = await harnessStorage.revokeTerminalGrant({
     harnessName: 'default',
     sessionId,
     admissionId,
     executionGrant: { key: grantKey, generation: 1 },
-    reason: { code: 'turn_released', message: 'released before admission' },
+    reason: { code: 'turn_released', message: 'released before it started' },
   });
-  if (receipt.status === 'admitted') {
-    // The turn was admitted: settle it through its terminal intent instead.
+  if (result.status === 'admitted') {
+    // The turn already started: handle it when it finishes.
   }
 }
 ```
 
-**Dispatch is fenced on the session lease.** `compareAndSwapSignalDispatch` accepts an optional `leaseOwner`. Harness passes it when it marks a `message()` turn as dispatching, so a process whose session another process adopted can no longer dispatch that turn: `message()` rejects with `HarnessSessionLockedError` (or `HarnessSessionClosedError`) and the provider is not called. The last check of the dispatch claim now runs immediately before the provider is called. One window remains: a process that pauses between that check and the provider request for longer than what remains of the dispatch claim (at most 30 seconds) can still call the provider after another process interrupted the turn.
+**Fixed: a process that lost its session could still start a turn.** When another process takes over a session, the old process can no longer start that session's pending turn. `message()` fails with `HarnessSessionLockedError` or `HarnessSessionClosedError`, and the model is not called. One case remains: a process that freezes for longer than the rest of its 30-second start window, right before the model call, can still call the model once.
 
-**A rejected provider run settles as failed.** When the run of a native terminal turn ends with a provider or agent error, Harness now commits a durable `failed` terminal result and its delivery intent instead of leaving the turn pending. `onTerminalCommit` receives the receipt, and `message()` rejects with the run's error, redacted as for any failed run. A same-admission retry does not call the provider again and receives the same receipt, and adopting the session after a restart no longer reports the turn as interrupted. A failure whose outcome is unknown, such as a stream that ended without reporting an error or a terminal commit that failed, stays pending as before; a same-admission retry in the same process can still commit it. Aborting or deleting the session while that commit is stalled releases `message()` as it does for a completed run.
+**Fixed: a turn whose model call failed stayed pending.** When the model or agent reports an error, the turn now ends as `failed`, and `onTerminalCommit` receives the result. A retry of the same turn does not call the model again. After a restart, the turn is no longer reported as interrupted.
 
-Custom storage adapters that support terminal handoff or dispatch recovery must honor the `leaseOwner` precondition of `compareAndSwapSignalDispatch`.
+Custom harness storage adapters that support terminal handoff or dispatch recovery must honor the new `leaseOwner` option of `compareAndSwapSignalDispatch`.

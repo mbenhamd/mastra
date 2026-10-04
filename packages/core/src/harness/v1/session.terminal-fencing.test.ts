@@ -479,10 +479,13 @@ describe('rejected provider runs commit a durable failed terminal', () => {
         );
       await entered;
       session.abort();
+      let raceTimer: ReturnType<typeof setTimeout> | undefined;
       const outcome = await Promise.race([
         settled,
-        new Promise<'still-waiting'>(resolve => setTimeout(() => resolve('still-waiting'), 2_000)),
-      ]);
+        new Promise<'still-waiting'>(resolve => {
+          raceTimer = setTimeout(() => resolve('still-waiting'), 2_000);
+        }),
+      ]).finally(() => clearTimeout(raceTimer));
       expect(outcome).toMatchObject({
         ok: false,
         err: { name: 'HarnessTerminalHandoffError:harness.terminal_pending' },
