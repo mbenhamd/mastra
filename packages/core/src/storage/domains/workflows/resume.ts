@@ -537,13 +537,18 @@ export function persistWorkflowStepUpdateRecord(
   const retainedMetadata = Object.fromEntries(
     Object.entries(existing).filter(([key]) => !(key in proposed) && !WORKFLOW_STATE_RUNTIME_KEYS.has(key)),
   );
+  // A cancel request is written only by `Run.requestCancel()` through a
+  // lineage compare-and-set. Step writes neither add nor drop it, so the
+  // executing engine can still observe it at its next boundary.
+  const { cancelRequest: _proposedCancelRequest, ...proposedState } = proposed;
   const snapshot = materialize({
-    ...proposed,
+    ...proposedState,
     ...retainedMetadata,
     resourceId: existing.resourceId ?? proposed.resourceId ?? input.resourceId,
     resumeCheckpoint: existing.resumeCheckpoint,
     resumeResultReceipt: existing.resumeResultReceipt,
     resumeRollbackReceipt: existing.resumeRollbackReceipt,
+    ...(existing.cancelRequest === undefined ? {} : { cancelRequest: existing.cancelRequest }),
   });
   return persistedStepUpdate(
     snapshot,
@@ -835,6 +840,10 @@ export function finalizeWorkflowResumeRecord(
   }
   delete snapshot.resumeCheckpoint;
   delete snapshot.resumeRollbackReceipt;
+  // The finalized state comes from the checkpoint or the supplied snapshot;
+  // keep a cancel request recorded since admission rather than erase it.
+  delete snapshot.cancelRequest;
+  if (existing.cancelRequest !== undefined) snapshot.cancelRequest = existing.cancelRequest;
   if (TERMINAL_STATUSES.has(snapshot.status)) {
     snapshot.suspendedPaths = {};
     snapshot.resumeLabels = {};

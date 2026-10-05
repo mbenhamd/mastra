@@ -5919,6 +5919,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         status_present: boolean;
         execution_generation_json: string | null;
         execution_generation_present: boolean;
+        cancel_request_json: string | null;
+        cancel_request_present: boolean;
       }>(
         `SELECT jsonb_typeof(snapshot.snapshot) AS snapshot_type,
                 CASE WHEN jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'status'
@@ -5926,7 +5928,10 @@ export class WorkflowsPG extends WorkflowsStorage {
                 jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'status' AS status_present,
                 CASE WHEN jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'executionGeneration'
                   THEN (snapshot.snapshot->'executionGeneration')::text END AS execution_generation_json,
-                jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'executionGeneration' AS execution_generation_present
+                jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'executionGeneration' AS execution_generation_present,
+                CASE WHEN jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'cancelRequest'
+                  THEN (snapshot.snapshot->'cancelRequest')::text END AS cancel_request_json,
+                jsonb_typeof(snapshot.snapshot) = 'object' AND snapshot.snapshot ? 'cancelRequest' AS cancel_request_present
          FROM ${this.workflowSnapshotTableName()} AS snapshot
          WHERE workflow_name = $1 AND run_id = $2`,
         [workflowName, runId],
@@ -5942,6 +5947,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         ...(row.execution_generation_present
           ? { executionGeneration: parseProjectedJson(row.execution_generation_json) }
           : {}),
+        ...(row.cancel_request_present ? { cancelRequest: parseProjectedJson(row.cancel_request_json) } : {}),
       } as WorkflowExecutionState;
     } catch (error) {
       throw new MastraError(

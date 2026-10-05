@@ -1,0 +1,102 @@
+---
+title: 'Reference: Run.requestCancel() | Workflows'
+description: 'The .requestCancel() method asks one specific execution of a workflow run to stop, from any process, without affecting a later execution.'
+packages:
+  - '@mastra/core'
+---
+
+# Run.requestCancel()
+
+The `.requestCancel()` method asks one execution of a workflow run to stop. Use it when the run may be executing in another process, or when a late cancellation must not stop a run that was restarted or resumed in the meantime. For a run that your process owns and that can't be restarted or resumed concurrently, [`Run.cancel()`](./cancel) is simpler.
+
+Each execution of a run is identified by its execution generation and its resume attempt. A request names one of them and is stored with the run. The request is written only while that execution still owns the run. The process executing the run stops at its next step and marks the run `canceled`. `restart()` and `resume()` mark a run with a request as `canceled` instead of running it.
+
+## Usage example
+
+```typescript
+const state = await workflow.getWorkflowRunById(runId)
+if (state?.executionGeneration === undefined) {
+  throw new Error(`Workflow run ${runId} was not found or has no execution to cancel`)
+}
+
+const run = await workflow.createRun({ runId })
+const outcome = await run.requestCancel({
+  requestId: 'abort-1',
+  expectedExecutionGeneration: state.executionGeneration,
+  expectedLifecycleResumeAttempt: state.lifecycleResumeAttempt ?? 0,
+})
+
+if (outcome.status === 'lineage_moved') {
+  // The run restarted or resumed after you read it. Read it again and
+  // send a new request for the execution you now see.
+}
+```
+
+Read the execution to target from `workflow.getWorkflowRunById()`, which returns `executionGeneration`, `lifecycleResumeAttempt` and any stored `cancelRequest`. A `Run` that's executing the run itself can omit both fields to target its own execution.
+
+## Parameters
+
+<PropertiesTable
+  content={[
+  {
+    name: 'requestId',
+    type: 'string',
+    description:
+      'Identifier stored with the request, for example the ID of the user action that asked to stop the run.',
+    isOptional: false,
+  },
+  {
+    name: 'expectedExecutionGeneration',
+    type: 'string',
+    description:
+      'Execution generation the request targets. Pass it together with `expectedLifecycleResumeAttempt`, or omit both to target the execution this `Run` is running.',
+    isOptional: true,
+  },
+  {
+    name: 'expectedLifecycleResumeAttempt',
+    type: 'number',
+    description: 'Resume attempt the request targets. Pass it together with `expectedExecutionGeneration`.',
+    isOptional: true,
+  },
+]}
+/>
+
+## Returns
+
+<PropertiesTable
+  content={[
+  {
+    name: 'outcome',
+    type: 'Promise<WorkflowCancelRequestOutcome>',
+    description: 'The result of the request. Check `status` to see what happened.',
+  },
+]}
+/>
+
+| `status` | Meaning |
+| - | - |
+| `requested` | The request is stored. The run stays `running` until the process executing it reaches its next step, or until `restart()` picks it up. Read the run afterwards: it can still finish another way if the request arrived after its last step. |
+| `already_requested` | That execution already has a request. The stored request is returned and kept. |
+| `canceled` | The run was pending, suspended or paused, and no process was executing it, so it was canceled immediately. |
+| `terminal` | The run had already finished. `runStatus` holds its status. |
+| `lineage_moved` | A restart or resume created a newer execution. Nothing was written. The current `executionGeneration` and `lifecycleResumeAttempt` are returned. |
+| `not_found` | The run doesn't exist in storage. |
+
+## Errors
+
+`requestCancel()` throws when:
+
+- The workflow uses an engine other than the default engine.
+- The storage adapter can't store the request reliably. In-memory, PostgreSQL and LibSQL storage are supported.
+- The run is a transient run.
+- The inputs are invalid, or the `Run` has no execution of its own and no execution was named.
+
+## Abort signal behavior
+
+When the `Run` that sends the request is executing that execution, its steps receive the abort at once. `abortSignal.reason` is a `WorkflowCancelRequestedError`. Other processes stop at their next step, or before a sleep starts. A sleep already in progress finishes first. Steps that honor `abortSignal` stop sooner. See [Run.cancel()](./cancel#abort-signal-behavior).
+
+## Related
+
+- [Run.cancel()](./cancel)
+- [Run.restart()](./restart)
+- [Run.resume()](./resume)

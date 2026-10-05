@@ -71,6 +71,15 @@ import type { Tool } from '../tools/tool';
 import { isMastraTool } from '../tools/toolchecks';
 import type { ToolExecutionContext } from '../tools/types';
 import type { DynamicArgument } from '../types';
+import {
+  WORKFLOW_CANCEL_REQUEST_EXECUTING_STATUSES,
+  WorkflowCancelRequestedError,
+  commitWorkflowLineageCancellation,
+  isTerminalWorkflowRunStatus,
+  markDurableCancelCommitted,
+  workflowCancelRequestFor,
+} from './cancel-request';
+import type { WorkflowCancelRequestInput, WorkflowCancelRequestOutcome } from './cancel-request';
 import { PROCESSOR_EXECUTION_SYMBOL, PUBSUB_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from './constants';
 import { DefaultExecutionEngine } from './default';
 import { getAdmittedJsonSchema } from './dynamic/admitted-schema-source';
@@ -122,6 +131,7 @@ import type {
   StreamEvent,
   SubsetOf,
   TimeTravelContext,
+  WorkflowCancelRequestV1,
   WorkflowConfig,
   WorkflowEngineType,
   WorkflowOptions,
@@ -3855,6 +3865,13 @@ export class Workflow<
 
       // Execution state
       status: snapshotState.status,
+      ...(snapshotState.executionGeneration === undefined
+        ? {}
+        : {
+            executionGeneration: snapshotState.executionGeneration,
+            lifecycleResumeAttempt: snapshotState.lifecycleResumeAttempt ?? 0,
+          }),
+      ...(snapshotState.cancelRequest === undefined ? {} : { cancelRequest: snapshotState.cancelRequest }),
       initialState: Object.keys(snapshotState.value).length > 0 ? snapshotState.value : undefined,
       result: includeAllFields || fieldsSet.has('result') ? snapshotState.result : undefined,
       error: includeAllFields || fieldsSet.has('error') ? snapshotState.error : undefined,
@@ -3895,6 +3912,33 @@ export class Workflow<
 /**
  * Represents a workflow run that can be executed
  */
+
+/**
+ * Rebuilds the public result fields a live run would have returned from a
+ * persisted snapshot, for operations that settle a run without executing it.
+ */
+function reconstructWorkflowResultBase<TState, TInput>(snapshot: WorkflowRunState, runId: string) {
+  // Match fmtReturnValue: context keeps `input` alongside step results, and `input`
+  // is also surfaced as a top-level field on the returned WorkflowResult.
+  const hydratedSteps = hydrateSerializedStepErrors({ ...(snapshot.context ?? {}) }) ?? {};
+  // Strip internal bookkeeping (__state, metadata.nestedRunId) from step results so the
+  // reconstructed result matches what a live run would have returned via fmtReturnValue.
+  const steps = Object.fromEntries(
+    Object.entries(hydratedSteps).map(([stepId, stepResult]) => [stepId, cleanStepResult(stepResult)]),
+  ) as typeof hydratedSteps;
+  const input = (snapshot.context as { input?: TInput } | undefined)?.input as TInput;
+  return {
+    steps,
+    input,
+    runId,
+    ...(snapshot.value && Object.keys(snapshot.value).length > 0 ? { state: snapshot.value as TState } : {}),
+    ...(snapshot.stepExecutionPath ? { stepExecutionPath: snapshot.stepExecutionPath } : {}),
+    ...(snapshot.resumeLabels ? { resumeLabels: snapshot.resumeLabels } : {}),
+  };
+}
+
+/** Compare-and-set rounds `Run.requestCancel()` spends before reporting contention. */
+const WORKFLOW_CANCEL_REQUEST_CAS_ATTEMPTS = 5;
 
 export class Run<
   TEngineType = DefaultEngineType,
@@ -4424,6 +4468,7 @@ export class Run<
               lifecycleResumeAttempt: canceled.lifecycleResumeAttempt ?? 0,
             };
             this.abortController.abort();
+            markDurableCancelCommitted(this.abortController.signal);
             this.workflowRunStatus = 'canceled';
           }
           return;
@@ -4454,6 +4499,9 @@ export class Run<
 
     // Abort any running execution and update in-memory status
     cancellationController.abort();
+    // A cancel request may have aborted this execution first; the durable
+    // cancellation committed above now owns the outcome.
+    if (workflowsStore) markDurableCancelCommitted(cancellationController.signal);
     this.workflowRunStatus = 'canceled';
 
     // A step may ignore abortSignal and never unwind through the engine, so
@@ -4488,6 +4536,275 @@ export class Run<
     if (this.transientExecution && !this.hasActiveLifecycleExecution(executionGeneration)) {
       this.cleanup?.();
     }
+  }
+
+  /**
+   * Durably requests cancellation of one execution lineage.
+   *
+   * `cancel()` cancels whatever lineage storage holds when it loads the run,
+   * so a delayed call can land on a successor. `requestCancel()` names its
+   * lineage — this handle's active execution, or the generation and resume
+   * attempt the caller observed — and writes with a compare-and-set on status,
+   * generation and attempt, so a successor is never touched.
+   *
+   * A running or waiting lineage records the request and keeps its status.
+   * The engine executing it, in this process or another, commits `canceled`
+   * at its next step boundary; when this handle executes the lineage its abort
+   * signal also fires at once. `restart()` and `resume()` commit `canceled`
+   * instead of executing a lineage that carries a request, so a request
+   * outlives the process that owned the execution. A pending, suspended or
+   * paused lineage that no engine executes is canceled immediately.
+   *
+   * Supported on the default engine with workflow storage that applies
+   * compare-and-set updates and fenced step writes (in-memory, PostgreSQL,
+   * LibSQL), where step writes cannot drop the request.
+   */
+  async requestCancel(input: WorkflowCancelRequestInput): Promise<WorkflowCancelRequestOutcome> {
+    try {
+      return await this.recordCancelRequest(input);
+    } finally {
+      // A handle created only to send the request never executes, so nothing
+      // else would release it from the workflow's run cache.
+      if (!this.isExecutingLifecycle()) this.cleanup?.();
+    }
+  }
+
+  /** True while this handle executes, or has claimed in start(), its current lineage. */
+  private isExecutingLifecycle(): boolean {
+    return (
+      this.#executionGeneration !== undefined &&
+      (this.hasActiveLifecycleExecution(this.#executionGeneration) || this.workflowRunStatus === 'running')
+    );
+  }
+
+  private async recordCancelRequest(input: WorkflowCancelRequestInput): Promise<WorkflowCancelRequestOutcome> {
+    const { requestId, expectedExecutionGeneration, expectedLifecycleResumeAttempt } = input;
+    if (typeof requestId !== 'string' || requestId.length === 0) {
+      throw new TypeError('requestCancel() requires a non-empty requestId');
+    }
+    if ((expectedExecutionGeneration === undefined) !== (expectedLifecycleResumeAttempt === undefined)) {
+      throw new TypeError(
+        'requestCancel() takes expectedExecutionGeneration and expectedLifecycleResumeAttempt together, or neither',
+      );
+    }
+    if (
+      expectedExecutionGeneration !== undefined &&
+      (typeof expectedExecutionGeneration !== 'string' || expectedExecutionGeneration.length === 0)
+    ) {
+      throw new TypeError('requestCancel() requires a non-empty expectedExecutionGeneration');
+    }
+    if (
+      expectedLifecycleResumeAttempt !== undefined &&
+      (!Number.isSafeInteger(expectedLifecycleResumeAttempt) || expectedLifecycleResumeAttempt < 0)
+    ) {
+      throw new TypeError('requestCancel() requires a non-negative integer expectedLifecycleResumeAttempt');
+    }
+    if (this.transientExecution) throw new Error('Transient workflow runs cannot record a cancel request');
+    // Other engines notify their own runtime on cancel() and do not read the
+    // request at their step boundaries.
+    if (this.workflowEngineType !== 'default' || !(this.executionEngine instanceof DefaultExecutionEngine)) {
+      throw new Error(`requestCancel() is not supported on ${this.workflowEngineType} workflows`);
+    }
+    const executionGeneration = expectedExecutionGeneration ?? this.#executionGeneration;
+    const lifecycleResumeAttempt = expectedLifecycleResumeAttempt ?? this.#lifecycleResumeAttempt;
+    if (!executionGeneration) {
+      throw new Error(
+        `Workflow run ${this.workflowId}/${this.runId} has no execution lineage on this handle; ` +
+          'pass expectedExecutionGeneration and expectedLifecycleResumeAttempt',
+      );
+    }
+    const workflowsStore = await this.#mastra?.getStorage()?.getStore('workflows');
+    // A store whose step writes replace the whole snapshot could drop a
+    // request written between its load and its write.
+    if (
+      !workflowsStore?.supportsConcurrentUpdates() ||
+      workflowsStore.getWorkflowResumeCapabilities()?.fencedStepUpdateVersion !== 1
+    ) {
+      throw new Error('requestCancel() requires workflow storage with compare-and-set updates and fenced step writes');
+    }
+    const lineage = { executionGeneration, lifecycleResumeAttempt };
+    // start() persists `running` only once its first step starts, so a run
+    // whose execution this handle has begun can still read `pending`. That
+    // includes the onStart preflight, after start() claimed the lineage and
+    // before the engine is entered.
+    const executedHere = () =>
+      this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt) &&
+      (this.hasActiveLifecycleExecution(executionGeneration) || this.workflowRunStatus === 'running');
+
+    // Each failed compare-and-set means the row changed under this call; the
+    // next read reports where it went.
+    for (let attempt = 0; attempt < WORKFLOW_CANCEL_REQUEST_CAS_ATTEMPTS; attempt++) {
+      const snapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: this.workflowId, runId: this.runId });
+      if (!snapshot) return { status: 'not_found' };
+      if (
+        snapshot.executionGeneration !== executionGeneration ||
+        (snapshot.lifecycleResumeAttempt ?? 0) !== lifecycleResumeAttempt
+      ) {
+        return {
+          status: 'lineage_moved',
+          executionGeneration: snapshot.executionGeneration,
+          lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
+        };
+      }
+      if (isTerminalWorkflowRunStatus(snapshot.status)) return { status: 'terminal', runStatus: snapshot.status };
+
+      const executing =
+        WORKFLOW_CANCEL_REQUEST_EXECUTING_STATUSES.includes(snapshot.status) ||
+        (snapshot.status === 'pending' && executedHere());
+      if (executing) {
+        const existing = workflowCancelRequestFor(snapshot.cancelRequest, lineage);
+        if (existing) {
+          this.abortLocalLineageForRequest(existing);
+          return { status: 'already_requested', cancelRequest: existing };
+        }
+        const cancelRequest: WorkflowCancelRequestV1 = {
+          version: 1,
+          requestId,
+          executionGeneration,
+          lifecycleResumeAttempt,
+          requestedAt: Date.now(),
+        };
+        const written = await workflowsStore.updateWorkflowState({
+          workflowName: this.workflowId,
+          runId: this.runId,
+          opts: {
+            cancelRequest,
+            expectedStatus: snapshot.status,
+            expectedExecutionGeneration: executionGeneration,
+            expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
+          },
+        });
+        if (!written) continue;
+        // A local execution that ended before its first write leaves the run
+        // pending, where nothing would observe the request; cancel it instead.
+        if (snapshot.status === 'pending' && !executedHere()) continue;
+        this.abortLocalLineageForRequest(cancelRequest);
+        return { status: 'requested', cancelRequest };
+      }
+
+      const canceled = await commitWorkflowLineageCancellation({
+        workflowsStore,
+        workflowName: this.workflowId,
+        runId: this.runId,
+        expectedStatus: snapshot.status,
+        executionGeneration,
+        lifecycleResumeAttempt,
+      });
+      if (!canceled) continue;
+      await this.settleCommittedLineageCancellation(lineage);
+      return { status: 'canceled' };
+    }
+    throw new Error(
+      `Workflow run ${this.workflowId}/${this.runId} changed on every cancel request attempt; read it again before retrying`,
+    );
+  }
+
+  /**
+   * Fires this handle's abort signal when it is executing the requested
+   * lineage, or has claimed it in start()'s onStart preflight.
+   */
+  private abortLocalLineageForRequest(cancelRequest: WorkflowCancelRequestV1): void {
+    if (
+      this.isCurrentLifecycleAttempt(cancelRequest.executionGeneration, cancelRequest.lifecycleResumeAttempt) &&
+      (this.hasActiveLifecycleExecution(cancelRequest.executionGeneration) || this.workflowRunStatus === 'running')
+    ) {
+      this.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
+    }
+  }
+
+  /**
+   * Local bookkeeping after this handle committed `canceled` for a lineage it
+   * was not executing, mirroring `cancel()`: an engine this handle starts on
+   * that lineage later treats the cancellation as its own, and the terminal
+   * lifecycle sequence is published when no local engine will publish it.
+   */
+  private async settleCommittedLineageCancellation(lineage: {
+    executionGeneration: string;
+    lifecycleResumeAttempt: number;
+  }): Promise<void> {
+    const { executionGeneration, lifecycleResumeAttempt } = lineage;
+    if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
+      this.#admittedCancellation = { executionGeneration, lifecycleResumeAttempt };
+      this.abortController.abort();
+      this.workflowRunStatus = 'canceled';
+    }
+    if (this.hasActiveLifecycleExecution(executionGeneration)) return;
+    try {
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.pubsub,
+        workflowId: this.workflowId,
+        runId: this.runId,
+        executionGeneration,
+        event: { type: 'workflow.canceled', resumeAttempt: lifecycleResumeAttempt },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.pubsub,
+        workflowId: this.workflowId,
+        runId: this.runId,
+        executionGeneration,
+        event: { type: 'workflow.finished', resumeAttempt: lifecycleResumeAttempt, status: 'canceled' },
+      });
+    } catch {
+      // Cancellation is already durable. Lifecycle delivery remains
+      // best-effort when the configured transport is unavailable.
+    }
+  }
+
+  /**
+   * `restart()` and `resume()` honour a cancel request recorded for the
+   * lineage they would otherwise execute: they commit `canceled` with the
+   * lineage compare-and-set and return the canceled result. When that
+   * compare-and-set loses because the lineage's own engine already honoured
+   * the request, the stored cancellation is returned. Returns undefined when
+   * the snapshot carries no request for its own lineage, or when the row moved
+   * on otherwise — the caller's own claim then fails as it always has.
+   */
+  private async commitRequestedCancellationInsteadOfExecuting(
+    workflowsStore: WorkflowsStorage | undefined,
+    snapshot: WorkflowRunState,
+  ): Promise<WorkflowResult<TState, TInput, TOutput, TSteps> | undefined> {
+    if (
+      !workflowsStore?.supportsConcurrentUpdates() ||
+      !snapshot.executionGeneration ||
+      isTerminalWorkflowRunStatus(snapshot.status)
+    ) {
+      return undefined;
+    }
+    const lineage = {
+      executionGeneration: snapshot.executionGeneration,
+      lifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
+    };
+    if (!workflowCancelRequestFor(snapshot.cancelRequest, lineage)) return undefined;
+    const canceled = await commitWorkflowLineageCancellation({
+      workflowsStore,
+      workflowName: this.workflowId,
+      runId: this.runId,
+      expectedStatus: snapshot.status,
+      ...lineage,
+    });
+    let settled: WorkflowRunState | null | undefined = canceled;
+    if (canceled) {
+      await this.settleCommittedLineageCancellation(lineage);
+    } else {
+      settled = await workflowsStore.loadWorkflowSnapshot({ workflowName: this.workflowId, runId: this.runId });
+      if (
+        settled?.status !== 'canceled' ||
+        settled.executionGeneration !== lineage.executionGeneration ||
+        (settled.lifecycleResumeAttempt ?? 0) !== lineage.lifecycleResumeAttempt
+      ) {
+        return undefined;
+      }
+    }
+    // A cached handle can still be executing this lineage in-process; its
+    // engine owns cleanup then.
+    if (!this.hasActiveLifecycleExecution(lineage.executionGeneration)) {
+      this.workflowRunStatus = 'canceled';
+      this.cleanup?.();
+    }
+    return {
+      ...reconstructWorkflowResultBase<TState, TInput>(settled ?? snapshot, this.runId),
+      status: 'canceled',
+    } as unknown as WorkflowResult<TState, TInput, TOutput, TSteps>;
   }
 
   protected hasActiveLifecycleExecution(executionGeneration: string | undefined): boolean {
@@ -5694,6 +6011,16 @@ export class Run<
       throw new Error('This workflow run was not suspended');
     }
 
+    // A cancel request can land while the lineage runs and lose the race with
+    // its suspension; resuming would then execute a lineage asked to stop.
+    const requestedCancellation = await this.commitRequestedCancellationInsteadOfExecuting(workflowsStore, snapshot);
+    if (requestedCancellation) {
+      this.executionResults = Promise.resolve(requestedCancellation);
+      if (!params.isVNext) this.closeStreamAction?.().catch(() => {});
+      this.streamOutput?.updateResults(requestedCancellation);
+      return requestedCancellation;
+    }
+
     const snapshotResumeLabel = params.label ? snapshot?.resumeLabels?.[params.label] : undefined;
     const stepParam = snapshotResumeLabel?.stepId ?? params.step;
 
@@ -5962,23 +6289,7 @@ export class Run<
     // "was not active" behavior — expanding WorkflowResult is out of scope for this fix.
     if (snapshot.status === 'success' || snapshot.status === 'failed' || snapshot.status === 'tripwire') {
       this.cleanup?.();
-      // Match fmtReturnValue: context keeps `input` alongside step results, and `input`
-      // is also surfaced as a top-level field on the returned WorkflowResult.
-      const hydratedSteps = hydrateSerializedStepErrors({ ...(snapshot.context ?? {}) }) ?? {};
-      // Strip internal bookkeeping (__state, metadata.nestedRunId) from step results so the
-      // reconstructed result matches what a live run would have returned via fmtReturnValue.
-      const steps = Object.fromEntries(
-        Object.entries(hydratedSteps).map(([stepId, stepResult]) => [stepId, cleanStepResult(stepResult)]),
-      ) as typeof hydratedSteps;
-      const input = (snapshot.context as { input?: TInput } | undefined)?.input as TInput;
-      const base = {
-        steps,
-        input,
-        runId: this.runId,
-        ...(snapshot.value && Object.keys(snapshot.value).length > 0 ? { state: snapshot.value as TState } : {}),
-        ...(snapshot.stepExecutionPath ? { stepExecutionPath: snapshot.stepExecutionPath } : {}),
-        ...(snapshot.resumeLabels ? { resumeLabels: snapshot.resumeLabels } : {}),
-      };
+      const base = reconstructWorkflowResultBase<TState, TInput>(snapshot, this.runId);
 
       if (snapshot.status === 'success') {
         return { ...base, status: 'success', result: snapshot.result as TOutput } as WorkflowResult<
@@ -6002,6 +6313,11 @@ export class Run<
         TSteps
       >;
     }
+
+    // A cancel request recorded for the stranded lineage is honoured here, so a
+    // restart or recovery sweep never re-executes a run its owner asked to stop.
+    const requestedCancellation = await this.commitRequestedCancellationInsteadOfExecuting(workflowsStore, snapshot);
+    if (requestedCancellation) return requestedCancellation;
 
     const restartData = createRestartExecutionParams({ snapshot, graph: this.executionGraph });
 

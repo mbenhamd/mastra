@@ -7,6 +7,7 @@ import { resolveObservabilityContext } from '../../observability';
 import type { ObservabilityContext } from '../../observability';
 import { WORKFLOW_LIFECYCLE_OUTBOX_LIMIT } from '../../storage/domains/workflows/resume';
 import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
+import { WorkflowCancelRequestedError } from '../cancel-request';
 import type { DefaultExecutionEngine } from '../default';
 import { requireWorkflowExecutionGeneration, workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
 import type { WorkflowLifecycleEvent } from '../lifecycle-events';
@@ -551,6 +552,33 @@ export function prepareStepSnapshot(engine: DefaultExecutionEngine, params: Pers
   })();
 
   return { snapshot, snapshotForPersistence, prunedLifecycleEvents };
+}
+
+/**
+ * Reads durable authority at a boundary that has no other check. Returns true
+ * when the lineage must not continue into the boundary: another owner settled
+ * it or a successor replaced it, or a cancel request targets this exact
+ * lineage, in which case the run is also aborted.
+ */
+async function stopForDurableAuthority(
+  engine: DefaultExecutionEngine,
+  params: {
+    workflowId: string;
+    runId: string;
+    executionContext: ExecutionContext;
+    abortController: AbortController;
+  },
+): Promise<boolean> {
+  const { executionContext } = params;
+  if (executionContext.transientExecution || executionContext.executionGeneration === undefined) return false;
+  const { disposition, cancelRequest } = await engine.readExecutionAuthority({
+    workflowId: params.workflowId,
+    runId: params.runId,
+    executionGeneration: executionContext.executionGeneration,
+    lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+  });
+  if (cancelRequest) params.abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
+  return disposition !== undefined || cancelRequest !== undefined;
 }
 
 export async function persistStepUpdate(
@@ -1123,29 +1151,39 @@ export async function executeEntry(
       });
     }
 
-    await engine.executeSleep({
+    // A lineage that another owner settled, or that a cancel request
+    // targets, does not start the sleep or its dynamic duration function.
+    const sleepStopped = await stopForDurableAuthority(engine, {
       workflowId,
       runId,
-      entry,
-      prevStep,
-      prevOutput,
-      stepResults,
-      serializedStepGraph,
-      resume,
       executionContext,
-      ...observabilityContext,
-      pubsub,
       abortController,
-      requestContext,
-      outputWriter,
     });
+
+    if (!sleepStopped)
+      await engine.executeSleep({
+        workflowId,
+        runId,
+        entry,
+        prevStep,
+        prevOutput,
+        stepResults,
+        serializedStepGraph,
+        resume,
+        executionContext,
+        ...observabilityContext,
+        pubsub,
+        abortController,
+        requestContext,
+        outputWriter,
+      });
 
     delete executionContext.activeStepsPath[entry.id];
 
     // An abort during the sleep must not be overwritten by a success terminal
     // for the sleep entry; upstream fix, kept behind the fork's transient and
     // lifecycle-suppression guards.
-    if (abortController?.signal?.aborted) {
+    if (sleepStopped || abortController?.signal?.aborted) {
       execResults = { status: 'canceled' };
     } else {
       if (!executionContext.transientExecution) {
@@ -1246,29 +1284,39 @@ export async function executeEntry(
       });
     }
 
-    await engine.executeSleepUntil({
+    // A lineage that another owner settled, or that a cancel request
+    // targets, does not start the sleep or its dynamic duration function.
+    const sleepStopped = await stopForDurableAuthority(engine, {
       workflowId,
       runId,
-      entry,
-      prevStep,
-      prevOutput,
-      stepResults,
-      serializedStepGraph,
-      resume,
       executionContext,
-      ...observabilityContext,
-      pubsub,
       abortController,
-      requestContext,
-      outputWriter,
     });
+
+    if (!sleepStopped)
+      await engine.executeSleepUntil({
+        workflowId,
+        runId,
+        entry,
+        prevStep,
+        prevOutput,
+        stepResults,
+        serializedStepGraph,
+        resume,
+        executionContext,
+        ...observabilityContext,
+        pubsub,
+        abortController,
+        requestContext,
+        outputWriter,
+      });
 
     delete executionContext.activeStepsPath[entry.id];
 
     // An abort during the sleep must not be overwritten by a success terminal
     // for the sleep entry; upstream fix, kept behind the fork's transient and
     // lifecycle-suppression guards.
-    if (abortController?.signal?.aborted) {
+    if (sleepStopped || abortController?.signal?.aborted) {
       execResults = { status: 'canceled' };
     } else {
       if (!executionContext.transientExecution) {

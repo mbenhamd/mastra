@@ -1020,6 +1020,7 @@ const sidebars = {
           label: 'Run Methods',
           items: [
             { type: 'doc', id: 'workflows/run-methods/cancel', label: '.cancel()' },
+            { type: 'doc', id: 'workflows/run-methods/requestCancel', label: '.requestCancel()' },
             { type: 'doc', id: 'workflows/run-methods/restart', label: '.restart()' },
             { type: 'doc', id: 'workflows/run-methods/resume', label: '.resume()' },
             { type: 'doc', id: 'workflows/run-methods/start', label: '.start()' },

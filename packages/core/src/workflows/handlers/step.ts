@@ -17,6 +17,7 @@ import { executeWithContext } from '../../observability/utils';
 import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
 import { ToolStream } from '../../tools/stream';
 import type { DynamicArgument } from '../../types';
+import { WorkflowCancelRequestedError } from '../cancel-request';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
 import {
@@ -36,6 +37,7 @@ import type {
   StepExecutionResult,
   StepResult,
   TimeTravelExecutionParams,
+  WorkflowCancelRequestV1,
   WorkflowRunStatus,
 } from '../types';
 import {
@@ -281,12 +283,23 @@ export async function executeStep(
       phase: 'start',
     });
     // A start write can be acknowledged after another worker cancels the run.
-    // Recheck before emitting the start event or entering user step code.
-    const startDisposition =
-      startPersist && startPersist.status !== 'persisted' && startPersist.status !== 'protected_state'
-        ? (startPersist.disposition ?? 'canceled')
-        : await engine.getAuthoritativeExecutionDisposition({ workflowId, runId, executionGeneration });
-    if (startDisposition) {
+    // Recheck before emitting the start event or entering user step code. A
+    // durable cancel request for this lineage stops here too, so loop
+    // iterations and later steps honour it before running user code.
+    let startDisposition: WorkflowRunStatus | 'superseded' | undefined;
+    let cancelRequest: WorkflowCancelRequestV1 | undefined;
+    if (startPersist && startPersist.status !== 'persisted' && startPersist.status !== 'protected_state') {
+      startDisposition = startPersist.disposition ?? 'canceled';
+    } else {
+      ({ disposition: startDisposition, cancelRequest } = await engine.readExecutionAuthority({
+        workflowId,
+        runId,
+        executionGeneration,
+        lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
+      }));
+    }
+    if (cancelRequest) abortController.abort(new WorkflowCancelRequestedError(cancelRequest));
+    if (startDisposition || cancelRequest) {
       delete executionContext.activeStepsPath[step.id];
       const canceledStepResult = {
         ...omitPriorCompletionFields(stepInfo),
