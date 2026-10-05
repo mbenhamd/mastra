@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { projectHarnessPublicError } from '../../../harness/v1/events';
 import { InMemoryDB } from '../inmemory-db';
 import {
+  HarnessStorageLeaseConflictError,
+  HarnessStorageSessionClosedError,
   HarnessTerminalHandoffClaimConflictError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
@@ -1161,5 +1163,221 @@ describe('native chat terminal handoff', () => {
     // still creates the fence (not a `duplicate` against phantom evidence).
     await expect(storage.cancelTerminalHandoff(cancel)).resolves.toMatchObject({ status: 'cancelled' });
     await expect(storage.cancelTerminalHandoff(cancel)).resolves.toMatchObject({ status: 'duplicate' });
+  });
+
+  describe('pre-admission grant revocation', () => {
+    const revocation = (input: HarnessTerminalAdmissionInput) => ({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      admissionId: input.admissionId,
+      executionGrant: input.executionGrant,
+      reason: { code: 'doxa.turn_released', message: 'released before admission' },
+    });
+
+    it('fences a grant that was never admitted, so its late admission is cancelled', async () => {
+      const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+      expect(storage.supportsTerminalGrantRevocation).toBe(true);
+      await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+      const input = admission();
+
+      const revoked = await storage.revokeTerminalGrant({ ...revocation(input), revokedAt: 2_050 });
+      expect(revoked).toMatchObject({ status: 'revoked', grant: input.executionGrant, revokedAt: 2_050 });
+      await expect(storage.revokeTerminalGrant({ ...revocation(input), revokedAt: 2_060 })).resolves.toEqual({
+        ...revoked,
+        status: 'duplicate',
+      });
+
+      // The owner reserves and admits after the revocation: the admission is
+      // refused and nothing is admitted.
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      await expect(storage.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'cancelled' });
+      await expect(
+        storage.loadTerminalAdmission({
+          harnessName: input.harnessName,
+          sessionId: input.sessionId,
+          admissionId: input.admissionId,
+          executionGrant: input.executionGrant,
+        }),
+      ).resolves.toBeNull();
+      // A cancel that later learns the admission identity finds the same fence.
+      await expect(
+        storage.cancelTerminalHandoff({
+          harnessName: input.harnessName,
+          sessionId: input.sessionId,
+          sessionIncarnation: input.sessionIncarnation,
+          admissionId: input.admissionId,
+          admissionHash: input.admissionHash,
+          executionGrant: input.executionGrant,
+          reason: { code: 'cancelled', message: 'stop' },
+        }),
+      ).resolves.toMatchObject({ status: 'duplicate', tombstoneId: revoked.tombstoneId });
+    });
+
+    it("settles the lease holder's undispatched reservation in the same step that refuses the grant", async () => {
+      const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+      await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+      await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 30_000 });
+      const input = admission();
+      await storage.revokeTerminalGrant(revocation(input));
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      const load = () =>
+        storage.loadMessageResultEvidence({
+          harnessName: input.harnessName,
+          sessionId: input.sessionId,
+          resourceId: input.resourceId,
+          threadId: input.threadId,
+          signalId: input.signalId,
+        });
+
+      // Without the lease fence nothing is settled.
+      await expect(storage.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'cancelled' });
+      await expect(load()).resolves.toMatchObject({ status: 'pending' });
+      await expect(storage.admitTerminalHandoff(input, { leaseOwner: { ownerId: 'owner-1' } })).resolves.toMatchObject({
+        status: 'cancelled',
+      });
+      await expect(load()).resolves.toMatchObject({
+        status: 'failed',
+        error: { code: 'harness.terminal_cancelled' },
+      });
+    });
+
+    it('returns an existing admission unchanged instead of revoking it', async () => {
+      const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+      await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+      const input = admission();
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      const admitted = await storage.admitTerminalHandoff(input);
+
+      await expect(storage.revokeTerminalGrant(revocation(input))).resolves.toMatchObject({
+        status: 'admitted',
+        admission: admitted.admission,
+      });
+      // No tombstone was written: the admitted turn still commits.
+      const committed = await storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'completed', result: { text: 'ok' }, updatedAt: 3_000 },
+        terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+        projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} },
+      });
+      expect(committed.status).toBe('committed');
+      await expect(storage.revokeTerminalGrant(revocation(input))).resolves.toMatchObject({
+        status: 'admitted',
+        admission: { status: 'committed' },
+      });
+
+      // The grant is bound to that admission: a revocation naming another
+      // admission or session conflicts instead of minting a fence.
+      await expect(
+        storage.revokeTerminalGrant({ ...revocation(input), admissionId: 'admission-foreign' }),
+      ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
+      await expect(
+        storage.revokeTerminalGrant({ ...revocation(input), sessionId: 'session-foreign' }),
+      ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
+    });
+
+    it('rejects a malformed revocation without minting a fence', async () => {
+      const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+      const input = admission();
+      await expect(storage.revokeTerminalGrant({ ...revocation(input), admissionId: '' })).rejects.toBeInstanceOf(
+        HarnessTerminalHandoffValidationError,
+      );
+      await expect(
+        storage.revokeTerminalGrant({ ...revocation(input), executionGrant: { key: 'grant-1', generation: 0 } }),
+      ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+      await expect(storage.revokeTerminalGrant({ ...revocation(input), revokedAt: -1 })).rejects.toBeInstanceOf(
+        HarnessTerminalHandoffValidationError,
+      );
+      await expect(storage.revokeTerminalGrant(revocation(input))).resolves.toMatchObject({ status: 'revoked' });
+
+      const disabled = new InMemoryHarness({ db: new InMemoryDB() });
+      expect(disabled.supportsTerminalGrantRevocation).toBe(false);
+      await expect(disabled.revokeTerminalGrant(revocation(input))).rejects.toBeInstanceOf(
+        HarnessTerminalHandoffUnsupportedError,
+      );
+    });
+  });
+
+  describe('lease-fenced dispatch compare-and-swap', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function reservedTurn() {
+      const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+      await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+      await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 30_000 });
+      const input = admission();
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      const stamp = (ownerId: string) =>
+        storage.compareAndSwapSignalDispatch({
+          harnessName: input.harnessName,
+          sessionId: input.sessionId,
+          resourceId: input.resourceId,
+          threadId: input.threadId,
+          signalId: input.signalId,
+          admissionId: input.admissionId,
+          admissionHash: input.admissionHash,
+          operationKind: 'message',
+          expected: { state: 'reserved' },
+          next: {
+            state: 'dispatching',
+            attemptId: `terminal-dispatch-${ownerId}`,
+            claimExpiresAt: Date.now() + 30_000,
+            delivery: 'idle',
+            runId: input.runId,
+          },
+          leaseOwner: { ownerId },
+          updatedAt: Date.now(),
+        });
+      const dispatchState = async () => {
+        const evidence = await storage.loadMessageResultEvidence({
+          harnessName: input.harnessName,
+          sessionId: input.sessionId,
+          resourceId: input.resourceId,
+          threadId: input.threadId,
+          signalId: input.signalId,
+        });
+        return (evidence as AgentSignalResultEvidence).dispatch?.state ?? 'unstamped';
+      };
+      return { storage, stamp, dispatchState };
+    }
+
+    it('refuses a stamp from an owner that does not hold the lease and writes nothing', async () => {
+      const { stamp, dispatchState } = await reservedTurn();
+      await expect(stamp('owner-2')).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+      expect(await dispatchState()).toBe('unstamped');
+      await expect(stamp('owner-1')).resolves.toMatchObject({ applied: true });
+      expect(await dispatchState()).toBe('dispatching');
+    });
+
+    it('judges ownership: an untaken lapsed lease still stamps, an adopted or closed session does not', async () => {
+      const lapsed = await reservedTurn();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + 31_000);
+      // Nobody took the lapsed lease, so nobody can have recovered the turn;
+      // liveness is the dispatcher's own last check.
+      await expect(lapsed.stamp('owner-1')).resolves.toMatchObject({ applied: true });
+      vi.useRealTimers();
+
+      const adopted = await reservedTurn();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + 31_000);
+      await adopted.storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-2', ttlMs: 30_000 });
+      await expect(adopted.stamp('owner-1')).rejects.toMatchObject({
+        name: 'HarnessStorageLeaseConflictError',
+        heldBy: 'owner-2',
+      });
+      expect(await adopted.dispatchState()).toBe('unstamped');
+      vi.useRealTimers();
+
+      const closed = await reservedTurn();
+      const record = (await closed.storage.loadSession({ sessionId: 'session-1' }))!;
+      await closed.storage.saveSession(
+        { ...record, closedAt: Date.now() },
+        { ownerId: 'owner-1', ifVersion: record.version },
+      );
+      await expect(closed.stamp('owner-1')).rejects.toBeInstanceOf(HarnessStorageSessionClosedError);
+      expect(await closed.dispatchState()).toBe('unstamped');
+    });
   });
 });

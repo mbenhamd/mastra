@@ -68,7 +68,9 @@ jobs:
 
   changeset-check:
     name: Validate changeset packages
-    runs-on: starsling-ubuntu-24.04-2
+    # Public fork code always uses ephemeral GitHub-hosted runners. Starsling is
+    # reserved for same-repository PRs in the canonical Mastra repository.
+    runs-on: ${{ (github.repository == 'mastra-ai/mastra' && github.event.pull_request.head.repo.full_name == github.repository) && 'starsling-ubuntu-24.04-2' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     permissions:
       contents: read

@@ -1180,9 +1180,11 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     grant_key: { type: 'text', nullable: false },
     grant_generation: { type: 'bigint', nullable: false },
     session_id: { type: 'text', nullable: false },
-    session_incarnation: { type: 'text', nullable: false },
+    // NULL on a pre-admission grant revocation, which has no admission identity.
+    session_incarnation: { type: 'text', nullable: true },
     admission_id: { type: 'text', nullable: false },
-    admission_hash: { type: 'text', nullable: false },
+    // NULL on a pre-admission grant revocation, which has no admission identity.
+    admission_hash: { type: 'text', nullable: true },
     reason_json: { type: 'text', nullable: false },
     created_at: { type: 'bigint', nullable: false },
   },

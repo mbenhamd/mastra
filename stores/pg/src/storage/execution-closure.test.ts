@@ -18,6 +18,7 @@ import {
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_SESSION_PROJECTION_INTENTS,
   TABLE_HARNESS_TERMINAL_INTENTS,
+  TABLE_HARNESS_TERMINAL_TOMBSTONES,
   TABLE_HARNESS_WAKEUPS,
   TABLE_MESSAGES,
   TABLE_OBSERVATIONAL_MEMORY,
@@ -1205,6 +1206,68 @@ describe('importExecutionClosure', () => {
     expect(comparableDigest(reexported.rows[TABLE_THREADS])).toEqual(comparableDigest(exported.rows[TABLE_THREADS]));
     const thread = (reexported.rows[TABLE_THREADS] ?? []).find(r => r.id === threadId);
     expect(thread).toBeDefined();
+  });
+
+  it('carries a pre-admission grant revocation to the destination, where it still fences admission', async () => {
+    const terminalStore = async (name: string) => {
+      const schemaName = `import_${name}_${randomUUID().slice(0, 8)}`.replaceAll('-', '_');
+      const s = new PostgresStore({
+        ...TEST_CONFIG,
+        id: `import-${name}`,
+        schemaName,
+        enabledDomains: ['harness', 'memory', 'workflows', 'threadState', 'backgroundTasks'],
+        sessionRecordProjection: { enabled: true },
+        terminalHandoff: { enabled: true },
+      });
+      await s.init();
+      stores.push(s);
+      return { s, schemaName };
+    };
+    const src = await terminalStore('revoke-src');
+    const dst = await terminalStore('revoke-dst');
+    await seedClosure(src.s, src.schemaName, 'rv1');
+    const grant = { key: 'grant-rv1', generation: 1 };
+    await expect(
+      src.s.stores.harness!.revokeTerminalGrant({
+        harnessName: HARNESS,
+        sessionId: 'rv1',
+        admissionId: 'admission-rv1',
+        executionGrant: grant,
+        reason: { code: 'doxa.turn_released', message: 'released before admission' },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    const exported = await src.s.exportExecutionClosure({ harnessName: HARNESS, sessionId: 'rv1' });
+    expect(exported.manifest.completeness).toBe('complete');
+    const result = await dst.s.importExecutionClosure(exported);
+    expect(result.status).toBe('imported');
+    await expect(
+      dst.s.db.one(
+        `SELECT session_incarnation, admission_hash FROM "${dst.schemaName}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}"
+          WHERE grant_key = $1`,
+        [grant.key],
+      ),
+    ).resolves.toEqual({ session_incarnation: null, admission_hash: null });
+
+    // The revoked grant can no longer be admitted where the session now lives.
+    const session = (await dst.s.stores.harness!.loadSession({ harnessName: HARNESS, sessionId: 'rv1' }))!;
+    await expect(
+      dst.s.stores.harness!.admitTerminalHandoff({
+        harnessName: HARNESS,
+        sessionId: 'rv1',
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        sessionIncarnation: session.sessionIncarnation!,
+        admissionId: 'admission-rv1',
+        admissionHash: 'admission-hash-rv1',
+        signalId: 'signal-rv1',
+        runId: 'run-rv1-turn',
+        executionGrant: grant,
+        finalizerId: 'doxa.chat',
+        finalizerVersion: '1',
+        seed: {},
+      }),
+    ).resolves.toMatchObject({ status: 'cancelled' });
   });
 
   it('converges on re-import instead of duplicating or erroring', async () => {
