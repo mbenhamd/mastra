@@ -4553,7 +4553,10 @@ export class Run<
    * signal also fires at once. `restart()` and `resume()` commit `canceled`
    * instead of executing a lineage that carries a request, so a request
    * outlives the process that owned the execution. A pending, suspended or
-   * paused lineage that no engine executes is canceled immediately.
+   * paused lineage that no engine executes is canceled immediately, as is a
+   * running or waiting one when the caller passes `noActiveExecution` because
+   * it knows no engine executes it, for example while it holds the run's
+   * external execution lease.
    *
    * Supported on the default engine with workflow storage that applies
    * compare-and-set updates and fenced step writes (in-memory, PostgreSQL,
@@ -4578,7 +4581,7 @@ export class Run<
   }
 
   private async recordCancelRequest(input: WorkflowCancelRequestInput): Promise<WorkflowCancelRequestOutcome> {
-    const { requestId, expectedExecutionGeneration, expectedLifecycleResumeAttempt } = input;
+    const { requestId, expectedExecutionGeneration, expectedLifecycleResumeAttempt, noActiveExecution } = input;
     if (typeof requestId !== 'string' || requestId.length === 0) {
       throw new TypeError('requestCancel() requires a non-empty requestId');
     }
@@ -4598,6 +4601,14 @@ export class Run<
       (!Number.isSafeInteger(expectedLifecycleResumeAttempt) || expectedLifecycleResumeAttempt < 0)
     ) {
       throw new TypeError('requestCancel() requires a non-negative integer expectedLifecycleResumeAttempt');
+    }
+    if (noActiveExecution !== undefined && typeof noActiveExecution !== 'boolean') {
+      throw new TypeError('requestCancel() takes a boolean noActiveExecution');
+    }
+    if (noActiveExecution === true && expectedExecutionGeneration === undefined) {
+      throw new TypeError(
+        'requestCancel() with noActiveExecution requires expectedExecutionGeneration and expectedLifecycleResumeAttempt',
+      );
     }
     if (this.transientExecution) throw new Error('Transient workflow runs cannot record a cancel request');
     // Other engines notify their own runtime on cancel() and do not read the
@@ -4648,9 +4659,12 @@ export class Run<
       }
       if (isTerminalWorkflowRunStatus(snapshot.status)) return { status: 'terminal', runStatus: snapshot.status };
 
+      // With noActiveExecution the caller vouches that no engine executes the
+      // lineage, so a running or waiting one is canceled like a suspended one.
       const executing =
-        WORKFLOW_CANCEL_REQUEST_EXECUTING_STATUSES.includes(snapshot.status) ||
-        (snapshot.status === 'pending' && executedHere());
+        noActiveExecution !== true &&
+        (WORKFLOW_CANCEL_REQUEST_EXECUTING_STATUSES.includes(snapshot.status) ||
+          (snapshot.status === 'pending' && executedHere()));
       if (executing) {
         const existing = workflowCancelRequestFor(snapshot.cancelRequest, lineage);
         if (existing) {
