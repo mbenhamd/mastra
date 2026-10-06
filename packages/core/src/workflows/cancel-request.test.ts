@@ -378,6 +378,82 @@ describe('Run.requestCancel()', () => {
     expect(probe.stageOneExecutions).toBe(2);
   });
 
+  it('cancels a running lineage at once when the caller vouches that no engine executes it', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const deadOwner = createProcess(storage, probe);
+    const survivor = createProcess(storage, probe);
+
+    // The owner is mid-stage and its process is treated as gone. The survivor
+    // holds the run's execution lease, so it knows no engine executes it.
+    const ownerRun = await deadOwner.workflow.createRun();
+    const abandoned = ownerRun.start({ inputData: { topic: 'aspirin' } });
+    await probe.stageOneStarted.promise;
+    const strandedLineage = await lineageOf(storage, ownerRun.runId);
+    const remoteRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
+
+    expect(
+      await remoteRun.requestCancel({ requestId: 'abort-op-1', ...strandedLineage, noActiveExecution: true }),
+    ).toEqual({ status: 'canceled' });
+    const settled = await loadSnapshot(storage, ownerRun.runId);
+    expect(settled?.status).toBe('canceled');
+    expect(settled?.executionGeneration).toBe(strandedLineage.expectedExecutionGeneration);
+
+    // A late wake-up of the old owner finds the lineage settled.
+    probe.releaseStageOne.resolve();
+    expect((await abandoned).status).toBe('canceled');
+    expect(probe.stageTwoExecutions).toBe(0);
+  });
+
+  it('never cancels a lineage a restart claimed before an unexecuted cancellation committed', async () => {
+    const storage = new InMemoryStore();
+    const probe = createProbe();
+    const deadOwner = createProcess(storage, probe);
+    const survivor = createProcess(storage, probe);
+    const workflowsStore = (await storage.getStore('workflows'))!;
+
+    const ownerRun = await deadOwner.workflow.createRun();
+    const abandoned = ownerRun.start({ inputData: { topic: 'aspirin' } });
+    await probe.stageOneStarted.promise;
+    const strandedLineage = await lineageOf(storage, ownerRun.runId);
+
+    // A restart that read the stranded lineage earlier claims the run after
+    // requestCancel() read it and before its compare-and-set.
+    let recovery: Promise<unknown> | undefined;
+    const updateWorkflowState = workflowsStore.updateWorkflowState.bind(workflowsStore);
+    const spy = vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(async args => {
+      if (args.opts.status === 'canceled' && recovery === undefined) {
+        recovery = (await survivor.workflow.createRun({ runId: ownerRun.runId })).restart();
+        await vi.waitFor(async () => {
+          expect((await loadSnapshot(storage, ownerRun.runId))?.executionGeneration).not.toBe(
+            strandedLineage.expectedExecutionGeneration,
+          );
+        });
+      }
+      return updateWorkflowState(args);
+    });
+
+    const lateRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
+    const outcome = await lateRun.requestCancel({
+      requestId: 'stale-abort',
+      ...strandedLineage,
+      noActiveExecution: true,
+    });
+    spy.mockRestore();
+
+    const successor = await loadSnapshot(storage, ownerRun.runId);
+    expect(outcome).toEqual({
+      status: 'lineage_moved',
+      executionGeneration: successor?.executionGeneration,
+      lifecycleResumeAttempt: 0,
+    });
+    expect(successor?.status).toBe('running');
+    probe.releaseStageOne.resolve();
+    expect(((await recovery) as { status: string }).status).toBe('success');
+    expect((await abandoned).status).toBe('canceled');
+    expect((await loadSnapshot(storage, ownerRun.runId))?.status).toBe('success');
+  });
+
   it('reports a lineage a restart claimed between its read and its write, and writes nothing', async () => {
     const storage = new InMemoryStore();
     const probe = createProbe();

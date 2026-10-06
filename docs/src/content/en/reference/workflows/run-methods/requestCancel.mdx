@@ -34,6 +34,8 @@ if (outcome.status === 'lineage_moved') {
 
 Read the execution to target from `workflow.getWorkflowRunById()`, which returns `executionGeneration`, `lifecycleResumeAttempt` and any stored `cancelRequest`. A `Run` that's executing the run itself can omit both fields to target its own execution.
 
+When your application knows that no process is executing the run, for example because it holds the run's execution lease after the previous owner's lease expired, pass `noActiveExecution: true`. The named execution is then canceled immediately, even while the run is `running`. The write is still bound to that execution, so a restart that has replaced it returns `lineage_moved` and keeps running. If a process is in fact still executing it, that process stops at its next step.
+
 ## Parameters
 
 <PropertiesTable
@@ -58,6 +60,13 @@ Read the execution to target from `workflow.getWorkflowRunById()`, which returns
     description: 'Resume attempt the request targets. Pass it together with `expectedExecutionGeneration`.',
     isOptional: true,
   },
+  {
+    name: 'noActiveExecution',
+    type: 'boolean',
+    description:
+      "Set to `true` when you know that no process is executing the named execution, for example because you hold the run's own execution lease after its owner's lease expired. A `running` or `waiting` run is then canceled immediately instead of storing a request. Requires `expectedExecutionGeneration` and `expectedLifecycleResumeAttempt`.",
+    isOptional: true,
+  },
 ]}
 />
 
@@ -77,7 +86,7 @@ Read the execution to target from `workflow.getWorkflowRunById()`, which returns
 | - | - |
 | `requested` | The request is stored. The run stays `running` until the process executing it reaches its next step, or until `restart()` picks it up. Read the run afterwards: it can still finish another way if the request arrived after its last step. |
 | `already_requested` | That execution already has a request. The stored request is returned and kept. |
-| `canceled` | The run was pending, suspended or paused, and no process was executing it, so it was canceled immediately. |
+| `canceled` | The run was pending, suspended or paused, and no process was executing it, so it was canceled immediately. With `noActiveExecution`, a `running` or `waiting` run is canceled immediately too. |
 | `terminal` | The run had already finished. `runStatus` holds its status. |
 | `lineage_moved` | A restart or resume created a newer execution. Nothing was written. The current `executionGeneration` and `lifecycleResumeAttempt` are returned. |
 | `not_found` | The run doesn't exist in storage. |

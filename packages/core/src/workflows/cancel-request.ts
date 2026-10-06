@@ -23,6 +23,16 @@ export interface WorkflowCancelRequestInput {
    */
   expectedExecutionGeneration?: string;
   expectedLifecycleResumeAttempt?: number;
+  /**
+   * Set when the caller knows no engine is executing the targeted lineage, for
+   * example because it holds the run's external execution lease after the
+   * owner's lease expired. A running or waiting lineage is then canceled at
+   * once, with the same lineage compare-and-set as a suspended one, instead of
+   * carrying a request for an engine to honour. An engine that is in fact
+   * still executing it stops at its next step boundary on the committed
+   * cancellation. Requires the expected lineage.
+   */
+  noActiveExecution?: boolean;
 }
 
 /**
@@ -49,9 +59,10 @@ export type WorkflowCancelRequestOutcome =
    */
   | { status: 'already_requested'; cancelRequest: WorkflowCancelRequestV1 }
   /**
-   * A pending, suspended or paused lineage no engine was executing: it is
-   * canceled now. A pending run whose execution this handle has already
-   * begun is treated as running instead.
+   * A pending, suspended or paused lineage no engine was executing, or with
+   * `noActiveExecution` a running or waiting one: it is canceled now. Without
+   * `noActiveExecution`, a pending run whose execution this handle has
+   * already begun is treated as running instead.
    */
   | { status: 'canceled' }
   /** The run already ended. */

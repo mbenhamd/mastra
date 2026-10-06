@@ -162,6 +162,29 @@ describe('Run.requestCancel() on PostgreSQL', () => {
     expect((await loadSnapshot(survivor.storage, ownerRun.runId))?.status).toBe('success');
   });
 
+  it('cancels a stranded running lineage at once when the caller vouches that no engine executes it', async () => {
+    const probe = createProbe();
+    const deadOwner = createProcess(probe);
+    const survivor = createProcess(probe);
+
+    const ownerRun = await deadOwner.workflow.createRun();
+    const abandoned = ownerRun.start({ inputData: { topic: 'aspirin' } });
+    await probe.stageOneStarted.promise;
+    const strandedLineage = await lineageOf(survivor.storage, ownerRun.runId);
+    const remoteRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
+
+    expect(
+      await remoteRun.requestCancel({ requestId: 'abort-op-1', ...strandedLineage, noActiveExecution: true }),
+    ).toEqual({ status: 'canceled' });
+    const settled = await loadSnapshot(survivor.storage, ownerRun.runId);
+    expect(settled?.status).toBe('canceled');
+    expect(settled?.executionGeneration).toBe(strandedLineage.expectedExecutionGeneration);
+
+    probe.releaseStageOne.resolve();
+    expect((await abandoned).status).toBe('canceled');
+    expect(probe.stageTwoExecutions).toBe(0);
+  });
+
   it('makes a recovery sweep commit canceled instead of re-executing the stranded lineage', async () => {
     const probe = createProbe();
     const deadOwner = createProcess(probe);
