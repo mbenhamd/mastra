@@ -419,6 +419,14 @@ jobs:
           # The literal placeholder is deliberately fail-closed: until the
           # draft PR exists and its numeric ID replaces this token, selecting
           # the protected base would hide the new validator self-tests.
+          guard_policy_placeholder='__PF5144_POLICY_PR_NUMBER''__'
+          if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${HEAD_REF}" == 'feature/pf-5144-cancel-guard-ci' && \
+            "${BASE_REF}" == 'main' ]] && \
+            grep -Fq -- "$guard_policy_placeholder" "$workflow_path"; then
+            echo 'PF-5144 policy PR number is unbound; failing closed.' >&2
+            exit 1
+          fi
           policy_pr_placeholder='__PF4243_POLICY_PR_NUMBER''__'
           if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
             "${HEAD_REF}" == 'codex/pf-4243-pg-index-unit-validation' && \
@@ -471,6 +479,13 @@ jobs:
             "${HEAD_REF}" == 'ci/pf-4278-clickhouse-cloudflare-validation' && \
             "${BASE_REF}" == 'main' ]]; then
             echo 'Bootstrapping the validator from exact PF-4278 policy PR #425.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${PR_NUMBER}" == '448' && \
+            "${HEAD_REF}" == 'feature/pf-5144-cancel-guard-ci' && \
+            "${BASE_REF}" == 'main' ]]; then
+            echo 'Bootstrapping the validator from the exact PF-5144 guard-coverage policy PR.'
             /usr/bin/git show "${HEAD_SHA}:${script_path}" \
               > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
           elif /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}" && \
