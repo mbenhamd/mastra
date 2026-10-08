@@ -4817,7 +4817,19 @@ run_validator_self_tests() {
       printf '%s\n' 'export default {};' > "stores/$guard_adapter/vitest.config.ts"
       printf '%s\n' 'export const workflowFixture = true;' \
         > "stores/$guard_adapter/src/storage/domains/workflows/index.ts"
-      printf '%s\n' "import { it } from 'vitest';" "it('unsupported guard refusal', () => {});" \
+      case "$guard_adapter" in
+        dsql) guard_export=WorkflowsDSQL ;;
+        dynamodb) guard_export=WorkflowStorageDynamoDB ;;
+        elasticsearch) guard_export=WorkflowsElasticSearch ;;
+        mssql) guard_export=WorkflowsMSSQL ;;
+        mysql) guard_export=WorkflowsMySQL ;;
+        oracledb) guard_export=WorkflowsOracle ;;
+        spanner) guard_export=WorkflowsSpanner ;;
+        valkey) guard_export=WorkflowsValkey ;;
+        convex) guard_export=WorkflowsConvex ;;
+      esac
+      printf '%s\n' "import { it } from 'vitest';" "import { $guard_export } from './index';" \
+        "it('unsupported guard refusal', () => Object.create($guard_export.prototype));" \
         > "stores/$guard_adapter/src/storage/domains/workflows/cancel-guard.test.ts"
     done
     printf '%s\n' '{}' > stores/convex/package.json
@@ -10315,6 +10327,52 @@ NODE
     assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
   done
 
+  # The feature PR introduces the refusal test for the first time. Exercise
+  # that real BASE-absent path and a direct-helper attempt to borrow base trust.
+  guard_complete_base_sha="$base_sha"
+  base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$guard_complete_base_sha"
+    rm stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    printf '%s\n' "import { baseHelper } from './base-helper';" 'export const workflowFixture = true;' \
+      > stores/valkey/src/storage/domains/workflows/index.ts
+    printf '%s\n' 'export const baseHelper = () => process.env.UNAPPROVED_PROVIDER_KEY;' \
+      > stores/valkey/src/storage/domains/workflows/base-helper.ts
+    git add .
+    git commit -q -m 'native adapter baseline without a guard test'
+    git rev-parse HEAD
+  )"
+  head_sha="$(
+    cd "$fixture_repo"
+    git checkout "$guard_complete_base_sha" -- stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    git commit -q -m 'new guard test imports its mapped adapter'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/guard-new-at-base-success.log"
+  if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
+  assert_contains '--dir stores/valkey exec vitest run' "$command_log"
+  assert_contains 'src/storage/domains/workflows/cancel-guard.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' "import { baseHelper } from './base-helper';" "it('direct helper', () => baseHelper());" \
+      >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    git add .
+    git commit -q -m 'new guard test directly imports a trusted-base helper'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/guard-direct-base-helper-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then echo 'Direct BASE helper bypassed guard provenance.' >&2; cat "$output" >&2; exit 1; fi
+  assert_contains 'guard test imports outside the mapped public adapter: ./base-helper' "$output"
+  assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
+  base_sha="$guard_complete_base_sha"
+
   echo 'PapersFlow fork validator fixtures passed.'
 }
 
@@ -13797,15 +13855,6 @@ while IFS= read -r file; do
         stores/convex/src/cache/index.test.ts | \
         stores/convex/src/server/cache.test.ts | \
         stores/convex/src/server/storage.test.ts | \
-        stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
-        stores/convex/src/storage/domains/workflows/cancel-guard.test.ts | \
         stores/libsql/src/storage/index.test.ts | \
         stores/libsql/src/storage/domains/harness/index.test.ts | \
         stores/libsql/src/storage/domains/thread-state/index.test.ts | \
@@ -15423,6 +15472,44 @@ function configLoaderHookFindings(file, source) {
 
 function unsupportedRuntimeReasons(file, source) {
   const reasons = new Set();
+  if (guardTest && repositoryPath(file) === entryFile) {
+    // Guard tests exercise exactly the mapped public adapter with no
+    // constructor/transport. Do not let a new test borrow baseline trust by
+    // importing a helper directly from the adapter's production closure.
+    const parsed = sourceFile(file, source);
+    const guardExports = {
+      dsql: 'WorkflowsDSQL', dynamodb: 'WorkflowStorageDynamoDB',
+      elasticsearch: 'WorkflowsElasticSearch', mssql: 'WorkflowsMSSQL',
+      mysql: 'WorkflowsMySQL', oracledb: 'WorkflowsOracle',
+      spanner: 'WorkflowsSpanner', valkey: 'WorkflowsValkey', convex: 'WorkflowsConvex',
+    };
+    const adapter = entryFile.split('/')[1];
+    let mappedImport = false;
+    const imports = runtimeModuleSpecifiers(file, source);
+    for (const specifier of imports) {
+      if (specifier !== 'vitest' && specifier !== './index') {
+        reasons.add(`guard test imports outside the mapped public adapter: ${specifier}`);
+      }
+    }
+    for (const statement of parsed.statements) {
+      if (!ts.isImportDeclaration(statement) || statement.moduleSpecifier.text !== './index') continue;
+      const clause = statement.importClause;
+      const bindings = clause?.namedBindings;
+      if (clause && !clause.isTypeOnly && !clause.name && bindings && ts.isNamedImports(bindings) &&
+          bindings.elements.length === 1 && !bindings.elements[0].isTypeOnly &&
+          bindings.elements[0].name.text === guardExports[adapter] && !bindings.elements[0].propertyName) {
+        mappedImport = true;
+      } else {
+        reasons.add('guard test must import only the mapped public workflow class');
+      }
+    }
+    if (!mappedImport) reasons.add('guard test is missing its mapped public workflow class import');
+    const visit = node => {
+      if (ts.isNewExpression(node)) reasons.add('guard test must not construct a transport');
+      ts.forEachChild(node, visit);
+    };
+    visit(parsed);
+  }
   const wasReachableFromExactTest = baseGraph.has(repositoryPath(file));
   const baseSource = readBaseSource(file);
   const baseSpecifiers = baseSource ? runtimeModuleSpecifiers(file, baseSource) : new Set();
