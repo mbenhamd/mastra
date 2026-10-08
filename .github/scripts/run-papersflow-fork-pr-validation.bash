@@ -10298,7 +10298,7 @@ NODE
     assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
   done
 
-  for rejected_case in fetch environment network-import adapter-runtime manifest; do
+  for rejected_case in fetch environment network-import adapter-runtime manifest reflective-construction reflective-alias; do
     head_sha="$(
       cd "$fixture_repo"
       git reset -q --hard "$base_sha"
@@ -10311,6 +10311,8 @@ NODE
           printf '%s\n' "void fetch('https://example.invalid');" >> stores/valkey/src/storage/domains/workflows/index.ts
           ;;
         manifest) printf '%s\n' '{"scripts":{"build:lib":"exit 0"}}' > stores/valkey/package.json ;;
+        reflective-construction) printf '%s\n' 'Reflect.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-alias) printf '%s\n' 'const construct = Reflect["construct"]; construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
       esac
       git add .
       git commit -q -m "guard boundary $rejected_case"
@@ -15505,7 +15507,15 @@ function unsupportedRuntimeReasons(file, source) {
     }
     if (!mappedImport) reasons.add('guard test is missing its mapped public workflow class import');
     const visit = node => {
-      if (ts.isNewExpression(node)) reasons.add('guard test must not construct a transport');
+      const reflectiveConstruction =
+        (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+        ts.isIdentifier(node.expression) && node.expression.text === 'Reflect' &&
+        (ts.isPropertyAccessExpression(node)
+          ? node.name.text === 'construct'
+          : ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === 'construct');
+      if (ts.isNewExpression(node) || reflectiveConstruction) {
+        reasons.add('guard test must not construct the mapped adapter');
+      }
       ts.forEachChild(node, visit);
     };
     visit(parsed);
