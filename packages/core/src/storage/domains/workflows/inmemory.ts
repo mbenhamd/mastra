@@ -529,7 +529,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
-    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1 };
+    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1, retainedCancelRequestVersion: 1 };
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
@@ -2301,6 +2301,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // getters fire exactly once and the guard accessors are never re-read.
     const expectedExecutionGeneration = opts.expectedExecutionGeneration;
     const expectedLifecycleResumeAttempt = opts.expectedLifecycleResumeAttempt;
+    const expectedCancelRequest = pinWorkflowCasGuardValue(opts.expectedCancelRequest);
     const expectedStatus = pinWorkflowCasGuardValue(opts.expectedStatus);
     const finalState = opts.finalState;
     const stateOptions: Record<PropertyKey, unknown> = {};
@@ -2309,6 +2310,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         key === 'expectedStatus' ||
         key === 'expectedExecutionGeneration' ||
         key === 'expectedLifecycleResumeAttempt' ||
+        key === 'expectedCancelRequest' ||
         key === 'finalState'
       ) {
         continue;
@@ -2356,6 +2358,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
           expectedStatus,
           expectedExecutionGeneration,
           expectedLifecycleResumeAttempt,
+          expectedCancelRequest,
         })
       ) {
         return;

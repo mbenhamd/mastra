@@ -4,6 +4,7 @@ import { Mastra } from '../mastra';
 import { InMemoryStore } from '../storage/mock';
 import { WorkflowCancelRequestedError } from './cancel-request';
 import { createWorkflow } from './create';
+import type { WorkflowCancelRequestV1 } from './types';
 import { createStep } from './workflow';
 
 const WORKFLOW_ID = 'cancel-request-wf';
@@ -179,12 +180,17 @@ describe('Run.requestCancel()', () => {
     // The public run state names the execution to target.
     const observed = await controller.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] });
     const remoteRun = await controller.workflow.createRun({ runId: ownerRun.runId });
-    const outcome = await remoteRun.requestCancel({
-      requestId: 'abort-op-1',
+    const lineage = {
       expectedExecutionGeneration: observed!.executionGeneration!,
       expectedLifecycleResumeAttempt: observed!.lifecycleResumeAttempt!,
-    });
+    };
+    const ordinaryRun = await createProcess(storage, probe).workflow.createRun({ runId: ownerRun.runId });
+    const [outcome, concurrent] = await Promise.all([
+      remoteRun.requestCancel({ requestId: 'abort-op-1', ...lineage, retainCancellationRequest: true }),
+      ordinaryRun.requestCancel({ requestId: 'competing-ordinary-abort', ...lineage }),
+    ]);
     expect(outcome).toMatchObject({ status: 'requested', cancelRequest: { requestId: 'abort-op-1' } });
+    expect(concurrent).toEqual({ status: 'already_requested', cancelRequest: outcome.cancelRequest });
     // The controller-only handle never executes, so it is released at once.
     expect(await controller.workflow.createRun({ runId: ownerRun.runId })).not.toBe(remoteRun);
     // The request does not settle the run: its owner is still executing.
@@ -297,6 +303,62 @@ describe('Run.requestCancel()', () => {
       status: 'terminal',
       runStatus: 'canceled',
     });
+
+    // Recover an older immediate cancellation whose snapshot has no marker.
+    // An acknowledgement lost after the atomic write must not change its
+    // request identity or occurrence when another process retries.
+    const lineage = await lineageOf(storage, run.runId);
+    const workflows = (await storage.getStore('workflows'))!;
+    const rejectedMarker: WorkflowCancelRequestV1 = {
+      version: 1,
+      requestId: 'invalid-guard-write',
+      executionGeneration: lineage.expectedExecutionGeneration,
+      lifecycleResumeAttempt: lineage.expectedLifecycleResumeAttempt,
+      requestedAt: Date.now(),
+    };
+    await expect(
+      workflows.updateWorkflowState({
+        workflowName: WORKFLOW_ID,
+        runId: run.runId,
+        opts: {
+          cancelRequest: rejectedMarker,
+          expectedCancelRequest: {} as WorkflowCancelRequestV1,
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect((await loadSnapshot(storage, run.runId))?.cancelRequest).toBeUndefined();
+    const update = workflows.updateWorkflowState.bind(workflows);
+    const beforeRetention = Date.now();
+    const lostAck = vi.spyOn(workflows, 'updateWorkflowState').mockImplementationOnce(async args => {
+      await update(args);
+      throw new Error('lost cancellation acknowledgement');
+    });
+    await expect(
+      run.requestCancel({
+        requestId: 'retained-abort',
+        ...lineage,
+        retainCancellationRequest: true,
+      }),
+    ).rejects.toThrow('lost cancellation acknowledgement');
+    lostAck.mockRestore();
+    const marker = (await loadSnapshot(storage, run.runId))!.cancelRequest!;
+    expect(marker).toMatchObject({
+      requestId: 'retained-abort',
+      ...{
+        executionGeneration: lineage.expectedExecutionGeneration,
+        lifecycleResumeAttempt: lineage.expectedLifecycleResumeAttempt,
+      },
+    });
+    expect(marker.requestedAt).toBeGreaterThanOrEqual(beforeRetention);
+    expect(marker.requestedAt).toBeLessThanOrEqual(Date.now());
+    await expect(
+      run.requestCancel({
+        requestId: 'later-replay',
+        ...lineage,
+        retainCancellationRequest: true,
+      }),
+    ).resolves.toEqual({ status: 'canceled', cancelRequest: marker });
+    expect((await loadSnapshot(storage, run.runId))?.cancelRequest).toEqual(marker);
   });
 
   it('makes a recovery restart commit canceled instead of re-executing the stranded lineage', async () => {
@@ -393,8 +455,13 @@ describe('Run.requestCancel()', () => {
     const remoteRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
 
     expect(
-      await remoteRun.requestCancel({ requestId: 'abort-op-1', ...strandedLineage, noActiveExecution: true }),
-    ).toEqual({ status: 'canceled' });
+      await remoteRun.requestCancel({
+        requestId: 'abort-op-1',
+        ...strandedLineage,
+        noActiveExecution: true,
+        retainCancellationRequest: true,
+      }),
+    ).toMatchObject({ status: 'canceled', cancelRequest: { requestId: 'abort-op-1' } });
     const settled = await loadSnapshot(storage, ownerRun.runId);
     expect(settled?.status).toBe('canceled');
     expect(settled?.executionGeneration).toBe(strandedLineage.expectedExecutionGeneration);
@@ -438,6 +505,7 @@ describe('Run.requestCancel()', () => {
       requestId: 'stale-abort',
       ...strandedLineage,
       noActiveExecution: true,
+      retainCancellationRequest: true,
     });
     spy.mockRestore();
 
@@ -558,7 +626,7 @@ describe('Run.requestCancel()', () => {
     const probe = createProbe();
     const owner = createProcess(storage, probe);
     const workflowsStore = (await storage.getStore('workflows'))!;
-    vi.spyOn(workflowsStore, 'getWorkflowResumeCapabilities').mockReturnValue({});
+    const capabilities = vi.spyOn(workflowsStore, 'getWorkflowResumeCapabilities').mockReturnValue({});
 
     const run = await owner.workflow.createRun();
     const execution = run.start({ inputData: { topic: 'aspirin' } });
@@ -567,6 +635,14 @@ describe('Run.requestCancel()', () => {
     await expect(run.requestCancel({ requestId: 'abort-op-1' })).rejects.toThrow(
       'requestCancel() requires workflow storage with compare-and-set updates and fenced step writes',
     );
+    capabilities.mockReturnValue({ atomicResumeVersion: 1, fencedStepUpdateVersion: 1 });
+    await expect(
+      run.requestCancel({
+        requestId: 'retained-abort',
+        ...(await lineageOf(storage, run.runId)),
+        retainCancellationRequest: true,
+      }),
+    ).rejects.toThrow('requestCancel() retention requires workflow storage with atomic cancellation-marker updates');
     expect((await loadSnapshot(storage, run.runId))?.cancelRequest).toBeUndefined();
     probe.releaseStageOne.resolve();
     expect((await execution).status).toBe('success');

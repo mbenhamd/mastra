@@ -31,6 +31,7 @@ import {
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_SCHEMAS,
   matchesExpectedWorkflowState,
+  pinWorkflowCasGuardValue,
   WorkflowsStorage,
   rollbackWorkflowResumeRecord,
 } from '@mastra/core/storage';
@@ -83,7 +84,7 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
   }
 
   getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
-    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1 };
+    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1, retainedCancelRequestVersion: 1 };
   }
 
   private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
@@ -374,6 +375,28 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
     runId: string;
     opts: UpdateWorkflowStateOptions;
   }): Promise<WorkflowRunState | undefined> {
+    const expectedExecutionGeneration = opts.expectedExecutionGeneration;
+    const expectedLifecycleResumeAttempt = opts.expectedLifecycleResumeAttempt;
+    const expectedCancelRequest = pinWorkflowCasGuardValue(opts.expectedCancelRequest);
+    const expectedStatus = pinWorkflowCasGuardValue(opts.expectedStatus);
+    const state: Record<PropertyKey, unknown> = {};
+    for (const key of Reflect.ownKeys(opts)) {
+      if (
+        key === 'expectedStatus' ||
+        key === 'expectedExecutionGeneration' ||
+        key === 'expectedLifecycleResumeAttempt' ||
+        key === 'expectedCancelRequest'
+      )
+        continue;
+      const descriptor = Object.getOwnPropertyDescriptor(opts, key);
+      if (!descriptor?.enumerable) continue;
+      Object.defineProperty(state, key, {
+        configurable: true,
+        writable: true,
+        enumerable: true,
+        value: 'value' in descriptor ? descriptor.value : descriptor.get?.call(opts),
+      });
+    }
     return this.executeWithRetry(
       () =>
         // Serialize the interactive transaction against all other writes on the shared
@@ -402,12 +425,12 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
               throw new Error(`Snapshot not found for runId ${runId}`);
             }
 
-            const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = opts;
             if (
               !matchesExpectedWorkflowState(snapshot, {
                 expectedStatus,
                 expectedExecutionGeneration,
                 expectedLifecycleResumeAttempt,
+                expectedCancelRequest,
               })
             ) {
               await tx.rollback();

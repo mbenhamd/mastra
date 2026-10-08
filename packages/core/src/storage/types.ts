@@ -21,6 +21,7 @@ import type {
   WorkflowTerminalizationPhase,
   WorkflowTerminalizationRecord,
 } from '../workflows';
+import { materializeWorkflowCancelRequest } from '../workflows/cancel-request';
 import type { WorkflowLifecycleEvent } from '../workflows/lifecycle-events';
 import type { WorkflowTerminalParentContinuationContract } from '../workflows/terminal-continuation';
 import type {
@@ -74,6 +75,8 @@ export interface WorkflowRun {
 export interface WorkflowResumeCapabilities {
   atomicResumeVersion?: 1;
   fencedStepUpdateVersion?: 1;
+  /** Atomic cancellation-marker compare-and-set for retained requests. */
+  retainedCancelRequestVersion?: 1;
 }
 
 export type WorkflowSnapshotHandoffStatus = 'pending' | 'completed';
@@ -3225,6 +3228,8 @@ export interface UpdateWorkflowStateOptions {
   expectedLifecycleResumeAttempt?: number;
   /** Lineage-bound cancellation request written by `Run.requestCancel()`. */
   cancelRequest?: WorkflowRunState['cancelRequest'];
+  /** Guard the marker itself; null requires it to be absent. Never persisted. */
+  expectedCancelRequest?: WorkflowRunState['cancelRequest'] | null;
 }
 
 /**
@@ -3245,12 +3250,14 @@ export function matchesExpectedWorkflowStatus(
  * A snapshot written before resume attempts were introduced is attempt zero.
  */
 export function matchesExpectedWorkflowState(
-  snapshot: Pick<WorkflowRunState, 'status' | 'executionGeneration' | 'lifecycleResumeAttempt'>,
+  snapshot: Pick<WorkflowRunState, 'status' | 'executionGeneration' | 'lifecycleResumeAttempt' | 'cancelRequest'>,
   expected: Pick<
     UpdateWorkflowStateOptions,
-    'expectedStatus' | 'expectedExecutionGeneration' | 'expectedLifecycleResumeAttempt'
+    'expectedStatus' | 'expectedExecutionGeneration' | 'expectedLifecycleResumeAttempt' | 'expectedCancelRequest'
   >,
 ): boolean {
+  const expectedRequest = materializeWorkflowCancelRequest(expected.expectedCancelRequest);
+  const currentRequest = materializeWorkflowCancelRequest(snapshot.cancelRequest);
   return (
     matchesExpectedWorkflowStatus(snapshot.status, expected.expectedStatus) &&
     (expected.expectedExecutionGeneration === undefined ||
@@ -3264,7 +3271,17 @@ export function matchesExpectedWorkflowState(
     // malformed values must fail the guard rather than admit a stale writer.
     (expected.expectedLifecycleResumeAttempt === undefined ||
       (snapshot.lifecycleResumeAttempt === undefined ? 0 : snapshot.lifecycleResumeAttempt) ===
-        expected.expectedLifecycleResumeAttempt)
+        expected.expectedLifecycleResumeAttempt) &&
+    (expected.expectedCancelRequest === undefined ||
+      (expected.expectedCancelRequest === null
+        ? snapshot.cancelRequest === undefined
+        : expectedRequest !== undefined &&
+          currentRequest !== undefined &&
+          currentRequest.version === expectedRequest.version &&
+          currentRequest.requestId === expectedRequest.requestId &&
+          currentRequest.executionGeneration === expectedRequest.executionGeneration &&
+          currentRequest.lifecycleResumeAttempt === expectedRequest.lifecycleResumeAttempt &&
+          currentRequest.requestedAt === expectedRequest.requestedAt))
   );
 }
 
