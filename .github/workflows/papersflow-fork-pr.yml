@@ -497,7 +497,7 @@ jobs:
             /usr/bin/git show "${HEAD_SHA}:${script_path}" \
               > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
           elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
-            "${PR_NUMBER}" == '__PF5154_POLICY_PR_NUMBER__' && \
+            "${PR_NUMBER}" == '449' && \
             "${HEAD_REF}" == 'feature/pf-5154-convex-test-ci' && \
             "${BASE_REF}" == 'main' ]]; then
             echo 'Bootstrapping the validator from the exact PF-5154 Convex fixture policy PR.'
