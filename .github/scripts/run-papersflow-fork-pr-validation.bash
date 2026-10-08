@@ -10213,7 +10213,7 @@ NODE
     )"
     : > "$command_log"
     : > "$service_log"
-    output="$test_root/convex-fixture-test-success.log"
+    output="$test_root/convex-fixture-${convex_fixture_test//\//-}-success.log"
     if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
     assert_contains '--filter ./stores/convex --fail-if-no-match exec tsc --noEmit' "$command_log"
     assert_contains '--filter ./stores/convex --fail-if-no-match build:lib' "$command_log"
@@ -10225,18 +10225,17 @@ NODE
       cat "$service_log" >&2
       exit 1
     fi
-  done
 
-  : > "$command_log"
-  output="$test_root/convex-fixture-typecheck-failure.log"
-  set +e
-  run_fixture "$head_sha" "$output" \
-    MOCK_FAIL_PACKAGE_CONTRACT_COMMAND='--filter ./stores/convex --fail-if-no-match exec tsc --noEmit'
-  status=$?
-  set -e
-  if (( status == 0 )); then echo 'Failed Convex fixture typecheck passed.' >&2; exit 1; fi
-  assert_contains '--filter ./stores/convex --fail-if-no-match exec tsc --noEmit' "$command_log"
-  assert_not_contains '--dir stores/convex exec vitest run' "$command_log"
+    : > "$command_log"
+    output="$test_root/convex-fixture-${convex_fixture_test//\//-}-typecheck-failure.log"
+    if run_fixture "$head_sha" "$output" \
+      MOCK_FAIL_PACKAGE_CONTRACT_COMMAND='--filter ./stores/convex --fail-if-no-match exec tsc --noEmit'; then
+      echo "Failed Convex fixture typecheck passed for $convex_fixture_test." >&2
+      exit 1
+    fi
+    assert_contains '--filter ./stores/convex --fail-if-no-match exec tsc --noEmit' "$command_log"
+    assert_not_contains '--dir stores/convex exec vitest run' "$command_log"
+  done
 
   # Each newly owned pair must build/typecheck/lint and execute its public
   # no-network test even when only production source changes.
