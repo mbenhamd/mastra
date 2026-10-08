@@ -756,6 +756,36 @@ describe('mastraStorage workflow snapshot merge operations', () => {
     expect(patchedSnapshot).toEqual(JSON.parse(result.result));
   });
 
+  it.each([
+    null,
+    {
+      version: 1,
+      requestId: 'abort-1',
+      executionGeneration: 'generation-1',
+      lifecycleResumeAttempt: 0,
+      requestedAt: 1,
+    },
+  ])(
+    'rejects unsupported cancellation request guards at the public mutation boundary (%s)',
+    async expectedCancelRequest => {
+      const snapshot = { runId: 'run-1', status: 'running', context: {} };
+      const testCtx = createWorkflowSnapshotCtx(snapshot);
+      const result = await handleTypedOperation(testCtx.ctx, 'mastra_workflow_snapshots', {
+        op: 'mergeWorkflowState',
+        tableName: TABLE_WORKFLOW_SNAPSHOT,
+        workflowName: 'workflow-a',
+        runId: 'run-1',
+        opts: JSON.stringify({ status: 'canceled', expectedCancelRequest }),
+      });
+      expect(result).toEqual({
+        ok: false,
+        error: 'This storage adapter does not support expectedCancelRequest guards',
+      });
+      expect(testCtx.patch).not.toHaveBeenCalled();
+      expect(snapshot).toEqual({ runId: 'run-1', status: 'running', context: {} });
+    },
+  );
+
   it('merges workflow state from an object snapshot', async () => {
     const snapshot = {
       runId: 'run-1',

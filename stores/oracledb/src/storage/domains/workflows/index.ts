@@ -121,6 +121,12 @@ export class WorkflowsOracle extends WorkflowsStorage {
     runId: string;
     opts: UpdateWorkflowStateOptions;
   }): Promise<WorkflowRunState | undefined> {
+    const { expectedCancelRequest, ...stateOptions } = opts;
+    if (expectedCancelRequest !== undefined) {
+      throw new Error('This storage adapter does not support expectedCancelRequest guards');
+    }
+    opts = stateOptions;
+
     try {
       return await this.db.tx(async client => {
         // State updates patch top-level snapshot fields and require a pre-existing

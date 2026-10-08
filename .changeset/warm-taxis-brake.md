@@ -2,9 +2,21 @@
 '@mastra/core': minor
 '@mastra/libsql': patch
 '@mastra/pg': patch
+'@mastra/redis': patch
+'@mastra/valkey': patch
+'@mastra/elasticsearch': patch
+'@mastra/mysql': patch
+'@mastra/mssql': patch
+'@mastra/dynamodb': patch
+'@mastra/dsql': patch
+'@mastra/spanner': patch
+'@mastra/oracledb': patch
+'@mastra/mongodb': patch
+'@mastra/upstash': patch
+'@mastra/convex': patch
 ---
 
-Added lineage-bound cancellation request retention with atomic first-writer protection and replay-safe occurrence times.
+Retain cancellation requests so later requests for the same execution keep the first request ID and timestamp.
 
 Use the explicit lineage to retain a durable request even when cancellation is immediate or that lineage has already been canceled:
 
