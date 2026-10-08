@@ -4842,6 +4842,10 @@ run_validator_self_tests() {
     printf '%s\n' 'export const convexServerStorage = true;' > stores/convex/src/server/storage.ts
     printf '%s\n' "import { it } from 'vitest';" "it('convex server storage', () => {});" \
       > stores/convex/src/server/storage.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('convex schema', () => {});" \
+      > stores/convex/src/schema.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('convex observational memory', () => {});" \
+      > stores/convex/src/server/observational-memory.test.ts
     printf '%s\n' '{}' > stores/mongodb/package.json
     printf '%s\n' 'export default {};' > stores/mongodb/vitest.config.ts
     printf '%s\n' 'export const mongoWorkflows = true;' \
@@ -10195,6 +10199,45 @@ NODE
   assert_contains '--dir stores/convex exec vitest run' "$command_log"
   assert_contains 'src/server/storage.test.ts' "$command_log"
 
+  # Fixture typing repairs must run their existing behavior suite, as well as
+  # the complete native package gates, without requiring a deployed Convex app.
+  for convex_fixture_test in src/schema.test.ts src/server/observational-memory.test.ts; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' "it('fixture typing repair', () => {});" \
+        >> "stores/convex/$convex_fixture_test"
+      git add .
+      git commit -q -m 'convex fixture test-only change'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    : > "$service_log"
+    output="$test_root/convex-fixture-test-success.log"
+    if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
+    assert_contains '--filter ./stores/convex --fail-if-no-match exec tsc --noEmit' "$command_log"
+    assert_contains '--filter ./stores/convex --fail-if-no-match build:lib' "$command_log"
+    assert_contains '--filter ./stores/convex --fail-if-no-match lint' "$command_log"
+    assert_contains '--dir stores/convex exec vitest run' "$command_log"
+    assert_contains "$convex_fixture_test" "$command_log"
+    if [[ -s "$service_log" ]]; then
+      echo 'In-process Convex fixture validation requested a service.' >&2
+      cat "$service_log" >&2
+      exit 1
+    fi
+  done
+
+  : > "$command_log"
+  output="$test_root/convex-fixture-typecheck-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output" \
+    MOCK_FAIL_PACKAGE_CONTRACT_COMMAND='--filter ./stores/convex --fail-if-no-match exec tsc --noEmit'
+  status=$?
+  set -e
+  if (( status == 0 )); then echo 'Failed Convex fixture typecheck passed.' >&2; exit 1; fi
+  assert_contains '--filter ./stores/convex --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_not_contains '--dir stores/convex exec vitest run' "$command_log"
+
   # Each newly owned pair must build/typecheck/lint and execute its public
   # no-network test even when only production source changes.
   for guard_adapter in dsql dynamodb elasticsearch mssql mysql oracledb spanner valkey convex; do
@@ -13862,6 +13905,8 @@ while IFS= read -r file; do
         stores/convex/src/cache/index.test.ts | \
         stores/convex/src/server/cache.test.ts | \
         stores/convex/src/server/storage.test.ts | \
+        stores/convex/src/schema.test.ts | \
+        stores/convex/src/server/observational-memory.test.ts | \
         stores/libsql/src/storage/index.test.ts | \
         stores/libsql/src/storage/domains/harness/index.test.ts | \
         stores/libsql/src/storage/domains/thread-state/index.test.ts | \
@@ -15847,6 +15892,8 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" == stores/convex/src/cache/index.test.ts || \
       "$file" == stores/convex/src/server/cache.test.ts || \
       "$file" == stores/convex/src/server/storage.test.ts || \
+      "$file" == stores/convex/src/schema.test.ts || \
+      "$file" == stores/convex/src/server/observational-memory.test.ts || \
       "$file" == stores/libsql/src/storage/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/harness/index.test.ts || \
       "$file" == stores/libsql/src/storage/domains/thread-state/index.test.ts || \

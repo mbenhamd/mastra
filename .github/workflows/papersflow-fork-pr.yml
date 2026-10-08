@@ -420,6 +420,14 @@ jobs:
           # draft PR exists and its numeric ID replaces this token, selecting
           # the protected base would hide the new validator self-tests.
           guard_policy_placeholder='__PF5144_POLICY_PR_NUMBER''__'
+          convex_fixture_policy_placeholder='__PF5154_POLICY_PR_NUMBER''__'
+          if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${HEAD_REF}" == 'feature/pf-5154-convex-test-ci' && \
+            "${BASE_REF}" == 'main' ]] && \
+            grep -Fq -- "$convex_fixture_policy_placeholder" "$workflow_path"; then
+            echo 'PF-5154 policy PR number is unbound; failing closed.' >&2
+            exit 1
+          fi
           if [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
             "${HEAD_REF}" == 'feature/pf-5144-cancel-guard-ci' && \
             "${BASE_REF}" == 'main' ]] && \
@@ -486,6 +494,13 @@ jobs:
             "${HEAD_REF}" == 'feature/pf-5144-cancel-guard-ci' && \
             "${BASE_REF}" == 'main' ]]; then
             echo 'Bootstrapping the validator from the exact PF-5144 guard-coverage policy PR.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" \
+              > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
+          elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
+            "${PR_NUMBER}" == '__PF5154_POLICY_PR_NUMBER__' && \
+            "${HEAD_REF}" == 'feature/pf-5154-convex-test-ci' && \
+            "${BASE_REF}" == 'main' ]]; then
+            echo 'Bootstrapping the validator from the exact PF-5154 Convex fixture policy PR.'
             /usr/bin/git show "${HEAD_SHA}:${script_path}" \
               > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
           elif /usr/bin/git cat-file -e "${BASE_SHA}:${script_path}" && \
