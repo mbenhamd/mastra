@@ -10298,7 +10298,7 @@ NODE
     assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
   done
 
-  for rejected_case in fetch environment network-import adapter-runtime manifest reflective-construction reflective-alias; do
+  for rejected_case in fetch environment network-import adapter-runtime manifest reflective-construction reflective-alias reflective-destructuring reflective-receiver-alias reflective-global reflective-computed-binding; do
     head_sha="$(
       cd "$fixture_repo"
       git reset -q --hard "$base_sha"
@@ -10313,6 +10313,10 @@ NODE
         manifest) printf '%s\n' '{"scripts":{"build:lib":"exit 0"}}' > stores/valkey/package.json ;;
         reflective-construction) printf '%s\n' 'Reflect.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
         reflective-alias) printf '%s\n' 'const construct = Reflect["construct"]; construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-destructuring) printf '%s\n' 'const { construct } = Reflect; construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-receiver-alias) printf '%s\n' 'const R = Reflect; R.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-global) printf '%s\n' 'globalThis.Reflect.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-computed-binding) printf '%s\n' 'const { ["Reflect"]: R } = globalThis; R.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
       esac
       git add .
       git commit -q -m "guard boundary $rejected_case"
@@ -15508,11 +15512,19 @@ function unsupportedRuntimeReasons(file, source) {
     if (!mappedImport) reasons.add('guard test is missing its mapped public workflow class import');
     const visit = node => {
       const reflectiveConstruction =
-        (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
-        ts.isIdentifier(node.expression) && node.expression.text === 'Reflect' &&
-        (ts.isPropertyAccessExpression(node)
-          ? node.name.text === 'construct'
-          : ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === 'construct');
+        ((ts.isIdentifier(node) && node.text === 'Reflect') ||
+          (ts.isBindingElement(node) && node.propertyName &&
+            (ts.isStringLiteralLike(node.propertyName)
+              ? node.propertyName.text === 'Reflect'
+              : ts.isComputedPropertyName(node.propertyName) && ts.isStringLiteralLike(node.propertyName.expression) &&
+                node.propertyName.expression.text === 'Reflect')) ||
+          (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) &&
+            node.argumentExpression.text === 'Reflect')) &&
+        !(node.parent && node.parent.expression === node &&
+          (ts.isPropertyAccessExpression(node.parent)
+            ? node.parent.name.text !== 'construct'
+            : ts.isElementAccessExpression(node.parent) && ts.isStringLiteralLike(node.parent.argumentExpression) &&
+              node.parent.argumentExpression.text !== 'construct'));
       if (ts.isNewExpression(node) || reflectiveConstruction) {
         reasons.add('guard test must not construct the mapped adapter');
       }
