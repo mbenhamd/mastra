@@ -35,6 +35,7 @@ import {
   HarnessStorageWakeupTransitionError,
   DEFAULT_HARNESS_ATTACHMENT_MAX_BYTES,
   HarnessTerminalHandoffClaimConflictError,
+  HarnessTerminalHandoffCancelledError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
   HarnessTerminalHandoffNotFoundError,
@@ -192,6 +193,8 @@ import type {
   HarnessTerminalAdmissionReceipt,
   HarnessTerminalCancelInput,
   HarnessTerminalCancelReceipt,
+  HarnessTerminalGrantRevocationInput,
+  HarnessTerminalGrantRevocationReceipt,
   HarnessTerminalClaimIdentity,
   HarnessTerminalClaimInput,
   HarnessTerminalClaimReceipt,
@@ -223,6 +226,7 @@ import type { DbClient, QueryValues, TxClient } from '../../client';
 import { PgDB, generateIndexSQL, generateTableSQL, resolvePgConfig } from '../../db';
 import type { PgDomainConfig } from '../../db';
 import { POSTGRES_IDENTIFIER_MAX_LENGTH, truncateIdentifier } from '../../db/constraint-utils';
+import { EXPORTED_FENCE_AUTHORITY } from '../../exported-fence';
 
 type HarnessWakeupClaimStatus = Extract<HarnessWakeupItem['status'], 'due' | 'claimed' | 'failed'>;
 type PgHarnessExecuteArgs = string | { sql: string; args?: QueryValues };
@@ -858,6 +862,10 @@ export class HarnessPG extends HarnessStorage {
     return this.terminalHandoff.enabled;
   }
 
+  override get supportsTerminalGrantRevocation(): boolean {
+    return this.terminalHandoff.enabled;
+  }
+
   override get supportsDispatchRecovery(): boolean {
     return true;
   }
@@ -1057,6 +1065,7 @@ export class HarnessPG extends HarnessStorage {
         await this.#client.execute(`ALTER TABLE ${TABLE_HARNESS_ATTACHMENTS} ALTER COLUMN data_b64 DROP NOT NULL`);
       }
     }
+    await this.#relaxTerminalTombstoneIdentityColumns();
     await this.#backfillHarnessNamespace();
     await this.#backfillPendingResumeExpiry();
     if (!this.#skipDefaultIndexes) {
@@ -5065,6 +5074,14 @@ export class HarnessPG extends HarnessStorage {
         args: [tombstoneId],
       });
       if (tombstone.rows[0]) {
+        // A revoked or cancelled grant is refused, and the lease holder's
+        // undispatched reservation of the turn is settled with the
+        // cancellation in the same transaction, so a refused turn never stays
+        // pending for recovery to report as interrupted. Lock order: grant ->
+        // session -> evidence, as below.
+        if (opts.leaseOwner !== undefined) {
+          await this.#settleRefusedReservationTx(tx, harnessName, admission, opts.leaseOwner);
+        }
         await tx.commit();
         return { status: 'cancelled', admission: { ...admission, status: 'cancelled' } };
       }
@@ -5211,6 +5228,43 @@ export class HarnessPG extends HarnessStorage {
       if (!tx.closed) await tx.rollback();
       throw err;
     }
+  }
+
+  async #settleRefusedReservationTx(
+    tx: PgHarnessClient,
+    harnessName: string,
+    admission: HarnessTerminalAdmissionRecord,
+    leaseOwner: HarnessSessionLeasePrecondition,
+  ): Promise<void> {
+    const session = await tx.execute({
+      sql: `SELECT owner_id, lease_expires_at, closed_at FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ? LIMIT 1 FOR UPDATE`,
+      args: [harnessName, admission.sessionId],
+    });
+    if (!rowHoldsSessionLease(session.rows[0] as Record<string, unknown> | undefined, leaseOwner)) return;
+    const evidenceId = messageEvidenceId({ harnessName, sessionId: admission.sessionId, signalId: admission.signalId });
+    const row = await tx.execute({
+      sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+      args: [evidenceId],
+    });
+    if (!row.rows[0]) return;
+    const current = rowToMessageResultEvidence(row.rows[0] as Record<string, unknown>);
+    if (
+      current.status !== 'pending' ||
+      current.operationKind !== 'message' ||
+      current.admissionId !== admission.admissionId ||
+      current.admissionHash !== admission.admissionHash ||
+      (current.dispatch !== undefined && current.dispatch.state !== 'reserved')
+    ) {
+      return;
+    }
+    const cancelled = new HarnessTerminalHandoffCancelledError(admission.executionGrant.key);
+    await tx.execute({
+      sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+            SET status = 'failed', error = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'`,
+      args: [JSON.stringify({ code: cancelled.code, message: cancelled.message }), Date.now(), evidenceId],
+    });
   }
 
   async loadTerminalAdmission(
@@ -5684,6 +5738,89 @@ export class HarnessPG extends HarnessStorage {
     }
   }
 
+  async revokeTerminalGrant(
+    input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt> {
+    this.#assertTerminalHandoffEnabled();
+    await this.#ensureTerminalHandoffTables();
+    validateHarnessTerminalExecutionGrant(input.executionGrant);
+    const harnessName = this.#resolveHarnessName(input.harnessName);
+    if (!input.sessionId || !input.admissionId) {
+      throw new HarnessTerminalHandoffValidationError('revoke', 'session and admission ids are required');
+    }
+    const now = input.revokedAt ?? Date.now();
+    assertTerminalClock(now, 'revokedAt');
+    const grant = { ...input.executionGrant };
+    const tombstoneId = harnessTerminalGrantTombstoneId({ harnessName, executionGrant: grant });
+    const tx = await this.#client.transaction('write');
+    try {
+      // The grant lock serializes this with admission, commit and cancel of the
+      // same grant: an admission either committed before it (returned as is)
+      // or runs after it and finds the tombstone.
+      await this.#lockTerminalGrant(tx, harnessName, grant);
+      // The session row is the execution-closure export's serialization point.
+      // Writing it (a no-op that leaves `version` unchanged) makes a
+      // REPEATABLE READ export whose snapshot predates this revocation fail
+      // when it retires the row, so the export is retried and carries the
+      // tombstone. An export that already retired the row is seen here: the
+      // session's admissions now belong to the store it was imported into, so
+      // a tombstone here would fence nothing and the revocation is refused.
+      // Lock order: grant -> session, as in admission and commit.
+      const sessionRow = await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_SESSIONS} SET version = version
+              WHERE harness_name = ? AND id = ? RETURNING owner_id`,
+        args: [harnessName, input.sessionId],
+      });
+      if (sessionRow.rows[0]?.owner_id === EXPORTED_FENCE_AUTHORITY) {
+        throw new HarnessTerminalHandoffFencedError(input.sessionId);
+      }
+      const admissionRow = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+              WHERE harness_name = ? AND grant_key = ? AND grant_generation = ?
+              LIMIT 1`,
+        args: [harnessName, grant.key, grant.generation],
+      });
+      if (admissionRow.rows[0]) {
+        const admission = rowToHarnessTerminalAdmission(admissionRow.rows[0] as Record<string, unknown>);
+        if (admission.sessionId !== input.sessionId || admission.admissionId !== input.admissionId) {
+          throw new HarnessTerminalHandoffIdentityConflictError(grant.key);
+        }
+        await tx.commit();
+        return { status: 'admitted', grant, tombstoneId, admission };
+      }
+      const tombstoneRow = await tx.execute({
+        sql: `SELECT created_at FROM ${TABLE_HARNESS_TERMINAL_TOMBSTONES} WHERE id = ? LIMIT 1`,
+        args: [tombstoneId],
+      });
+      if (tombstoneRow.rows[0]) {
+        await tx.commit();
+        return { status: 'duplicate', grant, tombstoneId, revokedAt: Number(tombstoneRow.rows[0].created_at) };
+      }
+      // A revocation has no admission identity: incarnation and hash stay NULL.
+      await tx.execute({
+        sql: `INSERT INTO ${TABLE_HARNESS_TERMINAL_TOMBSTONES}
+              (id, harness_name, grant_key, grant_generation, session_id, session_incarnation,
+               admission_id, admission_hash, reason_json, created_at)
+              VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
+        args: [
+          tombstoneId,
+          harnessName,
+          grant.key,
+          grant.generation,
+          input.sessionId,
+          input.admissionId,
+          JSON.stringify(input.reason),
+          now,
+        ],
+      });
+      await tx.commit();
+      return { status: 'revoked', grant, tombstoneId, revokedAt: now };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
+  }
+
   async claimTerminalIntents(input: HarnessTerminalClaimInput): Promise<HarnessTerminalClaimReceipt> {
     this.#assertTerminalHandoffEnabled();
     await this.#ensureTerminalHandoffTables();
@@ -6088,6 +6225,14 @@ export class HarnessPG extends HarnessStorage {
     const id = messageEvidenceId({ harnessName, sessionId: input.sessionId, signalId: input.signalId });
     const tx = await this.#client.transaction('write');
     try {
+      // A lease-fenced stamp locks the session row before the evidence row, the
+      // order recovery settlement (`compareAndSwapSignalTerminal`) and
+      // `commitTerminalHandoff` use, so no other owner can take the lease (and
+      // recover the turn) until the stamp commits.
+      const leaseRow =
+        input.leaseOwner === undefined
+          ? undefined
+          : await this.#lockSessionLeaseRowTx(tx, harnessName, input.sessionId);
       const selected = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
         args: [id],
@@ -6112,6 +6257,25 @@ export class HarnessPG extends HarnessStorage {
       if (isTerminalMessageEvidence(current) || !signalDispatchMatches(current, input.expected)) {
         await tx.commit();
         return { applied: false, evidence: current };
+      }
+      // Ownership, as the reservation fence judges it: a lease that expired
+      // untaken still names its owner, and no other process can have adopted
+      // or recovered the session. Liveness is the caller's own last check
+      // before dispatch.
+      if (input.leaseOwner !== undefined && leaseRow?.closed_at != null) {
+        await tx.commit();
+        throw new HarnessStorageSessionClosedError(input.sessionId);
+      }
+      if (
+        input.leaseOwner !== undefined &&
+        (leaseRow === undefined || leaseRow.owner_id !== input.leaseOwner.ownerId)
+      ) {
+        await tx.commit();
+        throw new HarnessStorageLeaseConflictError(
+          input.sessionId,
+          typeof leaseRow?.owner_id === 'string' ? leaseRow.owner_id : '',
+          leaseRow?.lease_expires_at == null ? 0 : Number(leaseRow.lease_expires_at),
+        );
       }
       const evidence: AgentSignalResultEvidence = {
         ...(current as Extract<AgentSignalResultEvidence, { status: 'pending' }>),
@@ -9373,6 +9537,7 @@ export class HarnessPG extends HarnessStorage {
         schema: TABLE_SCHEMAS[TABLE_HARNESS_TERMINAL_INTENTS],
         ifNotExists: ['consumer_id'],
       });
+      await this.#relaxTerminalTombstoneIdentityColumns();
       await this.#createDefaultIndexes([
         'idx_harness_terminal_admissions_grant',
         'idx_harness_terminal_admissions_run',
@@ -9384,6 +9549,43 @@ export class HarnessPG extends HarnessStorage {
       throw error;
     });
     return this.#terminalHandoffReady;
+  }
+
+  /**
+   * A pre-admission grant revocation has no admission identity, so its
+   * tombstone stores NULL `session_incarnation` and `admission_hash`. Tables
+   * created before that column contract required both; relax them once.
+   * Existing rows keep their values, and readers only use `id`/`created_at`.
+   * DROP NOT NULL takes an AccessExclusiveLock even on a nullable column, so
+   * alter only what the catalog still reports as required. In external-schema
+   * mode the operator owns the migration (see `getExportDDL()`); until it is
+   * applied a revocation fails on the NOT NULL constraint and writes nothing.
+   */
+  async #relaxTerminalTombstoneIdentityColumns(): Promise<void> {
+    if (this.#db.isExternalSchemaMode()) return;
+    const required = await this.#client.execute({
+      sql: `SELECT column_name FROM information_schema.columns
+            WHERE table_schema = ? AND table_name = ? AND column_name IN (?, ?) AND is_nullable = 'NO'`,
+      args: [this.#schema, TABLE_HARNESS_TERMINAL_TOMBSTONES, 'session_incarnation', 'admission_hash'],
+    });
+    for (const row of required.rows) {
+      const column = String(row.column_name);
+      if (column !== 'session_incarnation' && column !== 'admission_hash') continue;
+      try {
+        await this.#client.execute(
+          `ALTER TABLE ${TABLE_HARNESS_TERMINAL_TOMBSTONES} ALTER COLUMN ${column} DROP NOT NULL`,
+        );
+      } catch (error) {
+        // A least-privilege runtime role cannot alter a table it does not own.
+        // Initialization still succeeds; revocations fail closed on the
+        // constraint until the table owner applies the migration.
+        if ((error as { code?: unknown }).code !== '42501') throw error;
+        this.logger?.warn?.(
+          `Cannot make ${TABLE_HARNESS_TERMINAL_TOMBSTONES}.${column} nullable (insufficient privilege); terminal grant revocation fails until the table owner drops its NOT NULL constraint`,
+        );
+        return;
+      }
+    }
   }
 
   async #ensureOperationTombstonesTable(): Promise<void> {

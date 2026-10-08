@@ -96,6 +96,7 @@ import type {
   AgentSignalDispatchState,
   AgentSignalResultEvidence,
   AgentSignalResultStatus,
+  CompareAndSwapSignalDispatchResult,
   HarnessAssistantDraft,
   HarnessPlanTask,
   HarnessPlanTaskStatus,
@@ -1866,11 +1867,16 @@ export class Session {
    * the time `_awaitRunCompletion(runId)` runs the terminal chunk may already
    * have been processed. Entries are retained so duplicate admission waiters
    * that converge on the same run can all observe the terminal result.
+   * `runFailed` marks a failure the run's own output reported (a provider or
+   * agent error), as opposed to harness bookkeeping around the run.
    */
   private readonly _completedRuns = new Map<
     string,
-    { ok: true; full: FullOutput<unknown>; resumeAccountingKey?: string } | { ok: false; err: unknown }
+    | { ok: true; full: FullOutput<unknown>; resumeAccountingKey?: string }
+    | { ok: false; err: unknown; runFailed?: true }
   >();
+  /** Runs of aborted native terminal turns whose output had not settled yet (bounded). */
+  private readonly _abortedTerminalRunIds = new Set<string>();
   /**
    * Message admission retries can observe `_completedRuns` before the original
    * message continuation has accounted usage. Track run ids accounted through
@@ -4701,6 +4707,86 @@ export class Session {
     // drain — duplicate/suspended callers retained here would wait forever.
     if (runId !== undefined) this._drainTerminalObservers(runId, pending);
     return pending;
+  }
+
+  /**
+   * Whether a dispatched native terminal turn failed because its run's own
+   * output rejected — a provider or agent error the run surfaced — rather than
+   * harness bookkeeping around the run (output drain, run materialization,
+   * usage persistence, suspension parking, the commit itself) or the turn
+   * waiter (abort, delete, close). Only the run's outcome is known in the
+   * former, so only it may be committed as a durable `failed` terminal; the
+   * rest stays indeterminate for a retry or reconciliation that can still
+   * commit the true outcome. An aborted turn is never a run failure: its cached
+   * failure is demoted so a later same-admission retry does not commit it.
+   */
+  private _isRejectedTerminalRun(runId: string, err: unknown, turnAbortSignal: AbortSignal): boolean {
+    if (turnAbortSignal.aborted) {
+      this._noteAbortedTerminalRun(runId);
+      return false;
+    }
+    const cached = this._completedRuns.get(runId);
+    return cached !== undefined && !cached.ok && cached.runFailed === true && cached.err === err;
+  }
+
+  /**
+   * An aborted turn's run is never a run failure, whichever settles first: the
+   * cached failure is demoted, or — when the abort released the caller before
+   * the run's output failed — the run is remembered so its later failure is
+   * not marked, and a same-admission retry never commits it as failed.
+   */
+  private _noteAbortedTerminalRun(runId: string): void {
+    const cached = this._completedRuns.get(runId);
+    if (cached !== undefined) {
+      if (!cached.ok) delete cached.runFailed;
+      return;
+    }
+    this._abortedTerminalRunIds.add(runId);
+    while (this._abortedTerminalRunIds.size > 64) {
+      const oldest = this._abortedTerminalRunIds.values().next().value;
+      if (oldest === undefined) return;
+      this._abortedTerminalRunIds.delete(oldest);
+    }
+  }
+
+  /**
+   * Commit the durable `failed` terminal result (failed evidence plus its
+   * delivery intent) of a dispatched run whose own output rejected. On success
+   * the receipt reaches `onReceipt` and retained observers, and the caller
+   * rejects with the run's own error. When the commit itself fails, the
+   * failure is the terminal error the commit helper reported (indeterminate
+   * `harness.terminal_pending`, or a cancelled/fenced outcome): a
+   * same-admission retry in this process can still commit the failure.
+   */
+  private async _settleRejectedTerminalRun(
+    identity: HarnessTerminalIdentity,
+    err: unknown,
+    options: {
+      modeId?: string;
+      modelId?: string;
+      onReceipt?: (receipt: HarnessTerminalCommitReceipt) => void;
+      onFailure?: (error: HarnessTerminalHandoffError) => void;
+    },
+    activeTurnWaiter: Promise<never>,
+  ): Promise<{ committed: boolean; failure: unknown }> {
+    const commit = this._commitTerminalHandoff(identity, new RejectedTerminalRun(err), options);
+    void commit.catch(() => {});
+    try {
+      await this._raceActiveTurnWaiter(commit, activeTurnWaiter);
+      return { committed: true, failure: err };
+    } catch (error) {
+      // A failed commit already reported its terminal error. An aborted or
+      // deleted turn stops waiting, as a completed turn's commit does: the
+      // caller gets the indeterminate outcome and the detached commit still
+      // settles the durable result for its observers and reconciliation.
+      return {
+        committed: false,
+        failure:
+          error instanceof HarnessTerminalHandoffError
+            ? error
+            : this._terminalFailure(error, options.onFailure, identity.runId),
+      };
+    }
   }
 
   private async _withActiveDeletedWaiter<T>(fn: (activeTurnWaiter: Promise<never>) => Promise<T>): Promise<T> {
@@ -7824,8 +7910,26 @@ export class Session {
       if (waiter) waiter.reject(cached.err);
       return;
     }
+    let rawFull: FullOutput<unknown>;
     try {
-      const rawFull = (await out.getFullOutput()) as FullOutput<unknown>;
+      rawFull = (await out.getFullOutput()) as FullOutput<unknown>;
+    } catch (err) {
+      // Only an explicit terminal failure of the run is a run failure: its
+      // stream emitted an `error` chunk (a provider or agent error, including
+      // a provider AbortError the loop did not treat as cancellation), which
+      // marks the output failed and rejects every pending output promise with
+      // that same error. A collector that closed without a terminal chunk, or a
+      // stream consumption failure, rejects with another error and leaves the
+      // run's outcome unknown.
+      const aborted = this._abortedTerminalRunIds.delete(runId);
+      const runFailed = !aborted && out.status === 'failed' && out.error !== undefined && out.error === err;
+      this._runToolReceipts.delete(runId);
+      this._rememberCompletedRun(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
+      if (waiter) waiter.reject(err);
+      return;
+    }
+    this._abortedTerminalRunIds.delete(runId);
+    try {
       // Close dangling tools while their receipt state can still be attached to
       // this run's output. Suspended tools remain parked for their real terminal.
       if (rawFull.finishReason !== 'suspended' && this._currentRunId === runId) {
@@ -7843,7 +7947,7 @@ export class Session {
 
   private _rememberCompletedRun(
     runId: string,
-    entry: { ok: true; full: FullOutput<unknown> } | { ok: false; err: unknown },
+    entry: { ok: true; full: FullOutput<unknown> } | { ok: false; err: unknown; runFailed?: true },
   ): void {
     const existing = this._completedRuns.get(runId);
     if (existing !== undefined) {
@@ -8622,6 +8726,9 @@ export class Session {
       throw err;
     }
 
+    // The dispatch claim this attempt stamped, checked once more as the last
+    // step before `sendSignal` (below).
+    let dispatchClaim: { claimExpiresAt: number; signalId: string } | undefined;
     if (admissionIdentity !== undefined && admissionHash !== undefined && admissionStart !== undefined) {
       try {
         const reservation = await Promise.race([
@@ -8686,13 +8793,19 @@ export class Session {
                     executionGrant: opts.executionAuthorityGrant!,
                   })
                 : undefined;
+            const dispatch = (existing as AgentSignalResultEvidence).dispatch;
+            const dispatchNotStarted = dispatch === undefined || dispatch.state === 'reserved';
             // A stored admission that is already cancelled or fenced can never
             // produce completed evidence — surface the durable outcome now
-            // instead of waiting out the generic duplicate path.
+            // instead of waiting out the generic duplicate path. An
+            // undispatched turn of a cancelled grant instead goes through the
+            // admission below, whose refusal settles its reservation with the
+            // cancellation in the same step.
             if (
               probedTerminalAdmission !== undefined &&
               probedTerminalAdmission !== null &&
-              (probedTerminalAdmission.status === 'cancelled' || probedTerminalAdmission.status === 'fenced')
+              (probedTerminalAdmission.status === 'fenced' ||
+                (probedTerminalAdmission.status === 'cancelled' && !dispatchNotStarted))
             ) {
               const terminalError =
                 probedTerminalAdmission.status === 'cancelled'
@@ -8705,12 +8818,11 @@ export class Session {
               }
               throw terminalError;
             }
-            const dispatch = (existing as AgentSignalResultEvidence).dispatch;
-            const dispatchNotStarted = dispatch === undefined || dispatch.state === 'reserved';
             const strandedPendingTerminal =
               probedTerminalAdmission !== undefined &&
               (probedTerminalAdmission === null ||
-                (probedTerminalAdmission.status === 'pending' && dispatchNotStarted));
+                ((probedTerminalAdmission.status === 'pending' || probedTerminalAdmission.status === 'cancelled') &&
+                  dispatchNotStarted));
             if (!strandedPendingTerminal) {
               releaseDuplicateStart();
               try {
@@ -8746,29 +8858,48 @@ export class Session {
         // admitted turn is stamped too when the storage supports orphaned-
         // dispatch recovery, which settles unstamped reservations: an owner that
         // stalled after its reservation then loses the CAS instead of
-        // dispatching a turn recovery already interrupted.
+        // dispatching a turn recovery already interrupted. The stamp is also
+        // fenced on this process holding the session lease when it commits:
+        // an owner whose session another process adopted is refused (typed
+        // lease/closed error below) and never dispatches.
         if (terminalHandoffTurn || (terminalIdentity === undefined && this._storage.supportsDispatchRecovery)) {
           if (admissionIdentity !== undefined && admissionHash !== undefined) {
             const claimExpiresAt = Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS;
-            const stamped = await this._storage.compareAndSwapSignalDispatch({
-              harnessName: this._record.harnessName,
-              sessionId: this.id,
-              resourceId: this.resourceId,
-              threadId: this.threadId,
-              signalId: admissionIdentity.signalId,
-              admissionId: opts.admissionId!,
-              admissionHash,
-              operationKind: 'message',
-              expected: { state: 'reserved' },
-              next: {
-                state: 'dispatching',
-                attemptId: `${terminalHandoffTurn ? 'terminal' : 'message'}-dispatch-${randomUUID()}`,
-                claimExpiresAt,
-                delivery: terminalHandoffTurn || sub.activeRunId() === null ? 'idle' : 'active',
-                runId: admissionIdentity.runId,
-              },
-              updatedAt: Date.now(),
-            });
+            let stamped: CompareAndSwapSignalDispatchResult;
+            try {
+              stamped = await this._storage.compareAndSwapSignalDispatch({
+                harnessName: this._record.harnessName,
+                sessionId: this.id,
+                resourceId: this.resourceId,
+                threadId: this.threadId,
+                signalId: admissionIdentity.signalId,
+                admissionId: opts.admissionId!,
+                admissionHash,
+                operationKind: 'message',
+                expected: { state: 'reserved' },
+                next: {
+                  state: 'dispatching',
+                  attemptId: `${terminalHandoffTurn ? 'terminal' : 'message'}-dispatch-${randomUUID()}`,
+                  claimExpiresAt,
+                  delivery: terminalHandoffTurn || sub.activeRunId() === null ? 'idle' : 'active',
+                  runId: admissionIdentity.runId,
+                },
+                leaseOwner: { ownerId: this._harness.ownerId },
+                updatedAt: Date.now(),
+              });
+            } catch (err) {
+              // A hard delete that raced the stamp removed the lease with the
+              // session: report the deletion, as the claim check below does.
+              if (this._state === 'deleted') {
+                throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
+              }
+              // The reservation stays unstamped; whoever holds the lease next
+              // settles it. Keep recovery due in case that is this process.
+              if (err instanceof HarnessStorageLeaseConflictError || err instanceof HarnessStorageSessionClosedError) {
+                this._scheduleOrphanRecheck(Date.now());
+              }
+              throw err;
+            }
             if (!stamped.applied) {
               const registeredStart = this._messageAdmissionStarts.get(opts.admissionId!);
               if (registeredStart !== undefined) registeredStart.duplicate = true;
@@ -8780,36 +8911,7 @@ export class Session {
                 finishOwnedMessageTurn();
               }
             }
-            // The claim's acknowledgement may arrive after the claim or this
-            // session's lease lapsed, when recovery elsewhere may already have
-            // interrupted the turn. Never dispatch on a lapsed claim: re-read
-            // the turn and fail closed. A turn still pending is left for the
-            // recovery made due here.
-            if (!this._dispatchClaimStillHeld(claimExpiresAt)) {
-              if (this._state === 'deleted') {
-                throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
-              }
-              this._scheduleOrphanRecheck(Date.now());
-              const latest = await this._storage.loadMessageResultEvidence({
-                harnessName: this._record.harnessName,
-                sessionId: this.id,
-                resourceId: this.resourceId,
-                threadId: this.threadId,
-                signalId: admissionIdentity.signalId,
-              });
-              if (latest !== null && 'status' in latest && latest.status !== 'pending') {
-                const registeredStart = this._messageAdmissionStarts.get(opts.admissionId!);
-                if (registeredStart !== undefined) registeredStart.duplicate = true;
-                this._messageAdmissionStarts.delete(opts.admissionId!);
-                admissionStart.resolve(latest);
-                try {
-                  return await this._returnDuplicateMessageResult(latest, opts);
-                } finally {
-                  finishOwnedMessageTurn();
-                }
-              }
-              throw new HarnessConfigError('message()', 'durable message dispatch claim lapsed before dispatch');
-            }
+            dispatchClaim = { claimExpiresAt, signalId: admissionIdentity.signalId };
           }
         }
       } catch (err) {
@@ -8828,6 +8930,56 @@ export class Session {
       assertOwnedMessageTurnNotDeleted();
     }
     reportAdmissionPhase('evidence_reserved');
+
+    // Last step before `sendSignal`: the claim's acknowledgement (or the
+    // caller's synchronous phase observer above) may have outlasted the claim
+    // or this session's lease, when recovery elsewhere may already have
+    // interrupted the turn. Never dispatch on a lapsed claim: re-read the turn
+    // and fail closed. A turn still pending is left for the recovery made due
+    // here.
+    //
+    // Residual, not closable here: `sendSignal` returns synchronously and the
+    // thread runtime issues the provider request asynchronously. A process
+    // pause between this check and that request which outlives the claim lets
+    // an adopter interrupt the turn while this process still calls the
+    // provider once. No storage fence can cover the provider's network
+    // request; the claim TTL bounds how stale this check can be, not how long
+    // the process can pause.
+    if (dispatchClaim !== undefined && !this._dispatchClaimStillHeld(dispatchClaim.claimExpiresAt)) {
+      let latest: AgentSignalResultEvidence | OperationAdmissionTombstone | null;
+      try {
+        if (this._state === 'deleted') {
+          throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
+        }
+        this._scheduleOrphanRecheck(Date.now());
+        latest = await this._storage.loadMessageResultEvidence({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          signalId: dispatchClaim.signalId,
+        });
+      } catch (err) {
+        failOwnedMessageTurnBeforeDispatch(err);
+        throw redactPublicBoundaryRejection(err);
+      }
+      if (latest !== null && 'status' in latest && latest.status !== 'pending') {
+        const registeredStart = this._messageAdmissionStarts.get(opts.admissionId!);
+        if (registeredStart !== undefined) registeredStart.duplicate = true;
+        this._messageAdmissionStarts.delete(opts.admissionId!);
+        admissionStart?.resolve(latest);
+        try {
+          return await this._returnDuplicateMessageResult(latest, opts);
+        } catch (err) {
+          throw redactPublicBoundaryRejection(err);
+        } finally {
+          finishOwnedMessageTurn();
+        }
+      }
+      const lapsed = new HarnessConfigError('message()', 'durable message dispatch claim lapsed before dispatch');
+      failOwnedMessageTurnBeforeDispatch(lapsed);
+      throw lapsed;
+    }
 
     let signal;
     let nativeDispatchStarted = false;
@@ -9186,11 +9338,28 @@ export class Session {
           streamAgentEndEmitted = true;
           await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
         })
-        .catch(err => {
-          const failure =
-            terminalIdentity !== undefined && !streamAgentEndEmitted
-              ? this._terminalFailure(err, opts.onTerminalCommitError, terminalIdentity?.runId)
-              : err;
+        .catch(async err => {
+          // A run whose own output rejected commits a durable failed terminal;
+          // any other failure before the terminal commit stays indeterminate.
+          let terminalCommitted = false;
+          let failure: unknown = err;
+          if (terminalIdentity !== undefined && !streamAgentEndEmitted) {
+            if (this._isRejectedTerminalRun(signal.runId, err, turnAbortSignal)) {
+              ({ committed: terminalCommitted, failure } = await this._settleRejectedTerminalRun(
+                terminalIdentity,
+                err,
+                {
+                  modeId: effectiveModeId,
+                  modelId: effectiveModelId,
+                  onReceipt: opts.onTerminalCommit,
+                  onFailure: opts.onTerminalCommitError,
+                },
+                activeTurnWaiter.promise,
+              ));
+            } else {
+              failure = this._terminalFailure(err, opts.onTerminalCommitError, terminalIdentity.runId);
+            }
+          }
           if (
             admissionIdentity !== undefined &&
             !streamCompletedEvidenceWriteFailed &&
@@ -9213,7 +9382,7 @@ export class Session {
             ).catch(() => {});
           }
           if (!streamAgentEndEmitted) {
-            if (terminalIdentity !== undefined) {
+            if (terminalIdentity !== undefined && !terminalCommitted) {
               // Provider EOF is not native terminal settlement. Surface the
               // typed handoff result separately so Doxa can retain an
               // indeterminate/pending operation instead of refunding or
@@ -9310,10 +9479,27 @@ export class Session {
       await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
       return full;
     } catch (err) {
-      const failure =
-        terminalIdentity !== undefined && !agentEndEmitted
-          ? this._terminalFailure(err, opts.onTerminalCommitError, terminalIdentity?.runId)
-          : err;
+      // A run whose own output rejected commits a durable failed terminal;
+      // any other failure before the terminal commit stays indeterminate.
+      let terminalCommitted = false;
+      let failure: unknown = err;
+      if (terminalIdentity !== undefined && !agentEndEmitted) {
+        if (this._isRejectedTerminalRun(signal.runId, err, turnAbortSignal)) {
+          ({ committed: terminalCommitted, failure } = await this._settleRejectedTerminalRun(
+            terminalIdentity,
+            err,
+            {
+              modeId: effectiveModeId,
+              modelId: effectiveModelId,
+              onReceipt: opts.onTerminalCommit,
+              onFailure: opts.onTerminalCommitError,
+            },
+            activeTurnWaiter.promise,
+          ));
+        } else {
+          failure = this._terminalFailure(err, opts.onTerminalCommitError, terminalIdentity.runId);
+        }
+      }
       if (!streamStarted) {
         void completion.catch(() => {});
         const waiter = this._runCompletionPromises.get(signal.runId);
@@ -9346,7 +9532,7 @@ export class Session {
         ]);
       }
       if (!agentEndEmitted) {
-        if (terminalIdentity !== undefined) {
+        if (terminalIdentity !== undefined && !terminalCommitted) {
           // Keep the native commit barrier observable independently of the
           // provider's terminal event. Canonical evidence remains pending
           // until a later native receipt/reconciliation wins.
@@ -9584,6 +9770,16 @@ export class Session {
             const runId = await this._pendingMessageRunId(evidence);
             if (runId && this._completedRuns.has(runId)) {
               const cached = this._completedRuns.get(runId);
+              // A run whose own output rejected in this process: commit its
+              // durable failed terminal instead of leaving it pending.
+              if (cached !== undefined && !cached.ok && cached.runFailed === true) {
+                await this._commitCachedDuplicateTerminal(
+                  new RejectedTerminalRun(cached.err),
+                  evidence,
+                  opts,
+                  activeDeleted,
+                );
+              }
               if (cached?.ok && evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
                 await this._prepareCachedDuplicateMessageCompletion(cached.full, evidence, opts, activeDeleted);
                 const terminalCommitted = await this._commitCachedDuplicateTerminal(
@@ -9709,12 +9905,28 @@ export class Session {
                     this._terminalFailure(err, undefined, runId);
                   }
                 })
-                .catch(err => {
-                  // A rejection here means `_awaitRunCompletion` itself failed
-                  // (collector or output-drain) — the `.then` never ran, so no
-                  // settlement helper saw the failure. Drain the retained
-                  // observers with the indeterminate outcome; the admission
-                  // stays pending for recovery either way.
+                .catch(async err => {
+                  // A run whose own output rejected commits its durable failed
+                  // terminal (the commit drains the retained observers).
+                  const cached = this._completedRuns.get(runId!);
+                  if (
+                    identity !== undefined &&
+                    cached !== undefined &&
+                    !cached.ok &&
+                    cached.runFailed === true &&
+                    cached.err === err
+                  ) {
+                    await this._commitTerminalHandoff(identity, new RejectedTerminalRun(err), {
+                      modeId: duplicateMode,
+                      modelId: duplicateModel,
+                    }).catch(() => {});
+                    return;
+                  }
+                  // Otherwise `_awaitRunCompletion` itself failed (collector or
+                  // output-drain) — the `.then` never ran, so no settlement
+                  // helper saw the failure. Drain the retained observers with
+                  // the indeterminate outcome; the admission stays pending for
+                  // recovery either way.
                   this._terminalFailure(err, undefined, runId);
                 });
               return output;
@@ -9735,6 +9947,7 @@ export class Session {
               activeDeleted,
             );
           }
+          if (evidence.status === 'failed') await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
           throw new HarnessValidationError('message().admissionId', 'duplicate stream is no longer live');
         }
         if (evidence.status === 'completed') {
@@ -9751,7 +9964,10 @@ export class Session {
           }
           return evidence.result as AgentResult;
         }
-        if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
+        if (evidence.status === 'failed') {
+          await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
+          throw publicErrorProjectionToError(evidence.error);
+        }
         const runId = await this._pendingMessageRunId(evidence);
         if (runId) {
           const duplicateModeId = this._messageDuplicateModeId(evidence, opts);
@@ -9760,7 +9976,20 @@ export class Session {
           await this._raceActiveTurnWaiter(this._ensureThreadSubscription(agent), activeDeleted);
           const cached = this._completedRuns.get(runId);
           if (cached) {
-            if (!cached.ok) throw cached.err;
+            if (!cached.ok) {
+              // A run whose own output rejected in this process: commit its
+              // durable failed terminal (a no-op replay once committed), then
+              // report the run's failure as before.
+              if (cached.runFailed === true) {
+                await this._commitCachedDuplicateTerminal(
+                  new RejectedTerminalRun(cached.err),
+                  evidence,
+                  opts,
+                  activeDeleted,
+                );
+              }
+              throw cached.err;
+            }
             if (evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
               await this._prepareCachedDuplicateMessageCompletion(cached.full, evidence, opts, activeDeleted);
               const terminalCommitted = await this._commitCachedDuplicateTerminal(
@@ -9786,17 +10015,36 @@ export class Session {
             return cached.full;
           }
           if (!this._hasLiveMessageRun(agent, runId)) {
-            const durable = await this._raceActiveTurnWaiter(
-              this._awaitDurableMessageResult(evidence, opts),
-              activeDeleted,
-            );
+            let durable: AgentResult;
+            try {
+              durable = await this._raceActiveTurnWaiter(
+                this._awaitDurableMessageResult(evidence, opts),
+                activeDeleted,
+              );
+            } catch (err) {
+              // The admission may have committed a failed or interrupted
+              // terminal meanwhile: replay its durable receipt to this retry.
+              await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
+              throw err;
+            }
             // The durable wait resolved because the admission committed — the
             // committed fast-path replays the stored receipt so this retry's
             // terminal observers see the same outcome as the winner's caller.
             await this._commitCachedDuplicateTerminal(durable as FullOutput<unknown>, evidence, opts, activeDeleted);
             return durable;
           }
-          const live = await this._raceActiveTurnWaiter(this._awaitRunCompletion(runId), activeDeleted);
+          let live: FullOutput<unknown>;
+          try {
+            live = await this._raceActiveTurnWaiter(this._awaitRunCompletion(runId), activeDeleted);
+          } catch (err) {
+            // A live run whose own output rejected: commit (or replay) its
+            // durable failed terminal for this retry, then report the failure.
+            const rejected = this._completedRuns.get(runId);
+            if (rejected !== undefined && !rejected.ok && rejected.runFailed === true && rejected.err === err) {
+              await this._commitCachedDuplicateTerminal(new RejectedTerminalRun(err), evidence, opts, activeDeleted);
+            }
+            throw err;
+          }
           if (evidence.admissionId !== undefined && evidence.admissionHash !== undefined) {
             await this._prepareCachedDuplicateMessageCompletion(live, evidence, opts, activeDeleted);
             const terminalCommitted = await this._commitCachedDuplicateTerminal(live, evidence, opts, activeDeleted);
@@ -9828,7 +10076,7 @@ export class Session {
    * only valid for turns that did not opt into native terminal handoff.
    */
   private async _commitCachedDuplicateTerminal(
-    full: FullOutput<unknown>,
+    full: FullOutput<unknown> | RejectedTerminalRun,
     evidence: AgentSignalResultEvidence,
     opts: MessageOptions,
     activeDeleted?: Promise<never>,
@@ -9857,6 +10105,58 @@ export class Session {
       activeDeleted,
     );
     return true;
+  }
+
+  /**
+   * A same-admission retry whose turn already committed a non-completed
+   * terminal — a rejected run's `failed` result, or an interrupted dispatch's
+   * `aborted` one — gets that durable receipt replayed to its
+   * `onTerminalCommit`, as a retry of a completed turn does, before it reports
+   * the failure. An admission that is not committed is left alone, and a
+   * failed lookup only skips the replay: the durable intent is authoritative.
+   */
+  private async _replayCommittedTerminalFailure(
+    evidence: AgentSignalResultEvidence,
+    opts: MessageOptions,
+    activeDeleted?: Promise<never>,
+  ): Promise<void> {
+    const grant = opts.executionAuthorityGrant;
+    if (
+      opts.onTerminalCommit === undefined ||
+      grant === undefined ||
+      evidence.admissionId === undefined ||
+      !this._storage.supportsTerminalHandoff
+    ) {
+      return;
+    }
+    let receipt: HarnessTerminalCommitReceipt;
+    try {
+      const admission = await this._raceActiveTurnWaiter(
+        this._storage.loadTerminalAdmission({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          admissionId: evidence.admissionId,
+          executionGrant: grant,
+        }),
+        activeDeleted,
+      );
+      if (admission?.status !== 'committed' || admission.terminalResult?.status === 'completed') return;
+      const intent = await this._raceActiveTurnWaiter(
+        this._storage.loadTerminalIntent({
+          harnessName: admission.harnessName,
+          intentId: harnessTerminalIntentId(admission.id),
+        }),
+        activeDeleted,
+      );
+      receipt = { status: 'duplicate', admission, ...(intent !== null ? { intent } : {}) };
+    } catch {
+      return;
+    }
+    try {
+      opts.onTerminalCommit(receipt);
+    } catch {
+      // Receipt observers are diagnostics only and cannot change the durable winner.
+    }
   }
 
   private async _prepareCachedDuplicateMessageCompletion(
@@ -10068,6 +10368,14 @@ export class Session {
   private async _settleCancelledTerminalMessage(
     admission: HarnessTerminalAdmissionRecord,
     message: string,
+    options: {
+      /**
+       * Settle only a row that was never dispatched (no claim stamped). A
+       * dispatched row of a cancelled grant is left to its own run or to
+       * recovery once its claim expires.
+       */
+      requireUndispatched?: boolean;
+    } = {},
   ): Promise<void> {
     if (!this._storage.supportsDispatchRecovery) return;
     const scope = {
@@ -10084,7 +10392,10 @@ export class Session {
         evidence.status !== 'pending' ||
         evidence.operationKind !== 'message' ||
         evidence.admissionId !== admission.admissionId ||
-        evidence.admissionHash !== admission.admissionHash
+        evidence.admissionHash !== admission.admissionHash ||
+        (options.requireUndispatched === true &&
+          evidence.dispatch !== undefined &&
+          evidence.dispatch.state !== 'reserved')
       ) {
         return;
       }
@@ -10486,9 +10797,16 @@ export class Session {
     } catch (error) {
       return reportFailure(error);
     }
-    if (receipt.status === 'cancelled') {
-      return reportFailure(new HarnessTerminalHandoffCancelledError(identity.executionGrant.key));
-    }
+    // A revoked or cancelled grant never dispatches. Its reserved row is
+    // settled with the cancellation (best effort, fenced on this lease and the
+    // row's dispatch) so it neither blocks close nor is later published as an
+    // interrupted run; a same-admission retry replays the cancellation.
+    const reportCancelled = async (): Promise<never> => {
+      const cancelled = new HarnessTerminalHandoffCancelledError(identity.executionGrant.key);
+      await this._settleCancelledTerminalMessage(receipt.admission, cancelled.message, { requireUndispatched: true });
+      return reportFailure(cancelled);
+    };
+    if (receipt.status === 'cancelled') return reportCancelled();
     if (receipt.status === 'fenced') {
       return reportFailure(new HarnessTerminalHandoffFencedError(identity.sessionId));
     }
@@ -10503,9 +10821,7 @@ export class Session {
     // A `duplicate`/`admitted` envelope can still carry a dead stored row when
     // fencing or cancellation landed between the probe and the re-admission —
     // the stored status is authoritative and must never reach dispatch.
-    if (receipt.admission.status === 'cancelled') {
-      return reportFailure(new HarnessTerminalHandoffCancelledError(identity.executionGrant.key));
-    }
+    if (receipt.admission.status === 'cancelled') return reportCancelled();
     if (receipt.admission.status === 'fenced') {
       return reportFailure(new HarnessTerminalHandoffFencedError(identity.sessionId));
     }
@@ -10528,10 +10844,13 @@ export class Session {
    * the terminal result embeds a caller-side `completedAt`, so two committers
    * building independent results would produce divergent projection bytes and
    * force the loser into `harness.terminal_conflict` on an identical message.
+   *
+   * A `RejectedTerminalRun` (the run's own output rejected) commits a durable
+   * `failed` terminal result with failed evidence and its delivery intent.
    */
   private async _commitTerminalHandoff(
     identity: HarnessTerminalIdentity,
-    full: FullOutput<unknown>,
+    full: FullOutput<unknown> | RejectedTerminalRun,
     options: {
       modeId?: string;
       modelId?: string;
@@ -10577,7 +10896,7 @@ export class Session {
         // resume-side settlement that will drain them. A terminal caller must
         // NOT retain: the re-driven commit drains retained observers AND
         // invokes this caller's options directly, double-notifying it.
-        if (this._agentEndReasonForFullOutput(full) === 'suspended') {
+        if (!(full instanceof RejectedTerminalRun) && this._agentEndReasonForFullOutput(full) === 'suspended') {
           // `undefined` also covers the shared attempt CANCELLING its
           // admission — the record-size budget can drop the suspension's
           // durable park, making the deferral undeliverable. Deferral is only
@@ -10612,7 +10931,7 @@ export class Session {
 
   private async _runTerminalHandoffCommit(
     identity: HarnessTerminalIdentity,
-    full: FullOutput<unknown>,
+    outcome: FullOutput<unknown> | RejectedTerminalRun,
     options: {
       modeId?: string;
       modelId?: string;
@@ -10695,8 +11014,15 @@ export class Session {
       this._drainTerminalObservers(identity.runId, receipt);
       return receipt;
     }
-    const finishReason = typeof full.finishReason === 'string' ? full.finishReason : undefined;
-    const endReason = this._agentEndReasonForFullOutput(full);
+    // A rejected run produced no full output: its provider or agent failure is
+    // committed as a durable `failed` result with failed evidence.
+    const rejectedError =
+      outcome instanceof RejectedTerminalRun
+        ? boundHarnessTerminalError(projectHarnessPublicError(outcome.error))
+        : undefined;
+    const full = outcome instanceof RejectedTerminalRun ? undefined : outcome;
+    const finishReason = typeof full?.finishReason === 'string' ? full.finishReason : undefined;
+    const endReason = full === undefined ? 'error' : this._agentEndReasonForFullOutput(full);
     if (endReason === 'suspended') {
       // A suspended run has not reached a terminal outcome — the approval-gated
       // resume settles this admission later, so defer instead of sealing a
@@ -10768,7 +11094,9 @@ export class Session {
       completedAt: Date.now(),
       ...(endReason === 'error'
         ? {
-            error: boundHarnessTerminalError(projectHarnessPublicError(full.error ?? new Error('agent run failed'))),
+            error:
+              rejectedError ??
+              boundHarnessTerminalError(projectHarnessPublicError(full?.error ?? new Error('agent run failed'))),
           }
         : {}),
     };
@@ -10799,14 +11127,12 @@ export class Session {
     } catch (error) {
       return reportFailure(error);
     }
-    const evidence: AgentSignalResultEvidence = {
-      status: 'completed',
+    const evidenceIdentity = {
       signalId: identity.signalId,
       runId: identity.runId,
       modeId: options.modeId,
       modelId: options.modelId,
-      operationKind: 'message',
-      result: full,
+      operationKind: 'message' as const,
       admissionId: identity.admissionId,
       admissionHash: identity.admissionHash,
       harnessName: identity.harnessName,
@@ -10816,6 +11142,10 @@ export class Session {
       createdAt: admission.createdAt,
       updatedAt: Date.now(),
     };
+    const evidence: AgentSignalResultEvidence =
+      rejectedError !== undefined
+        ? { ...evidenceIdentity, status: 'failed', error: rejectedError }
+        : { ...evidenceIdentity, status: 'completed', result: full };
     let receipt: HarnessTerminalCommitReceipt;
     try {
       receipt = await this._storage.commitTerminalHandoff({
@@ -21675,6 +22005,15 @@ function lineagedSignalAcceptanceError(path: string, action: string): HarnessCon
     return new HarnessConfigError(path, 'a full logical message identity was blocked by a suspended thread');
   }
   return new HarnessConfigError(path, `a full logical message identity was not accepted (${action})`);
+}
+
+/**
+ * A dispatched native terminal run whose own output rejected (a provider or
+ * agent error). Settled through the terminal commit as a durable `failed`
+ * result; the finalizer receives no output.
+ */
+class RejectedTerminalRun {
+  constructor(readonly error: unknown) {}
 }
 
 function lineagedSignalRunMismatchError(path: string, expectedRunId: string, actualRunId: string): HarnessConfigError {
