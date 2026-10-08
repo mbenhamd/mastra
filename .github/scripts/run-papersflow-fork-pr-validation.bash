@@ -4811,6 +4811,27 @@ run_validator_self_tests() {
       > stores/cloudflare/src/kv/storage/types.ts
     printf '%s\n' "import { it } from 'vitest';" "it('cloudflare kv db', () => {});" \
       > stores/cloudflare/src/kv/storage/db/index.test.ts
+    for guard_adapter in dsql dynamodb elasticsearch mssql mysql oracledb spanner valkey convex; do
+      mkdir -p "stores/$guard_adapter/src/storage/domains/workflows"
+      printf '%s\n' '{}' > "stores/$guard_adapter/package.json"
+      printf '%s\n' 'export default {};' > "stores/$guard_adapter/vitest.config.ts"
+      printf '%s\n' 'export const workflowFixture = true;' \
+        > "stores/$guard_adapter/src/storage/domains/workflows/index.ts"
+      case "$guard_adapter" in
+        dsql) guard_export=WorkflowsDSQL ;;
+        dynamodb) guard_export=WorkflowStorageDynamoDB ;;
+        elasticsearch) guard_export=WorkflowsElasticSearch ;;
+        mssql) guard_export=WorkflowsMSSQL ;;
+        mysql) guard_export=WorkflowsMySQL ;;
+        oracledb) guard_export=WorkflowsOracle ;;
+        spanner) guard_export=WorkflowsSpanner ;;
+        valkey) guard_export=WorkflowsValkey ;;
+        convex) guard_export=WorkflowsConvex ;;
+      esac
+      printf '%s\n' "import { it } from 'vitest';" "import { $guard_export } from './index';" \
+        "it('unsupported guard refusal', () => Object.create($guard_export.prototype));" \
+        > "stores/$guard_adapter/src/storage/domains/workflows/cancel-guard.test.ts"
+    done
     printf '%s\n' '{}' > stores/convex/package.json
     printf '%s\n' 'export const convexCache = true;' > stores/convex/src/cache/index.ts
     printf '%s\n' "import { it } from 'vitest';" "it('convex cache', () => {});" \
@@ -10174,6 +10195,191 @@ NODE
   assert_contains '--dir stores/convex exec vitest run' "$command_log"
   assert_contains 'src/server/storage.test.ts' "$command_log"
 
+  # Each newly owned pair must build/typecheck/lint and execute its public
+  # no-network test even when only production source changes.
+  for guard_adapter in dsql dynamodb elasticsearch mssql mysql oracledb spanner valkey convex; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' 'export const workflowFixture = "reviewed-head";' \
+        > "stores/$guard_adapter/src/storage/domains/workflows/index.ts"
+      git add .
+      git commit -q -m 'owned unsupported guard source'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    : > "$service_log"
+    output="$test_root/$guard_adapter-public-guard-success.log"
+    if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
+    assert_contains "--filter ./stores/$guard_adapter --fail-if-no-match exec tsc --noEmit" "$command_log"
+    guard_build=build:lib
+    [[ "$guard_adapter" != dsql ]] || guard_build=build
+    assert_contains "--filter ./stores/$guard_adapter --fail-if-no-match $guard_build" "$command_log"
+    assert_contains "--filter ./stores/$guard_adapter --fail-if-no-match lint" "$command_log"
+    assert_contains "--dir stores/$guard_adapter exec vitest run" "$command_log"
+    assert_contains 'src/storage/domains/workflows/cancel-guard.test.ts' "$command_log"
+    if [[ -s "$service_log" ]]; then
+      echo 'No-network guard validation requested a service.' >&2
+      cat "$service_log" >&2
+      exit 1
+    fi
+  done
+
+  # Admission must not turn these workspaces into blanket coverage. Unknown
+  # source/test, absent/symlinked required test and native command failure all
+  # remain red before unrelated green tests can substitute for coverage.
+  for rejected_case in unknown-source unknown-test missing-test symlink-test; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' 'export const workflowFixture = "reviewed-head";' \
+        > stores/valkey/src/storage/domains/workflows/index.ts
+      case "$rejected_case" in
+        unknown-source) printf '%s\n' 'export const unreviewed = true;' > stores/valkey/src/unreviewed.ts ;;
+        unknown-test) printf '%s\n' "it('unknown', () => {});" > stores/valkey/src/unreviewed.test.ts ;;
+        missing-test) rm stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        symlink-test)
+          rm stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+          ln -s index.ts stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+          ;;
+      esac
+      git add .
+      git commit -q -m "guard policy $rejected_case"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/guard-$rejected_case-failure.log"
+    set +e
+    run_fixture "$head_sha" "$output"
+    status=$?
+    set -e
+    if (( status == 0 )); then
+      echo "Guard policy $rejected_case unexpectedly passed." >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'stores/valkey/' "$output"
+    if [[ -s "$command_log" ]]; then
+      echo 'Rejected guard coverage executed package commands.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+  done
+
+  # A test-only change must also execute the owning adapter's native gates.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('additional guard case', () => {});" \
+      >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    git add .
+    git commit -q -m 'guard test-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/guard-test-only-success.log"
+  if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
+  assert_contains '--filter ./stores/valkey --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--dir stores/valkey exec vitest run' "$command_log"
+  assert_contains 'src/storage/domains/workflows/cancel-guard.test.ts' "$command_log"
+
+  for failed_command in \
+    '--filter ./stores/valkey --fail-if-no-match exec tsc --noEmit' \
+    '--filter ./stores/valkey --fail-if-no-match build:lib' \
+    '--filter ./stores/valkey --fail-if-no-match lint'; do
+    : > "$command_log"
+    output="$test_root/guard-native-command-failure.log"
+    set +e
+    run_fixture "$head_sha" "$output" MOCK_FAIL_PACKAGE_CONTRACT_COMMAND="$failed_command"
+    status=$?
+    set -e
+    if (( status == 0 )); then echo 'Failed native guard command passed.' >&2; exit 1; fi
+    assert_contains "$failed_command" "$command_log"
+    assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
+  done
+
+  for rejected_case in fetch environment network-import adapter-runtime manifest reflective-construction reflective-alias reflective-destructuring reflective-receiver-alias reflective-global reflective-computed-binding reflective-get; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      case "$rejected_case" in
+        fetch) printf '%s\n' "void fetch('https://example.invalid');" >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        environment) printf '%s\n' 'void process.env.UNAPPROVED_PROVIDER_KEY;' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        network-import) printf '%s\n' "import { connect } from 'node:net';" >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        adapter-runtime)
+          printf '%s\n' "import { workflowFixture } from './index';" >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+          printf '%s\n' "void fetch('https://example.invalid');" >> stores/valkey/src/storage/domains/workflows/index.ts
+          ;;
+        manifest) printf '%s\n' '{"scripts":{"build:lib":"exit 0"}}' > stores/valkey/package.json ;;
+        reflective-construction) printf '%s\n' 'Reflect.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-alias) printf '%s\n' 'const construct = Reflect["construct"]; construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-destructuring) printf '%s\n' 'const { construct } = Reflect; construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-receiver-alias) printf '%s\n' 'const R = Reflect; R.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-global) printf '%s\n' 'globalThis.Reflect.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-computed-binding) printf '%s\n' 'const { ["Reflect"]: R } = globalThis; R.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-get) printf '%s\n' 'Reflect.get(globalThis, "Reflect").construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+      esac
+      git add .
+      git commit -q -m "guard boundary $rejected_case"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/guard-$rejected_case-failure.log"
+    set +e
+    run_fixture "$head_sha" "$output"
+    status=$?
+    set -e
+    if (( status == 0 )); then echo "Guard $rejected_case unexpectedly passed." >&2; cat "$output" >&2; exit 1; fi
+    assert_contains 'stores/valkey/' "$output"
+    assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
+  done
+
+  # The feature PR introduces the refusal test for the first time. Exercise
+  # that real BASE-absent path and a direct-helper attempt to borrow base trust.
+  guard_complete_base_sha="$base_sha"
+  base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$guard_complete_base_sha"
+    rm stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    printf '%s\n' "import { baseHelper } from './base-helper';" 'export const workflowFixture = true;' \
+      > stores/valkey/src/storage/domains/workflows/index.ts
+    printf '%s\n' 'export const baseHelper = () => process.env.UNAPPROVED_PROVIDER_KEY;' \
+      > stores/valkey/src/storage/domains/workflows/base-helper.ts
+    git add .
+    git commit -q -m 'native adapter baseline without a guard test'
+    git rev-parse HEAD
+  )"
+  head_sha="$(
+    cd "$fixture_repo"
+    git checkout "$guard_complete_base_sha" -- stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    git commit -q -m 'new guard test imports its mapped adapter'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/guard-new-at-base-success.log"
+  if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
+  assert_contains '--dir stores/valkey exec vitest run' "$command_log"
+  assert_contains 'src/storage/domains/workflows/cancel-guard.test.ts' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    printf '%s\n' "import { baseHelper } from './base-helper';" "it('direct helper', () => baseHelper());" \
+      >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    git add .
+    git commit -q -m 'new guard test directly imports a trusted-base helper'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/guard-direct-base-helper-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then echo 'Direct BASE helper bypassed guard provenance.' >&2; cat "$output" >&2; exit 1; fi
+  assert_contains 'guard test imports outside the mapped public adapter: ./base-helper' "$output"
+  assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
+  base_sha="$guard_complete_base_sha"
+
   echo 'PapersFlow fork validator fixtures passed.'
 }
 
@@ -13031,7 +13237,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     server-adapters/fastify)
       if [[ "$pf3553_selected_route_exports" == false ]]; then
         printf '%s\n' "$workspace" >> "$unsupported_workspaces"
@@ -13311,7 +13517,7 @@ while IFS= read -r path; do
   printf '%s\n' "$path" >> "$unsupported_inputs"
 done < <(
   grep -E \
-    '^(client-sdks/client-js|mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|libsql)|workflows/inngest)/package\.json$' \
+    '^(client-sdks/client-js|mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/inngest)/package\.json$' \
     "$changed_files" || true
 )
 
@@ -13612,7 +13818,7 @@ fi
 # source or test in a newly admitted workspace fails closed until its runtime
 # and service contract are reviewed explicitly.
 while IFS= read -r file; do
-  if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|libsql)|workflows/(inngest|temporal))/ ]] &&
+  if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/(inngest|temporal))/ ]] &&
     ! [[ "$file" =~ \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
     if [[ "$file" == 'workflows/inngest/package.json' ]] &&
       { [[ "$inngest_pf2050_coordination" == true ]] ||
@@ -13632,12 +13838,23 @@ while IFS= read -r file; do
     continue
   fi
 
-  if ! [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|libsql)|workflows/(inngest|temporal))/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
+  if ! [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/(inngest|temporal))/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
     continue
   fi
 
   if grep -Eq '\.(test|spec)\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$|\.test-d\.ts$' <<< "$file"; then
     case "$file" in
+      stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/convex/src/storage/domains/workflows/cancel-guard.test.ts)
+        queue_owned_workspace_test "${file%/cancel-guard.test.ts}/index.ts" "$file"
+        ;;
       pubsub/google-cloud-pubsub/src/group.test.ts | \
         pubsub/redis-streams/src/pubsub.test.ts | \
         stores/clickhouse/src/storage/db/index.test.ts | \
@@ -13691,6 +13908,17 @@ while IFS= read -r file; do
       # Miniflare binding suite exercises the consuming db module in-process
       # and needs no Cloudflare account or container.
       queue_owned_workspace_test "$file" stores/cloudflare/src/kv/storage/db/index.test.ts
+      ;;
+    stores/dsql/src/storage/domains/workflows/index.ts | \
+      stores/dynamodb/src/storage/domains/workflows/index.ts | \
+      stores/elasticsearch/src/storage/domains/workflows/index.ts | \
+      stores/mssql/src/storage/domains/workflows/index.ts | \
+      stores/mysql/src/storage/domains/workflows/index.ts | \
+      stores/oracledb/src/storage/domains/workflows/index.ts | \
+      stores/spanner/src/storage/domains/workflows/index.ts | \
+      stores/valkey/src/storage/domains/workflows/index.ts | \
+      stores/convex/src/storage/domains/workflows/index.ts)
+      queue_owned_workspace_test "$file" "${file%/index.ts}/cancel-guard.test.ts"
       ;;
     stores/convex/src/cache/index.ts | stores/convex/src/cache/types.ts)
       queue_owned_workspace_test "$file" stores/convex/src/cache/index.test.ts
@@ -14503,6 +14731,19 @@ if workspace_changed stores/redis; then
   run_with_validation_budget 600 pnpm --filter ./stores/redis --fail-if-no-match lint
 fi
 
+# PF-5144 admits only the reviewed workflow source/refusal-test pair in these
+# adapters. Compile the production package and run its native lint/type gates;
+# the mandatory no-network public refusal test is executed below in full.
+for guard_adapter in dsql dynamodb elasticsearch mssql mysql oracledb spanner valkey; do
+  if workspace_changed "stores/$guard_adapter"; then
+    run_with_validation_budget 600 pnpm --filter "./stores/$guard_adapter" --fail-if-no-match exec tsc --noEmit
+    guard_build=build:lib
+    [[ "$guard_adapter" != dsql ]] || guard_build=build
+    run_with_validation_budget 900 pnpm --filter "./stores/$guard_adapter" --fail-if-no-match "$guard_build"
+    run_with_validation_budget 600 pnpm --filter "./stores/$guard_adapter" --fail-if-no-match lint
+  fi
+done
+
 if workspace_changed stores/clickhouse; then
   run_with_validation_budget 600 pnpm --filter ./stores/clickhouse --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 900 pnpm --filter ./stores/clickhouse --fail-if-no-match build:lib
@@ -14645,6 +14886,15 @@ fi
 
 is_explicit_fork_safe_test() {
   case "$1" in
+    stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/convex/src/storage/domains/workflows/cancel-guard.test.ts | \
     "$PG_PERFORMANCE_INDEX_UNIT_TEST" | \
     packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts | \
       packages/core/src/harness/v1/session.permission-gate.e2e.test.ts | \
@@ -14819,8 +15069,8 @@ function readBaseSource(file) {
   return source;
 }
 
-function collectGraph(readSource, failOnUnresolved) {
-  const entry = path.resolve(entryFile);
+function collectGraph(readSource, failOnUnresolved, entryPath = entryFile) {
+  const entry = path.resolve(entryPath);
   const queue = [entry];
   const visited = new Set();
   while (queue.length > 0) {
@@ -14840,6 +15090,15 @@ function collectGraph(readSource, failOnUnresolved) {
 
 const headGraph = collectGraph(file => fs.readFileSync(file, 'utf8'), true);
 const baseGraph = collectGraph(readBaseSource, false);
+const guardTest = /^stores\/(dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|convex)\/src\/storage\/domains\/workflows\/cancel-guard\.test\.ts$/.test(entryFile);
+if (guardTest && readBaseSource(path.resolve(entryFile)) === undefined) {
+  // A new refusal test imports an existing native adapter. Its immutable base
+  // closure is the reviewed production boundary, not a new test's empty graph.
+  // Only that corresponding adapter seeds trust; changed and newly reachable
+  // modules/global accesses still pass through the same fail-closed scanner.
+  const adapterEntry = entryFile.replace(/cancel-guard\.test\.ts$/, 'index.ts');
+  for (const file of collectGraph(readBaseSource, false, adapterEntry)) baseGraph.add(file);
+}
 const surface = new Set(
   [...headGraph].filter(file => file === entryFile || changedFiles.has(file) || !baseGraph.has(file)),
 );
@@ -14898,6 +15157,8 @@ const exactTestEntries = new Set([
   'packages/core/src/harness/v1/session.real-agent.e2e.test.ts',
   'packages/server/src/server/handlers/favorites.integration.test.ts',
 ]);
+
+if (guardTest) exactTestEntries.add(entryFile);
 
 function unsupportedModuleReason(specifier) {
   if (specifier === '@playwright/test' || specifier === 'testcontainers') return specifier;
@@ -15218,6 +15479,62 @@ function configLoaderHookFindings(file, source) {
 
 function unsupportedRuntimeReasons(file, source) {
   const reasons = new Set();
+  if (guardTest && repositoryPath(file) === entryFile) {
+    // Guard tests exercise exactly the mapped public adapter with no
+    // constructor/transport. Do not let a new test borrow baseline trust by
+    // importing a helper directly from the adapter's production closure.
+    const parsed = sourceFile(file, source);
+    const guardExports = {
+      dsql: 'WorkflowsDSQL', dynamodb: 'WorkflowStorageDynamoDB',
+      elasticsearch: 'WorkflowsElasticSearch', mssql: 'WorkflowsMSSQL',
+      mysql: 'WorkflowsMySQL', oracledb: 'WorkflowsOracle',
+      spanner: 'WorkflowsSpanner', valkey: 'WorkflowsValkey', convex: 'WorkflowsConvex',
+    };
+    const adapter = entryFile.split('/')[1];
+    let mappedImport = false;
+    const imports = runtimeModuleSpecifiers(file, source);
+    for (const specifier of imports) {
+      if (specifier !== 'vitest' && specifier !== './index') {
+        reasons.add(`guard test imports outside the mapped public adapter: ${specifier}`);
+      }
+    }
+    for (const statement of parsed.statements) {
+      if (!ts.isImportDeclaration(statement) || statement.moduleSpecifier.text !== './index') continue;
+      const clause = statement.importClause;
+      const bindings = clause?.namedBindings;
+      if (clause && !clause.isTypeOnly && !clause.name && bindings && ts.isNamedImports(bindings) &&
+          bindings.elements.length === 1 && !bindings.elements[0].isTypeOnly &&
+          bindings.elements[0].name.text === guardExports[adapter] && !bindings.elements[0].propertyName) {
+        mappedImport = true;
+      } else {
+        reasons.add('guard test must import only the mapped public workflow class');
+      }
+    }
+    if (!mappedImport) reasons.add('guard test is missing its mapped public workflow class import');
+    const visit = node => {
+      // Only direct/static Reflect.apply is needed for method-only guards.
+      // Reflect.get can recover a constructor without naming it as a member.
+      const reflectiveConstruction =
+        ((ts.isIdentifier(node) && node.text === 'Reflect') ||
+          (ts.isBindingElement(node) && node.propertyName &&
+            (ts.isStringLiteralLike(node.propertyName)
+              ? node.propertyName.text === 'Reflect'
+              : ts.isComputedPropertyName(node.propertyName) && ts.isStringLiteralLike(node.propertyName.expression) &&
+                node.propertyName.expression.text === 'Reflect')) ||
+          (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) &&
+            node.argumentExpression.text === 'Reflect')) &&
+        !(node.parent && node.parent.expression === node &&
+          (ts.isPropertyAccessExpression(node.parent)
+            ? node.parent.name.text === 'apply'
+            : ts.isElementAccessExpression(node.parent) && ts.isStringLiteralLike(node.parent.argumentExpression) &&
+              node.parent.argumentExpression.text === 'apply'));
+      if (ts.isNewExpression(node) || reflectiveConstruction) {
+        reasons.add('guard test must not construct the mapped adapter');
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(parsed);
+  }
   const wasReachableFromExactTest = baseGraph.has(repositoryPath(file));
   const baseSource = readBaseSource(file);
   const baseSpecifiers = baseSource ? runtimeModuleSpecifiers(file, baseSource) : new Set();
@@ -15336,6 +15653,21 @@ mapfile -t detected_tests < <(
     fi
   done < "$changed_files"
 )
+
+# Forced source-only guard tests need the same runtime scan as changed tests.
+while IFS= read -r forced_test; do
+  case "$forced_test" in
+    stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/convex/src/storage/domains/workflows/cancel-guard.test.ts) detected_tests+=("$forced_test") ;;
+  esac
+done < "$forced_workspace_tests"
 
 # A changed or newly reachable local dependency of an exact-path exception
 # changes the runtime contract of that test even when the test file is untouched.
@@ -15500,6 +15832,16 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != stores/pg/* && "$file" != stores/redis/* && \
       "$file" != stores/mongodb/* && "$file" != stores/upstash/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/convex/src/storage/domains/workflows/cancel-guard.test.ts ]]; then
+      printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == stores/clickhouse/src/storage/db/index.test.ts || \
       "$file" == stores/cloudflare/src/kv/storage/db/index.test.ts || \
       "$file" == stores/convex/src/cache/index.test.ts || \
