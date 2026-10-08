@@ -10298,7 +10298,7 @@ NODE
     assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
   done
 
-  for rejected_case in fetch environment network-import adapter-runtime manifest reflective-construction reflective-alias reflective-destructuring reflective-receiver-alias reflective-global reflective-computed-binding; do
+  for rejected_case in fetch environment network-import adapter-runtime manifest reflective-construction reflective-alias reflective-destructuring reflective-receiver-alias reflective-global reflective-computed-binding reflective-get; do
     head_sha="$(
       cd "$fixture_repo"
       git reset -q --hard "$base_sha"
@@ -10317,6 +10317,7 @@ NODE
         reflective-receiver-alias) printf '%s\n' 'const R = Reflect; R.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
         reflective-global) printf '%s\n' 'globalThis.Reflect.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
         reflective-computed-binding) printf '%s\n' 'const { ["Reflect"]: R } = globalThis; R.construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        reflective-get) printf '%s\n' 'Reflect.get(globalThis, "Reflect").construct(WorkflowsValkey, [{}]);' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
       esac
       git add .
       git commit -q -m "guard boundary $rejected_case"
@@ -15511,6 +15512,8 @@ function unsupportedRuntimeReasons(file, source) {
     }
     if (!mappedImport) reasons.add('guard test is missing its mapped public workflow class import');
     const visit = node => {
+      // Only direct/static Reflect.apply is needed for method-only guards.
+      // Reflect.get can recover a constructor without naming it as a member.
       const reflectiveConstruction =
         ((ts.isIdentifier(node) && node.text === 'Reflect') ||
           (ts.isBindingElement(node) && node.propertyName &&
@@ -15522,9 +15525,9 @@ function unsupportedRuntimeReasons(file, source) {
             node.argumentExpression.text === 'Reflect')) &&
         !(node.parent && node.parent.expression === node &&
           (ts.isPropertyAccessExpression(node.parent)
-            ? node.parent.name.text !== 'construct'
+            ? node.parent.name.text === 'apply'
             : ts.isElementAccessExpression(node.parent) && ts.isStringLiteralLike(node.parent.argumentExpression) &&
-              node.parent.argumentExpression.text !== 'construct'));
+              node.parent.argumentExpression.text === 'apply'));
       if (ts.isNewExpression(node) || reflectiveConstruction) {
         reasons.add('guard test must not construct the mapped adapter');
       }
