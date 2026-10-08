@@ -10246,12 +10246,73 @@ NODE
       cat "$output" >&2
       exit 1
     fi
-    assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+    assert_contains 'stores/valkey/' "$output"
     if [[ -s "$command_log" ]]; then
       echo 'Rejected guard coverage executed package commands.' >&2
       cat "$command_log" >&2
       exit 1
     fi
+  done
+
+  # A test-only change must also execute the owning adapter's native gates.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('additional guard case', () => {});" \
+      >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+    git add .
+    git commit -q -m 'guard test-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/guard-test-only-success.log"
+  if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
+  assert_contains '--filter ./stores/valkey --fail-if-no-match build:lib' "$command_log"
+  assert_contains '--dir stores/valkey exec vitest run' "$command_log"
+  assert_contains 'src/storage/domains/workflows/cancel-guard.test.ts' "$command_log"
+
+  for failed_command in \
+    '--filter ./stores/valkey --fail-if-no-match exec tsc --noEmit' \
+    '--filter ./stores/valkey --fail-if-no-match build:lib' \
+    '--filter ./stores/valkey --fail-if-no-match lint'; do
+    : > "$command_log"
+    output="$test_root/guard-native-command-failure.log"
+    set +e
+    run_fixture "$head_sha" "$output" MOCK_FAIL_PACKAGE_CONTRACT_COMMAND="$failed_command"
+    status=$?
+    set -e
+    if (( status == 0 )); then echo 'Failed native guard command passed.' >&2; exit 1; fi
+    assert_contains "$failed_command" "$command_log"
+    assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
+  done
+
+  for rejected_case in fetch environment network-import adapter-runtime manifest; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      case "$rejected_case" in
+        fetch) printf '%s\n' "void fetch('https://example.invalid');" >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        environment) printf '%s\n' 'void process.env.UNAPPROVED_PROVIDER_KEY;' >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        network-import) printf '%s\n' "import { connect } from 'node:net';" >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        adapter-runtime)
+          printf '%s\n' "import { workflowFixture } from './index';" >> stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+          printf '%s\n' "void fetch('https://example.invalid');" >> stores/valkey/src/storage/domains/workflows/index.ts
+          ;;
+        manifest) printf '%s\n' '{"scripts":{"build:lib":"exit 0"}}' > stores/valkey/package.json ;;
+      esac
+      git add .
+      git commit -q -m "guard boundary $rejected_case"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/guard-$rejected_case-failure.log"
+    set +e
+    run_fixture "$head_sha" "$output"
+    status=$?
+    set -e
+    if (( status == 0 )); then echo "Guard $rejected_case unexpectedly passed." >&2; cat "$output" >&2; exit 1; fi
+    assert_contains 'stores/valkey/' "$output"
+    assert_not_contains '--dir stores/valkey exec vitest run' "$command_log"
   done
 
   echo 'PapersFlow fork validator fixtures passed.'
@@ -14769,6 +14830,15 @@ fi
 
 is_explicit_fork_safe_test() {
   case "$1" in
+    stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/convex/src/storage/domains/workflows/cancel-guard.test.ts | \
     "$PG_PERFORMANCE_INDEX_UNIT_TEST" | \
     packages/core/src/agent/durable/__tests__/durable-agent-background-tasks.e2e.test.ts | \
       packages/core/src/harness/v1/session.permission-gate.e2e.test.ts | \
@@ -14943,8 +15013,8 @@ function readBaseSource(file) {
   return source;
 }
 
-function collectGraph(readSource, failOnUnresolved) {
-  const entry = path.resolve(entryFile);
+function collectGraph(readSource, failOnUnresolved, entryPath = entryFile) {
+  const entry = path.resolve(entryPath);
   const queue = [entry];
   const visited = new Set();
   while (queue.length > 0) {
@@ -14964,6 +15034,15 @@ function collectGraph(readSource, failOnUnresolved) {
 
 const headGraph = collectGraph(file => fs.readFileSync(file, 'utf8'), true);
 const baseGraph = collectGraph(readBaseSource, false);
+const guardTest = /^stores\/(dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|convex)\/src\/storage\/domains\/workflows\/cancel-guard\.test\.ts$/.test(entryFile);
+if (guardTest && readBaseSource(path.resolve(entryFile)) === undefined) {
+  // A new refusal test imports an existing native adapter. Its immutable base
+  // closure is the reviewed production boundary, not a new test's empty graph.
+  // Only that corresponding adapter seeds trust; changed and newly reachable
+  // modules/global accesses still pass through the same fail-closed scanner.
+  const adapterEntry = entryFile.replace(/cancel-guard\.test\.ts$/, 'index.ts');
+  for (const file of collectGraph(readBaseSource, false, adapterEntry)) baseGraph.add(file);
+}
 const surface = new Set(
   [...headGraph].filter(file => file === entryFile || changedFiles.has(file) || !baseGraph.has(file)),
 );
@@ -15022,6 +15101,8 @@ const exactTestEntries = new Set([
   'packages/core/src/harness/v1/session.real-agent.e2e.test.ts',
   'packages/server/src/server/handlers/favorites.integration.test.ts',
 ]);
+
+if (guardTest) exactTestEntries.add(entryFile);
 
 function unsupportedModuleReason(specifier) {
   if (specifier === '@playwright/test' || specifier === 'testcontainers') return specifier;
@@ -15460,6 +15541,21 @@ mapfile -t detected_tests < <(
     fi
   done < "$changed_files"
 )
+
+# Forced source-only guard tests need the same runtime scan as changed tests.
+while IFS= read -r forced_test; do
+  case "$forced_test" in
+    stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
+    stores/convex/src/storage/domains/workflows/cancel-guard.test.ts) detected_tests+=("$forced_test") ;;
+  esac
+done < "$forced_workspace_tests"
 
 # A changed or newly reachable local dependency of an exact-path exception
 # changes the runtime contract of that test even when the test file is untouched.
