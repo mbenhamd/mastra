@@ -13,4 +13,4 @@
 '@mastra/convex': patch
 ---
 
-Reject unsupported cancellation-request comparison guards before adapter access instead of allowing a guard to enter the persisted snapshot. These adapters do not retain durable cancellation requests and do not advertise retainedCancelRequestVersion1.
+Reject `expectedCancelRequest` in `updateWorkflowState` with a clear error before accessing the adapter. These adapters do not support retained cancellation requests.
