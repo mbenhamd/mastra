@@ -145,6 +145,12 @@ export class WorkflowsValkey extends WorkflowsStorage {
     runId: string;
     opts: UpdateWorkflowStateOptions;
   }): Promise<WorkflowRunState | undefined> {
+    const { expectedCancelRequest, ...stateOptions } = opts;
+    if (expectedCancelRequest !== undefined) {
+      throw new Error('This storage adapter does not support expectedCancelRequest guards');
+    }
+    opts = stateOptions;
+
     try {
       const existingRecord = await this.db.get<{
         namespace: string;

@@ -226,6 +226,12 @@ export class WorkflowsStorageMongoDB extends WorkflowsStorage {
     runId: string;
     opts: UpdateWorkflowStateOptions;
   }): Promise<WorkflowRunState | undefined> {
+    const { expectedCancelRequest, ...stateOptions } = opts;
+    if (expectedCancelRequest !== undefined) {
+      throw new Error('This storage adapter does not support expectedCancelRequest guards');
+    }
+    opts = stateOptions;
+
     try {
       const collection = await this.getCollection(TABLE_WORKFLOW_SNAPSHOT);
 

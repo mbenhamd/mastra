@@ -114,15 +114,22 @@ describe('Run.requestCancel() on PostgreSQL', () => {
     // The public run state names the execution to target.
     const observed = await controller.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] });
     const remoteRun = await controller.workflow.createRun({ runId: ownerRun.runId });
-    const outcome = await remoteRun.requestCancel({
-      requestId: 'abort-op-1',
+    const lineage = {
       expectedExecutionGeneration: observed!.executionGeneration!,
       expectedLifecycleResumeAttempt: observed!.lifecycleResumeAttempt!,
-    });
-    expect(outcome.status).toBe('requested');
+    };
+    const ordinaryRun = await createProcess(probe).workflow.createRun({ runId: ownerRun.runId });
+    const [outcome, concurrent] = await Promise.all([
+      remoteRun.requestCancel({ requestId: 'abort-op-1', ...lineage, retainCancellationRequest: true }),
+      ordinaryRun.requestCancel({ requestId: 'competing-ordinary-abort', ...lineage }),
+    ]);
+    expect(['requested', 'already_requested']).toContain(outcome.status);
+    expect(['requested', 'already_requested']).toContain(concurrent.status);
+    if (!('cancelRequest' in outcome) || !('cancelRequest' in concurrent)) throw new Error('Expected stored requests');
+    expect(outcome.cancelRequest).toEqual(concurrent.cancelRequest);
     expect(await owner.workflow.getWorkflowRunById(ownerRun.runId, { fields: [] })).toMatchObject({
       status: 'running',
-      cancelRequest: { requestId: 'abort-op-1' },
+      cancelRequest: outcome.cancelRequest,
     });
 
     probe.releaseStageOne.resolve();
@@ -132,7 +139,7 @@ describe('Run.requestCancel() on PostgreSQL', () => {
     expect(probe.stageTwoExecutions).toBe(0);
     const settled = await loadSnapshot(controller.storage, ownerRun.runId);
     expect(settled?.status).toBe('canceled');
-    expect(settled?.cancelRequest?.requestId).toBe('abort-op-1');
+    expect(settled?.cancelRequest).toEqual(outcome.cancelRequest);
   });
 
   it('rejects a request whose lineage a restart has replaced', async () => {
@@ -150,7 +157,11 @@ describe('Run.requestCancel() on PostgreSQL', () => {
     await expect.poll(() => probe.stageOneExecutions).toBe(2);
 
     const lateRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
-    const outcome = await lateRun.requestCancel({ requestId: 'stale-abort', ...strandedLineage });
+    const outcome = await lateRun.requestCancel({
+      requestId: 'stale-abort',
+      ...strandedLineage,
+      retainCancellationRequest: true,
+    });
 
     expect(outcome).toMatchObject({ status: 'lineage_moved' });
     expect((await loadSnapshot(survivor.storage, ownerRun.runId))?.cancelRequest).toBeUndefined();
@@ -174,11 +185,26 @@ describe('Run.requestCancel() on PostgreSQL', () => {
     const remoteRun = await survivor.workflow.createRun({ runId: ownerRun.runId });
 
     expect(
-      await remoteRun.requestCancel({ requestId: 'abort-op-1', ...strandedLineage, noActiveExecution: true }),
-    ).toEqual({ status: 'canceled' });
+      await remoteRun.requestCancel({
+        requestId: 'abort-op-1',
+        ...strandedLineage,
+        noActiveExecution: true,
+        retainCancellationRequest: true,
+      }),
+    ).toMatchObject({ status: 'canceled', cancelRequest: { requestId: 'abort-op-1' } });
     const settled = await loadSnapshot(survivor.storage, ownerRun.runId);
     expect(settled?.status).toBe('canceled');
     expect(settled?.executionGeneration).toBe(strandedLineage.expectedExecutionGeneration);
+    const marker = settled!.cancelRequest!;
+    const replay = await (
+      await createProcess(probe).workflow.createRun({ runId: ownerRun.runId })
+    ).requestCancel({
+      requestId: 'later-replay',
+      ...strandedLineage,
+      retainCancellationRequest: true,
+    });
+    expect(replay).toEqual({ status: 'canceled', cancelRequest: marker });
+    expect((await loadSnapshot(survivor.storage, ownerRun.runId))?.cancelRequest).toEqual(marker);
 
     probe.releaseStageOne.resolve();
     expect((await abandoned).status).toBe('canceled');

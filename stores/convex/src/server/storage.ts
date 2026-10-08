@@ -929,11 +929,15 @@ export async function handleTypedOperation(
         return { ok: false, error: parsedOpts.error };
       }
 
+      const { expectedCancelRequest, ...stateOptions } = parsedOpts.value;
+      if (expectedCancelRequest !== undefined) {
+        return { ok: false, error: 'This storage adapter does not support expectedCancelRequest guards' };
+      }
+
       // Expected values are compare-and-set guards, not state. Convex mutations
       // are serializable, so checking them here keeps the guard and write atomic.
       // An empty result signals "guard did not match" to the caller.
-      const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } =
-        parsedOpts.value;
+      const { expectedStatus, expectedExecutionGeneration, expectedLifecycleResumeAttempt, ...state } = stateOptions;
       if (expectedStatus !== undefined) {
         const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
         if (!expected.includes(snapshot.status)) {

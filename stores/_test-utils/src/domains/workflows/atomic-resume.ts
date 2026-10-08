@@ -105,7 +105,7 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
   });
 
   try {
-    expect(options.primary.getWorkflowResumeCapabilities()).toEqual({
+    expect(options.primary.getWorkflowResumeCapabilities()).toMatchObject({
       atomicResumeVersion: 1,
       fencedStepUpdateVersion: 1,
     });

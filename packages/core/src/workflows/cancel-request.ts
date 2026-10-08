@@ -33,6 +33,13 @@ export interface WorkflowCancelRequestInput {
    * cancellation. Requires the expected lineage.
    */
   noActiveExecution?: boolean;
+  /**
+   * Retain the first lineage-bound request even when cancellation is immediate
+   * or this lineage is already canceled. Requires an explicit lineage and a
+   * store advertising retainedCancelRequestVersion 1. Replays preserve the
+   * original request and occurrence time. Other terminal statuses stay terminal.
+   */
+  retainCancellationRequest?: boolean;
 }
 
 /**
@@ -53,9 +60,10 @@ export type WorkflowCancelRequestOutcome =
    */
   | { status: 'requested'; cancelRequest: WorkflowCancelRequestV1 }
   /**
-   * That lineage already carries a request, which is kept. Two callers racing
-   * to record the first request can both see `requested`; the later write's
-   * `requestId` is the one stored, and either way the same lineage stops.
+   * That lineage already carries a request, which is kept. Stores advertising
+   * retainedCancelRequestVersion 1 atomically preserve the first request even
+   * when callers race. Other stores can let concurrent first writes replace
+   * one another; either way the same lineage stops.
    */
   | { status: 'already_requested'; cancelRequest: WorkflowCancelRequestV1 }
   /**
@@ -64,7 +72,7 @@ export type WorkflowCancelRequestOutcome =
    * `noActiveExecution`, a pending run whose execution this handle has
    * already begun is treated as running instead.
    */
-  | { status: 'canceled' }
+  | { status: 'canceled'; cancelRequest?: WorkflowCancelRequestV1 }
   /** The run already ended. */
   | { status: 'terminal'; runStatus: WorkflowRunStatus }
   /** Another generation or resume attempt owns the run; nothing was written. */
@@ -167,6 +175,8 @@ export async function commitWorkflowLineageCancellation({
   expectedStatus,
   executionGeneration,
   lifecycleResumeAttempt,
+  cancelRequest,
+  expectedCancelRequest,
 }: {
   workflowsStore: WorkflowsStorage;
   workflowName: string;
@@ -174,12 +184,15 @@ export async function commitWorkflowLineageCancellation({
   expectedStatus: WorkflowRunStatus | readonly WorkflowRunStatus[];
   executionGeneration: string;
   lifecycleResumeAttempt: number;
+  cancelRequest?: WorkflowCancelRequestV1;
+  expectedCancelRequest?: WorkflowRunState['cancelRequest'] | null;
 }): Promise<WorkflowRunState | undefined> {
   return workflowsStore.updateWorkflowState({
     workflowName,
     runId,
     opts: {
       status: 'canceled',
+      ...(cancelRequest === undefined ? {} : { cancelRequest, expectedCancelRequest }),
       expectedStatus: typeof expectedStatus === 'string' ? expectedStatus : [...expectedStatus],
       expectedExecutionGeneration: executionGeneration,
       expectedLifecycleResumeAttempt: lifecycleResumeAttempt,

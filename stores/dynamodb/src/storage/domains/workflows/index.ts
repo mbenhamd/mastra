@@ -234,6 +234,12 @@ export class WorkflowStorageDynamoDB extends WorkflowsStorage {
     runId: string;
     opts: UpdateWorkflowStateOptions;
   }): Promise<WorkflowRunState | undefined> {
+    const { expectedCancelRequest, ...stateOptions } = opts;
+    if (expectedCancelRequest !== undefined) {
+      throw new Error('This storage adapter does not support expectedCancelRequest guards');
+    }
+    opts = stateOptions;
+
     // Use optimistic locking with retry for atomic updates
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {

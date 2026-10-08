@@ -14,7 +14,11 @@ import { TABLE_INDEX_MAP } from './server/index-map';
  * equivalent of pg's om-migration-columns guard.
  */
 describe('mastraObservationalMemoryTable schema drift guard', () => {
-  const exported = JSON.parse(JSON.stringify(mastraObservationalMemoryTable.export())) as {
+  // Convex's runtime serializer is @internal and omitted from public declarations.
+  const tableForTest = mastraObservationalMemoryTable as typeof mastraObservationalMemoryTable & {
+    export(): unknown;
+  };
+  const exported = JSON.parse(JSON.stringify(tableForTest.export())) as {
     indexes: Array<{ indexDescriptor: string; fields: string[] }>;
     documentType: { type: string; value: Record<string, { fieldType: unknown; optional: boolean }> };
   };

@@ -148,3 +148,28 @@ describe('WorkflowsRedis resourceId keying', () => {
     expect(r1Any.runs.filter(r => r.workflowName === workflowName)).toHaveLength(2);
   });
 });
+
+describe('WorkflowsRedis cancellation request guards', () => {
+  it.each([
+    null,
+    {
+      version: 1 as const,
+      requestId: 'abort-1',
+      executionGeneration: 'generation-1',
+      lifecycleResumeAttempt: 0,
+      requestedAt: 1,
+    },
+  ])('rejects an unsupported request guard before contacting Redis (%s)', async expectedCancelRequest => {
+    const get = vi.fn();
+    const client = { get } as unknown as RedisClient;
+    const store = new WorkflowsRedis({ client });
+    await expect(
+      store.updateWorkflowState({
+        workflowName: 'workflow-a',
+        runId: 'run-1',
+        opts: { status: 'canceled', expectedCancelRequest },
+      }),
+    ).rejects.toThrow('does not support expectedCancelRequest guards');
+    expect(get).not.toHaveBeenCalled();
+  });
+});

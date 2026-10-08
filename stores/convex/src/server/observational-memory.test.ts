@@ -67,7 +67,10 @@ function serializedChunk(overrides: Partial<SerializedOMChunk> = {}): Serialized
  * generationCount with .order() control) index semantics.
  */
 function createFakeOMDb(initialDocs: Array<Record<string, any>>) {
-  const docs = initialDocs.map((doc, index) => ({ _id: `doc-${index}` as GenericId<string>, ...doc }));
+  const docs: Array<Record<string, any> & { _id: GenericId<string> }> = initialDocs.map((doc, index) => ({
+    _id: `doc-${index}` as GenericId<string>,
+    ...doc,
+  }));
   const usedIndexes: string[] = [];
   const inserted: Array<{ table: string; doc: Record<string, any> }> = [];
 

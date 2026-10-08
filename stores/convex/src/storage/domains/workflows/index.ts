@@ -52,7 +52,11 @@ export class WorkflowsConvex extends WorkflowsStorage {
     runId: string;
     opts: UpdateWorkflowStateOptions;
   }): Promise<WorkflowRunState | undefined> {
-    return this.#db.mergeWorkflowState(args);
+    const { expectedCancelRequest, ...opts } = args.opts;
+    if (expectedCancelRequest !== undefined) {
+      throw new Error('This storage adapter does not support expectedCancelRequest guards');
+    }
+    return this.#db.mergeWorkflowState({ ...args, opts });
   }
 
   async persistWorkflowSnapshot({
