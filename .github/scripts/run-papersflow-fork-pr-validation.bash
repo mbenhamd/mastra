@@ -4811,6 +4811,15 @@ run_validator_self_tests() {
       > stores/cloudflare/src/kv/storage/types.ts
     printf '%s\n' "import { it } from 'vitest';" "it('cloudflare kv db', () => {});" \
       > stores/cloudflare/src/kv/storage/db/index.test.ts
+    for guard_adapter in dsql dynamodb elasticsearch mssql mysql oracledb spanner valkey convex; do
+      mkdir -p "stores/$guard_adapter/src/storage/domains/workflows"
+      printf '%s\n' '{}' > "stores/$guard_adapter/package.json"
+      printf '%s\n' 'export default {};' > "stores/$guard_adapter/vitest.config.ts"
+      printf '%s\n' 'export const workflowFixture = true;' \
+        > "stores/$guard_adapter/src/storage/domains/workflows/index.ts"
+      printf '%s\n' "import { it } from 'vitest';" "it('unsupported guard refusal', () => {});" \
+        > "stores/$guard_adapter/src/storage/domains/workflows/cancel-guard.test.ts"
+    done
     printf '%s\n' '{}' > stores/convex/package.json
     printf '%s\n' 'export const convexCache = true;' > stores/convex/src/cache/index.ts
     printf '%s\n' "import { it } from 'vitest';" "it('convex cache', () => {});" \
@@ -10174,6 +10183,77 @@ NODE
   assert_contains '--dir stores/convex exec vitest run' "$command_log"
   assert_contains 'src/server/storage.test.ts' "$command_log"
 
+  # Each newly owned pair must build/typecheck/lint and execute its public
+  # no-network test even when only production source changes.
+  for guard_adapter in dsql dynamodb elasticsearch mssql mysql oracledb spanner valkey convex; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' 'export const workflowFixture = "reviewed-head";' \
+        > "stores/$guard_adapter/src/storage/domains/workflows/index.ts"
+      git add .
+      git commit -q -m 'owned unsupported guard source'
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    : > "$service_log"
+    output="$test_root/$guard_adapter-public-guard-success.log"
+    if ! run_fixture "$head_sha" "$output"; then cat "$output" >&2; exit 1; fi
+    assert_contains "--filter ./stores/$guard_adapter --fail-if-no-match exec tsc --noEmit" "$command_log"
+    guard_build=build:lib
+    [[ "$guard_adapter" != dsql ]] || guard_build=build
+    assert_contains "--filter ./stores/$guard_adapter --fail-if-no-match $guard_build" "$command_log"
+    assert_contains "--filter ./stores/$guard_adapter --fail-if-no-match lint" "$command_log"
+    assert_contains "--dir stores/$guard_adapter exec vitest run" "$command_log"
+    assert_contains 'src/storage/domains/workflows/cancel-guard.test.ts' "$command_log"
+    if [[ -s "$service_log" ]]; then
+      echo 'No-network guard validation requested a service.' >&2
+      cat "$service_log" >&2
+      exit 1
+    fi
+  done
+
+  # Admission must not turn these workspaces into blanket coverage. Unknown
+  # source/test, absent/symlinked required test and native command failure all
+  # remain red before unrelated green tests can substitute for coverage.
+  for rejected_case in unknown-source unknown-test missing-test symlink-test; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' 'export const workflowFixture = "reviewed-head";' \
+        > stores/valkey/src/storage/domains/workflows/index.ts
+      case "$rejected_case" in
+        unknown-source) printf '%s\n' 'export const unreviewed = true;' > stores/valkey/src/unreviewed.ts ;;
+        unknown-test) printf '%s\n' "it('unknown', () => {});" > stores/valkey/src/unreviewed.test.ts ;;
+        missing-test) rm stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts ;;
+        symlink-test)
+          rm stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+          ln -s index.ts stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts
+          ;;
+      esac
+      git add .
+      git commit -q -m "guard policy $rejected_case"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/guard-$rejected_case-failure.log"
+    set +e
+    run_fixture "$head_sha" "$output"
+    status=$?
+    set -e
+    if (( status == 0 )); then
+      echo "Guard policy $rejected_case unexpectedly passed." >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'Failing closed instead of reporting incomplete validation as successful.' "$output"
+    if [[ -s "$command_log" ]]; then
+      echo 'Rejected guard coverage executed package commands.' >&2
+      cat "$command_log" >&2
+      exit 1
+    fi
+  done
+
   echo 'PapersFlow fork validator fixtures passed.'
 }
 
@@ -13031,7 +13111,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     server-adapters/fastify)
       if [[ "$pf3553_selected_route_exports" == false ]]; then
         printf '%s\n' "$workspace" >> "$unsupported_workspaces"
@@ -13311,7 +13391,7 @@ while IFS= read -r path; do
   printf '%s\n' "$path" >> "$unsupported_inputs"
 done < <(
   grep -E \
-    '^(client-sdks/client-js|mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|libsql)|workflows/inngest)/package\.json$' \
+    '^(client-sdks/client-js|mastracode/(sdk|tui)|pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/inngest)/package\.json$' \
     "$changed_files" || true
 )
 
@@ -13612,7 +13692,7 @@ fi
 # source or test in a newly admitted workspace fails closed until its runtime
 # and service contract are reviewed explicitly.
 while IFS= read -r file; do
-  if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|libsql)|workflows/(inngest|temporal))/ ]] &&
+  if [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/(inngest|temporal))/ ]] &&
     ! [[ "$file" =~ \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
     if [[ "$file" == 'workflows/inngest/package.json' ]] &&
       { [[ "$inngest_pf2050_coordination" == true ]] ||
@@ -13632,12 +13712,23 @@ while IFS= read -r file; do
     continue
   fi
 
-  if ! [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|libsql)|workflows/(inngest|temporal))/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
+  if ! [[ "$file" =~ ^(pubsub/(google-cloud-pubsub|redis-streams)|stores/(clickhouse|cloudflare|convex|dsql|dynamodb|elasticsearch|mssql|mysql|oracledb|spanner|valkey|libsql)|workflows/(inngest|temporal))/.*\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$ ]]; then
     continue
   fi
 
   if grep -Eq '\.(test|spec)\.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$|\.test-d\.ts$' <<< "$file"; then
     case "$file" in
+      stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/convex/src/storage/domains/workflows/cancel-guard.test.ts)
+        queue_owned_workspace_test "${file%/cancel-guard.test.ts}/index.ts" "$file"
+        ;;
       pubsub/google-cloud-pubsub/src/group.test.ts | \
         pubsub/redis-streams/src/pubsub.test.ts | \
         stores/clickhouse/src/storage/db/index.test.ts | \
@@ -13645,6 +13736,15 @@ while IFS= read -r file; do
         stores/convex/src/cache/index.test.ts | \
         stores/convex/src/server/cache.test.ts | \
         stores/convex/src/server/storage.test.ts | \
+        stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts | \
+        stores/convex/src/storage/domains/workflows/cancel-guard.test.ts | \
         stores/libsql/src/storage/index.test.ts | \
         stores/libsql/src/storage/domains/harness/index.test.ts | \
         stores/libsql/src/storage/domains/thread-state/index.test.ts | \
@@ -13691,6 +13791,17 @@ while IFS= read -r file; do
       # Miniflare binding suite exercises the consuming db module in-process
       # and needs no Cloudflare account or container.
       queue_owned_workspace_test "$file" stores/cloudflare/src/kv/storage/db/index.test.ts
+      ;;
+    stores/dsql/src/storage/domains/workflows/index.ts | \
+      stores/dynamodb/src/storage/domains/workflows/index.ts | \
+      stores/elasticsearch/src/storage/domains/workflows/index.ts | \
+      stores/mssql/src/storage/domains/workflows/index.ts | \
+      stores/mysql/src/storage/domains/workflows/index.ts | \
+      stores/oracledb/src/storage/domains/workflows/index.ts | \
+      stores/spanner/src/storage/domains/workflows/index.ts | \
+      stores/valkey/src/storage/domains/workflows/index.ts | \
+      stores/convex/src/storage/domains/workflows/index.ts)
+      queue_owned_workspace_test "$file" "${file%/index.ts}/cancel-guard.test.ts"
       ;;
     stores/convex/src/cache/index.ts | stores/convex/src/cache/types.ts)
       queue_owned_workspace_test "$file" stores/convex/src/cache/index.test.ts
@@ -14502,6 +14613,19 @@ if workspace_changed stores/redis; then
   run_with_validation_budget 900 pnpm --filter ./stores/redis --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter ./stores/redis --fail-if-no-match lint
 fi
+
+# PF-5144 admits only the reviewed workflow source/refusal-test pair in these
+# adapters. Compile the production package and run its native lint/type gates;
+# the mandatory no-network public refusal test is executed below in full.
+for guard_adapter in dsql dynamodb elasticsearch mssql mysql oracledb spanner valkey; do
+  if workspace_changed "stores/$guard_adapter"; then
+    run_with_validation_budget 600 pnpm --filter "./stores/$guard_adapter" --fail-if-no-match exec tsc --noEmit
+    guard_build=build:lib
+    [[ "$guard_adapter" != dsql ]] || guard_build=build
+    run_with_validation_budget 900 pnpm --filter "./stores/$guard_adapter" --fail-if-no-match "$guard_build"
+    run_with_validation_budget 600 pnpm --filter "./stores/$guard_adapter" --fail-if-no-match lint
+  fi
+done
 
 if workspace_changed stores/clickhouse; then
   run_with_validation_budget 600 pnpm --filter ./stores/clickhouse --fail-if-no-match exec tsc --noEmit
@@ -15500,6 +15624,16 @@ if (( ${#detected_tests[@]} > 0 )); then
       "$file" != stores/pg/* && "$file" != stores/redis/* && \
       "$file" != stores/mongodb/* && "$file" != stores/upstash/* ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == stores/dsql/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/dynamodb/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/elasticsearch/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/mssql/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/mysql/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/oracledb/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/spanner/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/valkey/src/storage/domains/workflows/cancel-guard.test.ts || \
+      "$file" == stores/convex/src/storage/domains/workflows/cancel-guard.test.ts ]]; then
+      printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == stores/clickhouse/src/storage/db/index.test.ts || \
       "$file" == stores/cloudflare/src/kv/storage/db/index.test.ts || \
       "$file" == stores/convex/src/cache/index.test.ts || \
