@@ -1280,9 +1280,11 @@ export class Memory extends MastraMemory {
               memoryStore,
               coordinates: { scope: 'resource', resourceId: thread.resourceId, threadId: thread.id },
               workingMemory: managedWorkingMemory.workingMemory,
-              ...(observationalMemorySourceWriteGuard
-                ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
-                : {}),
+              observationalMemoryGuard: await this.resolveWorkingMemoryGuardForSourceWrite(
+                memoryStore,
+                observationalMemorySourceWriteGuard,
+                thread.id,
+              ),
               ...(config.workingMemory?.maxDataBytes !== undefined
                 ? { maxDataBytes: config.workingMemory.maxDataBytes }
                 : {}),
@@ -1346,9 +1348,11 @@ export class Memory extends MastraMemory {
           memoryStore,
           coordinates: { scope: 'thread', resourceId: thread.resourceId, threadId: thread.id },
           workingMemory: managedWorkingMemory.workingMemory,
-          ...(observationalMemorySourceWriteGuard
-            ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
-            : {}),
+          observationalMemoryGuard: await this.resolveWorkingMemoryGuardForSourceWrite(
+            memoryStore,
+            observationalMemorySourceWriteGuard,
+            thread.id,
+          ),
           ...(config.workingMemory?.maxDataBytes !== undefined
             ? { maxDataBytes: config.workingMemory.maxDataBytes }
             : {}),
@@ -1472,9 +1476,11 @@ export class Memory extends MastraMemory {
                 memoryStore,
                 coordinates: { scope: 'resource', resourceId, threadId: id },
                 workingMemory: managedWorkingMemory.workingMemory,
-                ...(observationalMemorySourceWriteGuard
-                  ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
-                  : {}),
+                observationalMemoryGuard: await this.resolveWorkingMemoryGuardForSourceWrite(
+                  memoryStore,
+                  observationalMemorySourceWriteGuard,
+                  id,
+                ),
                 ...(config.workingMemory?.maxDataBytes !== undefined
                   ? { maxDataBytes: config.workingMemory.maxDataBytes }
                   : {}),
@@ -1547,9 +1553,11 @@ export class Memory extends MastraMemory {
           memoryStore,
           coordinates: { scope: 'thread', resourceId: updatedThread.resourceId, threadId: id },
           workingMemory: managedWorkingMemory.workingMemory,
-          ...(observationalMemorySourceWriteGuard
-            ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
-            : {}),
+          observationalMemoryGuard: await this.resolveWorkingMemoryGuardForSourceWrite(
+            memoryStore,
+            observationalMemorySourceWriteGuard,
+            id,
+          ),
           ...(config.workingMemory?.maxDataBytes !== undefined
             ? { maxDataBytes: config.workingMemory.maxDataBytes }
             : {}),
@@ -1962,6 +1970,28 @@ export class Memory extends MastraMemory {
     } catch {
       this.logger.warn('Failed to clean up vectors of the deleted thread', { threadId });
     }
+  }
+
+  /**
+   * Bind a derived working-memory write to the OM generation that is current
+   * now. An execution's source-write guard names the record that was active
+   * when the execution started; ordinary reflection archives but keeps that
+   * record, so it remains a valid source fence while the derived WM guard
+   * checks the latest generation. Validate the source fence atomically and
+   * return the active generation as the WM guard; retraction still rejects.
+   */
+  private async resolveWorkingMemoryGuardForSourceWrite(
+    memoryStore: MemoryStorage,
+    sourceWriteGuard: ObservationalMemorySourceWriteGuard | undefined,
+    threadId: string,
+  ): Promise<ObservationalMemoryWriteGuard | undefined> {
+    if (!sourceWriteGuard) return undefined;
+    const active = await memoryStore.getObservationalMemoryForSourceWrite({
+      threadId,
+      resourceId: sourceWriteGuard.resourceId,
+      sourceWriteGuard,
+    });
+    return { recordId: active.id, threadId: active.threadId, resourceId: active.resourceId };
   }
 
   private async writeObserverWorkingMemory({

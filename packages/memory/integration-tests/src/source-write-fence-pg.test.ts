@@ -82,6 +82,40 @@ describe('source-write fence with managed working memory on PostgreSQL', () => {
     },
   );
 
+  it('accepts the thread working-memory update when its first thread lookup misses (lagging read)', async () => {
+    const memory = createMemory('thread');
+    const memoryStore = (await store.getStore('memory'))!;
+    const threadId = `thread-${randomUUID()}`;
+    const resourceId = `resource-${randomUUID()}`;
+
+    const guard = (await memory.prepareObservationalMemorySourceWriteGuard(threadId, resourceId))!;
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt: new Date(), updatedAt: new Date() },
+      observationalMemorySourceWriteGuard: guard,
+    });
+    const captured = (await memoryStore.getObservationalMemory(threadId, resourceId))!;
+    await memoryStore.createReflectionGeneration({ currentRecord: captured, reflection: 'reflected', tokenCount: 1 });
+
+    // PG reads threads through its read client; a lagging replica (or a thread created
+    // concurrently by another writer) makes the first lookup miss. That routes the update
+    // through the non-revisioned fallback, which must still honor source-fence semantics.
+    const getThreadById = memoryStore.getThreadById.bind(memoryStore);
+    let lookups = 0;
+    memoryStore.getThreadById = async args => (lookups++ === 0 ? null : getThreadById(args));
+    try {
+      await memory.updateThread({
+        id: threadId,
+        title: 'generated title',
+        metadata: { workingMemory: '# Notes\n- lagging read still valid' },
+        observationalMemorySourceWriteGuard: guard,
+      });
+    } finally {
+      memoryStore.getThreadById = getThreadById;
+    }
+
+    await expect(memory.getWorkingMemory({ threadId, resourceId })).resolves.toContain('lagging read still valid');
+  });
+
   it('still rejects the same write once the captured scope was erased', async () => {
     const memory = createMemory('thread');
     const memoryStore = (await store.getStore('memory'))!;
