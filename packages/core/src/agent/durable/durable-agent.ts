@@ -242,6 +242,8 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   context?: AgentExecutionOptions<OUTPUT>['context'];
   /** Native identity for the admitted input and the response segments it owns. */
   logicalMessageIdentity?: AgentExecutionOptions<OUTPUT>['logicalMessageIdentity'];
+  /** Prepared OM source-write fence; serialized with the run and reused on recovery. */
+  observationalMemorySourceWriteGuard?: AgentExecutionOptions<OUTPUT>['observationalMemorySourceWriteGuard'];
   /** Memory configuration for conversation persistence and retrieval */
   memory?: AgentExecutionOptions<OUTPUT>['memory'];
   /** Unique identifier for this execution run */

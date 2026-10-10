@@ -8,7 +8,7 @@ import { createTool, webSearchTool } from '../tools';
 import { Agent } from './agent';
 import type { AgentRunToolCall } from './agent';
 import type { AgentExecutionOptions, PublicAgentExecutionOptions } from './agent.types';
-import type { DurableAgent, DurableAgentResumeOptions } from './durable';
+import type { DurableAgent, DurableAgentResumeOptions, DurableAgentStreamOptions } from './durable';
 import type { AgentConfig } from './types';
 
 /**
@@ -33,6 +33,18 @@ describe('Agent Type Tests', () => {
       void durableAgent.resumeStream({}, { runId: 'run-123', toolCallId: 'call-123' });
       // @ts-expect-error Unknown resume options must not be accepted by the durable override.
       void durableAgent.resumeStream({}, { runId: 'run-123', banana: true });
+    });
+
+    it('accepts a prepared OM source-write guard on durable stream options', () => {
+      const options: DurableAgentStreamOptions = {
+        memory: { thread: 'thread-123', resource: 'resource-123' },
+        observationalMemorySourceWriteGuard: {
+          recordId: 'record-1',
+          threadId: 'thread-123',
+          resourceId: 'resource-123',
+        },
+      };
+      expectTypeOf(options.observationalMemorySourceWriteGuard?.recordId).toEqualTypeOf<string | undefined>();
     });
   });
 
