@@ -251,6 +251,65 @@ describe('workflow storage persistence failures', () => {
     },
   );
 
+  it('does not re-run a nested workflow whose terminal write is commit_unknown', async () => {
+    const childEffect = vi.fn(async () => ({ ok: true }));
+    const childStep = createStep({
+      id: 'child-step',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute: childEffect,
+    });
+    const child = createWorkflow({
+      id: 'nested-child-wf',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      steps: [childStep],
+    })
+      .then(childStep)
+      .commit();
+    const parent = createWorkflow({
+      id: 'nested-parent-wf',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      steps: [child],
+      retryConfig: { attempts: 1 },
+    })
+      .then(child)
+      .commit();
+    const storage = new MockStore();
+    const mastra = new Mastra({ storage, workflows: { 'nested-parent-wf': parent }, logger: false });
+    try {
+      const workflowsStore = (await storage.getStore('workflows'))!;
+      const persistStepUpdate = workflowsStore.persistWorkflowStepUpdate.bind(workflowsStore);
+      let failed = false;
+      vi.spyOn(workflowsStore, 'persistWorkflowStepUpdate').mockImplementation(async input => {
+        const result = await persistStepUpdate(input);
+        // The child's terminal write commits, but its caller sees a failure.
+        if (!failed && input.workflowName === 'nested-child-wf' && input.snapshot.status === 'success') {
+          failed = true;
+          throw classifiedStorageFailure('commit_unknown');
+        }
+        return result;
+      });
+      const run = await parent.createRun();
+
+      const error = await rejection(run.start({ inputData: {} }));
+
+      expect(failed).toBe(true);
+      expect(getStoragePersistenceFailure(error)).toBe('commit_unknown');
+      // The parent's step retry would replay the child's effects over its
+      // committed terminal state.
+      expect(childEffect).toHaveBeenCalledTimes(1);
+      const durableParent = await workflowsStore.loadWorkflowSnapshot({
+        workflowName: 'nested-parent-wf',
+        runId: run.runId,
+      });
+      expect(durableParent?.status).toBe('running');
+    } finally {
+      await mastra.shutdown();
+    }
+  });
+
   it('keeps an unclassified in-memory storage failure unclassified', async () => {
     const { workflowsStore } = await setup();
     await workflowsStore.persistWorkflowSnapshot({

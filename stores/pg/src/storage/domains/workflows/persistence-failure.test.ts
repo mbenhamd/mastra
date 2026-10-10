@@ -88,6 +88,14 @@ describe('WorkflowsPG persistence failure classification on PostgreSQL', () => {
     return commit();
   };
 
+  const terminalFence = {
+    workflowName: 'terminal-lookup-wf',
+    runId: 'missing-run',
+    ownerId: 'owner',
+    claimToken: 'token',
+    claimGeneration: 1,
+  };
+
   async function seedRun(workflowName: string, runId: string) {
     const snapshot = createEmptyWorkflowSnapshot(runId);
     snapshot.status = 'running';
@@ -187,6 +195,51 @@ describe('WorkflowsPG persistence failure classification on PostgreSQL', () => {
     },
     20_000,
   );
+
+  it.each([
+    ['commits before the session dies', commitThenTerminate, 'commit_unknown', 'success'],
+    ['cannot send its COMMIT', terminateBeforeCommit, 'transient', 'running'],
+  ] as const)(
+    'classifies a step update that %s by what it may have left behind',
+    async (_name, interceptor, persistenceFailure, durable) => {
+      const workflowName = `step-update-${randomUUID()}`;
+      await seedRun(workflowName, 'run');
+      const snapshot = createEmptyWorkflowSnapshot('run');
+      snapshot.status = 'success';
+      interceptCommit = interceptor;
+
+      const error = await rejection(writer.persistWorkflowStepUpdate({ workflowName, runId: 'run', snapshot }));
+
+      expect(error).toMatchObject({
+        id: 'MASTRA_STORAGE_PG_PERSIST_WORKFLOW_STEP_UPDATE_FAILED',
+        details: { workflowName, runId: 'run', persistenceFailure },
+      });
+      expect(await durableStatus(workflowName, 'run')).toBe(durable);
+    },
+  );
+
+  it.each([
+    [
+      'getWorkflowTerminalEffectForDispatch',
+      () => writer.getWorkflowTerminalEffectForDispatch({ ...terminalFence, kind: 'workflow-finish' }),
+    ],
+    [
+      'getWorkflowTerminalDestinationReceipt',
+      () =>
+        writer.getWorkflowTerminalDestinationReceipt({
+          ...terminalFence,
+          effectKind: 'workflow-finish',
+          consumerId: 'consumer',
+        }),
+    ],
+    ['getWorkflowTerminalContinuationPlan', () => writer.getWorkflowTerminalContinuationPlan(terminalFence)],
+  ])('classifies a lost COMMIT response of the %s lookup as a transient read', async (_name, lookup) => {
+    interceptCommit = commitThenTerminate;
+
+    const error = await rejection(lookup());
+
+    expect(getStoragePersistenceFailure(error)).toBe('transient');
+  });
 
   it('classifies writes and reads the server rejects as permanent', async () => {
     const missing = (await storeOn(writerPool, `missing_${randomUUID().replaceAll('-', '')}`).getStore('workflows'))!;

@@ -2646,6 +2646,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2791,6 +2792,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2950,6 +2952,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }

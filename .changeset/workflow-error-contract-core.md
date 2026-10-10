@@ -13,7 +13,7 @@ Added stable error ids for workflow lifecycle preconditions and a storage persis
 
 The stored status is reported in `details.actualStatus`.
 
-**Persistence failures.** Storage adapters can now say what a failed operation left behind: `transient` (it did not apply, and a later attempt may succeed), `permanent` (it did not apply, and repeating it fails the same way) or `commit_unknown` (the write may have committed although the caller saw a failure). Today only the PostgreSQL workflow storage (`@mastra/pg`) reports it; other adapters, including the in-memory store, return `undefined`. Read it with `getStoragePersistenceFailure`:
+**Persistence failures.** Storage adapters can now say what a failed operation left behind: `transient` (it did not apply, and a later attempt may succeed), `permanent` (it did not apply, and repeating it fails the same way) or `commit_unknown` (the write may have committed although the caller saw a failure). Today only the PostgreSQL workflow storage (`@mastra/pg`) reports it; other adapters, including the in-memory store, return `undefined`. Read it with `getStoragePersistenceFailure`. Step retries never repeat a step that failed with `commit_unknown` (for example a nested workflow whose final write may have committed); the failure reaches the caller instead, and no failed outcome is recorded over it:
 
 ```ts
 import { getStoragePersistenceFailure } from '@mastra/core/storage';

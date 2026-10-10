@@ -9,6 +9,7 @@ import type { PubSub } from '../events/pubsub';
 import type { ObservabilityContext, Span, SpanType, TracingPolicy } from '../observability';
 import { createObservabilityContext, resolveExportedSpanId } from '../observability';
 import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_AUTH_TOKEN_KEY } from '../request-context';
+import { getStoragePersistenceFailure } from '../storage/persistence-failure';
 import type { PersistWorkflowStepUpdateResult } from '../storage/types';
 import { deepEqual } from '../utils/deep-equal';
 import {
@@ -634,6 +635,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         const result = await retryCountStorage.run(i, () => this.wrapDurableOperation(stepId, () => runStep(i)));
         return { ok: true, result };
       } catch (e) {
+        // A storage write that may have committed (for example a nested
+        // workflow's terminal write) is never repeated here: re-running the
+        // step would replay its effects over durable state the caller has not
+        // reconciled. It reaches the caller unchanged, like any other workflow
+        // persistence failure, and no failed outcome is recorded over it.
+        if (getStoragePersistenceFailure(e) === 'commit_unknown') throw e;
         const isNonRetryable = e instanceof MastraNonRetryableError;
 
         if (isNonRetryable || i === params.retries) {
