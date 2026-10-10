@@ -1005,12 +1005,16 @@ export class AgentLegacyHandler {
           onStepFinish: async (props: any) => {
             if (savePerStep) {
               if (!threadExists && !threadCreatedByStep && memory && thread) {
+                // A per-step upsert can run after the thread was erased mid-step;
+                // bind it to this execution's captured source-write fence.
                 await memory.createThread({
                   threadId,
                   title: thread.title,
                   metadata: thread.metadata,
                   resourceId: thread.resourceId,
                   memoryConfig,
+                  observationalMemorySourceWriteGuard:
+                    messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard,
                 });
                 threadCreatedByStep = true;
               }
