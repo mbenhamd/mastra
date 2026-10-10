@@ -8451,6 +8451,18 @@ export class Session {
     }
     const preexistingTurnSourceWriteGuard =
       this._currentTurnAbortController !== undefined ? this._currentTurnSourceWriteGuard : undefined;
+    // Reject a replacement fence before _beginTurn replaces the shared turn
+    // state: the rejection cleanup ends this call's turn, which would otherwise
+    // clear the still-running execution's fence and break its later steering.
+    if (
+      sourceWriteGuard !== undefined &&
+      preexistingTurnSourceWriteGuard !== undefined &&
+      !sameObservationalMemorySourceWriteGuard(sourceWriteGuard, preexistingTurnSourceWriteGuard)
+    ) {
+      throw new HarnessOverrideConflictError(this.id, this._currentRunId ?? '', [
+        'observationalMemorySourceWriteGuard',
+      ]);
+    }
     // When a turn is already in flight, the signal-routed path interleaves into
     // that active run and its streamOptions (which carry the request context)
     // are ignored, so a caller `app` could never reach the running tools. Reject
