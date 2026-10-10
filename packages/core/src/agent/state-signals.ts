@@ -293,12 +293,6 @@ export async function applyStateSignal({
     },
   });
 
-  beforeAddSignal?.();
-  if (messageList) {
-    messageList.addSignal(updatedSignal);
-  }
-  await writeSignal?.(updatedSignal);
-
   const updatedAt = new Date().toISOString();
   const updatedActiveSignals = [...activeSignals, updatedSignal];
   const nextTracking: StateSignalTracking = {
@@ -333,6 +327,14 @@ export async function applyStateSignal({
     memoryConfig,
     observationalMemorySourceWriteGuard,
   });
+
+  // Publish only after the (possibly source-write-fenced) metadata write
+  // succeeds, so a rejected write leaves the live transcript and stream intact.
+  beforeAddSignal?.();
+  if (messageList) {
+    messageList.addSignal(updatedSignal);
+  }
+  await writeSignal?.(updatedSignal);
 
   return { skipped: false, signal: updatedSignal, stateId, version, tracking: nextTracking };
 }

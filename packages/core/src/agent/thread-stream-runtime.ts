@@ -12,6 +12,8 @@ import { getChunkProducedAt } from '../stream/base/produced-at';
 import { isSignalChunkExcluded } from '../stream/signal-exclusions';
 import { ChunkFrom } from '../stream/types';
 import type { ChunkType, ThreadHistoryChunk } from '../stream/types';
+import { ObservationalMemorySourceWriteConflictError } from '../storage';
+import type { ObservationalMemorySourceWriteGuard } from '../storage';
 import { readPositiveIntEnv } from '../utils';
 import type { Agent } from './agent';
 import type { AgentExecutionOptions } from './agent.types';
@@ -101,6 +103,32 @@ export function rememberBoundedResumableTerminalStream(
     for (const evictedStreamId of evictedRun ?? []) evictedStreamIds.push(evictedStreamId);
   }
   return evictedStreamIds;
+}
+
+/**
+ * The OM source-write fence for a direct signal write. A guard passed in
+ * stream options is the execution's captured fence; the memory request
+ * context may carry the same one. Conflicting values are rejected rather
+ * than letting either silently win.
+ */
+function resolveSignalSourceWriteGuard(streamOptions?: {
+  requestContext?: RequestContext;
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+}): ObservationalMemorySourceWriteGuard | undefined {
+  const explicit = streamOptions?.observationalMemorySourceWriteGuard;
+  const contextual = parseMemoryRequestContext(streamOptions?.requestContext)?.observationalMemorySourceWriteGuard;
+  if (
+    explicit &&
+    contextual &&
+    (explicit.recordId !== contextual.recordId ||
+      explicit.threadId !== contextual.threadId ||
+      explicit.resourceId !== contextual.resourceId)
+  ) {
+    throw new ObservationalMemorySourceWriteConflictError(
+      'Signal stream options and memory request context carry different observational memory source-write guards.',
+    );
+  }
+  return explicit ?? contextual;
 }
 
 export type AgentThreadOutputDrainErrorReason =
@@ -4306,18 +4334,18 @@ export class AgentThreadStreamRuntime {
     signal: CreatedAgentSignal,
     resourceId: string,
     threadId: string,
-    requestContext?: RequestContext,
+    streamOptions?: AgentExecutionOptions<any>,
   ) {
     // Transient signals are delivery-only: never write them to storage, even when the
     // active-behavior asked to persist. Honored here (not just in the memory layer) so it holds
     // for any memory implementation, including ones without a signal-aware save filter.
     if (signal.transient) return;
+    const requestContext = streamOptions?.requestContext;
     const memory = await agent.getMemory({ requestContext });
     if (!memory) return;
-    const memoryContext = parseMemoryRequestContext(requestContext);
     await memory.saveMessages({
       messages: [signal.toDBMessage({ resourceId, threadId })],
-      observationalMemorySourceWriteGuard: memoryContext?.observationalMemorySourceWriteGuard,
+      observationalMemorySourceWriteGuard: resolveSignalSourceWriteGuard(streamOptions),
     });
   }
 
@@ -4469,11 +4497,11 @@ export class AgentThreadStreamRuntime {
     signal: CreatedAgentSignal,
     resourceId: string,
     threadId: string,
-    requestContext?: RequestContext,
+    streamOptions?: AgentExecutionOptions<any>,
   ) {
     if (signal.transient) return;
 
-    await this.#persistSignal(agent, signal, resourceId, threadId, requestContext);
+    await this.#persistSignal(agent, signal, resourceId, threadId, streamOptions);
     this.#broadcastPersistedSignal(state, pubsub, key, runId, agent.id, signal, resourceId, threadId);
   }
 
@@ -9194,7 +9222,7 @@ export class AgentThreadStreamRuntime {
       resourceId,
       threadId,
       memoryConfig: memoryContext?.memoryConfig,
-      observationalMemorySourceWriteGuard: memoryContext?.observationalMemorySourceWriteGuard,
+      observationalMemorySourceWriteGuard: resolveSignalSourceWriteGuard(target.ifIdle?.streamOptions),
       acceptedAt: new Date(),
     });
 
@@ -9420,13 +9448,7 @@ export class AgentThreadStreamRuntime {
             accepted: Promise.resolve({ action: 'discard' as const }),
           };
         }
-        const persisted = this.#persistSignal(
-          agent,
-          signal,
-          resourceId,
-          threadId,
-          target.ifIdle?.streamOptions?.requestContext,
-        );
+        const persisted = this.#persistSignal(agent, signal, resourceId, threadId, target.ifIdle?.streamOptions);
         void persisted.catch(() => {});
         return acceptSignal(
           {
@@ -9617,7 +9639,7 @@ export class AgentThreadStreamRuntime {
         signal,
         resourceId,
         threadId,
-        target.ifIdle?.streamOptions?.requestContext,
+        target.ifIdle?.streamOptions,
       );
       void persisted.catch(() => {});
       return acceptSignal(
