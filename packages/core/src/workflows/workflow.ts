@@ -85,6 +85,7 @@ import { DefaultExecutionEngine } from './default';
 import { getAdmittedJsonSchema } from './dynamic/admitted-schema-source';
 import type { ClassifierStepOutput } from './entry-executors';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
+import { workflowRunNotSuspendedError, workflowSnapshotNotFoundError } from './lifecycle-errors';
 import {
   createWorkflowExecutionGeneration,
   getWorkflowLifecycleTopic,
@@ -6055,11 +6056,15 @@ export class Run<
     const snapshot = await waitForSuspendedSnapshot(workflowsStore, this.workflowId, this.runId);
 
     if (!snapshot) {
-      throw new Error('No snapshot found for this workflow run: ' + this.workflowId + ' ' + this.runId);
+      throw workflowSnapshotNotFoundError({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        text: 'No snapshot found for this workflow run: ' + this.workflowId + ' ' + this.runId,
+      });
     }
 
     if (snapshot.status !== 'suspended') {
-      throw new Error('This workflow run was not suspended');
+      throw workflowRunNotSuspendedError({ workflowId: this.workflowId, runId: this.runId, status: snapshot.status });
     }
 
     // A cancel request can land while the lineage runs and lose the race with
@@ -6327,7 +6332,11 @@ export class Run<
     });
 
     if (!snapshot) {
-      throw new Error(`Snapshot not found for run ${this.runId}`);
+      throw workflowSnapshotNotFoundError({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        text: `Snapshot not found for run ${this.runId}`,
+      });
     }
 
     // Parent parallel activeStepsPath can lag behind nested child completion after a crash:
@@ -6508,7 +6517,11 @@ export class Run<
     });
 
     if (!snapshot) {
-      throw new Error(`Snapshot not found for run ${this.runId}`);
+      throw workflowSnapshotNotFoundError({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        text: `Snapshot not found for run ${this.runId}`,
+      });
     }
 
     if (snapshot.status === 'running') {

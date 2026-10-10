@@ -15,3 +15,4 @@ export * from './utils';
 export * from './workflow-snapshot';
 export * from './workflow-snapshot-handoff';
 export * from './execution-closure';
+export * from './persistence-failure';

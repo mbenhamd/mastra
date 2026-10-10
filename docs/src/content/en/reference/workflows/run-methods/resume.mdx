@@ -265,6 +265,36 @@ If execution fails after claiming a suspension, the claim remains consumed. The 
 
 :::
 
+## Errors
+
+`resume()` throws a `MastraError` with a stable `id` when the stored run can't be resumed. Match on the `id`, not the message:
+
+- `WORKFLOW_SNAPSHOT_NOT_FOUND`: the run has no stored snapshot.
+- `WORKFLOW_RUN_NOT_SUSPENDED`: the stored run is no longer suspended, for example because another caller already resumed it.
+- `WORKFLOW_RESUME_ALREADY_CLAIMED`: another caller claimed the same suspension first.
+
+When a storage write fails during the resume, `getStoragePersistenceFailure(error)` from `@mastra/core/storage` returns what the adapter knows about that write:
+
+- `transient`: the write didn't apply, and a later attempt may succeed.
+- `permanent`: the write didn't apply, and repeating it fails the same way.
+- `commit_unknown`: the write may have committed even though the call failed.
+- `undefined`: the adapter doesn't report a classification.
+
+The classification describes only the failed write. Earlier writes of the same resume, such as its claim, may already be stored. Read the run with `getWorkflowRunById()` before deciding what to do, and don't repeat a `commit_unknown` resume without that read.
+
+```typescript
+import { getStoragePersistenceFailure } from '@mastra/core/storage'
+
+try {
+  await run.resume({ step: 'approval', resumeData: { approved: true } })
+} catch (error) {
+  if (getStoragePersistenceFailure(error) !== undefined) {
+    const stored = await workflow.getWorkflowRunById(run.runId)
+    // Decide from the stored status, not from the failure.
+  }
+}
+```
+
 ## Related
 
 - [Workflows overview](/docs/workflows/overview#running-workflows)
