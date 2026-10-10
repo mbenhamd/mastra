@@ -20,6 +20,7 @@ describe('prepare memory step source-write fencing', () => {
     const memory = {
       getThreadById: vi.fn().mockResolvedValue(existingThread),
       getMergedThreadConfig: vi.fn().mockReturnValue({}),
+      storage: { getStore: vi.fn().mockResolvedValue({ supportsObservationalMemorySourceWriteGuards: true }) },
       saveThread: vi.fn(async ({ thread, observationalMemorySourceWriteGuard }) => {
         savedGuards.push(observationalMemorySourceWriteGuard);
         return thread;
