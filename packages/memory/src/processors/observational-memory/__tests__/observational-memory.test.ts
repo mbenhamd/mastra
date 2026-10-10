@@ -7,7 +7,12 @@ import { coreFeatures } from '@mastra/core/features';
 import { TITLE_PINNED_THREAD_METADATA_KEY } from '@mastra/core/memory';
 import { MASTRA_THREAD_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { createSkill } from '@mastra/core/skills';
-import { InMemoryMemory, InMemoryDB, InMemoryStore } from '@mastra/core/storage';
+import {
+  InMemoryMemory,
+  InMemoryDB,
+  InMemoryStore,
+  ObservationalMemorySourceWriteConflictError,
+} from '@mastra/core/storage';
 import { estimateTokenCount } from 'tokenx';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
@@ -15886,6 +15891,48 @@ describe('Single-thread replay red tests', () => {
     expect(messages[0]?.content?.parts?.map((p: any) => (p.type === 'text' ? p.text : p.type))).toEqual([
       'array fresh-tail',
     ]);
+  });
+
+  it('T2-D3: marker cleanup leaves the live transcript unchanged when the guarded save is rejected', async () => {
+    const { om, messageList, threadId, resourceId } = await createReplayFixture();
+    const t0 = new Date('2025-01-01T10:00:00.000Z');
+    messageList.add(
+      {
+        id: 'older',
+        threadId,
+        resourceId,
+        role: 'user',
+        content: { format: 2, parts: [{ type: 'text', text: 'older observed input' }] },
+        createdAt: t0,
+      } as any,
+      'memory',
+    );
+    messageList.add(
+      {
+        id: 'anchor',
+        threadId,
+        resourceId,
+        role: 'assistant',
+        content: {
+          format: 2,
+          parts: [
+            { type: 'text', text: 'observed-prefix' },
+            { type: 'data-om-observation-end', data: { cycleId: 'cleanup-cycle' } },
+            { type: 'text', text: 'fresh-tail' },
+          ],
+        },
+        createdAt: new Date(t0.getTime() + 1),
+      } as any,
+      'memory',
+    );
+    const before = structuredClone(messageList.get.all.db());
+    vi.spyOn(om, 'persistMessages').mockRejectedValueOnce(new ObservationalMemorySourceWriteConflictError());
+
+    await expect(om.cleanupMessages({ threadId, resourceId, messages: messageList })).rejects.toBeInstanceOf(
+      ObservationalMemorySourceWriteConflictError,
+    );
+
+    expect(messageList.get.all.db()).toEqual(before);
   });
 
   it('T3-A: sealed remint (id=A->id=B) should not replay sealed prefix', async () => {

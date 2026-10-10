@@ -2893,33 +2893,38 @@ ${formattedMessages}
         }
       }
 
-      messagesToSave.push(markerMsg);
-
       // The marker anchor itself may be an in-flight message (e.g. the step-0
       // seeded response message) — preserved ids must never be trimmed or removed.
       const preserveMarker = Boolean(markerMsg.id && preserveSet?.has(markerMsg.id));
+      let trimmedMarkerParts: MastraDBMessage['content']['parts'] | undefined;
       if (!preserveMarker) {
         const unobservedParts = getUnobservedParts(markerMsg);
         if (unobservedParts.length === 0) {
           if (markerMsg.id) idsToRemove.push(markerMsg.id);
         } else if (unobservedParts.length < (markerMsg.content?.parts?.length ?? 0)) {
-          markerMsg.content.parts = unobservedParts;
+          trimmedMarkerParts = unobservedParts;
         }
       }
+      // Persist the trimmed copy before touching the live transcript: a rejected
+      // source-write guard must leave the in-flight messages unchanged.
+      messagesToSave.push(
+        trimmedMarkerParts ? { ...markerMsg, content: { ...markerMsg.content, parts: trimmedMarkerParts } } : markerMsg,
+      );
 
       if (messageList) {
-        if (idsToRemove.length > 0) {
-          messageList.removeByIds(idsToRemove);
-        }
-
         if (messagesToSave.length > 0) {
           await this.persistMessages(messagesToSave, threadId, resourceId, sourceWriteGuard);
+        }
+        if (trimmedMarkerParts) markerMsg.content.parts = trimmedMarkerParts;
+        if (idsToRemove.length > 0) {
+          messageList.removeByIds(idsToRemove);
         }
 
         omDebug(`[OM:cleanupMarker] removed ${idsToRemove.length} messages, saved ${messagesToSave.length}`);
         return messageList.get.all.db();
       }
 
+      if (trimmedMarkerParts) markerMsg.content.parts = trimmedMarkerParts;
       this.removeIdsFromArray(allMsgs, idsToRemove);
       return allMsgs;
     }
