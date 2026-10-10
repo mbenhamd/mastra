@@ -13214,6 +13214,7 @@ export class Session {
               streamOptions: {
                 maxSteps: HARNESS_SESSION_MAX_STEPS,
                 ...this._createEmptySynthesisOptions(),
+                ...this._subagentTracingOptions(),
                 ...(lineagedWakeAbortController ? { abortSignal: lineagedWakeAbortController.signal } : {}),
                 ...(responseLogicalMessageIdentity ? { logicalMessageIdentity: responseLogicalMessageIdentity } : {}),
               } as never,
@@ -13510,6 +13511,7 @@ export class Session {
             memory: { thread: this.threadId, resource: this.resourceId },
             maxSteps: HARNESS_SESSION_MAX_STEPS,
             ...this._createEmptySynthesisOptions(),
+            ...this._subagentTracingOptions(),
           } as never,
         },
       },
