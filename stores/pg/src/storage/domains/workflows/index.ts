@@ -176,14 +176,6 @@ import { getSchemaSnapshot } from '../../db/schema-snapshot';
 import type { SchemaCheckConstraint } from '../../db/schema-snapshot';
 import { runPrune, resolveTargets } from '../../retention';
 
-/**
- * Storage operations whose names begin with GET_ or LIST_ only read; every
- * other named operation can mutate durable state.
- */
-function isWriteOperation(operation: string): boolean {
-  return !/^(GET|LIST)_/.test(operation);
-}
-
 class CorruptWorkflowTerminalSnapshotRecordError extends TypeError {
   constructor() {
     super('Invalid workflow terminal snapshot record');
@@ -1815,6 +1807,10 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.bumpWorkflowParentRevision(t, input.workflowName, input.runId, parentRevision);
   }
 
+  // Terminalization and snapshot-handoff operations are classified as writes:
+  // several lookups (for example GET_WORKFLOW_TERMINAL_PARENT_CONTEXT) latch
+  // state inside their transaction, and a read wrongly treated as a write can
+  // only be reported commit_unknown, never falsely as not applied.
   private terminalizationError(operation: string, workflowName: string, runId: string, error: unknown): never {
     if (error instanceof TypeError || error instanceof RangeError) throw error;
     throw new MastraError(
@@ -1825,7 +1821,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         details: {
           workflowName,
           runId,
-          persistenceFailure: classifyPgPersistenceFailure(error, { write: isWriteOperation(operation) }),
+          persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
         },
       },
       error,
@@ -1843,7 +1839,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     if (error instanceof WorkflowSnapshotHandoffFenceError) return error;
     if (error instanceof TypeError || error instanceof RangeError) return error;
     const details: Record<string, string> = {
-      persistenceFailure: classifyPgPersistenceFailure(error, { write: isWriteOperation(operation) }),
+      persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
     };
     if (workflowName !== undefined) details.workflowName = workflowName;
     if (runId !== undefined) details.runId = runId;

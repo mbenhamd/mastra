@@ -51,14 +51,19 @@ export function isDuplicateSchemaError(error: unknown): boolean {
 }
 
 /**
- * SQLSTATE values whose server response does not settle a write that was
- * already executing or committing: the statement completion is unknown
- * (40003), the backend was shut down or crashed around the commit (57P01,
- * 57P02), the connection failed (class 08) or the server hit an internal error
- * (XX000). A read or a write that never reached COMMIT still did not apply.
+ * SQLSTATE classes that only arise while a statement is parsed, planned,
+ * executed or pre-commit checked, so their error response proves the write
+ * rolled back even when it answered a COMMIT or an autocommit write: data
+ * exceptions (22), integrity violations including deferred constraints (23),
+ * serialization failures and deadlocks (40, except 40003 "statement completion
+ * unknown"), syntax or access errors (42) and unsupported features (0A).
+ * PostgreSQL cannot abort a transaction after its commit record is durable, so
+ * any other error answering a COMMIT or an autocommit write, such as running
+ * out of memory, a shutdown or an internal error, may follow a commit.
  */
-function isAmbiguousWriteSqlState(code: string): boolean {
-  return code === '40003' || code === '57P01' || code === '57P02' || code === 'XX000' || code.startsWith('08');
+function isDefinitiveRollbackSqlState(code: string): boolean {
+  if (code === '40003') return false;
+  return ['22', '23', '40', '42', '0A'].includes(code.slice(0, 2));
 }
 
 /**
@@ -92,10 +97,25 @@ function pgSqlState(error: unknown): string | undefined {
   return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && typeof severity === 'string' ? code : undefined;
 }
 
-/** Socket errors raised before a statement reached the server. */
-const UNSENT_SOCKET_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH']);
-/** Socket errors that can interrupt a statement the server already received. */
-const IN_FLIGHT_SOCKET_CODES = new Set(['ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNABORTED']);
+/**
+ * Socket errors that only occur while establishing a connection: name
+ * resolution failed or the server refused the connection, so no statement was
+ * sent.
+ */
+const UNSENT_SOCKET_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+/**
+ * Socket errors that can also end an established connection after a statement
+ * reached the server. Routing errors belong here: the kernel reports them for
+ * an established connection whose retransmissions fail.
+ */
+const IN_FLIGHT_SOCKET_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ECONNABORTED',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+]);
 /**
  * node-postgres and pg-pool raise these without a code. The first group fails
  * before a statement is written to the connection; the second ends a
@@ -146,12 +166,11 @@ function pgTransportFailure(error: unknown): TransportFailure | undefined {
  * Classify a failed PostgreSQL storage operation for the shared storage
  * persistence failure contract (`@mastra/core/storage`).
  *
- * `write` says whether the operation mutates durable state; a read-only
+ * `write` says whether the operation can mutate durable state; a read-only
  * operation (even one inside a transaction) is never `commit_unknown`. A failure is
  * `commit_unknown` only when a write may have reached its commit point: the
- * COMMIT of a `tx()` failed without a definitive server rejection, or an
- * autocommit write statement lost its connection or got an ambiguous server
- * response. A `tx()` failure before COMMIT was sent, a read, or a definitive
+ * COMMIT of a `tx()`, or an autocommit write statement, lost its connection or
+ * got a server error that does not prove a rollback. A `tx()` failure before COMMIT was sent, a read, or a definitive
  * server rejection never committed, and is `transient` or `permanent` by its
  * cause. Errors without a server or connection cause (validation, contract
  * and programming errors) are `permanent`. A classification already present
@@ -170,7 +189,7 @@ export function classifyPgPersistenceFailure(error: unknown, { write }: { write:
   for (const link of chain) {
     const sqlState = pgSqlState(link);
     if (sqlState !== undefined) {
-      if (mayHaveCommitted && isAmbiguousWriteSqlState(sqlState)) return 'commit_unknown';
+      if (mayHaveCommitted && !isDefinitiveRollbackSqlState(sqlState)) return 'commit_unknown';
       return isTransientSqlState(sqlState) ? 'transient' : 'permanent';
     }
     const transport = pgTransportFailure(link);

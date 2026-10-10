@@ -81,6 +81,8 @@ describe('classifyPgPersistenceFailure', () => {
     ],
     ['the server rejected a serialization conflict', serverError('40001'), 'transient'],
     ['the server rejected a deferred constraint', serverError('23505'), 'permanent'],
+    ['the server ran out of memory, which can follow a commit', serverError('53200'), 'commit_unknown'],
+    ['the route to the server failed', socketError('EHOSTUNREACH'), 'commit_unknown'],
     ['the client was unusable before sending it', new Error('Client was closed and is not queryable'), 'transient'],
   ])('classifies a write COMMIT failure when %s', async (_name, error, expected) => {
     const failure = await txFailure('COMMIT', error);
@@ -98,6 +100,7 @@ describe('classifyPgPersistenceFailure', () => {
     ['could not connect', socketError('ECONNREFUSED'), true, 'transient'],
     ['timed out acquiring a connection', new Error('timeout exceeded when trying to connect'), true, 'transient'],
     ['was rejected by a definitive server error', serverError('23505'), true, 'permanent'],
+    ['got a server error that can follow a commit', serverError('57P01', 'FATAL'), true, 'commit_unknown'],
     ['lost its connection while reading', socketError('ECONNRESET'), false, 'transient'],
   ])('classifies an autocommit statement that %s', async (_name, error, write, expected) => {
     const failure = await statementFailure(error);
