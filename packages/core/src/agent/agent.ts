@@ -6104,12 +6104,19 @@ export class Agent<
                 : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
               if (rejectionMemory) {
                 try {
+                  // A resumed delegation reuses the original child thread and
+                  // execution. Never prepare a replacement fence for it: after
+                  // erasure that would mint a fresh OM record and recreate the
+                  // erased thread. Only a first invocation may prepare one.
+                  const isResumedDelegation = suspendedToolRunId !== undefined;
                   const rejectionSourceWriteGuard =
                     getSubAgentSourceWriteGuard() ??
-                    (await rejectionMemory.prepareObservationalMemorySourceWriteGuard(
-                      subAgentThreadId,
-                      subAgentResourceId,
-                    ));
+                    (isResumedDelegation
+                      ? undefined
+                      : await rejectionMemory.prepareObservationalMemorySourceWriteGuard(
+                          subAgentThreadId,
+                          subAgentResourceId,
+                        ));
                   const userMessage: MastraDBMessage = {
                     id: this.#mastra?.generateId() || randomUUID(),
                     role: 'user',
@@ -6132,11 +6139,13 @@ export class Agent<
                     },
                   };
 
-                  await rejectionMemory.createThread({
-                    resourceId: subAgentResourceId,
-                    threadId: subAgentThreadId,
-                    observationalMemorySourceWriteGuard: rejectionSourceWriteGuard,
-                  });
+                  if (!isResumedDelegation) {
+                    await rejectionMemory.createThread({
+                      resourceId: subAgentResourceId,
+                      threadId: subAgentThreadId,
+                      observationalMemorySourceWriteGuard: rejectionSourceWriteGuard,
+                    });
+                  }
                   await rejectionMemory.saveMessages({
                     messages: [userMessage, assistantMessage],
                     observationalMemorySourceWriteGuard: rejectionSourceWriteGuard,
