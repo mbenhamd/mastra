@@ -2020,7 +2020,13 @@ describe('Memory', () => {
       });
     });
 
-    it('rejects weakening required source fencing through a per-execution disable', async () => {
+    it.each([
+      ['false', false],
+      ['true', true],
+      ['enabled:false', { enabled: false }],
+      ['another fencing mode', { sourceWriteFencing: 'optional' }],
+      ['null', null],
+    ])('rejects weakening required source fencing through a per-execution %s override', async (_label, override) => {
       const storage = new InMemoryStore();
       const memory = new Memory({
         storage,
@@ -2042,7 +2048,7 @@ describe('Memory', () => {
               content: { format: 2, parts: [{ type: 'text', text: 'must remain fenced' }] },
             },
           ],
-          memoryConfig: { observationalMemory: false },
+          memoryConfig: { observationalMemory: override as never },
         }),
       ).rejects.toThrow('cannot be disabled by a per-execution memory config');
 

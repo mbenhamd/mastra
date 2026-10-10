@@ -434,6 +434,14 @@ function normalizeObservationalMemoryConfig(
   return config as NormalizedObservationalMemoryConfig;
 }
 
+/** Source-write fencing mode of an enabled OM config value, tolerating untyped per-call input. */
+function getRequiredSourceWriteFencing(value: unknown): 'required' | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const config = value as { enabled?: unknown; sourceWriteFencing?: unknown };
+  if (config.enabled === false) return undefined;
+  return config.sourceWriteFencing === 'required' ? 'required' : undefined;
+}
+
 /**
  * Observer model selection (`observation.model`, else top-level `model`), read into the widened
  * model type first: combining values of the public type makes TS subtype-reduce the model-id
@@ -593,43 +601,30 @@ export class Memory extends MastraMemory {
   }
 
   public override getMergedThreadConfig(config?: MemoryConfigInternal): MemoryConfigInternal {
-    const requestedObservationalMemory = normalizeObservationalMemoryConfig(
-      config?.observationalMemory as boolean | MemoryObservationalMemoryOptions | undefined,
-    );
-    const configuredObservationalMemory = normalizeObservationalMemoryConfig(
-      this.threadConfig?.observationalMemory as boolean | MemoryObservationalMemoryOptions | undefined,
-    );
-    const requestedObservationalMemoryValue = config?.observationalMemory as
-      | boolean
-      | MemoryObservationalMemoryOptions
-      | undefined;
-    const weakensConfiguredSourceWriteFencing =
-      requestedObservationalMemoryValue === true ||
-      requestedObservationalMemoryValue === false ||
-      (typeof requestedObservationalMemoryValue === 'object' &&
-        requestedObservationalMemoryValue !== null &&
-        (requestedObservationalMemoryValue.enabled === false ||
-          (requestedObservationalMemoryValue.sourceWriteFencing !== undefined &&
-            requestedObservationalMemoryValue.sourceWriteFencing !== 'required')));
+    const configuredSourceWriteFencing = getRequiredSourceWriteFencing(this.threadConfig?.observationalMemory);
     if (
       this._sourceWriteFencingConfigurationReady &&
-      configuredObservationalMemory?.sourceWriteFencing === 'required' &&
-      weakensConfiguredSourceWriteFencing
-    ) {
-      throw new ObservationalMemorySourceWriteConflictError(
-        "Observational memory sourceWriteFencing: 'required' cannot be disabled by a per-execution memory config.",
-      );
-    }
-    if (
-      this._sourceWriteFencingConfigurationReady &&
-      requestedObservationalMemory?.sourceWriteFencing === 'required' &&
-      configuredObservationalMemory?.sourceWriteFencing !== 'required'
+      getRequiredSourceWriteFencing(config?.observationalMemory) === 'required' &&
+      configuredSourceWriteFencing !== 'required'
     ) {
       throw new ObservationalMemorySourceWriteConflictError(
         "Observational memory sourceWriteFencing: 'required' must be configured on the Memory instance, not per execution.",
       );
     }
     const merged = super.getMergedThreadConfig(config);
+    // Instance-required source fencing is an invariant of every execution, not
+    // a per-call preference. Check the merged result instead of enumerating
+    // override shapes so any value that drops it (false, true, enabled:false,
+    // another fencing mode, null or a non-object) is rejected before use.
+    if (
+      this._sourceWriteFencingConfigurationReady &&
+      configuredSourceWriteFencing === 'required' &&
+      getRequiredSourceWriteFencing(merged.observationalMemory) !== 'required'
+    ) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        "Observational memory sourceWriteFencing: 'required' cannot be disabled by a per-execution memory config.",
+      );
+    }
     return this.applyManagedWorkingMemoryDefaults(this.applySubconsciousDefaults(merged));
   }
 
