@@ -187,4 +187,269 @@ describe('Harness subagent provider lineage (real exporter)', () => {
       await harness.shutdown();
     }
   });
+
+  it('runs an inline subagent inside the parent trace, under its spawn_subagent tool call', async () => {
+    const requestId = 'parent-turn-request-5258';
+    const exporter = new TestExporter();
+    const rootProvider = toolCallModel({
+      provider: 'root-provider',
+      modelId: 'root-model',
+      responseId: 'root-response',
+      toolCallId: 'spawn-child',
+      toolName: 'spawn_subagent',
+      input: { agentType: 'worker', task: 'Return the verified child outcome.', delivery: 'final' },
+    });
+    const childProvider = toolCallModel({
+      provider: 'child-provider',
+      modelId: 'child-model',
+      responseId: 'child-response',
+      toolCallId: 'report-child-outcome',
+      toolName: 'report_subagent_outcome',
+      input: {
+        outcome: 'completed',
+        summary: 'child trace verified',
+        evidence: [{ kind: 'analysis', description: 'Deterministic provider fixture completed.' }],
+      },
+    });
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({
+      agents: {
+        // Run-level trace metadata belongs to the parent turn only; the child
+        // agent declares none of its own.
+        'root-agent': new Agent({
+          id: 'root-agent',
+          name: 'root-agent',
+          instructions: 'Delegate once.',
+          model: rootProvider.model,
+          memory: new MockMemory({ storage }),
+          defaultOptions: { tracingOptions: { metadata: { requestId } } },
+        }),
+        'child-agent': new Agent({
+          id: 'child-agent',
+          name: 'child-agent',
+          instructions: 'Report the completed outcome.',
+          model: childProvider.model,
+          memory: new MockMemory({ storage }),
+        }),
+      } as any,
+      storage,
+      observability: new Observability({
+        configs: { test: { serviceName: 'harness-subagent-trace-it', exporters: [exporter] } },
+      }),
+    });
+    const harness = new Harness({
+      mastra,
+      modes: [
+        { id: 'root-mode', agentId: 'root-agent' },
+        { id: 'child-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'root-mode',
+      subagents: {
+        maxDepth: 1,
+        types: {
+          worker: {
+            agentId: 'child-agent',
+            modeId: 'child-mode',
+            description: 'Deterministic trace worker',
+            defaultModelId: 'child-model',
+          },
+        },
+      },
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'trace-user', threadId: { fresh: true } });
+      const result = await session.message({ content: 'Delegate the trace check.' });
+      expect(result.text).toBe('child trace verified');
+
+      await settle(exporter);
+      const agentRuns = exporter.getSpansByType(SpanType.AGENT_RUN);
+      const rootRun = agentRuns.find(span => span.entityId === 'root-agent');
+      const childRun = agentRuns.find(span => span.entityId === 'child-agent');
+      const spawnCall = exporter
+        .getSpansByType(SpanType.TOOL_CALL)
+        .find(span => span.entityName === 'spawn_subagent' || span.name.includes('spawn_subagent'));
+      expect(rootRun).toBeDefined();
+      expect(childRun).toBeDefined();
+      expect(spawnCall).toBeDefined();
+      expect(childRun!.traceId).toBe(rootRun!.traceId);
+      expect(childRun!.parentSpanId).toBe(spawnCall!.id);
+      // The child keeps its own run identity; only the turn's metadata is inherited.
+      expect(childRun!.metadata?.runId).toBeDefined();
+      expect(childRun!.metadata?.runId).not.toBe(rootRun!.metadata?.runId);
+
+      const generations = exporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(new Set(generations.map(span => span.attributes?.model))).toEqual(new Set(['root-model', 'child-model']));
+      for (const generation of generations) {
+        expect(generation.traceId).toBe(rootRun!.traceId);
+        expect(generation.metadata?.requestId).toBe(requestId);
+      }
+      expect(exporter.getIncompleteSpans()).toHaveLength(0);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('joins a durable delegation to the parent trace without tying it to the parent turn', async () => {
+    const requestId = 'parent-turn-request-5258-delegated';
+    const exporter = new TestExporter();
+    const createdTaskIds: string[] = [];
+    let releaseChild!: () => void;
+    const childReleased = new Promise<void>(resolve => {
+      releaseChild = resolve;
+    });
+
+    const streamOf = (chunks: unknown[]) => ({
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      warnings: [],
+      stream: convertArrayToReadableStream(chunks as any[]),
+    });
+    const toolCallChunks = (toolCallId: string, toolName: string, input: object) => [
+      { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', id: `id-${toolCallId}`, modelId: 'root-model', timestamp: new Date(0) },
+      { type: 'tool-call', toolCallType: 'function', toolCallId, toolName, input: JSON.stringify(input) },
+      { type: 'finish', finishReason: 'tool-calls', usage },
+    ];
+    let rootCall = 0;
+    const rootModel = new MockLanguageModelV2({
+      provider: 'root-provider',
+      modelId: 'root-model',
+      doStream: async () => {
+        rootCall += 1;
+        if (rootCall === 1) return streamOf(toolCallChunks('add-task', 'task_add', { content: 'Delegate this' }));
+        if (rootCall === 2) {
+          return streamOf(
+            toolCallChunks('delegate-task', 'task_delegate', { taskId: createdTaskIds[0], agentType: 'worker' }),
+          );
+        }
+        return streamOf([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'root-final', modelId: 'root-model', timestamp: new Date(0) },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: 'Delegated.' },
+          { type: 'text-end', id: 'text-1' },
+          { type: 'finish', finishReason: 'stop', usage },
+        ]);
+      },
+    });
+    const childProvider = toolCallModel({
+      provider: 'child-provider',
+      modelId: 'child-model',
+      responseId: 'child-response',
+      toolCallId: 'report-child-outcome',
+      toolName: 'report_subagent_outcome',
+      input: {
+        outcome: 'completed',
+        summary: 'delegated trace verified',
+        evidence: [{ kind: 'analysis', description: 'Deterministic provider fixture completed.' }],
+      },
+    });
+    const childModel = new MockLanguageModelV2({
+      provider: 'child-provider',
+      modelId: 'child-model',
+      // The delegated child produces its generation only after the parent
+      // turn has finished.
+      doStream: async options => {
+        await childReleased;
+        return childProvider.doStream(options as never);
+      },
+    });
+
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({
+      agents: {
+        'root-agent': new Agent({
+          id: 'root-agent',
+          name: 'root-agent',
+          instructions: 'Plan and delegate.',
+          model: rootModel,
+          memory: new MockMemory({ storage }),
+          defaultOptions: { tracingOptions: { metadata: { requestId } } },
+        }),
+        'child-agent': new Agent({
+          id: 'child-agent',
+          name: 'child-agent',
+          instructions: 'Report the completed outcome.',
+          model: childModel,
+          memory: new MockMemory({ storage }),
+        }),
+      } as any,
+      storage,
+      observability: new Observability({
+        configs: { test: { serviceName: 'harness-subagent-delegation-trace-it', exporters: [exporter] } },
+      }),
+    });
+    const harness = new Harness({
+      mastra,
+      modes: [
+        { id: 'root-mode', agentId: 'root-agent' },
+        { id: 'child-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'root-mode',
+      subagents: {
+        maxDepth: 1,
+        types: {
+          worker: {
+            agentId: 'child-agent',
+            modeId: 'child-mode',
+            description: 'Deterministic delegated trace worker',
+            defaultModelId: 'child-model',
+          },
+        },
+      },
+    });
+
+    try {
+      const session = await harness.session({ resourceId: 'delegation-trace-user', threadId: { fresh: true } });
+      session.subscribe(event => {
+        const output = (event as { output?: { taskId?: string } }).output;
+        if (event.type === 'tool_end' && (event as { toolName?: string }).toolName === 'task_add' && output?.taskId) {
+          createdTaskIds.push(output.taskId);
+        }
+      });
+      const result = await session.message({ content: 'Delegate the work.' });
+      expect(result.text).toBe('Delegated.');
+      const rootRun = exporter.getSpansByType(SpanType.AGENT_RUN).find(span => span.entityId === 'root-agent');
+      expect(rootRun?.endTime).toBeDefined();
+      expect(childProvider.doStream).not.toHaveBeenCalled();
+
+      releaseChild();
+      const deadline = Date.now() + 3_000;
+      while (
+        !exporter.getSpansByType(SpanType.MODEL_GENERATION).some(span => span.attributes?.model === 'child-model')
+      ) {
+        if (Date.now() > deadline) throw new Error('delegated child generation was not exported');
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      await settle(exporter);
+
+      const delegateCall = exporter
+        .getSpansByType(SpanType.TOOL_CALL)
+        .find(span => span.entityName === 'task_delegate' || span.name.includes('task_delegate'));
+      const delegation = exporter
+        .getSpansByType(SpanType.GENERIC)
+        .find(span => span.name === "subagent delegation: 'worker'");
+      const childRun = exporter.getSpansByType(SpanType.AGENT_RUN).find(span => span.entityId === 'child-agent');
+      expect(delegateCall).toBeDefined();
+      expect(delegation).toBeDefined();
+      expect(childRun).toBeDefined();
+      expect(delegation!.traceId).toBe(rootRun!.traceId);
+      expect(delegation!.parentSpanId).toBe(delegateCall!.id);
+      expect(childRun!.traceId).toBe(rootRun!.traceId);
+      expect(childRun!.parentSpanId).toBe(delegation!.id);
+      expect(childRun!.metadata?.runId).toBeDefined();
+      expect(childRun!.metadata?.runId).not.toBe(rootRun!.metadata?.runId);
+
+      const childGeneration = exporter
+        .getSpansByType(SpanType.MODEL_GENERATION)
+        .find(span => span.attributes?.model === 'child-model');
+      expect(childGeneration!.traceId).toBe(rootRun!.traceId);
+      expect(childGeneration!.metadata?.requestId).toBe(requestId);
+      expect(childGeneration!.metadata?.runId).toBe(childRun!.metadata?.runId);
+      expect(exporter.getIncompleteSpans()).toHaveLength(0);
+    } finally {
+      releaseChild();
+      await harness.shutdown();
+    }
+  });
 });
