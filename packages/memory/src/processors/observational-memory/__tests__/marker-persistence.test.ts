@@ -10,6 +10,10 @@
 import { MessageList } from '@mastra/core/agent';
 import type { MastraDBMessage } from '@mastra/core/agent';
 import { MessageHistory } from '@mastra/core/processors';
+import {
+  ObservationalMemorySourceWriteConflictError,
+  type ObservationalMemorySourceWriteGuard,
+} from '@mastra/core/storage';
 import { describe, it, expect, vi } from 'vitest';
 
 import { ObservationStrategy } from '../observation-strategies/base';
@@ -74,12 +78,18 @@ class TestStrategy extends ObservationStrategy {
   }
 }
 
-function createHarness(opts: { messageList?: MessageList; storedMessages?: MastraDBMessage[] }) {
+function createHarness(opts: {
+  messageList?: MessageList;
+  storedMessages?: MastraDBMessage[];
+  sourceWriteFencing?: 'required';
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+}) {
   const persistMessages = vi.fn().mockResolvedValue(undefined);
   const listMessages = vi.fn().mockResolvedValue({ messages: opts.storedMessages ?? [] });
 
   const deps = {
-    storage: { listMessages },
+    storage: { listMessages, supportsObservationalMemorySourceWriteGuards: true },
+    sourceWriteFencing: opts.sourceWriteFencing,
     messageHistory: { persistMessages },
     tokenCounter: {},
     observationConfig: { messageTokens: 1000 },
@@ -94,6 +104,7 @@ function createHarness(opts: { messageList?: MessageList; storedMessages?: Mastr
     resourceId,
     messages: [],
     messageList: opts.messageList,
+    sourceWriteGuard: opts.sourceWriteGuard,
   } as ObservationRunOpts;
 
   return { strategy: new TestStrategy(deps, runOpts), persistMessages, listMessages };
@@ -250,6 +261,7 @@ describe('OM marker persistence plumbing', () => {
     const om = {
       storage: { listMessages },
       messageHistory: { persistMessages },
+      assertSourceWriteReady: () => {},
     } as unknown as ObservationalMemory;
 
     await ObservationalMemory.prototype.persistMarkerToStorage.call(om, reflectionMarker, threadId, resourceId);
@@ -293,13 +305,36 @@ describe('OM marker persistence plumbing', () => {
     expect(liveAssistant?.content.parts).toContainEqual(marker);
     expect(listMessages).not.toHaveBeenCalled();
   });
+
+  it('does not mutate the live marker when a guarded save is rejected', async () => {
+    const assistantMsg = makeAssistantMessage('assistant-guard-conflict');
+    const messageList = new MessageList({ threadId, resourceId });
+    messageList.add([assistantMsg], 'memory');
+    const guard = { recordId: 'record-1', threadId, resourceId } satisfies ObservationalMemorySourceWriteGuard;
+    const { strategy, persistMessages } = createHarness({
+      messageList,
+      sourceWriteFencing: 'required',
+      sourceWriteGuard: guard,
+    });
+    persistMessages.mockRejectedValueOnce(new ObservationalMemorySourceWriteConflictError('revoked'));
+
+    await expect(strategy.testStreamMarker(marker)).rejects.toBeInstanceOf(ObservationalMemorySourceWriteConflictError);
+
+    const liveAssistant = messageList.get.all.db().find(m => m.role === 'assistant');
+    expect(liveAssistant?.content.parts).toEqual([{ type: 'text', text: 'Hi there' }]);
+    const persisted = persistMessages.mock.calls[0]![0].messages[0] as MastraDBMessage;
+    expect(persisted.content.parts).toContainEqual(marker);
+  });
 });
 
 describe('ObservationalMemory.persistMarkerToMessage', () => {
   it('returns false when saving the marker fails so callers can fall back to storage', async () => {
     const messageList = new MessageList({ threadId, resourceId });
     messageList.add([makeUserMessage('user-1'), makeAssistantMessage('assistant-1')], 'memory');
-    const fakeThis = { messageHistory: { persistMessages: vi.fn().mockRejectedValue(new Error('db down')) } };
+    const fakeThis = {
+      messageHistory: { persistMessages: vi.fn().mockRejectedValue(new Error('db down')) },
+      assertSourceWriteReady: () => {},
+    };
 
     const persisted = await ObservationalMemory.prototype.persistMarkerToMessage.call(
       fakeThis as unknown as ObservationalMemory,

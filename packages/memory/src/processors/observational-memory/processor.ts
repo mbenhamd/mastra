@@ -9,7 +9,7 @@ import type {
   ProcessOutputResultArgs,
   ProcessorSpanPhase,
 } from '@mastra/core/processors';
-import type { ObservationalMemoryRecord } from '@mastra/core/storage';
+import type { ObservationalMemoryRecord, ObservationalMemorySourceWriteGuard } from '@mastra/core/storage';
 
 import { OBSERVATION_CONTINUATION_HINT } from './constants';
 import { omDebug } from './debug';
@@ -35,7 +35,12 @@ function asLiveTurn(value: unknown): ObservationTurn | undefined {
 
 /** Subset of Memory that the processor needs — avoids circular imports. */
 export interface MemoryContextProvider {
-  getContext(opts: { threadId: string; resourceId?: string; runState?: MemoryRunState }): Promise<{
+  getContext(opts: {
+    threadId: string;
+    resourceId?: string;
+    runState?: MemoryRunState;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<{
     systemMessage: string | undefined;
     messages: MastraDBMessage[];
     hasObservations: boolean;
@@ -44,7 +49,7 @@ export interface MemoryContextProvider {
     otherThreadsContext: string | undefined;
   }>;
   /** Raw message upsert — persist sealed messages to storage without embedding or working memory processing. */
-  persistMessages(messages: MastraDBMessage[]): Promise<void>;
+  persistMessages(messages: MastraDBMessage[], sourceWriteGuard?: ObservationalMemorySourceWriteGuard): Promise<void>;
 }
 
 /**
@@ -206,6 +211,8 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
     }
 
     const { threadId, resourceId } = context;
+    const sourceWriteGuard = this.engine.getObservationalMemorySourceWriteGuardFromMessageList(messageList);
+    this.engine.assertObservationalMemorySourceWriteGuard(sourceWriteGuard);
     const memoryContext = parseMemoryRequestContext(requestContext);
     const runState = memoryContext?.runState?.();
     const readOnly = memoryContext?.memoryConfig?.readOnly;
@@ -219,7 +226,9 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
       // Repro capture setup
       const reproCaptureEnabled = isOmReproCaptureEnabled();
       const preRecordSnapshot = reproCaptureEnabled
-        ? (safeCaptureJson(await this.engine.getOrCreateRecord(threadId, resourceId)) as ObservationalMemoryRecord)
+        ? (safeCaptureJson(
+            await this.engine.getOrCreateRecord(threadId, resourceId, sourceWriteGuard),
+          ) as ObservationalMemoryRecord)
         : null;
       const preMessagesSnapshot = reproCaptureEnabled
         ? (safeCaptureJson(messageList.get.all.db()) as MastraDBMessage[])
@@ -236,6 +245,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
           threadId,
           resourceId,
           runState,
+          observationalMemorySourceWriteGuard: sourceWriteGuard,
         });
         // Pass the record through even without observations — resource-scoped
         // retrieval still injects recall guidance so the actor can browse and
@@ -246,6 +256,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
               resourceId,
               record: ctx.omRecord,
               unobservedContextBlocks: ctx.otherThreadsContext,
+              sourceWriteGuard,
             })
           : undefined;
 
@@ -452,7 +463,12 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
           const newInput = messageList.get.input.db();
           const messagesToSave = [...newInput, ...newOutput];
           if (messagesToSave.length > 0 && context.threadId) {
-            await this.engine.persistMessages(messagesToSave, context.threadId, context.resourceId);
+            await this.engine.persistMessages(
+              messagesToSave,
+              context.threadId,
+              context.resourceId,
+              this.engine.getObservationalMemorySourceWriteGuardFromMessageList(messageList),
+            );
           }
         }
 

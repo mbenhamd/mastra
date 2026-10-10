@@ -8,6 +8,8 @@ import type { MemoryConfigInternal, StorageThreadType } from '../../../memory/ty
 import { resolveObservabilityContext } from '../../../observability';
 import type { ProcessorState } from '../../../processors/runner';
 import type { RequestContext } from '../../../request-context';
+import { ObservationalMemorySourceWriteConflictError } from '../../../storage';
+import type { ObservationalMemorySourceWriteGuard } from '../../../storage';
 import { createStep } from '../../../workflows/workflow';
 import type { InnerAgentExecutionOptions } from '../../agent.types';
 import { assertThreadOwnedByResource } from '../../memory-thread-ownership';
@@ -64,8 +66,68 @@ interface PrepareMemoryStepOptions<OUTPUT = undefined> {
   mcpServerGuidance?: string;
   memoryConfig?: MemoryConfigInternal;
   memory?: MastraMemory;
+  resumeContext?: {
+    snapshot: any;
+  };
   isResume?: boolean;
   runScope: PrepareStreamRunScope<OUTPUT>;
+}
+
+function readResumeSourceWriteGuard(
+  resumeContext: PrepareMemoryStepOptions['resumeContext'],
+): ObservationalMemorySourceWriteGuard | undefined {
+  const guards: ObservationalMemorySourceWriteGuard[] = [];
+  const addGuard = (messageListState: unknown) => {
+    if (!messageListState || typeof messageListState !== 'object' || Array.isArray(messageListState)) return;
+    const memoryInfo = (messageListState as { memoryInfo?: unknown }).memoryInfo;
+    if (!memoryInfo || typeof memoryInfo !== 'object' || Array.isArray(memoryInfo)) return;
+    const value = (memoryInfo as { observationalMemorySourceWriteGuard?: unknown }).observationalMemorySourceWriteGuard;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const guard = value as Partial<ObservationalMemorySourceWriteGuard>;
+    if (
+      typeof guard.recordId !== 'string' ||
+      guard.recordId.length === 0 ||
+      typeof guard.resourceId !== 'string' ||
+      guard.resourceId.length === 0 ||
+      !Object.prototype.hasOwnProperty.call(guard, 'threadId') ||
+      (guard.threadId !== null && typeof guard.threadId !== 'string')
+    ) {
+      return;
+    }
+    const normalized = {
+      recordId: guard.recordId,
+      threadId: guard.threadId ?? null,
+      resourceId: guard.resourceId,
+    } satisfies ObservationalMemorySourceWriteGuard;
+    if (
+      !guards.some(
+        existing =>
+          existing.recordId === normalized.recordId &&
+          existing.threadId === normalized.threadId &&
+          existing.resourceId === normalized.resourceId,
+      )
+    ) {
+      guards.push(normalized);
+    }
+  };
+
+  for (const step of Object.values(resumeContext?.snapshot?.context ?? {})) {
+    if (!step || typeof step !== 'object' || (step as { status?: string }).status !== 'suspended') continue;
+    const payload = (step as { suspendPayload?: any }).suspendPayload;
+    if (!payload || typeof payload !== 'object') continue;
+    addGuard(payload.__streamState?.messageList);
+    const foreachOutput = payload.__workflow_meta?.foreachOutput;
+    const iterations = Array.isArray(foreachOutput)
+      ? foreachOutput
+      : foreachOutput && typeof foreachOutput === 'object'
+        ? Object.values(foreachOutput)
+        : [];
+    for (const iteration of iterations) {
+      if (iteration?.status === 'suspended') addGuard(iteration.suspendPayload?.__streamState?.messageList);
+    }
+  }
+
+  return guards.length === 1 ? guards[0] : undefined;
 }
 
 export function createPrepareMemoryStep<OUTPUT = undefined>({
@@ -79,6 +141,7 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
   mcpServerGuidance,
   memoryConfig,
   memory,
+  resumeContext,
   isResume,
   runScope,
 }: PrepareMemoryStepOptions<OUTPUT>) {
@@ -89,9 +152,41 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
     execute: async ({ ...rest }) => {
       const observabilityContext = resolveObservabilityContext(rest);
       const thread = threadFromArgs;
+      let observationalMemorySourceWriteGuard = options.observationalMemorySourceWriteGuard;
+      const observationalMemoryConfig = memory?.getMergedThreadConfig(memoryConfig).observationalMemory;
+      if (isResume) {
+        observationalMemorySourceWriteGuard =
+          readResumeSourceWriteGuard(resumeContext) ?? observationalMemorySourceWriteGuard;
+        if (observationalMemorySourceWriteGuard) {
+          options.observationalMemorySourceWriteGuard = observationalMemorySourceWriteGuard;
+        }
+        if (
+          observationalMemoryConfig &&
+          typeof observationalMemoryConfig === 'object' &&
+          observationalMemoryConfig.enabled !== false &&
+          observationalMemoryConfig.sourceWriteFencing === 'required' &&
+          !observationalMemorySourceWriteGuard
+        ) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source write fencing is required but the resumed execution has no captured record guard.',
+          );
+        }
+      }
+      // A resumed execution must reuse the guard serialized in its existing
+      // MessageList state. Only a fresh execution may prepare a token here.
+      if (!isResume && !observationalMemorySourceWriteGuard && memory && thread?.id) {
+        observationalMemorySourceWriteGuard = await memory.prepareObservationalMemorySourceWriteGuard(
+          thread.id,
+          resourceId,
+        );
+        if (observationalMemorySourceWriteGuard) {
+          options.observationalMemorySourceWriteGuard = observationalMemorySourceWriteGuard;
+        }
+      }
       const messageList = new MessageList({
         threadId: thread?.id,
         resourceId,
+        observationalMemorySourceWriteGuard,
         generateMessageId: capabilities.generateMessageId,
         logger: capabilities.logger,
         filterIncompleteToolCalls: memoryConfig?.filterIncompleteToolCalls,
@@ -182,6 +277,7 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
           threadObject = await memory.saveThread({
             thread: { ...existingThread, metadata: { ...(existingThread.metadata ?? {}), ...thread.metadata } },
             memoryConfig,
+            observationalMemorySourceWriteGuard,
           });
         } else {
           threadObject = existingThread;
@@ -198,6 +294,7 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
           memoryConfig,
           resourceId,
           saveThread: true,
+          observationalMemorySourceWriteGuard,
         });
       }
 
@@ -215,6 +312,7 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
         thread: threadObject,
         resourceId,
         memoryConfig,
+        ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
         runState: () => runScope.get(MEMORY_RUN_STATE_KEY),
       });
 

@@ -1287,6 +1287,9 @@ export class DurableAgent<
     )?.memoryInfo;
     const threadId = workflowInput.state?.threadId ?? messageListMemoryInfo?.threadId;
     const resourceId = workflowInput.state?.resourceId ?? messageListMemoryInfo?.resourceId;
+    const observationalMemorySourceWriteGuard =
+      workflowInput.options?.observationalMemorySourceWriteGuard ??
+      workflowInput.messageListState?.memoryInfo?.observationalMemorySourceWriteGuard;
 
     // `requestContextEntries` captures caller state before preparation adds
     // the run-owned memory context. Rebuild it from the persisted run so a
@@ -1296,6 +1299,7 @@ export class DurableAgent<
         thread: { id: threadId },
         resourceId,
         memoryConfig: workflowInput.state?.memoryConfig,
+        ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
       });
     } else {
       requestContext.delete('MastraMemory');
@@ -3340,6 +3344,9 @@ export class DurableAgent<
     }
     const threadId = threadIds[0];
     const resourceId = resourceIds[0];
+    const observationalMemorySourceWriteGuard =
+      workflowInput.options?.observationalMemorySourceWriteGuard ??
+      workflowInput.messageListState?.memoryInfo?.observationalMemorySourceWriteGuard;
     const callerRequestContext = options.requestContext ?? new RequestContext();
     const requestContext: RequestContext = workflowInput.requestContextEntries
       ? new RequestContext(Object.entries(workflowInput.requestContextEntries) as Iterable<readonly [string, unknown]>)
@@ -3354,6 +3361,7 @@ export class DurableAgent<
         thread: { id: threadId },
         resourceId,
         memoryConfig: workflowInput.state?.memoryConfig,
+        ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
       });
     } else {
       requestContext.delete('MastraMemory');

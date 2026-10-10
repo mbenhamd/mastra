@@ -4314,8 +4314,10 @@ export class AgentThreadStreamRuntime {
     if (signal.transient) return;
     const memory = await agent.getMemory({ requestContext });
     if (!memory) return;
+    const memoryContext = parseMemoryRequestContext(requestContext);
     await memory.saveMessages({
       messages: [signal.toDBMessage({ resourceId, threadId })],
+      observationalMemorySourceWriteGuard: memoryContext?.observationalMemorySourceWriteGuard,
     });
   }
 
@@ -9192,6 +9194,7 @@ export class AgentThreadStreamRuntime {
       resourceId,
       threadId,
       memoryConfig: memoryContext?.memoryConfig,
+      observationalMemorySourceWriteGuard: memoryContext?.observationalMemorySourceWriteGuard,
       acceptedAt: new Date(),
     });
 

@@ -1979,6 +1979,80 @@ describe('Memory', () => {
     });
   });
 
+  describe('observational memory source-write fencing', () => {
+    it('rejects enabling source fencing only through per-execution memory config', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { observationalMemory: true },
+      });
+
+      expect(() =>
+        memory.getMergedThreadConfig({
+          observationalMemory: { sourceWriteFencing: 'required' },
+        }),
+      ).toThrow("sourceWriteFencing: 'required' must be configured on the Memory instance");
+    });
+
+    it('rejects saveMessages without a captured record guard before storage writes', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { observationalMemory: { sourceWriteFencing: 'required' } },
+      });
+      const threadId = 'thread-source-fence-save';
+      const resourceId = 'resource-source-fence-save';
+      const message: MastraDBMessage = {
+        id: 'source-fence-save-message',
+        threadId,
+        resourceId,
+        role: 'user',
+        createdAt: new Date('2024-01-01T10:00:00Z'),
+        content: { format: 2, parts: [{ type: 'text', text: 'must not persist' }] },
+      };
+
+      await expect(memory.saveMessages({ messages: [message] })).rejects.toThrow(
+        'no captured record guard was provided',
+      );
+
+      const memoryStore = await storage.getStore('memory');
+      await expect(memoryStore!.listMessages({ threadId, resourceId, perPage: false })).resolves.toMatchObject({
+        messages: [],
+      });
+    });
+
+    it('rejects weakening required source fencing through a per-execution disable', async () => {
+      const storage = new InMemoryStore();
+      const memory = new Memory({
+        storage,
+        options: { observationalMemory: { sourceWriteFencing: 'required' } },
+      });
+      const threadId = 'thread-source-fence-disable';
+      const resourceId = 'resource-source-fence-disable';
+      await memory.createThread({ threadId, resourceId });
+
+      await expect(
+        memory.saveMessages({
+          messages: [
+            {
+              id: 'source-fence-disable-message',
+              threadId,
+              resourceId,
+              role: 'user',
+              createdAt: new Date('2024-01-01T10:00:00Z'),
+              content: { format: 2, parts: [{ type: 'text', text: 'must remain fenced' }] },
+            },
+          ],
+          memoryConfig: { observationalMemory: false },
+        }),
+      ).rejects.toThrow('cannot be disabled by a per-execution memory config');
+
+      const memoryStore = await storage.getStore('memory');
+      await expect(memoryStore!.listMessages({ threadId, resourceId, perPage: false })).resolves.toMatchObject({
+        messages: [],
+      });
+    });
+  });
+
   describe('transient signal classification agreement with @mastra/core', () => {
     it('drops exactly the messages the core classifier flags as transient signals', async () => {
       const storage = new InMemoryStore();

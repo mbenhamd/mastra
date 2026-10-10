@@ -1,5 +1,6 @@
 import type { MastraMemory } from '../memory/memory';
 import type { MemoryConfigInternal, StorageThreadType } from '../memory/types';
+import type { ObservationalMemorySourceWriteGuard } from '../storage';
 import type { MessageList } from './message-list';
 import type { MastraDBMessage } from './message-list/state/types';
 import { createSignal, mastraDBMessageToSignal } from './signals';
@@ -237,6 +238,7 @@ export async function applyStateSignal({
   resourceId,
   threadId,
   memoryConfig,
+  observationalMemorySourceWriteGuard,
   messageList,
   activeStateSignals,
   defaultId,
@@ -250,6 +252,7 @@ export async function applyStateSignal({
   resourceId: string;
   threadId: string;
   memoryConfig?: MemoryConfigInternal;
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   messageList?: MessageList;
   activeStateSignals?: ActiveStateSignal[];
   defaultId?: string;
@@ -328,6 +331,7 @@ export async function applyStateSignal({
       metadata: setStateSignalMetadata(thread.metadata, stateId, nextTracking),
     },
     memoryConfig,
+    observationalMemorySourceWriteGuard,
   });
 
   return { skipped: false, signal: updatedSignal, stateId, version, tracking: nextTracking };

@@ -89,6 +89,7 @@ export class ObservationStep {
         currentModel: this.turn.actorModelContext,
         writer: this.turn.writer,
         messageList,
+        sourceWriteGuard: this.turn.sourceWriteGuard,
       });
 
       this.turn.setRecord(activation.record);
@@ -123,6 +124,7 @@ export class ObservationStep {
         lastActivityAt: getLastActivityFromMessages(getObservableMessages(messageList)),
         reflectionHooks: om.composeHooks(undefined, { threadId, resourceId, trigger: 'turn-sync' }),
         trigger: 'turn-sync',
+        sourceWriteGuard: this.turn.sourceWriteGuard,
       });
       await this.turn.refreshRecord();
       if (this.turn.record.generationCount > preReflectGeneration) {
@@ -155,6 +157,7 @@ export class ObservationStep {
       resourceId,
       record: this.turn.record,
       messages: getObservableMessages(messageList),
+      sourceWriteGuard: this.turn.sourceWriteGuard,
     });
 
     // Trigger buffering if interval boundary crossed (fire-and-forget, all steps).
@@ -194,9 +197,9 @@ export class ObservationStep {
         if (this.turn.memory) {
           if (om.toolCallFilter === undefined) {
             // Preserve the pre-filter OM buffering path when no policy is configured.
-            await this.turn.memory.persistMessages(safeCandidates);
+            await this.turn.memory.persistMessages(safeCandidates, this.turn.sourceWriteGuard);
           } else {
-            await om.persistMessagesForBuffering(safeCandidates, threadId, resourceId);
+            await om.persistMessagesForBuffering(safeCandidates, threadId, resourceId, this.turn.sourceWriteGuard);
           }
         }
 
@@ -225,6 +228,7 @@ export class ObservationStep {
               sendStateSignal: this.turn.sendStateSignal,
               requestContext: this.turn.requestContext,
               observabilityContext: this.turn.observabilityContext,
+              sourceWriteGuard: this.turn.sourceWriteGuard,
             })
             .catch((err: Error) => {
               omDebug(`[OM:buffer] fire-and-forget buffer failed: ${err?.message}`);
@@ -250,7 +254,7 @@ export class ObservationStep {
         const newOutput = messageList.clear.response.db();
         const messagesToSave = [...newInput, ...newOutput];
         if (messagesToSave.length > 0) {
-          await om.persistMessages(messagesToSave, threadId, resourceId);
+          await om.persistMessages(messagesToSave, threadId, resourceId, this.turn.sourceWriteGuard);
           for (const msg of messagesToSave) {
             messageList.add(msg, 'memory');
           }
@@ -265,7 +269,7 @@ export class ObservationStep {
         // these messages later is harmless.
         const pending = [...messageList.get.input.db(), ...messageList.get.response.db()];
         if (pending.length > 0) {
-          await om.persistMessages(pending, threadId, resourceId);
+          await om.persistMessages(pending, threadId, resourceId, this.turn.sourceWriteGuard);
         }
         // The in-flight prompt was just observed, but the model still needs it to answer —
         // protect it (and everything else pending) from cleanup by identity rather than
@@ -321,6 +325,7 @@ export class ObservationStep {
             observedMessageIds: observedIds,
             retentionFloor: minRemaining,
             preserveMessageIds: step0PreserveIds,
+            sourceWriteGuard: this.turn.sourceWriteGuard,
           });
 
           if (statusSnapshot.asyncObservationEnabled) {
@@ -345,6 +350,7 @@ export class ObservationStep {
         resourceId,
         record: this.turn.record,
         messages: getObservableMessages(messageList),
+        sourceWriteGuard: this.turn.sourceWriteGuard,
       });
     }
 
@@ -357,6 +363,7 @@ export class ObservationStep {
       resourceId,
       record: this.turn.record,
       unobservedContextBlocks: otherThreadsContext,
+      sourceWriteGuard: this.turn.sourceWriteGuard,
     });
 
     // ── Filter observed messages ──────────────────────────────
@@ -433,6 +440,7 @@ export class ObservationStep {
       resourceId,
       record: this.turn.record,
       messages: observableMessages,
+      sourceWriteGuard: this.turn.sourceWriteGuard,
     });
 
     if (!freshStatus.shouldObserve) {
@@ -449,6 +457,7 @@ export class ObservationStep {
         currentModel: this.turn.actorModelContext,
         writer: this.turn.writer,
         messageList,
+        sourceWriteGuard: this.turn.sourceWriteGuard,
       });
       this.turn.setRecord(activation.record);
 
@@ -469,6 +478,7 @@ export class ObservationStep {
           lastActivityAt: getLastActivityFromMessages(getObservableMessages(messageList)),
           reflectionHooks: om.composeHooks(undefined, { threadId, resourceId, trigger: 'turn-sync' }),
           trigger: 'turn-sync',
+          sourceWriteGuard: this.turn.sourceWriteGuard,
         });
 
         return {
@@ -495,6 +505,7 @@ export class ObservationStep {
         requestContext: this.turn.requestContext,
         writer: this.turn.writer,
         observabilityContext: this.turn.observabilityContext,
+        sourceWriteGuard: this.turn.sourceWriteGuard,
       });
     } catch (error) {
       if (
@@ -550,7 +561,7 @@ export class ObservationStep {
       }
 
       if (messagesToSeal.length > 0) {
-        await om.persistMessages(messagesToSeal, threadId, resourceId);
+        await om.persistMessages(messagesToSeal, threadId, resourceId, this.turn.sourceWriteGuard);
       }
     }
 

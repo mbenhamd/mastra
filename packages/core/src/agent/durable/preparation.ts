@@ -624,6 +624,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const messageList = new MessageList({
     threadId,
     resourceId,
+    observationalMemorySourceWriteGuard: execOptions.observationalMemorySourceWriteGuard,
     logicalMessageIdentity: execOptions?.logicalMessageIdentity,
   });
 
@@ -703,6 +704,25 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     // thread this preparation created (never a pre-existing one).
     processorMemory = memory;
     const memoryConfig = execOptions?.memory?.options;
+    // Native OM source fencing is configured on the Memory instance. Validate any
+    // per-execution override before preparing the guard or reading the thread.
+    if (memory && memoryConfig?.observationalMemory !== undefined) {
+      memory.getMergedThreadConfig(memoryConfig);
+    }
+    // Capture the source-write fence before any guarded thread lookup/create.
+    // A resumed execution already carries its original token; fresh execution
+    // must bind the token before admission and reuse it for thread creation.
+    let observationalMemorySourceWriteGuard = execOptions.observationalMemorySourceWriteGuard;
+    if (!observationalMemorySourceWriteGuard && memory && threadId) {
+      observationalMemorySourceWriteGuard = await memory.prepareObservationalMemorySourceWriteGuard(
+        threadId,
+        resourceId,
+      );
+      if (observationalMemorySourceWriteGuard) {
+        messageList.setObservationalMemorySourceWriteGuard(observationalMemorySourceWriteGuard);
+        execOptions.observationalMemorySourceWriteGuard = observationalMemorySourceWriteGuard;
+      }
+    }
     if (memory && threadId && resourceId) {
       const existingThread = await memory.getThreadById({ threadId });
       if (existingThread) {
@@ -716,11 +736,17 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
           memoryConfig,
           resourceId,
           saveThread: true,
+          observationalMemorySourceWriteGuard,
         });
         createdThreadDuringPreparation = true;
       }
       threadExists = true;
-      requestContext.set('MastraMemory', { thread: threadObject, resourceId, memoryConfig });
+      requestContext.set('MastraMemory', {
+        thread: threadObject,
+        resourceId,
+        memoryConfig,
+        ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
+      });
     } else {
       // This run has no complete per-request memory context. Clear any
       // MastraMemory inherited from a caller-provided requestContext (e.g. a
@@ -1035,6 +1061,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       modelList: modelList ?? undefined,
       scorers,
       options: {
+        observationalMemorySourceWriteGuard: execOptions?.observationalMemorySourceWriteGuard,
         maxSteps: execOptions?.maxSteps,
         recoveryMaxSteps: execOptions?.recoveryMaxSteps,
         toolChoice: execOptions?.toolChoice as any,
@@ -1181,6 +1208,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       // title. Non-serializable — cross-process engines skip title generation.
       generateThreadTitle: memory
         ? async ({ threadId, resourceId, memoryConfig, messageListState, requestContext: rc, tracingContext }) => {
+            const sourceWriteGuard =
+              messageListState.memoryInfo?.observationalMemorySourceWriteGuard ?? observationalMemorySourceWriteGuard;
             // Re-read the thread so a title written mid-run isn't regenerated, and so we only
             // generate on the first turn (mirrors the non-durable `!thread.title` guard).
             const thread = await memory.getThreadById?.({ threadId });
@@ -1223,6 +1252,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
                 title,
                 metadata: thread.metadata ?? {},
                 memoryConfig,
+                observationalMemorySourceWriteGuard: sourceWriteGuard,
               });
             } else {
               await memory.createThread({
@@ -1230,6 +1260,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
                 resourceId,
                 memoryConfig,
                 title,
+                observationalMemorySourceWriteGuard: sourceWriteGuard,
               });
             }
 

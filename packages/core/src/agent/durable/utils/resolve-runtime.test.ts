@@ -6,6 +6,7 @@ import { createDurableRuntimeRequestContext, resolveRuntimeDependencies } from '
 
 describe('durable runtime request context', () => {
   it('rebinds inherited parent memory coordinates to the durable child run', () => {
+    const guard = { recordId: 'child-record', threadId: 'child-thread', resourceId: 'child-resource' };
     const context = createDurableRuntimeRequestContext({
       entries: {
         tenantId: 'tenant-1',
@@ -23,6 +24,7 @@ describe('durable runtime request context', () => {
         resourceId: 'child-resource',
         memoryConfig: { readOnly: true },
       },
+      observationalMemorySourceWriteGuard: guard,
     });
 
     expect(context.get('tenantId')).toBe('tenant-1');
@@ -32,6 +34,7 @@ describe('durable runtime request context', () => {
       thread: { id: 'child-thread' },
       resourceId: 'child-resource',
       memoryConfig: { readOnly: true },
+      observationalMemorySourceWriteGuard: guard,
     });
   });
 
@@ -43,6 +46,7 @@ describe('durable runtime request context', () => {
       contexts.push(value);
       return value;
     };
+    const guard = { recordId: 'child-record', threadId: 'child-thread', resourceId: 'child-resource' };
     const agent = {
       getToolsForExecution: vi.fn(async ({ requestContext }) => {
         capture(requestContext);
@@ -93,7 +97,7 @@ describe('durable runtime request context', () => {
         .serialize(),
       toolsMetadata: [],
       modelConfig: { provider: 'test', modelId: 'test-model', specificationVersion: 'v2' },
-      options: {},
+      options: { observationalMemorySourceWriteGuard: guard },
       state: {
         memoryConfigured: true,
         threadId: 'child-thread',
@@ -133,6 +137,7 @@ describe('durable runtime request context', () => {
         thread: { id: 'child-thread' },
         resourceId: 'child-resource',
         memoryConfig: { readOnly: true },
+        observationalMemorySourceWriteGuard: guard,
       });
     }
     expect(agent.getToolsForExecution).toHaveBeenCalledWith(

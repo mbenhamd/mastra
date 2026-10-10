@@ -56,6 +56,7 @@ import { mergeVersionOverrides } from '../mastra/types';
 import type { MastraMemory } from '../memory/memory';
 import { normalizeMessageHistoryConfig } from '../memory/message-history-config';
 import { getMemoryRunState } from '../memory/run-state';
+import { parseMemoryRequestContext } from '../memory/types';
 import type { MemoryConfig, MemoryConfigInternal } from '../memory/types';
 import {
   resolveDeliveryFailureUpdate,
@@ -5851,6 +5852,11 @@ export class Agent<
                   key !== MASTRA_INHERITED_MEMORY_KEY,
               ),
             );
+            // The child captures its own source fence during memory preparation. Read it
+            // back for the projection writes below; never recapture after a child run,
+            // because that could turn a revoked execution into a fresh OM generation.
+            const getSubAgentSourceWriteGuard = () =>
+              parseMemoryRequestContext(subAgentRequestContext)?.observationalMemorySourceWriteGuard;
 
             // Expand `contextFromRefs` into the prompt before any hook runs so
             // onDelegationStart and messageFilter see the prompt the sub-agent
@@ -6098,6 +6104,12 @@ export class Agent<
                 : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
               if (rejectionMemory) {
                 try {
+                  const rejectionSourceWriteGuard =
+                    getSubAgentSourceWriteGuard() ??
+                    (await rejectionMemory.prepareObservationalMemorySourceWriteGuard(
+                      subAgentThreadId,
+                      subAgentResourceId,
+                    ));
                   const userMessage: MastraDBMessage = {
                     id: this.#mastra?.generateId() || randomUUID(),
                     role: 'user',
@@ -6123,8 +6135,12 @@ export class Agent<
                   await rejectionMemory.createThread({
                     resourceId: subAgentResourceId,
                     threadId: subAgentThreadId,
+                    observationalMemorySourceWriteGuard: rejectionSourceWriteGuard,
                   });
-                  await rejectionMemory.saveMessages({ messages: [userMessage, assistantMessage] });
+                  await rejectionMemory.saveMessages({
+                    messages: [userMessage, assistantMessage],
+                    observationalMemorySourceWriteGuard: rejectionSourceWriteGuard,
+                  });
                 } catch (memoryError) {
                   this.logger.error('Failed to save rejection to sub-agent memory', {
                     agent: this.name,
@@ -6450,13 +6466,16 @@ export class Agent<
                   : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
                 if (memory) {
                   try {
+                    const subAgentSourceWriteGuard = getSubAgentSourceWriteGuard();
                     await memory.createThread({
                       resourceId: effectiveGenerateResourceId,
                       threadId: effectiveGenerateThreadId,
+                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
                     });
 
                     await memory.saveMessages({
                       messages: fullSubAgentMessages,
+                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
                     });
                   } catch (memoryError) {
                     this.logger.error('Failed to save messages to sub-agent memory', {
@@ -6634,13 +6653,16 @@ export class Agent<
                   : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
                 if (streamMemory) {
                   try {
+                    const subAgentSourceWriteGuard = getSubAgentSourceWriteGuard();
                     await streamMemory.createThread({
                       resourceId: effectiveStreamResourceId,
                       threadId: effectiveStreamThreadId,
+                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
                     });
 
                     await streamMemory.saveMessages({
                       messages: fullSubAgentMessages,
+                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
                     });
                   } catch (memoryError) {
                     this.logger.error('Failed to save messages to sub-agent memory', {
@@ -6787,6 +6809,8 @@ export class Agent<
                       try {
                         await supervisorMemory.saveMessages({
                           messages: [feedbackMessage],
+                          observationalMemorySourceWriteGuard:
+                            parseMemoryRequestContext(parentRequestContext)?.observationalMemorySourceWriteGuard,
                         });
                       } catch (memoryError) {
                         this.logger.error('Failed to save feedback to supervisor memory', {
@@ -6882,6 +6906,8 @@ export class Agent<
                       try {
                         await supervisorMemory.saveMessages({
                           messages: [feedbackMessage],
+                          observationalMemorySourceWriteGuard:
+                            parseMemoryRequestContext(parentRequestContext)?.observationalMemorySourceWriteGuard,
                         });
                       } catch (memoryError) {
                         this.logger.error('Failed to save feedback to supervisor memory', {
@@ -9581,6 +9607,7 @@ export class Agent<
     });
 
     const memoryRunState = memory ? getMemoryRunState(requestContext, memory, threadId, resourceId) : undefined;
+    const observationalMemorySourceWriteGuard = messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard;
     // Re-read the latest thread so metadata written mid-run (working memory,
     // processors) is not overwritten by the pre-run snapshot.
     const thread = (!readOnlyMemory && threadId ? await memory?.getThreadById({ threadId }) : undefined) ?? threadAfter;
@@ -9619,6 +9646,7 @@ export class Agent<
             title: thread.title,
             memoryConfig,
             resourceId: thread.resourceId,
+            observationalMemorySourceWriteGuard,
           });
         }
 
@@ -9670,13 +9698,25 @@ export class Agent<
               )
                 .then(async title => {
                   if (title) {
-                    await memory.createThread({
-                      threadId: thread.id,
-                      resourceId,
-                      memoryConfig,
-                      title,
-                      metadata: thread.metadata,
-                    });
+                    const latestThread = await memory.getThreadById({ threadId: thread.id });
+                    if (latestThread) {
+                      await memory.updateThread({
+                        id: thread.id,
+                        title,
+                        metadata: latestThread.metadata ?? thread.metadata ?? {},
+                        memoryConfig,
+                        observationalMemorySourceWriteGuard,
+                      });
+                    } else {
+                      await memory.createThread({
+                        threadId: thread.id,
+                        resourceId,
+                        memoryConfig,
+                        title,
+                        metadata: thread.metadata,
+                        observationalMemorySourceWriteGuard,
+                      });
+                    }
 
                     if (emitEvent && writer && !abortSignal?.aborted) {
                       try {

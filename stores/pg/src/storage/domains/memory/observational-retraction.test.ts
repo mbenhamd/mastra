@@ -214,6 +214,244 @@ describe('MemoryPG observational-memory retraction', () => {
     });
   });
 
+  it('fences source writes to the archived record and the authoritative thread owner', async () => {
+    const guardedResourceId = `${resourceId}-source-write-guard`;
+    const guardedThreadId = `${threadId}-source-write-guard`;
+    const movedResourceId = `${guardedResourceId}-moved`;
+    const guardedThread = {
+      id: guardedThreadId,
+      resourceId: guardedResourceId,
+      title: 'Source guard thread',
+      metadata: {},
+      createdAt,
+      updatedAt: createdAt,
+    };
+    await observerMemory.saveThread({ thread: guardedThread });
+    const predecessor = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: guardedResourceId,
+      scope: 'thread',
+      threadId: guardedThreadId,
+    });
+    const sourceWriteGuard = {
+      recordId: predecessor.id,
+      threadId: guardedThreadId,
+      resourceId: guardedResourceId,
+    };
+
+    await observerMemory.createReflectionGeneration({
+      currentRecord: predecessor,
+      reflection: 'Archived source guard remains valid.',
+      tokenCount: 1,
+    });
+    await expect(
+      observerMemory.saveMessages({
+        messages: [
+          {
+            id: `${guardedThreadId}-archived-source-message`,
+            threadId: guardedThreadId,
+            resourceId: guardedResourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'delayed source write' }] },
+            createdAt,
+          },
+        ],
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      }),
+    ).resolves.toMatchObject({ messages: [expect.objectContaining({ threadId: guardedThreadId })] });
+
+    await observerMemory.updateThreadResourceId({ threadId: guardedThreadId, resourceId: movedResourceId });
+    const staleMessageId = `${guardedThreadId}-stale-source-message`;
+    await expect(
+      observerMemory.saveMessages({
+        messages: [
+          {
+            id: staleMessageId,
+            threadId: guardedThreadId,
+            resourceId: guardedResourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'must be rejected' }] },
+            createdAt,
+          },
+        ],
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      }),
+    ).rejects.toThrow(/source write guard/i);
+    await expect(observerMemory.listMessagesById({ messageIds: [staleMessageId] })).resolves.toEqual({ messages: [] });
+
+    await observerStore.db.none(`DELETE FROM "${schemaName}"."mastra_threads" WHERE id = $1`, [guardedThreadId]);
+    const missingThreadMessageId = `${guardedThreadId}-missing-thread-source-message`;
+    await expect(
+      observerMemory.saveMessages({
+        messages: [
+          {
+            id: missingThreadMessageId,
+            threadId: guardedThreadId,
+            resourceId: guardedResourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'must remain rejected' }] },
+            createdAt,
+          },
+        ],
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      }),
+    ).rejects.toThrow(/source write guard/i);
+    await expect(observerMemory.listMessagesById({ messageIds: [missingThreadMessageId] })).resolves.toEqual({
+      messages: [],
+    });
+  });
+
+  it('atomically validates source-bound thread creation and active-record refresh', async () => {
+    const guardedResourceId = `${resourceId}-atomic-source-guard`;
+    const guardedThreadId = `${threadId}-atomic-source-guard`;
+    const sourceRecord = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: guardedResourceId,
+      scope: 'thread',
+      threadId: guardedThreadId,
+    });
+    const sourceWriteGuard = {
+      recordId: sourceRecord.id,
+      threadId: guardedThreadId,
+      resourceId: guardedResourceId,
+    };
+
+    await expect(
+      observerMemory.saveThread({
+        thread: {
+          id: guardedThreadId,
+          resourceId: guardedResourceId,
+          title: 'first turn',
+          metadata: {},
+          createdAt,
+          updatedAt: createdAt,
+        },
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      }),
+    ).resolves.toMatchObject({ id: guardedThreadId, title: 'first turn' });
+
+    const activeRecord = await observerMemory.createReflectionGeneration({
+      currentRecord: sourceRecord,
+      reflection: 'active generation',
+      tokenCount: 1,
+    });
+    await expect(
+      observerMemory.getObservationalMemoryForSourceWrite({
+        threadId: guardedThreadId,
+        resourceId: guardedResourceId,
+        sourceWriteGuard,
+      }),
+    ).resolves.toMatchObject({ id: activeRecord.id });
+
+    await retractorMemory.retractObservationalMemory({ resourceId: guardedResourceId, threadId: guardedThreadId });
+    await retractorMemory.deleteThread({ threadId: guardedThreadId });
+    await expect(
+      observerMemory.saveThread({
+        thread: {
+          id: guardedThreadId,
+          resourceId: guardedResourceId,
+          title: 'erased title',
+          metadata: { erased: true },
+          createdAt,
+          updatedAt: createdAt,
+        },
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      }),
+    ).rejects.toThrow(/source write guard/i);
+    await expect(observerMemory.getThreadById({ threadId: guardedThreadId })).resolves.toBeNull();
+    await expect(
+      observerMemory.getObservationalMemoryForSourceWrite({
+        threadId: guardedThreadId,
+        resourceId: guardedResourceId,
+        sourceWriteGuard,
+      }),
+    ).rejects.toThrow(/source write guard/i);
+  });
+
+  it('rejects mismatched thread ownership before initializing a source-write record', async () => {
+    const guardedThreadId = `${threadId}-initial-owner`;
+    const ownerResourceId = `${resourceId}-initial-owner`;
+    const mismatchedResourceId = `${resourceId}-initial-mismatched`;
+    await observerMemory.saveThread({
+      thread: {
+        id: guardedThreadId,
+        resourceId: ownerResourceId,
+        title: 'owned thread',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+
+    await expect(
+      observerMemory.initializeObservationalMemory({
+        config: {},
+        resourceId: mismatchedResourceId,
+        scope: 'thread',
+        threadId: guardedThreadId,
+      }),
+    ).rejects.toThrow('does not own the thread');
+    await expect(observerMemory.getObservationalMemory(guardedThreadId, mismatchedResourceId)).resolves.toBeNull();
+
+    await expect(
+      observerMemory.initializeObservationalMemory({
+        config: {},
+        resourceId: ownerResourceId,
+        scope: 'thread',
+        threadId: guardedThreadId,
+      }),
+    ).resolves.toMatchObject({ threadId: guardedThreadId, resourceId: ownerResourceId });
+  });
+
+  it('rejects a guarded whole-row save when an ungoverned thread owner changed', async () => {
+    const guardedResourceId = `${resourceId}-whole-row-owner-original`;
+    const movedResourceId = `${resourceId}-whole-row-owner-moved`;
+    const guardedThreadId = `${threadId}-whole-row-owner`;
+    await observerMemory.saveThread({
+      thread: {
+        id: guardedThreadId,
+        resourceId: guardedResourceId,
+        title: 'original',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const sourceRecord = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: guardedResourceId,
+      scope: 'thread',
+      threadId: guardedThreadId,
+    });
+    await observerMemory.updateThreadResourceId({ threadId: guardedThreadId, resourceId: movedResourceId });
+
+    await expect(
+      observerMemory.mutateThreadWithWorkingMemory({
+        mutation: {
+          type: 'save',
+          thread: {
+            id: guardedThreadId,
+            resourceId: guardedResourceId,
+            title: 'stale whole-row save',
+            metadata: {},
+            createdAt,
+            updatedAt: createdAt,
+          },
+        },
+        workingMemory: { type: 'require-ungoverned' },
+        observationalMemorySourceWriteGuard: {
+          recordId: sourceRecord.id,
+          threadId: guardedThreadId,
+          resourceId: guardedResourceId,
+        },
+      }),
+    ).rejects.toThrow('guarded thread owner changed');
+    await expect(observerMemory.getThreadById({ threadId: guardedThreadId })).resolves.toMatchObject({
+      resourceId: movedResourceId,
+      title: 'original',
+    });
+  });
+
   it('serializes direct OM clears with guarded derived-state writes', async () => {
     const lockedResourceId = `${resourceId}-clear-lock`;
     const lockedThreadId = `${threadId}-clear-lock`;
@@ -1207,6 +1445,54 @@ describe('MemoryPG observational-memory retraction', () => {
     await expect(retractorMemory.getResourceById({ resourceId: deleteResourceId })).resolves.toMatchObject({
       workingMemory: null,
     });
+  });
+
+  it('retracts a prepared thread record when deletion wins before thread creation', async () => {
+    const preparedThreadId = `${threadId}-prepared-delete-thread`;
+    const preparedResourceId = `${resourceId}-prepared-delete-thread`;
+    const record = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: preparedResourceId,
+      scope: 'thread',
+      threadId: preparedThreadId,
+    });
+    const sourceWriteGuard = {
+      recordId: record.id,
+      threadId: preparedThreadId,
+      resourceId: preparedResourceId,
+    };
+    const retractions: Array<{
+      input: { resourceId: string; threadId: string };
+      result: { clearedScopes: Array<'resource' | 'thread'> };
+    }> = [];
+
+    await retractorMemory.deleteThread({
+      threadId: preparedThreadId,
+      observationalMemoryRetractions: retractions as any,
+    });
+
+    expect(retractions).toMatchObject([
+      {
+        input: { resourceId: preparedResourceId, threadId: preparedThreadId },
+        result: { clearedScopes: ['thread'] },
+      },
+    ]);
+    await expect(retractorMemory.getObservationalMemory(preparedThreadId, preparedResourceId)).resolves.toBeNull();
+    await expect(
+      retractorMemory.saveMessages({
+        messages: [
+          {
+            id: `${preparedThreadId}-message`,
+            threadId: preparedThreadId,
+            resourceId: preparedResourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'must be rejected after deletion' }] },
+            createdAt,
+          },
+        ],
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      }),
+    ).rejects.toThrow('source write guard');
   });
 
   it('retracts observer-derived thread metadata stored in a legacy TEXT column', async () => {

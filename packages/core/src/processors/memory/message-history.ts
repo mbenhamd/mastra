@@ -13,7 +13,8 @@ import {
 import { SpanType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
 import type { RequestContext } from '../../request-context';
-import type { MemoryStorage } from '../../storage';
+import { ObservationalMemorySourceWriteConflictError } from '../../storage';
+import type { MemoryStorage, ObservationalMemorySourceWriteGuard } from '../../storage';
 import type { TerminalToolResult } from '../../tools';
 import {
   filterToolCallMessages,
@@ -94,6 +95,11 @@ export interface MessageHistoryOptions {
    * messages so their IDs remain usable as history cursors.
    */
   retainFilteredMessageAnchors?: boolean;
+  /**
+   * @internal Require each native Observational Memory source write to carry
+   * the record captured for the current execution.
+   */
+  requireObservationalMemorySourceWriteGuard?: boolean;
 }
 
 /**
@@ -143,6 +149,7 @@ export class MessageHistory implements Processor {
   private retainFilteredMessageAnchors: boolean;
   private tokenLimit?: MessageHistoryOptions['tokenLimit'];
   private tokenCounter?: MessageHistoryOptions['tokenCounter'];
+  private requireObservationalMemorySourceWriteGuard: boolean;
 
   constructor(options: MessageHistoryOptions) {
     if (options.persistence !== undefined && options.toolCallFilter !== undefined) {
@@ -155,6 +162,55 @@ export class MessageHistory implements Processor {
     this.toolCallFilter = options.toolCallFilter;
     this.persistence = options.persistence;
     this.retainFilteredMessageAnchors = options.retainFilteredMessageAnchors ?? false;
+    this.requireObservationalMemorySourceWriteGuard = options.requireObservationalMemorySourceWriteGuard ?? false;
+  }
+
+  private getSourceWriteGuard(messageList: MessageList): ObservationalMemorySourceWriteGuard | undefined {
+    const value: unknown = messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard;
+    if (value === undefined || value === null) return undefined;
+
+    const parsed =
+      typeof value === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(value) as unknown;
+            } catch {
+              return undefined;
+            }
+          })()
+        : value;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+
+    const guard = parsed as Partial<ObservationalMemorySourceWriteGuard>;
+    if (
+      typeof guard.recordId !== 'string' ||
+      guard.recordId.length === 0 ||
+      typeof guard.resourceId !== 'string' ||
+      guard.resourceId.length === 0 ||
+      (guard.threadId !== null && typeof guard.threadId !== 'string')
+    ) {
+      return undefined;
+    }
+
+    return {
+      recordId: guard.recordId,
+      threadId: guard.threadId ?? null,
+      resourceId: guard.resourceId,
+    };
+  }
+
+  private assertSourceWriteReady(guard: ObservationalMemorySourceWriteGuard | undefined): void {
+    if (!this.requireObservationalMemorySourceWriteGuard) return;
+    if (!this.storage.supportsObservationalMemorySourceWriteGuards) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the storage adapter does not support it.',
+      );
+    }
+    if (!guard) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but no captured record guard was provided.',
+      );
+    }
   }
 
   private createFilteredMessageAnchor(message: MastraDBMessage): MastraDBMessage | undefined {
@@ -252,6 +308,7 @@ export class MessageHistory implements Processor {
     }
 
     const { threadId, resourceId } = context;
+    this.assertSourceWriteReady(this.getSourceWriteGuard(messageList));
     const memoryRunState = parseMemoryRequestContext(requestContext)?.runState?.();
 
     const span = this.memorySpan(observabilityContext);
@@ -575,7 +632,12 @@ export class MessageHistory implements Processor {
     span?.update({ attributes: { messageCount: messagesToSave.length } });
 
     try {
-      await this.persistMessages({ messages: messagesToSave, threadId, resourceId });
+      await this.persistMessages({
+        messages: messagesToSave,
+        threadId,
+        resourceId,
+        observationalMemorySourceWriteGuard: this.getSourceWriteGuard(messageList),
+      });
       // add extra 1ms latency to make sure the next generate has not the same input
       await new Promise(resolve => setTimeout(resolve, 10));
 
@@ -593,8 +655,13 @@ export class MessageHistory implements Processor {
    * This method can be called externally by other processors (e.g., ObservationalMemory)
    * that need to save messages incrementally.
    */
-  async persistMessages(args: { messages: MastraDBMessage[]; threadId: string; resourceId?: string }): Promise<void> {
-    const { messages, threadId, resourceId } = args;
+  async persistMessages(args: {
+    messages: MastraDBMessage[];
+    threadId: string;
+    resourceId?: string;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<void> {
+    const { messages, threadId, resourceId, observationalMemorySourceWriteGuard } = args;
 
     if (messages.length === 0) {
       return;
@@ -606,12 +673,15 @@ export class MessageHistory implements Processor {
       return;
     }
 
-    // Ensure thread exists (create if needed) before saving messages.
+    this.assertSourceWriteReady(observationalMemorySourceWriteGuard);
+
+    // Ensure the thread exists before saving messages. Guarded adapters bind
+    // this upsert to the captured OM record under their lifecycle/resource
+    // locks, so a revoked guard cannot recreate an erased thread.
     // Nothing to write when it already exists: re-writing the row we just read
     // would clobber a title generated concurrently with this save.
     const thread = await this.storage.getThreadById({ threadId });
     if (!thread) {
-      // Auto-create thread if it doesn't exist
       await this.storage.saveThread({
         thread: {
           id: threadId,
@@ -621,11 +691,15 @@ export class MessageHistory implements Processor {
           createdAt: new Date(),
           updatedAt: new Date(),
         },
+        observationalMemorySourceWriteGuard,
       });
     }
 
-    // Persist messages after thread is guaranteed to exist
-    await this.storage.saveMessages({ messages: filtered });
+    // Persist messages after the guarded or unguarded thread has been ensured.
+    await this.storage.saveMessages({
+      messages: filtered,
+      observationalMemorySourceWriteGuard,
+    });
     // These messages may be only an old row updated by another processor.
     // No whole-thread saved-through cutoff can be inferred for replay trimming.
   }

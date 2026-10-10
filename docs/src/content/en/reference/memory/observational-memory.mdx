@@ -66,6 +66,14 @@ OM performs thresholding with fast local token estimation. Text uses `tokenx`, a
     defaultValue: "'thread'",
   },
   {
+    name: 'sourceWriteFencing',
+    type: "'required'",
+    description:
+      'Require an execution-scoped native source-write guard for Observational Memory reads and writes. The guard is prepared before admission and is reused across retries and durable resumes. Storage adapters that do not support source-write guards fail closed when this mode is enabled.',
+    isOptional: true,
+    defaultValue: 'disabled',
+  },
+  {
     name: 'activateAfterIdle',
     type: 'number | string | false | "auto"',
     description:

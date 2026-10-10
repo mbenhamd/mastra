@@ -33,6 +33,7 @@ import {
   WorkingMemoryRevisionConflictError,
   WorkingMemoryValidationError,
   assertObservationalMemoryClearExpectation,
+  ObservationalMemorySourceWriteConflictError,
 } from '@mastra/core/storage';
 
 /**
@@ -154,6 +155,7 @@ import type {
   SwapBufferedReflectionToActiveInput,
   CreateReflectionGenerationInput,
   ObservationalMemoryWriteGuard,
+  ObservationalMemorySourceWriteGuard,
   ObservationalMemoryRetractionReceipt,
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
@@ -245,6 +247,33 @@ function parseMetadata(value: unknown): Record<string, unknown> {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+const OBSERVATIONAL_MEMORY_SOURCE_WRITE_SUCCESSOR_METADATA_KEY = 'sourceWriteSuccessor';
+
+function getSourceWriteSuccessorPredecessor(value: unknown): ObservationalMemorySourceWriteGuard | undefined {
+  const metadata = parseMetadata(value);
+  const successor = asRecord(metadata[OBSERVATIONAL_MEMORY_SOURCE_WRITE_SUCCESSOR_METADATA_KEY]);
+  const predecessor = asRecord(successor.predecessor);
+  if (
+    typeof predecessor.recordId !== 'string' ||
+    typeof predecessor.resourceId !== 'string' ||
+    (predecessor.threadId !== null && typeof predecessor.threadId !== 'string')
+  ) {
+    return undefined;
+  }
+  return {
+    recordId: predecessor.recordId,
+    threadId: predecessor.threadId,
+    resourceId: predecessor.resourceId,
+  };
+}
+
+function matchesSourceWriteGuardRow(
+  row: { id: string; resourceId: string; threadId: string | null },
+  guard: ObservationalMemorySourceWriteGuard,
+): boolean {
+  return row.id === guard.recordId && row.resourceId === guard.resourceId && row.threadId === guard.threadId;
 }
 
 function mergeThreadMetadataPreservingWorkingMemory(
@@ -376,6 +405,7 @@ function hasSameMessageCoordinates(
 export class MemoryPG extends MemoryStorage {
   override readonly supportsPartialThreadUpdate = true;
   readonly supportsObservationalMemory = true;
+  readonly supportsObservationalMemorySourceWriteGuards = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
@@ -991,18 +1021,47 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
+  async saveThread({
+    thread,
+    observationalMemorySourceWriteGuard,
+  }: {
+    thread: StorageThreadType;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<StorageThreadType> {
     const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    if (
+      observationalMemorySourceWriteGuard &&
+      (observationalMemorySourceWriteGuard.resourceId !== thread.resourceId ||
+        (observationalMemorySourceWriteGuard.threadId !== null &&
+          observationalMemorySourceWriteGuard.threadId !== thread.id))
+    ) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write guard does not match the target thread.',
+      );
+    }
     try {
       const createdAt = toUtcISOString(thread.createdAt);
       const updatedAt = toUtcISOString(thread.updatedAt);
       return await this.#db.client.tx(async t => {
         await this.lockThreadLifecycles(t, [thread.id]);
+        if (observationalMemorySourceWriteGuard) {
+          await this.lockObservationalMemoryResource(t, observationalMemorySourceWriteGuard.resourceId);
+          await this.assertObservationalMemorySourceRecordExists(t, observationalMemorySourceWriteGuard);
+        }
         await this.lockWorkingMemoryTarget(t, 'thread', thread.id);
         const currentRow = await t.oneOrNone<{ resourceId: string; metadata: unknown }>(
           `SELECT "resourceId", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
           [thread.id],
         );
+        if (
+          observationalMemorySourceWriteGuard &&
+          currentRow &&
+          currentRow.resourceId !== observationalMemorySourceWriteGuard.resourceId
+        ) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source write guard does not match the stored thread owner.',
+          );
+        }
         const currentMetadata = currentRow ? parseMetadata(currentRow.metadata) : undefined;
         if (currentRow) {
           assertGovernedThreadResourceUnchanged({
@@ -1043,7 +1102,12 @@ export class MemoryPG extends MemoryStorage {
         };
       });
     } catch (error) {
-      if (error instanceof WorkingMemoryValidationError) throw error;
+      if (
+        error instanceof WorkingMemoryValidationError ||
+        error instanceof ObservationalMemorySourceWriteConflictError
+      ) {
+        throw error;
+      }
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'SAVE_THREAD', 'FAILED'),
@@ -1062,14 +1126,29 @@ export class MemoryPG extends MemoryStorage {
     id,
     title,
     metadata,
+    observationalMemorySourceWriteGuard,
   }: {
     id: string;
     title?: string;
     metadata?: Record<string, unknown>;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+    if (
+      observationalMemorySourceWriteGuard?.threadId !== null &&
+      observationalMemorySourceWriteGuard?.threadId !== undefined &&
+      observationalMemorySourceWriteGuard.threadId !== id
+    ) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write guard does not match the target thread.',
+      );
+    }
     try {
       return await this.#db.client.tx(async t => {
+        if (observationalMemorySourceWriteGuard) {
+          await this.lockThreadLifecycles(t, [id]);
+          await this.lockObservationalMemoryResource(t, observationalMemorySourceWriteGuard.resourceId);
+        }
         await this.lockWorkingMemoryTarget(t, 'thread', id);
         const existingThread = await t.oneOrNone<StorageThreadType & { createdAtZ: Date; updatedAtZ: Date }>(
           `SELECT * FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
@@ -1083,6 +1162,14 @@ export class MemoryPG extends MemoryStorage {
             text: `Thread ${id} not found`,
             details: { threadId: id, title: title ?? null },
           });
+        }
+        if (observationalMemorySourceWriteGuard) {
+          if (existingThread.resourceId !== observationalMemorySourceWriteGuard.resourceId) {
+            throw new ObservationalMemorySourceWriteConflictError(
+              'Observational memory source write guard does not match the stored thread owner.',
+            );
+          }
+          await this.assertObservationalMemorySourceRecordExists(t, observationalMemorySourceWriteGuard);
         }
         const currentMetadata = parseMetadata(existingThread.metadata);
         const proposedMetadata =
@@ -1118,6 +1205,7 @@ export class MemoryPG extends MemoryStorage {
     } catch (error) {
       if (error instanceof MastraError) throw error;
       if (error instanceof WorkingMemoryValidationError) throw error;
+      if (error instanceof ObservationalMemorySourceWriteConflictError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'UPDATE_THREAD', 'FAILED'),
@@ -1143,6 +1231,7 @@ export class MemoryPG extends MemoryStorage {
     try {
       const tableName = getTableName({ indexName: TABLE_MESSAGES, schemaName: getSchemaName(this.#schema) });
       const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
+      const omTableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
       let committedRetraction: ObservationalMemoryRetractionReceipt | undefined;
       await this.#db.client.tx(async t => {
         await this.lockThreadLifecycles(t, [threadId]);
@@ -1156,16 +1245,27 @@ export class MemoryPG extends MemoryStorage {
           [schemaName, OM_TABLE],
         );
         let retraction: RetractObservationalMemoryResult | undefined;
-        if (threadSnapshot?.resourceId) {
+        let deletionResourceId = threadSnapshot?.resourceId;
+        if (!deletionResourceId && omTableExists !== null) {
+          const threadScopedRecord = await t.oneOrNone<{ resourceId: string }>(
+            `SELECT "resourceId" FROM ${omTableName}
+             WHERE "lookupKey" = $1
+             ORDER BY "generationCount" DESC
+             LIMIT 1`,
+            [this.getOMKey(threadId, '')],
+          );
+          deletionResourceId = threadScopedRecord?.resourceId;
+        }
+        if (deletionResourceId) {
           if (omTableExists !== null) {
             const input = {
-              resourceId: threadSnapshot.resourceId,
+              resourceId: deletionResourceId,
               threadId,
             };
             retraction = await this.retractObservationalMemoryInTransaction(t, input);
             committedRetraction = { input, result: retraction };
           } else {
-            await this.lockObservationalMemoryResource(t, threadSnapshot.resourceId);
+            await this.lockObservationalMemoryResource(t, deletionResourceId);
           }
         }
 
@@ -1198,9 +1298,7 @@ export class MemoryPG extends MemoryStorage {
           const vectorTableName = getTableName({ indexName: tablename, schemaName: getSchemaName(this.#schema) });
           const isObservationTable =
             tablename === 'memory_observations' || tablename.startsWith('memory_observations_');
-          const clearedResourceId = retraction?.clearedScopes.includes('resource')
-            ? threadSnapshot?.resourceId
-            : undefined;
+          const clearedResourceId = retraction?.clearedScopes.includes('resource') ? deletionResourceId : undefined;
           if (isObservationTable && clearedResourceId) {
             await t.none(`DELETE FROM ${vectorTableName} WHERE metadata->>'resource_id' = $1`, [clearedResourceId]);
           } else {
@@ -2060,7 +2158,13 @@ export class MemoryPG extends MemoryStorage {
     }
   }
 
-  async saveMessages({ messages }: { messages: MastraDBMessage[] }): Promise<{ messages: MastraDBMessage[] }> {
+  async saveMessages({
+    messages,
+    observationalMemorySourceWriteGuard,
+  }: {
+    messages: MastraDBMessage[];
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<{ messages: MastraDBMessage[] }> {
     if (messages.length === 0) return { messages: [] };
 
     const threadId = messages[0]?.threadId;
@@ -2090,9 +2194,31 @@ export class MemoryPG extends MemoryStorage {
         threadIds.add(message.threadId);
       }
 
+      if (observationalMemorySourceWriteGuard) {
+        const guard = observationalMemorySourceWriteGuard;
+        if (
+          messages.some(
+            message =>
+              message.resourceId !== guard.resourceId ||
+              (guard.threadId !== null && message.threadId !== guard.threadId),
+          )
+        ) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source write guard does not match the message scope.',
+          );
+        }
+      }
+
+      // Fail fast before opening a transaction. The locked re-check below stays
+      // authoritative for concurrent deletion.
       for (const threadIdToCheck of threadIds) {
         const thread = await this.#getThreadById(this.#db.client, { threadId: threadIdToCheck });
         if (!thread) {
+          if (observationalMemorySourceWriteGuard) {
+            throw new ObservationalMemorySourceWriteConflictError(
+              `Observational memory source write guard thread ${threadIdToCheck} no longer exists.`,
+            );
+          }
           throw new MastraError({
             id: createStorageErrorId('PG', 'SAVE_MESSAGES', 'FAILED'),
             domain: ErrorDomain.STORAGE,
@@ -2109,6 +2235,10 @@ export class MemoryPG extends MemoryStorage {
       const threadTableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
       await this.#db.client.tx(async t => {
         await this.lockThreadLifecycles(t, threadIds);
+        if (observationalMemorySourceWriteGuard) {
+          await this.lockObservationalMemoryResource(t, observationalMemorySourceWriteGuard.resourceId);
+          await this.assertObservationalMemorySourceRecordExists(t, observationalMemorySourceWriteGuard);
+        }
         const sortedThreadIds = sortedUniqueStrings(threadIds);
         const lockedThreads = await this.lockThreadRows(t, sortedThreadIds);
         if (
@@ -2119,7 +2249,20 @@ export class MemoryPG extends MemoryStorage {
         ) {
           const lockedThreadIds = new Set(lockedThreads.map(thread => thread.id));
           const missingThreadId = sortedThreadIds.find(threadId => !lockedThreadIds.has(threadId));
+          if (observationalMemorySourceWriteGuard) {
+            throw new ObservationalMemorySourceWriteConflictError(
+              `Observational memory source write guard thread ${missingThreadId ?? sortedThreadIds[0]} no longer exists.`,
+            );
+          }
           throw new Error(`Thread ${missingThreadId ?? sortedThreadIds[0]} no longer exists.`);
+        }
+        if (
+          observationalMemorySourceWriteGuard &&
+          lockedThreads.some(thread => thread.resourceId !== observationalMemorySourceWriteGuard.resourceId)
+        ) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source write guard does not match the stored thread owner.',
+          );
         }
         for (let offset = 0; offset < messagesToSave.length; offset += MAX_MESSAGES_PER_INSERT) {
           const batch = messagesToSave.slice(offset, offset + MAX_MESSAGES_PER_INSERT);
@@ -2186,7 +2329,7 @@ export class MemoryPG extends MemoryStorage {
       const list = new MessageList().add(messagesWithParsedContent as (MastraMessageV1 | MastraDBMessage)[], 'memory');
       return { messages: list.get.all.db() };
     } catch (error) {
-      if (error instanceof MastraError) {
+      if (error instanceof MastraError || error instanceof ObservationalMemorySourceWriteConflictError) {
         throw error;
       }
       throw new MastraError(
@@ -2779,6 +2922,9 @@ export class MemoryPG extends MemoryStorage {
     const tableName = getTableName({ indexName: TABLE_THREADS, schemaName: getSchemaName(this.#schema) });
     try {
       return await this.#db.client.tx(async t => {
+        if (guard.threadId !== null) {
+          await this.lockThreadLifecycles(t, [id]);
+        }
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.lockWorkingMemoryTarget(t, 'thread', id);
         await this.assertCurrentObservationalMemoryGeneration(t, guard);
@@ -2982,10 +3128,16 @@ export class MemoryPG extends MemoryStorage {
 
     try {
       return await this.#db.client.tx(async t => {
-        if (input.mutation.type === 'save') {
+        if (input.mutation.type === 'save' || input.observationalMemorySourceWriteGuard) {
           await this.lockThreadLifecycles(t, [threadId]);
         }
-        if (input.workingMemory.type === 'observer-update') {
+        if (input.observationalMemorySourceWriteGuard) {
+          // Source-derived thread writes share the same lock order as the
+          // observer working-memory update path: lifecycle -> OM resource ->
+          // working-memory target. Holding the resource lock after the
+          // working-memory row can deadlock against applyWorkingMemoryUpdate.
+          await this.lockObservationalMemoryResource(t, input.observationalMemorySourceWriteGuard.resourceId);
+        } else if (input.workingMemory.type === 'observer-update') {
           await this.lockObservationalMemoryResource(t, input.workingMemory.resourceId);
         }
         await this.lockWorkingMemoryTarget(t, 'thread', threadId);
@@ -3009,6 +3161,19 @@ export class MemoryPG extends MemoryStorage {
         assertThreadWorkingMemoryRemoved(proposedMetadata);
         const resourceId =
           input.mutation.type === 'save' ? input.mutation.thread.resourceId : currentThread!.resourceId;
+        if (input.observationalMemorySourceWriteGuard) {
+          this.assertObservationalMemorySourceWriteTarget(
+            input.observationalMemorySourceWriteGuard,
+            threadId,
+            resourceId,
+          );
+          if (currentThread && currentThread.resourceId !== input.observationalMemorySourceWriteGuard.resourceId) {
+            throw new ObservationalMemorySourceWriteConflictError(
+              'The guarded thread owner changed before the source write could be committed.',
+            );
+          }
+          await this.assertObservationalMemorySourceRecordExists(t, input.observationalMemorySourceWriteGuard);
+        }
         if (input.mutation.type === 'save' && currentThread) {
           assertGovernedThreadResourceUnchanged({
             currentResourceId: currentThread.resourceId,
@@ -3115,7 +3280,8 @@ export class MemoryPG extends MemoryStorage {
       if (
         error instanceof MastraError ||
         error instanceof WorkingMemoryRevisionConflictError ||
-        error instanceof WorkingMemoryValidationError
+        error instanceof WorkingMemoryValidationError ||
+        error instanceof ObservationalMemorySourceWriteConflictError
       ) {
         throw error;
       }
@@ -3204,12 +3370,20 @@ export class MemoryPG extends MemoryStorage {
 
     try {
       return await this.#db.client.tx(async t => {
-        if (input.mutation.type === 'save') {
+        if (input.mutation.type === 'save' || input.observationalMemorySourceWriteGuard) {
           await this.lockThreadLifecycles(t, [threadId]);
         }
         await this.lockObservationalMemoryResource(t, resourceId);
         await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
         await this.lockWorkingMemoryTarget(t, 'thread', threadId);
+        if (input.observationalMemorySourceWriteGuard) {
+          this.assertObservationalMemorySourceWriteTarget(
+            input.observationalMemorySourceWriteGuard,
+            threadId,
+            resourceId,
+          );
+          await this.assertObservationalMemorySourceRecordExists(t, input.observationalMemorySourceWriteGuard);
+        }
 
         const currentThread = await t.oneOrNone<
           StorageThreadType & { createdAtZ?: Date | string; updatedAtZ?: Date | string }
@@ -3341,7 +3515,8 @@ export class MemoryPG extends MemoryStorage {
       if (
         error instanceof MastraError ||
         error instanceof WorkingMemoryRevisionConflictError ||
-        error instanceof WorkingMemoryValidationError
+        error instanceof WorkingMemoryValidationError ||
+        error instanceof ObservationalMemorySourceWriteConflictError
       ) {
         throw error;
       }
@@ -3857,6 +4032,45 @@ export class MemoryPG extends MemoryStorage {
     );
   }
 
+  /**
+   * Verify that a captured OM source-write record still exists in its scope.
+   * This intentionally avoids ordering by generationCount: archived records
+   * remain valid for delayed transcript writes until their scope is retracted.
+   */
+  private async assertObservationalMemorySourceRecordExists(
+    t: TxClient,
+    guard: ObservationalMemorySourceWriteGuard,
+  ): Promise<void> {
+    const tableName = getTableName({
+      indexName: OM_TABLE,
+      schemaName: getSchemaName(this.#schema),
+    });
+    const current = await t.oneOrNone<{ id: string }>(
+      `SELECT id FROM ${tableName}
+       WHERE id = $1
+         AND "lookupKey" = $2
+         AND "resourceId" = $3
+         AND "threadId" IS NOT DISTINCT FROM $4
+       LIMIT 1`,
+      [guard.recordId, this.getOMKey(guard.threadId, guard.resourceId), guard.resourceId, guard.threadId],
+    );
+    if (current?.id !== guard.recordId) {
+      throw new ObservationalMemorySourceWriteConflictError();
+    }
+  }
+
+  private assertObservationalMemorySourceWriteTarget(
+    guard: ObservationalMemorySourceWriteGuard,
+    threadId: string,
+    resourceId: string,
+  ): void {
+    if (guard.resourceId !== resourceId || (guard.threadId !== null && guard.threadId !== threadId)) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write guard does not match the target thread.',
+      );
+    }
+  }
+
   private parseOMRow(row: any): ObservationalMemoryRecord {
     // OM is a new table - use timezone-aware columns (*Z) directly (no legacy fallback needed)
     return {
@@ -3931,6 +4145,68 @@ export class MemoryPG extends MemoryStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: { threadId, resourceId },
+        },
+        error,
+      );
+    }
+  }
+
+  async getObservationalMemoryForSourceWrite({
+    threadId,
+    resourceId,
+    sourceWriteGuard,
+  }: {
+    threadId: string;
+    resourceId: string;
+    sourceWriteGuard: ObservationalMemorySourceWriteGuard;
+  }): Promise<ObservationalMemoryRecord> {
+    if (
+      sourceWriteGuard.resourceId !== resourceId ||
+      (sourceWriteGuard.threadId !== null && sourceWriteGuard.threadId !== threadId)
+    ) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write guard does not match the requested record scope.',
+      );
+    }
+
+    const tableName = getTableName({
+      indexName: OM_TABLE,
+      schemaName: getSchemaName(this.#schema),
+    });
+    try {
+      return await this.#db.client.tx(async t => {
+        // Retraction uses the same thread-lifecycle -> resource lock order.
+        // Holding these locks while validating the captured row prevents a
+        // revoked guard from racing into replacement initialization.
+        await this.lockThreadLifecycles(t, [threadId]);
+        await this.lockObservationalMemoryResource(t, resourceId);
+        const rows = await t.manyOrNone<any>(
+          `SELECT * FROM ${tableName} WHERE "lookupKey" = $1 ORDER BY "generationCount" DESC FOR UPDATE`,
+          [this.getOMKey(sourceWriteGuard.threadId, sourceWriteGuard.resourceId)],
+        );
+        const captured = rows.find(
+          row =>
+            row.id === sourceWriteGuard.recordId &&
+            row.resourceId === sourceWriteGuard.resourceId &&
+            row.threadId === sourceWriteGuard.threadId,
+        );
+        if (!captured) {
+          throw new ObservationalMemorySourceWriteConflictError();
+        }
+        const active = rows[0];
+        if (!active) {
+          throw new ObservationalMemorySourceWriteConflictError();
+        }
+        return this.parseOMRow(active);
+      });
+    } catch (error) {
+      if (error instanceof ObservationalMemorySourceWriteConflictError) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'GET_OBSERVATIONAL_MEMORY_FOR_SOURCE_WRITE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { threadId, resourceId, recordId: sourceWriteGuard.recordId },
         },
         error,
       );
@@ -4026,7 +4302,25 @@ export class MemoryPG extends MemoryStorage {
       });
       const nowStr = now.toISOString();
       const storedRecord = await this.#db.client.tx(async t => {
+        if (input.scope === 'thread' && input.threadId) {
+          await this.lockThreadLifecycles(t, [input.threadId]);
+        }
         await this.lockObservationalMemoryResource(t, input.resourceId);
+        if (input.scope === 'thread' && input.threadId) {
+          const threadTableName = getTableName({
+            indexName: TABLE_THREADS,
+            schemaName: getSchemaName(this.#schema),
+          });
+          const thread = await t.oneOrNone<{ resourceId: string }>(
+            `SELECT "resourceId" FROM ${threadTableName} WHERE id = $1 FOR UPDATE`,
+            [input.threadId],
+          );
+          if (thread?.resourceId && thread.resourceId !== input.resourceId) {
+            throw new ObservationalMemorySourceWriteConflictError(
+              'Observational memory source-write initialization resource does not own the thread.',
+            );
+          }
+        }
         // Another caller (possibly in another process) may have created the record
         // while this one was waiting for the lock. Return theirs instead of adding
         // a duplicate, using the shared stable generation ordering.
@@ -4077,6 +4371,7 @@ export class MemoryPG extends MemoryStorage {
 
       return storedRecord;
     } catch (error) {
+      if (error instanceof ObservationalMemorySourceWriteConflictError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'INITIALIZE_OBSERVATIONAL_MEMORY', 'FAILED'),
@@ -4190,30 +4485,45 @@ export class MemoryPG extends MemoryStorage {
       const lastObservedAtStr = input.lastObservedAt.toISOString();
       const nowStr = now.toISOString();
       const observedMessageIdsJson = input.observedMessageIds ? toPgJson(input.observedMessageIds) : null;
-      const result = await this.#db.client.query(
-        `UPDATE ${tableName} SET
-          "activeObservations" = $1,
-          "lastObservedAt" = $2,
-          "lastObservedAtZ" = $3,
-          "pendingMessageTokens" = 0,
-          "observationTokenCount" = $4,
-          "totalTokensObserved" = "totalTokensObserved" + $5,
-          "observedMessageIds" = $6,
-          "updatedAt" = $7,
-          "updatedAtZ" = $8
-        WHERE id = $9`,
-        [
-          input.observations,
-          lastObservedAtStr,
-          lastObservedAtStr,
-          Math.round(input.tokenCount),
-          Math.round(input.tokenCount),
-          observedMessageIdsJson,
-          nowStr,
-          nowStr,
-          input.id,
-        ],
-      );
+      const runUpdate = async (client: Pick<TxClient, 'query'>) =>
+        client.query(
+          `UPDATE ${tableName} SET
+            "activeObservations" = $1,
+            "lastObservedAt" = $2,
+            "lastObservedAtZ" = $3,
+            "pendingMessageTokens" = 0,
+            "observationTokenCount" = $4,
+            "totalTokensObserved" = "totalTokensObserved" + $5,
+            "observedMessageIds" = $6,
+            "updatedAt" = $7,
+            "updatedAtZ" = $8
+          WHERE id = $9`,
+          [
+            input.observations,
+            lastObservedAtStr,
+            lastObservedAtStr,
+            Math.round(input.tokenCount),
+            Math.round(input.tokenCount),
+            observedMessageIdsJson,
+            nowStr,
+            nowStr,
+            input.id,
+          ],
+        );
+      const writeGuard = input.observationalMemoryWriteGuard;
+      const result = writeGuard
+        ? await this.#db.client.tx(async t => {
+            if (writeGuard.threadId) {
+              await this.lockThreadLifecycles(t, [writeGuard.threadId]);
+            }
+            await this.lockObservationalMemoryResource(t, writeGuard.resourceId);
+            if (writeGuard.recordId !== input.id) {
+              throw new ObservationalMemoryGenerationConflictError();
+            }
+            await this.assertCurrentObservationalMemoryGeneration(t, writeGuard);
+            return runUpdate(t);
+          })
+        : await runUpdate(this.#db.client);
 
       if (result.rowCount === 0) {
         throw new MastraError({
@@ -4592,13 +4902,103 @@ export class MemoryPG extends MemoryStorage {
     const resourceLookupKey = this.getOMKey(null, input.resourceId);
     const threadLookupKey = this.getOMKey(input.threadId, input.resourceId);
 
+    await this.lockThreadLifecycles(t, [input.threadId]);
     await this.lockObservationalMemoryResource(t, input.resourceId);
-    const records = await t.manyOrNone<{ lookupKey: string; config: unknown }>(
-      `SELECT "lookupKey", config FROM ${omTableName}
+    const records = await t.manyOrNone<{
+      id: string;
+      lookupKey: string;
+      scope: string;
+      resourceId: string;
+      threadId: string | null;
+      config: unknown;
+      metadata: unknown;
+      observedTimezone: string | null;
+    }>(
+      `SELECT id, "lookupKey", scope, "resourceId", "threadId", config, metadata, "observedTimezone"
+       FROM ${omTableName}
        WHERE "lookupKey" IN ($1, $2)
        FOR UPDATE`,
       [resourceLookupKey, threadLookupKey],
     );
+
+    const sourceWriteSuccessor = input.sourceWriteSuccessor;
+    let successorGuard: ObservationalMemorySourceWriteGuard | undefined;
+    let successorRecord: (typeof records)[number] | undefined;
+    if (sourceWriteSuccessor) {
+      if (
+        sourceWriteSuccessor.successorRecordId.length === 0 ||
+        sourceWriteSuccessor.successorRecordId === sourceWriteSuccessor.predecessor.recordId ||
+        sourceWriteSuccessor.predecessor.resourceId !== input.resourceId ||
+        (sourceWriteSuccessor.predecessor.threadId !== null &&
+          sourceWriteSuccessor.predecessor.threadId !== input.threadId)
+      ) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'Observational memory source-write successor coordinates are invalid.',
+        );
+      }
+
+      successorRecord = records.find(record => record.id === sourceWriteSuccessor.successorRecordId);
+      if (successorRecord) {
+        const predecessor = getSourceWriteSuccessorPredecessor(successorRecord.metadata);
+        if (
+          !matchesSourceWriteGuardRow(successorRecord, {
+            recordId: sourceWriteSuccessor.successorRecordId,
+            threadId: sourceWriteSuccessor.predecessor.threadId,
+            resourceId: sourceWriteSuccessor.predecessor.resourceId,
+          }) ||
+          !predecessor ||
+          !matchesSourceWriteGuardRow(
+            {
+              id: predecessor.recordId,
+              threadId: predecessor.threadId,
+              resourceId: predecessor.resourceId,
+            },
+            sourceWriteSuccessor.predecessor,
+          )
+        ) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source-write successor provenance does not match.',
+          );
+        }
+        successorGuard = {
+          recordId: successorRecord.id,
+          threadId: successorRecord.threadId,
+          resourceId: successorRecord.resourceId,
+        };
+      } else {
+        const existingId = await t.oneOrNone<{ id: string }>(`SELECT id FROM ${omTableName} WHERE id = $1 LIMIT 1`, [
+          sourceWriteSuccessor.successorRecordId,
+        ]);
+        if (existingId) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'The predetermined observational memory successor ID is already in use.',
+          );
+        }
+
+        const predecessor = records.find(record =>
+          matchesSourceWriteGuardRow(record, sourceWriteSuccessor.predecessor),
+        );
+        if (!predecessor) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'The captured observational memory predecessor no longer exists.',
+          );
+        }
+        successorRecord = predecessor;
+      }
+    }
+
+    if (successorGuard) {
+      return {
+        clearedScopes: [
+          ...(records.some(record => record.lookupKey === resourceLookupKey) ? (['resource'] as const) : []),
+          ...(records.some(record => record.lookupKey === threadLookupKey) ? (['thread'] as const) : []),
+        ],
+        clearedResourceWorkingMemory: false,
+        clearedThreadMetadata: false,
+        sourceWriteGuard: successorGuard,
+      };
+    }
+
     await t.none(`DELETE FROM ${omTableName} WHERE "lookupKey" IN ($1, $2)`, [resourceLookupKey, threadLookupKey]);
 
     const lookupKeys = new Set(records.map(record => record.lookupKey));
@@ -4720,6 +5120,64 @@ export class MemoryPG extends MemoryStorage {
       }
     }
 
+    if (sourceWriteSuccessor && successorRecord && !successorGuard) {
+      const now = new Date().toISOString();
+      const config =
+        typeof successorRecord.config === 'string'
+          ? successorRecord.config
+          : JSON.stringify(successorRecord.config ?? {});
+      await t.none(
+        `INSERT INTO ${omTableName} (
+          id, "lookupKey", scope, "resourceId", "threadId",
+          "activeObservations", "activeObservationsPendingUpdate",
+          "originType", config, "generationCount", "lastObservedAt", "lastObservedAtZ", "lastReflectionAt", "lastReflectionAtZ",
+          "pendingMessageTokens", "totalTokensObserved", "observationTokenCount",
+          "isObserving", "isReflecting", "isBufferingObservation", "isBufferingReflection", "lastBufferedAtTokens", "lastBufferedAtTime",
+          "observedTimezone", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)`,
+        [
+          sourceWriteSuccessor.successorRecordId,
+          successorRecord.lookupKey,
+          successorRecord.scope,
+          successorRecord.resourceId,
+          successorRecord.threadId,
+          '',
+          null,
+          'initial',
+          config,
+          0,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          0,
+          false,
+          false,
+          false,
+          false,
+          0,
+          null,
+          successorRecord.observedTimezone,
+          JSON.stringify({
+            [OBSERVATIONAL_MEMORY_SOURCE_WRITE_SUCCESSOR_METADATA_KEY]: {
+              predecessor: sourceWriteSuccessor.predecessor,
+            },
+          }),
+          now,
+          now,
+          now,
+          now,
+        ],
+      );
+      successorGuard = {
+        recordId: sourceWriteSuccessor.successorRecordId,
+        threadId: successorRecord.threadId,
+        resourceId: successorRecord.resourceId,
+      };
+    }
+
     return {
       clearedScopes: [
         ...(lookupKeys.has(resourceLookupKey) ? (['resource'] as const) : []),
@@ -4727,6 +5185,7 @@ export class MemoryPG extends MemoryStorage {
       ],
       clearedResourceWorkingMemory,
       clearedThreadMetadata,
+      ...(successorGuard ? { sourceWriteGuard: successorGuard } : {}),
     };
   }
 
@@ -4805,6 +5264,7 @@ export class MemoryPG extends MemoryStorage {
     try {
       return await this.#db.client.tx(t => this.retractObservationalMemoryInTransaction(t, input));
     } catch (error) {
+      if (error instanceof ObservationalMemorySourceWriteConflictError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'RETRACT_OBSERVATIONAL_MEMORY', 'FAILED'),

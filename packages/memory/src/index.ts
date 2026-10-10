@@ -40,6 +40,7 @@ import type {
   OutputProcessorOrWorkflow,
 } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
+import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
 import type {
   StorageListThreadsInput,
   StorageListThreadsOutput,
@@ -55,6 +56,7 @@ import type {
   ObservationalMemoryRecord,
   ObservationalMemoryRetractionReceipt,
   ObservationalMemoryWriteGuard,
+  ObservationalMemorySourceWriteGuard,
   BufferedObservationChunk,
   WorkingMemorySnapshotInput,
   KnowledgeStorage,
@@ -142,6 +144,7 @@ type MemoryObservationalMemoryOptions = Omit<ObservationalMemoryOptions, 'model'
   onDebugEvent?: ObservationalMemoryConfig['onDebugEvent'];
   hooks?: ObservationalMemoryConfig['hooks'];
   hookExecution?: ObservationalMemoryConfig['hookExecution'];
+  sourceWriteFencing?: ObservationalMemoryConfig['sourceWriteFencing'];
 };
 
 type MemoryOptions = Omit<MemoryConfigInternal, 'observationalMemory'> & {
@@ -513,6 +516,7 @@ export class Memory extends MastraMemory {
   private _omEngineInstance: ObservationalMemory | null | undefined;
   private _mastraInstance: Mastra | undefined;
   private _knowledgeSemanticIndex?: Promise<KnowledgeSemanticIndexCoordinator>;
+  private _sourceWriteFencingConfigurationReady = false;
 
   /**
    * Every vector cleanup that deleteThread or deleteMessages started in the background.
@@ -589,6 +593,42 @@ export class Memory extends MastraMemory {
   }
 
   public override getMergedThreadConfig(config?: MemoryConfigInternal): MemoryConfigInternal {
+    const requestedObservationalMemory = normalizeObservationalMemoryConfig(
+      config?.observationalMemory as boolean | MemoryObservationalMemoryOptions | undefined,
+    );
+    const configuredObservationalMemory = normalizeObservationalMemoryConfig(
+      this.threadConfig?.observationalMemory as boolean | MemoryObservationalMemoryOptions | undefined,
+    );
+    const requestedObservationalMemoryValue = config?.observationalMemory as
+      | boolean
+      | MemoryObservationalMemoryOptions
+      | undefined;
+    const weakensConfiguredSourceWriteFencing =
+      requestedObservationalMemoryValue === true ||
+      requestedObservationalMemoryValue === false ||
+      (typeof requestedObservationalMemoryValue === 'object' &&
+        requestedObservationalMemoryValue !== null &&
+        (requestedObservationalMemoryValue.enabled === false ||
+          (requestedObservationalMemoryValue.sourceWriteFencing !== undefined &&
+            requestedObservationalMemoryValue.sourceWriteFencing !== 'required')));
+    if (
+      this._sourceWriteFencingConfigurationReady &&
+      configuredObservationalMemory?.sourceWriteFencing === 'required' &&
+      weakensConfiguredSourceWriteFencing
+    ) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        "Observational memory sourceWriteFencing: 'required' cannot be disabled by a per-execution memory config.",
+      );
+    }
+    if (
+      this._sourceWriteFencingConfigurationReady &&
+      requestedObservationalMemory?.sourceWriteFencing === 'required' &&
+      configuredObservationalMemory?.sourceWriteFencing !== 'required'
+    ) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        "Observational memory sourceWriteFencing: 'required' must be configured on the Memory instance, not per execution.",
+      );
+    }
     const merged = super.getMergedThreadConfig(config);
     return this.applyManagedWorkingMemoryDefaults(this.applySubconsciousDefaults(merged));
   }
@@ -693,6 +733,8 @@ export class Memory extends MastraMemory {
         throw new Error('Subconscious semantic knowledge requires an embedder. Pass an `embedder` option to Memory.');
       }
     }
+
+    this._sourceWriteFencingConfigurationReady = true;
   }
 
   private async getKnowledgeStore(): Promise<KnowledgeStorage> {
@@ -1188,9 +1230,11 @@ export class Memory extends MastraMemory {
   async saveThread({
     thread,
     memoryConfig,
+    observationalMemorySourceWriteGuard,
   }: {
     thread: StorageThreadType;
     memoryConfig?: MemoryConfigInternal;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const config = this.getMergedThreadConfig(memoryConfig || {});
     const managedWorkingMemory = this.getManagedWorkingMemoryFromMetadata({
@@ -1220,17 +1264,24 @@ export class Memory extends MastraMemory {
                 mutation: { type: 'save', thread: threadForStorage },
                 value: managedWorkingMemory.workingMemory,
                 preparation,
+                observationalMemorySourceWriteGuard,
                 ...(config.workingMemory?.maxDataBytes === undefined
                   ? {}
                   : { maxDataBytes: config.workingMemory.maxDataBytes }),
               });
               return transitioned.thread;
             }
-            const savedThread = await memoryStore.saveThread({ thread: threadForStorage });
+            const savedThread = await memoryStore.saveThread({
+              thread: threadForStorage,
+              observationalMemorySourceWriteGuard,
+            });
             await this.writeObserverWorkingMemory({
               memoryStore,
               coordinates: { scope: 'resource', resourceId: thread.resourceId, threadId: thread.id },
               workingMemory: managedWorkingMemory.workingMemory,
+              ...(observationalMemorySourceWriteGuard
+                ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
+                : {}),
               ...(config.workingMemory?.maxDataBytes !== undefined
                 ? { maxDataBytes: config.workingMemory.maxDataBytes }
                 : {}),
@@ -1276,6 +1327,7 @@ export class Memory extends MastraMemory {
                 ? {}
                 : { maxDataBytes: config.workingMemory.maxDataBytes }),
             },
+            observationalMemorySourceWriteGuard,
           });
           return result.thread;
         }
@@ -1287,11 +1339,15 @@ export class Memory extends MastraMemory {
               existingThread?.metadata,
             ),
           },
+          observationalMemorySourceWriteGuard,
         });
         await this.writeObserverWorkingMemory({
           memoryStore,
           coordinates: { scope: 'thread', resourceId: thread.resourceId, threadId: thread.id },
           workingMemory: managedWorkingMemory.workingMemory,
+          ...(observationalMemorySourceWriteGuard
+            ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
+            : {}),
           ...(config.workingMemory?.maxDataBytes !== undefined
             ? { maxDataBytes: config.workingMemory.maxDataBytes }
             : {}),
@@ -1306,10 +1362,11 @@ export class Memory extends MastraMemory {
         const result = await memoryStore.mutateThreadWithWorkingMemory({
           mutation: { type: 'save', thread: threadForStorage },
           workingMemory: { type: 'require-ungoverned' },
+          observationalMemorySourceWriteGuard,
         });
         return result.thread;
       }
-      return memoryStore.saveThread({ thread: threadForStorage });
+      return memoryStore.saveThread({ thread: threadForStorage, observationalMemorySourceWriteGuard });
     });
   }
 
@@ -1325,11 +1382,13 @@ export class Memory extends MastraMemory {
     title,
     metadata,
     memoryConfig,
+    observationalMemorySourceWriteGuard,
   }: {
     id: string;
     title?: string;
     metadata?: Record<string, unknown>;
     memoryConfig?: MemoryConfigInternal;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const config = this.getMergedThreadConfig(memoryConfig || {});
     const managedWorkingMemory = this.getManagedWorkingMemoryFromMetadata({
@@ -1357,6 +1416,7 @@ export class Memory extends MastraMemory {
                     : { metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata) }),
                 },
                 workingMemory: { type: 'require-ungoverned' },
+                observationalMemorySourceWriteGuard,
               });
               return result.thread;
             }
@@ -1364,6 +1424,7 @@ export class Memory extends MastraMemory {
               id,
               title,
               metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata),
+              observationalMemorySourceWriteGuard,
             });
           }
           const threadForStorage = {
@@ -1392,17 +1453,24 @@ export class Memory extends MastraMemory {
                   },
                   value: managedWorkingMemory.workingMemory,
                   preparation,
+                  observationalMemorySourceWriteGuard,
                   ...(config.workingMemory?.maxDataBytes === undefined
                     ? {}
                     : { maxDataBytes: config.workingMemory.maxDataBytes }),
                 });
                 return transitioned.thread;
               }
-              const updatedThread = await memoryStore.saveThread({ thread: threadForStorage });
+              const updatedThread = await memoryStore.saveThread({
+                thread: threadForStorage,
+                observationalMemorySourceWriteGuard,
+              });
               await this.writeObserverWorkingMemory({
                 memoryStore,
                 coordinates: { scope: 'resource', resourceId, threadId: id },
                 workingMemory: managedWorkingMemory.workingMemory,
+                ...(observationalMemorySourceWriteGuard
+                  ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
+                  : {}),
                 ...(config.workingMemory?.maxDataBytes !== undefined
                   ? { maxDataBytes: config.workingMemory.maxDataBytes }
                   : {}),
@@ -1424,10 +1492,11 @@ export class Memory extends MastraMemory {
                   : { metadata: this.stripManagedWorkingMemoryFromThreadMetadata(metadata) }),
               },
               workingMemory: { type: 'require-ungoverned' },
+              observationalMemorySourceWriteGuard,
             });
             return result.thread;
           }
-          return memoryStore.saveThread({ thread: threadForStorage });
+          return memoryStore.saveThread({ thread: threadForStorage, observationalMemorySourceWriteGuard });
         });
       return managedWorkingMemory
         ? this.withResourceMetadataOperationMutex(updateResourceScopedThread)
@@ -1460,6 +1529,7 @@ export class Memory extends MastraMemory {
                 ? {}
                 : { maxDataBytes: config.workingMemory.maxDataBytes }),
             },
+            observationalMemorySourceWriteGuard,
           });
           return result.thread;
         }
@@ -1467,11 +1537,15 @@ export class Memory extends MastraMemory {
           id,
           title,
           metadata: this.prepareThreadMetadataForManagedWorkingMemory(metadata ?? {}, existingThread?.metadata),
+          observationalMemorySourceWriteGuard,
         });
         await this.writeObserverWorkingMemory({
           memoryStore,
           coordinates: { scope: 'thread', resourceId: updatedThread.resourceId, threadId: id },
           workingMemory: managedWorkingMemory.workingMemory,
+          ...(observationalMemorySourceWriteGuard
+            ? { observationalMemoryGuard: observationalMemorySourceWriteGuard }
+            : {}),
           ...(config.workingMemory?.maxDataBytes !== undefined
             ? { maxDataBytes: config.workingMemory.maxDataBytes }
             : {}),
@@ -1485,6 +1559,7 @@ export class Memory extends MastraMemory {
       id,
       title,
       metadata,
+      observationalMemorySourceWriteGuard,
     });
   }
 
@@ -2317,10 +2392,12 @@ ${workingMemory}`;
     messages,
     memoryConfig,
     observabilityContext,
+    observationalMemorySourceWriteGuard,
   }: {
     messages: MastraDBMessage[];
     memoryConfig?: MemoryConfig | undefined;
     observabilityContext?: Partial<ObservabilityContext>;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{ messages: MastraDBMessage[]; usage?: { tokens: number } }> {
     const span = this.createMemorySpan('save', observabilityContext, undefined, {
       messageCount: messages.length,
@@ -2338,6 +2415,12 @@ ${workingMemory}`;
         .filter((m): m is MastraDBMessage => Boolean(m));
 
       const config = this.getMergedThreadConfig(memoryConfig);
+      const omConfig = normalizeObservationalMemoryConfig(config.observationalMemory);
+      if (omConfig?.sourceWriteFencing === 'required' && !observationalMemorySourceWriteGuard) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'Observational memory source write fencing is required but no captured record guard was provided.',
+        );
+      }
 
       // Convert messages to MastraDBMessage format if needed
       const dbMessages = new MessageList({
@@ -2347,8 +2430,14 @@ ${workingMemory}`;
         .get.all.db();
 
       const memoryStore = await this.getMemoryStore();
+      if (omConfig?.sourceWriteFencing === 'required' && !memoryStore.supportsObservationalMemorySourceWriteGuards) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'Observational memory source write fencing is required but the storage adapter does not support it.',
+        );
+      }
       const result = await memoryStore.saveMessages({
         messages: dbMessages,
+        ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
       });
 
       let totalTokens = 0;
@@ -2716,6 +2805,7 @@ ${workingMemory}`;
     resourceId?: string;
     memoryConfig?: MemoryConfigInternal;
     runState?: MemoryRunState;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{
     /** Fully-formed system message (observations + instructions + working memory), or undefined if none. */
     systemMessage: string | undefined;
@@ -2730,9 +2820,20 @@ ${workingMemory}`;
     /** Formatted context blocks from other threads (resource scope only). */
     otherThreadsContext: string | undefined;
   }> {
-    const { threadId, resourceId, memoryConfig, runState } = opts;
+    const { threadId, resourceId, memoryConfig, runState, observationalMemorySourceWriteGuard } = opts;
     const config = this.getMergedThreadConfig(memoryConfig);
+    const omConfig = normalizeObservationalMemoryConfig(config.observationalMemory);
+    if (omConfig?.sourceWriteFencing === 'required' && !observationalMemorySourceWriteGuard) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but no captured record guard was provided.',
+      );
+    }
     const memoryStore = await this.getMemoryStore();
+    if (omConfig?.sourceWriteFencing === 'required' && !memoryStore.supportsObservationalMemorySourceWriteGuards) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the storage adapter does not support it.',
+      );
+    }
 
     // Build system message parts
     const systemParts: string[] = [];
@@ -2744,8 +2845,13 @@ ${workingMemory}`;
     let otherThreadsContext: string | undefined;
 
     const omEngine = await this.omEngine;
+    if (omConfig?.sourceWriteFencing === 'required' && !omEngine) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the native OM engine is unavailable.',
+      );
+    }
     if (omEngine) {
-      const loadOmRecord = () => omEngine.getRecord(threadId, resourceId);
+      const loadOmRecord = () => omEngine.getRecord(threadId, resourceId, observationalMemorySourceWriteGuard);
       omRecord = runState
         ? await runState.load(`observational-memory:record:${threadId}:${resourceId ?? ''}`, loadOmRecord)
         : await loadOmRecord();
@@ -2768,6 +2874,7 @@ ${workingMemory}`;
           resourceId,
           record: omRecord,
           unobservedContextBlocks: otherThreadsContext,
+          sourceWriteGuard: observationalMemorySourceWriteGuard,
         });
         if (obsSystemMessage) {
           systemParts.push(obsSystemMessage);
@@ -2920,14 +3027,56 @@ ${workingMemory}`;
    * Raw message upsert — persist messages to storage without embedding or working memory processing.
    * Used by the processor to save sealed messages before firing a background buffer operation.
    */
-  async persistMessages(messages: MastraDBMessage[]): Promise<void> {
+  async persistMessages(
+    messages: MastraDBMessage[],
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard,
+  ): Promise<void> {
     if (messages.length === 0) return;
 
     const persistableMessages = messages.filter(m => m.role !== 'system' && !isTransientSignalMessage(m));
     if (persistableMessages.length === 0) return;
 
+    const omConfig = normalizeObservationalMemoryConfig(this.threadConfig.observationalMemory);
+    if (omConfig?.sourceWriteFencing === 'required') {
+      if (!observationalMemorySourceWriteGuard) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'Observational memory source write fencing is required but no captured record guard was provided.',
+        );
+      }
+    }
     const memoryStore = await this.getMemoryStore();
-    await memoryStore.saveMessages({ messages: persistableMessages });
+    if (omConfig?.sourceWriteFencing === 'required') {
+      if (!memoryStore.supportsObservationalMemorySourceWriteGuards) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'Observational memory source write fencing is required but the storage adapter does not support it.',
+        );
+      }
+    }
+    await memoryStore.saveMessages({
+      messages: persistableMessages,
+      observationalMemorySourceWriteGuard,
+    });
+  }
+
+  /**
+   * Prepare the per-execution OM source-write fence before authoritative
+   * admission. The returned record identity must be serialized with the
+   * execution and reused for every source or marker write in that execution.
+   */
+  override async prepareObservationalMemorySourceWriteGuard(
+    threadId: string,
+    resourceId?: string,
+  ): Promise<ObservationalMemorySourceWriteGuard | undefined> {
+    const omConfig = normalizeObservationalMemoryConfig(this.threadConfig.observationalMemory);
+    if (omConfig?.sourceWriteFencing !== 'required') return undefined;
+    const om = await this.omEngine;
+    if (!om || om.sourceWriteFencing !== 'required') {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the native OM engine is unavailable.',
+      );
+    }
+    const record = await om.getOrCreateRecord(threadId, resourceId);
+    return om.getObservationalMemorySourceWriteGuard(record);
   }
 
   /**
@@ -2940,6 +3089,12 @@ ${workingMemory}`;
 
     const memoryStore = await this.storage.getStore('memory');
     if (!memoryStore || !memoryStore.supportsObservationalMemory) return null;
+
+    if (omConfig.sourceWriteFencing === 'required' && !memoryStore.supportsObservationalMemorySourceWriteGuards) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the storage adapter does not support it.',
+      );
+    }
 
     const coreSupportsOM = coreFeatures.has('observationalMemory');
     if (!coreSupportsOM) {
@@ -2993,6 +3148,7 @@ ${workingMemory}`;
           : undefined,
       scope: omConfig.scope,
       retrieval: omConfig.retrieval,
+      sourceWriteFencing: omConfig.sourceWriteFencing,
       toolCallFilter: omConfig.toolCallFilter,
       activateAfterIdle: omConfig.activateAfterIdle,
       activateOnProviderChange: omConfig.activateOnProviderChange,

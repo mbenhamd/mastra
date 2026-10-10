@@ -28,6 +28,7 @@ import type {
 } from '../../processors';
 import type { ProcessorRunner, ProcessorState } from '../../processors/runner';
 import type { RequestContext, VersionOverrides } from '../../request-context';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage';
 import type { ChunkType } from '../../stream/types';
 import type { ToolPayloadTransformMetadata } from '../../tools/payload-transform';
 import type {
@@ -212,6 +213,8 @@ export interface SerializableToolHookPolicy {
  * Options for durable agent execution (serializable subset)
  */
 export interface SerializableDurableOptions {
+  /** Captured OM source-write fence carried with the prepared execution. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   /** Maximum number of ordinary agentic loop iterations */
   maxSteps?: number;
   /** Framework-owned calls available only after the ordinary iteration ceiling. */

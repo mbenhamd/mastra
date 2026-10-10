@@ -10,6 +10,7 @@
  */
 
 import type { LogicalMessageIdentity } from '../../../agent/message-list';
+import type { ObservationalMemorySourceWriteGuard } from '../../types';
 
 // ---------------------------------------------------------------------------
 // SessionRecord
@@ -108,6 +109,8 @@ export interface QueuedItem {
   content: string;
   attachments: PersistedAttachment[];
   requestContext?: PersistedRequestContextInput;
+  /** Captured native OM record identity; retries must reuse this exact value. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   /** Validated native input/response identity captured at queue admission. */
   logicalMessageIdentity?: LogicalMessageIdentity;
   model?: string;
@@ -223,6 +226,8 @@ export interface PendingResume {
    * projections alongside `runtimeDependencies`.
    */
   requestContext?: PersistedRequestContextInput;
+  /** Captured native OM record identity retained across suspend/resume recovery. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   /**
    * Immutable model-visible tool-name ceiling captured from a replacement
    * toolset turn. Reapplied on resume so processors cannot expand the surface.
