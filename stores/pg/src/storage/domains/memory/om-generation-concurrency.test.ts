@@ -134,6 +134,14 @@ describe('PostgreSQL observational memory generation creation under concurrency'
     await memories[0]!.insertObservationalMemoryRecord(duplicate(first, new Date('2026-01-01T00:00:00Z')));
 
     expect((await memories[0]!.getObservationalMemory(null, resourceId))?.id).toBe(first);
+    // A source-write guard bound to either duplicate resolves the same active record.
+    await expect(
+      memories[1]!.getObservationalMemoryForSourceWrite({
+        threadId: 'any-thread',
+        resourceId,
+        sourceWriteGuard: { recordId: second, threadId: null, resourceId },
+      }),
+    ).resolves.toMatchObject({ id: first });
 
     // Writing to the other duplicate must not change which record is active.
     await memories[0]!.updateActiveObservations({

@@ -4180,20 +4180,14 @@ export class MemoryPG extends MemoryStorage {
         // revoked guard from racing into replacement initialization.
         await this.lockThreadLifecycles(t, [threadId]);
         await this.lockObservationalMemoryResource(t, resourceId);
-        const rows = await t.manyOrNone<any>(
-          `SELECT * FROM ${tableName} WHERE "lookupKey" = $1 ORDER BY "generationCount" DESC FOR UPDATE`,
-          [this.getOMKey(sourceWriteGuard.threadId, sourceWriteGuard.resourceId)],
+        await this.assertObservationalMemorySourceRecordExists(t, sourceWriteGuard);
+        // Same stable ordering as every other active-record read, so duplicate
+        // generations resolve to the record later guarded writes validate.
+        const active = await this.#getLatestOMRow(
+          t,
+          tableName,
+          this.getOMKey(sourceWriteGuard.threadId, sourceWriteGuard.resourceId),
         );
-        const captured = rows.find(
-          row =>
-            row.id === sourceWriteGuard.recordId &&
-            row.resourceId === sourceWriteGuard.resourceId &&
-            row.threadId === sourceWriteGuard.threadId,
-        );
-        if (!captured) {
-          throw new ObservationalMemorySourceWriteConflictError();
-        }
-        const active = rows[0];
         if (!active) {
           throw new ObservationalMemorySourceWriteConflictError();
         }
