@@ -452,3 +452,38 @@ describe('deepMergeWorkingMemory undefined padding', () => {
     expect(merged).toEqual({ people: ['Alice', 'Bob'], work: { company: 'TechStartup Inc' } });
   });
 });
+
+describe('updateWorkingMemoryTool source-write fence', () => {
+  it('does not recreate an erased thread from a delayed tool call', async () => {
+    const { InMemoryStore } = await import('@mastra/core/storage');
+    const { RequestContext } = await import('@mastra/core/request-context');
+    const { Memory } = await import('../index');
+    const storage = new InMemoryStore();
+    const memory = new Memory({ storage, options: { workingMemory: { enabled: true, scope: 'thread' } } });
+    const store = (await storage.getStore('memory'))!;
+    const threadId = 'wm-tool-erased-thread';
+    const resourceId = 'wm-tool-resource';
+    const record = await store.initializeObservationalMemory({ threadId, resourceId, scope: 'thread', config: {} });
+    const requestContext = new RequestContext();
+    requestContext.set('MastraMemory', {
+      thread: { id: threadId },
+      resourceId,
+      observationalMemorySourceWriteGuard: { recordId: record.id, threadId, resourceId },
+    });
+    // Authoritative erasure lands before the delayed tool call executes.
+    await store.retractObservationalMemory({ resourceId, threadId });
+
+    const tool = updateWorkingMemoryTool({ workingMemory: { enabled: true, scope: 'thread' } } as any);
+    await expect(
+      tool.execute!(
+        { memory: '# Notes\n- stale' } as any,
+        {
+          agent: { threadId, resourceId },
+          memory,
+          requestContext,
+        } as any,
+      ),
+    ).rejects.toThrow(/source write guard/i);
+    await expect(store.getThreadById({ threadId })).resolves.toBeNull();
+  });
+});
