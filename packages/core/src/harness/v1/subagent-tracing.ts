@@ -44,3 +44,32 @@ export function startDelegatedSubagentSpan(parent: TracingContext | undefined, a
     detachedLifetime: true,
   });
 }
+
+/**
+ * How a live delegation drive settled its delegation:
+ * - `settled`: the child closed and the durable plan task was reconciled.
+ * - `close_failed`: the child could not be closed; reconciliation is retried.
+ * - `not_reconciled`: the fenced plan-task reconciliation did not commit.
+ * - `error`: the drive threw before settling.
+ */
+export type DelegationDriveSettlement = 'settled' | 'close_failed' | 'not_reconciled' | 'error';
+
+/**
+ * End a delegation span once its drive has settled. The span records the
+ * child's outcome and the settlement; an unsettled delegation ends as an
+ * error, so a delegation the drive could not settle is visible in the trace.
+ */
+export function endDelegatedSubagentSpan(
+  span: AnySpan | undefined,
+  outcome: string,
+  settlement: DelegationDriveSettlement,
+): void {
+  if (span === undefined) return;
+  const output = { outcome, settlement };
+  if (settlement === 'settled') {
+    span.end({ output });
+    return;
+  }
+  span.update({ output });
+  span.error({ error: new Error(`delegation was not settled: ${settlement}`), endSpan: true });
+}

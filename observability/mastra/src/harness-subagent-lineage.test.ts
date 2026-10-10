@@ -290,15 +290,18 @@ describe('Harness subagent provider lineage (real exporter)', () => {
     }
   });
 
-  it('joins a durable delegation to the parent trace and its trace settings without tying it to the parent turn', async () => {
-    const requestId = 'parent-turn-request-5258-delegated';
+  /**
+   * A parent turn that plans one task and durably delegates it to a child whose
+   * provider call waits for `releaseChild()`, so the child generates only after
+   * the parent turn has finished.
+   */
+  async function startDelegation(requestId: string) {
     const exporter = new TestExporter();
     const createdTaskIds: string[] = [];
     let releaseChild!: () => void;
     const childReleased = new Promise<void>(resolve => {
       releaseChild = resolve;
     });
-
     const streamOf = (chunks: unknown[]) => ({
       rawCall: { rawPrompt: null, rawSettings: {} },
       warnings: [],
@@ -347,8 +350,6 @@ describe('Harness subagent provider lineage (real exporter)', () => {
     const childModel = new MockLanguageModelV2({
       provider: 'child-provider',
       modelId: 'child-model',
-      // The delegated child produces its generation only after the parent
-      // turn has finished.
       doStream: async options => {
         await childReleased;
         return childProvider.doStream(options as never);
@@ -398,15 +399,37 @@ describe('Harness subagent provider lineage (real exporter)', () => {
         },
       },
     });
+    const session = await harness.session({ resourceId: 'delegation-trace-user', threadId: { fresh: true } });
+    session.subscribe(event => {
+      const output = (event as { output?: { taskId?: string } }).output;
+      if (event.type === 'tool_end' && (event as { toolName?: string }).toolName === 'task_add' && output?.taskId) {
+        createdTaskIds.push(output.taskId);
+      }
+    });
+    return { exporter, harness, session, childProvider, releaseChild };
+  }
 
+  /**
+   * The detached delegation drive is not part of `session.waitForIdle()` (the
+   * parent turn does not wait for it), so wait for the drive's own end
+   * marker: the delegation span ends only after settlement.
+   */
+  async function endedDelegationSpan(exporter: TestExporter) {
+    const deadline = Date.now() + 3_000;
+    for (;;) {
+      const delegation = exporter
+        .getSpansByType(SpanType.GENERIC)
+        .find(span => span.name === "subagent delegation: 'worker'" && span.endTime !== undefined);
+      if (delegation !== undefined) return delegation;
+      if (Date.now() > deadline) throw new Error('the delegation span did not end');
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  }
+
+  it('joins a durable delegation to the parent trace and its trace settings without tying it to the parent turn', async () => {
+    const requestId = 'parent-turn-request-5258-delegated';
+    const { exporter, harness, session, childProvider, releaseChild } = await startDelegation(requestId);
     try {
-      const session = await harness.session({ resourceId: 'delegation-trace-user', threadId: { fresh: true } });
-      session.subscribe(event => {
-        const output = (event as { output?: { taskId?: string } }).output;
-        if (event.type === 'tool_end' && (event as { toolName?: string }).toolName === 'task_add' && output?.taskId) {
-          createdTaskIds.push(output.taskId);
-        }
-      });
       const result = await session.message({ content: 'Delegate the work.' });
       expect(result.text).toBe('Delegated.');
       const rootRun = exporter.getSpansByType(SpanType.AGENT_RUN).find(span => span.entityId === 'root-agent');
@@ -414,29 +437,21 @@ describe('Harness subagent provider lineage (real exporter)', () => {
       expect(childProvider.doStream).not.toHaveBeenCalled();
 
       releaseChild();
-      const deadline = Date.now() + 3_000;
-      while (
-        !exporter.getSpansByType(SpanType.MODEL_GENERATION).some(span => span.attributes?.model === 'child-model')
-      ) {
-        if (Date.now() > deadline) throw new Error('delegated child generation was not exported');
-        await new Promise(resolve => setTimeout(resolve, 20));
-      }
+      const delegation = await endedDelegationSpan(exporter);
       await settle(exporter);
 
       const delegateCall = exporter
         .getSpansByType(SpanType.TOOL_CALL)
         .find(span => span.entityName === 'task_delegate' || span.name.includes('task_delegate'));
-      const delegation = exporter
-        .getSpansByType(SpanType.GENERIC)
-        .find(span => span.name === "subagent delegation: 'worker'");
       const childRun = exporter.getSpansByType(SpanType.AGENT_RUN).find(span => span.entityId === 'child-agent');
       expect(delegateCall).toBeDefined();
-      expect(delegation).toBeDefined();
       expect(childRun).toBeDefined();
-      expect(delegation!.traceId).toBe(rootRun!.traceId);
-      expect(delegation!.parentSpanId).toBe(delegateCall!.id);
+      expect(delegation.traceId).toBe(rootRun!.traceId);
+      expect(delegation.parentSpanId).toBe(delegateCall!.id);
+      expect(delegation.output).toEqual({ outcome: 'completed', settlement: 'settled' });
+      expect(delegation.errorInfo).toBeUndefined();
       expect(childRun!.traceId).toBe(rootRun!.traceId);
-      expect(childRun!.parentSpanId).toBe(delegation!.id);
+      expect(childRun!.parentSpanId).toBe(delegation.id);
       expect(childRun!.metadata?.runId).toBeDefined();
       expect(childRun!.metadata?.runId).not.toBe(rootRun!.metadata?.runId);
 
@@ -452,6 +467,28 @@ describe('Harness subagent provider lineage (real exporter)', () => {
       expect(exporter.getIncompleteSpans()).toHaveLength(0);
     } finally {
       releaseChild();
+      await harness.shutdown();
+    }
+  });
+
+  it('ends the delegation span as an error when the drive cannot settle the delegation', async () => {
+    const { exporter, harness, session, releaseChild } = await startDelegation('parent-turn-request-5258-unsettled');
+    // The child completes, but the fenced plan-task reconciliation does not
+    // commit, so the delegation stays unsettled for restart reconciliation.
+    const reconcile = vi
+      .spyOn(session as unknown as { _reconcileDelegatedTask: () => Promise<boolean> }, '_reconcileDelegatedTask')
+      .mockResolvedValue(false);
+    try {
+      await session.message({ content: 'Delegate the work.' });
+      releaseChild();
+      const delegation = await endedDelegationSpan(exporter);
+
+      expect(reconcile).toHaveBeenCalled();
+      expect(delegation.output).toEqual({ outcome: 'completed', settlement: 'not_reconciled' });
+      expect(delegation.errorInfo?.message).toBe('delegation was not settled: not_reconciled');
+    } finally {
+      releaseChild();
+      reconcile.mockRestore();
       await harness.shutdown();
     }
   });

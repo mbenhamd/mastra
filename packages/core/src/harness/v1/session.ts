@@ -250,7 +250,8 @@ import {
 } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
-import { startDelegatedSubagentSpan } from './subagent-tracing';
+import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
+import type { DelegationDriveSettlement } from './subagent-tracing';
 import type {
   HarnessSubagentDirectAnswer,
   HarnessSubagentResultSummary,
@@ -21362,9 +21363,10 @@ export class Session {
     });
     // The delegation outlives the delegating tool call, so its child runs
     // attach to a detached-lifetime delegation span in the parent trace
-    // (subagent-tracing.ts). Started immediately before the try so the
-    // finally always ends it. A restart re-drive has no live parent span; its
-    // child runs start their own trace.
+    // (subagent-tracing.ts). It covers the whole drive through settlement and
+    // is started immediately before the try blocks whose last finally ends it.
+    // A restart re-drive has no live parent span; its child runs start their
+    // own trace.
     const delegationSpan = startDelegatedSubagentSpan(parentTracingContext, agentType);
     child._subagentTracingContext = delegationSpan !== undefined ? { currentSpan: delegationSpan } : undefined;
     try {
@@ -21441,13 +21443,15 @@ export class Session {
       unsubProgress();
       this._activeSubagents.delete(`delegate:${child.id}`);
       child._subagentTracingContext = undefined;
-      delegationSpan?.end({ output: { outcome } });
     }
-    const summary = summarizeHarnessSubagentResult(rawResult, {
-      isError: outcome !== 'completed',
-      ...(publicError !== undefined ? { error: publicError } : {}),
-    });
+    // How the drive settled the delegation, recorded on the delegation span.
+    // Anything but `settled` leaves the durable task to restart reconciliation.
+    let settlement: DelegationDriveSettlement = 'error';
     try {
+      const summary = summarizeHarnessSubagentResult(rawResult, {
+        isError: outcome !== 'completed',
+        ...(publicError !== undefined ? { error: publicError } : {}),
+      });
       // Close the terminal child BEFORE clearing its durable plan link. If the
       // process dies after close, recovery can still settle from signal evidence;
       // if close fails, retaining the link keeps ownership discoverable and
@@ -21455,11 +21459,16 @@ export class Session {
       try {
         await child.close();
       } catch {
+        settlement = 'close_failed';
         this._scheduleDelegationReconcileRetry(0);
         return;
       }
       const reconciled = await this._reconcileDelegatedTask(taskId, child.id, outcome, summary);
-      if (!reconciled) return;
+      if (!reconciled) {
+        settlement = 'not_reconciled';
+        return;
+      }
+      settlement = 'settled';
       // A successful subagent_end is a durable settlement notification, not a
       // provider-stop notification. Emit only after child closure and the
       // fenced plan write both committed so reconnecting UI cannot show a
@@ -21477,6 +21486,7 @@ export class Session {
     } finally {
       this._delegationDriverClaims.delete(child.id);
       this._internalReleaseSubagentExecution();
+      endDelegatedSubagentSpan(delegationSpan, outcome, settlement);
     }
   }
 
