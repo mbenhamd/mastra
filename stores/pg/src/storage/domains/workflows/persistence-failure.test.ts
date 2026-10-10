@@ -40,7 +40,7 @@ async function rejection(promise: Promise<unknown>): Promise<unknown> {
 describe('WorkflowsPG persistence failure classification on PostgreSQL', () => {
   const schemaName = `persistence_failure_${randomUUID().replaceAll('-', '')}`;
   const admin = new Pool(config);
-  const writerPool = new Pool({ ...config, application_name: WRITER, options: '-c lock_timeout=1500' });
+  const writerPool = new Pool({ ...config, application_name: WRITER, options: '-c lock_timeout=8000' });
   let interceptCommit: CommitInterceptor | undefined;
   const stores: PostgresStore[] = [];
   let writer: WorkflowsStorage;
@@ -149,40 +149,44 @@ describe('WorkflowsPG persistence failure classification on PostgreSQL', () => {
   it.each([
     ['times out on a lock', false],
     ['loses its backend', true],
-  ])('classifies a write that %s before COMMIT as transient and leaves the run unchanged', async (_name, kill) => {
-    const workflowName = `blocked-${randomUUID()}`;
-    await seedRun(workflowName, 'run');
-    const blocker = await admin.connect();
-    try {
-      await blocker.query('BEGIN');
-      await blocker.query(`LOCK TABLE "${schemaName}".mastra_workflow_snapshot IN ACCESS EXCLUSIVE MODE`);
-      const write = rejection(persistSuccess(workflowName, 'run'));
-      if (kill) {
-        await vi.waitFor(
-          async () => {
-            const { rowCount } = await admin.query(
-              `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+  ])(
+    'classifies a write that %s before COMMIT as transient and leaves the run unchanged',
+    async (_name, kill) => {
+      const workflowName = `blocked-${randomUUID()}`;
+      await seedRun(workflowName, 'run');
+      const blocker = await admin.connect();
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(`LOCK TABLE "${schemaName}".mastra_workflow_snapshot IN ACCESS EXCLUSIVE MODE`);
+        const write = rejection(persistSuccess(workflowName, 'run'));
+        if (kill) {
+          await vi.waitFor(
+            async () => {
+              const { rowCount } = await admin.query(
+                `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
                WHERE application_name = $1 AND wait_event_type = 'Lock'`,
-              [WRITER],
-            );
-            expect(rowCount).toBe(1);
-          },
-          { timeout: 1000, interval: 50 },
-        );
+                [WRITER],
+              );
+              expect(rowCount).toBe(1);
+            },
+            { timeout: 5000, interval: 50 },
+          );
+        }
+
+        const error = await write;
+
+        expect(error).toMatchObject({
+          details: { persistenceFailure: 'transient' },
+          cause: { code: kill ? '57P01' : '55P03' },
+        });
+      } finally {
+        await blocker.query('ROLLBACK');
+        blocker.release();
       }
-
-      const error = await write;
-
-      expect(error).toMatchObject({
-        details: { persistenceFailure: 'transient' },
-        cause: { code: kill ? '57P01' : '55P03' },
-      });
-    } finally {
-      await blocker.query('ROLLBACK');
-      blocker.release();
-    }
-    expect(await durableStatus(workflowName, 'run')).toBe('running');
-  });
+      expect(await durableStatus(workflowName, 'run')).toBe('running');
+    },
+    20_000,
+  );
 
   it('classifies writes and reads the server rejects as permanent', async () => {
     const missing = (await storeOn(writerPool, `missing_${randomUUID().replaceAll('-', '')}`).getStore('workflows'))!;

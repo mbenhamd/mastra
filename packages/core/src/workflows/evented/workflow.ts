@@ -697,7 +697,8 @@ function createStepFromTool<TStepInput, TSuspend, TResume, TStepOutput>(
   agentOrToolOptions?: Record<string, unknown>,
 ): Step<string, any, TStepInput, TStepOutput, TResume, TSuspend, DefaultEngineType> {
   const toolOpts = agentOrToolOptions as
-    { retries?: number; scorers?: DynamicArgument<MastraScorers>; metadata?: StepMetadata } | undefined;
+    | { retries?: number; scorers?: DynamicArgument<MastraScorers>; metadata?: StepMetadata }
+    | undefined;
   if (!params.inputSchema || !params.outputSchema) {
     throw new Error('Tool must have input and output schemas defined');
   }

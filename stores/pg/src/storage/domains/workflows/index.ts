@@ -1807,11 +1807,18 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.bumpWorkflowParentRevision(t, input.workflowName, input.runId, parentRevision);
   }
 
-  // Terminalization and snapshot-handoff operations are classified as writes:
-  // several lookups (for example GET_WORKFLOW_TERMINAL_PARENT_CONTEXT) latch
-  // state inside their transaction, and a read wrongly treated as a write can
-  // only be reported commit_unknown, never falsely as not applied.
-  private terminalizationError(operation: string, workflowName: string, runId: string, error: unknown): never {
+  // Terminalization and snapshot-handoff operations are classified as writes
+  // unless the caller passes `{ write: false }` for a pure read: several
+  // lookups (for example GET_WORKFLOW_TERMINAL_PARENT_CONTEXT) latch state
+  // inside their transaction, and a read wrongly treated as a write can only
+  // be reported commit_unknown, never falsely as not applied.
+  private terminalizationError(
+    operation: string,
+    workflowName: string,
+    runId: string,
+    error: unknown,
+    { write }: { write: boolean } = { write: true },
+  ): never {
     if (error instanceof TypeError || error instanceof RangeError) throw error;
     throw new MastraError(
       {
@@ -1821,7 +1828,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         details: {
           workflowName,
           runId,
-          persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
+          persistenceFailure: classifyPgPersistenceFailure(error, { write }),
         },
       },
       error,
@@ -1833,13 +1840,14 @@ export class WorkflowsPG extends WorkflowsStorage {
     workflowName: string | undefined,
     runId: string | undefined,
     error: unknown,
+    { write }: { write: boolean } = { write: true },
   ): Error {
     // The fence error must reach callers as its own instanceof-checkable type;
     // validation TypeErrors/RangeErrors likewise keep their identity.
     if (error instanceof WorkflowSnapshotHandoffFenceError) return error;
     if (error instanceof TypeError || error instanceof RangeError) return error;
     const details: Record<string, string> = {
-      persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
+      persistenceFailure: classifyPgPersistenceFailure(error, { write }),
     };
     if (workflowName !== undefined) details.workflowName = workflowName;
     if (runId !== undefined) details.runId = runId;
@@ -2009,6 +2017,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         input.workflowName,
         input.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2082,7 +2091,9 @@ export class WorkflowsPG extends WorkflowsStorage {
     try {
       return await this.getTerminalizationObservation(operation.workflowName, operation.runId);
     } catch (error) {
-      return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', operation.workflowName, operation.runId, error);
+      return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', operation.workflowName, operation.runId, error, {
+        write: false,
+      });
     }
   }
 
@@ -2169,6 +2180,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2428,14 +2440,14 @@ export class WorkflowsPG extends WorkflowsStorage {
           return snapshotCapture;
         }
         const recoveryCapture:
-          { status: 'captured'; value: WorkflowTerminalRecoveryEnvelopeV1 } | { status: 'invalid_recovery_envelope' } =
-          (() => {
-            try {
-              return { status: 'captured', value: materializeWorkflowTerminalRecoveryEnvelope(input.recoveryEnvelope) };
-            } catch {
-              return { status: 'invalid_recovery_envelope' };
-            }
-          })();
+          | { status: 'captured'; value: WorkflowTerminalRecoveryEnvelopeV1 }
+          | { status: 'invalid_recovery_envelope' } = (() => {
+          try {
+            return { status: 'captured', value: materializeWorkflowTerminalRecoveryEnvelope(input.recoveryEnvelope) };
+          } catch {
+            return { status: 'invalid_recovery_envelope' };
+          }
+        })();
         if (recoveryCapture.status === 'invalid_recovery_envelope') {
           return recoveryCapture;
         }
@@ -5552,7 +5564,9 @@ export class WorkflowsPG extends WorkflowsStorage {
       );
       decoded = rows.map(row => this.decodeWorkflowSnapshotHandoff(row));
     } catch (error) {
-      throw this.snapshotHandoffError('LIST_WORKFLOW_SNAPSHOT_HANDOFFS', input.workflowName, undefined, error);
+      throw this.snapshotHandoffError('LIST_WORKFLOW_SNAPSHOT_HANDOFFS', input.workflowName, undefined, error, {
+        write: false,
+      });
     }
     const page = decoded.slice(0, limit);
     const hasMore = decoded.length > limit;

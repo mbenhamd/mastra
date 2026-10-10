@@ -12,9 +12,17 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../error';
  * - `WORKFLOW_RUN_NOT_SUSPENDED`: resume() loaded a snapshot that is no longer
  *   suspended, typically because another caller already resumed it. A lost
  *   resume compare-and-set keeps its own `WORKFLOW_RESUME_ALREADY_CLAIMED`.
+ * - `WORKFLOW_RUN_STILL_RUNNING`: timeTravel() found a run that is still
+ *   running.
+ *
+ * The stored status is reported as `details.actualStatus`; `details.status`
+ * is not used because server error handling reads it as an HTTP status.
  */
 export type WorkflowLifecycleErrorId =
-  'WORKFLOW_RUN_NOT_ACTIVE' | 'WORKFLOW_SNAPSHOT_NOT_FOUND' | 'WORKFLOW_RUN_NOT_SUSPENDED';
+  | 'WORKFLOW_RUN_NOT_ACTIVE'
+  | 'WORKFLOW_SNAPSHOT_NOT_FOUND'
+  | 'WORKFLOW_RUN_NOT_SUSPENDED'
+  | 'WORKFLOW_RUN_STILL_RUNNING';
 
 export function workflowRunNotActiveError({
   workflowId,
@@ -33,7 +41,7 @@ export function workflowRunNotActiveError({
     details: {
       ...(workflowId !== undefined ? { workflowId } : {}),
       ...(runId !== undefined ? { runId } : {}),
-      status: status ?? 'unknown',
+      actualStatus: status ?? 'unknown',
     },
   });
 }
@@ -70,6 +78,22 @@ export function workflowRunNotSuspendedError({
     domain: ErrorDomain.MASTRA_WORKFLOW,
     category: ErrorCategory.USER,
     text: 'This workflow run was not suspended',
-    details: { workflowId, runId, status: status ?? 'unknown' },
+    details: { workflowId, runId, actualStatus: status ?? 'unknown' },
+  });
+}
+
+export function workflowRunStillRunningError({
+  workflowId,
+  runId,
+}: {
+  workflowId: string;
+  runId: string;
+}): MastraError {
+  return new MastraError({
+    id: 'WORKFLOW_RUN_STILL_RUNNING' satisfies WorkflowLifecycleErrorId,
+    domain: ErrorDomain.MASTRA_WORKFLOW,
+    category: ErrorCategory.USER,
+    text: 'This workflow run is still running, cannot time travel',
+    details: { workflowId, runId, actualStatus: 'running' },
   });
 }

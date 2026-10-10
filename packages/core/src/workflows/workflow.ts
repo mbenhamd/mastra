@@ -85,7 +85,11 @@ import { DefaultExecutionEngine } from './default';
 import { getAdmittedJsonSchema } from './dynamic/admitted-schema-source';
 import type { ClassifierStepOutput } from './entry-executors';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
-import { workflowRunNotSuspendedError, workflowSnapshotNotFoundError } from './lifecycle-errors';
+import {
+  workflowRunNotSuspendedError,
+  workflowRunStillRunningError,
+  workflowSnapshotNotFoundError,
+} from './lifecycle-errors';
 import {
   createWorkflowExecutionGeneration,
   getWorkflowLifecycleTopic,
@@ -6525,7 +6529,7 @@ export class Run<
     }
 
     if (snapshot.status === 'running') {
-      throw new Error('This workflow run is still running, cannot time travel');
+      throw workflowRunStillRunningError({ workflowId: this.workflowId, runId: this.runId });
     }
 
     let steps: string[];

@@ -9,8 +9,11 @@ Added stable error ids for workflow lifecycle preconditions and a storage persis
 - `WORKFLOW_RUN_NOT_SUSPENDED`: `resume()` found a run that is no longer suspended.
 - `WORKFLOW_RUN_NOT_ACTIVE`: `restart()` found a run that is not running or waiting.
 - `WORKFLOW_SNAPSHOT_NOT_FOUND`: the run has no stored snapshot.
+- `WORKFLOW_RUN_STILL_RUNNING`: `timeTravel()` found a run that is still running.
 
-**Persistence failures.** Storage adapters can now say what a failed operation left behind: `transient` (it did not apply, and a later attempt may succeed), `permanent` (it did not apply, and repeating it fails the same way) or `commit_unknown` (the write may have committed although the caller saw a failure). Read it with `getStoragePersistenceFailure`:
+The stored status is reported in `details.actualStatus`.
+
+**Persistence failures.** Storage adapters can now say what a failed operation left behind: `transient` (it did not apply, and a later attempt may succeed), `permanent` (it did not apply, and repeating it fails the same way) or `commit_unknown` (the write may have committed although the caller saw a failure). Today only the PostgreSQL workflow storage (`@mastra/pg`) reports it; other adapters, including the in-memory store, return `undefined`. Read it with `getStoragePersistenceFailure`:
 
 ```ts
 import { getStoragePersistenceFailure } from '@mastra/core/storage';

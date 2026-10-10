@@ -92,8 +92,10 @@ describe('workflow lifecycle error ids', () => {
         domain: ErrorDomain.MASTRA_WORKFLOW,
         category: ErrorCategory.USER,
         message: 'This workflow run was not suspended',
-        details: { workflowId: WORKFLOW_ID, runId: run.runId, status: 'success' },
+        details: { workflowId: WORKFLOW_ID, runId: run.runId, actualStatus: 'success' },
       });
+      // Server error handling reads details.status as the HTTP status code.
+      expect((error as MastraError).details).not.toHaveProperty('status');
     } finally {
       await mastra.shutdown();
     }
@@ -111,7 +113,7 @@ describe('workflow lifecycle error ids', () => {
         id: 'WORKFLOW_RUN_NOT_ACTIVE',
         category: ErrorCategory.USER,
         message: 'This workflow run was not active',
-        details: { runId: run.runId, status: 'suspended' },
+        details: { runId: run.runId, actualStatus: 'suspended' },
       });
     } finally {
       await mastra.shutdown();
@@ -154,10 +156,34 @@ describe('workflow lifecycle error ids', () => {
       expect(error).toMatchObject({
         id: 'WORKFLOW_RUN_NOT_SUSPENDED',
         category: ErrorCategory.USER,
-        details: { workflowId: workflow.id, runId: run.runId, status: 'success' },
+        details: { workflowId: workflow.id, runId: run.runId, actualStatus: 'success' },
       });
     } finally {
       await mastra.stopWorkers();
+      await mastra.shutdown();
+    }
+  });
+
+  it('rejects timeTravel of a run that is still running with WORKFLOW_RUN_STILL_RUNNING', async () => {
+    const { workflow, mastra, workflowsStore } = await setup();
+    try {
+      const run = await workflow.createRun();
+      expect((await run.start({ inputData: { item: 'a' } })).status).toBe('suspended');
+      await workflowsStore.updateWorkflowState({
+        workflowName: WORKFLOW_ID,
+        runId: run.runId,
+        opts: { status: 'running' },
+      });
+
+      const error = await rejection(run.timeTravel({ step: 'approval', inputData: { item: 'a' } }));
+
+      expect(error).toMatchObject({
+        id: 'WORKFLOW_RUN_STILL_RUNNING',
+        category: ErrorCategory.USER,
+        message: 'This workflow run is still running, cannot time travel',
+        details: { workflowId: WORKFLOW_ID, runId: run.runId, actualStatus: 'running' },
+      });
+    } finally {
       await mastra.shutdown();
     }
   });

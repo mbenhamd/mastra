@@ -74,7 +74,7 @@ function isDefinitiveRollbackSqlState(code: string): boolean {
  */
 function isTransientSqlState(code: string): boolean {
   return (
-    code.startsWith('40') ||
+    (code.startsWith('40') && code !== '40002') ||
     code.startsWith('53') ||
     code.startsWith('08') ||
     code === '55P03' ||
@@ -170,7 +170,8 @@ function pgTransportFailure(error: unknown): TransportFailure | undefined {
  * operation (even one inside a transaction) is never `commit_unknown`. A failure is
  * `commit_unknown` only when a write may have reached its commit point: the
  * COMMIT of a `tx()`, or an autocommit write statement, lost its connection or
- * got a server error that does not prove a rollback. A `tx()` failure before COMMIT was sent, a read, or a definitive
+ * got a server error that does not prove a rollback.
+ * A `tx()` failure before COMMIT was sent, a read, or a definitive
  * server rejection never committed, and is `transient` or `permanent` by its
  * cause. Errors without a server or connection cause (validation, contract
  * and programming errors) are `permanent`. A classification already present
