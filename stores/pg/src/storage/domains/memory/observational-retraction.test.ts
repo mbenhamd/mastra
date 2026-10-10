@@ -1,3 +1,5 @@
+import { MessageHistory } from '@mastra/core/processors';
+import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -299,6 +301,80 @@ describe('MemoryPG observational-memory retraction', () => {
     await expect(observerMemory.listMessagesById({ messageIds: [missingThreadMessageId] })).resolves.toEqual({
       messages: [],
     });
+  });
+
+  it('rejects a delayed MessageHistory source write after erasure without recreating the thread or OM', async () => {
+    const erasedResourceId = `${resourceId}-delayed-history-writer`;
+    const erasedThreadId = `${threadId}-delayed-history-writer`;
+    const history = new MessageHistory({ storage: observerMemory, requireObservationalMemorySourceWriteGuard: true });
+    const message = (id: string, text: string) => ({
+      id,
+      threadId: erasedThreadId,
+      resourceId: erasedResourceId,
+      role: 'user' as const,
+      content: { format: 2 as const, parts: [{ type: 'text' as const, text }] },
+      createdAt,
+    });
+    const guardFor = (recordId: string) => ({ recordId, threadId: erasedThreadId, resourceId: erasedResourceId });
+
+    // Execution A captures its record before any source write and creates the thread through it.
+    const recordA = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: erasedResourceId,
+      scope: 'thread',
+      threadId: erasedThreadId,
+    });
+    await history.persistMessages({
+      messages: [message(`${erasedThreadId}-a-1`, 'first turn')],
+      threadId: erasedThreadId,
+      resourceId: erasedResourceId,
+      observationalMemorySourceWriteGuard: guardFor(recordA.id),
+    });
+
+    // Another store instance erases the conversation while A still holds its token.
+    await retractorMemory.retractObservationalMemory({ resourceId: erasedResourceId, threadId: erasedThreadId });
+    await retractorMemory.deleteThread({ threadId: erasedThreadId });
+
+    // A's delayed source/marker write must not resurrect the thread, the row, or OM.
+    await expect(
+      history.persistMessages({
+        messages: [message(`${erasedThreadId}-a-1`, 'first turn + late marker')],
+        threadId: erasedThreadId,
+        resourceId: erasedResourceId,
+        observationalMemorySourceWriteGuard: guardFor(recordA.id),
+      }),
+    ).rejects.toBeInstanceOf(ObservationalMemorySourceWriteConflictError);
+    await expect(observerMemory.getThreadById({ threadId: erasedThreadId })).resolves.toBeNull();
+    await expect(observerMemory.getObservationalMemory(erasedThreadId, erasedResourceId)).resolves.toBeNull();
+    await expect(observerMemory.listMessagesById({ messageIds: [`${erasedThreadId}-a-1`] })).resolves.toEqual({
+      messages: [],
+    });
+
+    // A fresh execution prepares its own record and may write; A stays revoked.
+    const recordB = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: erasedResourceId,
+      scope: 'thread',
+      threadId: erasedThreadId,
+    });
+    await history.persistMessages({
+      messages: [message(`${erasedThreadId}-b-1`, 'new conversation')],
+      threadId: erasedThreadId,
+      resourceId: erasedResourceId,
+      observationalMemorySourceWriteGuard: guardFor(recordB.id),
+    });
+    await expect(
+      history.persistMessages({
+        messages: [message(`${erasedThreadId}-a-2`, 'stale after reuse')],
+        threadId: erasedThreadId,
+        resourceId: erasedResourceId,
+        observationalMemorySourceWriteGuard: guardFor(recordA.id),
+      }),
+    ).rejects.toBeInstanceOf(ObservationalMemorySourceWriteConflictError);
+    const stored = await observerMemory.listMessagesById({
+      messageIds: [`${erasedThreadId}-a-1`, `${erasedThreadId}-a-2`, `${erasedThreadId}-b-1`],
+    });
+    expect(stored.messages.map(storedMessage => storedMessage.id)).toEqual([`${erasedThreadId}-b-1`]);
   });
 
   it('atomically validates source-bound thread creation and active-record refresh', async () => {
