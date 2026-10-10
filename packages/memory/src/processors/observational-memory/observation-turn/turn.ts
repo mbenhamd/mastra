@@ -3,7 +3,8 @@ import type { MemoryRunState } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
 import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { ObservationalMemoryRecord } from '@mastra/core/storage';
+import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
+import type { ObservationalMemoryRecord, ObservationalMemorySourceWriteGuard } from '@mastra/core/storage';
 
 import { omDebug } from '../debug';
 import { getObservableMessages } from '../message-utils';
@@ -45,6 +46,8 @@ export class ObservationTurn {
   private _currentStep?: ObservationStep;
   private _started = false;
   private _ended = false;
+  /** Source-write fence captured at turn start; never replaced by refreshRecord(). */
+  private _sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 
   /** Generation count at turn start — used to detect if reflection happened during the turn. */
   private _generationCountAtStart = -1;
@@ -116,6 +119,11 @@ export class ObservationTurn {
     return this._record;
   }
 
+  /** Captured source-write fence for this execution. */
+  get sourceWriteGuard(): ObservationalMemorySourceWriteGuard | undefined {
+    return this._sourceWriteGuard;
+  }
+
   /** The context loaded during start(). */
   get context(): TurnContext {
     if (!this._context) throw new Error('Turn not started — call start() first');
@@ -147,7 +155,12 @@ export class ObservationTurn {
     if (this._started) throw new Error('Turn already started');
     this._started = true;
 
-    this._record = await this.om.getOrCreateRecord(this.threadId, this.resourceId);
+    const capturedSourceWriteGuard = this.om.getObservationalMemorySourceWriteGuardFromMessageList(this.messageList);
+    if (this.om.sourceWriteFencing === 'required') {
+      this.om.assertObservationalMemorySourceWriteGuard(capturedSourceWriteGuard);
+    }
+    this._sourceWriteGuard = capturedSourceWriteGuard;
+    this._record = await this.om.getOrCreateRecord(this.threadId, this.resourceId, this._sourceWriteGuard);
     runState?.set(`observational-memory:record:${this.threadId}:${this.resourceId ?? ''}`, this._record);
     this._generationCountAtStart = this._record.generationCount;
     this.memory = memory;
@@ -159,6 +172,7 @@ export class ObservationTurn {
         threadId: this.threadId,
         resourceId: this.resourceId,
         runState,
+        observationalMemorySourceWriteGuard: this._sourceWriteGuard,
       });
 
       this._context = {
@@ -223,7 +237,7 @@ export class ObservationTurn {
     const unsavedOutput = messageList.get.response.db();
     const unsavedMessages = [...unsavedInput, ...unsavedOutput];
     if (unsavedMessages.length > 0) {
-      await this.om.persistMessages(unsavedMessages, this.threadId, this.resourceId);
+      await this.om.persistMessages(unsavedMessages, this.threadId, this.resourceId, this._sourceWriteGuard);
     }
 
     // When the agent goes idle, start buffering any unobserved messages in the background.
@@ -248,6 +262,7 @@ export class ObservationTurn {
           requestContext: this.requestContext,
           writer: this.writer,
           observabilityContext: this.observabilityContext,
+          sourceWriteGuard: this._sourceWriteGuard,
         });
         if (observeResult.observed) {
           omDebug(
@@ -255,6 +270,7 @@ export class ObservationTurn {
           );
         }
       } catch (err) {
+        if (err instanceof ObservationalMemorySourceWriteConflictError) throw err;
         omDebug(`[OM:turn.end] end-of-turn observation failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -280,6 +296,7 @@ export class ObservationTurn {
               requestContext: this.requestContext,
               currentModel: this.actorModelContext,
               observabilityContext: this.observabilityContext,
+              sourceWriteGuard: this._sourceWriteGuard,
               skipMinimumTokenCheck: true,
             })
             .catch((err: Error) => {
@@ -297,7 +314,8 @@ export class ObservationTurn {
    * @internal
    */
   async refreshRecord(): Promise<void> {
-    this.setRecord(await this.om.getOrCreateRecord(this.threadId, this.resourceId));
+    this.om.assertObservationalMemorySourceWriteGuard(this._sourceWriteGuard);
+    this.setRecord(await this.om.getOrCreateRecord(this.threadId, this.resourceId, this._sourceWriteGuard));
   }
 
   /**
@@ -305,6 +323,7 @@ export class ObservationTurn {
    * @internal
    */
   async refreshOtherThreadsContext(): Promise<string | undefined> {
+    this.om.assertObservationalMemorySourceWriteGuard(this._sourceWriteGuard);
     if (this.om.scope === 'resource' && this.resourceId) {
       const otherThreadsContext = await this.om.getOtherThreadsContext(this.resourceId!, this.threadId);
       if (this._context) {

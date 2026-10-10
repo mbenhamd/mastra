@@ -2,7 +2,7 @@ import type { MastraDBMessage, MessageList } from '@mastra/core/agent';
 import type { ObservabilityContext } from '@mastra/core/observability';
 import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { ObservationalMemoryRecord } from '@mastra/core/storage';
+import type { ObservationalMemoryRecord, ObservationalMemorySourceWriteGuard } from '@mastra/core/storage';
 import type { ProviderMetadata } from '@mastra/core/stream';
 
 import type { Extractor } from '../extractor';
@@ -14,6 +14,8 @@ export interface ObservationRunOpts {
   threadId: string;
   resourceId?: string;
   messages: MastraDBMessage[];
+  /** Captured record fence for source transcript and marker writes. */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 
   /**
    * Live MessageList for the in-flight agent turn, when observation runs inside

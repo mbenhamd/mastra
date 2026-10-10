@@ -32,6 +32,7 @@ import {
 } from '../observability';
 import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors/index';
 import { RequestContext, MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY } from '../request-context';
+import type { ObservationalMemorySourceWriteGuard } from '../storage';
 import type { ChunkType } from '../stream/types';
 import type { CoreTool, ToolHooks } from '../tools/types';
 import type { DynamicArgument } from '../types';
@@ -275,6 +276,7 @@ export class AgentLegacyHandler {
     hooks,
     resolveMemory,
     runScope,
+    observationalMemorySourceWriteGuard,
     ...rest
   }: {
     instructions: AgentInstructions;
@@ -295,6 +297,7 @@ export class AgentLegacyHandler {
     hooks?: ToolHooks;
     resolveMemory: () => Promise<ResolvedAgentMemory>;
     runScope: ReturnType<typeof createRunScope>;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     return {
@@ -340,6 +343,13 @@ export class AgentLegacyHandler {
         const memory = resolvedMemory.value;
 
         const threadId = thread?.id;
+        if (memory && memoryConfig?.observationalMemory !== undefined) {
+          memory.getMergedThreadConfig(memoryConfig);
+        }
+        let capturedSourceWriteGuard = observationalMemorySourceWriteGuard;
+        if (!capturedSourceWriteGuard && memory && threadId) {
+          capturedSourceWriteGuard = await memory.prepareObservationalMemorySourceWriteGuard(threadId, resourceId);
+        }
 
         let convertedTools = await this.capabilities.convertTools({
           toolsets,
@@ -378,6 +388,7 @@ export class AgentLegacyHandler {
         let messageList = new MessageList({
           threadId,
           resourceId,
+          observationalMemorySourceWriteGuard: capturedSourceWriteGuard,
           generateMessageId: this.capabilities.mastra?.generateId?.bind(this.capabilities.mastra),
           // @ts-expect-error Flag for agent network messages
           _agentNetworkAppend: this.capabilities._agentNetworkAppend,
@@ -471,6 +482,7 @@ export class AgentLegacyHandler {
             threadObject = await memory.saveThread({
               thread: { ...existingThread, metadata: { ...(existingThread.metadata ?? {}), ...thread.metadata } },
               memoryConfig,
+              observationalMemorySourceWriteGuard: capturedSourceWriteGuard,
             });
           } else {
             threadObject = existingThread;
@@ -487,6 +499,7 @@ export class AgentLegacyHandler {
             memoryConfig,
             resourceId,
             saveThread: true,
+            observationalMemorySourceWriteGuard: capturedSourceWriteGuard,
           });
         }
 
@@ -504,6 +517,7 @@ export class AgentLegacyHandler {
           thread: threadObject,
           resourceId,
           memoryConfig,
+          ...(capturedSourceWriteGuard ? { observationalMemorySourceWriteGuard: capturedSourceWriteGuard } : {}),
           runState: () => runScope.get(LEGACY_MEMORY_RUN_STATE_KEY),
         });
 
@@ -628,6 +642,8 @@ export class AgentLegacyHandler {
         const resolvedMemory = await resolveMemory();
         const memory = resolvedMemory.value;
         const memoryRunState = memory ? getMemoryRunState(requestContext, memory, threadId, resourceId) : undefined;
+        const observationalMemorySourceWriteGuard =
+          messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard;
         // re-read the latest thread so metadata written mid-run (working memory, processors) isn't overwritten.
         // This write path stays authoritative and never reads through the run snapshot.
         const thread = (threadId ? await memory?.getThreadById({ threadId }) : undefined) ?? threadAfter;
@@ -660,6 +676,7 @@ export class AgentLegacyHandler {
                 title: thread.title,
                 memoryConfig,
                 resourceId: thread.resourceId,
+                observationalMemorySourceWriteGuard,
               });
             }
 
@@ -692,13 +709,24 @@ export class AgentLegacyHandler {
                     .genTitle(userMessage, requestContext, observabilityContext, titleModel, titleInstructions)
                     .then(title => {
                       if (title) {
-                        return memory.createThread({
-                          threadId: thread.id,
-                          resourceId,
-                          memoryConfig,
-                          title,
-                          metadata: thread.metadata,
-                        });
+                        return memory.getThreadById({ threadId: thread.id }).then(latestThread =>
+                          latestThread
+                            ? memory.updateThread({
+                                id: thread.id,
+                                title,
+                                metadata: latestThread.metadata ?? thread.metadata ?? {},
+                                memoryConfig,
+                                observationalMemorySourceWriteGuard,
+                              })
+                            : memory.createThread({
+                                threadId: thread.id,
+                                resourceId,
+                                memoryConfig,
+                                title,
+                                metadata: thread.metadata,
+                                observationalMemorySourceWriteGuard,
+                              }),
+                        );
                       }
                     }),
                 );
@@ -940,6 +968,7 @@ export class AgentLegacyHandler {
       hooks,
       resolveMemory,
       runScope,
+      observationalMemorySourceWriteGuard: args.observationalMemorySourceWriteGuard,
       ...resolveObservabilityContext(args as Partial<ObservabilityContext>),
     });
 
@@ -976,12 +1005,16 @@ export class AgentLegacyHandler {
           onStepFinish: async (props: any) => {
             if (savePerStep) {
               if (!threadExists && !threadCreatedByStep && memory && thread) {
+                // A per-step upsert can run after the thread was erased mid-step;
+                // bind it to this execution's captured source-write fence.
                 await memory.createThread({
                   threadId,
                   title: thread.title,
                   metadata: thread.metadata,
                   resourceId: thread.resourceId,
                   memoryConfig,
+                  observationalMemorySourceWriteGuard:
+                    messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard,
                 });
                 threadCreatedByStep = true;
               }

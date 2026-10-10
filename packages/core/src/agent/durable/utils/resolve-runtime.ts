@@ -17,6 +17,7 @@ import {
   MASTRA_THREAD_ID_KEY,
   RequestContext,
 } from '../../../request-context';
+import type { ObservationalMemorySourceWriteGuard } from '../../../storage';
 import { resolveToolApprovalRequirement, resolveToolRequiresApproval } from '../../../tools/approval';
 import type { ResolvedToolApproval } from '../../../tools/approval';
 import type { CoreTool, RequireToolApproval } from '../../../tools/types';
@@ -160,6 +161,7 @@ export function createDurableRuntimeRequestContext(options: {
   entries?: Record<string, unknown>;
   state: Pick<SerializableDurableState, 'memoryConfigured' | 'threadId' | 'resourceId' | 'memoryConfig'>;
   liveContext?: RequestContext;
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }): RequestContext {
   const context = new RequestContext();
   for (const [key, value] of Object.entries(options.entries ?? {})) {
@@ -190,6 +192,9 @@ export function createDurableRuntimeRequestContext(options: {
       thread: { id: threadId },
       resourceId,
       memoryConfig,
+      ...(options.observationalMemorySourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: options.observationalMemorySourceWriteGuard }
+        : {}),
     });
   }
   return context;
@@ -317,6 +322,9 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
         entries: input.requestContextEntries,
         state: input.state,
         liveContext: options.requestContext,
+        observationalMemorySourceWriteGuard:
+          input.options?.observationalMemorySourceWriteGuard ??
+          input.messageListState?.memoryInfo?.observationalMemorySourceWriteGuard,
       });
 
       tools = await agent.getToolsForExecution({
@@ -522,6 +530,9 @@ export async function rebuildRunToolsFromMastra(options: {
       entries: requestContextEntries,
       state,
       liveContext: requestContext,
+      observationalMemorySourceWriteGuard:
+        execOptions?.observationalMemorySourceWriteGuard ??
+        messageListState?.memoryInfo?.observationalMemorySourceWriteGuard,
     });
     const processorMessages =
       options.processorMessages ??

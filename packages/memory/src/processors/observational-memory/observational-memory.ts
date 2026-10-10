@@ -16,8 +16,16 @@ import {
   type ProcessorStreamWriter,
 } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { MemoryStorage, ObservationalMemoryRecord, ObservationalMemoryHistoryOptions } from '@mastra/core/storage';
-import { assertObservationalMemoryClearExpectation } from '@mastra/core/storage';
+import type {
+  MemoryStorage,
+  ObservationalMemoryRecord,
+  ObservationalMemoryHistoryOptions,
+  ObservationalMemorySourceWriteGuard,
+} from '@mastra/core/storage';
+import {
+  assertObservationalMemoryClearExpectation,
+  ObservationalMemorySourceWriteConflictError,
+} from '@mastra/core/storage';
 import type { ProviderMetadata } from '@mastra/core/stream';
 import xxhash from 'xxhash-wasm';
 
@@ -346,6 +354,8 @@ export class ObservationalMemory {
   readonly retrievalScope: 'thread' | 'resource';
   /** Optional policy for removing raw tool-call payloads from native OM history. */
   readonly toolCallFilter?: MessageHistoryToolCallFilterOptions;
+  /** Whether source transcript writes require a captured OM record fence. */
+  readonly sourceWriteFencing: 'required' | undefined;
   /** Application-provided guidance appended after the native retrieval instructions. */
   private retrievalInstructions?: string;
   private retrievalSearch: boolean;
@@ -514,6 +524,12 @@ export class ObservationalMemory {
     this.retrievalInstructions = typeof config.retrieval === 'object' ? config.retrieval.instructions : undefined;
     this.retrievalSearch = typeof config.retrieval === 'object' && Boolean(config.retrieval.vector);
     this.toolCallFilter = config.toolCallFilter;
+    this.sourceWriteFencing = config.sourceWriteFencing;
+    if (this.sourceWriteFencing === 'required' && !this.storage.supportsObservationalMemorySourceWriteGuards) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the storage adapter does not support it.',
+      );
+    }
     this.onIndexObservations = config.onIndexObservations;
     this.hooks = config.hooks;
     this.hookExecution = config.hookExecution ?? 'non-blocking';
@@ -737,6 +753,7 @@ export class ObservationalMemory {
       storage: this.storage,
       toolCallFilter: this.toolCallFilter,
       retainFilteredMessageAnchors: this.toolCallFilter !== undefined,
+      requireObservationalMemorySourceWriteGuard: this.sourceWriteFencing === 'required',
     });
 
     this.observer = new ObserverRunner({
@@ -763,8 +780,8 @@ export class ObservationalMemory {
       scope: this.scope,
       buffering: this.buffering,
       emitDebugEvent: e => this.emitDebugEvent(e),
-      persistMarkerToStorage: (m, t, r) => this.persistMarkerToStorage(m, t, r),
-      persistMarkerToMessage: (m, ml, t, r) => this.persistMarkerToMessage(m, ml, t, r),
+      persistMarkerToStorage: (m, t, r, guard) => this.persistMarkerToStorage(m, t, r, guard),
+      persistMarkerToMessage: (m, ml, t, r, guard) => this.persistMarkerToMessage(m, ml, t, r, guard),
       getCompressionStartLevel: rc => this.getCompressionStartLevel(rc),
       resolveModel: inputTokens => this.resolveReflectionModel(inputTokens),
       mastra: config.mastra,
@@ -804,6 +821,7 @@ export class ObservationalMemory {
   get config(): {
     scope: 'resource' | 'thread';
     retrieval: boolean;
+    sourceWriteFencing?: 'required';
     toolCallFilter?: MessageHistoryToolCallFilterOptions;
     observation: {
       messageTokens: number | ThresholdRange;
@@ -820,6 +838,7 @@ export class ObservationalMemory {
     return {
       scope: this.scope,
       retrieval: this.retrieval,
+      ...(this.sourceWriteFencing === undefined ? {} : { sourceWriteFencing: this.sourceWriteFencing }),
       ...(this.toolCallFilter === undefined ? {} : { toolCallFilter: { ...this.toolCallFilter } }),
       observation: {
         messageTokens: this.observationConfig.messageTokens,
@@ -833,6 +852,76 @@ export class ObservationalMemory {
         failurePolicy: this.reflectionConfig.failurePolicy,
       },
     };
+  }
+
+  /**
+   * Capture the OM record coordinates that authorize source transcript writes
+   * for one execution. The record ID is an existence fence: archived records
+   * remain valid until the complete scope is retracted.
+   */
+  getObservationalMemorySourceWriteGuard(
+    record: Pick<ObservationalMemoryRecord, 'id' | 'threadId' | 'resourceId'>,
+  ): ObservationalMemorySourceWriteGuard | undefined {
+    if (this.sourceWriteFencing !== 'required') return undefined;
+    return {
+      recordId: record.id,
+      threadId: record.threadId,
+      resourceId: record.resourceId,
+    };
+  }
+
+  /** Read the serialized per-execution source fence prepared on a MessageList. */
+  getObservationalMemorySourceWriteGuardFromMessageList(
+    messageList: MessageList,
+  ): ObservationalMemorySourceWriteGuard | undefined {
+    const value: unknown = messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard;
+    if (value === undefined || value === null) return undefined;
+
+    const parsed =
+      typeof value === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(value) as unknown;
+            } catch {
+              return undefined;
+            }
+          })()
+        : value;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const guard = parsed as Partial<ObservationalMemorySourceWriteGuard>;
+    if (
+      typeof guard.recordId !== 'string' ||
+      guard.recordId.length === 0 ||
+      typeof guard.resourceId !== 'string' ||
+      guard.resourceId.length === 0 ||
+      (guard.threadId !== null && typeof guard.threadId !== 'string')
+    ) {
+      return undefined;
+    }
+    return {
+      recordId: guard.recordId,
+      threadId: guard.threadId ?? null,
+      resourceId: guard.resourceId,
+    };
+  }
+
+  private assertSourceWriteReady(guard: ObservationalMemorySourceWriteGuard | undefined): void {
+    if (this.sourceWriteFencing !== 'required') return;
+    if (!this.storage.supportsObservationalMemorySourceWriteGuards) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the storage adapter does not support it.',
+      );
+    }
+    if (!guard) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but no captured record guard was provided.',
+      );
+    }
+  }
+
+  /** @internal Validate the captured guard before a native execution initializes or writes OM state. */
+  assertObservationalMemorySourceWriteGuard(guard: ObservationalMemorySourceWriteGuard | undefined): void {
+    this.assertSourceWriteReady(guard);
   }
 
   /**
@@ -1300,7 +1389,20 @@ export class ObservationalMemory {
    * Get or create the observational memory record.
    * Returns the existing record if one exists, otherwise initializes a new one.
    */
-  async getOrCreateRecord(threadId: string, resourceId?: string): Promise<ObservationalMemoryRecord> {
+  async getOrCreateRecord(
+    threadId: string,
+    resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
+  ): Promise<ObservationalMemoryRecord> {
+    if (sourceWriteGuard) {
+      this.assertSourceWriteReady(sourceWriteGuard);
+      return this.storage.getObservationalMemoryForSourceWrite({
+        threadId,
+        resourceId: sourceWriteGuard.resourceId,
+        sourceWriteGuard,
+      });
+    }
+
     const lookupIds = this.getStorageIds(threadId, resourceId);
     // Storage adapters identify thread-scoped records by threadId alone and
     // resource-scoped records by resourceId alone. The single-flight key must
@@ -1386,8 +1488,10 @@ export class ObservationalMemory {
     messageList: MessageList | undefined,
     threadId: string,
     resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<boolean> {
     if (!messageList) return false;
+    this.assertSourceWriteReady(sourceWriteGuard);
     const allMsgs = messageList.get.all.db();
     const markerData = marker.data as { cycleId?: string; operationType?: string } | undefined;
     const targetRole = markerData?.operationType === 'reflection' ? 'user' : 'assistant';
@@ -1400,18 +1504,30 @@ export class ObservationalMemory {
         const alreadyPresent =
           markerData?.cycleId &&
           msg.content.parts.some((p: any) => p?.type === marker.type && p?.data?.cycleId === markerData.cycleId);
-        if (!alreadyPresent) {
-          msg.content.parts.push(marker as any);
-        }
-        // Upsert the modified message to DB so the marker part is persisted.
-        // On failure, return false so the caller can fall back to storage.
+        // Persist a copy with the marker first so a rejected guard cannot
+        // mutate the in-flight transcript after its OM record was retracted or
+        // moved. Generic persistence failures keep the marker in the live
+        // stream and return false so the caller can fall back to storage.
+        const message = alreadyPresent
+          ? msg
+          : {
+              ...msg,
+              content: {
+                ...msg.content,
+                parts: [...msg.content.parts, marker as any],
+              },
+            };
         try {
           await this.messageHistory.persistMessages({
-            messages: [msg],
+            messages: [message],
             threadId,
             resourceId,
+            observationalMemorySourceWriteGuard: sourceWriteGuard,
           });
+          if (!alreadyPresent) msg.content.parts.push(marker as any);
         } catch (e) {
+          if (e instanceof ObservationalMemorySourceWriteConflictError) throw e;
+          if (!alreadyPresent) msg.content.parts.push(marker as any);
           omDebug(`[OM:persistMarker] failed to save marker to DB: ${e}`);
           return false;
         }
@@ -1432,7 +1548,9 @@ export class ObservationalMemory {
     marker: { type: string; data: unknown },
     threadId: string,
     resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<void> {
+    this.assertSourceWriteReady(sourceWriteGuard);
     try {
       const result = await this.storage.listMessages({
         threadId,
@@ -1447,18 +1565,26 @@ export class ObservationalMemory {
           const alreadyPresent =
             markerData?.cycleId &&
             msg.content.parts.some((p: any) => p?.type === marker.type && p?.data?.cycleId === markerData.cycleId);
-          if (!alreadyPresent) {
-            msg.content.parts.push(marker as any);
-          }
+          const message = alreadyPresent
+            ? msg
+            : {
+                ...msg,
+                content: {
+                  ...msg.content,
+                  parts: [...msg.content.parts, marker as any],
+                },
+              };
           await this.messageHistory.persistMessages({
-            messages: [msg],
+            messages: [message],
             threadId,
             resourceId,
+            observationalMemorySourceWriteGuard: sourceWriteGuard,
           });
           return;
         }
       }
     } catch (e) {
+      if (e instanceof ObservationalMemorySourceWriteConflictError) throw e;
       omDebug(`[OM:persistMarkerToStorage] failed to save marker to DB: ${e}`);
     }
   }
@@ -1993,6 +2119,7 @@ export class ObservationalMemory {
     messagesToSave: MastraDBMessage[],
     threadId: string,
     resourceId: string | undefined,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<void> {
     const filteredMessages: MastraDBMessage[] = [];
     for (const msg of messagesToSave) {
@@ -2013,6 +2140,7 @@ export class ObservationalMemory {
         messages: filteredMessages,
         threadId,
         resourceId,
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
       });
     }
   }
@@ -2027,13 +2155,17 @@ export class ObservationalMemory {
     messagesToSave: MastraDBMessage[],
     threadId: string,
     resourceId: string | undefined,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<void> {
     if (messagesToSave.length === 0) return;
+
+    this.assertSourceWriteReady(sourceWriteGuard);
 
     await this.messageHistory.persistMessages({
       messages: messagesToSave,
       threadId,
       resourceId,
+      observationalMemorySourceWriteGuard: sourceWriteGuard,
     });
   }
 
@@ -2309,6 +2441,7 @@ ${formattedMessages}
     contextWindowTokens?: number,
     requestContext?: RequestContext,
     observabilityContext?: ObservabilityContext,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<void> {
     const bufferKey = this.buffering.getObservationBufferKey(lockKey);
 
@@ -2335,6 +2468,7 @@ ${formattedMessages}
       writer,
       requestContext,
       observabilityContext,
+      sourceWriteGuard,
     )
       .catch(err => {
         omError('[OM] async buffering observation failed', err);
@@ -2364,7 +2498,13 @@ ${formattedMessages}
     writer?: ProcessorStreamWriter,
     requestContext?: RequestContext,
     observabilityContext?: ObservabilityContext,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<void> {
+    // A required execution must carry the guard captured before admission. Do
+    // not derive a replacement token from a refreshed/old record here: that
+    // would let recovery silently authorize a different execution.
+    const capturedSourceWriteGuard = sourceWriteGuard;
+    this.assertSourceWriteReady(capturedSourceWriteGuard);
     // Wait for any existing buffering operation to complete first (mutex behavior)
     const existingOp = BufferingCoordinator.asyncBufferingOps.get(bufferKey);
     if (existingOp) {
@@ -2376,7 +2516,13 @@ ${formattedMessages}
     }
 
     // Re-fetch record to get latest state after waiting
-    const freshRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const freshRecord = capturedSourceWriteGuard
+      ? await this.storage.getObservationalMemoryForSourceWrite({
+          threadId,
+          resourceId: capturedSourceWriteGuard.resourceId,
+          sourceWriteGuard: capturedSourceWriteGuard,
+        })
+      : await this.storage.getObservationalMemory(record.threadId, record.resourceId);
     if (!freshRecord) {
       return;
     }
@@ -2437,6 +2583,7 @@ ${formattedMessages}
         messages: messagesToBuffer,
         threadId,
         resourceId: freshRecord.resourceId ?? undefined,
+        observationalMemorySourceWriteGuard: capturedSourceWriteGuard,
       });
     } catch (err) {
       omError('[OM] Failed to persist sealed messages before buffering — skipping observation cycle', err);
@@ -2457,7 +2604,12 @@ ${formattedMessages}
       threadIds: [threadId],
       config: this.getObservationMarkerConfig(),
     });
-    await this.persistMarkerToStorage(startMarker, threadId, freshRecord.resourceId ?? undefined);
+    await this.persistMarkerToStorage(
+      startMarker,
+      threadId,
+      freshRecord.resourceId ?? undefined,
+      capturedSourceWriteGuard,
+    );
 
     // Emit buffering start marker without letting the stream writer create a separate data-only DB message.
     if (writer) {
@@ -2483,6 +2635,7 @@ ${formattedMessages}
           requestContext,
           observabilityContext,
           trigger: 'async-buffer',
+          sourceWriteGuard: capturedSourceWriteGuard,
         }).run(),
     );
 
@@ -2515,7 +2668,10 @@ ${formattedMessages}
     writer?: ProcessorStreamWriter;
     requestContext?: RequestContext;
     observabilityContext?: ObservabilityContext;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<boolean> {
+    const sourceWriteGuard = opts.sourceWriteGuard;
+    this.assertSourceWriteReady(sourceWriteGuard);
     if (!this.buffering.isAsyncObservationEnabled()) return false;
 
     const lockKey = this.buffering.getLockKey(opts.threadId, opts.resourceId);
@@ -2538,6 +2694,7 @@ ${formattedMessages}
           opts.unbufferedPendingTokens,
           opts.requestContext,
           opts.observabilityContext,
+          sourceWriteGuard,
         ),
       );
     }
@@ -2577,11 +2734,14 @@ ${formattedMessages}
     retentionFloor?: number;
     /** Message ids that must never be removed (e.g. the in-flight turn's pending messages). */
     preserveMessageIds?: string[];
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<string[]> {
-    const { threadId, resourceId, messages, observedMessageIds, retentionFloor } = opts;
+    const { threadId, resourceId, messages, observedMessageIds, retentionFloor, sourceWriteGuard } = opts;
     const preserveSet = opts.preserveMessageIds?.length ? new Set(opts.preserveMessageIds) : null;
 
-    const record = await this.getOrCreateRecord(threadId, resourceId);
+    this.assertSourceWriteReady(sourceWriteGuard);
+
+    const record = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
     const effectiveObservedIds =
       observedMessageIds && observedMessageIds.length > 0
         ? observedMessageIds
@@ -2671,8 +2831,11 @@ ${formattedMessages}
     retentionFloor?: number;
     /** Message ids that must never be removed (e.g. the in-flight turn's pending messages). */
     preserveMessageIds?: string[];
+    /** Captured OM record fence for the marker/source save performed by cleanup. */
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<MastraDBMessage[]> {
-    const { threadId, resourceId, observedMessageIds, retentionFloor, preserveMessageIds } = opts;
+    const { threadId, resourceId, observedMessageIds, retentionFloor, preserveMessageIds, sourceWriteGuard } = opts;
+    this.assertSourceWriteReady(sourceWriteGuard);
     const messageList = this.isMessageList(opts.messages) ? opts.messages : undefined;
     const allMsgs: MastraDBMessage[] = messageList
       ? getObservableMessages(messageList)
@@ -2703,6 +2866,7 @@ ${formattedMessages}
         observedMessageIds,
         retentionFloor,
         preserveMessageIds,
+        sourceWriteGuard,
       });
 
       if (messageList) {
@@ -2729,33 +2893,38 @@ ${formattedMessages}
         }
       }
 
-      messagesToSave.push(markerMsg);
-
       // The marker anchor itself may be an in-flight message (e.g. the step-0
       // seeded response message) — preserved ids must never be trimmed or removed.
       const preserveMarker = Boolean(markerMsg.id && preserveSet?.has(markerMsg.id));
+      let trimmedMarkerParts: MastraDBMessage['content']['parts'] | undefined;
       if (!preserveMarker) {
         const unobservedParts = getUnobservedParts(markerMsg);
         if (unobservedParts.length === 0) {
           if (markerMsg.id) idsToRemove.push(markerMsg.id);
         } else if (unobservedParts.length < (markerMsg.content?.parts?.length ?? 0)) {
-          markerMsg.content.parts = unobservedParts;
+          trimmedMarkerParts = unobservedParts;
         }
       }
+      // Persist the trimmed copy before touching the live transcript: a rejected
+      // source-write guard must leave the in-flight messages unchanged.
+      messagesToSave.push(
+        trimmedMarkerParts ? { ...markerMsg, content: { ...markerMsg.content, parts: trimmedMarkerParts } } : markerMsg,
+      );
 
       if (messageList) {
+        if (messagesToSave.length > 0) {
+          await this.persistMessages(messagesToSave, threadId, resourceId, sourceWriteGuard);
+        }
+        if (trimmedMarkerParts) markerMsg.content.parts = trimmedMarkerParts;
         if (idsToRemove.length > 0) {
           messageList.removeByIds(idsToRemove);
-        }
-
-        if (messagesToSave.length > 0) {
-          await this.persistMessages(messagesToSave, threadId, resourceId);
         }
 
         omDebug(`[OM:cleanupMarker] removed ${idsToRemove.length} messages, saved ${messagesToSave.length}`);
         return messageList.get.all.db();
       }
 
+      if (trimmedMarkerParts) markerMsg.content.parts = trimmedMarkerParts;
       this.removeIdsFromArray(allMsgs, idsToRemove);
       return allMsgs;
     }
@@ -2778,14 +2947,16 @@ ${formattedMessages}
     resourceId?: string;
     observedMessageIds?: string[];
     retentionFloor?: number;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<void> {
-    const { messageList, threadId, resourceId, observedMessageIds, retentionFloor } = opts;
+    const { messageList, threadId, resourceId, observedMessageIds, retentionFloor, sourceWriteGuard } = opts;
     await this.cleanupMessages({
       threadId,
       resourceId,
       messages: messageList,
       observedMessageIds,
       retentionFloor,
+      sourceWriteGuard,
     });
   }
 
@@ -2838,6 +3009,7 @@ ${formattedMessages}
     record?: ObservationalMemoryRecord;
     unobservedContextBlocks?: string;
     currentDate?: Date;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<string | undefined> {
     const parts = await this.buildContextSystemMessages(opts);
     return parts?.join('\n\n');
@@ -2855,9 +3027,13 @@ ${formattedMessages}
     record?: ObservationalMemoryRecord;
     unobservedContextBlocks?: string;
     currentDate?: Date;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<string[] | undefined> {
-    const { threadId, resourceId, unobservedContextBlocks } = opts;
-    const record = opts.record ?? (await this.getOrCreateRecord(threadId, resourceId));
+    const { threadId, resourceId, unobservedContextBlocks, sourceWriteGuard } = opts;
+    this.assertSourceWriteReady(sourceWriteGuard);
+    const record = sourceWriteGuard
+      ? await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard)
+      : (opts.record ?? (await this.getOrCreateRecord(threadId, resourceId)));
 
     if (!record.activeObservations) {
       // Resource-scoped recall can browse and search other threads even before any
@@ -3069,6 +3245,7 @@ ${formattedMessages}
     messages?: MastraDBMessage[];
     /** Pre-loaded record to skip the initial storage read. */
     record?: ObservationalMemoryRecord;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{
     record: ObservationalMemoryRecord;
     pendingTokens: number;
@@ -3085,8 +3262,11 @@ ${formattedMessages}
     asyncReflectionEnabled: boolean;
     scope: 'resource' | 'thread';
   }> {
-    const { threadId, resourceId, record: providedRecord, messages } = opts;
-    const record = providedRecord ?? (await this.getOrCreateRecord(threadId, resourceId));
+    const { threadId, resourceId, record: providedRecord, messages, sourceWriteGuard } = opts;
+    this.assertSourceWriteReady(sourceWriteGuard);
+    const record = sourceWriteGuard
+      ? await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard)
+      : (providedRecord ?? (await this.getOrCreateRecord(threadId, resourceId)));
     const currentObservationTokens = record.observationTokenCount ?? 0;
 
     // Use provided messages or load from storage
@@ -3187,13 +3367,19 @@ ${formattedMessages}
    * // result.observed: true if a full observation pass ran
    * ```
    */
-  async finalize(opts: { threadId: string; resourceId?: string; messages?: MastraDBMessage[] }): Promise<{
+  async finalize(opts: {
+    threadId: string;
+    resourceId?: string;
+    messages?: MastraDBMessage[];
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<{
     activated: boolean;
     observed: boolean;
     reflected: boolean;
     record: ObservationalMemoryRecord;
   }> {
-    const { threadId, resourceId, messages } = opts;
+    const { threadId, resourceId, messages, sourceWriteGuard } = opts;
+    this.assertSourceWriteReady(sourceWriteGuard);
     let activated = false;
     let observed = false;
     let reflected = false;
@@ -3202,27 +3388,27 @@ ${formattedMessages}
     await BufferingCoordinator.awaitBuffering(threadId, resourceId ?? null, this.scope);
 
     // Activate any remaining buffered chunks
-    const preStatus = await this.getStatus({ threadId, resourceId, messages });
+    const preStatus = await this.getStatus({ threadId, resourceId, messages, sourceWriteGuard });
     if (preStatus.canActivate) {
-      const actResult = await this.activate({ threadId, resourceId, messages });
+      const actResult = await this.activate({ threadId, resourceId, messages, sourceWriteGuard });
       activated = actResult.activated;
     }
 
     // Observe if threshold is crossed (advances the cursor)
-    const postStatus = await this.getStatus({ threadId, resourceId, messages });
+    const postStatus = await this.getStatus({ threadId, resourceId, messages, sourceWriteGuard });
     if (postStatus.shouldObserve) {
-      const obsResult = await this.observe({ threadId, resourceId, messages });
+      const obsResult = await this.observe({ threadId, resourceId, messages, sourceWriteGuard });
       observed = obsResult.observed;
     }
 
     // Reflect if observation tokens exceed reflection threshold
-    const reflectStatus = await this.getStatus({ threadId, resourceId });
+    const reflectStatus = await this.getStatus({ threadId, resourceId, sourceWriteGuard });
     if (reflectStatus.shouldReflect) {
-      const refResult = await this.reflect(threadId, resourceId);
+      const refResult = await this.reflect(threadId, resourceId, undefined, undefined, undefined, sourceWriteGuard);
       reflected = refResult.reflected;
     }
 
-    const record = await this.getOrCreateRecord(threadId, resourceId);
+    const record = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
     return { activated, observed, reflected, record };
   }
 
@@ -3243,9 +3429,11 @@ ${formattedMessages}
     threadId: string;
     resourceId?: string;
     messages: MastraDBMessage[];
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<MastraDBMessage[]> {
-    const { threadId, resourceId, messages } = opts;
-    const record = await this.getOrCreateRecord(threadId, resourceId);
+    const { threadId, resourceId, messages, sourceWriteGuard } = opts;
+    this.assertSourceWriteReady(sourceWriteGuard);
+    const record = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
     return this.getUnobservedMessages(messages, record);
   }
 
@@ -3260,9 +3448,14 @@ ${formattedMessages}
    * hasn't been observed yet (e.g. in a stateless gateway proxy that
    * only receives the latest message from the HTTP request).
    */
-  async loadUnobservedMessages(opts: { threadId: string; resourceId?: string }): Promise<MastraDBMessage[]> {
-    const { threadId, resourceId } = opts;
-    const record = await this.getOrCreateRecord(threadId, resourceId);
+  async loadUnobservedMessages(opts: {
+    threadId: string;
+    resourceId?: string;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<MastraDBMessage[]> {
+    const { threadId, resourceId, sourceWriteGuard } = opts;
+    this.assertSourceWriteReady(sourceWriteGuard);
+    const record = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
     const rawMessages = await this.loadMessagesFromStorage(
       threadId,
       resourceId,
@@ -3310,6 +3503,7 @@ ${formattedMessages}
     requestContext?: RequestContext;
     currentModel?: ObservationModelContext;
     observabilityContext?: ObservabilityContext;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
     /** Allow idle-triggered buffering to observe any non-empty candidate set. */
     skipMinimumTokenCheck?: boolean;
     /** Called with the final candidate messages after cursor filtering, before the observer runs.
@@ -3320,8 +3514,12 @@ ${formattedMessages}
     record: ObservationalMemoryRecord;
   }> {
     const { threadId, resourceId, requestContext, observabilityContext } = opts;
+    const sourceWriteGuard = opts.sourceWriteGuard;
+    this.assertSourceWriteReady(sourceWriteGuard);
 
-    let record = opts.record ?? (await this.getOrCreateRecord(threadId, resourceId));
+    let record = sourceWriteGuard
+      ? await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard)
+      : (opts.record ?? (await this.getOrCreateRecord(threadId, resourceId)));
     if (Object.isFrozen(record)) record = { ...record };
     const inMemoryRecord = record;
 
@@ -3379,7 +3577,13 @@ ${formattedMessages}
 
     // Keep the caller's turn-scoped record current while using a fresh storage snapshot
     // for the asynchronous write path.
-    const refreshedRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const refreshedRecord = sourceWriteGuard
+      ? await this.storage.getObservationalMemoryForSourceWrite({
+          threadId,
+          resourceId: sourceWriteGuard.resourceId,
+          sourceWriteGuard,
+        })
+      : await this.storage.getObservationalMemory(record.threadId, record.resourceId);
     if (refreshedRecord) record = { ...refreshedRecord };
     const setBufferingState = (isBufferingObservation: boolean, lastBufferedAtTokens?: number) => {
       inMemoryRecord.isBufferingObservation = isBufferingObservation;
@@ -3457,7 +3661,7 @@ ${formattedMessages}
         threadIds: [threadId],
         config: this.getObservationMarkerConfig(),
       });
-      await this.persistMarkerToStorage(startMarker, threadId, record.resourceId ?? undefined);
+      await this.persistMarkerToStorage(startMarker, threadId, record.resourceId ?? undefined, sourceWriteGuard);
 
       // Emit buffering start marker without letting the stream writer create a separate data-only DB message.
       const writer = opts.writer;
@@ -3486,6 +3690,7 @@ ${formattedMessages}
             currentModel: opts.currentModel,
             observabilityContext,
             trigger: 'async-buffer',
+            sourceWriteGuard,
           }).run(),
       );
 
@@ -3522,7 +3727,14 @@ ${formattedMessages}
       const cursor = new Date(maxTimestamp.getTime() + 1);
       BufferingCoordinator.lastBufferedAtTime.set(bufferKey, cursor);
 
-      const updatedRecord = (await this.storage.getObservationalMemory(record.threadId, record.resourceId)) ?? record;
+      const updatedRecord =
+        (sourceWriteGuard
+          ? await this.storage.getObservationalMemoryForSourceWrite({
+              threadId,
+              resourceId: sourceWriteGuard.resourceId,
+              sourceWriteGuard,
+            })
+          : await this.storage.getObservationalMemory(record.threadId, record.resourceId)) ?? record;
       return { buffered: true, record: updatedRecord };
     } catch (error) {
       omError('[OM] buffer() failed', error);
@@ -3575,14 +3787,20 @@ ${formattedMessages}
     writer?: ProcessorStreamWriter;
     /** MessageList for persisting activation markers on the last assistant message. */
     messageList?: MessageList;
+    /** Captured OM record fence for activation marker writes. */
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{
     activated: boolean;
     record: ObservationalMemoryRecord;
     activatedMessageIds?: string[];
   }> {
     const { threadId, resourceId } = opts;
+    const sourceWriteGuard = opts.sourceWriteGuard;
+    this.assertSourceWriteReady(sourceWriteGuard);
 
-    const record = opts.record ?? (await this.getOrCreateRecord(threadId, resourceId));
+    const record = sourceWriteGuard
+      ? await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard)
+      : (opts.record ?? (await this.getOrCreateRecord(threadId, resourceId)));
 
     // Reset stale lastBufferedBoundary at the start of a new turn.
     // If the stored boundary is far above the current context size, it's
@@ -3648,7 +3866,13 @@ ${formattedMessages}
         activationActivateAfterIdle = activateAfterIdle;
         activateAfterIdleExpiredMs = ttlExpiredMs;
       } else {
-        const status = await this.getStatus({ threadId, resourceId, record, messages: thresholdMessages });
+        const status = await this.getStatus({
+          threadId,
+          resourceId,
+          record,
+          messages: thresholdMessages,
+          sourceWriteGuard,
+        });
         if (status.pendingTokens < status.threshold) {
           return { activated: false, record };
         }
@@ -3676,7 +3900,13 @@ ${formattedMessages}
     }
 
     // Re-fetch to get latest chunks after any completed buffering
-    const freshRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const freshRecord = sourceWriteGuard
+      ? await this.storage.getObservationalMemoryForSourceWrite({
+          threadId,
+          resourceId: sourceWriteGuard.resourceId,
+          sourceWriteGuard,
+        })
+      : await this.storage.getObservationalMemory(record.threadId, record.resourceId);
     if (!freshRecord) {
       return { activated: false, record };
     }
@@ -3713,7 +3943,13 @@ ${formattedMessages}
     unregisterOp(freshRecord.id, 'bufferingObservation');
 
     // Fetch updated record for marker emission
-    const postSwapRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const postSwapRecord = sourceWriteGuard
+      ? await this.storage.getObservationalMemoryForSourceWrite({
+          threadId,
+          resourceId: sourceWriteGuard.resourceId,
+          sourceWriteGuard,
+        })
+      : await this.storage.getObservationalMemory(record.threadId, record.resourceId);
 
     // Emit activation markers for UI feedback — one per activated cycleId
     if (opts.writer && postSwapRecord && activationResult.activatedCycleIds.length > 0) {
@@ -3748,6 +3984,7 @@ ${formattedMessages}
           opts.messageList,
           record.threadId ?? '',
           record.resourceId ?? undefined,
+          sourceWriteGuard,
         );
       }
     }
@@ -3780,7 +4017,7 @@ ${formattedMessages}
       }
     }
 
-    const updatedRecord = await this.getOrCreateRecord(threadId, resourceId);
+    const updatedRecord = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
     return {
       activated: true,
       record: updatedRecord,
@@ -3912,11 +4149,13 @@ ${formattedMessages}
     requestContext?: RequestContext;
     writer?: ProcessorStreamWriter;
     observabilityContext?: ObservabilityContext;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{
     observed: boolean;
     reflected: boolean;
     record: ObservationalMemoryRecord;
   }> {
+    this.assertSourceWriteReady(opts.sourceWriteGuard);
     const { threadId, resourceId, messages, requestContext } = opts;
     const lockKey = this.buffering.getLockKey(threadId, resourceId);
     const trigger = opts.trigger ?? 'manual';
@@ -3936,7 +4175,7 @@ ${formattedMessages}
 
     try {
       await this.withLock(lockKey, async () => {
-        const freshRecord = await this.getOrCreateRecord(threadId, resourceId);
+        const freshRecord = await this.getOrCreateRecord(threadId, resourceId, opts.sourceWriteGuard);
         recordInsideLock = freshRecord;
         generationBefore = freshRecord.generationCount;
 
@@ -3973,6 +4212,7 @@ ${formattedMessages}
           requestContext,
           writer: opts.writer,
           observabilityContext: opts.observabilityContext,
+          sourceWriteGuard: opts.sourceWriteGuard,
         }).run();
         observed = result.observed;
         observationUsage = result.usage;
@@ -4030,12 +4270,14 @@ ${formattedMessages}
     prompt?: string,
     requestContext?: RequestContext,
     observabilityContext?: ObservabilityContext,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<{
     reflected: boolean;
     record: ObservationalMemoryRecord;
     usage?: ObserveHookUsage;
   }> {
-    const record = await this.getOrCreateRecord(threadId, resourceId);
+    this.assertSourceWriteReady(sourceWriteGuard);
+    const record = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
 
     if (!record.activeObservations) {
       return { reflected: false, record, usage: undefined };
@@ -4132,15 +4374,16 @@ ${formattedMessages}
         });
       }
 
-      const updatedRecord = await this.getOrCreateRecord(threadId, resourceId);
+      const updatedRecord = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
       reflectionUsage = reflectResult.usage;
       reflectionProviderMetadata = reflectResult.providerMetadata;
       return { reflected: true, record: updatedRecord, usage: reflectResult.usage };
     } catch (error) {
+      if (error instanceof ObservationalMemorySourceWriteConflictError) throw error;
       reflectionError = error instanceof Error ? error : new Error(String(error));
       if (lifecycleError !== undefined) throw error;
       omError('[OM] reflect() failed', error);
-      const latestRecord = await this.getOrCreateRecord(threadId, resourceId);
+      const latestRecord = await this.getOrCreateRecord(threadId, resourceId, sourceWriteGuard);
       return { reflected: false, record: latestRecord, usage: undefined };
     } finally {
       try {
@@ -4181,7 +4424,14 @@ ${formattedMessages}
   /**
    * Get current record for a thread/resource
    */
-  async getRecord(threadId: string, resourceId?: string): Promise<ObservationalMemoryRecord | null> {
+  async getRecord(
+    threadId: string,
+    resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
+  ): Promise<ObservationalMemoryRecord | null> {
+    if (sourceWriteGuard) {
+      return this.getOrCreateRecord(threadId, sourceWriteGuard.resourceId, sourceWriteGuard);
+    }
     const ids = this.getStorageIds(threadId, resourceId);
     return this.storage.getObservationalMemory(ids.threadId, ids.resourceId);
   }

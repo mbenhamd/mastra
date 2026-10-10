@@ -836,6 +836,16 @@ function titleGenerationTests(version: 'v1' | 'v2') {
         }
         return originalCreateThread(args);
       };
+      // The thread already exists by the time the title lands, so the title is
+      // written through the guarded update path rather than a whole-row upsert.
+      const originalUpdateThread = mockMemory.updateThread.bind(mockMemory);
+      mockMemory.updateThread = async args => {
+        if (args.title) {
+          await titleWriteGate;
+          titlePersisted = true;
+        }
+        return originalUpdateThread(args);
+      };
 
       let testModel: MockLanguageModelV1 | MockLanguageModelV2;
 
@@ -2148,6 +2158,14 @@ function titleGenerationTests(version: 'v1' | 'v2') {
         }
 
         return originalSaveThread(args);
+      });
+      const originalUpdateThread = mockMemory.updateThread.bind(mockMemory);
+      vi.spyOn(mockMemory, 'updateThread').mockImplementation(async args => {
+        if (args.title === titleText) {
+          throw new Error('sqlite write failed');
+        }
+
+        return originalUpdateThread(args);
       });
 
       const titleModel = new MockLanguageModelV2({

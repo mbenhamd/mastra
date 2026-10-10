@@ -7,6 +7,7 @@ import { MastraError, ErrorDomain, ErrorCategory } from '../../error';
 import type { IMastraLogger } from '../../logger';
 import type { AnySpan } from '../../observability/types';
 import { resolveCurrentSpan } from '../../observability/utils';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage';
 import { getTransformedToolPayload, hasTransformedToolPayload } from '../../tools/payload-transform';
 import type { IdGeneratorContext } from '../../types';
 import { deepEqual } from '../../utils';
@@ -343,6 +344,7 @@ export class MessageList {
   constructor({
     threadId,
     resourceId,
+    observationalMemorySourceWriteGuard,
     generateMessageId,
     logger,
     filterIncompleteToolCalls,
@@ -352,20 +354,58 @@ export class MessageList {
   }: {
     threadId?: string;
     resourceId?: string;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
     generateMessageId?: (context?: IdGeneratorContext) => string;
     logger?: IMastraLogger;
     filterIncompleteToolCalls?: boolean;
     logicalMessageIdentity?: LogicalMessageIdentity;
   } = {}) {
     if (threadId) {
-      this.memoryInfo = { threadId, resourceId };
+      this.memoryInfo = {
+        threadId,
+        resourceId,
+        ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
+      };
     }
     this.generateMessageId = generateMessageId;
     this.logger = logger;
     this.filterIncompleteToolCalls = filterIncompleteToolCalls ?? true;
     this._agentNetworkAppend = _agentNetworkAppend || false;
+    if (observationalMemorySourceWriteGuard) {
+      this.setObservationalMemorySourceWriteGuard(observationalMemorySourceWriteGuard);
+    }
+    /** Attach the native identity to the initial input batch. */
     this.logicalMessageIdentity = normalizeLogicalMessageIdentity(logicalMessageIdentity);
     this.logicalMessageInputBatchPending = this.logicalMessageIdentity !== undefined;
+  }
+
+  /** Attach the prepared OM source-write fence to this execution's memory metadata. */
+  public setObservationalMemorySourceWriteGuard(guard: ObservationalMemorySourceWriteGuard): this {
+    const capturedGuard: ObservationalMemorySourceWriteGuard = {
+      recordId: guard.recordId,
+      threadId: guard.threadId,
+      resourceId: guard.resourceId,
+    };
+    if (!this.memoryInfo) {
+      if (!capturedGuard.threadId) {
+        throw new Error('An OM source-write guard requires a threadId when attached to a MessageList.');
+      }
+      this.memoryInfo = {
+        threadId: capturedGuard.threadId,
+        resourceId: capturedGuard.resourceId,
+        observationalMemorySourceWriteGuard: capturedGuard,
+      };
+      return this;
+    }
+
+    if (
+      (capturedGuard.threadId !== null && this.memoryInfo.threadId !== capturedGuard.threadId) ||
+      (this.memoryInfo.resourceId ?? null) !== (capturedGuard.resourceId ?? null)
+    ) {
+      throw new Error('An OM source-write guard must match the MessageList memory coordinates.');
+    }
+    this.memoryInfo = { ...this.memoryInfo, observationalMemorySourceWriteGuard: capturedGuard };
+    return this;
   }
 
   /**

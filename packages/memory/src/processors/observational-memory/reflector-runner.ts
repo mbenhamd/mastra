@@ -7,7 +7,13 @@ import type { MastraMemory } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
 import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { MemoryStorage, ObservationalMemoryRecord, ObservationalMemoryWriteGuard } from '@mastra/core/storage';
+import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
+import type {
+  MemoryStorage,
+  ObservationalMemoryRecord,
+  ObservationalMemorySourceWriteGuard,
+  ObservationalMemoryWriteGuard,
+} from '@mastra/core/storage';
 import type { ProviderMetadata } from '@mastra/core/stream';
 
 import type { Memory } from '../..';
@@ -208,12 +214,14 @@ export class ReflectorRunner {
     marker: { type: string; data: unknown },
     threadId: string,
     resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ) => Promise<void>;
   private readonly persistMarkerToMessage: (
     marker: { type: string; data: unknown },
     messageList: MessageList | undefined,
     threadId: string,
     resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ) => Promise<boolean>;
   private readonly getCompressionStartLevel: (requestContext?: RequestContext) => Promise<CompressionLevel>;
   private readonly memory?: Memory;
@@ -249,12 +257,14 @@ export class ReflectorRunner {
       marker: { type: string; data: unknown },
       threadId: string,
       resourceId?: string,
+      sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
     ) => Promise<void>;
     persistMarkerToMessage: (
       marker: { type: string; data: unknown },
       messageList: MessageList | undefined,
       threadId: string,
       resourceId?: string,
+      sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
     ) => Promise<boolean>;
     getCompressionStartLevel: (requestContext?: RequestContext) => Promise<CompressionLevel>;
     resolveModel: ReflectionModelResolver;
@@ -324,6 +334,21 @@ export class ReflectorRunner {
     };
   }
 
+  private getCurrentRecord(
+    record: ObservationalMemoryRecord,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
+    threadId?: string,
+  ): Promise<ObservationalMemoryRecord | null> {
+    if (sourceWriteGuard) {
+      return this.storage.getObservationalMemoryForSourceWrite({
+        threadId: threadId ?? record.threadId ?? '',
+        resourceId: sourceWriteGuard.resourceId,
+        sourceWriteGuard,
+      });
+    }
+    return this.storage.getObservationalMemory(record.threadId, record.resourceId);
+  }
+
   /**
    * Resolve the effective reflection observationTokens for a record.
    * Only explicit per-record overrides (stored under `_overrides`) win;
@@ -354,6 +379,7 @@ export class ReflectorRunner {
       recordId: string;
       threadId: string;
       resourceId?: string;
+      sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
     },
     observationTokensThreshold?: number,
     abortSignal?: AbortSignal,
@@ -580,7 +606,12 @@ export class ReflectorRunner {
         });
         // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
         await streamContext.writer.custom({ ...failedMarker, transient: true }).catch(() => {});
-        await this.persistMarkerToStorage(failedMarker, streamContext.threadId, streamContext.resourceId);
+        await this.persistMarkerToStorage(
+          failedMarker,
+          streamContext.threadId,
+          streamContext.resourceId,
+          streamContext.sourceWriteGuard,
+        );
 
         const retryCycleId = crypto.randomUUID();
         streamContext.cycleId = retryCycleId;
@@ -597,7 +628,12 @@ export class ReflectorRunner {
         streamContext.startedAt = startMarker.data.startedAt;
         // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
         await streamContext.writer.custom({ ...startMarker, transient: true }).catch(() => {});
-        await this.persistMarkerToStorage(startMarker, streamContext.threadId, streamContext.resourceId);
+        await this.persistMarkerToStorage(
+          startMarker,
+          streamContext.threadId,
+          streamContext.resourceId,
+          streamContext.sourceWriteGuard,
+        );
       }
 
       currentLevel = Math.min(currentLevel + 1, maxLevel) as CompressionLevel;
@@ -677,6 +713,7 @@ export class ReflectorRunner {
     mainAgent?: ProcessorContext['agent'],
     sendSignal?: ProcessorContext['sendSignal'],
     trigger?: ObserveTrigger,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): void {
     const bufferKey = this.buffering.getReflectionBufferKey(lockKey);
 
@@ -712,6 +749,7 @@ export class ReflectorRunner {
           mainAgent,
           sendSignal,
           trigger,
+          sourceWriteGuard,
         );
       } catch (error) {
         reflectionError = error instanceof Error ? error : new Error(String(error));
@@ -729,8 +767,14 @@ export class ReflectorRunner {
             });
             // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
             void writer.custom({ ...failedMarker, transient: true }).catch(() => {});
-            await this.persistMarkerToStorage(failedMarker, record.threadId ?? '', record.resourceId ?? undefined);
+            await this.persistMarkerToStorage(
+              failedMarker,
+              record.threadId ?? '',
+              record.resourceId ?? undefined,
+              sourceWriteGuard,
+            );
           } catch (markerError) {
+            if (markerError instanceof ObservationalMemorySourceWriteConflictError) throw markerError;
             omError(
               '[OM] Failed to persist buffering-failed marker after async buffered reflection failure',
               markerError,
@@ -778,6 +822,7 @@ export class ReflectorRunner {
     mainAgent?: ProcessorContext['agent'],
     sendSignal?: ProcessorContext['sendSignal'],
     trigger?: ObserveTrigger,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<
     | {
         usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
@@ -785,7 +830,7 @@ export class ReflectorRunner {
       }
     | undefined
   > {
-    const freshRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const freshRecord = await this.getCurrentRecord(record, sourceWriteGuard, threadId);
     const currentRecord = freshRecord ?? record;
     const observationTokens = currentRecord.observationTokenCount ?? 0;
     const reflectThreshold = getMaxThreshold(this.getEffectiveReflectionTokens(currentRecord));
@@ -841,7 +886,7 @@ export class ReflectorRunner {
       });
       // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
       void writer.custom({ ...startMarker, transient: true }).catch(() => {});
-      await this.persistMarkerToStorage(startMarker, threadId, currentRecord.resourceId ?? undefined);
+      await this.persistMarkerToStorage(startMarker, threadId, currentRecord.resourceId ?? undefined, sourceWriteGuard);
     }
 
     const compressionStartLevel = await this.getCompressionStartLevel(requestContext);
@@ -915,7 +960,12 @@ export class ReflectorRunner {
       });
       // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
       void writer.custom({ ...endMarker, transient: true }).catch(() => {});
-      await this.persistMarkerToStorage(endMarker, currentRecord.threadId ?? '', currentRecord.resourceId ?? undefined);
+      await this.persistMarkerToStorage(
+        endMarker,
+        currentRecord.threadId ?? '',
+        currentRecord.resourceId ?? undefined,
+        sourceWriteGuard,
+      );
     }
 
     return { usage: reflectResult.usage, providerMetadata: reflectResult.providerMetadata };
@@ -941,6 +991,7 @@ export class ReflectorRunner {
       currentModel?: string;
     },
     committedContext?: Omit<ReflectionCommittedContext, 'observations'>,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<TryActivateResult> {
     const bufferKey = this.buffering.getReflectionBufferKey(lockKey);
 
@@ -966,7 +1017,7 @@ export class ReflectorRunner {
       }
     }
 
-    const freshRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const freshRecord = await this.getCurrentRecord(record, sourceWriteGuard, committedContext?.parentThreadId);
 
     omDebug(
       `[OM:reflect] tryActivateBufferedReflection: recordId=${record.id}, hasBufferedReflection=${!!freshRecord?.bufferedReflection}, bufferedReflectionLen=${freshRecord?.bufferedReflection?.length ?? 0}`,
@@ -1054,7 +1105,7 @@ export class ReflectorRunner {
 
     BufferingCoordinator.lastBufferedBoundary.delete(bufferKey);
 
-    const afterRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const afterRecord = await this.getCurrentRecord(record, sourceWriteGuard, committedContext?.parentThreadId);
     const afterTokens = afterRecord?.observationTokenCount ?? 0;
     omDebug(
       `[OM:reflect] tryActivateBufferedReflection: activation complete! beforeTokens=${beforeTokens}, afterTokens=${afterTokens}, newRecordId=${afterRecord?.id}, newGenCount=${afterRecord?.generationCount}`,
@@ -1090,6 +1141,7 @@ export class ReflectorRunner {
         messageList,
         freshRecord.threadId ?? '',
         freshRecord.resourceId ?? undefined,
+        sourceWriteGuard,
       );
     }
 
@@ -1129,6 +1181,7 @@ export class ReflectorRunner {
     requestContext?: RequestContext;
     observabilityContext?: ObservabilityContext;
     lastActivityAt?: number;
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<void> {
     const {
       record,
@@ -1145,6 +1198,7 @@ export class ReflectorRunner {
       requestContext,
       observabilityContext,
       lastActivityAt,
+      sourceWriteGuard,
       threadId: requestedThreadId,
     } = opts;
     const lockKey = this.buffering.getLockKey(record.threadId, record.resourceId);
@@ -1188,6 +1242,7 @@ export class ReflectorRunner {
           mainAgent,
           sendSignal,
           trigger,
+          sourceWriteGuard,
         );
       }
     }
@@ -1252,6 +1307,7 @@ export class ReflectorRunner {
           abortSignal,
           observabilityContext,
         },
+        sourceWriteGuard,
       );
       if (activationResult.status === 'activated') {
         return;
@@ -1296,6 +1352,7 @@ export class ReflectorRunner {
           mainAgent,
           sendSignal,
           trigger,
+          sourceWriteGuard,
         );
         return;
       }
@@ -1341,7 +1398,7 @@ export class ReflectorRunner {
       });
       // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
       await writer.custom({ ...startMarker, transient: true }).catch(() => {});
-      await this.persistMarkerToStorage(startMarker, threadId, record.resourceId ?? undefined);
+      await this.persistMarkerToStorage(startMarker, threadId, record.resourceId ?? undefined, sourceWriteGuard);
     }
 
     this.emitDebugEvent({
@@ -1361,6 +1418,7 @@ export class ReflectorRunner {
           recordId: record.id,
           threadId,
           resourceId: record.resourceId ?? undefined,
+          sourceWriteGuard,
         }
       : undefined;
 
@@ -1468,7 +1526,7 @@ export class ReflectorRunner {
         });
         // Stream OM lifecycle markers as transient so the OutputWriter does not persist standalone data-only messages; OM persists the durable marker explicitly.
         await writer.custom({ ...endMarker, transient: true }).catch(() => {});
-        await this.persistMarkerToStorage(endMarker, threadId, record.resourceId ?? undefined);
+        await this.persistMarkerToStorage(endMarker, threadId, record.resourceId ?? undefined, sourceWriteGuard);
       }
 
       this.emitDebugEvent({
@@ -1507,6 +1565,7 @@ export class ReflectorRunner {
           messageList,
           threadId,
           record.resourceId ?? undefined,
+          sourceWriteGuard,
         );
       } catch {
         persistedToList = false;
@@ -1514,7 +1573,7 @@ export class ReflectorRunner {
       if (!persistedToList) {
         // Best-effort: a marker storage failure must not replace the reflector error.
         try {
-          await this.persistMarkerToStorage(failedMarker, threadId, record.resourceId ?? undefined);
+          await this.persistMarkerToStorage(failedMarker, threadId, record.resourceId ?? undefined, sourceWriteGuard);
         } catch (markerError) {
           omError('[OM] Failed to persist reflection-failed marker', markerError);
         }

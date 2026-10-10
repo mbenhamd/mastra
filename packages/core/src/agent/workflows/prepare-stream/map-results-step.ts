@@ -102,6 +102,10 @@ export function createMapResultsStep<OUTPUT = undefined>({
               metadata: memoryData.thread?.metadata,
               resourceId: memoryData.thread?.resourceId,
               memoryConfig,
+              // The step callback can run after the thread was erased mid-step;
+              // bind the upsert to this execution's captured source-write fence.
+              observationalMemorySourceWriteGuard:
+                messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard,
             });
 
             threadCreatedByStep = true;

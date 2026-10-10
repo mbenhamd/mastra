@@ -3230,6 +3230,59 @@ describe('ProcessorRunner', () => {
       );
     });
 
+    it('uses the MessageList source guard when durable request context restoration omitted it', async () => {
+      const guard = { recordId: 'record-1', threadId: 'thread-1', resourceId: 'resource-1' };
+      const guardedMessageList = new MessageList({
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        observationalMemorySourceWriteGuard: guard,
+      });
+      const requestContext = new RequestContext();
+      requestContext.set('MastraMemory', {
+        thread: { id: 'thread-1', resourceId: 'resource-1', metadata: {} },
+        resourceId: 'resource-1',
+      });
+      const savedGuards: unknown[] = [];
+      const memory = {
+        getThreadById: vi.fn(async () => ({
+          id: 'thread-1',
+          resourceId: 'resource-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          metadata: {},
+        })),
+        saveThread: vi.fn(async ({ thread, observationalMemorySourceWriteGuard }) => {
+          savedGuards.push(observationalMemorySourceWriteGuard);
+          return thread;
+        }),
+      };
+
+      runner = new ProcessorRunner({
+        inputProcessors: [
+          {
+            id: 'state-processor',
+            computeStateSignal: () => ({ cacheKey: 'guarded-state', contents: 'guarded state' }),
+          },
+        ],
+        outputProcessors: [],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+
+      await runner.runProcessInputStep({
+        messageList: guardedMessageList,
+        stepNumber: 0,
+        steps: [],
+        model: {} as any,
+        tools: {},
+        retryCount: 0,
+        requestContext,
+        memory: memory as any,
+      });
+
+      expect(savedGuards).toEqual([guard]);
+    });
+
     it('computes state signals for processors carried by combined workflows', async () => {
       const requestContext = new RequestContext();
       requestContext.set('MastraMemory', {

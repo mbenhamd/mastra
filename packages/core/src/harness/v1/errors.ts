@@ -892,7 +892,12 @@ export class HarnessSkillArgsValidationError extends Error {
  * changed mid-flight; silently ignoring the override would be a footgun,
  * so the harness rejects at admission. See spec §4.2.
  */
-export type HarnessOverrideConflictField = 'model' | 'mode' | 'addTools' | 'yolo';
+export type HarnessOverrideConflictField =
+  | 'model'
+  | 'mode'
+  | 'addTools'
+  | 'yolo'
+  | 'observationalMemorySourceWriteGuard';
 
 export class HarnessOverrideConflictError extends HarnessError {
   readonly name = 'HarnessOverrideConflictError';

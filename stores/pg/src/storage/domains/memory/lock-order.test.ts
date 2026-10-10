@@ -181,6 +181,29 @@ describe('MemoryPG lock ordering', () => {
     };
   }
 
+  async function blockThreadRow(threadId: string) {
+    const pool = new Pool({ connectionString });
+    const client = await pool.connect();
+    let transactionOpen = true;
+    await client.query('BEGIN');
+    await client.query(`SELECT id FROM "${schemaName}"."mastra_threads" WHERE id = $1 FOR UPDATE`, [threadId]);
+    return {
+      async release() {
+        if (!transactionOpen) return;
+        await client.query('COMMIT');
+        transactionOpen = false;
+      },
+      async close() {
+        if (transactionOpen) {
+          await client.query('ROLLBACK');
+          transactionOpen = false;
+        }
+        client.release();
+        await pool.end();
+      },
+    };
+  }
+
   async function seedClone(
     suffix: string,
     metadata: Record<string, unknown> = {},
@@ -273,6 +296,74 @@ describe('MemoryPG lock ordering', () => {
     await expect(rollbackMemory.getObservationalMemory(threadId, resourceId)).resolves.toMatchObject({
       id: current.id,
     });
+  });
+
+  it('keeps guarded thread working-memory mutation ordered after OM resource acquisition', async () => {
+    const threadId = 'guarded-thread-working-memory-lock-order-thread';
+    const resourceId = 'guarded-thread-working-memory-lock-order-resource';
+    const thread = {
+      id: threadId,
+      resourceId,
+      title: 'Source thread',
+      metadata: {
+        workingMemory: '{"seed":"governed"}',
+        mastra: {
+          workingMemory: {
+            revision: 1,
+            protectedPaths: [],
+            provenance: {},
+          },
+        },
+      },
+      createdAt,
+      updatedAt: createdAt,
+    };
+    await rollbackMemory.saveThread({ thread });
+    const sourceRecord = await rollbackMemory.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+    const sourceWriteGuard = { recordId: sourceRecord.id, threadId, resourceId };
+    const snapshot = await rollbackMemory.getWorkingMemorySnapshot({ scope: 'thread', resourceId, threadId });
+    // Hold the row so the mutation acquires its working-memory lock before
+    // waiting on the row. Against the old order (lifecycle -> WM -> row -> OM), the observer can
+    // then acquire OM and wait for WM while the guarded mutation waits for OM:
+    // releasing this row lock deterministically exposes the inversion.
+    const rowBlocker = await blockThreadRow(threadId);
+    let observerPromise: ReturnType<MemoryPG['applyWorkingMemoryUpdate']> | undefined;
+    let guardedMutationPromise: ReturnType<MemoryPG['mutateThreadWithWorkingMemory']> | undefined;
+    try {
+      guardedMutationPromise = rollbackMemory.mutateThreadWithWorkingMemory({
+        mutation: { type: 'save', thread: { ...thread, title: 'Guarded source update', metadata: {} } },
+        workingMemory: { type: 'require-ungoverned' },
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      });
+      await waitForLockWait(rollbackApplicationName, '%FOR UPDATE%', 'the guarded thread row');
+
+      observerPromise = competitorMemory.applyWorkingMemoryUpdate({
+        scope: 'thread',
+        resourceId,
+        threadId,
+        value: '{"observer":true}',
+        expectedRevision: snapshot.revision,
+        source: 'observer',
+      });
+      await waitForAdvisoryLockWait(competitorApplicationName);
+
+      await rowBlocker.release();
+      const outcomes = await within(
+        Promise.allSettled([observerPromise, guardedMutationPromise]),
+        'guarded thread and observer working-memory lock-order race',
+      );
+      expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
+      expect(outcomes.filter(outcome => outcome.status === 'rejected')).toHaveLength(1);
+      await expect(guardedMutationPromise).rejects.toMatchObject({ name: 'WorkingMemoryValidationError' });
+    } finally {
+      await rowBlocker.close();
+      await Promise.allSettled([observerPromise, guardedMutationPromise].filter(Boolean) as Promise<unknown>[]);
+    }
   });
 
   async function seedCloneWithObservationalMemory(suffix: string): Promise<{

@@ -1,5 +1,6 @@
 import type { MastraMemory } from '../memory/memory';
 import type { MemoryConfigInternal, StorageThreadType } from '../memory/types';
+import type { ObservationalMemorySourceWriteGuard } from '../storage';
 import type { MessageList } from './message-list';
 import type { MastraDBMessage } from './message-list/state/types';
 import { createSignal, mastraDBMessageToSignal } from './signals';
@@ -237,6 +238,7 @@ export async function applyStateSignal({
   resourceId,
   threadId,
   memoryConfig,
+  observationalMemorySourceWriteGuard,
   messageList,
   activeStateSignals,
   defaultId,
@@ -250,6 +252,7 @@ export async function applyStateSignal({
   resourceId: string;
   threadId: string;
   memoryConfig?: MemoryConfigInternal;
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   messageList?: MessageList;
   activeStateSignals?: ActiveStateSignal[];
   defaultId?: string;
@@ -290,12 +293,6 @@ export async function applyStateSignal({
     },
   });
 
-  beforeAddSignal?.();
-  if (messageList) {
-    messageList.addSignal(updatedSignal);
-  }
-  await writeSignal?.(updatedSignal);
-
   const updatedAt = new Date().toISOString();
   const updatedActiveSignals = [...activeSignals, updatedSignal];
   const nextTracking: StateSignalTracking = {
@@ -328,7 +325,16 @@ export async function applyStateSignal({
       metadata: setStateSignalMetadata(thread.metadata, stateId, nextTracking),
     },
     memoryConfig,
+    observationalMemorySourceWriteGuard,
   });
+
+  // Publish only after the (possibly source-write-fenced) metadata write
+  // succeeds, so a rejected write leaves the live transcript and stream intact.
+  beforeAddSignal?.();
+  if (messageList) {
+    messageList.addSignal(updatedSignal);
+  }
+  await writeSignal?.(updatedSignal);
 
   return { skipped: false, signal: updatedSignal, stateId, version, tracking: nextTracking };
 }

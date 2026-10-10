@@ -28,6 +28,7 @@ import type {
   SwapBufferedReflectionToActiveInput,
   CreateReflectionGenerationInput,
   ObservationalMemoryWriteGuard,
+  ObservationalMemorySourceWriteGuard,
   ObservationalMemoryRetractionReceipt,
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
@@ -47,6 +48,28 @@ export class ObservationalMemoryClearConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'ObservationalMemoryClearConflictError';
+  }
+}
+
+export class ObservationalMemorySourceWriteConflictError extends Error {
+  constructor(message = 'Observational memory source write guard is no longer valid.') {
+    super(message);
+    this.name = 'ObservationalMemorySourceWriteConflictError';
+  }
+}
+
+/**
+ * A captured OM source-write guard is only meaningful on an adapter that
+ * validates it; an adapter without the capability would silently ignore it.
+ * Reject before any read or write that would rely on the guard.
+ */
+export function assertObservationalMemorySourceWriteGuardSupported(
+  store: { supportsObservationalMemorySourceWriteGuards?: boolean } | null | undefined,
+): void {
+  if (!store?.supportsObservationalMemorySourceWriteGuards) {
+    throw new ObservationalMemorySourceWriteConflictError(
+      'An observational memory source write guard was supplied but the storage adapter does not support it.',
+    );
   }
 }
 
@@ -99,6 +122,9 @@ export abstract class MemoryStorage extends StorageDomain {
    */
   readonly supportsObservationalMemory?: boolean = false;
 
+  /** Whether source transcript writes can be fenced to an existing OM record. */
+  readonly supportsObservationalMemorySourceWriteGuards?: boolean = false;
+
   /** Whether edit/delete retraction and guarded derived writes are atomic. */
   readonly supportsAtomicObservationalMemoryRetraction?: boolean = false;
 
@@ -142,7 +168,14 @@ export abstract class MemoryStorage extends StorageDomain {
     resourceId?: string;
   }): Promise<StorageThreadType | null>;
 
-  abstract saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType>;
+  abstract saveThread({
+    thread,
+    observationalMemorySourceWriteGuard,
+  }: {
+    thread: StorageThreadType;
+    /** @internal Captured OM fence for preparation-time thread upserts. */
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<StorageThreadType>;
 
   /**
    * Update a thread's title and/or metadata.
@@ -157,10 +190,13 @@ export abstract class MemoryStorage extends StorageDomain {
     id,
     title,
     metadata,
+    observationalMemorySourceWriteGuard,
   }: {
     id: string;
     title?: string;
     metadata?: Record<string, unknown>;
+    /** @internal Captured OM fence for execution-derived thread metadata writes. */
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType>;
 
   /**
@@ -181,10 +217,13 @@ export abstract class MemoryStorage extends StorageDomain {
     id,
     title,
     metadata,
+    observationalMemorySourceWriteGuard,
   }: {
     id: string;
     title?: string;
     metadata?: Record<string, unknown>;
+    /** @internal Captured OM fence for execution-derived thread metadata writes. */
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     if (!this.supportsPartialThreadUpdate && (title === undefined || metadata === undefined)) {
       const existing = await this.getThreadById({ threadId: id });
@@ -197,6 +236,7 @@ export abstract class MemoryStorage extends StorageDomain {
       id,
       ...(title !== undefined ? { title } : {}),
       ...(metadata !== undefined ? { metadata } : {}),
+      ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
     });
   }
 
@@ -278,7 +318,11 @@ export abstract class MemoryStorage extends StorageDomain {
 
   abstract listMessagesById({ messageIds }: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }>;
 
-  abstract saveMessages(args: { messages: MastraDBMessage[] }): Promise<{ messages: MastraDBMessage[] }>;
+  abstract saveMessages(args: {
+    messages: MastraDBMessage[];
+    /** @internal Captured OM record fence for source transcript writes. */
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<{ messages: MastraDBMessage[] }>;
 
   abstract updateMessages(args: {
     messages: (Partial<Omit<MastraDBMessage, 'createdAt'>> & {
@@ -703,6 +747,26 @@ export abstract class MemoryStorage extends StorageDomain {
     _resourceId: string,
   ): Promise<ObservationalMemoryRecord | null> {
     throw new Error(`Observational memory is not implemented by this storage adapter (${this.constructor.name}).`);
+  }
+
+  /**
+   * Atomically validate a captured source-write record and return the active
+   * record for its scope. Reflection may archive the captured record, so the
+   * returned record can be a newer generation. Retraction invalidates the
+   * source guard by removing every record in the scope.
+   *
+   * Native source-fenced adapters must override this operation. A separate
+   * read followed by initialization would allow a revoked guard to recreate
+   * observational memory after retraction.
+   */
+  async getObservationalMemoryForSourceWrite(_input: {
+    threadId: string;
+    resourceId: string;
+    sourceWriteGuard: ObservationalMemorySourceWriteGuard;
+  }): Promise<ObservationalMemoryRecord> {
+    throw new Error(
+      `Atomic observational-memory source-write loading is not implemented by this storage adapter (${this.constructor.name}).`,
+    );
   }
 
   /**

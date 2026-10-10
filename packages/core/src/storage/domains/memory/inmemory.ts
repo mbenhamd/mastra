@@ -30,6 +30,8 @@ import type {
   SwapBufferedReflectionToActiveInput,
   CreateReflectionGenerationInput,
   ObservationalMemoryWriteGuard,
+  ObservationalMemorySourceWriteGuard,
+  ObservationalMemorySourceWriteSuccessor,
   ObservationalMemoryRetractionReceipt,
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
@@ -51,7 +53,11 @@ import {
   validateStorageMetadataFilter,
 } from '../../utils';
 import type { InMemoryDB } from '../inmemory-db';
-import { assertObservationalMemoryClearExpectation, MemoryStorage } from './base';
+import {
+  assertObservationalMemoryClearExpectation,
+  MemoryStorage,
+  ObservationalMemorySourceWriteConflictError,
+} from './base';
 import {
   applyWorkingMemorySnapshotUpdate,
   assertGovernedThreadResourceUnchanged,
@@ -265,9 +271,62 @@ function removeObservationalMemoryMetadata(
   };
 }
 
+const OBSERVATIONAL_MEMORY_SOURCE_WRITE_SUCCESSOR_METADATA_KEY = 'sourceWriteSuccessor';
+
+function getSourceWriteSuccessorPredecessor(
+  record: ObservationalMemoryRecord,
+): ObservationalMemorySourceWriteGuard | undefined {
+  const metadata = isRecord(record.metadata) ? record.metadata : undefined;
+  const successor = metadata?.[OBSERVATIONAL_MEMORY_SOURCE_WRITE_SUCCESSOR_METADATA_KEY];
+  if (!isRecord(successor) || !isRecord(successor.predecessor)) return undefined;
+  const predecessor = successor.predecessor;
+  if (
+    typeof predecessor.recordId !== 'string' ||
+    typeof predecessor.resourceId !== 'string' ||
+    (predecessor.threadId !== null && typeof predecessor.threadId !== 'string')
+  ) {
+    return undefined;
+  }
+  return {
+    recordId: predecessor.recordId,
+    threadId: predecessor.threadId,
+    resourceId: predecessor.resourceId,
+  };
+}
+
+function matchesSourceWriteGuard(
+  record: ObservationalMemoryRecord,
+  guard: ObservationalMemorySourceWriteGuard,
+): boolean {
+  return record.id === guard.recordId && record.threadId === guard.threadId && record.resourceId === guard.resourceId;
+}
+
+function matchesSourceWriteGuardValues(
+  left: ObservationalMemorySourceWriteGuard,
+  right: ObservationalMemorySourceWriteGuard,
+): boolean {
+  return left.recordId === right.recordId && left.threadId === right.threadId && left.resourceId === right.resourceId;
+}
+
+function matchesSourceWriteSuccessor(
+  record: ObservationalMemoryRecord,
+  successor: ObservationalMemorySourceWriteSuccessor,
+  input: RetractObservationalMemoryInput,
+): boolean {
+  const predecessor = getSourceWriteSuccessorPredecessor(record);
+  return (
+    record.id === successor.successorRecordId &&
+    record.threadId === successor.predecessor.threadId &&
+    record.resourceId === input.resourceId &&
+    predecessor !== undefined &&
+    matchesSourceWriteGuardValues(predecessor, successor.predecessor)
+  );
+}
+
 export class InMemoryMemory extends MemoryStorage {
   override readonly supportsPartialThreadUpdate: boolean = true;
   readonly supportsObservationalMemory = true;
+  readonly supportsObservationalMemorySourceWriteGuards = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
@@ -344,8 +403,20 @@ export class InMemoryMemory extends MemoryStorage {
     return cloneThreadBoundary(thread);
   }
 
-  async saveThread({ thread }: { thread: StorageThreadType }): Promise<StorageThreadType> {
+  async saveThread({
+    thread,
+    observationalMemorySourceWriteGuard,
+  }: {
+    thread: StorageThreadType;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<StorageThreadType> {
     const current = this.db.threads.get(thread.id);
+    if (observationalMemorySourceWriteGuard) {
+      this.assertSourceWriteGuardForThread(observationalMemorySourceWriteGuard, thread.id, thread.resourceId);
+      if (current && current.resourceId !== observationalMemorySourceWriteGuard.resourceId) {
+        throw new ObservationalMemorySourceWriteConflictError();
+      }
+    }
     if (current) {
       assertGovernedThreadResourceUnchanged({
         currentResourceId: current.resourceId,
@@ -367,15 +438,20 @@ export class InMemoryMemory extends MemoryStorage {
     id,
     title,
     metadata,
+    observationalMemorySourceWriteGuard,
   }: {
     id: string;
     title?: string;
     metadata?: Record<string, unknown>;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const thread = this.db.threads.get(id);
 
     if (!thread) {
       throw new Error(`Thread with id ${id} not found`);
+    }
+    if (observationalMemorySourceWriteGuard) {
+      this.assertSourceWriteGuardForThread(observationalMemorySourceWriteGuard, id, thread.resourceId);
     }
 
     const mergedMetadata =
@@ -417,8 +493,10 @@ export class InMemoryMemory extends MemoryStorage {
         }
       });
 
-      if (thread?.resourceId) {
-        const input = { resourceId: thread.resourceId, threadId };
+      const input = thread?.resourceId
+        ? { resourceId: thread.resourceId, threadId }
+        : this.resolveObservationalMemoryRetractionInput(threadId);
+      if (input) {
         const result = this.retractObservationalMemoryState(input);
         committedRetraction = { input, result };
       }
@@ -741,8 +819,35 @@ export class InMemoryMemory extends MemoryStorage {
     return { messages: list.get.all.db() };
   }
 
-  async saveMessages(args: { messages: MastraDBMessage[] }): Promise<{ messages: MastraDBMessage[] }> {
+  async saveMessages(args: {
+    messages: MastraDBMessage[];
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+  }): Promise<{ messages: MastraDBMessage[] }> {
     const { messages } = args;
+    const sourceWriteGuard = args.observationalMemorySourceWriteGuard;
+
+    // Keep this validation synchronous with the mutation below. The source
+    // fence authorizes an existing record, including archived generations;
+    // it intentionally does not require the record to remain current.
+    if (sourceWriteGuard) {
+      const record = this.findObservationalMemoryRecordById(sourceWriteGuard.recordId);
+      if (
+        !record ||
+        record.threadId !== sourceWriteGuard.threadId ||
+        record.resourceId !== sourceWriteGuard.resourceId ||
+        messages.some(message => message.resourceId !== sourceWriteGuard.resourceId) ||
+        (sourceWriteGuard.threadId !== null &&
+          messages.some(message => message.threadId !== sourceWriteGuard.threadId)) ||
+        messages.some(message => {
+          if (!message.threadId) return true;
+          const thread = this.db.threads.get(message.threadId);
+          return !thread || thread.resourceId !== sourceWriteGuard.resourceId;
+        })
+      ) {
+        throw new ObservationalMemorySourceWriteConflictError();
+      }
+    }
+
     // Simulate error handling for testing - check before saving
     if (messages.some(msg => msg.id === 'error-message' || msg.resourceId === null)) {
       throw new Error('Simulated error for testing');
@@ -1278,6 +1383,14 @@ export class InMemoryMemory extends MemoryStorage {
       assertThreadWorkingMemoryRemoved(proposedMetadata);
 
       const resourceId = input.mutation.type === 'save' ? input.mutation.thread.resourceId : currentThread!.resourceId;
+      if (input.observationalMemorySourceWriteGuard) {
+        this.assertSourceWriteGuardForThread(input.observationalMemorySourceWriteGuard, threadId, resourceId);
+        if (currentThread && currentThread.resourceId !== input.observationalMemorySourceWriteGuard.resourceId) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'The guarded thread owner changed before the source write could be committed.',
+          );
+        }
+      }
       if (input.mutation.type === 'save' && currentThread) {
         assertGovernedThreadResourceUnchanged({
           currentResourceId: currentThread.resourceId,
@@ -1366,6 +1479,9 @@ export class InMemoryMemory extends MemoryStorage {
       const currentThread = this.db.threads.get(threadId);
       if (input.mutation.type === 'update' && !currentThread) {
         throw new Error(`Thread with id ${threadId} not found`);
+      }
+      if (input.observationalMemorySourceWriteGuard) {
+        this.assertSourceWriteGuardForThread(input.observationalMemorySourceWriteGuard, threadId, resourceId);
       }
       if (currentThread && currentThread.resourceId !== resourceId) {
         throw new WorkingMemoryValidationError('Working-memory thread does not belong to the requested resource.');
@@ -1675,6 +1791,39 @@ export class InMemoryMemory extends MemoryStorage {
     return records?.[0] ? cloneObservationalMemoryBoundary(records[0]) : null;
   }
 
+  async getObservationalMemoryForSourceWrite({
+    threadId,
+    resourceId,
+    sourceWriteGuard,
+  }: {
+    threadId: string;
+    resourceId: string;
+    sourceWriteGuard: ObservationalMemorySourceWriteGuard;
+  }): Promise<ObservationalMemoryRecord> {
+    if (
+      sourceWriteGuard.resourceId !== resourceId ||
+      (sourceWriteGuard.threadId !== null && sourceWriteGuard.threadId !== threadId)
+    ) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write guard does not match the requested record scope.',
+      );
+    }
+
+    const records = this.db.observationalMemory.get(
+      this.getObservationalMemoryKey(sourceWriteGuard.threadId, sourceWriteGuard.resourceId),
+    );
+    const captured = records?.find(record => record.id === sourceWriteGuard.recordId);
+    if (!captured || captured.threadId !== sourceWriteGuard.threadId || captured.resourceId !== resourceId) {
+      throw new ObservationalMemorySourceWriteConflictError();
+    }
+
+    const active = records?.[0];
+    if (!active) {
+      throw new ObservationalMemorySourceWriteConflictError();
+    }
+    return cloneObservationalMemoryBoundary(active);
+  }
+
   async getObservationalMemoryHistory(
     threadId: string | null,
     resourceId: string,
@@ -1700,6 +1849,14 @@ export class InMemoryMemory extends MemoryStorage {
 
   async initializeObservationalMemory(input: CreateObservationalMemoryInput): Promise<ObservationalMemoryRecord> {
     const { threadId, resourceId, scope, config, observedTimezone } = input;
+    if (scope === 'thread' && threadId) {
+      const thread = this.db.threads.get(threadId);
+      if (thread?.resourceId && thread.resourceId !== resourceId) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'Observational memory source-write initialization resource does not own the thread.',
+        );
+      }
+    }
     const key = this.getObservationalMemoryKey(threadId, resourceId);
     const now = new Date();
 
@@ -1779,10 +1936,28 @@ export class InMemoryMemory extends MemoryStorage {
   }
 
   async updateActiveObservations(input: UpdateActiveObservationsInput): Promise<void> {
-    const { id, observations, tokenCount, lastObservedAt, observedMessageIds } = input;
+    const { id, observations, tokenCount, lastObservedAt, observedMessageIds, observationalMemoryWriteGuard } = input;
     const record = this.findObservationalMemoryRecordById(id);
     if (!record) {
       throw new Error(`Observational memory record not found: ${id}`);
+    }
+    if (observationalMemoryWriteGuard) {
+      if (
+        observationalMemoryWriteGuard.recordId !== id ||
+        observationalMemoryWriteGuard.resourceId !== record.resourceId ||
+        observationalMemoryWriteGuard.threadId !== record.threadId
+      ) {
+        throw new Error('Observational memory guard does not match the active observation record.');
+      }
+      const current = this.db.observationalMemory.get(
+        this.getObservationalMemoryKey(
+          observationalMemoryWriteGuard.threadId,
+          observationalMemoryWriteGuard.resourceId,
+        ),
+      )?.[0];
+      if (current?.id !== observationalMemoryWriteGuard.recordId) {
+        throw new Error('Observational memory generation is no longer current.');
+      }
     }
 
     record.activeObservations = observations;
@@ -2169,10 +2344,93 @@ export class InMemoryMemory extends MemoryStorage {
     const clearedScopes: Array<'resource' | 'thread'> = [];
     if (resourceRecords.length > 0) clearedScopes.push('resource');
     if (threadRecords.length > 0) clearedScopes.push('thread');
+
+    const sourceWriteSuccessor = input.sourceWriteSuccessor;
+    let successorRecord: ObservationalMemoryRecord | undefined;
+    if (sourceWriteSuccessor) {
+      if (
+        sourceWriteSuccessor.successorRecordId.length === 0 ||
+        sourceWriteSuccessor.successorRecordId === sourceWriteSuccessor.predecessor.recordId ||
+        sourceWriteSuccessor.predecessor.resourceId !== input.resourceId ||
+        (sourceWriteSuccessor.predecessor.threadId !== null &&
+          sourceWriteSuccessor.predecessor.threadId !== input.threadId)
+      ) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'Observational memory source-write successor coordinates are invalid.',
+        );
+      }
+
+      const scopedRecords = [...resourceRecords, ...threadRecords];
+      const existingSuccessor = this.findObservationalMemoryRecordById(sourceWriteSuccessor.successorRecordId);
+      if (existingSuccessor) {
+        if (
+          !scopedRecords.includes(existingSuccessor) ||
+          !matchesSourceWriteSuccessor(existingSuccessor, sourceWriteSuccessor, input)
+        ) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source-write successor provenance does not match.',
+          );
+        }
+        return {
+          clearedScopes,
+          clearedResourceWorkingMemory: false,
+          clearedThreadMetadata: false,
+          sourceWriteGuard: {
+            recordId: existingSuccessor.id,
+            threadId: existingSuccessor.threadId,
+            resourceId: existingSuccessor.resourceId,
+          },
+        };
+      }
+
+      const predecessorRecord = scopedRecords.find(record =>
+        matchesSourceWriteGuard(record, sourceWriteSuccessor.predecessor),
+      );
+      if (!predecessorRecord) {
+        throw new ObservationalMemorySourceWriteConflictError(
+          'The captured observational memory predecessor no longer exists.',
+        );
+      }
+      successorRecord = {
+        id: sourceWriteSuccessor.successorRecordId,
+        scope: predecessorRecord.scope,
+        threadId: predecessorRecord.threadId,
+        resourceId: predecessorRecord.resourceId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastObservedAt: undefined,
+        originType: 'initial',
+        generationCount: 0,
+        activeObservations: '',
+        totalTokensObserved: 0,
+        observationTokenCount: 0,
+        pendingMessageTokens: 0,
+        isReflecting: false,
+        isObserving: false,
+        isBufferingObservation: false,
+        isBufferingReflection: false,
+        lastBufferedAtTokens: 0,
+        lastBufferedAtTime: null,
+        config: cloneMemoryBoundaryValue(predecessorRecord.config),
+        metadata: {
+          [OBSERVATIONAL_MEMORY_SOURCE_WRITE_SUCCESSOR_METADATA_KEY]: {
+            predecessor: cloneMemoryBoundaryValue(sourceWriteSuccessor.predecessor),
+          },
+        },
+        observedTimezone: predecessorRecord.observedTimezone,
+      };
+    }
+
     this.forgetObservationalMemoryGenerations(resourceRecords);
     this.forgetObservationalMemoryGenerations(threadRecords);
     this.db.observationalMemory.delete(resourceKey);
     this.db.observationalMemory.delete(threadKey);
+
+    if (successorRecord) {
+      const successorKey = this.getObservationalMemoryKey(successorRecord.threadId, successorRecord.resourceId);
+      this.db.observationalMemory.set(successorKey, [cloneObservationalMemoryBoundary(successorRecord, false)]);
+      this.rotateObservationalMemoryGeneration(successorRecord.id);
+    }
 
     const resourceManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(resourceRecords);
     const threadManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(threadRecords);
@@ -2244,6 +2502,15 @@ export class InMemoryMemory extends MemoryStorage {
       clearedScopes,
       clearedResourceWorkingMemory,
       clearedThreadMetadata,
+      ...(successorRecord
+        ? {
+            sourceWriteGuard: {
+              recordId: successorRecord.id,
+              threadId: successorRecord.threadId,
+              resourceId: successorRecord.resourceId,
+            },
+          }
+        : {}),
     };
   }
 
@@ -2284,5 +2551,21 @@ export class InMemoryMemory extends MemoryStorage {
       if (record) return record;
     }
     return null;
+  }
+
+  private assertSourceWriteGuardForThread(
+    guard: ObservationalMemorySourceWriteGuard,
+    threadId: string,
+    resourceId: string,
+  ): void {
+    if (guard.resourceId !== resourceId || (guard.threadId !== null && guard.threadId !== threadId)) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write guard does not match the target thread.',
+      );
+    }
+    const record = this.findObservationalMemoryRecordById(guard.recordId);
+    if (!record || record.threadId !== guard.threadId || record.resourceId !== guard.resourceId) {
+      throw new ObservationalMemorySourceWriteConflictError();
+    }
   }
 }

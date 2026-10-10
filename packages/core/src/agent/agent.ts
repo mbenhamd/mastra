@@ -56,6 +56,7 @@ import { mergeVersionOverrides } from '../mastra/types';
 import type { MastraMemory } from '../memory/memory';
 import { normalizeMessageHistoryConfig } from '../memory/message-history-config';
 import { getMemoryRunState } from '../memory/run-state';
+import { parseMemoryRequestContext } from '../memory/types';
 import type { MemoryConfig, MemoryConfigInternal } from '../memory/types';
 import {
   resolveDeliveryFailureUpdate,
@@ -6098,6 +6099,17 @@ export class Agent<
                 : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
               if (rejectionMemory) {
                 try {
+                  // A resumed delegation reuses the original child thread and
+                  // execution. Never prepare a replacement fence for it: after
+                  // erasure that would mint a fresh OM record and recreate the
+                  // erased thread. Only a first invocation may prepare one.
+                  const isResumedDelegation = suspendedToolRunId !== undefined;
+                  const rejectionSourceWriteGuard = isResumedDelegation
+                    ? undefined
+                    : await rejectionMemory.prepareObservationalMemorySourceWriteGuard(
+                        subAgentThreadId,
+                        subAgentResourceId,
+                      );
                   const userMessage: MastraDBMessage = {
                     id: this.#mastra?.generateId() || randomUUID(),
                     role: 'user',
@@ -6120,11 +6132,17 @@ export class Agent<
                     },
                   };
 
-                  await rejectionMemory.createThread({
-                    resourceId: subAgentResourceId,
-                    threadId: subAgentThreadId,
+                  if (!isResumedDelegation) {
+                    await rejectionMemory.createThread({
+                      resourceId: subAgentResourceId,
+                      threadId: subAgentThreadId,
+                      observationalMemorySourceWriteGuard: rejectionSourceWriteGuard,
+                    });
+                  }
+                  await rejectionMemory.saveMessages({
+                    messages: [userMessage, assistantMessage],
+                    observationalMemorySourceWriteGuard: rejectionSourceWriteGuard,
                   });
-                  await rejectionMemory.saveMessages({ messages: [userMessage, assistantMessage] });
                 } catch (memoryError) {
                   this.logger.error('Failed to save rejection to sub-agent memory', {
                     agent: this.name,
@@ -6190,6 +6208,27 @@ export class Agent<
               // undefined runId into resumeGenerate/resumeStream and throw
               // AGENT_RESUME_NO_SNAPSHOT_FOUND before the sub-agent ever runs. See issue #21608.
               const shouldResumeSubAgent = !!resumeData && !!suspendedToolRunId;
+              // The projection after the child run writes the delegated transcript
+              // into the child's memory at (subAgentThreadId, subAgentResourceId).
+              // Capture its source-write fence for exactly those coordinates before
+              // the run, so an erasure during the run revokes it. Resolve the memory
+              // once and hand the same instance to the child execution. A resumed
+              // delegation continues an earlier execution and never mints a new
+              // fence. Only the generate/stream paths below (built-in or custom
+              // sub-agents) project into memory; the v1 legacy paths do not.
+              const projectsDelegationToMemory = supportedLanguageModelSpecifications.includes(resolvedModelVersion);
+              const projectionMemory = projectsDelegationToMemory
+                ? inheritParentMemory
+                  ? memory
+                  : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext })
+                : undefined;
+              const projectionSourceWriteGuard =
+                shouldResumeSubAgent || !projectionMemory
+                  ? undefined
+                  : await projectionMemory.prepareObservationalMemorySourceWriteGuard(
+                      subAgentThreadId,
+                      subAgentResourceId,
+                    );
               // Apply messageFilter callback (runs after onDelegationStart so effectivePrompt
               // reflects any hook modifications). Falls back to full context on error.
               let filteredContextMessages = sanitizedMessages;
@@ -6224,8 +6263,13 @@ export class Agent<
               // config of its own. The prompt message format and the memory option passed to
               // generate/stream below must stay in lockstep on this condition.
               const injectSupervisorMemory = Boolean(resourceId && threadId && !resolvedHasOwnMemoryConfig);
+              // When the child runs on the projection coordinates it must reuse the
+              // fence captured above instead of preparing a replacement.
               const subAgentMemoryOption = injectSupervisorMemory
                 ? {
+                    ...(projectionSourceWriteGuard
+                      ? { observationalMemorySourceWriteGuard: projectionSourceWriteGuard }
+                      : {}),
                     memory: {
                       resource: subAgentResourceId,
                       thread: subAgentThreadId,
@@ -6339,10 +6383,7 @@ export class Agent<
               const subAgentAbortOptions = context?.abortSignal ? { abortSignal: context.abortSignal } : {};
               subAgentMemoryHandoff =
                 resolvedAgent instanceof Agent && supportedLanguageModelSpecifications.includes(resolvedModelVersion)
-                  ? await resolvedAgent.#createResolvedMemoryHandoff(
-                      subAgentRunId,
-                      inheritParentMemory ? { value: memory } : undefined,
-                    )
+                  ? await resolvedAgent.#createResolvedMemoryHandoff(subAgentRunId, { value: projectionMemory })
                   : undefined;
               const executionAgent: Pick<SubAgent, 'generate' | 'stream' | 'resumeGenerate' | 'resumeStream'> =
                 subAgentMemoryHandoff
@@ -6445,18 +6486,22 @@ export class Agent<
                   : [subAgentUserMessage, ...agentResponseMessages];
 
                 // Save response messages to sub-agent's memory so the UI can display them
-                const memory = subAgentMemoryHandoff
-                  ? subAgentExecutionMemory?.value
-                  : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
+                const memory = subAgentMemoryHandoff ? subAgentExecutionMemory?.value : projectionMemory;
                 if (memory) {
                   try {
-                    await memory.createThread({
-                      resourceId: effectiveGenerateResourceId,
-                      threadId: effectiveGenerateThreadId,
-                    });
+                    // A resumed run's thread already exists; never upsert it, so an
+                    // erased thread is not recreated by a late projection.
+                    if (!shouldResumeSubAgent) {
+                      await memory.createThread({
+                        resourceId: effectiveGenerateResourceId,
+                        threadId: effectiveGenerateThreadId,
+                        observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
+                      });
+                    }
 
                     await memory.saveMessages({
                       messages: fullSubAgentMessages,
+                      observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
                     });
                   } catch (memoryError) {
                     this.logger.error('Failed to save messages to sub-agent memory', {
@@ -6629,18 +6674,22 @@ export class Agent<
                   : [subAgentUserMessage, ...agentResponseMessages];
 
                 // Save response messages to sub-agent's memory so the UI can display them
-                const streamMemory = subAgentMemoryHandoff
-                  ? subAgentExecutionMemory?.value
-                  : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
+                const streamMemory = subAgentMemoryHandoff ? subAgentExecutionMemory?.value : projectionMemory;
                 if (streamMemory) {
                   try {
-                    await streamMemory.createThread({
-                      resourceId: effectiveStreamResourceId,
-                      threadId: effectiveStreamThreadId,
-                    });
+                    // A resumed run's thread already exists; never upsert it, so an
+                    // erased thread is not recreated by a late projection.
+                    if (!shouldResumeSubAgent) {
+                      await streamMemory.createThread({
+                        resourceId: effectiveStreamResourceId,
+                        threadId: effectiveStreamThreadId,
+                        observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
+                      });
+                    }
 
                     await streamMemory.saveMessages({
                       messages: fullSubAgentMessages,
+                      observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
                     });
                   } catch (memoryError) {
                     this.logger.error('Failed to save messages to sub-agent memory', {
@@ -6787,6 +6836,8 @@ export class Agent<
                       try {
                         await supervisorMemory.saveMessages({
                           messages: [feedbackMessage],
+                          observationalMemorySourceWriteGuard:
+                            parseMemoryRequestContext(parentRequestContext)?.observationalMemorySourceWriteGuard,
                         });
                       } catch (memoryError) {
                         this.logger.error('Failed to save feedback to supervisor memory', {
@@ -6882,6 +6933,8 @@ export class Agent<
                       try {
                         await supervisorMemory.saveMessages({
                           messages: [feedbackMessage],
+                          observationalMemorySourceWriteGuard:
+                            parseMemoryRequestContext(parentRequestContext)?.observationalMemorySourceWriteGuard,
                         });
                       } catch (memoryError) {
                         this.logger.error('Failed to save feedback to supervisor memory', {
@@ -9581,6 +9634,7 @@ export class Agent<
     });
 
     const memoryRunState = memory ? getMemoryRunState(requestContext, memory, threadId, resourceId) : undefined;
+    const observationalMemorySourceWriteGuard = messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard;
     // Re-read the latest thread so metadata written mid-run (working memory,
     // processors) is not overwritten by the pre-run snapshot.
     const thread = (!readOnlyMemory && threadId ? await memory?.getThreadById({ threadId }) : undefined) ?? threadAfter;
@@ -9619,6 +9673,7 @@ export class Agent<
             title: thread.title,
             memoryConfig,
             resourceId: thread.resourceId,
+            observationalMemorySourceWriteGuard,
           });
         }
 
@@ -9670,13 +9725,25 @@ export class Agent<
               )
                 .then(async title => {
                   if (title) {
-                    await memory.createThread({
-                      threadId: thread.id,
-                      resourceId,
-                      memoryConfig,
-                      title,
-                      metadata: thread.metadata,
-                    });
+                    const latestThread = await memory.getThreadById({ threadId: thread.id });
+                    if (latestThread) {
+                      await memory.updateThread({
+                        id: thread.id,
+                        title,
+                        metadata: latestThread.metadata ?? thread.metadata ?? {},
+                        memoryConfig,
+                        observationalMemorySourceWriteGuard,
+                      });
+                    } else {
+                      await memory.createThread({
+                        threadId: thread.id,
+                        resourceId,
+                        memoryConfig,
+                        title,
+                        metadata: thread.metadata,
+                        observationalMemorySourceWriteGuard,
+                      });
+                    }
 
                     if (emitEvent && writer && !abortSignal?.aborted) {
                       try {
