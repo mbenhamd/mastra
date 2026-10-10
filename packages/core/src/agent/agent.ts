@@ -5852,11 +5852,6 @@ export class Agent<
                   key !== MASTRA_INHERITED_MEMORY_KEY,
               ),
             );
-            // The child captures its own source fence during memory preparation. Read it
-            // back for the projection writes below; never recapture after a child run,
-            // because that could turn a revoked execution into a fresh OM generation.
-            const getSubAgentSourceWriteGuard = () =>
-              parseMemoryRequestContext(subAgentRequestContext)?.observationalMemorySourceWriteGuard;
 
             // Expand `contextFromRefs` into the prompt before any hook runs so
             // onDelegationStart and messageFilter see the prompt the sub-agent
@@ -6109,14 +6104,12 @@ export class Agent<
                   // erasure that would mint a fresh OM record and recreate the
                   // erased thread. Only a first invocation may prepare one.
                   const isResumedDelegation = suspendedToolRunId !== undefined;
-                  const rejectionSourceWriteGuard =
-                    getSubAgentSourceWriteGuard() ??
-                    (isResumedDelegation
-                      ? undefined
-                      : await rejectionMemory.prepareObservationalMemorySourceWriteGuard(
-                          subAgentThreadId,
-                          subAgentResourceId,
-                        ));
+                  const rejectionSourceWriteGuard = isResumedDelegation
+                    ? undefined
+                    : await rejectionMemory.prepareObservationalMemorySourceWriteGuard(
+                        subAgentThreadId,
+                        subAgentResourceId,
+                      );
                   const userMessage: MastraDBMessage = {
                     id: this.#mastra?.generateId() || randomUUID(),
                     role: 'user',
@@ -6215,6 +6208,21 @@ export class Agent<
               // undefined runId into resumeGenerate/resumeStream and throw
               // AGENT_RESUME_NO_SNAPSHOT_FOUND before the sub-agent ever runs. See issue #21608.
               const shouldResumeSubAgent = !!resumeData && !!suspendedToolRunId;
+              // The projection after the child run writes the delegated transcript
+              // into the child's memory at (subAgentThreadId, subAgentResourceId).
+              // Capture its source-write fence for exactly those coordinates before
+              // the run, so an erasure during the run revokes it. A resumed
+              // delegation continues an earlier execution and never mints a new one.
+              const projectionMemory = inheritParentMemory
+                ? memory
+                : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
+              const projectionSourceWriteGuard =
+                shouldResumeSubAgent || !projectionMemory
+                  ? undefined
+                  : await projectionMemory.prepareObservationalMemorySourceWriteGuard(
+                      subAgentThreadId,
+                      subAgentResourceId,
+                    );
               // Apply messageFilter callback (runs after onDelegationStart so effectivePrompt
               // reflects any hook modifications). Falls back to full context on error.
               let filteredContextMessages = sanitizedMessages;
@@ -6475,16 +6483,19 @@ export class Agent<
                   : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
                 if (memory) {
                   try {
-                    const subAgentSourceWriteGuard = getSubAgentSourceWriteGuard();
-                    await memory.createThread({
-                      resourceId: effectiveGenerateResourceId,
-                      threadId: effectiveGenerateThreadId,
-                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
-                    });
+                    // A resumed run's thread already exists; never upsert it, so an
+                    // erased thread is not recreated by a late projection.
+                    if (!shouldResumeSubAgent) {
+                      await memory.createThread({
+                        resourceId: effectiveGenerateResourceId,
+                        threadId: effectiveGenerateThreadId,
+                        observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
+                      });
+                    }
 
                     await memory.saveMessages({
                       messages: fullSubAgentMessages,
-                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
+                      observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
                     });
                   } catch (memoryError) {
                     this.logger.error('Failed to save messages to sub-agent memory', {
@@ -6662,16 +6673,19 @@ export class Agent<
                   : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
                 if (streamMemory) {
                   try {
-                    const subAgentSourceWriteGuard = getSubAgentSourceWriteGuard();
-                    await streamMemory.createThread({
-                      resourceId: effectiveStreamResourceId,
-                      threadId: effectiveStreamThreadId,
-                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
-                    });
+                    // A resumed run's thread already exists; never upsert it, so an
+                    // erased thread is not recreated by a late projection.
+                    if (!shouldResumeSubAgent) {
+                      await streamMemory.createThread({
+                        resourceId: effectiveStreamResourceId,
+                        threadId: effectiveStreamThreadId,
+                        observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
+                      });
+                    }
 
                     await streamMemory.saveMessages({
                       messages: fullSubAgentMessages,
-                      observationalMemorySourceWriteGuard: subAgentSourceWriteGuard,
+                      observationalMemorySourceWriteGuard: projectionSourceWriteGuard,
                     });
                   } catch (memoryError) {
                     this.logger.error('Failed to save messages to sub-agent memory', {
