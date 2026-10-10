@@ -290,7 +290,7 @@ describe('Harness subagent provider lineage (real exporter)', () => {
     }
   });
 
-  it('joins a durable delegation to the parent trace without tying it to the parent turn', async () => {
+  it('joins a durable delegation to the parent trace and its trace settings without tying it to the parent turn', async () => {
     const requestId = 'parent-turn-request-5258-delegated';
     const exporter = new TestExporter();
     const createdTaskIds: string[] = [];
@@ -364,7 +364,7 @@ describe('Harness subagent provider lineage (real exporter)', () => {
           instructions: 'Plan and delegate.',
           model: rootModel,
           memory: new MockMemory({ storage }),
-          defaultOptions: { tracingOptions: { metadata: { requestId } } },
+          defaultOptions: { tracingOptions: { metadata: { requestId }, hideInput: true } },
         }),
         'child-agent': new Agent({
           id: 'child-agent',
@@ -446,6 +446,9 @@ describe('Harness subagent provider lineage (real exporter)', () => {
       expect(childGeneration!.traceId).toBe(rootRun!.traceId);
       expect(childGeneration!.metadata?.requestId).toBe(requestId);
       expect(childGeneration!.metadata?.runId).toBe(childRun!.metadata?.runId);
+      // The parent's trace-level settings hold across the delegation boundary.
+      expect(childGeneration!.input).toBeUndefined();
+      expect(childRun!.input).toBeUndefined();
       expect(exporter.getIncompleteSpans()).toHaveLength(0);
     } finally {
       releaseChild();

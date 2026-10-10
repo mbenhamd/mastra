@@ -1992,6 +1992,14 @@ interface CreateBaseOptions<TType extends SpanType> {
   tracingPolicy?: TracingPolicy;
   /** Request Context for metadata extraction */
   requestContext?: RequestContext;
+  /**
+   * Keep a child span out of its parent's open-descendant tracking, so the
+   * parent's `endTree()` never ends it. The span still inherits the parent's
+   * trace, sampling decision, trace state and metadata. Use it for work that
+   * legitimately outlives its parent span, such as a detached background run;
+   * its owner must end it.
+   */
+  detachedLifetime?: boolean;
 }
 
 /**
