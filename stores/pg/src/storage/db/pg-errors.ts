@@ -1,3 +1,7 @@
+import { getStoragePersistenceFailure } from '@mastra/core/storage';
+import type { StoragePersistenceFailure } from '@mastra/core/storage';
+import { getPgTransactionFailurePhase } from '../client';
+
 /**
  * Postgres error classifiers for concurrent DDL.
  *
@@ -44,4 +48,157 @@ export function isDuplicateSchemaError(error: unknown): boolean {
   if (code === '42P06') return true;
   if (code === '23505' && constraint === 'pg_namespace_nspname_index') return true;
   return /schema .* already exists/i.test(message);
+}
+
+/**
+ * SQLSTATE classes that only arise while a statement is parsed, planned,
+ * executed or pre-commit checked, so their error response proves the write
+ * rolled back even when it answered a COMMIT or an autocommit write: data
+ * exceptions (22), integrity violations including deferred constraints (23),
+ * serialization failures and deadlocks (40, except 40003 "statement completion
+ * unknown"), syntax or access errors (42) and unsupported features (0A).
+ * PostgreSQL cannot abort a transaction after its commit record is durable, so
+ * any other error answering a COMMIT or an autocommit write, such as running
+ * out of memory, a shutdown or an internal error, may follow a commit.
+ */
+function isDefinitiveRollbackSqlState(code: string): boolean {
+  if (code === '40003') return false;
+  return ['22', '23', '40', '42', '0A'].includes(code.slice(0, 2));
+}
+
+/**
+ * SQLSTATE values a later attempt can get past: transaction rollback
+ * conflicts (class 40), exhausted resources (class 53), lock and object-in-use
+ * waits, statement or session timeouts and cancellations, server shutdown,
+ * connection failures (class 08) and server I/O errors.
+ */
+function isTransientSqlState(code: string): boolean {
+  return (
+    (code.startsWith('40') && code !== '40002') ||
+    code.startsWith('53') ||
+    code.startsWith('08') ||
+    code === '55P03' ||
+    code === '55006' ||
+    code === '57014' ||
+    code === '57P01' ||
+    code === '57P02' ||
+    code === '57P03' ||
+    code === '57P05' ||
+    code === '25P03' ||
+    code === '25P04' ||
+    code === '58030'
+  );
+}
+
+/** A PostgreSQL server error response carries a five-character SQLSTATE and a severity. */
+function pgSqlState(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const { code, severity } = error as { code?: unknown; severity?: unknown };
+  return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && typeof severity === 'string' ? code : undefined;
+}
+
+/**
+ * Socket errors that only occur while establishing a connection: name
+ * resolution failed or the server refused the connection, so no statement was
+ * sent.
+ */
+const UNSENT_SOCKET_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+/**
+ * Socket errors that can also end an established connection after a statement
+ * reached the server. Routing errors belong here: the kernel reports them for
+ * an established connection whose retransmissions fail.
+ */
+const IN_FLIGHT_SOCKET_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ECONNABORTED',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+]);
+/**
+ * node-postgres and pg-pool raise these without a code. The first group fails
+ * before a statement is written to the connection; the second ends a
+ * connection or abandons a statement that may already be executing.
+ */
+const UNSENT_DRIVER_MESSAGES = new Set([
+  'timeout exceeded when trying to connect',
+  'Connection terminated due to connection timeout',
+  'Client has encountered a connection error and is not queryable',
+  'Client was closed and is not queryable',
+  'timeout expired',
+]);
+const IN_FLIGHT_DRIVER_MESSAGES = new Set([
+  'Connection terminated unexpectedly',
+  'Connection terminated',
+  'Query read timeout',
+]);
+
+type TransportFailure = 'unsent' | 'in_flight';
+
+const MAX_CLASSIFIED_CAUSE_DEPTH = 8;
+
+function causeChain(error: unknown): unknown[] {
+  const chain: unknown[] = [];
+  let candidate = error;
+  while (chain.length < MAX_CLASSIFIED_CAUSE_DEPTH && typeof candidate === 'object' && candidate !== null) {
+    chain.push(candidate);
+    candidate = (candidate as { cause?: unknown }).cause;
+  }
+  return chain;
+}
+
+function pgTransportFailure(error: unknown): TransportFailure | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  if (typeof code === 'string') {
+    if (UNSENT_SOCKET_CODES.has(code)) return 'unsent';
+    if (IN_FLIGHT_SOCKET_CODES.has(code)) return 'in_flight';
+  }
+  if (typeof message === 'string') {
+    if (UNSENT_DRIVER_MESSAGES.has(message)) return 'unsent';
+    if (IN_FLIGHT_DRIVER_MESSAGES.has(message)) return 'in_flight';
+  }
+  return undefined;
+}
+
+/**
+ * Classify a failed PostgreSQL storage operation for the shared storage
+ * persistence failure contract (`@mastra/core/storage`).
+ *
+ * `write` says whether the operation can mutate durable state; a read-only
+ * operation (even one inside a transaction) is never `commit_unknown`. A failure is
+ * `commit_unknown` only when a write may have reached its commit point: the
+ * COMMIT of a `tx()`, or an autocommit write statement, lost its connection or
+ * got a server error that does not prove a rollback.
+ * A `tx()` failure before COMMIT was sent, a read, or a definitive
+ * server rejection never committed, and is `transient` or `permanent` by its
+ * cause. Errors without a server or connection cause (validation, contract
+ * and programming errors) are `permanent`. A classification already present
+ * on the error or its causes is kept.
+ */
+export function classifyPgPersistenceFailure(error: unknown, { write }: { write: boolean }): StoragePersistenceFailure {
+  const existing = getStoragePersistenceFailure(error);
+  if (existing) return existing;
+
+  // Domain code can wrap the driver error before it leaves a transaction, so
+  // the phase and the driver cause are each taken from the nearest link of the
+  // bounded cause chain that carries one.
+  const chain = causeChain(error);
+  const phase = chain.map(getPgTransactionFailurePhase).find(value => value !== undefined);
+  const mayHaveCommitted = write && (phase === 'commit' || phase === undefined);
+  for (const link of chain) {
+    const sqlState = pgSqlState(link);
+    if (sqlState !== undefined) {
+      if (mayHaveCommitted && !isDefinitiveRollbackSqlState(sqlState)) return 'commit_unknown';
+      return isTransientSqlState(sqlState) ? 'transient' : 'permanent';
+    }
+    const transport = pgTransportFailure(link);
+    if (transport !== undefined) {
+      return mayHaveCommitted && transport === 'in_flight' ? 'commit_unknown' : 'transient';
+    }
+  }
+  // Only the driver can fail a COMMIT; an unrecognized failure of a write's
+  // COMMIT is not a definitive rollback.
+  return write && phase === 'commit' ? 'commit_unknown' : 'permanent';
 }

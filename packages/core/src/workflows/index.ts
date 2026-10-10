@@ -29,6 +29,7 @@ export * from './state-reader';
 export * from './terminal-recovery';
 export * from './create';
 export * from './lifecycle-events';
+export type { WorkflowLifecycleErrorId } from './lifecycle-errors';
 export { WorkflowCancelRequestedError } from './cancel-request';
 export type { WorkflowCancelRequestInput, WorkflowCancelRequestOutcome } from './cancel-request';
 export * from './dynamic';

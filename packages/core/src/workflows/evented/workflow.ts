@@ -93,6 +93,7 @@ import type {
 } from '../../workflows/types';
 import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from '../constants';
 import type { ClassifierStepOutput } from '../entry-executors';
+import { workflowRunNotSuspendedError, workflowSnapshotNotFoundError } from '../lifecycle-errors';
 import { createWorkflowExecutionGeneration, requireWorkflowExecutionGeneration } from '../lifecycle-events';
 import type { WorkflowExecutionGeneration, WorkflowStepLifecycleStateMap } from '../lifecycle-events';
 import { validateCron } from '../scheduler/cron';
@@ -2662,12 +2663,16 @@ export class EventedRun<
     }
     const snapshot = await waitForSuspendedSnapshot(workflowsStore, this.workflowId, this.runId);
     if (!snapshot) {
-      throw new Error(`Cannot resume workflow: no snapshot found for runId ${this.runId}`);
+      throw workflowSnapshotNotFoundError({
+        workflowId: this.workflowId,
+        runId: this.runId,
+        text: `Cannot resume workflow: no snapshot found for runId ${this.runId}`,
+      });
     }
 
     // Check if workflow is suspended before proceeding
     if (snapshot.status !== 'suspended') {
-      throw new Error('This workflow run was not suspended');
+      throw workflowRunNotSuspendedError({ workflowId: this.workflowId, runId: this.runId, status: snapshot.status });
     }
 
     if (params.label !== undefined && (typeof params.label !== 'string' || params.label.length === 0)) {
