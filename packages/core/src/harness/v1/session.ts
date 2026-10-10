@@ -21274,12 +21274,6 @@ export class Session {
     parentTracingContext?: TracingContext,
   ): Promise<void> {
     let outcome: DelegatedSubagentOutcome = 'failed';
-    // The delegation outlives the delegating tool call, so its child runs
-    // attach to a delegation span in the parent trace rather than to the
-    // tool call's live span (subagent-tracing.ts). A restart re-drive has no
-    // live parent span; its child runs start their own trace.
-    const delegationSpan = startDelegatedSubagentSpan(parentTracingContext, agentType);
-    child._subagentTracingContext = delegationSpan !== undefined ? { currentSpan: delegationSpan } : undefined;
     let rawResult: unknown;
     let publicError: { code: string; message: string } | undefined;
     // §SA2 — fold the detached child's live progress into the parent's display
@@ -21366,6 +21360,13 @@ export class Session {
       modelId,
       depth: childDepth,
     });
+    // The delegation outlives the delegating tool call, so its child runs
+    // attach to a detached-lifetime delegation span in the parent trace
+    // (subagent-tracing.ts). Started immediately before the try so the
+    // finally always ends it. A restart re-drive has no live parent span; its
+    // child runs start their own trace.
+    const delegationSpan = startDelegatedSubagentSpan(parentTracingContext, agentType);
+    child._subagentTracingContext = delegationSpan !== undefined ? { currentSpan: delegationSpan } : undefined;
     try {
       // The deadline covers admission/dispatch as well as the eventual result.
       // Racing only the returned result leaves a storage/provider stall inside
