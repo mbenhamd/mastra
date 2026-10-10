@@ -6214,9 +6214,9 @@ export class Agent<
               // the run, so an erasure during the run revokes it. Resolve the memory
               // once and hand the same instance to the child execution. A resumed
               // delegation continues an earlier execution and never mints a new
-              // fence; only the handoff paths below project into memory.
-              const projectsDelegationToMemory =
-                resolvedAgent instanceof Agent && supportedLanguageModelSpecifications.includes(resolvedModelVersion);
+              // fence. Only the generate/stream paths below (built-in or custom
+              // sub-agents) project into memory; the v1 legacy paths do not.
+              const projectsDelegationToMemory = supportedLanguageModelSpecifications.includes(resolvedModelVersion);
               const projectionMemory = projectsDelegationToMemory
                 ? inheritParentMemory
                   ? memory
@@ -6486,9 +6486,7 @@ export class Agent<
                   : [subAgentUserMessage, ...agentResponseMessages];
 
                 // Save response messages to sub-agent's memory so the UI can display them
-                const memory = subAgentMemoryHandoff
-                  ? subAgentExecutionMemory?.value
-                  : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
+                const memory = subAgentMemoryHandoff ? subAgentExecutionMemory?.value : projectionMemory;
                 if (memory) {
                   try {
                     // A resumed run's thread already exists; never upsert it, so an
@@ -6676,9 +6674,7 @@ export class Agent<
                   : [subAgentUserMessage, ...agentResponseMessages];
 
                 // Save response messages to sub-agent's memory so the UI can display them
-                const streamMemory = subAgentMemoryHandoff
-                  ? subAgentExecutionMemory?.value
-                  : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
+                const streamMemory = subAgentMemoryHandoff ? subAgentExecutionMemory?.value : projectionMemory;
                 if (streamMemory) {
                   try {
                     // A resumed run's thread already exists; never upsert it, so an

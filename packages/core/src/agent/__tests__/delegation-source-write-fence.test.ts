@@ -184,3 +184,63 @@ describe('delegation child execution source-write fence', () => {
     await expect(store.getObservationalMemory(target.threadId, target.resourceId!)).resolves.toBeNull();
   });
 });
+
+describe('custom sub-agent projection source-write fence', () => {
+  it('does not let the projection recreate a thread erased while a custom sub-agent ran', async () => {
+    const childMemory = new FencedMockMemory();
+    const store = (await childMemory.storage.getStore('memory'))!;
+    const prepared: Array<{ threadId: string; resourceId?: string }> = [];
+    const prepare = childMemory.prepareObservationalMemorySourceWriteGuard.bind(childMemory);
+    childMemory.prepareObservationalMemorySourceWriteGuard = async (threadId, resourceId) => {
+      prepared.push({ threadId, resourceId });
+      return prepare(threadId, resourceId);
+    };
+    const customChild = {
+      id: 'custom-child',
+      name: 'custom-child',
+      getDescription: () => 'Custom child',
+      getModel: () => new MockLanguageModelV2({}),
+      getInstructions: () => 'test',
+      hasOwnMemory: () => true,
+      __setMemory: () => {},
+      getMemory: () => childMemory,
+      generate: async () => {
+        // Authoritative erasure lands while the custom child is running.
+        const target = prepared[0]!;
+        await store.retractObservationalMemory({ resourceId: target.resourceId!, threadId: target.threadId });
+        await store.deleteThread({ threadId: target.threadId });
+        return { text: 'custom answer' };
+      },
+      stream: async () => ({}) as any,
+      resumeGenerate: async () => undefined as any,
+      resumeStream: async () => undefined as any,
+    } as any;
+    const parentModel = new MockLanguageModelV2({});
+    const parent = new Agent({
+      id: 'parent',
+      name: 'parent',
+      instructions: 'test',
+      model: parentModel,
+      agents: { customChild },
+    });
+    const tools = await (parent as any).listAgentTools({
+      runId: 'parent-run',
+      threadId: 'parent-thread',
+      resourceId: 'parent-resource',
+      requestContext: new RequestContext(),
+      methodType: 'generate',
+      getModel: async () => parentModel,
+    });
+
+    await tools['agent-customChild']
+      .execute(
+        { prompt: 'delegate', threadId: 'parent-thread', resourceId: 'parent-resource' },
+        { toolCallId: 'call-1', messages: [] },
+      )
+      .catch(() => undefined);
+
+    expect(prepared).toHaveLength(1);
+    const target = prepared[0]!;
+    await expect(store.getThreadById({ threadId: target.threadId })).resolves.toBeNull();
+  });
+});
