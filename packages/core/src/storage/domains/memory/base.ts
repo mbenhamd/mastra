@@ -58,6 +58,21 @@ export class ObservationalMemorySourceWriteConflictError extends Error {
   }
 }
 
+/**
+ * A captured OM source-write guard is only meaningful on an adapter that
+ * validates it; an adapter without the capability would silently ignore it.
+ * Reject before any read or write that would rely on the guard.
+ */
+export function assertObservationalMemorySourceWriteGuardSupported(
+  store: { supportsObservationalMemorySourceWriteGuards?: boolean } | null | undefined,
+): void {
+  if (!store?.supportsObservationalMemorySourceWriteGuards) {
+    throw new ObservationalMemorySourceWriteConflictError(
+      'An observational memory source write guard was supplied but the storage adapter does not support it.',
+    );
+  }
+}
+
 export function assertObservationalMemoryClearExpectation(
   currentRecord: Pick<ObservationalMemoryRecord, 'id' | 'resourceId'> | null,
   expectedResourceId: string,

@@ -1980,6 +1980,29 @@ describe('Memory', () => {
   });
 
   describe('observational memory source-write fencing', () => {
+    it('rejects a supplied guard on an adapter without source-write guard support before writing', async () => {
+      const storage = new InMemoryStore();
+      const memoryStore = (await storage.getStore('memory'))!;
+      Object.defineProperty(memoryStore, 'supportsObservationalMemorySourceWriteGuards', { value: false });
+      const memory = new Memory({ storage });
+      const guard = { recordId: 'record-1', threadId: 'unsupported-thread', resourceId: 'unsupported-resource' };
+
+      await expect(
+        memory.saveThread({
+          thread: {
+            id: 'unsupported-thread',
+            resourceId: 'unsupported-resource',
+            title: '',
+            metadata: {},
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          observationalMemorySourceWriteGuard: guard,
+        }),
+      ).rejects.toThrow('does not support it');
+      await expect(memoryStore.getThreadById({ threadId: 'unsupported-thread' })).resolves.toBeNull();
+    });
+
     it('rejects enabling source fencing only through per-execution memory config', () => {
       const memory = new Memory({
         storage: new InMemoryStore(),

@@ -8,6 +8,7 @@ import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
 import type { MastraMemory } from '../../memory/memory';
 import type { MemoryConfig, MemoryConfig as _MemoryConfig, StorageThreadType } from '../../memory/types';
+import { assertObservationalMemorySourceWriteGuardSupported } from '../../storage';
 import { EntityType, SpanType, createObservabilityContext, getOrCreateSpan } from '../../observability';
 import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
 import type { ProcessorState } from '../../processors/runner';
@@ -722,6 +723,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         messageList.setObservationalMemorySourceWriteGuard(observationalMemorySourceWriteGuard);
         execOptions.observationalMemorySourceWriteGuard = observationalMemorySourceWriteGuard;
       }
+    }
+    if (observationalMemorySourceWriteGuard && memory) {
+      assertObservationalMemorySourceWriteGuardSupported(await memory.storage.getStore('memory'));
     }
     if (memory && threadId && resourceId) {
       const existingThread = await memory.getThreadById({ threadId });

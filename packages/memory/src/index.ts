@@ -40,7 +40,10 @@ import type {
   OutputProcessorOrWorkflow,
 } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
+import {
+  assertObservationalMemorySourceWriteGuardSupported,
+  ObservationalMemorySourceWriteConflictError,
+} from '@mastra/core/storage';
 import type {
   StorageListThreadsInput,
   StorageListThreadsOutput,
@@ -1232,6 +1235,9 @@ export class Memory extends MastraMemory {
     observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const config = this.getMergedThreadConfig(memoryConfig || {});
+    if (observationalMemorySourceWriteGuard) {
+      assertObservationalMemorySourceWriteGuardSupported(await this.getMemoryStore());
+    }
     const managedWorkingMemory = this.getManagedWorkingMemoryFromMetadata({
       workingMemory: thread.metadata?.workingMemory,
       memoryConfig: config,
@@ -1386,6 +1392,9 @@ export class Memory extends MastraMemory {
     observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const config = this.getMergedThreadConfig(memoryConfig || {});
+    if (observationalMemorySourceWriteGuard) {
+      assertObservationalMemorySourceWriteGuardSupported(await this.getMemoryStore());
+    }
     const managedWorkingMemory = this.getManagedWorkingMemoryFromMetadata({
       workingMemory: metadata?.workingMemory,
       memoryConfig: config,
@@ -2425,6 +2434,9 @@ ${workingMemory}`;
         .get.all.db();
 
       const memoryStore = await this.getMemoryStore();
+      if (observationalMemorySourceWriteGuard) {
+        assertObservationalMemorySourceWriteGuardSupported(memoryStore);
+      }
       if (omConfig?.sourceWriteFencing === 'required' && !memoryStore.supportsObservationalMemorySourceWriteGuards) {
         throw new ObservationalMemorySourceWriteConflictError(
           'Observational memory source write fencing is required but the storage adapter does not support it.',

@@ -8,7 +8,10 @@ import type { MemoryConfigInternal, StorageThreadType } from '../../../memory/ty
 import { resolveObservabilityContext } from '../../../observability';
 import type { ProcessorState } from '../../../processors/runner';
 import type { RequestContext } from '../../../request-context';
-import { ObservationalMemorySourceWriteConflictError } from '../../../storage';
+import {
+  assertObservationalMemorySourceWriteGuardSupported,
+  ObservationalMemorySourceWriteConflictError,
+} from '../../../storage';
 import type { ObservationalMemorySourceWriteGuard } from '../../../storage';
 import { createStep } from '../../../workflows/workflow';
 import type { InnerAgentExecutionOptions } from '../../agent.types';
@@ -182,6 +185,9 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
         if (observationalMemorySourceWriteGuard) {
           options.observationalMemorySourceWriteGuard = observationalMemorySourceWriteGuard;
         }
+      }
+      if (observationalMemorySourceWriteGuard && memory) {
+        assertObservationalMemorySourceWriteGuardSupported(await memory.storage.getStore('memory'));
       }
       const messageList = new MessageList({
         threadId: thread?.id,
