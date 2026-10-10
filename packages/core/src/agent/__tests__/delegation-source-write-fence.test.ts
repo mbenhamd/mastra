@@ -118,3 +118,69 @@ describe('delegation projection source-write fence', () => {
     expect(projected.messages.map(message => message.role)).toEqual(expect.arrayContaining(['user', 'assistant']));
   });
 });
+
+describe('delegation child execution source-write fence', () => {
+  it('reuses the captured projection fence so an erasure before the child run is not undone', async () => {
+    const childMemory = new FencedMockMemory();
+    const store = (await childMemory.storage.getStore('memory'))!;
+    const prepared: Array<{ threadId: string; resourceId?: string }> = [];
+    const prepare = childMemory.prepareObservationalMemorySourceWriteGuard.bind(childMemory);
+    childMemory.prepareObservationalMemorySourceWriteGuard = async (threadId, resourceId) => {
+      prepared.push({ threadId, resourceId });
+      return prepare(threadId, resourceId);
+    };
+    const child = new Agent({
+      id: 'child',
+      name: 'child',
+      description: 'Child agent',
+      instructions: 'test',
+      model: new MockLanguageModelV2({
+        doGenerate: async () => ({
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          content: [{ type: 'text', text: 'child answer' }],
+          warnings: [],
+        }),
+      }),
+      memory: childMemory,
+    });
+    const parentModel = new MockLanguageModelV2({});
+    const parent = new Agent({
+      id: 'parent',
+      name: 'parent',
+      instructions: 'test',
+      model: parentModel,
+      agents: { child },
+    });
+    const tools = await (parent as any).listAgentTools({
+      runId: 'parent-run',
+      threadId: 'parent-thread',
+      resourceId: 'parent-resource',
+      requestContext: new RequestContext(),
+      methodType: 'generate',
+      getModel: async () => parentModel,
+      delegation: {
+        // Authoritative erasure of the delegation coordinates lands after the
+        // fence was captured but before the child run starts.
+        messageFilter: async ({ messages }: { messages: unknown[] }) => {
+          const target = prepared[0]!;
+          await store.retractObservationalMemory({ resourceId: target.resourceId!, threadId: target.threadId });
+          await store.deleteThread({ threadId: target.threadId });
+          return messages;
+        },
+      },
+    });
+
+    await tools['agent-child']
+      .execute(
+        { prompt: 'delegate', threadId: 'parent-thread', resourceId: 'parent-resource' },
+        { toolCallId: 'call-1', messages: [] },
+      )
+      .catch(() => undefined);
+
+    const target = prepared[0]!;
+    await expect(store.getThreadById({ threadId: target.threadId })).resolves.toBeNull();
+    await expect(store.getObservationalMemory(target.threadId, target.resourceId!)).resolves.toBeNull();
+  });
+});

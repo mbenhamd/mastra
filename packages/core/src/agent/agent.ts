@@ -6211,11 +6211,17 @@ export class Agent<
               // The projection after the child run writes the delegated transcript
               // into the child's memory at (subAgentThreadId, subAgentResourceId).
               // Capture its source-write fence for exactly those coordinates before
-              // the run, so an erasure during the run revokes it. A resumed
-              // delegation continues an earlier execution and never mints a new one.
-              const projectionMemory = inheritParentMemory
-                ? memory
-                : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext });
+              // the run, so an erasure during the run revokes it. Resolve the memory
+              // once and hand the same instance to the child execution. A resumed
+              // delegation continues an earlier execution and never mints a new
+              // fence; only the handoff paths below project into memory.
+              const projectsDelegationToMemory =
+                resolvedAgent instanceof Agent && supportedLanguageModelSpecifications.includes(resolvedModelVersion);
+              const projectionMemory = projectsDelegationToMemory
+                ? inheritParentMemory
+                  ? memory
+                  : await resolvedAgent.getMemory({ requestContext: subAgentRequestContext })
+                : undefined;
               const projectionSourceWriteGuard =
                 shouldResumeSubAgent || !projectionMemory
                   ? undefined
@@ -6257,8 +6263,13 @@ export class Agent<
               // config of its own. The prompt message format and the memory option passed to
               // generate/stream below must stay in lockstep on this condition.
               const injectSupervisorMemory = Boolean(resourceId && threadId && !resolvedHasOwnMemoryConfig);
+              // When the child runs on the projection coordinates it must reuse the
+              // fence captured above instead of preparing a replacement.
               const subAgentMemoryOption = injectSupervisorMemory
                 ? {
+                    ...(projectionSourceWriteGuard
+                      ? { observationalMemorySourceWriteGuard: projectionSourceWriteGuard }
+                      : {}),
                     memory: {
                       resource: subAgentResourceId,
                       thread: subAgentThreadId,
@@ -6372,10 +6383,7 @@ export class Agent<
               const subAgentAbortOptions = context?.abortSignal ? { abortSignal: context.abortSignal } : {};
               subAgentMemoryHandoff =
                 resolvedAgent instanceof Agent && supportedLanguageModelSpecifications.includes(resolvedModelVersion)
-                  ? await resolvedAgent.#createResolvedMemoryHandoff(
-                      subAgentRunId,
-                      inheritParentMemory ? { value: memory } : undefined,
-                    )
+                  ? await resolvedAgent.#createResolvedMemoryHandoff(subAgentRunId, { value: projectionMemory })
                   : undefined;
               const executionAgent: Pick<SubAgent, 'generate' | 'stream' | 'resumeGenerate' | 'resumeStream'> =
                 subAgentMemoryHandoff
