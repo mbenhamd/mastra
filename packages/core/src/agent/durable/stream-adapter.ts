@@ -187,7 +187,9 @@ export function createTerminalToolResultEnvelope(
  * processor retained the authoritative message unchanged. The marker is
  * identified by its framework part id across the response, because a final
  * output processor may re-identify the message that carries it (for example a
- * memory processor that stamps a deterministic storage id).
+ * memory processor that stamps a deterministic storage id). Earlier terminal
+ * parts of other runs may legitimately sit in the response (a signal boundary
+ * promotes recalled history), so only parts with this run's id count.
  */
 export function assertTerminalToolResultRetained(
   messageList: MessageList,
@@ -197,10 +199,13 @@ export function assertTerminalToolResultRetained(
     .db()
     .flatMap(message =>
       typeof message.content === 'object' && Array.isArray(message.content.parts)
-        ? message.content.parts.filter(part => part.type === 'data-terminal-tool-result')
+        ? message.content.parts.filter(
+            part => part.type === 'data-terminal-tool-result' && 'id' in part && part.id === envelope.id,
+          )
         : [],
     ) as Array<{ type: 'data-terminal-tool-result'; id: string; data: unknown }>;
-  if (terminalParts.length !== 1 || terminalParts[0]?.id !== envelope.id) {
+  const [retained] = terminalParts;
+  if (terminalParts.length !== 1 || retained === undefined) {
     throw new TerminalToolResultIntegrityError(
       'Final output processors did not retain exactly one authoritative terminal tool result',
     );
@@ -208,7 +213,7 @@ export function assertTerminalToolResultRetained(
 
   let retainedData: ReturnType<typeof materializeTerminalToolResult>;
   try {
-    retainedData = materializeTerminalToolResult(terminalParts[0].data);
+    retainedData = materializeTerminalToolResult(retained.data);
   } catch {
     throw new TerminalToolResultIntegrityError('Final output processors produced an invalid terminal tool result');
   }
