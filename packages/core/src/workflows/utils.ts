@@ -6,6 +6,7 @@ import { getRequestContextInputValues } from '../request-context/input-source';
 import type { StandardSchemaWithJSON } from '../schema';
 import { removeUndefinedValues } from '../utils';
 import type { ExecutionGraph } from './execution-engine';
+import { workflowRunNotActiveError } from './lifecycle-errors';
 import type { Step } from './step';
 import { getEntryId } from './step-entry';
 import type {
@@ -592,7 +593,7 @@ export const createRestartExecutionParams = ({
       //only nested workflows have input data in context when it's still pending
       nestedWorkflowPending = true;
     } else {
-      throw new Error('This workflow run was not active');
+      throw workflowRunNotActiveError({ runId: snapshot.runId, status: snapshot.status });
     }
   }
 

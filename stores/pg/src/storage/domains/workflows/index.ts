@@ -170,6 +170,7 @@ import type { DbClient, TxClient } from '../../client';
 import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../../db';
 import type { PgDomainConfig } from '../../db';
 import { buildConstraintName, truncateIdentifierWithHash } from '../../db/constraint-utils';
+import { classifyPgPersistenceFailure } from '../../db/pg-errors';
 import { PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, sanitizeJsonForPg, toPgJson } from '../../db/sanitize-json';
 import { getSchemaSnapshot } from '../../db/schema-snapshot';
 import type { SchemaCheckConstraint } from '../../db/schema-snapshot';
@@ -484,7 +485,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           id: createStorageErrorId('PG', operation.toUpperCase(), 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { workflowName, runId },
+          details: { workflowName, runId, persistenceFailure: classifyPgPersistenceFailure(error, { write: true }) },
         },
         error,
       );
@@ -724,7 +725,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           id: createStorageErrorId('PG', 'PERSIST_WORKFLOW_STEP_UPDATE', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { workflowName, runId },
+          details: { workflowName, runId, persistenceFailure: classifyPgPersistenceFailure(error, { write: true }) },
         },
         error,
       );
@@ -1806,14 +1807,29 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.bumpWorkflowParentRevision(t, input.workflowName, input.runId, parentRevision);
   }
 
-  private terminalizationError(operation: string, workflowName: string, runId: string, error: unknown): never {
+  // Terminalization and snapshot-handoff operations are classified as writes
+  // unless the caller passes `{ write: false }` for a pure read: several
+  // lookups (for example GET_WORKFLOW_TERMINAL_PARENT_CONTEXT) latch state
+  // inside their transaction, and a read wrongly treated as a write can only
+  // be reported commit_unknown, never falsely as not applied.
+  private terminalizationError(
+    operation: string,
+    workflowName: string,
+    runId: string,
+    error: unknown,
+    { write }: { write: boolean } = { write: true },
+  ): never {
     if (error instanceof TypeError || error instanceof RangeError) throw error;
     throw new MastraError(
       {
         id: createStorageErrorId('PG', operation, 'FAILED'),
         domain: ErrorDomain.STORAGE,
         category: ErrorCategory.THIRD_PARTY,
-        details: { workflowName, runId },
+        details: {
+          workflowName,
+          runId,
+          persistenceFailure: classifyPgPersistenceFailure(error, { write }),
+        },
       },
       error,
     );
@@ -1824,12 +1840,15 @@ export class WorkflowsPG extends WorkflowsStorage {
     workflowName: string | undefined,
     runId: string | undefined,
     error: unknown,
+    { write }: { write: boolean } = { write: true },
   ): Error {
     // The fence error must reach callers as its own instanceof-checkable type;
     // validation TypeErrors/RangeErrors likewise keep their identity.
     if (error instanceof WorkflowSnapshotHandoffFenceError) return error;
     if (error instanceof TypeError || error instanceof RangeError) return error;
-    const details: Record<string, string> = {};
+    const details: Record<string, string> = {
+      persistenceFailure: classifyPgPersistenceFailure(error, { write }),
+    };
     if (workflowName !== undefined) details.workflowName = workflowName;
     if (runId !== undefined) details.runId = runId;
     return new MastraError(
@@ -1998,6 +2017,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         input.workflowName,
         input.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2071,7 +2091,9 @@ export class WorkflowsPG extends WorkflowsStorage {
     try {
       return await this.getTerminalizationObservation(operation.workflowName, operation.runId);
     } catch (error) {
-      return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', operation.workflowName, operation.runId, error);
+      return this.terminalizationError('GET_WORKFLOW_TERMINALIZATION', operation.workflowName, operation.runId, error, {
+        write: false,
+      });
     }
   }
 
@@ -2158,6 +2180,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2623,6 +2646,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2768,6 +2792,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -2927,6 +2952,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         operation.workflowName,
         operation.runId,
         error,
+        { write: false },
       );
     }
   }
@@ -4995,7 +5021,12 @@ export class WorkflowsPG extends WorkflowsStorage {
           id: createStorageErrorId('PG', 'BIND_WORKFLOW_NESTED_RUN_OWNERSHIP', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { workflowName: operation.workflowName, runId: operation.runId, stepId: operation.stepId },
+          details: {
+            workflowName: operation.workflowName,
+            runId: operation.runId,
+            stepId: operation.stepId,
+            persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
+          },
         },
         error,
       );
@@ -5536,7 +5567,9 @@ export class WorkflowsPG extends WorkflowsStorage {
       );
       decoded = rows.map(row => this.decodeWorkflowSnapshotHandoff(row));
     } catch (error) {
-      throw this.snapshotHandoffError('LIST_WORKFLOW_SNAPSHOT_HANDOFFS', input.workflowName, undefined, error);
+      throw this.snapshotHandoffError('LIST_WORKFLOW_SNAPSHOT_HANDOFFS', input.workflowName, undefined, error, {
+        write: false,
+      });
     }
     const page = decoded.slice(0, limit);
     const hasMore = decoded.length > limit;
@@ -5650,6 +5683,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: {
+            persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
             workflowName,
             runId,
             stepId,
@@ -5782,6 +5816,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: {
+            persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
             workflowName,
             runId,
           },
@@ -5872,6 +5907,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           id: createStorageErrorId('PG', 'PERSIST_WORKFLOW_SNAPSHOT', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
+          details: { workflowName, runId, persistenceFailure: classifyPgPersistenceFailure(error, { write: true }) },
         },
         error,
       );
@@ -5898,6 +5934,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           id: createStorageErrorId('PG', 'LOAD_WORKFLOW_SNAPSHOT', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
+          details: { workflowName, runId, persistenceFailure: classifyPgPersistenceFailure(error, { write: false }) },
         },
         error,
       );
@@ -5958,7 +5995,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           id: createStorageErrorId('PG', 'GET_WORKFLOW_EXECUTION_STATE', 'FAILED'),
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
-          details: { workflowName, runId },
+          details: { workflowName, runId, persistenceFailure: classifyPgPersistenceFailure(error, { write: false }) },
         },
         error,
       );
@@ -6013,6 +6050,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: {
+            persistenceFailure: classifyPgPersistenceFailure(error, { write: false }),
             runId,
             workflowName: workflowName || '',
           },
@@ -6053,6 +6091,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: {
+            persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
             runId,
             workflowName,
           },
@@ -6187,6 +6226,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: {
+            persistenceFailure: classifyPgPersistenceFailure(error, { write: false }),
             workflowName: workflowName || 'all',
           },
         },

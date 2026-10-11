@@ -1,6 +1,7 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { IMastraLogger } from '../logger';
 import type { WorkflowsStorage } from '../storage/domains/workflows/base';
+import { workflowSnapshotNotFoundError } from './lifecycle-errors';
 import type { WorkflowRunState } from './types';
 
 export async function claimWorkflowResume({
@@ -45,7 +46,13 @@ export async function claimWorkflowResume({
   if (claimed) return;
 
   const current = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
-  if (!current) throw new Error('No snapshot found for this workflow run: ' + workflowId + ' ' + runId);
+  if (!current) {
+    throw workflowSnapshotNotFoundError({
+      workflowId,
+      runId,
+      text: 'No snapshot found for this workflow run: ' + workflowId + ' ' + runId,
+    });
+  }
 
   throw new MastraError({
     id: 'WORKFLOW_RESUME_ALREADY_CLAIMED',

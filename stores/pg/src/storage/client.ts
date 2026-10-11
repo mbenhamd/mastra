@@ -93,6 +93,39 @@ export interface TxClient {
 }
 
 /**
+ * Where a failed `tx()` stopped. `before_commit` means COMMIT was never sent,
+ * so the transaction cannot have committed: the failure came from acquiring
+ * the connection, BEGIN, the callback or draining its queries. `commit` means
+ * the COMMIT statement itself failed; whether it committed then depends on the
+ * failure (a definitive server rejection rolled back, a lost connection did
+ * not say).
+ */
+export type PgTransactionFailurePhase = 'before_commit' | 'commit';
+
+const transactionFailurePhases = new WeakMap<object, PgTransactionFailurePhase>();
+
+/**
+ * Record the phase an error escaped `tx()` from. The first recorded phase
+ * wins: an error that left an inner transaction from its COMMIT keeps that
+ * phase when an enclosing transaction rethrows it.
+ */
+function markTransactionFailure(error: unknown, phase: PgTransactionFailurePhase): unknown {
+  if (typeof error === 'object' && error !== null && !transactionFailurePhases.has(error)) {
+    transactionFailurePhases.set(error, phase);
+  }
+  return error;
+}
+
+/**
+ * The phase in which `error` escaped a `DbClient.tx()` call, or `undefined`
+ * when it did not come out of a transaction (an autocommit statement, or code
+ * outside the client).
+ */
+export function getPgTransactionFailurePhase(error: unknown): PgTransactionFailurePhase | undefined {
+  return typeof error === 'object' && error !== null ? transactionFailurePhases.get(error) : undefined;
+}
+
+/**
  * Truncate a query string for error messages.
  */
 function truncateQuery(query: string, maxLength = 100): string {
@@ -162,14 +195,17 @@ export class PoolAdapter implements DbClient {
   }
 
   async tx<T>(callback: (t: TxClient) => Promise<T>): Promise<T> {
-    const client = await this.$pool.connect();
+    let commitSent = false;
+    let client: PoolClient | undefined;
     try {
+      client = await this.$pool.connect();
       await client.query('BEGIN');
       const txClient = new TransactionClient(client);
       try {
         const result = await callback(txClient);
         // Drain before COMMIT so fire-and-forget / batch tails can't race it.
         await txClient.drain();
+        commitSent = true;
         await client.query('COMMIT');
         return result;
       } catch (error) {
@@ -185,8 +221,10 @@ export class PoolAdapter implements DbClient {
         }
         throw error;
       }
+    } catch (error) {
+      throw markTransactionFailure(error, commitSent ? 'commit' : 'before_commit');
     } finally {
-      client.release();
+      client?.release();
     }
   }
 }
@@ -435,21 +473,27 @@ export class PinnedClientAdapter implements DbClient {
     // Enqueue the entire BEGIN/work/COMMIT block so concurrent callers
     // can't interleave statements inside someone else's transaction.
     return this.#enqueue(async () => {
-      await this.pinnedClient.query('BEGIN');
-      const txClient = new TransactionClient(this.pinnedClient);
+      let commitSent = false;
       try {
-        const result = await callback(txClient);
-        await txClient.drain();
-        await this.pinnedClient.query('COMMIT');
-        return result;
-      } catch (error) {
-        await txClient.drain().catch(() => undefined);
+        await this.pinnedClient.query('BEGIN');
+        const txClient = new TransactionClient(this.pinnedClient);
         try {
-          await this.pinnedClient.query('ROLLBACK');
-        } catch (rollbackError) {
-          console.error('Transaction rollback failed:', rollbackError);
+          const result = await callback(txClient);
+          await txClient.drain();
+          commitSent = true;
+          await this.pinnedClient.query('COMMIT');
+          return result;
+        } catch (error) {
+          await txClient.drain().catch(() => undefined);
+          try {
+            await this.pinnedClient.query('ROLLBACK');
+          } catch (rollbackError) {
+            console.error('Transaction rollback failed:', rollbackError);
+          }
+          throw error;
         }
-        throw error;
+      } catch (error) {
+        throw markTransactionFailure(error, commitSent ? 'commit' : 'before_commit');
       }
     });
   }
