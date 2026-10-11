@@ -6991,27 +6991,28 @@ export class HarnessPG extends HarnessStorage {
   // Run summaries (span-summary O1/O2)
   // -------------------------------------------------------------------------
 
-  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary | null> {
     await this.#ensureRunSummariesTable();
     const namespace = this.#resolveHarnessName(summary.harnessName);
     const stored: HarnessRunSummary = { ...summary, harnessName: namespace };
     const cols = runSummaryColumnValues(stored);
     // A summary is written only while its session exists: the session row is
-    // share locked (session before summaries, as deleteSessions locks them),
-    // so a concurrent delete either waits for this write and then deletes it,
-    // or commits first and this write is dropped. A deleted session never
-    // regains a summary from a late write.
+    // key-share locked (session before summaries, as deleteSessions locks
+    // them), so a concurrent delete either waits for this write and then
+    // deletes it, or commits first and this write is dropped. A deleted
+    // session never regains a summary from a late write. KEY SHARE conflicts
+    // with the delete but not with lease renewals or version writes.
     const tx = await this.#client.transaction('write');
     try {
       const live = await tx.execute({
         sql: `SELECT 1 FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ? AND resource_id = ? AND thread_id = ?
-              FOR SHARE`,
+              FOR KEY SHARE`,
         args: [namespace, summary.sessionId, summary.resourceId, summary.threadId],
       });
       if (live.rows.length === 0) {
         await tx.rollback();
-        return stored;
+        return null;
       }
       // First-terminal-wins idempotency: a later write for the same (harness, run)
       // is a no-op.

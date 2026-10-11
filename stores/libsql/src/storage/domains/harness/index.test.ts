@@ -269,12 +269,12 @@ describe('HarnessLibSQL attachments', () => {
     });
 
     const saved = await storage.saveRunSummary({ summary: mk('rs-1', 100) as any });
-    expect(saved.durationMs).toBe(10);
+    expect(saved?.durationMs).toBe(10);
     const again = await storage.saveRunSummary({
       summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any,
     });
-    expect(again.durationMs).toBe(10);
-    expect(again.status).toBe('completed');
+    expect(again?.durationMs).toBe(10);
+    expect(again?.status).toBe('completed');
 
     const loaded = await storage.loadRunSummary({ runId: 'rs-1' });
     expect(loaded?.reconstructed).toBe(false);

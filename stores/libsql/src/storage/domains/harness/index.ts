@@ -2451,7 +2451,7 @@ export class HarnessLibSQL extends HarnessStorage {
   // Run summaries (span-summary O1/O2)
   // -------------------------------------------------------------------------
 
-  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary | null> {
     await this.#ensureRunSummariesTable();
     const namespace = this.#resolveHarnessName(summary.harnessName);
     const stored: HarnessRunSummary = { ...summary, harnessName: namespace };
@@ -2469,7 +2469,7 @@ export class HarnessLibSQL extends HarnessStorage {
       });
       if (live.rows.length === 0) {
         await tx.rollback();
-        return stored;
+        return null;
       }
       // First-terminal-wins idempotency.
       await tx.execute({
@@ -2480,7 +2480,8 @@ export class HarnessLibSQL extends HarnessStorage {
       });
       await tx.commit();
     } catch (err) {
-      if (!tx.closed) await tx.rollback();
+      // The original failure wins over a failed rollback.
+      if (!tx.closed) await tx.rollback().catch(() => undefined);
       throw err;
     }
     const existing = await this.loadRunSummary({ harnessName: namespace, runId: summary.runId });

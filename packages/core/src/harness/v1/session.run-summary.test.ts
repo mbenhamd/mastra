@@ -287,9 +287,9 @@ describe('span-summary — durable run history (Slice B)', () => {
     };
     const first = await storage.saveRunSummary({ summary: { ...base, durationMs: 5 } });
     const second = await storage.saveRunSummary({ summary: { ...base, durationMs: 999, status: 'failed' } });
-    expect(first.durationMs).toBe(5);
-    expect(second.durationMs).toBe(5);
-    expect(second.status).toBe('completed');
+    expect(first?.durationMs).toBe(5);
+    expect(second?.durationMs).toBe(5);
+    expect(second?.status).toBe('completed');
   });
 
   it('composite keyset paging returns same-completedAt rows without skipping (InMemory)', async () => {
