@@ -113,6 +113,71 @@ describe('run usage across suspension (PF-5349 #5)', () => {
     }
   });
 
+  it('reports both billed steps when a resumed run suspends again in a later step', async () => {
+    // Step 1 suspends on approval; after approval step 1 settles (its
+    // step-finish clears the pending usage) and step 2 suspends on a second
+    // approval. The interim suspended result must be step 1 + step 2, not a
+    // stale step-1 pending value.
+    const applyEdit = createTool({
+      id: 'applyEdit',
+      description: 'apply an edit',
+      inputSchema: z.object({ text: z.string() }),
+      requireApproval: true,
+      execute: async () => ({ applied: true }),
+    });
+    let calls = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        calls++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            calls === 1
+              ? toolCallStream('call-edit-1', 'applyEdit', '{"text":"a"}')
+              : calls === 2
+                ? convertArrayToReadableStream([
+                    { type: 'stream-start', warnings: [] },
+                    { type: 'response-metadata', id: 'id-tool-2', modelId: 'mock-model-id', timestamp: new Date(0) },
+                    {
+                      type: 'tool-call',
+                      toolCallId: 'call-edit-2',
+                      toolName: 'applyEdit',
+                      input: '{"text":"b"}',
+                      providerExecuted: false,
+                    },
+                    { type: 'finish', finishReason: 'tool-calls', usage: stepTwoUsage },
+                  ])
+                : textStream('done'),
+        };
+      },
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'edit', model, tools: { applyEdit } });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-usage-two-steps', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(e => events.push(e));
+
+      const suspended = (await session.message({ content: 'edit twice' })) as { finishReason: string };
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getTokenUsage().promptTokens).toBe(100);
+
+      // The resumed segment returns its suspended result directly.
+      const resumed = (await session.respondToToolApproval({ approved: true })) as {
+        finishReason: string;
+        totalUsage?: { inputTokens?: number };
+      };
+      expect(resumed.finishReason).toBe('suspended');
+      expect(calls).toBe(2);
+      expect(resumed.totalUsage?.inputTokens).toBe(300);
+      expect(session.getTokenUsage().promptTokens).toBe(300);
+      expect(session.getTokenUsage().completionTokens).toBe(30);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('reports the suspending step on the suspended run output without exposing it on the chunk', async () => {
     const applyEdit = createTool({
       id: 'applyEdit',
