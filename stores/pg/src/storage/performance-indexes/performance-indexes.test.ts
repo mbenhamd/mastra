@@ -2,6 +2,7 @@ import {
   TABLE_HARNESS_ATTACHMENT_OPERATIONS,
   TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_CHANNEL_INBOX,
+  TABLE_HARNESS_RUN_SUMMARIES,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_SESSION_EVENTS,
   TABLE_HARNESS_TERMINAL_ADMISSIONS,
@@ -149,7 +150,12 @@ describe('PostgresStore Domain Performance Indexes', () => {
 
       const indexes = harness.getDefaultIndexDefinitions();
 
-      expect(indexes.length).toBe(43);
+      expect(indexes.length).toBe(44);
+      expect(indexes).toContainEqual({
+        name: 'test_schema_idx_harness_run_summaries_session',
+        table: TABLE_HARNESS_RUN_SUMMARIES,
+        columns: ['harness_name', 'session_id', 'completed_at', 'run_id'],
+      });
       expect(indexes).toContainEqual({
         name: 'test_schema_idx_harness_sessions_active_key',
         table: TABLE_HARNESS_SESSIONS,
@@ -298,7 +304,7 @@ describe('PostgresStore Domain Performance Indexes', () => {
         observability.getDefaultIndexDefinitions().length +
         harness.getDefaultIndexDefinitions().length;
 
-      expect(totalIndexes).toBe(56);
+      expect(totalIndexes).toBe(57);
     });
   });
 });
