@@ -180,6 +180,26 @@ describe('native session record projection', () => {
         },
       ),
     ).resolves.toMatchObject({ version: existing.version + 1 });
+
+    // A legacy row that was never loaded through the projected store keeps no
+    // incarnation, so writing or deleting it without a load fails closed.
+    await legacy.saveSession(sampleSession({ id: 'session-unloaded', threadId: 'thread-unloaded' }), {
+      ownerId: 'legacy-owner',
+      ifVersion: 0,
+    });
+    const unloaded = db.harnessSessions.get(
+      [...db.harnessSessions.keys()].find(key => key.endsWith('session-unloaded'))!,
+    )!;
+    expect(unloaded.sessionIncarnation).toBeUndefined();
+    await expect(
+      projected.saveSession(
+        { ...unloaded, lastActivityAt: unloaded.lastActivityAt + 1 },
+        { ownerId: 'legacy-owner', ifVersion: unloaded.version },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionProjectionIncarnationError);
+    await expect(projected.deleteSession({ sessionId: 'session-unloaded' })).rejects.toBeInstanceOf(
+      HarnessStorageSessionProjectionIncarnationError,
+    );
   });
 
   it('keeps claim acknowledgements within the requested harness namespace', async () => {

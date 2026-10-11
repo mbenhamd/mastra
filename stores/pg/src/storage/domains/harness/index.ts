@@ -86,6 +86,8 @@ import {
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
   harnessTerminalSeedHash,
+  redactHarnessTerminalResult,
+  redactStoredHarnessTerminalProjection,
   HARNESS_MESSAGE_RESULT_ERASED_CODE,
   contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
@@ -209,6 +211,7 @@ import type {
   HarnessTerminalQueuePressure,
   HarnessTerminalRenewReceipt,
   HarnessTerminalResult,
+  StoredHarnessTerminalProjection,
   HarnessTerminalProjection,
   HarnessTerminalAdmissionRecord,
   AckSessionRecordProjectionInput,
@@ -8246,39 +8249,63 @@ export class HarnessPG extends HarnessStorage {
 
   /**
    * PF-5309: erases the content of a deleted session's terminal admissions and
-   * intents (see deleteSessions) in two set-based statements. A projection
-   * keeps every field but its payload and canonical bytes (kind, id, byte count
-   * and payload hash stay); a terminal result keeps every field but its error
-   * message. Mirrors `redactStoredHarnessTerminalProjection` and
-   * `redactHarnessTerminalResult`, which the in-memory store applies.
+   * intents (see deleteSessions). Each table is read once and rewritten in one
+   * set-based UPDATE. The kept values are built in JS by the shared core
+   * helpers from an allow-list of fields (kind, id, byte count and payload
+   * hash of a projection; status, run, time, finish reason and error code of a
+   * terminal result), the same values the in-memory store keeps. Parsing in JS
+   * also accepts text PostgreSQL's jsonb rejects (an escaped NUL), so such a
+   * row can never make the session undeletable.
    */
   async #redactTerminalRowsTx(tx: PgHarnessClient, namespace: string, sessionId: string): Promise<void> {
-    // `-> 'error' IS NOT NULL`, not the jsonb `?` operator: every `?` in this
-    // client's SQL is a bind placeholder.
-    const redactedResult = (column: string) => `((${column}::jsonb - 'error')
-      || CASE WHEN (${column}::jsonb -> 'error') IS NOT NULL
-              THEN jsonb_build_object('error', jsonb_build_object('code', ${column}::jsonb -> 'error' -> 'code', 'message', ''))
-              ELSE '{}'::jsonb END)::text`;
-    const redactedProjection = (column: string) =>
-      `((${column}::jsonb - 'payload' - 'payloadJson') || '{"payload":null,"payloadJson":"null"}'::jsonb)::text`;
-    await tx.execute({
-      sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
-            SET seed_json = 'null',
-                terminal_result_json = CASE WHEN terminal_result_json IS NULL THEN NULL
-                                            ELSE ${redactedResult('terminal_result_json')} END,
-                projection_json = CASE WHEN projection_json IS NULL THEN NULL
-                                       ELSE ${redactedProjection('projection_json')} END
-            WHERE harness_name = ? AND session_id = ?`,
+    const redactResult = (value: unknown): string | null => {
+      const parsed = parseJson(value) as HarnessTerminalResult | undefined;
+      return parsed !== null && typeof parsed === 'object' ? JSON.stringify(redactHarnessTerminalResult(parsed)) : null;
+    };
+    const redactProjection = (value: unknown): string | null => {
+      const parsed = parseJson(value) as StoredHarnessTerminalProjection | undefined;
+      return parsed !== null && typeof parsed === 'object'
+        ? JSON.stringify(redactStoredHarnessTerminalProjection(parsed))
+        : null;
+    };
+    const admissions = await tx.execute({
+      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
       args: [namespace, sessionId],
     });
-    await tx.execute({
-      sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-            SET terminal_result_json = ${redactedResult('terminal_result_json')},
-                projection_json = ${redactedProjection('projection_json')},
-                last_error_json = NULL
-            WHERE harness_name = ? AND session_id = ?`,
+    if (admissions.rows.length > 0) {
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS} AS a
+              SET seed_json = 'null', terminal_result_json = u.result_json, projection_json = u.projection_json
+              FROM unnest(?::text[], ?::text[], ?::text[]) AS u(id, result_json, projection_json)
+              WHERE a.id = u.id`,
+        args: [
+          admissions.rows.map(row => String(row.id)),
+          admissions.rows.map(row => redactResult(row.terminal_result_json)),
+          admissions.rows.map(row => redactProjection(row.projection_json)),
+        ],
+      });
+    }
+    const intents = await tx.execute({
+      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_INTENTS}
+            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
       args: [namespace, sessionId],
     });
+    if (intents.rows.length > 0) {
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS} AS i
+              SET terminal_result_json = COALESCE(u.result_json, 'null'),
+                  projection_json = COALESCE(u.projection_json, 'null'),
+                  last_error_json = NULL
+              FROM unnest(?::text[], ?::text[], ?::text[]) AS u(id, result_json, projection_json)
+              WHERE i.id = u.id`,
+        args: [
+          intents.rows.map(row => String(row.id)),
+          intents.rows.map(row => redactResult(row.terminal_result_json)),
+          intents.rows.map(row => redactProjection(row.projection_json)),
+        ],
+      });
+    }
   }
 
   /**

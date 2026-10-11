@@ -1452,6 +1452,106 @@ describe('HarnessPG native terminal handoff', () => {
     ).resolves.toMatchObject({ status: 'completed' });
   });
 
+  it('deletes a session whose terminal rows hold NUL text or extra fields, keeping only allowed metadata (PF-5309)', async () => {
+    const remaining = async (sessionId: string) =>
+      JSON.stringify(
+        await store.db.any(
+          `SELECT a.terminal_result_json AS admission_result, a.projection_json AS admission_projection,
+                  i.terminal_result_json AS intent_result, i.projection_json AS intent_projection
+             FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_ADMISSIONS}" a
+             JOIN "${schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" i ON i.session_id = a.session_id AND i.admission_id = a.admission_id
+            WHERE a.session_id = $1`,
+          [sessionId],
+        ),
+      );
+    for (const mode of ['nul-payload', 'nul-error', 'extra-field'] as const) {
+      const session = await createNativeSession(harness(), `session-redact-${mode}`);
+      const input = admissionFor(session, `redact-${mode}`);
+      await harness().writeMessageResultEvidence(pendingEvidence(input));
+      await harness().admitTerminalHandoff(input);
+      const base = commitInput(input, `redact-${mode}`);
+      const committed = await harness().commitTerminalHandoff({
+        ...base,
+        ...(mode === 'nul-payload'
+          ? { projection: { ...base.projection, payload: { text: 'private\u0000payload' } } }
+          : {}),
+        ...(mode === 'nul-error'
+          ? {
+              resultEvidence: {
+                ...pendingEvidence(input),
+                status: 'failed' as const,
+                error: { code: 'harness.message_failed', message: 'failed' },
+                updatedAt: Date.now(),
+              },
+              terminalResult: {
+                status: 'failed' as const,
+                runId: input.runId,
+                completedAt: Date.now(),
+                error: { code: 'provider.error', message: 'private\u0000error' },
+              },
+            }
+          : {}),
+        ...(mode === 'extra-field'
+          ? {
+              terminalResult: {
+                ...base.terminalResult,
+                providerOutput: 'private output',
+              } as typeof base.terminalResult,
+            }
+          : {}),
+      });
+      expect(committed.status).toBe('committed');
+
+      // The delete succeeds (no jsonb cast can reject the stored text) and
+      // keeps only the allowed metadata.
+      await harness().deleteSession({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        ifVersion: session.version,
+        expectedResourceId: session.resourceId,
+        expectedThreadId: session.threadId,
+        expectedCreatedAt: session.createdAt,
+      });
+      const left = await remaining(session.id);
+      expect(left).not.toContain('private');
+      expect(left).toContain(committed.intent!.projection.payloadHash);
+      if (mode === 'nul-error') expect(left).toContain('provider.error');
+    }
+  });
+
+  it("erases a deleted session id's results kept under another thread scope (PF-5309)", async () => {
+    const session = await createNativeSession(harness(), 'session-other-scope');
+    await harness().writeMessageResultEvidence({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: 'thread-other-scope',
+      signalId: 'signal-other-scope',
+      runId: 'run-other-scope',
+      status: 'completed',
+      result: { text: 'other scope secret' },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    await harness().deleteSession({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      ifVersion: session.version,
+      expectedResourceId: session.resourceId,
+      expectedThreadId: session.threadId,
+      expectedCreatedAt: session.createdAt,
+    });
+    const kept = await harness().loadMessageResultEvidence({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: 'thread-other-scope',
+      signalId: 'signal-other-scope',
+    });
+    expect(kept).toMatchObject({ status: 'completed', erased: true });
+    expect(JSON.stringify(kept)).not.toContain('other scope secret');
+  });
+
   it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
     const session = await createNativeSession(harness(), 'session-erased-roundtrip');
     const input = admissionFor(session, 'erased-roundtrip');
