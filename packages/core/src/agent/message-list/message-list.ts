@@ -246,15 +246,6 @@ type BoundaryToken = [type: string, identity: string | undefined];
 type BoundaryCheckpoint = { messageId: string; prefix: BoundaryToken[] };
 
 /**
- * Where one loop iteration wrote its response: after the boundary it opened, if any, and in the
- * listed response messages, in order. Produced by `MessageList.locateStepContent`.
- */
-export type StepContentLocation = {
-  readonly boundary?: MastraStepStartPart;
-  readonly messageIds: readonly string[];
-};
-
-/**
  * Identify the parts preceding an index — what a splice at that index is actually a statement
  * about. A tool call is named by its id, text and reasoning by their own string, anything else by
  * its type alone. Each token holds that string as-is rather than building one out of it, so the
@@ -2083,10 +2074,22 @@ export class MessageList {
    * When the last part is already a `step-start` the iteration begins at *that* marker — nothing
    * has been appended after it — so it is returned rather than duplicated.
    *
+   * With `acrossTrailingSignals`, signals at the end of the list are skipped and the boundary goes on
+   * the assistant message before them. A processor retry puts its feedback signal there and streams
+   * the retry into a fresh message, which opens with no marker; without one ahead of it, counting
+   * markers cannot tell the retry's parts from the accepted step before it.
+   *
    * @returns the marker beginning this iteration, and whether it had to be appended
    */
-  public openStepBoundary(): { boundary?: MastraStepStartPart; appended: boolean } {
-    const lastMsg = this.messages[this.messages.length - 1];
+  public openStepBoundary(options?: { acrossTrailingSignals?: boolean }): {
+    boundary?: MastraStepStartPart;
+    appended: boolean;
+  } {
+    let lastIndex = this.messages.length - 1;
+    if (options?.acrossTrailingSignals) {
+      while (lastIndex >= 0 && this.messages[lastIndex]?.role === 'signal') lastIndex--;
+    }
+    const lastMsg = this.messages[lastIndex];
     if (!lastMsg || lastMsg.role !== 'assistant' || !lastMsg.content?.parts) {
       return { appended: false };
     }
@@ -2127,78 +2130,6 @@ export class MessageList {
   #rememberBoundaryFingerprint(messageId: string, parts: MastraMessagePart[], boundary: MastraStepStartPart) {
     const index = parts.indexOf(boundary);
     if (index !== -1) this.#boundaryFingerprints.set(boundary, { messageId, prefix: prefixFingerprint(parts, index) });
-  }
-
-  /**
-   * Record where a loop iteration wrote its response, for `stepContent`.
-   *
-   * Call it once the iteration's response has streamed. `boundary` is the marker the iteration
-   * opened (`openStepBoundary()`), if any; `priorResponseMessageIds` are the response message ids
-   * that existed when it opened. The iteration owns what follows its boundary, plus every response
-   * message it started: a processor retry or a signal moves the response to a fresh message id,
-   * and that message opens with no boundary at all.
-   */
-  public locateStepContent(
-    boundary: MastraStepStartPart | undefined,
-    priorResponseMessageIds: ReadonlySet<string>,
-  ): StepContentLocation {
-    const boundaryMessageId = boundary ? this.#boundaryFingerprints.get(boundary)?.messageId : undefined;
-    const startedMessageIds = this.response
-      .db()
-      .map(message => message.id)
-      .filter(id => id !== boundaryMessageId && !priorResponseMessageIds.has(id));
-    return {
-      boundary,
-      messageIds: boundaryMessageId === undefined ? startedMessageIds : [boundaryMessageId, ...startedMessageIds],
-    };
-  }
-
-  /**
-   * The content of one loop iteration, read from the place `locateStepContent` recorded.
-   *
-   * `modelContent(stepNumber)` finds a step by counting `step-start` markers, which a processor
-   * retry breaks: the rejected attempt's marker is rolled back while its step stays counted, and
-   * the retry streams into a fresh message that opens with no marker, so the counted number lands
-   * on another step's parts or on none (PF-5364). Re-reading the same location later also picks up
-   * tool results that reached the step's parts after it finished.
-   *
-   * @returns the step content, or `undefined` when the iteration's boundary can no longer be found
-   *   in its message; callers then fall back to `modelContent(stepNumber)`.
-   */
-  public stepContent(location: StepContentLocation): AIV5Type.StepResult<any>['content'] | undefined {
-    const checkpoint = location.boundary ? this.#boundaryFingerprints.get(location.boundary) : undefined;
-    if (location.boundary && !checkpoint) return undefined;
-
-    const responseMessages = this.response.db();
-    const parts: AIV5Type.UIMessage['parts'] = [];
-    for (const messageId of location.messageIds) {
-      const message = responseMessages.find(candidate => candidate.id === messageId);
-      if (!message) continue;
-      if (location.boundary && checkpoint?.messageId === messageId) {
-        const messageParts = message.content.parts ?? [];
-        const boundaryIndex = findBoundaryIndex(messageParts, location.boundary, messageId, checkpoint);
-        if (boundaryIndex === -1) return undefined;
-        // Earlier steps wrote the front of this message. The legacy mirrors describe the whole
-        // message and would re-synthesize their parts, so only the parts after the boundary count.
-        const {
-          toolInvocations: _toolInvocations,
-          reasoning: _reasoning,
-          content: _content,
-          ...stepMessageContent
-        } = message.content;
-        const stepMessage: MastraDBMessage = {
-          ...message,
-          content: { ...stepMessageContent, parts: messageParts.slice(boundaryIndex + 1) },
-        };
-        parts.push(...this.toAIV5UIMessages([stepMessage]).flatMap(uiMessage => uiMessage.parts));
-      } else {
-        parts.push(...this.toAIV5UIMessages([message]).flatMap(uiMessage => uiMessage.parts));
-      }
-    }
-    // The next iteration may already have opened its boundary at the end of this step's message.
-    while (parts.at(-1)?.type === 'step-start') parts.pop();
-    if (parts.length === 0) return [];
-    return StepContentExtractor.convertPartsToContent(parts, 'step', this.response.aiV5.stepContent);
   }
 
   /** Sealing is not optional: a moved id whose boundary is missing folds the next response into the previous row. */

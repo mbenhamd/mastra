@@ -22,14 +22,9 @@ import { findProviderToolByName } from '../../../tools/provider-tool-utils';
 import { createStep } from '../../../workflows/workflow';
 import { readScoped, writeScoped } from '../../run-scope-access';
 import type { RunScopeContext } from '../../run-scope-access';
-import {
-  DELEGATION_BAILED_KEY,
-  STEP_CONTENT_KEY,
-  STEP_TOOLS_KEY,
-  TOOL_PAYLOAD_TRANSFORM_KEY,
-} from '../../run-scope-keys';
+import { DELEGATION_BAILED_KEY, STEP_TOOLS_KEY, TOOL_PAYLOAD_TRANSFORM_KEY } from '../../run-scope-keys';
 import { readToolResultFromMessageList } from '../../shared/read-tool-result';
-import { readStepContent, stepWasRolledBack } from '../../shared/step-content';
+import { messageStepNumber, stepWasRolledBack } from '../../shared/step-content';
 import {
   computeModelOutputProviderMetadata,
   withToolResultStatusProviderMetadata,
@@ -252,16 +247,11 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         if (!Array.isArray(steps) || steps.length === 0) return;
 
         const latestStep = steps.at(-1);
-        // A rolled-back retry attempt has no parts left in the MessageList.
+        // A rolled-back retry attempt has no parts left to re-extract.
         if (!latestStep || stepWasRolledBack(latestStep)) return;
 
         steps[steps.length - 1] = new DefaultStepResult({
-          content: readStepContent(
-            rest.messageList,
-            steps,
-            steps.length - 1,
-            readScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent'),
-          ),
+          content: rest.messageList.get.response.aiV5.modelContent(messageStepNumber(steps, steps.length - 1)),
           finishReason: latestStep.finishReason,
           providerMetadata: latestStep.providerMetadata,
           request: latestStep.request,

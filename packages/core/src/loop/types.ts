@@ -154,8 +154,6 @@ export type StreamInternal = {
   stepActiveTools?: string[];
   /** @deprecated Use `runScope.get(STEP_USAGE_KEY)` from `loop/run-scope-keys`. */
   stepUsage?: import('../stream/types').LanguageModelUsage;
-  /** Fallback for `runScope.get(STEP_CONTENT_KEY)` when a step factory runs without a run scope. */
-  stepContent?: import('./shared/step-content').LocatedStepContent;
   // Workspace from prepareStep/processInputStep - stored here to avoid workflow serialization
   /** @deprecated Use `runScope.get(STEP_WORKSPACE_KEY)` from `loop/run-scope-keys`. */
   stepWorkspace?: Workspace;
