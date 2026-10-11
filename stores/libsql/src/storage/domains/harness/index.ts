@@ -1106,6 +1106,7 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureWorkspaceActionsTable();
     await this.#ensureChannelBindingsTable();
     await this.#ensurePlanTasksTable();
+    await this.#ensureRunSummariesTable();
     const tx = await this.#client.transaction('write');
     const deleteCandidates = new Map<
       string,
@@ -1164,6 +1165,12 @@ export class HarnessLibSQL extends HarnessStorage {
         });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_SESSION_EVENTS}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        // A deleted session keeps no run summary (PG and in-memory mirror this).
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_RUN_SUMMARIES}
                 WHERE harness_name = ? AND session_id = ?`,
           args: [namespace, sessionId],
         });

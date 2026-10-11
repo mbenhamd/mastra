@@ -1219,6 +1219,12 @@ export class InMemoryHarness extends HarnessStorage {
         this.db.harnessWorkspaceActionJournal.delete(key);
       }
     }
+    // A deleted session keeps no run summary (PG mirrors this on delete).
+    for (const [key, summary] of this.db.harnessRunSummaries) {
+      if (summary.harnessName === namespace && summary.sessionId === sessionId) {
+        this.db.harnessRunSummaries.delete(key);
+      }
+    }
     // §14.1: channel bindings are session-scoped. A deleted session must not leave
     // a binding behind, or it would still win loadChannelBindingByExternal /
     // resolveChannelBinding and block rebinding that conversation to a replacement

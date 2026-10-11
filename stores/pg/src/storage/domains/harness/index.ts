@@ -2550,6 +2550,7 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureWorkspaceActionsTable();
     await this.#ensureChannelBindingsTable();
     await this.#ensurePlanTasksTable();
+    await this.#ensureRunSummariesTable();
     const tx = await this.#client.transaction('write');
     const attachmentCleanupOperationIds: string[] = [];
     const deleteCandidates = new Map<
@@ -2785,6 +2786,14 @@ export class HarnessPG extends HarnessStorage {
         });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_SESSION_EVENTS}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        // A deleted session keeps no run summary: each names the session's
+        // resource, thread, model and usage, and nothing reads it after the
+        // session's message results are gone (recovery joins it through them).
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_RUN_SUMMARIES}
                 WHERE harness_name = ? AND session_id = ?`,
           args: [namespace, sessionId],
         });

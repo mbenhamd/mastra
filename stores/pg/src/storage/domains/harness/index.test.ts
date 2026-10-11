@@ -925,6 +925,61 @@ describe('HarnessPG', () => {
     expect(seen).toEqual(['rs-3', 'rs-2b', 'rs-2', 'rs-1']);
   });
 
+  it("deletes a session with its run summaries and keeps other sessions' (PF-5301)", async () => {
+    const harness = store.stores.harness!;
+    const summary = (runId: string, sessionId: string) => ({
+      harnessName: 'default',
+      runId,
+      sessionId,
+      resourceId: 'u-del',
+      threadId: `thread-${sessionId}`,
+      agentId: 'agent-x',
+      modeId: 'default',
+      modelId: 'openai/gpt-4o-mini',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      startedAt: 90,
+      completedAt: 100,
+      durationMs: 10,
+      usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+      createdAt: 100,
+    });
+    await harness.saveSession(
+      createSampleSessionRecord({
+        id: 'rs-deleted',
+        resourceId: 'u-del',
+        threadId: 'thread-rs-deleted',
+        closedAt: 2000,
+        lastActivityAt: 2000,
+      }),
+      { ownerId: 'h', ifVersion: 0 },
+    );
+    await harness.saveRunSummary({ summary: summary('rs-deleted-1', 'rs-deleted') as any });
+    await harness.saveRunSummary({ summary: summary('rs-deleted-2', 'rs-deleted') as any });
+    await harness.saveRunSummary({ summary: summary('rs-kept-1', 'rs-kept') as any });
+
+    const closed = await harness.loadSession({ sessionId: 'rs-deleted' });
+    if (!closed) throw new Error('expected the closed session');
+    await harness.deleteSession({
+      sessionId: 'rs-deleted',
+      ifVersion: closed.version,
+      expectedResourceId: closed.resourceId,
+      expectedThreadId: closed.threadId,
+      expectedParentSessionId: closed.parentSessionId ?? null,
+      expectedCreatedAt: closed.createdAt,
+      requireClosed: true,
+    });
+
+    await expect(harness.listRunSummaries({ sessionId: 'rs-deleted', limit: 10 })).resolves.toEqual({
+      summaries: [],
+    });
+    await expect(harness.loadRunSummary({ runId: 'rs-deleted-1' })).resolves.toBeNull();
+    await expect(harness.loadRunSummary({ runId: 'rs-kept-1' })).resolves.toMatchObject({
+      sessionId: 'rs-kept',
+    });
+  });
+
   it('keeps §15 attachment-reference admission atomic and delete-guarded', async () => {
     const harness = attachmentStore.stores.harness;
     expect(harness).toBeDefined();
