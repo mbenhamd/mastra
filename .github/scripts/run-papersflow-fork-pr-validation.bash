@@ -22,6 +22,7 @@ PACKED_DECLARATION_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-pa
 readonly PACKED_DECLARATION_CHECK
 readonly PG_PERFORMANCE_INDEX_UNIT_TEST='stores/pg/src/storage/performance-indexes/performance-indexes.test.ts'
 readonly PG_PERFORMANCE_INDEX_UNIT_CONFIG='stores/pg/vitest.perf.config.ts'
+readonly MEMORY_SOURCE_FENCE_PG_TEST='packages/memory/integration-tests/src/source-write-fence-pg.test.ts'
 
 pf558_config() {
   PF558_PR_NUMBER="${PAPERSFLOW_PF558_PR_NUMBER:-266}"
@@ -4573,6 +4574,7 @@ run_validator_self_tests() {
     "$fixture_repo/stores/pg/src/storage/domains/memory" \
     "$fixture_repo/stores/pg/src/storage/db" \
     "$fixture_repo/stores/pg/src/storage/performance-indexes" \
+    "$fixture_repo/packages/memory/integration-tests/src" \
     "$fixture_repo/workflows/inngest/src/__tests__/adapters" \
     "$fixture_repo/workflows/inngest/src/durable-agent" \
     "$fixture_repo/workflows/inngest/src" \
@@ -4592,6 +4594,12 @@ run_validator_self_tests() {
     'printf '\''%s\n'\'' "$*" >> "${MOCK_PNPM_LOG:?}"' \
     'printf '\''LLM_TEST_MODE=%s\t%s\n'\'' "${LLM_TEST_MODE:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
     'printf '\''OPENAI_API_KEY=%s\t%s\n'\'' "${OPENAI_API_KEY:-}" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"' \
+    'if [[ -n "${DB_URL:-}" ]]; then printf '\''DB_URL=%s\t%s\n'\'' "$DB_URL" "$*" >> "${MOCK_PNPM_ENVIRONMENT_LOG:?}"; fi' \
+    'if [[ " $* " == *"--config .pf4233-vitest.memory-pg.config."* ]]; then' \
+    '  for config in packages/memory/.pf4233-vitest.memory-pg.config.*.ts; do' \
+    '    [[ -f "$config" ]] && cat "$config" >> "${MOCK_PNPM_CONFIG_LOG:?}"' \
+    '  done' \
+    'fi' \
     'if [[ " $* " == *"--config .pf4243-vitest.perf.config."* ]]; then' \
     '  for config in stores/pg/.pf4243-vitest.perf.config.*.ts; do' \
     '    [[ -f "$config" ]] && cat "$config" >> "${MOCK_PNPM_CONFIG_LOG:?}"' \
@@ -4894,6 +4902,19 @@ run_validator_self_tests() {
     printf '%s\n' "import { it } from 'vitest';" "it('libsql atomic resume', () => {});" \
       > stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
     printf '%s\n' '{}' > stores/pg/package.json
+    printf '%s\n' '{}' > packages/memory/package.json
+    printf '%s\n' '{"name":"@mastra/memory-integration-tests","private":true}' \
+      > packages/memory/integration-tests/package.json
+    printf '%s\n' "export default { test: { globalSetup: './setup.ts' } };" \
+      > packages/memory/integration-tests/vitest.config.ts
+    printf '%s\n' 'export default async function setup() {}' \
+      > packages/memory/integration-tests/setup.ts
+    printf '%s\n' "import { it } from 'vitest';" \
+      "const connectionString = process.env.DB_URL || 'postgres://postgres:password@localhost:5434/mastra';" \
+      "it('memory source-write fence on PostgreSQL', () => connectionString);" \
+      > packages/memory/integration-tests/src/source-write-fence-pg.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('memory sibling integration suite', () => {});" \
+      > packages/memory/integration-tests/src/sibling.test.ts
     printf '%s\n' 'export default {};' > stores/pg/vitest.config.ts
     printf '%s\n' \
       "import { defineConfig } from 'vitest/config';" \
@@ -10199,6 +10220,98 @@ NODE
   assert_contains '--dir stores/convex exec vitest run' "$command_log"
   assert_contains 'src/server/storage.test.ts' "$command_log"
 
+  # PF-4233 admits exactly one real-PostgreSQL suite from the nested,
+  # separately locked memory integration package. It must run through the
+  # trusted generated config against the job's PostgreSQL service, never the
+  # package-native config whose global setup compiles LibSQL/Upstash workers.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "it('memory source-write fence head', () => {});" \
+      >> packages/memory/integration-tests/src/source-write-fence-pg.test.ts
+    git add .
+    git commit -q -m 'exercise PF-4233 memory PostgreSQL suite'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$command_environment_log"
+  : > "$config_log"
+  : > "$service_log"
+  output="$test_root/memory-source-fence-pg-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Running changed test file in full: packages/memory/integration-tests/src/source-write-fence-pg.test.ts' "$output"
+  assert_line_match_count 1 \
+    '^--dir packages/memory exec vitest run --config \.pf4233-vitest\.memory-pg\.config\.[^ ]+\.ts --reporter=dot --reporter=json .*integration-tests/src/source-write-fence-pg\.test\.ts$' \
+    "$command_log"
+  assert_not_contains '--dir packages/memory/integration-tests' "$command_log"
+  assert_not_contains 'sibling.test.ts' "$command_log"
+  assert_contains \
+    $'DB_URL=postgresql://postgres:postgres@127.0.0.1:5434/mastra\t--dir packages/memory exec vitest run' \
+    "$command_environment_log"
+  assert_contains $'OPENAI_API_KEY=\t--dir packages/memory exec vitest run' "$command_environment_log"
+  assert_contains "include: ['integration-tests/src/source-write-fence-pg.test.ts']" "$config_log"
+  assert_contains 'globalSetup: []' "$config_log"
+  assert_not_contains 'setup.ts' "$config_log"
+  assert_contains 'postgres 127.0.0.1:5434' "$service_log"
+  if [[ -n "$(find "$fixture_repo/packages/memory" -maxdepth 1 -type f -name '.pf4233-vitest.memory-pg.config.*.ts' -print -quit)" ]]; then
+    echo 'Trusted memory PostgreSQL Vitest wrapper was not cleaned up after the suite run.' >&2
+    exit 1
+  fi
+
+  : > "$command_log"
+  output="$test_root/memory-source-fence-pg-unavailable-service.log"
+  if run_fixture "$head_sha" "$output" MOCK_UNAVAILABLE_SERVICE=postgres; then
+    echo 'PF-4233 memory PostgreSQL suite passed without its PostgreSQL service.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'Required postgres test service is unavailable at 127.0.0.1:5434.' "$output"
+  assert_not_contains 'exec vitest run' "$command_log"
+
+  : > "$command_log"
+  output="$test_root/memory-source-fence-pg-zero-report.log"
+  if run_fixture "$head_sha" "$output" \
+    MOCK_ZERO_PACKAGE_CONTRACT_TEST=integration-tests/src/source-write-fence-pg.test.ts; then
+    echo 'PF-4233 memory PostgreSQL suite passed with an empty Vitest report.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'The PF-4233 memory PostgreSQL suite did not record a passing run.' "$output"
+
+  # Every other nested-package input, including the native config, global
+  # setup, manifest, and sibling suites, remains outside the admitted target.
+  for memory_integration_input in vitest.config.ts setup.ts package.json src/sibling.test.ts; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' "it('memory source-write fence head', () => {});" \
+        >> packages/memory/integration-tests/src/source-write-fence-pg.test.ts
+      printf '%s\n' '// unreviewed nested change' \
+        >> "packages/memory/integration-tests/$memory_integration_input"
+      git add .
+      git commit -q -m "reject PF-4233 nested input $memory_integration_input"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    : > "$service_log"
+    output="$test_root/memory-integration-${memory_integration_input//\//-}-failure.log"
+    if run_fixture "$head_sha" "$output"; then
+      echo "PF-4233 nested memory input $memory_integration_input unexpectedly passed." >&2
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'These memory integration-test files are outside the PF-4233 single-suite PostgreSQL target:' "$output"
+    assert_contains "packages/memory/integration-tests/$memory_integration_input" "$output"
+    if grep -Fq -- 'exec vitest run' "$command_log" || [[ -s "$service_log" ]]; then
+      echo "PF-4233 nested memory input $memory_integration_input reached a test runner or service probe." >&2
+      cat "$command_log" "$service_log" >&2
+      exit 1
+    fi
+  done
+
   # Fixture typing repairs must run their existing behavior suite, as well as
   # the complete native package gates, without requiring a deployed Convex app.
   for convex_fixture_test in src/schema.test.ts src/server/observational-memory.test.ts; do
@@ -11716,9 +11829,10 @@ unsupported_tests="$(mktemp)"
 unsupported_owned_workspace_sources="$(mktemp)"
 unsupported_owned_workspace_tests="$(mktemp)"
 unsupported_owned_workspace_pairs="$(mktemp)"
+unsupported_memory_integration_files="$(mktemp)"
 unsupported_workspaces="$(mktemp)"
 workspace_candidates="$(mktemp)"
-trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$fastify_changed_tests" "$fastify_test_result" "$forced_mastracode_tests" "$forced_workspace_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_mastracode_tests" "$unsupported_tests" "$unsupported_owned_workspace_sources" "$unsupported_owned_workspace_tests" "$unsupported_owned_workspace_pairs" "$unsupported_workspaces" "$workspace_candidates"' EXIT
+trap 'rm -f "$changed_files" "$changed_lockfile_importers" "$changed_workspaces" "$changed_tests" "$fastify_changed_tests" "$fastify_test_result" "$forced_mastracode_tests" "$forced_workspace_tests" "$delegated_docs_tests" "$deleted_tests" "$fixer_test_result" "$root_vitest_config_list" "$unowned_files" "$unsupported_inputs" "$missing_mastracode_tests" "$unsupported_mastracode_sources" "$unsupported_mastracode_tests" "$unsupported_tests" "$unsupported_owned_workspace_sources" "$unsupported_owned_workspace_tests" "$unsupported_owned_workspace_pairs" "$unsupported_memory_integration_files" "$unsupported_workspaces" "$workspace_candidates"' EXIT
 
 # Treat renames as a delete plus an add so both ownership boundaries are
 # validated. Otherwise moving a generated artifact out of its canonical path
@@ -13280,6 +13394,12 @@ while IFS= read -r workspace; do
   fi
   case "$workspace" in
     auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    packages/memory/integration-tests)
+      # PF-4233 admits exactly one real-PostgreSQL suite from this nested,
+      # separately locked package. Its manifest, lockfile, Vitest config,
+      # global setup, workers, and every other suite stay outside the runnable
+      # graph; they fail closed below instead of riding on this admission.
+      ;;
     server-adapters/fastify)
       if [[ "$pf3553_selected_route_exports" == false ]]; then
         printf '%s\n' "$workspace" >> "$unsupported_workspaces"
@@ -13288,6 +13408,13 @@ while IFS= read -r workspace; do
     *) printf '%s\n' "$workspace" >> "$unsupported_workspaces" ;;
   esac
 done < "$changed_workspaces"
+
+while IFS= read -r file; do
+  if [[ "$file" == packages/memory/integration-tests/* && \
+    "$file" != "$MEMORY_SOURCE_FENCE_PG_TEST" ]]; then
+    printf '%s\n' "$file" >> "$unsupported_memory_integration_files"
+  fi
+done < "$changed_files"
 
 while IFS= read -r file; do
   case "$file" in
@@ -14069,7 +14196,7 @@ sort -u -o "$unsupported_owned_workspace_sources" "$unsupported_owned_workspace_
 sort -u -o "$unsupported_owned_workspace_tests" "$unsupported_owned_workspace_tests"
 sort -u -o "$unsupported_owned_workspace_pairs" "$unsupported_owned_workspace_pairs"
 
-if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_tests" || -s "$missing_mastracode_tests" || -s "$unsupported_mastracode_tests" || -s "$unsupported_mastracode_sources" || -s "$unsupported_owned_workspace_sources" || -s "$unsupported_owned_workspace_tests" || -s "$unsupported_owned_workspace_pairs" ]]; then
+if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_tests" || -s "$missing_mastracode_tests" || -s "$unsupported_mastracode_tests" || -s "$unsupported_mastracode_sources" || -s "$unsupported_owned_workspace_sources" || -s "$unsupported_owned_workspace_tests" || -s "$unsupported_owned_workspace_pairs" || -s "$unsupported_memory_integration_files" ]]; then
   if [[ -s "$unsupported_workspaces" ]]; then
     echo "These changed workspaces do not have an owned fork-safe validation target:" >&2
     cat "$unsupported_workspaces" >&2
@@ -14105,6 +14232,10 @@ if [[ -s "$unsupported_workspaces" || -s "$unsupported_inputs" || -s "$deleted_t
   if [[ -s "$unsupported_owned_workspace_pairs" ]]; then
     echo "The PF-2042 self-hosting Inngest test, Compose topology, and adapter launcher must change together as regular files:" >&2
     cat "$unsupported_owned_workspace_pairs" >&2
+  fi
+  if [[ -s "$unsupported_memory_integration_files" ]]; then
+    echo "These memory integration-test files are outside the PF-4233 single-suite PostgreSQL target:" >&2
+    cat "$unsupported_memory_integration_files" >&2
   fi
   echo "Failing closed instead of reporting Core-only validation as workspace coverage." >&2
   exit 1
@@ -15855,6 +15986,11 @@ if (( ${#detected_tests[@]} > 0 )); then
       esac
     elif [[ "$file" == browser/stagehand/src/__tests__/profile-lifecycle.test.ts ]]; then
       printf '%s\n' "$file" >> "$unsupported_tests"
+    elif [[ "$file" == "$MEMORY_SOURCE_FENCE_PG_TEST" ]]; then
+      # The exact PF-4233 suite runs against the job's disposable PostgreSQL
+      # service through a trusted generated config (see
+      # run_memory_source_fence_pg_test); every sibling suite stays unsupported.
+      printf '%s\n' "$file" >> "$changed_tests"
     elif [[ "$file" == e2e-tests/* || "$file" == */integration-tests/* || \
       "$file" == mastracode/tui/e2e/* || \
       "$file" =~ \.e2e\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$ ]] || \
@@ -16132,7 +16268,8 @@ NODE
 # missing. In-process Convex/LibSQL/Inngest tests deliberately need no probe, and
 # the owned ClickHouse/Cloudflare suites run entirely against a mocked client or
 # an in-process Miniflare binding.
-if grep -Eq '^stores/pg/.*\.(test|spec)\.' "$changed_tests"; then
+if grep -Eq '^stores/pg/.*\.(test|spec)\.' "$changed_tests" ||
+  grep -Fxq "$MEMORY_SOURCE_FENCE_PG_TEST" "$changed_tests"; then
   require_test_service postgres 127.0.0.1 5434
 fi
 if grep -Eq '^stores/redis/.*\.(test|spec)\.' "$changed_tests"; then
@@ -16364,6 +16501,67 @@ EOF
       "$relative_file"
 )
 
+run_memory_source_fence_pg_test() (
+  local timeout_seconds="$1"
+  local test_result="$2"
+  local generated_config=''
+
+  # The nested memory integration package is separately locked and is not part
+  # of the installed root workspace. Its native config also runs a global setup
+  # that compiles workers needing LibSQL/Upstash and downloads embedding models.
+  # Run the one admitted suite from the installed packages/memory workspace
+  # instead, with a trusted config that never loads PR-controlled config,
+  # declares no global setup, resolves the suite's three workspace imports to
+  # reviewed sources in this checkout, and constrains discovery to that file.
+  trap 'if [[ -n "$generated_config" ]]; then rm -f -- "$generated_config"; fi' EXIT
+  if [[ ! -f packages/memory/package.json || -L packages/memory/package.json ]]; then
+    echo 'The PF-4233 memory PostgreSQL route requires packages/memory/package.json; failing closed.' >&2
+    return 1
+  fi
+  if ! generated_config="$(mktemp packages/memory/.pf4233-vitest.memory-pg.config.XXXXXX.ts)"; then
+    echo 'Unable to create trusted memory PostgreSQL Vitest config; failing closed.' >&2
+    return 1
+  fi
+  if ! cat > "$generated_config" <<'EOF'
+import { fileURLToPath } from 'node:url';
+
+const fromMemoryPackage = (path: string) => fileURLToPath(new URL(path, import.meta.url));
+
+export default {
+  test: {
+    environment: 'node',
+    globals: true,
+    testTimeout: 60000,
+    hookTimeout: 30000,
+    globalSetup: [],
+    setupFiles: [],
+    include: ['integration-tests/src/source-write-fence-pg.test.ts'],
+  },
+  resolve: {
+    alias: [
+      { find: /^@mastra\/memory$/, replacement: fromMemoryPackage('./src/index.ts') },
+      { find: /^@mastra\/pg$/, replacement: fromMemoryPackage('../../stores/pg/src/index.ts') },
+      { find: /^execa$/, replacement: fromMemoryPackage('../core/node_modules/execa') },
+    ],
+  },
+};
+EOF
+  then
+    echo 'Unable to write trusted memory PostgreSQL Vitest config; failing closed.' >&2
+    return 1
+  fi
+  echo "Running the admitted PF-4233 memory PostgreSQL suite with a trusted generated config (no global setup; exact include): $(basename "$generated_config")"
+  # DB_URL points the suite at the job's disposable pgvector service, which
+  # also keeps its docker-compose fallback from running.
+  timeout --kill-after=30s "${timeout_seconds}s" \
+    env DB_URL=postgresql://postgres:postgres@127.0.0.1:5434/mastra \
+      OPENAI_API_KEY= ANTHROPIC_API_KEY= GOOGLE_GENERATIVE_AI_API_KEY= \
+    pnpm --dir packages/memory exec vitest run \
+      --config "$(basename "$generated_config")" \
+      --reporter=dot --reporter=json --outputFile.json="$test_result" \
+      integration-tests/src/source-write-fence-pg.test.ts
+)
+
 test_status=0
 while IFS= read -r file; do
   status=0
@@ -16426,6 +16624,36 @@ while IFS= read -r file; do
       test_status=1
       continue
     fi
+  fi
+
+  if [[ "$file" == "$MEMORY_SOURCE_FENCE_PG_TEST" ]]; then
+    if ! timeout_seconds="$(remaining_validation_seconds 900)"; then
+      echo "Validation budget exhausted before $file; failing predictably before the workflow timeout." >&2
+      test_status=124
+      break
+    fi
+    echo "Running changed test file in full: $file"
+    test_result="$(mktemp)"
+    set +e
+    run_memory_source_fence_pg_test "$timeout_seconds" "$test_result"
+    status=$?
+    if (( status == 0 )); then
+      node - "$test_result" <<'NODE'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (!(result.numPassedTests >= 1) || result.numFailedTests !== 0) {
+  console.error('The PF-4233 memory PostgreSQL suite did not record a passing run.');
+  process.exit(1);
+}
+NODE
+      status=$?
+    fi
+    set -e
+    rm -f "$test_result"
+    if (( status != 0 )); then
+      test_status=$status
+    fi
+    continue
   fi
 
   if [[ "$file" == packages/core/src/agent/__tests__/agent-signals.test.ts ]]; then

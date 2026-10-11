@@ -260,6 +260,17 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   and `pool` fields; loader hooks, unknown fields, methods, accessors,
   computed properties, and spreads fail closed before runner or PostgreSQL
   service execution.
+  PF-4233 admits one nested integration-test suite:
+  `packages/memory/integration-tests/src/source-write-fence-pg.test.ts`. That
+  package is separately locked and stays outside the installed workspace
+  graph, and its native global setup compiles LibSQL/Upstash workers, so the
+  suite runs from the installed `packages/memory` workspace through a fresh
+  trusted wrapper that loads no package-native config, declares no global
+  setup, resolves `@mastra/memory` and `@mastra/pg` to the checked-out sources,
+  includes only that file, and is removed after the run. `DB_URL` targets the
+  job's disposable pgvector service, which is probed first. Every other change
+  under `packages/memory/integration-tests/`, including its manifest, lockfile,
+  config, setup, workers, and sibling suites, fails closed.
   The PF-2044 ownership map additionally admits only the exact Convex cache,
   LibSQL composite Harness wiring, LibSQL Harness/thread-state, Google Cloud
   PubSub group, Redis Streams PubSub, and Inngest regression files needed by
