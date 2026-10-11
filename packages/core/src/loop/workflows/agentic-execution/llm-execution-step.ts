@@ -1615,7 +1615,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               .boundary
           : undefined;
       // Where this iteration's response goes; its StepResult content is read from here.
-      const iterationContent = messageList.openStepContent(iterationBoundary);
+      const iterationContent = messageList.openStepContent();
 
       try {
         // Open MODEL_STEP before any step-owned processor work. The outer

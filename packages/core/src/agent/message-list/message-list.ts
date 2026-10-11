@@ -251,13 +251,42 @@ type BoundaryCheckpoint = { messageId: string; prefix: BoundaryToken[] };
  * has written its last part (its tool results included).
  */
 export type StepContentLocation = {
-  /** The marker the iteration opened, if any; its parts follow it in that message. */
-  readonly boundary?: MastraStepStartPart;
-  /** How many parts each response message held when the iteration began. */
-  readonly startPartCounts: ReadonlyMap<string, number>;
-  /** How many parts each response message held when the iteration ended; unset while it is open. */
-  endPartCounts?: ReadonlyMap<string, number>;
+  /** Each response message's parts, as identity tokens, when the iteration began. */
+  readonly startParts: ReadonlyMap<string, readonly string[]>;
+  /** Each response message's parts, as identity tokens, when the iteration ended; unset while open. */
+  endParts?: ReadonlyMap<string, readonly string[]>;
 };
+
+/**
+ * What identifies a part across clones: a tool call by its id (so a result filled in later is the
+ * same part), text and reasoning by their content, a file by its data, anything else by its type.
+ */
+function partIdentity(part: MastraMessagePart): string {
+  let identity: string | undefined;
+  if (part.type === 'text') identity = part.text;
+  else if (part.type === 'tool-invocation') identity = part.toolInvocation?.toolCallId;
+  else if (part.type === 'reasoning') identity = part.reasoning;
+  else if (part.type === 'file') identity = typeof part.data === 'string' ? part.data : undefined;
+  return identity === undefined ? part.type : `${part.type}\u0000${identity}`;
+}
+
+/**
+ * Index of the last part that stands for one of `recorded`, matched in order. A processor may have
+ * cloned the message (identities survive), dropped some of the recorded parts (the rest still
+ * match in order) or rewritten one (it sits before a later match). Parts after the last match were
+ * written after `recorded` was taken.
+ */
+function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: readonly string[]): number {
+  let next = 0;
+  let last = -1;
+  for (let index = 0; index < parts.length && next < recorded.length; index++) {
+    const match = recorded.indexOf(partIdentity(parts[index]!), next);
+    if (match === -1) continue;
+    last = index;
+    next = match + 1;
+  }
+  return last;
+}
 
 /**
  * Identify the parts preceding an index — what a splice at that index is actually a statement
@@ -2146,16 +2175,16 @@ export class MessageList {
     if (index !== -1) this.#boundaryFingerprints.set(boundary, { messageId, prefix: prefixFingerprint(parts, index) });
   }
 
-  #responsePartCounts(): Map<string, number> {
-    return new Map(this.response.db().map(message => [message.id, message.content.parts?.length ?? 0]));
+  #responsePartIdentities(): Map<string, string[]> {
+    return new Map(this.response.db().map(message => [message.id, (message.content.parts ?? []).map(partIdentity)]));
   }
 
   /**
    * Start recording where a loop iteration writes its response. Call it after the iteration has
    * opened its boundary (`openStepBoundary()`) and before the model streams.
    */
-  public openStepContent(boundary?: MastraStepStartPart): StepContentLocation {
-    return { boundary, startPartCounts: this.#responsePartCounts() };
+  public openStepContent(): StepContentLocation {
+    return { startParts: this.#responsePartIdentities() };
   }
 
   /**
@@ -2164,42 +2193,30 @@ export class MessageList {
    * Closing an already-closed location keeps its first end.
    */
   public closeStepContent(location: StepContentLocation): void {
-    location.endPartCounts ??= this.#responsePartCounts();
+    location.endParts ??= this.#responsePartIdentities();
   }
 
   /**
-   * The content one loop iteration wrote: the parts each response message gained between the
-   * iteration's start and end. Where the iteration opened a boundary, its parts in that message are
-   * the ones after the marker.
+   * The content one loop iteration wrote: in each response message, the parts after those that
+   * were there when the iteration began, up to those that were there when it ended. Parts are
+   * recognised by identity rather than position, so a processor that clones, trims or rewrites
+   * earlier parts does not move the iteration's.
    *
    * `modelContent(stepNumber)` instead counts `step-start` markers, which goes wrong when a
    * processor retry rolls a rejected attempt's marker back and streams the retry into a fresh
    * message with none (PF-5364), when one response holds an intra-response marker (a tool call
    * followed by text), or when a processor prunes earlier messages.
-   *
-   * @returns the step content, or `undefined` when the iteration's boundary can no longer be found
-   *   (a processor replaced the parts around it, or the list was rebuilt); callers then fall back
-   *   to counting markers.
    */
-  public stepContent(location: StepContentLocation): AIV5Type.StepResult<any>['content'] | undefined {
-    const { boundary } = location;
-    const checkpoint = boundary ? this.#boundaryFingerprints.get(boundary) : undefined;
-    if (boundary && !checkpoint) return undefined;
-
+  public stepContent(location: StepContentLocation): AIV5Type.StepResult<any>['content'] {
     const parts: AIV5Type.UIMessage['parts'] = [];
     for (const message of this.response.db()) {
       const messageParts = message.content.parts ?? [];
-      const end = location.endPartCounts ? location.endPartCounts.get(message.id) : messageParts.length;
+      const endParts = location.endParts ? location.endParts.get(message.id) : undefined;
       // Started after the iteration ended.
-      if (end === undefined) continue;
+      if (location.endParts && !endParts) continue;
 
-      let start = location.startPartCounts.get(message.id) ?? 0;
-      if (boundary && checkpoint?.messageId === message.id) {
-        const boundaryIndex = findBoundaryIndex(messageParts, boundary, message.id, checkpoint);
-        if (boundaryIndex === -1) return undefined;
-        start = boundaryIndex + 1;
-      }
-      const stop = Math.min(end, messageParts.length);
+      const start = lastRecordedPartIndex(messageParts, location.startParts.get(message.id) ?? []) + 1;
+      const stop = endParts ? lastRecordedPartIndex(messageParts, endParts) + 1 : messageParts.length;
       if (start >= stop) continue;
 
       if (start === 0 && stop === messageParts.length) {

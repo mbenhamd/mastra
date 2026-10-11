@@ -38,10 +38,9 @@ export type LocatedStepContent = { readonly stepIndex: number; readonly location
 /**
  * The content of `steps[index]` as the MessageList holds it now.
  *
- * Read from where the step's iteration wrote its response when that is known
- * for this step. Otherwise (a durable run that rebuilt its MessageList, or a
- * boundary a processor replaced beyond recognition) fall back to counting
- * `step-start` markers.
+ * Read from where the step's iteration wrote its response when that was
+ * recorded for this step. Otherwise (a durable run that rebuilt its
+ * MessageList) fall back to counting `step-start` markers.
  *
  * @returns the content, or `undefined` when only the fallback was available and
  *   it found nothing: the list no longer holds the step, which is not the same
@@ -53,8 +52,7 @@ export function readStepContent(
   index: number,
   located: LocatedStepContent | undefined,
 ): StepResult<any>['content'] | undefined {
-  const locatedContent = located?.stepIndex === index ? messageList.stepContent(located.location) : undefined;
-  if (locatedContent) return locatedContent;
+  if (located?.stepIndex === index) return messageList.stepContent(located.location);
   const counted = messageList.get.response.aiV5.modelContent(messageStepNumber(steps, index));
   return counted.length > 0 ? counted : undefined;
 }

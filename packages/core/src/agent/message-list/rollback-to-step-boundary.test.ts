@@ -579,7 +579,8 @@ describe('MessageList step content location (PF-5364)', () => {
 
   it("reads the parts after the iteration's boundary and in messages it started", () => {
     const { list, id } = listWith(assistant([text('earlier step')]));
-    const location = list.openStepContent(openBoundary(list));
+    openBoundary(list);
+    const location = list.openStepContent();
     list.add([{ ...assistant([text('this step')]), id }], 'response');
     list.add([assistant([text('fresh message')])], 'response');
 
@@ -591,7 +592,8 @@ describe('MessageList step content location (PF-5364)', () => {
     // merges into the earlier response message.
     const { list, id } = listWith(assistant([toolCall('c1')]));
     list.add([assistant([text('feedback note')])], 'response');
-    const location = list.openStepContent(openBoundary(list));
+    openBoundary(list);
+    const location = list.openStepContent();
     list.add([{ ...assistant([text('answer')]), id }], 'response');
 
     expect(texts(list.stepContent(location))).toEqual(['answer']);
@@ -599,7 +601,7 @@ describe('MessageList step content location (PF-5364)', () => {
 
   it('stops at the end recorded when the iteration closed', () => {
     const { list, id } = listWith(assistant([text('earlier step')]));
-    const location = list.openStepContent(undefined);
+    const location = list.openStepContent();
     list.add([{ ...assistant([toolCall('c1')]), id }], 'response');
     list.closeStepContent(location);
     // A later attempt writes into the same message and a fresh one.
@@ -623,20 +625,46 @@ describe('MessageList step content location (PF-5364)', () => {
       } as any,
       'response',
     );
-    const location = list.openStepContent(list.openStepBoundary().boundary);
+    list.openStepBoundary();
+    const location = list.openStepContent();
     list.add({ role: 'assistant', content: 'second' } as any, 'response');
 
     expect(contentTypes(list.stepContent(location))).toEqual(['text']);
   });
 
-  it('cannot place the iteration once a processor replaced the parts ahead of its boundary', () => {
-    const { list, id } = listWith(assistant([toolCall('c1'), text('kept')]));
-    const location = list.openStepContent(openBoundary(list));
+  it("keeps the iteration's parts when a processor clones the message and trims earlier parts", () => {
+    const { list, id } = listWith(assistant([toolCall('c1'), toolCall('c2'), text('kept')]));
+    openBoundary(list);
+    const location = list.openStepContent();
     list.add([{ ...assistant([text('answer')]), id }], 'response');
     const replacement = structuredClone(list.get.response.db().find(message => message.id === id)!);
     replacement.content.parts = replacement.content.parts.filter(part => part.type !== 'tool-invocation');
-    list.add(replacement, 'response', { merge: false } as any);
+    list.add(replacement, 'response');
 
-    expect(list.stepContent(location)).toBeUndefined();
+    expect(texts(list.stepContent(location))).toEqual(['answer']);
+  });
+
+  it("keeps the iteration's parts when a processor rewrites an earlier part", () => {
+    const { list, id } = listWith(assistant([text('private note'), toolCall('c1')]));
+    openBoundary(list);
+    const location = list.openStepContent();
+    list.add([{ ...assistant([text('answer')]), id }], 'response');
+    const message = list.get.response.db().find(candidate => candidate.id === id)!;
+    message.content.parts[0] = text('[redacted]');
+
+    expect(texts(list.stepContent(location))).toEqual(['answer']);
+  });
+
+  it("reads a repeated answer as this iteration's own", () => {
+    const { list, id } = listWith(assistant([text('Done.')]));
+    openBoundary(list);
+    const location = list.openStepContent();
+    // Streamed straight onto the message, as the loop writes it (`add` would fold an identical part).
+    list.get.response
+      .db()
+      .find(message => message.id === id)!
+      .content.parts.push(text('Done.'));
+
+    expect(texts(list.stepContent(location))).toEqual(['Done.']);
   });
 });

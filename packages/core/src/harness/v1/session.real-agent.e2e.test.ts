@@ -5377,6 +5377,79 @@ describe('Harness v1 real-agent E2E — S23 processor retry after tool results',
     }
   });
 
+  it('delivers once when a processor trims parallel tool parts from the message the answer joins', async () => {
+    let providerCalls = 0;
+    const readFile = createTool({
+      id: 'readFile',
+      description: 'Read one test file.',
+      inputSchema: z.object({}),
+      execute: async () => ({ content: 'hello' }),
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? convertArrayToReadableStream([
+                  { type: 'stream-start', warnings: [] },
+                  { type: 'response-metadata', id: 'id-tools', modelId: 'mock-model-id', timestamp: new Date(0) },
+                  { type: 'tool-call', toolCallId: 'read-1', toolName: 'readFile', input: '{}', providerExecuted: false },
+                  { type: 'tool-call', toolCallId: 'read-2', toolName: 'readFile', input: '{}', providerExecuted: false },
+                  { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
+                ])
+              : textStream([REPAIRED_ANSWER]),
+        };
+      },
+    });
+    const dropToolParts = {
+      id: 'drop-tool-parts',
+      processOutputStep: ({ text: stepText, messages }: any) => {
+        if (!(stepText ?? '').includes(STATUS_LINE)) return messages;
+        return structuredClone(messages).map((message: any) =>
+          message.role === 'assistant'
+            ? {
+                ...message,
+                content: {
+                  ...message.content,
+                  parts: message.content.parts.filter((part: any) => part.type !== 'tool-invocation'),
+                },
+              }
+            : message,
+        );
+      },
+    };
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'read the files and answer with the status line',
+      model,
+      tools: { readFile },
+      outputProcessors: [dropToolParts] as any,
+      defaultOptions: {
+        onIterationComplete: async ({ iteration }) => (iteration === 1 ? { feedback: 'Now answer.' } : undefined),
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-trimmed-tools', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+      const result = (await session.message({ content: 'read them' })) as any;
+
+      expect(providerCalls).toBe(2);
+      expect(result.text).toBe(REPAIRED_ANSWER);
+      const visibleText = (events.filter(event => event.type === 'text_delta') as Array<{ delta: string }>)
+        .map(event => event.delta)
+        .join('');
+      expect(visibleText).toBe(REPAIRED_ANSWER);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('still recovers once when the repaired step is genuinely silent', async () => {
     const recovered = `Read the file.\n${STATUS_LINE}`;
     const { harness, providerCalls } = retryHarness([[REJECTED_ANSWER], [], [recovered]]);
