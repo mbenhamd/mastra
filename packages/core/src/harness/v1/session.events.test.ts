@@ -1402,6 +1402,63 @@ describe('Session synthetic tool_end on unsettled tools (§10.2)', () => {
     }
   });
 
+  it('keeps a tool-result classified as error when a later tool-result succeeds', async () => {
+    const { harness, agent } = setup();
+    // A raw error classification must not be overwritten by a later success:
+    // success never replaces an error, even between two tool-results.
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc-c', toolName: 'analyze', args: {} } },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'tc-c',
+          toolName: 'analyze',
+          result: { ok: false },
+          providerMetadata: { mastra: { resultStatus: 'error' } },
+        },
+      },
+      { type: 'tool-result', payload: { toolCallId: 'tc-c', toolName: 'analyze', result: { ok: true } } },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const result = (await session.message({ content: 'hi' })) as any;
+      expect(result.harnessToolReceipts).toEqual([
+        { toolCallId: 'tc-c', toolName: 'analyze', status: 'error' },
+        { toolCallId: 'tc-c', toolName: 'analyze', status: 'success' },
+      ]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('keeps the receipt byte budget exact when a tool-result receipt is replaced', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const internal = session as any;
+      internal._recordRunToolReceipt(
+        'run-b',
+        { toolCallId: 'tc-b', toolName: 'analyze', status: 'success' },
+        'tool-result',
+      );
+      internal._recordRunToolReceipt(
+        'run-b',
+        { toolCallId: 'tc-b', toolName: 'analyze', status: 'error' },
+        'tool-result',
+      );
+      const state = internal._runToolReceipts.get('run-b');
+      const encodedBytes = state.receipts.reduce(
+        (total: number, receipt: unknown) => total + new TextEncoder().encode(JSON.stringify(receipt)).byteLength,
+        0,
+      );
+
+      expect(state.receipts).toEqual([{ toolCallId: 'tc-b', toolName: 'analyze', status: 'error' }]);
+      expect(state.bytes).toBe(encodedBytes);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('records no receipt for a background placeholder whose completion never arrives', async () => {
     const { harness, agent } = setup();
     agent.chunks = [
