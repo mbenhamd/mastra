@@ -231,9 +231,6 @@ describeForAllEngines('AIMock loop scenario: tool result status', engine => {
     });
     const replacer = {
       id: 'replace-analysis-result',
-      // The loop engine builds its processor runner only when a processor
-      // handles the output stream; pass every part through.
-      processOutputStream: async ({ part }: { part: unknown }) => part,
       processToolResult: async ({
         messageList,
         toolCallId,
