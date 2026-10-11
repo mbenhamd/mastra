@@ -4999,7 +4999,7 @@ describe('Memory', () => {
     });
 
     it('forwards its observer working-memory policy so an unmarked record retracts working memory atomically', async () => {
-      for (const mutation of ['delete', 'edit'] as const) {
+      for (const mutation of ['delete', 'edit', 'thread-delete'] as const) {
         const storage = new InMemoryStore();
         const memory = new Memory({
           storage,
@@ -5036,12 +5036,20 @@ describe('Memory', () => {
             scope: 'resource',
           });
         };
-        const mutate = async (target: Memory, id: string) =>
-          mutation === 'delete'
-            ? await target.deleteMessages([id])
-            : await target.updateMessages({
-                messages: [{ id, content: { format: 2, parts: [{ type: 'text', text: 'Corrected.' }] } }],
-              });
+        const mutate = async (target: Memory, id: string) => {
+          if (mutation === 'delete') return await target.deleteMessages([id]);
+          if (mutation === 'thread-delete') {
+            // One thread per mutation: each thread holds one of the two messages.
+            const ownThreadId = `${threadId}-${id}`;
+            await memoryStore.saveThread({
+              thread: { id: ownThreadId, resourceId, title: '', metadata: {}, createdAt: now, updatedAt: now },
+            });
+            return await target.deleteThread(ownThreadId);
+          }
+          return await target.updateMessages({
+            messages: [{ id, content: { format: 2, parts: [{ type: 'text', text: 'Corrected.' }] } }],
+          });
+        };
 
         // A memory whose observer does not manage working memory leaves it alone.
         await seed();

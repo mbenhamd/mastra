@@ -804,6 +804,7 @@ describe('MemoryPG observational-memory retraction', () => {
     const deleter = await namedStore('om-retraction-deleter', deleterName);
     const writer = await namedStore('om-retraction-writer', writerName);
     const inspector = new Pool({ connectionString });
+    const blocker = new Pool({ connectionString });
     const waitForAdvisoryLockWait = async (applicationName: string) => {
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
@@ -820,7 +821,6 @@ describe('MemoryPG observational-memory retraction', () => {
       }
       throw new Error(`Timed out waiting for ${applicationName} to block on the OM resource lock.`);
     };
-    const blocker = new Pool({ connectionString });
     const client = await blocker.connect();
     let transactionOpen = false;
     const receipts: Array<{ result: { clearedScopes: string[]; clearedResourceWorkingMemory: boolean } }> = [];
@@ -855,11 +855,11 @@ describe('MemoryPG observational-memory retraction', () => {
     } finally {
       if (transactionOpen) await client.query('ROLLBACK');
       client.release();
-      await blocker.end();
+      await lateWrite;
+      await Promise.allSettled([blocker.end(), deleter.store.close(), writer.store.close(), inspector.end()]);
     }
     // The late observer write names the retracted generation and is refused.
     const refused = await lateWrite;
-    await Promise.allSettled([deleter.store.close(), writer.store.close(), inspector.end()]);
     expect((refused as { cause?: { name?: string } } | undefined)?.cause?.name).toBe(
       'ObservationalMemoryGenerationConflictError',
     );
@@ -963,6 +963,97 @@ describe('MemoryPG observational-memory retraction', () => {
     }
     await expect(retractorMemory.getResourceById({ resourceId: scopeResourceId })).resolves.toMatchObject({
       workingMemory: 'Resource profile.',
+    });
+  });
+
+  it('stamps a not-managed record managed when its observer writes working memory, so a retraction clears it', async () => {
+    const staleResourceId = `${resourceId}-stale-null-marker`;
+    const staleThreadId = `${threadId}-stale-null-marker`;
+    await observerMemory.saveThread({
+      thread: {
+        id: staleThreadId,
+        resourceId: staleResourceId,
+        title: '',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    // Created while the observer did not manage working memory; the policy has since changed.
+    const record = await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: null },
+      resourceId: staleResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await observerMemory.updateResourceFromObservationalMemory({
+      resourceId: staleResourceId,
+      workingMemory: 'FROM-DELETED-MSG',
+      guard: { recordId: record.id, threadId: null, resourceId: staleResourceId },
+    });
+    await expect(observerMemory.getObservationalMemory(null, staleResourceId)).resolves.toMatchObject({
+      config: expect.objectContaining({ _managedWorkingMemoryScope: 'resource' }),
+    });
+    await expect(
+      retractorMemory.retractObservationalMemory({ resourceId: staleResourceId, threadId: staleThreadId }),
+    ).resolves.toMatchObject({ clearedScopes: ['resource'], clearedResourceWorkingMemory: true });
+    await expect(retractorMemory.getResourceById({ resourceId: staleResourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+  });
+
+  it('forwards the policy through an atomic message edit', async () => {
+    const editResourceId = `${resourceId}-policy-edit`;
+    const editThreadId = `${threadId}-policy-edit`;
+    const editMessageId = `${editThreadId}-message`;
+    await observerMemory.saveResource({
+      resource: {
+        id: editResourceId,
+        workingMemory: 'Learned from the edited message.',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.saveThread({
+      thread: {
+        id: editThreadId,
+        resourceId: editResourceId,
+        title: '',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.saveMessages({
+      messages: [
+        {
+          id: editMessageId,
+          threadId: editThreadId,
+          resourceId: editResourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Original fact' }] },
+          createdAt,
+        },
+      ],
+    });
+    // Written before the marker existed.
+    await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: editResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    const receipts: Array<{ result: { clearedResourceWorkingMemory: boolean } }> = [];
+    await retractorMemory.updateMessages({
+      messages: [{ id: editMessageId, content: { content: 'Corrected fact' } }],
+      retractObservationalMemory: true,
+      managedWorkingMemoryScope: 'resource',
+      observationalMemoryRetractions: receipts as any,
+    });
+    expect(receipts).toMatchObject([{ result: { clearedResourceWorkingMemory: true } }]);
+    await expect(retractorMemory.getResourceById({ resourceId: editResourceId })).resolves.toMatchObject({
+      workingMemory: null,
     });
   });
 

@@ -254,6 +254,20 @@ function getManagedWorkingMemoryScopes(
   return scopes;
 }
 
+/**
+ * A guarded observer working-memory write proves its record's observer manages
+ * working memory at `scope`: a record marked `null` (created while it did not)
+ * is stamped, so a later retraction clears what the write stores. An unmarked
+ * (pre-marker) record is left to the caller's policy fallback.
+ */
+function markObservationalMemoryManagingWorkingMemory(
+  record: ObservationalMemoryRecord,
+  scope: 'thread' | 'resource',
+): void {
+  if (record.config?._managedWorkingMemoryScope !== null) return;
+  record.config = { ...record.config, _managedWorkingMemoryScope: scope };
+}
+
 function removeObservationalMemoryMetadata(
   metadata: Record<string, unknown> | undefined,
   clearWorkingMemory: boolean,
@@ -489,9 +503,11 @@ export class InMemoryMemory extends MemoryStorage {
 
   async deleteThread({
     threadId,
+    managedWorkingMemoryScope,
     observationalMemoryRetractions,
   }: {
     threadId: string;
+    managedWorkingMemoryScope?: 'thread' | 'resource';
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<void> {
     const thread = this.db.threads.get(threadId);
@@ -507,9 +523,12 @@ export class InMemoryMemory extends MemoryStorage {
         }
       });
 
-      const input = thread?.resourceId
+      const coordinate = thread?.resourceId
         ? { resourceId: thread.resourceId, threadId }
         : this.resolveObservationalMemoryRetractionInput(threadId);
+      const input = coordinate
+        ? { ...coordinate, ...(managedWorkingMemoryScope ? { managedWorkingMemoryScope } : {}) }
+        : undefined;
       if (input) {
         const result = this.retractObservationalMemoryState(input);
         committedRetraction = { input, result };
@@ -1251,6 +1270,7 @@ export class InMemoryMemory extends MemoryStorage {
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
     }
+    markObservationalMemoryManagingWorkingMemory(current, 'resource');
     const resource = this.db.resources.get(resourceId);
     assertWorkingMemorySnapshotUnchanged({
       currentValue: resource?.workingMemory,
@@ -1285,6 +1305,9 @@ export class InMemoryMemory extends MemoryStorage {
     )?.[0];
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
+    }
+    if (Object.prototype.hasOwnProperty.call(metadata, 'workingMemory')) {
+      markObservationalMemoryManagingWorkingMemory(current, 'thread');
     }
     return this.updateThread({
       id,
@@ -1352,6 +1375,7 @@ export class InMemoryMemory extends MemoryStorage {
         if (currentGeneration?.id !== guard.recordId) {
           throw new WorkingMemoryValidationError('Observational memory generation is no longer current.');
         }
+        markObservationalMemoryManagingWorkingMemory(currentGeneration, input.scope);
       }
 
       const now = new Date();

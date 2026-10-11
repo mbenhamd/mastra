@@ -207,7 +207,9 @@ type MessageCoordinateRow = Pick<MessageRowFromDB, 'id' | 'threadId' | 'resource
  * The working-memory scope a record's `_managedWorkingMemoryScope` marker
  * names: `'unmarked'` when the record carries no marker at all (written before
  * the marker existed), `undefined` when it marks working memory as not managed
- * (`null`) or its config is unreadable.
+ * (`null`). An unreadable config (not JSON, or not an object) is also
+ * `undefined`: a retraction's policy fallback does not reach it, a deliberate
+ * choice since the column always holds the engine's JSON object.
  */
 function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 'unmarked' | undefined {
   let parsed = config;
@@ -1240,9 +1242,11 @@ export class MemoryPG extends MemoryStorage {
 
   async deleteThread({
     threadId,
+    managedWorkingMemoryScope,
     observationalMemoryRetractions,
   }: {
     threadId: string;
+    managedWorkingMemoryScope?: 'thread' | 'resource';
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<void> {
     try {
@@ -1278,6 +1282,7 @@ export class MemoryPG extends MemoryStorage {
             const input = {
               resourceId: deletionResourceId,
               threadId,
+              ...(managedWorkingMemoryScope ? { managedWorkingMemoryScope } : {}),
             };
             retraction = await this.retractObservationalMemoryInTransaction(t, input);
             committedRetraction = { input, result: retraction };
@@ -2885,6 +2890,7 @@ export class MemoryPG extends MemoryStorage {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
         await this.assertCurrentObservationalMemoryGeneration(t, guard);
+        await this.markObservationalMemoryManagingWorkingMemory(t, guard, 'resource');
         const currentRow = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
           `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
           [resourceId],
@@ -2956,6 +2962,9 @@ export class MemoryPG extends MemoryStorage {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.lockWorkingMemoryTarget(t, 'thread', id);
         await this.assertCurrentObservationalMemoryGeneration(t, guard);
+        if (Object.prototype.hasOwnProperty.call(metadata, 'workingMemory')) {
+          await this.markObservationalMemoryManagingWorkingMemory(t, guard, 'thread');
+        }
         const currentRow = await t.oneOrNone<{ metadata: unknown }>(
           `SELECT metadata FROM ${tableName} WHERE id = $1 AND "resourceId" = $2 FOR UPDATE`,
           [id, guard.resourceId],
@@ -3061,6 +3070,7 @@ export class MemoryPG extends MemoryStorage {
             );
           }
           await this.assertCurrentObservationalMemoryGeneration(t, guard);
+          await this.markObservationalMemoryManagingWorkingMemory(t, guard, input.scope);
         }
 
         const now = new Date();
@@ -4016,6 +4026,46 @@ export class MemoryPG extends MemoryStorage {
 
   private async lockWorkingMemoryTarget(t: TxClient, scope: 'thread' | 'resource', id: string): Promise<void> {
     await t.none('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`mastra:working-memory:${scope}:${id}`]);
+  }
+
+  /**
+   * A guarded observer working-memory write proves its record's observer
+   * manages working memory at `scope`. A record marked `null` (created while
+   * the observer did not manage it) is stamped in the write's transaction,
+   * under the OM-resource lock and before the target row, so a later
+   * retraction clears what this write stores. An unmarked (pre-marker) record
+   * is left to the caller's policy fallback, and a marked one keeps its scope.
+   */
+  private async markObservationalMemoryManagingWorkingMemory(
+    t: TxClient,
+    guard: ObservationalMemoryWriteGuard,
+    scope: 'thread' | 'resource',
+  ): Promise<void> {
+    const tableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
+    const row = await t.oneOrNone<{ config: unknown }>(`SELECT config FROM ${tableName} WHERE id = $1 FOR UPDATE`, [
+      guard.recordId,
+    ]);
+    if (!row) return;
+    let config: unknown = row.config;
+    if (typeof config === 'string') {
+      try {
+        config = JSON.parse(config);
+      } catch {
+        return;
+      }
+    }
+    if (
+      typeof config !== 'object' ||
+      config === null ||
+      Array.isArray(config) ||
+      (config as Record<string, unknown>)._managedWorkingMemoryScope !== null
+    ) {
+      return;
+    }
+    await t.none(`UPDATE ${tableName} SET config = $1 WHERE id = $2`, [
+      toPgJson({ ...(config as Record<string, unknown>), _managedWorkingMemoryScope: scope }),
+      guard.recordId,
+    ]);
   }
 
   private async assertCurrentObservationalMemoryGeneration(

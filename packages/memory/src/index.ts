@@ -1682,10 +1682,7 @@ export class Memory extends MastraMemory {
     const threadVectorScopes = new Map<string, { resourceId: string; threadId: string }>();
     for (const coordinate of coordinates) {
       if (memoryStore.supportsAtomicObservationalMemoryRetraction) {
-        const result = await memoryStore.retractObservationalMemory({
-          ...coordinate,
-          ...this.managedWorkingMemoryScopeOption(),
-        });
+        const result = await memoryStore.retractObservationalMemory(coordinate);
         receipts.push({ input: coordinate, result });
         continue;
       }
@@ -1820,7 +1817,9 @@ export class Memory extends MastraMemory {
     try {
       await memoryStore.deleteThread({
         threadId,
-        ...(atomicRetraction ? { observationalMemoryRetractions: receipts } : {}),
+        ...(atomicRetraction
+          ? { ...this.managedWorkingMemoryScopeOption(), observationalMemoryRetractions: receipts }
+          : {}),
       });
     } catch (error) {
       if (fallbackCoordinate) {
@@ -3120,21 +3119,17 @@ ${workingMemory}`;
   }
 
   /**
-   * One-time initialization of the shared ObservationalMemory engine.
-   * Called lazily by the `omEngine` getter on first access.
-   */
-  /**
-   * The working-memory scope this memory's observer manages, if any. Records
-   * the observer writes carry it as their `_managedWorkingMemoryScope` marker,
-   * and an authoritative message edit or delete passes it to the store so a
-   * record written before that marker existed retracts the same working
-   * memory atomically.
+   * The working-memory scope this memory's observer manages, as the option an
+   * authoritative message edit, message delete or thread delete passes to the
+   * store, so a record written before the `_managedWorkingMemoryScope` marker
+   * existed retracts the same working memory atomically.
    */
   private managedWorkingMemoryScopeOption(): { managedWorkingMemoryScope?: 'thread' | 'resource' } {
     const managedWorkingMemoryScope = this.observerManagedWorkingMemoryScope();
     return managedWorkingMemoryScope ? { managedWorkingMemoryScope } : {};
   }
 
+  /** The working-memory scope this memory's observer manages, if any (its records' marker). */
   private observerManagedWorkingMemoryScope(): 'thread' | 'resource' | undefined {
     const omConfig = normalizeObservationalMemoryConfig(this.threadConfig.observationalMemory);
     if (!omConfig) return undefined;
@@ -3144,6 +3139,10 @@ ${workingMemory}`;
       : undefined;
   }
 
+  /**
+   * One-time initialization of the shared ObservationalMemory engine.
+   * Called lazily by the `omEngine` getter on first access.
+   */
   private async _initOMEngine(): Promise<ObservationalMemory | null> {
     const omConfig = normalizeObservationalMemoryConfig(this.threadConfig.observationalMemory);
     if (!omConfig) return null;
