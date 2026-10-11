@@ -1155,49 +1155,104 @@ describe('MemoryPG observational-memory retraction', () => {
       await store.init();
       return { store, memory: (await store.getStore('memory')) as MemoryPG };
     };
-    const seedNullMarked = async (suffix: string) => {
+    const seedMarked = async (suffix: string, scope: 'resource' | 'thread', marker: 'resource' | null = null) => {
       const caseResourceId = `${resourceId}-stamp-concurrency-${suffix}`;
+      const caseThreadId = scope === 'thread' ? `${threadId}-stamp-concurrency-${suffix}` : null;
       await observerMemory.saveResource({
         resource: { id: caseResourceId, workingMemory: 'Before.', metadata: {}, createdAt, updatedAt: createdAt },
       });
+      if (caseThreadId) {
+        await observerMemory.saveThread({
+          thread: {
+            id: caseThreadId,
+            resourceId: caseResourceId,
+            title: '',
+            metadata: {},
+            createdAt,
+            updatedAt: createdAt,
+          },
+        });
+      }
       const record = await observerMemory.initializeObservationalMemory({
-        config: { _managedWorkingMemoryScope: null, keep: 'unrelated' },
+        config: { _managedWorkingMemoryScope: marker, keep: 'unrelated' },
         resourceId: caseResourceId,
-        scope: 'resource',
-        threadId: null,
+        scope,
+        threadId: caseThreadId,
       });
       return {
         resourceId: caseResourceId,
+        threadId: caseThreadId,
         record,
-        guard: { recordId: record.id, threadId: null, resourceId: caseResourceId },
+        guard: { recordId: record.id, threadId: caseThreadId, resourceId: caseResourceId },
       };
     };
+    type Seeded = Awaited<ReturnType<typeof seedMarked>>;
+    // Each guarded write, prepared (snapshot read) before the OM row is blocked.
+    const guardedWrites = {
+      'updateResourceFromObservationalMemory (legacy)':
+        async (memory: MemoryPG, { resourceId: id, guard }: Seeded) =>
+        () =>
+          memory.updateResourceFromObservationalMemory({ resourceId: id, workingMemory: 'FROM-DELETED-MSG', guard }),
+      'applyWorkingMemoryUpdate, resource scope': async (memory: MemoryPG, { resourceId: id, guard }: Seeded) => {
+        const { revision } = await memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: id });
+        return () =>
+          memory.applyWorkingMemoryUpdate({
+            scope: 'resource',
+            resourceId: id,
+            value: 'FROM-DELETED-MSG',
+            expectedRevision: revision,
+            source: 'observer',
+            observationalMemoryGuard: guard,
+          });
+      },
+      'applyWorkingMemoryUpdate, thread scope': async (
+        memory: MemoryPG,
+        { resourceId: id, threadId: tid, guard }: Seeded,
+      ) => {
+        const { revision } = await memory.getWorkingMemorySnapshot({ scope: 'thread', resourceId: id, threadId: tid! });
+        return () =>
+          memory.applyWorkingMemoryUpdate({
+            scope: 'thread',
+            resourceId: id,
+            threadId: tid!,
+            value: 'FROM-DELETED-MSG',
+            expectedRevision: revision,
+            source: 'observer',
+            observationalMemoryGuard: guard,
+          });
+      },
+    } as const;
 
-    it('locks the OM row before the target row in a guarded write', async () => {
-      const { resourceId: id, record, guard } = await seedNullMarked('lock-order');
+    it.each([
+      ['updateResourceFromObservationalMemory (legacy)', 'resource'],
+      ['applyWorkingMemoryUpdate, resource scope', 'resource'],
+      ['applyWorkingMemoryUpdate, thread scope', 'thread'],
+    ] as const)('locks the OM row before the target row in a guarded write: %s', async (name, scope) => {
+      const seeded = await seedMarked(`lock-order-${name.replace(/\W+/g, '-')}`, scope);
       const writerName = `pf5257-stamp-writer-${Date.now()}`;
       const writer = await namedMemory('stamp-lock-order-writer', writerName);
       const inspector = new Pool({ connectionString });
       const blocker = await inspector.connect();
       const probe = await inspector.connect();
+      const targetTable = scope === 'thread' ? 'mastra_threads' : 'mastra_resources';
+      const targetId = scope === 'thread' ? seeded.threadId : seeded.resourceId;
       let write: Promise<unknown> | undefined;
       try {
+        const start = await guardedWrites[name](writer.memory, seeded);
         await blocker.query('BEGIN');
         await blocker.query(`SELECT 1 FROM "${schemaName}"."mastra_observational_memory" WHERE id = $1 FOR UPDATE`, [
-          record.id,
+          seeded.record.id,
         ]);
-        write = writer.memory
-          .updateResourceFromObservationalMemory({ resourceId: id, workingMemory: 'FROM-DELETED-MSG', guard })
-          .catch((error: unknown) => error);
+        write = start().catch((error: unknown) => error);
         await lockWaitOf(inspector, writerName);
         // Waiting on the OM row, the write holds no lock on its target row yet.
         await probe.query('BEGIN');
         await expect(
-          probe.query(`SELECT 1 FROM "${schemaName}"."mastra_resources" WHERE id = $1 FOR UPDATE NOWAIT`, [id]),
+          probe.query(`SELECT 1 FROM "${schemaName}"."${targetTable}" WHERE id = $1 FOR UPDATE NOWAIT`, [targetId]),
         ).resolves.toMatchObject({ rowCount: 1 });
         await probe.query('ROLLBACK');
         await blocker.query('COMMIT');
-        await expect(write).resolves.toMatchObject({ workingMemory: 'FROM-DELETED-MSG' });
+        await expect(write).resolves.not.toBeInstanceOf(Error);
       } finally {
         await blocker.query('ROLLBACK').catch(() => {});
         await probe.query('ROLLBACK').catch(() => {});
@@ -1206,13 +1261,51 @@ describe('MemoryPG observational-memory retraction', () => {
         await write;
         await Promise.allSettled([writer.store.close(), inspector.end()]);
       }
-      await expect(retractorMemory.getObservationalMemory(null, id)).resolves.toMatchObject({
-        config: expect.objectContaining({ _managedWorkingMemoryScope: 'resource' }),
+      const stored =
+        scope === 'thread'
+          ? (await retractorMemory.getThreadById({ threadId: seeded.threadId! }))?.metadata?.workingMemory
+          : (await retractorMemory.getResourceById({ resourceId: seeded.resourceId }))?.workingMemory;
+      expect(stored).toBe('FROM-DELETED-MSG');
+      await expect(retractorMemory.getObservationalMemory(seeded.threadId, seeded.resourceId)).resolves.toMatchObject({
+        config: expect.objectContaining({ _managedWorkingMemoryScope: scope }),
+      });
+    });
+
+    it('leaves the OM row of an already-marked record unlocked during a guarded write', async () => {
+      const seeded = await seedMarked('marked-no-lock', 'resource', 'resource');
+      const inspector = new Pool({ connectionString });
+      const blocker = await inspector.connect();
+      let write: Promise<unknown> | undefined;
+      try {
+        const start = await guardedWrites['applyWorkingMemoryUpdate, resource scope'](observerMemory, seeded);
+        await blocker.query('BEGIN');
+        await blocker.query(`SELECT 1 FROM "${schemaName}"."mastra_observational_memory" WHERE id = $1 FOR UPDATE`, [
+          seeded.record.id,
+        ]);
+        // The record is never stamped, so the write must not queue behind an OM-row holder.
+        write = start();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const outcome = await Promise.race([
+          write.then(() => 'written'),
+          new Promise<string>(resolve => {
+            timer = setTimeout(() => resolve('blocked on the OM row'), 3_000);
+          }),
+        ]);
+        clearTimeout(timer);
+        expect(outcome).toBe('written');
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => {});
+        blocker.release();
+        await write?.catch(() => {});
+        await inspector.end();
+      }
+      await expect(retractorMemory.getResourceById({ resourceId: seeded.resourceId })).resolves.toMatchObject({
+        workingMemory: 'FROM-DELETED-MSG',
       });
     });
 
     it('keeps a stamp that commits during a concurrent config merge, and the merged fields', async () => {
-      const { resourceId: id, record } = await seedNullMarked('config-merge');
+      const { resourceId: id, record } = await seedMarked('config-merge', 'resource');
       const mergerName = `pf5257-config-merger-${Date.now()}`;
       const merger = await namedMemory('stamp-config-merger', mergerName);
       const inspector = new Pool({ connectionString });

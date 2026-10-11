@@ -229,6 +229,28 @@ function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 
 }
 
 /**
+ * Whether a record's config explicitly marks working memory as not managed
+ * (`_managedWorkingMemoryScope: null`), the only state a guarded observer
+ * write stamps.
+ */
+function isNotManagedObservationalMemoryConfig(config: unknown): boolean {
+  let parsed = config;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return false;
+    }
+  }
+  return (
+    typeof parsed === 'object' &&
+    parsed !== null &&
+    !Array.isArray(parsed) &&
+    (parsed as Record<string, unknown>)._managedWorkingMemoryScope === null
+  );
+}
+
+/**
  * The working-memory scopes the retracted records manage. A record with no
  * marker at all counts as `fallback` when the caller's policy names one; an
  * explicit `null` ("not managed") marker is never overridden.
@@ -2888,7 +2910,7 @@ export class MemoryPG extends MemoryStorage {
       return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
-        const generation = await this.assertCurrentObservationalMemoryGeneration(t, guard, { lockRow: true });
+        const generation = await this.assertCurrentObservationalMemoryGeneration(t, guard, { lockRowForStamp: true });
         const currentRow = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
           `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
           [resourceId],
@@ -3068,7 +3090,9 @@ export class MemoryPG extends MemoryStorage {
               'Observational memory guard does not match the working-memory target.',
             );
           }
-          guardedGeneration = await this.assertCurrentObservationalMemoryGeneration(t, guard, { lockRow: true });
+          guardedGeneration = await this.assertCurrentObservationalMemoryGeneration(t, guard, {
+            lockRowForStamp: true,
+          });
         }
 
         const now = new Date();
@@ -3853,6 +3877,14 @@ export class MemoryPG extends MemoryStorage {
         // OM advisory locks must be acquired before either the thread row or
         // its messages. delete/retraction paths take the same order, so neither
         // side can hold a row the other needs while waiting on the OM lock.
+        //
+        // This lock is also the only cycle breaker against a guarded observer
+        // write: rollback locks the thread row and then OM rows, while the
+        // observer locks the OM row of a not-managed record and then the
+        // thread row (see assertCurrentObservationalMemoryGeneration). Any
+        // transaction that locks a thread or resource row and then an OM row
+        // must hold the OM-resource advisory lock for that row's resource
+        // first; dropping it here deadlocks (40P01) against that observer.
         await this.lockObservationalMemoryResources(t, [threadSnapshot.resourceId, observationalMemory?.resourceId]);
         const thread = await t.oneOrNone<{ resourceId: string; storageGeneration: string }>(
           `SELECT "resourceId", xmin::text AS "storageGeneration"
@@ -3979,6 +4011,14 @@ export class MemoryPG extends MemoryStorage {
    * 4. thread/resource rows; and
    * 5. message rows.
    *
+   * OM rows have no single place in that row order: a guarded observer write
+   * that may stamp a not-managed record locks its OM row before its target
+   * thread/resource row, while clone rollback locks the thread row before OM
+   * rows. Only the OM-resource advisory lock (2) keeps the two apart. Any
+   * transaction that locks a thread or resource row and then an OM row must
+   * therefore hold the OM-resource advisory lock for that row's resource
+   * first; without it, it deadlocks against the observer write.
+   *
    * The advisory key predates its broader ownership role, so it intentionally
    * retains the `thread-clone` prefix for cross-version serialization.
    */
@@ -4057,22 +4097,7 @@ export class MemoryPG extends MemoryStorage {
     scope: 'thread' | 'resource',
     current: { config: unknown },
   ): Promise<void> {
-    let config: unknown = current.config;
-    if (typeof config === 'string') {
-      try {
-        config = JSON.parse(config);
-      } catch {
-        return;
-      }
-    }
-    if (
-      typeof config !== 'object' ||
-      config === null ||
-      Array.isArray(config) ||
-      (config as Record<string, unknown>)._managedWorkingMemoryScope !== null
-    ) {
-      return;
-    }
+    if (!isNotManagedObservationalMemoryConfig(current.config)) return;
     // Only for a `null`-marked record (rare): a conditional update on the
     // stored value, so it does not clobber a concurrent config merge, and
     // updateObservationalMemoryConfig locks the row for its read-modify-write
@@ -4088,29 +4113,40 @@ export class MemoryPG extends MemoryStorage {
 
   /**
    * Throws unless the guard names the current generation; answers that
-   * record's config. `lockRow` locks the current OM row before the caller
-   * touches its target rows (the OM rows -> target rows order a later
-   * working-memory marker stamp keeps).
+   * record's config. `lockRowForStamp` locks the current OM row, only when it
+   * is marked not-managed and so may be stamped, before the caller touches
+   * its target rows (the OM row -> target row order the later
+   * working-memory marker stamp keeps). A marked or pre-marker record is
+   * never stamped, so it stays unlocked and unguarded OM writers do not
+   * queue behind the write. The caller must already hold the OM-resource
+   * advisory lock (see lockThreadLifecycles).
    */
   private async assertCurrentObservationalMemoryGeneration(
     t: TxClient,
     guard: ObservationalMemoryWriteGuard,
-    options: { lockRow?: boolean } = {},
+    options: { lockRowForStamp?: boolean } = {},
   ): Promise<{ config: unknown }> {
     const tableName = getTableName({
       indexName: OM_TABLE,
       schemaName: getSchemaName(this.#schema),
     });
-    const current = await t.oneOrNone<{ id: string; config: unknown }>(
-      `SELECT id, config FROM ${tableName}
-       WHERE "lookupKey" = $1
-       ORDER BY ${OM_GENERATION_ORDER}
-       LIMIT 1
-       ${options.lockRow ? 'FOR UPDATE' : ''}`,
-      [this.getOMKey(guard.threadId, guard.resourceId)],
-    );
-    if (!current || current.id !== guard.recordId) {
-      throw new ObservationalMemoryGenerationConflictError();
+    const readCurrent = async (lockRow: boolean) => {
+      const current = await t.oneOrNone<{ id: string; config: unknown }>(
+        `SELECT id, config FROM ${tableName}
+         WHERE "lookupKey" = $1
+         ORDER BY ${OM_GENERATION_ORDER}
+         LIMIT 1
+         ${lockRow ? 'FOR UPDATE' : ''}`,
+        [this.getOMKey(guard.threadId, guard.resourceId)],
+      );
+      if (!current || current.id !== guard.recordId) {
+        throw new ObservationalMemoryGenerationConflictError();
+      }
+      return current;
+    };
+    const current = await readCurrent(false);
+    if (options.lockRowForStamp && isNotManagedObservationalMemoryConfig(current.config)) {
+      return readCurrent(true);
     }
     return current;
   }
