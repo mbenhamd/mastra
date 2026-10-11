@@ -1093,6 +1093,50 @@ describe('native chat terminal handoff', () => {
     ).resolves.toMatchObject({ status: 'completed', erased: true });
   });
 
+  it("drops a caller's extra fields from a deleted session's retained rows (PF-5309)", async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    // Structurally typed callers can pass extra properties through a variable.
+    const input = { ...admission(), providerOutput: 'extra secret' } as HarnessTerminalAdmissionInput;
+    const pending = { ...pendingEvidence(input), providerOutput: 'extra secret' } as AgentSignalResultEvidence;
+    await storage.writeMessageResultEvidence(pending);
+    await storage.admitTerminalHandoff(input);
+    await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: { ...pending, status: 'completed', result: { text: 'provider output' }, updatedAt: 3_000 },
+      terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: { text: 'done' } },
+    });
+    expect(JSON.stringify([...db.harnessTerminalAdmissions.values()])).toContain('extra secret');
+
+    await storage.deleteSession({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      ifVersion: 1,
+      expectedResourceId: 'resource-1',
+      expectedThreadId: 'thread-1',
+      expectedParentSessionId: null,
+      expectedCreatedAt: 1_000,
+    });
+
+    const retained = JSON.stringify([
+      ...db.harnessTerminalAdmissions.values(),
+      ...db.harnessTerminalIntents.values(),
+      ...db.harnessMessageResultEvidence.values(),
+    ]);
+    expect(retained).not.toContain('extra secret');
+    expect(retained).not.toContain('provider output');
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pending, status: 'completed', result: { text: 'provider output' }, updatedAt: 3_000 },
+        terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+        projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: { text: 'done' } },
+      }),
+    ).resolves.toMatchObject({ status: 'duplicate' });
+  });
+
   it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
     await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });

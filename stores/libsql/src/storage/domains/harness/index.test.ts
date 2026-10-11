@@ -1806,6 +1806,19 @@ describe('HarnessLibSQL message result evidence', () => {
       createdAt: 1000,
       updatedAt: 2000,
     });
+    // Another session's result in the same harness stays untouched.
+    await storage.writeMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-other',
+      resourceId: 'resource-1',
+      threadId: 'thread-scope-b',
+      signalId: 'signal-other',
+      runId: 'run-other',
+      status: 'completed',
+      result: { text: 'other session result' },
+      createdAt: 1000,
+      updatedAt: 2000,
+    });
     const record = await storage.loadSession({ sessionId: 'session-scope' });
     if (!record) throw new Error('expected the session');
     await storage.deleteSession({ sessionId: record.id, ifVersion: record.version });
@@ -1818,6 +1831,15 @@ describe('HarnessLibSQL message result evidence', () => {
     });
     expect(kept).toMatchObject({ status: 'completed', erased: true });
     expect(JSON.stringify(kept)).not.toContain('other scope secret');
+    await expect(
+      storage.loadMessageResultEvidence({
+        harnessName: 'default',
+        sessionId: 'session-other',
+        resourceId: 'resource-1',
+        threadId: 'thread-scope-b',
+        signalId: 'signal-other',
+      }),
+    ).resolves.toMatchObject({ status: 'completed', result: { text: 'other session result' } });
   });
 
   it('stores retained message evidence and resolves duplicate/conflict admissions', async () => {

@@ -1501,6 +1501,8 @@ describe('HarnessPG native terminal handoff', () => {
           : {}),
       });
       expect(committed.status).toBe('committed');
+      // The private text really is stored before the delete.
+      if (mode !== 'malformed-error') expect(await remaining(session.id)).toContain('private');
       if (mode === 'malformed-error') {
         // A stored result whose error is not an object (written outside the API).
         for (const table of [TABLE_HARNESS_TERMINAL_ADMISSIONS, TABLE_HARNESS_TERMINAL_INTENTS]) {

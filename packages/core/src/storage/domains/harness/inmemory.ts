@@ -4435,6 +4435,7 @@ export class InMemoryHarness extends HarnessStorage {
   private redactRetainedSessionContent(namespace: string, sessionId: string): void {
     for (const admission of this.db.harnessTerminalAdmissions.values()) {
       if (admission.harnessName !== namespace || admission.sessionId !== sessionId) continue;
+      keepOnlyFields(admission, RETAINED_TERMINAL_ADMISSION_FIELDS);
       admission.seed = null;
       if (admission.terminalResult !== undefined) {
         admission.terminalResult = redactHarnessTerminalResult(admission.terminalResult);
@@ -4445,6 +4446,7 @@ export class InMemoryHarness extends HarnessStorage {
     }
     for (const intent of this.db.harnessTerminalIntents.values()) {
       if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
+      keepOnlyFields(intent, RETAINED_TERMINAL_INTENT_FIELDS);
       intent.terminalResult = redactHarnessTerminalResult(intent.terminalResult);
       intent.projection = redactStoredHarnessTerminalProjection(intent.projection);
       delete intent.lastError;
@@ -4465,6 +4467,7 @@ export class InMemoryHarness extends HarnessStorage {
       // Every resource and thread scope the session id was used under (the
       // delete itself only removes the current scope's uncommitted rows).
       if (evidence.harnessName !== namespace || evidence.sessionId !== sessionId) continue;
+      keepOnlyFields(evidence, RETAINED_MESSAGE_EVIDENCE_FIELDS);
       const mutable = evidence as { status: string; result?: unknown; error?: unknown; erased?: true };
       if (mutable.status === 'completed') {
         // The row keeps proving the turn completed; readers see the erased
@@ -4963,6 +4966,75 @@ export class InMemoryHarness extends HarnessStorage {
  * separator means session-prefix scans for `deleteAttachmentsForSession` are
  * unambiguous regardless of the contents of the ids.
  */
+/**
+ * PF-5309: the fields a deleted session's retained terminal and evidence rows
+ * keep. The in-memory store keeps whole caller objects, so the redaction
+ * removes every other property (a caller's extra field never survives a
+ * delete); the SQL adapters only ever store these columns.
+ */
+const RETAINED_TERMINAL_ADMISSION_FIELDS = new Set([
+  'harnessName',
+  'sessionId',
+  'resourceId',
+  'threadId',
+  'sessionIncarnation',
+  'admissionId',
+  'admissionHash',
+  'signalId',
+  'runId',
+  'executionGrant',
+  'id',
+  'protocolVersion',
+  'finalizerId',
+  'finalizerVersion',
+  'seed',
+  'seedBytes',
+  'seedHash',
+  'status',
+  'terminalResult',
+  'projection',
+  'revision',
+  'createdAt',
+  'updatedAt',
+]);
+const RETAINED_TERMINAL_INTENT_FIELDS = new Set([
+  ...RETAINED_TERMINAL_ADMISSION_FIELDS,
+  'attempts',
+  'claimId',
+  'claimExpiresAt',
+  'consumerId',
+  'nextAttemptAt',
+  'lastError',
+  'ackedAt',
+  'deadAt',
+]);
+const RETAINED_MESSAGE_EVIDENCE_FIELDS = new Set([
+  'status',
+  'signalId',
+  'runId',
+  'result',
+  'error',
+  'erased',
+  'modeId',
+  'modelId',
+  'operationKind',
+  'dispatch',
+  'harnessName',
+  'sessionId',
+  'resourceId',
+  'threadId',
+  'admissionId',
+  'admissionHash',
+  'createdAt',
+  'updatedAt',
+]);
+
+function keepOnlyFields(record: object, allowed: ReadonlySet<string>): void {
+  for (const key of Object.keys(record)) {
+    if (!allowed.has(key)) delete (record as Record<string, unknown>)[key];
+  }
+}
+
 function sessionKey(harnessName: string, sessionId: string): string {
   return `${harnessName}\u0000${sessionId}`;
 }
