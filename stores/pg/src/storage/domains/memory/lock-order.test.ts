@@ -20,8 +20,9 @@ vi.setConfig({ testTimeout: 15_000, hookTimeout: 30_000 });
 function connectionStringWithApplicationName(applicationName: string): string {
   const url = new URL(connectionString);
   url.searchParams.set('application_name', applicationName);
-  // A lock wait the test never releases fails fast (55P03) instead of hanging;
-  // a real deadlock still surfaces as 40P01 after deadlock_timeout.
+  // A lock wait the test never releases ends with 55P03 after 10s, so a stuck
+  // backend cannot hang finally/afterAll cleanup; a real deadlock still
+  // surfaces as 40P01 after deadlock_timeout.
   url.searchParams.set('options', '-c lock_timeout=10s');
   return url.toString();
 }
@@ -499,6 +500,9 @@ describe('MemoryPG lock ordering', () => {
       expect(outcomes.map(describeOutcome)).toEqual(['rolled_back', 'ObservationalMemoryGenerationConflictError']);
       // The observer queued on the OM-resource advisory lock, not on a row.
       // Asserted after the outcomes so that a missing fence reports its 40P01.
+      // The key is a bound parameter, so this pins "an advisory lock": it
+      // means the OM-resource one only while rollback takes no other advisory
+      // lock the observer also takes (today: none).
       expect(observerWait).toContain('pg_advisory_xact_lock');
       await expect(rollbackMemory.getThreadById({ threadId: clone.thread.id })).resolves.toBeNull();
     } finally {
