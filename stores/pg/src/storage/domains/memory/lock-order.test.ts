@@ -17,13 +17,14 @@ const competitorApplicationName = `pf1690-lock-b-${testRunId}`;
 
 vi.setConfig({ testTimeout: 15_000, hookTimeout: 30_000 });
 
+// A lock wait the test never releases ends with 55P03 after 10s, so a stuck
+// backend cannot hang finally/afterAll cleanup; a real deadlock still
+// surfaces as 40P01 after deadlock_timeout.
+const LOCK_TIMEOUT_MS = 10_000;
+
 function connectionStringWithApplicationName(applicationName: string): string {
   const url = new URL(connectionString);
   url.searchParams.set('application_name', applicationName);
-  // A lock wait the test never releases ends with 55P03 after 10s, so a stuck
-  // backend cannot hang finally/afterAll cleanup; a real deadlock still
-  // surfaces as 40P01 after deadlock_timeout.
-  url.searchParams.set('options', '-c lock_timeout=10s');
   return url.toString();
 }
 
@@ -55,6 +56,7 @@ describe('MemoryPG lock ordering', () => {
       id: 'lock-order-rollback',
       connectionString: connectionStringWithApplicationName(rollbackApplicationName),
       schemaName,
+      lock_timeout: LOCK_TIMEOUT_MS,
     });
     await rollbackStore.init();
     competitorStore = new PostgresStore({
@@ -62,6 +64,7 @@ describe('MemoryPG lock ordering', () => {
       connectionString: connectionStringWithApplicationName(competitorApplicationName),
       disableInit: true,
       schemaName,
+      lock_timeout: LOCK_TIMEOUT_MS,
     });
     await competitorStore.init();
     rollbackMemory = (await rollbackStore.getStore('memory')) as MemoryPG;
@@ -79,36 +82,26 @@ describe('MemoryPG lock ordering', () => {
     }
   });
 
-  async function waitForLockWait(applicationName: string, queryPattern: string, label: string): Promise<void> {
+  async function waitForLockWait(applicationName: string, queryPattern: string, label: string): Promise<string> {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      const result = await inspector.query<{ waiting: boolean }>(
-        `SELECT EXISTS (
-           SELECT 1
-           FROM pg_stat_activity
-           WHERE application_name = $1
-             AND wait_event_type = 'Lock'
-             AND query LIKE $2
-         ) AS waiting`,
+      const result = await inspector.query<{ query: string }>(
+        `SELECT query
+         FROM pg_stat_activity
+         WHERE application_name = $1
+           AND wait_event_type = 'Lock'
+           AND query LIKE $2
+         LIMIT 1`,
         [applicationName, queryPattern],
       );
-      if (result.rows[0]?.waiting) return;
+      if (result.rows[0]) return result.rows[0].query;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     throw new Error(`Timed out waiting for ${applicationName} to block on ${label}.`);
   }
 
   async function waitForAnyLockWait(applicationName: string): Promise<string> {
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      const result = await inspector.query<{ query: string }>(
-        `SELECT query FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' LIMIT 1`,
-        [applicationName],
-      );
-      if (result.rows[0]) return result.rows[0].query;
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    throw new Error(`Timed out waiting for ${applicationName} to block on a lock.`);
+    return waitForLockWait(applicationName, '%', 'a lock');
   }
 
   async function waitForAdvisoryLockWait(applicationName: string): Promise<void> {

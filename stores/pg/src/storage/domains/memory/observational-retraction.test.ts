@@ -1148,13 +1148,18 @@ describe('MemoryPG observational-memory retraction', () => {
       }
       throw new Error(`Timed out waiting for ${applicationName} to block on a row lock.`);
     };
-    // Every connection here gets a server-side lock_timeout, so a lock wait the
-    // test does not release fails fast with 55P03 instead of hanging.
-    const namedMemory = async (id: string, applicationName: string, lockTimeout = '10s') => {
+    // Every store connection here gets a server-side lock_timeout, so a lock
+    // wait the test does not release fails fast with 55P03 instead of hanging.
+    const namedMemory = async (id: string, applicationName: string, lockTimeoutMs = 10_000) => {
       const url = new URL(connectionString);
       url.searchParams.set('application_name', applicationName);
-      url.searchParams.set('options', `-c lock_timeout=${lockTimeout}`);
-      const store = new PostgresStore({ id, connectionString: url.toString(), disableInit: true, schemaName });
+      const store = new PostgresStore({
+        id,
+        connectionString: url.toString(),
+        disableInit: true,
+        schemaName,
+        lock_timeout: lockTimeoutMs,
+      });
       await store.init();
       return { store, memory: (await store.getStore('memory')) as MemoryPG };
     };
@@ -1279,7 +1284,7 @@ describe('MemoryPG observational-memory retraction', () => {
       // lock_timeout counts only time spent waiting on a lock, so this bound
       // does not depend on runner load: a write that queued behind the OM-row
       // holder fails with 55P03, one that never waits succeeds.
-      const writer = await namedMemory('stamp-marked-writer', `pf5324-marked-writer-${Date.now()}`, '2s');
+      const writer = await namedMemory('stamp-marked-writer', `pf5324-marked-writer-${Date.now()}`, 2_000);
       const inspector = new Pool({ connectionString });
       const blocker = await inspector.connect();
       try {
