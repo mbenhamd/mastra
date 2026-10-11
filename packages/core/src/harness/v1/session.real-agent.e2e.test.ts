@@ -5234,3 +5234,117 @@ describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
     }
   });
 });
+
+describe('Harness v1 real-agent E2E — S23 processor retry after tool results', () => {
+  const STATUS_LINE = '<status ok />';
+  const REJECTED_ANSWER = 'The file says hello.';
+  const REPAIRED_ANSWER = `The file says hello.\n${STATUS_LINE}`;
+
+  /** Rejects a non-empty answer that omits the status line, as a response-only guard does. */
+  const requireStatusLine = {
+    id: 'require-status-line',
+    name: 'Require status line',
+    processOutputStep: async ({ text, abort, messageList }: any) => {
+      if ((text ?? '').trim() !== '' && !(text as string).includes(STATUS_LINE)) {
+        abort('Add the status line to your answer.', { retry: true });
+      }
+      return messageList;
+    },
+  };
+
+  /** A Harness whose agent reads a file, then answers the scripted `answers` in turn. */
+  function retryHarness(answers: string[][]) {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    const readFile = createTool({
+      id: 'readFile',
+      description: 'Read one test file.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        toolExecutions += 1;
+        return { content: 'hello' };
+      },
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream:
+            providerCalls === 1
+              ? toolCallStream('read-1', 'readFile', '{}')
+              : textStream(answers[providerCalls - 2] ?? ['unexpected extra call']),
+        };
+      },
+    });
+    const storage = new InMemoryStore();
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'read the file and answer with the status line',
+      model,
+      tools: { readFile },
+      memory: new MockMemory({ storage }),
+      outputProcessors: [requireStatusLine],
+      maxProcessorRetries: 2,
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+    return { harness, providerCalls: () => providerCalls, toolExecutions: () => toolExecutions };
+  }
+
+  it('delivers and persists a repaired answer once, without a recovery call', async () => {
+    // A fourth call would answer again, as the model did live (PF-5364).
+    const { harness, providerCalls, toolExecutions } = retryHarness([
+      [REJECTED_ANSWER],
+      [REPAIRED_ANSWER],
+      [REPAIRED_ANSWER],
+    ]);
+    try {
+      const session = await harness.session({ resourceId: 'u-retry-repair', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+
+      const result = (await session.message({ content: 'read it' })) as any;
+
+      // Tool step, rejected answer, repaired answer. A fourth call would be the
+      // silent-terminal recovery reading the repaired step as empty.
+      expect(providerCalls()).toBe(3);
+      expect(toolExecutions()).toBe(1);
+      expect(result.text).toBe(REPAIRED_ANSWER);
+      // The rejected attempt streams before the processor rejects it; only the
+      // repaired answer carries the status line.
+      const visibleText = (events.filter(event => event.type === 'text_delta') as Array<{ delta: string }>)
+        .map(event => event.delta)
+        .join('');
+      expect(visibleText.split(STATUS_LINE)).toHaveLength(2);
+
+      const persistedAnswers = (await session.listMessages())
+        .flatMap(message => message.content)
+        .filter(part => part.type === 'text' && part.text.includes(STATUS_LINE));
+      expect(persistedAnswers).toHaveLength(1);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('still recovers once when the repaired step is genuinely silent', async () => {
+    const recovered = `Read the file.\n${STATUS_LINE}`;
+    const { harness, providerCalls } = retryHarness([[REJECTED_ANSWER], [], [recovered]]);
+    try {
+      const session = await harness.session({ resourceId: 'u-retry-silent', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'read it' })) as any;
+
+      // Tool step, rejected answer, silent repair, then the one recovery call.
+      expect(providerCalls()).toBe(4);
+      expect(result.text).toBe(recovered);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
