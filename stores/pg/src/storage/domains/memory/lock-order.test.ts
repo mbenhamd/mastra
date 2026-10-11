@@ -17,6 +17,11 @@ const competitorApplicationName = `pf1690-lock-b-${testRunId}`;
 
 vi.setConfig({ testTimeout: 15_000, hookTimeout: 30_000 });
 
+// A lock wait the test never releases ends with 55P03 after 10s, so a stuck
+// backend cannot hang finally/afterAll cleanup; a real deadlock still
+// surfaces as 40P01 after deadlock_timeout.
+const LOCK_TIMEOUT_MS = 10_000;
+
 function connectionStringWithApplicationName(applicationName: string): string {
   const url = new URL(connectionString);
   url.searchParams.set('application_name', applicationName);
@@ -51,6 +56,7 @@ describe('MemoryPG lock ordering', () => {
       id: 'lock-order-rollback',
       connectionString: connectionStringWithApplicationName(rollbackApplicationName),
       schemaName,
+      lock_timeout: LOCK_TIMEOUT_MS,
     });
     await rollbackStore.init();
     competitorStore = new PostgresStore({
@@ -58,6 +64,7 @@ describe('MemoryPG lock ordering', () => {
       connectionString: connectionStringWithApplicationName(competitorApplicationName),
       disableInit: true,
       schemaName,
+      lock_timeout: LOCK_TIMEOUT_MS,
     });
     await competitorStore.init();
     rollbackMemory = (await rollbackStore.getStore('memory')) as MemoryPG;
@@ -75,23 +82,26 @@ describe('MemoryPG lock ordering', () => {
     }
   });
 
-  async function waitForLockWait(applicationName: string, queryPattern: string, label: string): Promise<void> {
+  async function waitForLockWait(applicationName: string, queryPattern: string, label: string): Promise<string> {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      const result = await inspector.query<{ waiting: boolean }>(
-        `SELECT EXISTS (
-           SELECT 1
-           FROM pg_stat_activity
-           WHERE application_name = $1
-             AND wait_event_type = 'Lock'
-             AND query LIKE $2
-         ) AS waiting`,
+      const result = await inspector.query<{ query: string }>(
+        `SELECT query
+         FROM pg_stat_activity
+         WHERE application_name = $1
+           AND wait_event_type = 'Lock'
+           AND query LIKE $2
+         LIMIT 1`,
         [applicationName, queryPattern],
       );
-      if (result.rows[0]?.waiting) return;
+      if (result.rows[0]) return result.rows[0].query;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     throw new Error(`Timed out waiting for ${applicationName} to block on ${label}.`);
+  }
+
+  async function waitForAnyLockWait(applicationName: string): Promise<string> {
+    return waitForLockWait(applicationName, '%', 'a lock');
   }
 
   async function waitForAdvisoryLockWait(applicationName: string): Promise<void> {
@@ -473,7 +483,7 @@ describe('MemoryPG lock ordering', () => {
           resourceId: clone.thread.resourceId,
         },
       });
-      await waitForLockWait(competitorApplicationName, '%', 'a lock');
+      const observerWait = await waitForAnyLockWait(competitorApplicationName);
       await messages.release();
 
       const outcomes = await within(
@@ -481,6 +491,12 @@ describe('MemoryPG lock ordering', () => {
         'clone rollback and stamping observer write',
       );
       expect(outcomes.map(describeOutcome)).toEqual(['rolled_back', 'ObservationalMemoryGenerationConflictError']);
+      // The observer queued on the OM-resource advisory lock, not on a row.
+      // Asserted after the outcomes so that a missing fence reports its 40P01.
+      // The key is a bound parameter, so this pins "an advisory lock": it
+      // means the OM-resource one only while rollback takes no other advisory
+      // lock the observer also takes (today: none).
+      expect(observerWait).toContain('pg_advisory_xact_lock');
       await expect(rollbackMemory.getThreadById({ threadId: clone.thread.id })).resolves.toBeNull();
     } finally {
       await messages.close();

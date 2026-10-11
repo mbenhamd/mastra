@@ -709,6 +709,25 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
       // retraction did (the write is refused); never stored and unretracted.
       expect(resource?.workingMemory).not.toBe('FROM-DELETED-MSG');
     });
+
+    it('keeps a guarded write atomic with its stamp when updateResource is overridden to await before writing', async () => {
+      const context = await setup('race-async-override');
+      const updateResource = context.memory.updateResource.bind(context.memory);
+      context.memory.updateResource = async args => {
+        await Promise.resolve();
+        return updateResource(args);
+      };
+      await Promise.allSettled([
+        context.memory.updateResourceFromObservationalMemory({
+          resourceId: context.resourceId,
+          workingMemory: 'FROM-DELETED-MSG',
+          guard: context.guard,
+        }),
+        context.memory.retractObservationalMemory({ resourceId: context.resourceId, threadId: context.threadId }),
+      ]);
+      const resource = await context.memory.getResourceById({ resourceId: context.resourceId });
+      expect(resource?.workingMemory).not.toBe('FROM-DELETED-MSG');
+    });
   });
 
   it.each([

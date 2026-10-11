@@ -1148,10 +1148,18 @@ describe('MemoryPG observational-memory retraction', () => {
       }
       throw new Error(`Timed out waiting for ${applicationName} to block on a row lock.`);
     };
-    const namedMemory = async (id: string, applicationName: string) => {
+    // Every store connection here gets a server-side lock_timeout, so a lock
+    // wait the test does not release fails fast with 55P03 instead of hanging.
+    const namedMemory = async (id: string, applicationName: string, lockTimeoutMs = 10_000) => {
       const url = new URL(connectionString);
       url.searchParams.set('application_name', applicationName);
-      const store = new PostgresStore({ id, connectionString: url.toString(), disableInit: true, schemaName });
+      const store = new PostgresStore({
+        id,
+        connectionString: url.toString(),
+        disableInit: true,
+        schemaName,
+        lock_timeout: lockTimeoutMs,
+      });
       await store.init();
       return { store, memory: (await store.getStore('memory')) as MemoryPG };
     };
@@ -1273,31 +1281,24 @@ describe('MemoryPG observational-memory retraction', () => {
 
     it('leaves the OM row of an already-marked record unlocked during a guarded write', async () => {
       const seeded = await seedMarked('marked-no-lock', 'resource', 'resource');
+      // lock_timeout counts only time spent waiting on a lock, so this bound
+      // does not depend on runner load: a write that queued behind the OM-row
+      // holder fails with 55P03, one that never waits succeeds.
+      const writer = await namedMemory('stamp-marked-writer', `pf5324-marked-writer-${Date.now()}`, 2_000);
       const inspector = new Pool({ connectionString });
       const blocker = await inspector.connect();
-      let write: Promise<unknown> | undefined;
       try {
-        const start = await guardedWrites['applyWorkingMemoryUpdate, resource scope'](observerMemory, seeded);
+        const start = await guardedWrites['applyWorkingMemoryUpdate, resource scope'](writer.memory, seeded);
         await blocker.query('BEGIN');
         await blocker.query(`SELECT 1 FROM "${schemaName}"."mastra_observational_memory" WHERE id = $1 FOR UPDATE`, [
           seeded.record.id,
         ]);
         // The record is never stamped, so the write must not queue behind an OM-row holder.
-        write = start();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const outcome = await Promise.race([
-          write.then(() => 'written'),
-          new Promise<string>(resolve => {
-            timer = setTimeout(() => resolve('blocked on the OM row'), 3_000);
-          }),
-        ]);
-        clearTimeout(timer);
-        expect(outcome).toBe('written');
+        await expect(start()).resolves.toMatchObject({ value: 'FROM-DELETED-MSG' });
       } finally {
         await blocker.query('ROLLBACK').catch(() => {});
         blocker.release();
-        await write?.catch(() => {});
-        await inspector.end();
+        await Promise.allSettled([writer.store.close(), inspector.end()]);
       }
       await expect(retractorMemory.getResourceById({ resourceId: seeded.resourceId })).resolves.toMatchObject({
         workingMemory: 'FROM-DELETED-MSG',
