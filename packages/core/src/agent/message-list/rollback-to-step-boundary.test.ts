@@ -678,6 +678,32 @@ describe('MessageList step content location (PF-5364)', () => {
     }
   });
 
+  it('still recognises an earlier part whose provider metadata a processor rewrote', () => {
+    const recorded = { type: 'text' as const, text: 'earlier', providerMetadata: { openai: { itemId: 'msg_1' } } };
+    const { list, id } = listWith(assistant([recorded]));
+    const location = list.openStepContent();
+    const message = list.get.response.db().find(candidate => candidate.id === id)!;
+    // A processor hands back a clone whose metadata it extended, then the step answers.
+    const clone = structuredClone(message.content.parts[0]!) as typeof recorded;
+    clone.providerMetadata = { openai: { itemId: 'msg_1', redacted: true } } as typeof recorded.providerMetadata;
+    message.content.parts = [clone, text('answer')];
+
+    expect(texts(list.stepContent(location))).toEqual(['answer']);
+  });
+
+  it("keeps a closed step's last part when a processor rewrites it in place afterwards", () => {
+    const { list, id } = listWith(assistant([text('earlier step')]));
+    const location = list.openStepContent();
+    const message = list.get.response.db().find(candidate => candidate.id === id)!;
+    message.content.parts.push(text('secret note'));
+    list.closeStepContent(location);
+    // Redacted in place by a later processor, then a failed partial attempt writes after it.
+    (message.content.parts.at(-1) as { text: string }).text = 'REDACTED note';
+    message.content.parts.push(text('failed partial'));
+
+    expect(texts(list.stepContent(location))).toEqual(['REDACTED note']);
+  });
+
   it("keeps the iteration's parts when a processor clones the message and trims earlier parts", () => {
     const { list, id } = listWith(assistant([toolCall('c1'), toolCall('c2'), text('kept')]));
     openBoundary(list);

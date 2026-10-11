@@ -5396,8 +5396,20 @@ describe('Harness v1 real-agent E2E — S23 processor retry after tool results',
               ? convertArrayToReadableStream([
                   { type: 'stream-start', warnings: [] },
                   { type: 'response-metadata', id: 'id-tools', modelId: 'mock-model-id', timestamp: new Date(0) },
-                  { type: 'tool-call', toolCallId: 'read-1', toolName: 'readFile', input: '{}', providerExecuted: false },
-                  { type: 'tool-call', toolCallId: 'read-2', toolName: 'readFile', input: '{}', providerExecuted: false },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'read-1',
+                    toolName: 'readFile',
+                    input: '{}',
+                    providerExecuted: false,
+                  },
+                  {
+                    type: 'tool-call',
+                    toolCallId: 'read-2',
+                    toolName: 'readFile',
+                    input: '{}',
+                    providerExecuted: false,
+                  },
                   { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
                 ])
               : textStream([REPAIRED_ANSWER]),

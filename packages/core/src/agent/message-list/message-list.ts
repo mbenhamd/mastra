@@ -251,19 +251,35 @@ type BoundaryCheckpoint = { messageId: string; prefix: BoundaryToken[] };
  * has written its last part (its tool results included).
  */
 export type StepContentLocation = {
-  /** Each response message's parts, as identity tokens, when the iteration began. */
-  readonly startParts: ReadonlyMap<string, readonly string[]>;
-  /** Each response message's parts, as identity tokens, when the iteration ended; unset while open. */
-  endParts?: ReadonlyMap<string, readonly string[]>;
+  /** Each response message's parts when the iteration began. */
+  readonly startParts: ReadonlyMap<string, RecordedParts>;
+  /** Each response message's parts when the iteration ended; unset while it is open. */
+  endParts?: ReadonlyMap<string, RecordedParts>;
 };
 
 /**
+ * A message's parts as recorded for `StepContentLocation`: each part's identity token, and the part
+ * object itself, which a processor that rewrites a part in place keeps.
+ */
+type RecordedParts = { readonly tokens: readonly string[]; readonly objects: readonly MastraMessagePart[] };
+
+/** The provider's id for the output item a part came from, when the provider gives one. */
+function providerItemId(part: MastraMessagePart): string | undefined {
+  const metadata = 'providerMetadata' in part ? part.providerMetadata : undefined;
+  if (!metadata) return undefined;
+  for (const providerEntry of Object.values(metadata)) {
+    const itemId = (providerEntry as { itemId?: unknown } | undefined)?.itemId;
+    if (typeof itemId === 'string') return itemId;
+  }
+  return undefined;
+}
+
+/**
  * What identifies a part across clones. A tool call is its id, so a result filled in later is the
- * same part. Anything else is its type, its content (text, reasoning, file data), its provider
- * metadata (which carries the provider's item id) and the stamp it got when it was added to the
- * list. A clone keeps all of these, so the same answer written by two steps, or two step markers,
- * stay distinct. Two parts can still collide only with identical content and metadata stamped in
- * the same millisecond.
+ * same part. Anything else is its type, its content (text, reasoning, file data), the provider's
+ * item id and the stamp it got when it was added to the list. A clone keeps all of these, so the
+ * same answer written by two steps, or two step markers, stay distinct. Two parts can still collide
+ * only with identical content, no provider item id and stamps from the same millisecond.
  */
 function partIdentity(part: MastraMessagePart): string {
   if (part.type === 'tool-invocation') return `${part.type}\u0000${part.toolInvocation?.toolCallId}`;
@@ -271,23 +287,26 @@ function partIdentity(part: MastraMessagePart): string {
   if (part.type === 'text') content = part.text;
   else if (part.type === 'reasoning') content = part.reasoning;
   else if (part.type === 'file') content = typeof part.data === 'string' ? part.data : undefined;
-  const metadata = 'providerMetadata' in part && part.providerMetadata ? JSON.stringify(part.providerMetadata) : '';
   // Unary + so a Date, or a string from some storage round trip, compares as a number.
   const stamp = part.createdAt == null ? '' : String(+part.createdAt);
-  return `${part.type}\u0000${content ?? ''}\u0000${metadata}\u0000${stamp}`;
+  return `${part.type}\u0000${content ?? ''}\u0000${providerItemId(part) ?? ''}\u0000${stamp}`;
 }
 
 /**
- * Index of the last part that stands for one of `recorded`, matched in order. A processor may have
- * cloned the message (identities survive), dropped some of the recorded parts (the rest still
- * match in order) or rewritten one (it sits before a later match). Parts after the last match were
- * written after `recorded` was taken.
+ * Index of the last part that stands for one of `recorded`, matched in order: the same part object
+ * (a processor rewrote it in place), or failing that the same identity (a clone). A processor may
+ * have dropped some of the recorded parts (the rest still match in order) or replaced one with a
+ * new part (it sits before a later match). Parts after the last match were written after `recorded`
+ * was taken.
  */
-function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: readonly string[]): number {
+function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: RecordedParts | undefined): number {
+  if (!recorded) return -1;
   let next = 0;
   let last = -1;
-  for (let index = 0; index < parts.length && next < recorded.length; index++) {
-    const match = recorded.indexOf(partIdentity(parts[index]!), next);
+  for (let index = 0; index < parts.length && next < recorded.tokens.length; index++) {
+    const part = parts[index]!;
+    let match = recorded.objects.indexOf(part, next);
+    if (match === -1) match = recorded.tokens.indexOf(partIdentity(part), next);
     if (match === -1) continue;
     last = index;
     next = match + 1;
@@ -2183,21 +2202,19 @@ export class MessageList {
   }
 
   /**
-   * Each response message's parts as identity tokens. A part that reached the list unstamped (a
-   * processor pushed it onto `parts`) is stamped here first: otherwise a later clone of it, stamped
-   * when re-added, would no longer match and would read as new. Tool parts are identified by call
-   * id and are left as they are, since their stamp would surface in provider options.
+   * Each response message's parts as recorded for a step location. A part that reached the list
+   * unstamped (a processor pushed it onto `parts`) is stamped here first: otherwise a later clone of
+   * it, stamped when re-added, would no longer match. Tool parts are identified by call id and are
+   * left as they are, since their stamp would surface in provider options.
    */
-  #responsePartIdentities(): Map<string, string[]> {
+  #recordResponseParts(): Map<string, RecordedParts> {
     return new Map(
-      this.response
-        .db()
-        .map(message => [
-          message.id,
-          (message.content.parts ?? []).map(part =>
-            partIdentity(part.type === 'tool-invocation' ? part : stampPart(part)),
-          ),
-        ]),
+      this.response.db().map(message => {
+        const objects = (message.content.parts ?? []).map(part =>
+          part.type === 'tool-invocation' ? part : stampPart(part),
+        );
+        return [message.id, { tokens: objects.map(partIdentity), objects }];
+      }),
     );
   }
 
@@ -2206,7 +2223,7 @@ export class MessageList {
    * opened its boundary (`openStepBoundary()`) and before the model streams.
    */
   public openStepContent(): StepContentLocation {
-    return { startParts: this.#responsePartIdentities() };
+    return { startParts: this.#recordResponseParts() };
   }
 
   /**
@@ -2215,7 +2232,7 @@ export class MessageList {
    * Closing an already-closed location keeps its first end.
    */
   public closeStepContent(location: StepContentLocation): void {
-    location.endParts ??= this.#responsePartIdentities();
+    location.endParts ??= this.#recordResponseParts();
   }
 
   /**
@@ -2225,7 +2242,8 @@ export class MessageList {
    * earlier parts does not move the iteration's. A part a processor adds after every recorded part
    * counts as the iteration's; a part it puts among the recorded ones (a replacement of earlier
    * narration) stays with the earlier step, so a rewrite of history is never read as this step's
-   * answer.
+   * answer. A message a processor re-adds under a new id is new to the list, so all of it is read
+   * as the iteration's.
    *
    * `modelContent(stepNumber)` instead counts `step-start` markers, which goes wrong when a
    * processor retry rolls a rejected attempt's marker back and streams the retry into a fresh
@@ -2240,7 +2258,7 @@ export class MessageList {
       // Started after the iteration ended.
       if (location.endParts && !endParts) continue;
 
-      const start = lastRecordedPartIndex(messageParts, location.startParts.get(message.id) ?? []) + 1;
+      const start = lastRecordedPartIndex(messageParts, location.startParts.get(message.id)) + 1;
       const stop = endParts ? lastRecordedPartIndex(messageParts, endParts) + 1 : messageParts.length;
       if (start >= stop) continue;
 
