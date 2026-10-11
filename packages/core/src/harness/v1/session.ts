@@ -131,6 +131,7 @@ import type {
   SessionRecord,
   SessionSummary,
 } from '../../storage/domains/harness';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
@@ -344,6 +345,44 @@ type Deferred<T> = {
   resolve: (value: T) => void;
   reject: (reason: unknown) => void;
 };
+
+/**
+ * Validate and clone the native OM source-write fence at a Harness boundary.
+ * The fence is an execution identity, so accepting a partial or malformed
+ * value would turn a retry into an unbound write.
+ */
+function normalizeObservationalMemorySourceWriteGuard(
+  value: ObservationalMemorySourceWriteGuard | undefined,
+  field: string,
+): ObservationalMemorySourceWriteGuard | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new HarnessValidationError(field, 'must be an object with recordId, threadId, and resourceId');
+  }
+  if (typeof value.recordId !== 'string' || value.recordId.length === 0) {
+    throw new HarnessValidationError(`${field}.recordId`, 'must be a non-empty string');
+  }
+  if (value.threadId !== null && typeof value.threadId !== 'string') {
+    throw new HarnessValidationError(`${field}.threadId`, 'must be a string or null');
+  }
+  if (typeof value.resourceId !== 'string' || value.resourceId.length === 0) {
+    throw new HarnessValidationError(`${field}.resourceId`, 'must be a non-empty string');
+  }
+  return {
+    recordId: value.recordId,
+    threadId: value.threadId,
+    resourceId: value.resourceId,
+  };
+}
+
+function sameObservationalMemorySourceWriteGuard(
+  left: ObservationalMemorySourceWriteGuard | undefined,
+  right: ObservationalMemorySourceWriteGuard | undefined,
+): boolean {
+  return (
+    left?.recordId === right?.recordId && left?.threadId === right?.threadId && left?.resourceId === right?.resourceId
+  );
+}
 
 function harnessDisplayToolPayload(
   metadata: unknown,
@@ -1579,6 +1618,8 @@ export class Session {
    * run keeps auto-granting tool approvals (§4.2e). Cleared with the turn.
    */
   private _currentTurnYolo = false;
+  /** Captured native OM source-write fence for the live turn, if supplied. */
+  private _currentTurnSourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   /** `queuedItem.source` of the turn currently running. Used by the goal
    *  judge loop to skip re-judging on goal-driven continuation turns. */
   private _currentQueuedItemSource?: 'user' | 'goal';
@@ -2852,10 +2893,16 @@ export class Session {
   private _beginTurn(
     callerSignal: AbortSignal | undefined,
     runIdentity?: { modeId?: string; modelId?: string },
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): AbortController {
+    if (sourceWriteGuard !== undefined) {
+      normalizeObservationalMemorySourceWriteGuard(sourceWriteGuard, 'observationalMemorySourceWriteGuard');
+      this._assertSourceWriteGuardScope(sourceWriteGuard, 'observationalMemorySourceWriteGuard');
+    }
     const controller = new AbortController();
     this._currentTurnAbortController = controller;
     this._resetTurnTracking();
+    this._currentTurnSourceWriteGuard = sourceWriteGuard;
     // §5.1b: stamp the run's EFFECTIVE identity AFTER the reset above, so the
     // SessionRunProjection reports a per-turn `mode`/`model` override (or a queued
     // item's own mode/model) for the live run rather than the session default.
@@ -2872,6 +2919,15 @@ export class Session {
       }
     }
     return controller;
+  }
+
+  private _assertSourceWriteGuardScope(guard: ObservationalMemorySourceWriteGuard, field: string): void {
+    if (guard.resourceId !== this.resourceId) {
+      throw new HarnessValidationError(`${field}.resourceId`, 'must match the session resourceId');
+    }
+    if (guard.threadId !== null && guard.threadId !== this.threadId) {
+      throw new HarnessValidationError(`${field}.threadId`, 'must match the session threadId or be null');
+    }
   }
 
   /**
@@ -2894,6 +2950,7 @@ export class Session {
     // Default OFF each turn; queued-drain / resume re-arm it from the item /
     // captured pendingResume below so non-yolo turns never inherit a stale value.
     this._currentTurnYolo = false;
+    this._currentTurnSourceWriteGuard = undefined;
     this._activeTools.clear();
     this._toolInputBuffers.clear();
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
@@ -2927,6 +2984,7 @@ export class Session {
       this._currentTurnRequestContext = undefined;
       this._currentAgentRequestContext = undefined;
       this._currentTurnReplacementToolSurface = undefined;
+      this._currentTurnSourceWriteGuard = undefined;
       this._currentMessageId = undefined;
       this._currentTraceId = undefined;
       this._activeTools.clear();
@@ -8401,6 +8459,27 @@ export class Session {
     // side-effect (hash, evidence reservation, dispatch). Only `app` is allowed;
     // reserved/infrastructure keys are rejected here with HarnessValidationError.
     const callerRequestContext = validateCallerRequestContext(opts.requestContext, 'message()');
+    const sourceWriteGuard = normalizeObservationalMemorySourceWriteGuard(
+      opts.observationalMemorySourceWriteGuard,
+      'message().observationalMemorySourceWriteGuard',
+    );
+    if (sourceWriteGuard) {
+      this._assertSourceWriteGuardScope(sourceWriteGuard, 'message().observationalMemorySourceWriteGuard');
+    }
+    const preexistingTurnSourceWriteGuard =
+      this._currentTurnAbortController !== undefined ? this._currentTurnSourceWriteGuard : undefined;
+    // Reject a replacement fence before _beginTurn replaces the shared turn
+    // state: the rejection cleanup ends this call's turn, which would otherwise
+    // clear the still-running execution's fence and break its later steering.
+    if (
+      sourceWriteGuard !== undefined &&
+      preexistingTurnSourceWriteGuard !== undefined &&
+      !sameObservationalMemorySourceWriteGuard(sourceWriteGuard, preexistingTurnSourceWriteGuard)
+    ) {
+      throw new HarnessOverrideConflictError(this.id, this._currentRunId ?? '', [
+        'observationalMemorySourceWriteGuard',
+      ]);
+    }
     // When a turn is already in flight, the signal-routed path interleaves into
     // that active run and its streamOptions (which carry the request context)
     // are ignored, so a caller `app` could never reach the running tools. Reject
@@ -8526,10 +8605,14 @@ export class Session {
     // `session.abort()` can cancel the in-flight run. If the caller passes
     // their own AbortSignal, we forward it into the session controller so
     // both paths converge on a single signal handed to the agent.
-    const turnAbortController = this._beginTurn(opts.abortSignal, {
-      modeId: effectiveModeId,
-      modelId: effectiveModelId,
-    });
+    const turnAbortController = this._beginTurn(
+      opts.abortSignal,
+      {
+        modeId: effectiveModeId,
+        modelId: effectiveModelId,
+      },
+      sourceWriteGuard,
+    );
     this._setCurrentTurnReplacementToolSurface(toolSurface);
     const turnAbortSignal = turnAbortController.signal;
     const activeTurnWaiter = this._createActiveTurnWaiter();
@@ -8593,6 +8676,7 @@ export class Session {
       // (temperature, maxOutputTokens, …) layered onto the structured generate
       // turn. Omitted → model/provider defaults, so existing turns are unchanged.
       ...(opts.modelSettings ? { modelSettings: opts.modelSettings } : {}),
+      ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
       ...(logicalMessageIdentity ? { logicalMessageIdentity } : {}),
     };
 
@@ -8696,7 +8780,35 @@ export class Session {
     // path only): a run starting precisely during that write is admission-scoped only and is not
     // delivered to the interleaved run, matching how `abortSignal` behaves on active-delivery —
     // we deliberately do not reject post-reservation, because that would poison the retry.
-    if (callerRequestContext !== undefined && sub.activeRunId() !== null) {
+    const activeRunIdBeforeMessageDispatch = sub.activeRunId();
+    if (activeRunIdBeforeMessageDispatch !== null) {
+      // _beginTurn above installs this call's transient bookkeeping, so when
+      // another run became active while admission was in flight the live
+      // fence may now be on the session field rather than in the snapshot
+      // taken before _beginTurn. Preserve that run's fence and never adopt a
+      // caller-supplied replacement.
+      const activeTurnSourceWriteGuard =
+        preexistingTurnSourceWriteGuard ??
+        (this._currentTurnSourceWriteGuard !== undefined &&
+        !sameObservationalMemorySourceWriteGuard(this._currentTurnSourceWriteGuard, sourceWriteGuard)
+          ? this._currentTurnSourceWriteGuard
+          : undefined);
+      if (
+        sourceWriteGuard !== undefined &&
+        !sameObservationalMemorySourceWriteGuard(sourceWriteGuard, activeTurnSourceWriteGuard)
+      ) {
+        const err = new HarnessOverrideConflictError(this.id, activeRunIdBeforeMessageDispatch, [
+          'observationalMemorySourceWriteGuard',
+        ]);
+        failOwnedMessageTurnBeforeDispatch(err);
+        throw err;
+      }
+      // _beginTurn above owns a controller for this call, but an active
+      // signal-delivery run owns the source fence. Preserve that original
+      // fence while this message is steered into the active run.
+      this._currentTurnSourceWriteGuard = activeTurnSourceWriteGuard;
+    }
+    if (callerRequestContext !== undefined && activeRunIdBeforeMessageDispatch !== null) {
       // The probe (in flight since admission entry) preserves the idempotent
       // retry: a duplicate of an actively-delivering admission attaches to the
       // running turn instead of surfacing the active-delivery rejection.
@@ -9026,6 +9138,9 @@ export class Session {
             streamOptions: {
               ...baseExecOptions,
               ...this._createEmptySynthesisOptions(),
+              ...(this._currentTurnSourceWriteGuard
+                ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
+                : {}),
             } as never,
           },
         },
@@ -9616,6 +9731,13 @@ export class Session {
         'admitMessage().admissionId',
         'admissionId cannot be combined with additionalTools',
       );
+    }
+    const sourceWriteGuard = normalizeObservationalMemorySourceWriteGuard(
+      opts.observationalMemorySourceWriteGuard,
+      'admitMessage().observationalMemorySourceWriteGuard',
+    );
+    if (sourceWriteGuard) {
+      this._assertSourceWriteGuardScope(sourceWriteGuard, 'admitMessage().observationalMemorySourceWriteGuard');
     }
 
     const effectiveModeId = opts.mode ?? this._record.modeId;
@@ -11580,11 +11702,22 @@ export class Session {
       // present. Absent => omitted => the hash is byte-identical to pre-feature
       // evidence (backward-compatible). Mirrors the queue path's requestContext.
       ...(persistedRequestContext ? { requestContext: clonePersistedRequestContext(persistedRequestContext) } : {}),
+      ...(opts.observationalMemorySourceWriteGuard
+        ? {
+            observationalMemorySourceWriteGuard: normalizeObservationalMemorySourceWriteGuard(
+              opts.observationalMemorySourceWriteGuard,
+              'message().observationalMemorySourceWriteGuard',
+            ),
+          }
+        : {}),
     };
   }
 
   private _computeSignalAdmissionHash(
-    opts: Pick<SessionSignalOptions, 'content' | 'mode' | 'logicalMessageIdentity'>,
+    opts: Pick<
+      SessionSignalOptions,
+      'content' | 'mode' | 'observationalMemorySourceWriteGuard' | 'logicalMessageIdentity'
+    >,
     attachments: PersistedAttachment[],
     requestContext?: PersistedRequestContextInput,
   ): string {
@@ -11618,6 +11751,14 @@ export class Session {
           : { url: attachment.url }),
       })),
       ...(requestContext ? { requestContext: clonePersistedRequestContext(requestContext) } : {}),
+      ...(opts.observationalMemorySourceWriteGuard
+        ? {
+            observationalMemorySourceWriteGuard: normalizeObservationalMemorySourceWriteGuard(
+              opts.observationalMemorySourceWriteGuard,
+              'signal().observationalMemorySourceWriteGuard',
+            ),
+          }
+        : {}),
     });
   }
 
@@ -12183,6 +12324,13 @@ export class Session {
     // bag — combine, never deep-merge (mirrors `_admitQueue`).
     const callerRequestContext = validateCallerRequestContext(opts.requestContext, 'signal()');
     const callerPersistedRequestContext = callerRequestContextToPersisted(callerRequestContext);
+    const sourceWriteGuard = normalizeObservationalMemorySourceWriteGuard(
+      opts.observationalMemorySourceWriteGuard,
+      'signal().observationalMemorySourceWriteGuard',
+    );
+    if (sourceWriteGuard) {
+      this._assertSourceWriteGuardScope(sourceWriteGuard, 'signal().observationalMemorySourceWriteGuard');
+    }
     const persistedRequestContext: PersistedRequestContextInput | undefined =
       internal?.persistedRequestContext !== undefined || callerPersistedRequestContext !== undefined
         ? { ...(internal?.persistedRequestContext ?? {}), ...(callerPersistedRequestContext ?? {}) }
@@ -12298,6 +12446,12 @@ export class Session {
           'signal().requestContext',
           'cannot be supplied on an active-delivery signal — the in-flight run already committed its request context and could not receive a new app bag',
         );
+      }
+      if (
+        sourceWriteGuard !== undefined &&
+        !sameObservationalMemorySourceWriteGuard(sourceWriteGuard, this._currentTurnSourceWriteGuard)
+      ) {
+        throw new HarnessOverrideConflictError(this.id, runId, ['observationalMemorySourceWriteGuard']);
       }
     };
     if (activeRunId !== null) {
@@ -12734,10 +12888,14 @@ export class Session {
       // Owned-turn path: same bookkeeping as the message() default path.
       // `signal()` supports a per-turn `mode` override but not `model`, so the
       // effective model is the session default.
-      const turnAbortController = this._beginTurn(opts.abortSignal, {
-        modeId: effectiveModeId,
-        modelId: effectiveModelId,
-      });
+      const turnAbortController = this._beginTurn(
+        opts.abortSignal,
+        {
+          modeId: effectiveModeId,
+          modelId: effectiveModelId,
+        },
+        sourceWriteGuard,
+      );
       const turnAbortSignal = turnAbortController.signal;
       const activeTurnWaiter = this._createActiveTurnWaiter();
       void activeTurnWaiter.promise.catch(() => {});
@@ -12778,6 +12936,7 @@ export class Session {
           ...this._subagentTracingOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
+          ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
           ...(responseLogicalMessageIdentity ? { logicalMessageIdentity: responseLogicalMessageIdentity } : {}),
         };
         assertOwnedSignalTurnNotDeleted();
@@ -13215,6 +13374,9 @@ export class Session {
               streamOptions: {
                 maxSteps: HARNESS_SESSION_MAX_STEPS,
                 ...this._createEmptySynthesisOptions(),
+                ...(this._currentTurnSourceWriteGuard
+                  ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
+                  : {}),
                 ...this._subagentTracingOptions(),
                 ...(lineagedWakeAbortController ? { abortSignal: lineagedWakeAbortController.signal } : {}),
                 ...(responseLogicalMessageIdentity ? { logicalMessageIdentity: responseLogicalMessageIdentity } : {}),
@@ -13348,6 +13510,13 @@ export class Session {
     if (typeof content !== 'string' || content.length === 0) {
       throw new HarnessValidationError('injectSystemReminder()', '`content` must be a non-empty string');
     }
+    const sourceWriteGuard = normalizeObservationalMemorySourceWriteGuard(
+      opts?.observationalMemorySourceWriteGuard,
+      'injectSystemReminder().observationalMemorySourceWriteGuard',
+    );
+    if (sourceWriteGuard) {
+      this._assertSourceWriteGuardScope(sourceWriteGuard, 'injectSystemReminder().observationalMemorySourceWriteGuard');
+    }
 
     const effectiveModeId = this._record.modeId;
     const mode = this._harness._getMode(effectiveModeId);
@@ -13368,7 +13537,7 @@ export class Session {
     if (!willInterleave) {
       // Owned-turn path: full turn bookkeeping in a background
       // continuation. Caller doesn't get a result handle.
-      const turnAbortController = this._beginTurn(undefined);
+      const turnAbortController = this._beginTurn(undefined, undefined, sourceWriteGuard);
       const turnAbortSignal = turnAbortController.signal;
       const activeTurnWaiter = this._createActiveTurnWaiter();
       void activeTurnWaiter.promise.catch(() => {});
@@ -13405,6 +13574,7 @@ export class Session {
           ...this._subagentTracingOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
+          ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
@@ -13492,6 +13662,12 @@ export class Session {
 
     // Active-delivery path: drain into the live run.
     this._assertOpenForTurn('injectSystemReminder()');
+    if (
+      sourceWriteGuard !== undefined &&
+      !sameObservationalMemorySourceWriteGuard(sourceWriteGuard, this._currentTurnSourceWriteGuard)
+    ) {
+      throw new HarnessOverrideConflictError(this.id, activeRunId!, ['observationalMemorySourceWriteGuard']);
+    }
     const dispatched = agent.sendSignal(
       {
         type: 'system-reminder',
@@ -13512,6 +13688,9 @@ export class Session {
             memory: { thread: this.threadId, resource: this.resourceId },
             maxSteps: HARNESS_SESSION_MAX_STEPS,
             ...this._createEmptySynthesisOptions(),
+            ...(this._currentTurnSourceWriteGuard
+              ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
+              : {}),
             ...this._subagentTracingOptions(),
           } as never,
         },
@@ -13710,6 +13889,9 @@ export class Session {
       // SAME context (a re-suspend re-captures it because resume re-stashes it).
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
+      ...(this._currentTurnSourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
         : {}),
       ...(this._currentToolSurfaceFenceSnapshot(full.runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(full.runId) }
@@ -14699,6 +14881,9 @@ export class Session {
       mode: this._record.modeId,
       source: 'goal',
       goalId: goal.id,
+      ...(this._currentTurnSourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
+        : {}),
     };
     const droppedItems: QueueBackpressureDrop[] = [];
     let admitted = false;
@@ -16109,7 +16294,7 @@ export class Session {
     // Resumed runs run under a session-owned AbortController too, so
     // `session.abort()` can cancel an in-flight resume (e.g. ESC after the
     // user approved a tool that's now grinding through a long workflow).
-    const turnAbortController = this._beginTurn(undefined);
+    const turnAbortController = this._beginTurn(undefined, undefined, pending.observationalMemorySourceWriteGuard);
     this._setCurrentTurnReplacementToolSurface(resumeToolSurface);
     // §4.2e — carry the original turn's yolo forward (captured on pendingResume).
     // Re-arm the transient so a re-suspend on this resumed run persists it again.
@@ -16189,6 +16374,9 @@ export class Session {
         ...this._subagentTracingOptions(),
         ...resumeToolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
+        ...(pending.observationalMemorySourceWriteGuard
+          ? { observationalMemorySourceWriteGuard: pending.observationalMemorySourceWriteGuard }
+          : {}),
       });
       void resumeStream.catch(() => {});
       const out = await Promise.race([resumeStream, activeTurnWaiter.promise]);
@@ -17479,6 +17667,7 @@ export class Session {
     // admissionHash, it is replayed here so the queue boundary rejects a payload
     // that does not match the persisted admission (recovery integrity).
     expectedAdmissionHash?: string;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<QueueAdmissionResult> {
     if (opts.admissionId.length === 0) {
       throw new HarnessValidationError('admitChannelQueueTurn().admissionId', 'admissionId must be a non-empty string');
@@ -17488,6 +17677,9 @@ export class Session {
       admissionId: opts.admissionId,
       ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
       ...(opts.model !== undefined ? { model: opts.model } : {}),
+      ...(opts.observationalMemorySourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: opts.observationalMemorySourceWriteGuard }
+        : {}),
     };
     const admission = await this._admitQueue(queueOpts, 'admitQueue()', {
       persistedRequestContext: opts.requestContext,
@@ -17510,7 +17702,12 @@ export class Session {
    * — never re-running channel policy once the hash exists.
    */
   _channelQueueAdmissionHash(
-    opts: { content: string; mode?: string; model?: string },
+    opts: {
+      content: string;
+      mode?: string;
+      model?: string;
+      observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+    },
     attachments: PersistedAttachment[],
     requestContext: PersistedRequestContextInput,
   ): string {
@@ -17518,6 +17715,9 @@ export class Session {
       content: opts.content,
       ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
       ...(opts.model !== undefined ? { model: opts.model } : {}),
+      ...(opts.observationalMemorySourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: opts.observationalMemorySourceWriteGuard }
+        : {}),
     };
     return this._computeQueueAdmissionHash(queueOpts, attachments, requestContext);
   }
@@ -17540,6 +17740,7 @@ export class Session {
     expectedAdmissionHash: string;
     mode?: string;
     attachments?: PersistedAttachment[];
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{ runId: string; signalId: string; willInterleave: boolean }> {
     if (opts.admissionId.length === 0) {
       throw new HarnessValidationError(
@@ -17561,6 +17762,9 @@ export class Session {
         content: opts.content,
         admissionId: opts.admissionId,
         ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
+        ...(opts.observationalMemorySourceWriteGuard
+          ? { observationalMemorySourceWriteGuard: opts.observationalMemorySourceWriteGuard }
+          : {}),
       },
       {
         persistedRequestContext: opts.requestContext,
@@ -17599,7 +17803,11 @@ export class Session {
    * signal delivery has no `model` field, so model is intentionally absent.
    */
   _channelSignalAdmissionHash(
-    opts: { content: string; mode?: string },
+    opts: {
+      content: string;
+      mode?: string;
+      observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+    },
     attachments: PersistedAttachment[],
     requestContext: PersistedRequestContextInput,
   ): string {
@@ -17635,6 +17843,13 @@ export class Session {
     }
     if (opts.admissionId !== undefined && opts.admissionId.length === 0) {
       throw new HarnessValidationError(`${methodName}.admissionId`, 'admissionId must be a non-empty string');
+    }
+    const sourceWriteGuard = normalizeObservationalMemorySourceWriteGuard(
+      opts.observationalMemorySourceWriteGuard,
+      `${methodName}.observationalMemorySourceWriteGuard`,
+    );
+    if (sourceWriteGuard) {
+      this._assertSourceWriteGuardScope(sourceWriteGuard, `${methodName}.observationalMemorySourceWriteGuard`);
     }
     this._validateQueueSchedulingOptions(opts, methodName);
 
@@ -17690,6 +17905,7 @@ export class Session {
       ...(effectivePersistedRequestContext
         ? { requestContext: clonePersistedRequestContext(effectivePersistedRequestContext) }
         : {}),
+      ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
       ...(logicalMessageIdentity ? { logicalMessageIdentity } : {}),
       ...(opts.model !== undefined ? { model: opts.model } : {}),
       mode: effectiveModeId,
@@ -17791,6 +18007,7 @@ export class Session {
     logicalMessageIdentity?: LogicalMessageIdentity;
     attachments: PersistedAttachment[];
     requestContext?: PersistedRequestContextInput;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<QueueAdmissionResult> {
     const admission = await this._admitQueue(
       {
@@ -17799,6 +18016,9 @@ export class Session {
         ...(item.mode !== undefined ? { mode: item.mode } : {}),
         ...(item.model !== undefined ? { model: item.model } : {}),
         ...(item.yolo === true ? { yolo: true } : {}),
+        ...(item.observationalMemorySourceWriteGuard
+          ? { observationalMemorySourceWriteGuard: item.observationalMemorySourceWriteGuard }
+          : {}),
         ...(item.logicalMessageIdentity !== undefined ? { logicalMessageIdentity: item.logicalMessageIdentity } : {}),
       },
       'admitQueue()',
@@ -17974,6 +18194,14 @@ export class Session {
           : { url: attachment.url }),
       })),
       ...(requestContext ? { requestContext: clonePersistedRequestContext(requestContext) } : {}),
+      ...(opts.observationalMemorySourceWriteGuard
+        ? {
+            observationalMemorySourceWriteGuard: normalizeObservationalMemorySourceWriteGuard(
+              opts.observationalMemorySourceWriteGuard,
+              'queue().observationalMemorySourceWriteGuard',
+            ),
+          }
+        : {}),
     });
   }
 
@@ -18451,10 +18679,14 @@ export class Session {
     // Queued turns run under a session-owned AbortController so
     // `session.abort()` can cancel an in-flight queued run too.
     this._assertOpenForTurn('queue drain');
-    const turnAbortController = this._beginTurn(undefined, {
-      modeId: effectiveModeId,
-      modelId: item.model ?? this._record.modelId,
-    });
+    const turnAbortController = this._beginTurn(
+      undefined,
+      {
+        modeId: effectiveModeId,
+        modelId: item.model ?? this._record.modelId,
+      },
+      item.observationalMemorySourceWriteGuard,
+    );
     this._setCurrentTurnReplacementToolSurface(toolSurface);
     // §4.2e — arm per-turn yolo for the drain so suspend-capture persists it onto
     // pendingResume (so a later resume keeps auto-granting). `_beginTurn` reset it.
@@ -18500,6 +18732,9 @@ export class Session {
         ...this._subagentTracingOptions(),
         ...toolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
+        ...(item.observationalMemorySourceWriteGuard
+          ? { observationalMemorySourceWriteGuard: item.observationalMemorySourceWriteGuard }
+          : {}),
         ...(item.logicalMessageIdentity ? { logicalMessageIdentity: item.logicalMessageIdentity } : {}),
       };
 
@@ -19153,6 +19388,9 @@ export class Session {
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
         : {}),
+      ...(this._currentTurnSourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
+        : {}),
       ...(this._currentToolSurfaceFenceSnapshot(runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
         : {}),
@@ -19221,6 +19459,9 @@ export class Session {
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
+      ...(this._currentTurnSourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
         : {}),
       ...(this._currentToolSurfaceFenceSnapshot(runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
@@ -19299,6 +19540,9 @@ export class Session {
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
         ? { requestContext: clonePersistedRequestContext(this._currentTurnRequestContext) }
+        : {}),
+      ...(this._currentTurnSourceWriteGuard
+        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
         : {}),
       ...(this._currentToolSurfaceFenceSnapshot(runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }

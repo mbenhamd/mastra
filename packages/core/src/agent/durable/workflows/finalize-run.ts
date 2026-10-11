@@ -123,6 +123,9 @@ export async function runDurableFinishSideEffects({
     entries: initData.requestContextEntries,
     state: durableState,
     liveContext: requestContext,
+    observationalMemorySourceWriteGuard:
+      initData.options?.observationalMemorySourceWriteGuard ??
+      messageListState.memoryInfo?.observationalMemorySourceWriteGuard,
   });
   // Deserialize into the run's existing MessageList when there is one. MastraModelOutput
   // holds that instance and reads it during final processing, so swapping in a new one
@@ -192,6 +195,9 @@ export async function runDurableFinishSideEffects({
   // SaveQueueManager may reclassify flushed response messages as persisted
   // memory, so resolve the final response text before persistence runs.
   const outputText = resolveOutputText(messageList);
+  const sourceWriteGuard =
+    initData.options?.observationalMemorySourceWriteGuard ??
+    messageListState.memoryInfo?.observationalMemorySourceWriteGuard;
 
   const saveQueueManager = registryEntry?.saveQueueManager ?? rebuiltSaveQueueManager;
   const memory = registryEntry?.memory ?? rebuiltMemory;
@@ -235,6 +241,7 @@ export async function runDurableFinishSideEffects({
           threadId: durableState.threadId,
           resourceId: durableState.resourceId,
           memoryConfig: durableState.memoryConfig,
+          observationalMemorySourceWriteGuard: sourceWriteGuard,
         });
         // Fork: a retried strict terminal flush must not re-create the thread.
         durableState.threadExists = true;
@@ -334,6 +341,8 @@ export async function generateDurableThreadTitle({
   );
   if (!title) return;
 
+  const sourceWriteGuard = messageListState.memoryInfo?.observationalMemorySourceWriteGuard;
+
   // genTitle is a model round trip, so another writer may have created the thread in the
   // meantime. Re-read before falling back to createThread, which upserts the whole row and
   // would drop metadata that writer stored.
@@ -345,6 +354,7 @@ export async function generateDurableThreadTitle({
       title,
       metadata: currentThread.metadata ?? {},
       memoryConfig,
+      observationalMemorySourceWriteGuard: sourceWriteGuard,
     });
   } else {
     await memory.createThread({
@@ -352,6 +362,7 @@ export async function generateDurableThreadTitle({
       resourceId,
       memoryConfig,
       title,
+      observationalMemorySourceWriteGuard: sourceWriteGuard,
     });
   }
 }

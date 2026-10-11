@@ -28,6 +28,7 @@ import type {
   WorkingMemorySnapshot,
   WorkingMemorySnapshotInput,
   StorageCopyThreadOutput,
+  ObservationalMemorySourceWriteGuard,
 } from '../storage';
 import { augmentWithInit } from '../storage/storageWithInit';
 import type { ToolAction } from '../tools';
@@ -274,6 +275,18 @@ https://mastra.ai/en/docs/memory/overview`,
   }
 
   /**
+   * Prepare the per-execution OM source-write fence before authoritative
+   * admission. Memory implementations with native OM fencing override this;
+   * the core base remains unfenced for adapters without that capability.
+   */
+  public async prepareObservationalMemorySourceWriteGuard(
+    _threadId: string,
+    _resourceId?: string,
+  ): Promise<ObservationalMemorySourceWriteGuard | undefined> {
+    return undefined;
+  }
+
+  /**
    * Get a system message to inject into the conversation.
    * This will be called before each conversation turn.
    * Implementations can override this to inject custom system messages.
@@ -478,9 +491,11 @@ https://mastra.ai/en/docs/memory/overview`,
   abstract saveThread({
     thread,
     memoryConfig,
+    observationalMemorySourceWriteGuard,
   }: {
     thread: StorageThreadType;
     memoryConfig?: MemoryConfigInternal;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType>;
 
   /**
@@ -492,6 +507,8 @@ https://mastra.ai/en/docs/memory/overview`,
     messages: MastraDBMessage[];
     memoryConfig?: MemoryConfig | undefined;
     observabilityContext?: Partial<ObservabilityContext>;
+    /** @internal Captured OM fence for source transcript writes. */
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{ messages: MastraDBMessage[]; usage?: { tokens: number } }>;
 
   /**
@@ -534,6 +551,7 @@ https://mastra.ai/en/docs/memory/overview`,
     metadata,
     memoryConfig,
     saveThread = true,
+    observationalMemorySourceWriteGuard,
   }: {
     resourceId: string;
     threadId?: string;
@@ -541,6 +559,7 @@ https://mastra.ai/en/docs/memory/overview`,
     metadata?: Record<string, unknown>;
     memoryConfig?: MemoryConfigInternal;
     saveThread?: boolean;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const thread: StorageThreadType = {
       id:
@@ -557,7 +576,7 @@ https://mastra.ai/en/docs/memory/overview`,
       metadata,
     };
 
-    return saveThread ? this.saveThread({ thread, memoryConfig }) : thread;
+    return saveThread ? this.saveThread({ thread, memoryConfig, observationalMemorySourceWriteGuard }) : thread;
   }
 
   /**
@@ -573,11 +592,14 @@ https://mastra.ai/en/docs/memory/overview`,
     title,
     metadata,
     memoryConfig,
+    observationalMemorySourceWriteGuard,
   }: {
     id: string;
     title?: string;
     metadata?: Record<string, unknown>;
     memoryConfig?: MemoryConfigInternal;
+    /** @internal Captured OM fence for execution-derived thread metadata writes. */
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType>;
 
   /**
@@ -1346,6 +1368,7 @@ https://mastra.ai/en/docs/memory/overview`,
       activateOnProviderChange: om.activateOnProviderChange,
       shareTokenBudget: om.shareTokenBudget,
       temporalMarkers: om.temporalMarkers,
+      ...(om.sourceWriteFencing === undefined ? {} : { sourceWriteFencing: om.sourceWriteFencing }),
       retrieval: om.retrieval,
       ...(om.toolCallFilter
         ? {

@@ -12,6 +12,7 @@ import type {
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
   StorageCopyThreadOutput,
+  ObservationalMemorySourceWriteGuard,
 } from '../storage';
 import { InMemoryStore } from '../storage';
 import { createTool } from '../tools';
@@ -125,22 +126,29 @@ export class MockMemory extends MastraMemory {
 
   async saveThread({
     thread,
+    observationalMemorySourceWriteGuard,
   }: {
     thread: StorageThreadType;
     memoryConfig?: MemoryConfigInternal;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const memoryStorage = await this.getMemoryStore();
-    return memoryStorage.saveThread({ thread });
+    return memoryStorage.saveThread({ thread, observationalMemorySourceWriteGuard });
   }
 
   async saveMessages({
     messages,
+    observationalMemorySourceWriteGuard,
   }: {
     messages: MastraDBMessage[];
     memoryConfig?: MemoryConfigInternal;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<{ messages: MastraDBMessage[] }> {
     const memoryStorage = await this.getMemoryStore();
-    return memoryStorage.saveMessages({ messages: messages.filter(message => message.role !== 'system') });
+    return memoryStorage.saveMessages({
+      messages: messages.filter(message => message.role !== 'system'),
+      ...(observationalMemorySourceWriteGuard ? { observationalMemorySourceWriteGuard } : {}),
+    });
   }
 
   async listThreads(args: StorageListThreadsInput): Promise<StorageListThreadsOutput> {
@@ -190,14 +198,16 @@ export class MockMemory extends MastraMemory {
     id,
     title,
     metadata,
+    observationalMemorySourceWriteGuard,
   }: {
     id: string;
     title?: string;
     metadata?: Record<string, unknown>;
     memoryConfig?: MemoryConfigInternal;
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   }): Promise<StorageThreadType> {
     const memoryStorage = await this.getMemoryStore();
-    return memoryStorage.patchThread({ id, title, metadata });
+    return memoryStorage.patchThread({ id, title, metadata, observationalMemorySourceWriteGuard });
   }
 
   async deleteThread(threadId: string) {

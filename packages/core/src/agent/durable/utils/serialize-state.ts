@@ -321,6 +321,7 @@ export function serializeDurableOptions(options: {
   systemMessage?: SerializableDurableOptions['systemMessage'];
   transform?: SerializableDurableOptions['transform'];
   isTaskComplete?: SerializableDurableOptions['isTaskComplete'];
+  observationalMemorySourceWriteGuard?: SerializableDurableOptions['observationalMemorySourceWriteGuard'];
 }): SerializableDurableOptions {
   // Normalize toolChoice to serializable form
   let serializedToolChoice: SerializableDurableOptions['toolChoice'];
@@ -338,6 +339,9 @@ export function serializeDurableOptions(options: {
   }
 
   return {
+    ...(options.observationalMemorySourceWriteGuard
+      ? { observationalMemorySourceWriteGuard: options.observationalMemorySourceWriteGuard }
+      : {}),
     maxSteps: options.maxSteps,
     recoveryMaxSteps: options.recoveryMaxSteps,
     toolChoice: serializedToolChoice,

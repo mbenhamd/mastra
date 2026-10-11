@@ -146,6 +146,7 @@ export function createPrepareStreamWorkflow<OUTPUT = undefined>({
     mcpServerGuidance,
     memoryConfig,
     memory,
+    resumeContext,
     isResume: !!resumeContext,
     runScope,
   });

@@ -922,6 +922,9 @@ export class ProcessorRunner {
     if (!computeStateSignal) return;
 
     const memoryContext = parseMemoryRequestContext(requestContext);
+    const observationalMemorySourceWriteGuard =
+      memoryContext?.observationalMemorySourceWriteGuard ??
+      messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard;
     const resolvedMemory = memory;
     const resolvedThreadId = threadId ?? memoryContext?.thread?.id;
     const resolvedResourceId = resourceId ?? memoryContext?.resourceId;
@@ -996,6 +999,7 @@ export class ProcessorRunner {
           resourceId: resolvedResourceId,
           threadId: resolvedThreadId,
           memoryConfig: memoryContext?.memoryConfig,
+          observationalMemorySourceWriteGuard,
           messageList,
           defaultId: stateId,
           beforeAddSignal: beforeAddStateSignal,
@@ -1018,6 +1022,7 @@ export class ProcessorRunner {
       resourceId: resolvedResourceId,
       threadId: resolvedThreadId,
       memoryConfig: memoryContext?.memoryConfig,
+      observationalMemorySourceWriteGuard,
       messageList,
       defaultId: stateId,
       beforeAddSignal: beforeAddStateSignal,
@@ -2210,6 +2215,9 @@ export class ProcessorRunner {
             stateSignal: AgentStateSignalInput | (Omit<AgentStateSignalInput, 'id'> & { id?: string }),
           ) => {
             const memoryContext = parseMemoryRequestContext(requestContext);
+            const observationalMemorySourceWriteGuard =
+              memoryContext?.observationalMemorySourceWriteGuard ??
+              messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard;
             const resolvedMemory = args.memory;
             const resolvedThreadId = args.threadId ?? memoryContext?.thread?.id;
             const resolvedResourceId = args.resourceId ?? memoryContext?.resourceId;
@@ -2238,6 +2246,7 @@ export class ProcessorRunner {
               resourceId: resolvedResourceId,
               threadId: resolvedThreadId,
               memoryConfig: memoryContext?.memoryConfig,
+              observationalMemorySourceWriteGuard,
               messageList,
               defaultId: processor.stateId ?? processor.id,
               beforeAddSignal: rotateResponseMessageId,

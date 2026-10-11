@@ -8,7 +8,7 @@ import { recordTerminalErrorMessage } from '../../loop/shared/record-terminal-er
 import { MemoryRunState } from '../../memory';
 import type { MemoryRuntimeContext } from '../../memory';
 import { RequestContext } from '../../request-context';
-import { MemoryStorage } from '../../storage';
+import { MemoryStorage, ObservationalMemorySourceWriteConflictError } from '../../storage';
 import type { StorageListThreadsInput, StorageListThreadsOutput } from '../../storage/types';
 
 import { MessageHistory } from './message-history.js';
@@ -1038,6 +1038,54 @@ describe('MessageHistory', () => {
 
       expect(mockStorage.saveMessages).toHaveBeenCalledWith({
         messages: [expect.objectContaining({ id: 'msg-user', role: 'user' })],
+      });
+    });
+
+    it('passes the source guard through missing-thread creation before a guarded source write', async () => {
+      const sourceWriteGuard = {
+        recordId: 'record-1',
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+      };
+      const getThreadById = vi.fn().mockResolvedValue(null);
+      const saveThread = vi.fn();
+      const saveMessages = vi.fn().mockRejectedValue(new ObservationalMemorySourceWriteConflictError());
+      const mockStorage = {
+        supportsObservationalMemorySourceWriteGuards: true,
+        getThreadById,
+        saveThread,
+        saveMessages,
+      } as unknown as MemoryStorage;
+      const processor = new MessageHistory({
+        storage: mockStorage,
+        requireObservationalMemorySourceWriteGuard: true,
+      });
+      const message: MastraDBMessage = {
+        id: 'msg-guarded',
+        role: 'user',
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        content: { format: 2, parts: [{ type: 'text', text: 'guarded source write' }] },
+        createdAt: new Date(),
+      };
+
+      await expect(
+        processor.persistMessages({
+          messages: [message],
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          observationalMemorySourceWriteGuard: sourceWriteGuard,
+        }),
+      ).rejects.toBeInstanceOf(ObservationalMemorySourceWriteConflictError);
+
+      expect(getThreadById).toHaveBeenCalledWith({ threadId: 'thread-1' });
+      expect(saveThread).toHaveBeenCalledWith({
+        thread: expect.objectContaining({ id: 'thread-1', resourceId: 'resource-1' }),
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
+      });
+      expect(saveMessages).toHaveBeenCalledWith({
+        messages: [message],
+        observationalMemorySourceWriteGuard: sourceWriteGuard,
       });
     });
 

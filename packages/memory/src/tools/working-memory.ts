@@ -1,3 +1,4 @@
+import { parseMemoryRequestContext } from '@mastra/core/memory';
 import type { MemoryConfigInternal } from '@mastra/core/memory';
 import { isStandardSchemaWithJSON, toStandardSchema } from '@mastra/core/schema';
 import type { PublicSchema, StandardSchemaWithJSON } from '@mastra/core/schema';
@@ -260,10 +261,14 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
         let thread = await memory.getThreadById({ threadId });
 
         if (!thread) {
+          // A tool call can land after the thread was erased; bind the create to
+          // this execution's captured source-write fence so it cannot recreate it.
           thread = await memory.createThread({
             threadId,
             resourceId,
             memoryConfig,
+            observationalMemorySourceWriteGuard: parseMemoryRequestContext(context?.requestContext)
+              ?.observationalMemorySourceWriteGuard,
           });
         }
 
@@ -421,10 +426,14 @@ export const __experimental_updateWorkingMemoryToolVNext = (config: MemoryConfig
         let thread = await memory.getThreadById({ threadId });
 
         if (!thread) {
+          // A tool call can land after the thread was erased; bind the create to
+          // this execution's captured source-write fence so it cannot recreate it.
           thread = await memory.createThread({
             threadId,
             resourceId,
             memoryConfig: config,
+            observationalMemorySourceWriteGuard: parseMemoryRequestContext(context?.requestContext)
+              ?.observationalMemorySourceWriteGuard,
           });
         }
 

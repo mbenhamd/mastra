@@ -82,7 +82,7 @@ export class SyncObservationStrategy extends ObservationStrategy {
 
     this.tokensToObserve = await this.tokenCounter.countMessagesAsync(messages);
 
-    const freshRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const freshRecord = await this.getCurrentRecord();
     const existingObservations = freshRecord?.activeObservations ?? record.activeObservations ?? '';
     return { messages, existingObservations };
   }
@@ -271,6 +271,11 @@ export class SyncObservationStrategy extends ObservationStrategy {
       tokenCount: processed.observationTokens,
       lastObservedAt: processed.lastObservedAt,
       observedMessageIds: processed.observedMessageIds,
+      observationalMemoryWriteGuard: {
+        recordId: record.id,
+        threadId: record.threadId,
+        resourceId: record.resourceId,
+      },
     });
 
     await this.indexObservationGroups(processed.observations, threadId, resourceId, processed.lastObservedAt);

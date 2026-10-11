@@ -45,6 +45,7 @@ import type {
   QueuedItem,
   SessionRecord as StoredSessionRecord,
 } from '../../storage/domains/harness';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 import type { GoalEvaluationPayload } from '../../stream/types';
 import type { Workspace } from '../../workspace';
@@ -1963,6 +1964,13 @@ export interface MessageOverrides {
    * {@link MessageOverrides.model} for that.
    */
   modelSettings?: AgentExecutionOptionsBase<unknown>['modelSettings'];
+
+  /**
+   * Captured native OM record identity for this admitted execution. The
+   * Harness carries this value into the agent options and includes it in
+   * admission identity so retries cannot adopt a different source fence.
+   */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }
 
 /**
@@ -2173,6 +2181,9 @@ export interface QueueOverrides {
    * persisted value — never a fresh caller value.
    */
   requestContext?: RequestContextInput;
+
+  /** Captured native OM record identity persisted with this queued turn. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }
 
 /** Options accepted by `Session.queue(...)`. */
@@ -2281,6 +2292,9 @@ export interface SessionSignalOptions {
    * signal is rejected, since it could not reach the in-flight run's tools.
    */
   requestContext?: RequestContextInput;
+
+  /** Captured native OM record identity for an idle wake or active steer. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }
 
 /**
@@ -2321,6 +2335,9 @@ export interface SessionInjectSystemReminderOptions {
 
   /** Optional opaque metadata carried on the signal envelope. */
   metadata?: Record<string, unknown>;
+
+  /** Captured native OM record identity for the reminder's idle wake. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }
 
 /** Result returned by `Session.injectSystemReminder(...)` (resolved on the first await tick). */

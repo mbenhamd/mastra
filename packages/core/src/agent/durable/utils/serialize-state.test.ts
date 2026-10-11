@@ -286,6 +286,13 @@ describe('serializeDurableOptions', () => {
     expect(result.permissionPolicyRequired).toBe(true);
   });
 
+  it('persists the captured OM source-write guard for durable recovery', () => {
+    const guard = { recordId: 'om-record-1', threadId: 'thread-1', resourceId: 'resource-1' } as const;
+    expect(serializeDurableOptions({ observationalMemorySourceWriteGuard: guard })).toMatchObject({
+      observationalMemorySourceWriteGuard: guard,
+    });
+  });
+
   it('serialises string toolChoice directly', () => {
     const result = serializeDurableOptions({ toolChoice: 'auto' });
     expect(result.toolChoice).toBe('auto');

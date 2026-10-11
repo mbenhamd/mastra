@@ -194,6 +194,52 @@ describe('Standalone observe() method', () => {
       expect(result.record.activeObservations).toBeFalsy();
     });
 
+    it('rejects a revoked source guard without initializing a replacement record', async () => {
+      const fencedOm = new ObservationalMemory({
+        storage,
+        scope: 'thread',
+        sourceWriteFencing: 'required',
+        observation: {
+          model: createMockObserverModel(),
+          messageTokens: 100,
+          bufferTokens: false,
+        },
+        reflection: {
+          model: createMockObserverModel(),
+          observationTokens: 50000,
+        },
+      });
+      await storage.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Source guard thread',
+          metadata: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+      const sourceRecord = await fencedOm.getOrCreateRecord(threadId, resourceId);
+      const sourceWriteGuard = fencedOm.getObservationalMemorySourceWriteGuard(sourceRecord);
+      if (!sourceWriteGuard) throw new Error('Expected the required source guard.');
+      const observerCall = vi.spyOn(fencedOm.observer, 'call').mockResolvedValue({
+        observations: '* stale derived observation',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      });
+
+      await storage.retractObservationalMemory({ resourceId, threadId });
+      await expect(
+        fencedOm.observe({
+          threadId,
+          resourceId,
+          messages: createMessagesExceedingThreshold(10),
+          sourceWriteGuard,
+        }),
+      ).rejects.toThrow('source write guard');
+      expect(observerCall).not.toHaveBeenCalled();
+      await expect(storage.getObservationalMemory(threadId, resourceId)).resolves.toBeNull();
+    });
+
     it('should call onObservationStart and onObservationEnd hooks', async () => {
       const messages = createMessagesExceedingThreshold(10);
 

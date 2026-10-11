@@ -992,6 +992,13 @@ export interface ObservationalMemoryConfig {
   managedWorkingMemoryScope?: 'thread' | 'resource';
 
   /**
+   * Require source transcript writes to carry the OM record captured for the
+   * current execution. Archived generations remain valid; retracted records
+   * invalidate the captured guard.
+   */
+  sourceWriteFencing?: 'required';
+
+  /**
    * Enable retrieval-mode observation group metadata.
    * When true, observation groups are treated as durable pointers to raw
    * message history and a `recall` tool is registered so the actor can

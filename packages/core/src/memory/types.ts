@@ -9,7 +9,7 @@ import type { MastraLanguageModel, MastraModelConfig } from '../llm/model/shared
 import type { MessageHistoryToolCallFilterOptions } from '../processors/memory';
 import type { RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
-import type { MastraCompositeStore } from '../storage';
+import type { MastraCompositeStore, ObservationalMemorySourceWriteGuard } from '../storage';
 import type { DynamicArgument } from '../types';
 import type { MastraEmbeddingModel, MastraEmbeddingOptions, MastraVector } from '../vector';
 import type { VectorFilter } from '../vector/filter/base';
@@ -142,6 +142,8 @@ export type MemoryRequestContext = {
   thread?: Partial<StorageThreadType> & { id: string };
   resourceId?: string;
   memoryConfig?: MemoryConfigInternal;
+  /** Captured OM fence for source-derived writes in this execution. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   /** Internal accessor for non-serializable state shared within one agent run. */
   runState?: MemoryRunStateAccessor;
 };
@@ -838,6 +840,15 @@ export interface ObservationalMemoryOptions {
   enabled?: boolean;
 
   /**
+   * Fence native source transcript writes to the OM record captured for the
+   * current execution. Archived generations remain valid; retracted records do
+   * not. When enabled, the execution must carry a captured source-write guard.
+   *
+   * @default false
+   */
+  sourceWriteFencing?: 'required';
+
+  /**
    * Model for both Observer and Reflector agents.
    * Sets the model for both agents at once. Cannot be used together with
    * `observation.model` or `reflection.model` — an error will be thrown.
@@ -1435,6 +1446,9 @@ export type SerializedMemoryConfig = {
 export type SerializedObservationalMemoryConfig = {
   /** Model ID for both Observer and Reflector (e.g., "google/gemini-2.5-flash") */
   model?: string;
+
+  /** Require a captured OM record guard for native source transcript writes. */
+  sourceWriteFencing?: 'required';
 
   /**
    * Memory scope: 'resource' or 'thread'

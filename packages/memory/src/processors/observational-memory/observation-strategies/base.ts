@@ -1,6 +1,11 @@
 import type { MastraDBMessage, MessageList } from '@mastra/core/agent';
 import type { MessageHistory } from '@mastra/core/processors';
-import type { MemoryStorage } from '@mastra/core/storage';
+import type {
+  MemoryStorage,
+  ObservationalMemoryRecord,
+  ObservationalMemorySourceWriteGuard,
+} from '@mastra/core/storage';
+import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
 import xxhash from 'xxhash-wasm';
 
 import type { Memory } from '../../..';
@@ -32,6 +37,7 @@ const hasherPromise = xxhash();
  */
 export interface StrategyDeps {
   storage: MemoryStorage;
+  sourceWriteFencing?: 'required';
   memory?: Memory;
   messageHistory: MessageHistory;
   filterMessagesForHistory?: (messages: MastraDBMessage[]) => MastraDBMessage[];
@@ -100,8 +106,9 @@ export abstract class ObservationStrategy {
     const cycleId = this.generateCycleId();
 
     try {
+      this.assertSourceWriteReady(this.getSourceWriteGuard());
       if (this.needsLock) {
-        const fresh = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+        const fresh = await this.getCurrentRecord();
         if (fresh?.lastObservedAt && record.lastObservedAt && fresh.lastObservedAt > record.lastObservedAt) {
           return { observed: false };
         }
@@ -130,6 +137,7 @@ export abstract class ObservationStrategy {
           trigger: this.opts.trigger,
           requestContext,
           observabilityContext: this.opts.observabilityContext,
+          sourceWriteGuard: this.getSourceWriteGuard(),
         });
       }
 
@@ -150,7 +158,16 @@ export abstract class ObservationStrategy {
             threadId,
           },
         };
-        await this.persistMarkerToStorage(failedMarkerForStorage, threadId, this.opts.resourceId).catch(() => {});
+        try {
+          await this.persistMarkerToStorage(
+            failedMarkerForStorage,
+            threadId,
+            this.opts.resourceId,
+            this.getSourceWriteGuard(),
+          );
+        } catch (markerError) {
+          if (markerError instanceof ObservationalMemorySourceWriteConflictError) throw markerError;
+        }
         if (abortSignal?.aborted) throw error;
         omError('[OM] Observation failed', error);
         return { observed: false, error: error instanceof Error ? error : new Error(String(error)) };
@@ -189,9 +206,10 @@ export abstract class ObservationStrategy {
       this.opts.messageList,
       markerThreadId,
       this.opts.resourceId,
+      this.getSourceWriteGuard(),
     );
     if (!persisted) {
-      await this.persistMarkerToStorage(marker, markerThreadId, this.opts.resourceId);
+      await this.persistMarkerToStorage(marker, markerThreadId, this.opts.resourceId, this.getSourceWriteGuard());
     }
   }
 
@@ -201,6 +219,41 @@ export abstract class ObservationStrategy {
       observationTokens: getMaxThreshold(this.reflectionConfig.observationTokens),
       scope: this.scope,
     };
+  }
+
+  protected getSourceWriteGuard(): ObservationalMemorySourceWriteGuard | undefined {
+    return this.opts.sourceWriteGuard;
+  }
+
+  /**
+   * Refresh the active record while preserving the execution's original
+   * source-write fence. A revoked guard must fail closed instead of allowing a
+   * later strategy phase to initialize a replacement record.
+   */
+  protected async getCurrentRecord(): Promise<ObservationalMemoryRecord | null> {
+    const sourceWriteGuard = this.getSourceWriteGuard();
+    if (sourceWriteGuard) {
+      return this.storage.getObservationalMemoryForSourceWrite({
+        threadId: this.opts.threadId,
+        resourceId: sourceWriteGuard.resourceId,
+        sourceWriteGuard,
+      });
+    }
+    return this.storage.getObservationalMemory(this.opts.record.threadId, this.opts.record.resourceId);
+  }
+
+  protected assertSourceWriteReady(guard: ObservationalMemorySourceWriteGuard | undefined): void {
+    if (this.deps.sourceWriteFencing !== 'required') return;
+    if (!this.storage.supportsObservationalMemorySourceWriteGuards) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but the storage adapter does not support it.',
+      );
+    }
+    if (!guard) {
+      throw new ObservationalMemorySourceWriteConflictError(
+        'Observational memory source write fencing is required but no captured record guard was provided.',
+      );
+    }
   }
 
   protected getMaxMessageTimestamp(messages: MastraDBMessage[]): Date {
@@ -372,7 +425,10 @@ export abstract class ObservationStrategy {
     marker: { type: string; data: unknown },
     threadId: string,
     resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<void> {
+    const guard = sourceWriteGuard ?? this.getSourceWriteGuard();
+    this.assertSourceWriteReady(guard);
     try {
       const result = await this.storage.listMessages({
         threadId,
@@ -399,8 +455,10 @@ export abstract class ObservationStrategy {
         messages: [message],
         threadId,
         resourceId,
+        observationalMemorySourceWriteGuard: guard,
       });
     } catch (e) {
+      if (e instanceof ObservationalMemorySourceWriteConflictError) throw e;
       omDebug(`[OM:persistMarkerToStorage] failed to save marker to DB: ${e}`);
     }
   }
@@ -418,8 +476,11 @@ export abstract class ObservationStrategy {
     messageList: MessageList | undefined,
     threadId: string,
     resourceId?: string,
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<boolean> {
     if (!messageList) return false;
+    const guard = sourceWriteGuard ?? this.getSourceWriteGuard();
+    this.assertSourceWriteReady(guard);
     const allMsgs = getObservableMessages(messageList);
     for (let i = allMsgs.length - 1; i >= 0; i--) {
       const msg = allMsgs[i];
@@ -428,16 +489,28 @@ export abstract class ObservationStrategy {
         const alreadyPresent =
           markerData?.cycleId &&
           msg.content.parts.some((p: any) => p?.type === marker.type && p?.data?.cycleId === markerData.cycleId);
-        if (!alreadyPresent) {
-          msg.content.parts.push(marker as any);
-        }
+        // Persist a copy first. A rejected source-write guard must not leave a
+        // marker on the live transcript after the OM record was retracted.
+        const message = alreadyPresent
+          ? msg
+          : {
+              ...msg,
+              content: {
+                ...msg.content,
+                parts: [...msg.content.parts, marker as any],
+              },
+            };
         try {
           await this.messageHistory.persistMessages({
-            messages: [msg],
+            messages: [message],
             threadId,
             resourceId,
+            observationalMemorySourceWriteGuard: guard,
           });
+          if (!alreadyPresent) msg.content.parts.push(marker as any);
         } catch (e) {
+          if (e instanceof ObservationalMemorySourceWriteConflictError) throw e;
+          if (!alreadyPresent) msg.content.parts.push(marker as any);
           omDebug(`[OM:persistMarker] failed to save marker to DB: ${e}`);
         }
         return true;

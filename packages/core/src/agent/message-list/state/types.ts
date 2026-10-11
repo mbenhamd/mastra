@@ -1,5 +1,6 @@
 import type { UIMessage as UIMessageV4, CoreMessage as CoreMessageV4 } from '@internal/ai-sdk-v4';
 import type * as AIV5 from '@internal/ai-sdk-v5';
+import type { ObservationalMemorySourceWriteGuard } from '../../../storage';
 import type { AIV5Type } from '../types';
 
 export type MessageSource =
@@ -11,7 +12,12 @@ export type MessageSource =
   /* @deprecated use input instead. "user" was a confusing source type because the user can send messages that don't have role: "user" */
   | 'user';
 
-export type MemoryInfo = { threadId: string; resourceId?: string };
+export type MemoryInfo = {
+  threadId: string;
+  resourceId?: string;
+  /** Captured OM record identity reused by every source/marker write in one execution. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+};
 
 type MastraMessageShared = {
   id: string;

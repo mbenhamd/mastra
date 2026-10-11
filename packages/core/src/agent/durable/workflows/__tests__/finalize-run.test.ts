@@ -69,6 +69,43 @@ describe('runDurableFinishSideEffects', () => {
     expect(flushMessages).toHaveBeenCalledTimes(1);
   });
 
+  it('forwards the serialized source guard when recreating a missing durable thread', async () => {
+    const flushMessages = vi.fn().mockResolvedValue(undefined);
+    const createThread = vi.fn().mockResolvedValue(undefined);
+    const sourceWriteGuard = {
+      recordId: 'record-1',
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+    };
+
+    globalRunRegistry.set('run-1', {
+      runtimeBindingId: 'binding-1',
+      isPlaceholder: false,
+      outputProcessors: [],
+      saveQueueManager: { flushMessages },
+      memory: { createThread },
+    } as unknown as RunRegistryEntry);
+
+    const messageListState = makeMessageListState();
+    messageListState.memoryInfo = {
+      ...messageListState.memoryInfo,
+      observationalMemorySourceWriteGuard: sourceWriteGuard,
+    };
+
+    await runDurableFinishSideEffects({
+      runId: 'run-1',
+      initData: makeInitData({ threadId: 'thread-1', resourceId: 'resource-1', threadExists: false }),
+      messageListState,
+    });
+
+    expect(createThread).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      memoryConfig: undefined,
+      observationalMemorySourceWriteGuard: sourceWriteGuard,
+    });
+  });
+
   it('skips title generation for an observational-memory run, matching the persistence guard', async () => {
     const generateThreadTitle = vi.fn().mockResolvedValue(undefined);
     const flushMessages = vi.fn().mockResolvedValue(undefined);

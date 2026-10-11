@@ -10,7 +10,7 @@
 
 import { MessageList } from '@mastra/core/agent';
 import type { MastraDBMessage, MastraMessageContentV2 } from '@mastra/core/agent';
-import type { ObservationalMemoryRecord } from '@mastra/core/storage';
+import type { ObservationalMemoryRecord, ObservationalMemorySourceWriteGuard } from '@mastra/core/storage';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { ObservationTurn } from '../observation-turn/turn';
@@ -70,13 +70,21 @@ function createMessages(count: number): MastraDBMessage[] {
  * Create a minimal mock of ObservationalMemory with only the methods
  * that ObservationTurn.end() needs.
  */
-function createMockOM(opts: { asyncEnabled: boolean; bufferOnIdle?: boolean; unobservedMessages?: MastraDBMessage[] }) {
+function createMockOM(opts: {
+  asyncEnabled: boolean;
+  bufferOnIdle?: boolean;
+  unobservedMessages?: MastraDBMessage[];
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+}) {
   const record = createMockRecord();
   return {
     buffering: {
       isAsyncObservationEnabled: vi.fn(() => opts.asyncEnabled),
     },
     getObservationConfig: vi.fn(() => ({ bufferOnIdle: opts.bufferOnIdle ?? true })),
+    sourceWriteFencing: undefined,
+    getObservationalMemorySourceWriteGuardFromMessageList: vi.fn(() => opts.sourceWriteGuard),
+    assertObservationalMemorySourceWriteGuard: vi.fn(),
     getOrCreateRecord: vi.fn(async () => record),
     getUnobservedMessages: vi.fn(() => opts.unobservedMessages ?? []),
     persistMessages: vi.fn(async () => {}),
@@ -139,6 +147,35 @@ describe('turn.end() idle buffering', () => {
         record: mockOM._mockRecord,
       }),
     );
+  });
+
+  it('reuses a serialized source guard when fencing is optional', async () => {
+    const sourceWriteGuard = {
+      recordId: 'optional-fence-record',
+      threadId,
+      resourceId,
+    } satisfies ObservationalMemorySourceWriteGuard;
+    const mockOM = createMockOM({ asyncEnabled: false, sourceWriteGuard });
+    const mockMessageList = createMockMessageList([]) as any;
+    mockMessageList.serialize = vi.fn(() => ({
+      memoryInfo: { observationalMemorySourceWriteGuard: sourceWriteGuard },
+    }));
+    mockOM.getObservationalMemorySourceWriteGuardFromMessageList = vi.fn((messageList: any) => {
+      return messageList.serialize().memoryInfo.observationalMemorySourceWriteGuard;
+    });
+
+    const turn = new ObservationTurn({
+      om: mockOM as any,
+      threadId,
+      resourceId,
+      messageList: mockMessageList,
+    });
+
+    await turn.start();
+
+    expect(mockOM.getObservationalMemorySourceWriteGuardFromMessageList).toHaveBeenCalledWith(mockMessageList);
+    expect(mockOM.getOrCreateRecord).toHaveBeenCalledWith(threadId, resourceId, sourceWriteGuard);
+    expect(turn.sourceWriteGuard).toEqual(sourceWriteGuard);
   });
 
   // Regression: https://github.com/mastra-ai/mastra/issues/19730
@@ -333,7 +370,12 @@ describe('turn.end() idle buffering', () => {
     await turn.end();
 
     expect(mockOM.persistMessages).toHaveBeenCalledTimes(1);
-    expect(mockOM.persistMessages).toHaveBeenCalledWith([...unsavedInput, ...unsavedOutput], threadId, resourceId);
+    expect(mockOM.persistMessages).toHaveBeenCalledWith(
+      [...unsavedInput, ...unsavedOutput],
+      threadId,
+      resourceId,
+      undefined,
+    );
     expect(mockOM.buffer).toHaveBeenCalledTimes(1);
   });
 
@@ -421,7 +463,12 @@ describe('22573 idle', () => {
       const turn = new ObservationTurn({ om: mockOM as any, threadId: 'idle-buffer-thread', messageList: list });
       await turn.start();
       await turn.end();
-      expect(mockOM.persistMessages).toHaveBeenCalledWith(list.get.all.db(), 'idle-buffer-thread', undefined);
+      expect(mockOM.persistMessages).toHaveBeenCalledWith(
+        list.get.all.db(),
+        'idle-buffer-thread',
+        undefined,
+        undefined,
+      );
       if (expected) {
         expect(mockOM.buffer).toHaveBeenCalledWith(expect.objectContaining({ messages: messages.slice(0, expected) }));
       } else {
@@ -459,6 +506,7 @@ describe('22573 idle', () => {
             list.get.all.db(),
             'idle-buffer-thread',
             'idle-buffer-resource',
+            undefined,
           );
         }
         expect(mockOM.buffer).not.toHaveBeenCalled();

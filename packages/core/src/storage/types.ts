@@ -1127,6 +1127,8 @@ export type StorageTransitionThreadToResourceWorkingMemoryInput = {
   /** Source and destination state captured before this transition was proposed. */
   preparation: StorageThreadToResourceWorkingMemoryTransitionPreparation;
   maxDataBytes?: number;
+  /** @internal Original OM source fence used when preparation creates/updates the thread row. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 };
 
 /** @internal Result of a governed thread-to-resource Working Memory transition. */
@@ -1157,6 +1159,8 @@ export type StorageMutateThreadWithWorkingMemoryInput = {
         /** Fail before mutating the row when an explicit scope migration is required. */
         type: 'require-ungoverned';
       };
+  /** @internal Original OM source fence used when a save mutation may create the thread row. */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 };
 
 /** @internal Result of an atomic thread-row and Working Memory mutation. */
@@ -1315,6 +1319,7 @@ export type StorageDefaultOptions = Omit<
   | 'stopWhen' // StopCondition is a complex union type from AI SDK
   | 'providerOptions' // ProviderOptions includes provider-specific types from external packages
   | 'requireToolApproval' // can be a function at runtime; stored options must be serializable
+  | 'observationalMemorySourceWriteGuard' // execution-scoped OM token; never an agent default
 > & {
   /**
    * Stored agents only support a boolean here. Function-based approval policies are runtime-only
@@ -2245,6 +2250,8 @@ export interface UpdateActiveObservationsInput {
   tokenCount: number;
   /** Timestamp when these observations were created (for cursor-based message loading) */
   lastObservedAt: Date;
+  /** @internal Captured current-generation fence for the derived OM write. */
+  observationalMemoryWriteGuard?: ObservationalMemoryWriteGuard;
   /**
    * IDs of messages that were observed in this cycle.
    * Stored in record metadata as a safeguard against re-observation on process restart.
@@ -2403,15 +2410,42 @@ export interface ObservationalMemoryWriteGuard {
   resourceId: string;
 }
 
+/**
+ * Identifies the OM record that authorized a source transcript write.
+ *
+ * This fence checks record existence and coordinate ownership rather than
+ * requiring the record to remain the latest generation. Reflection archives
+ * old records so delayed writes from a captured execution can still complete;
+ * retraction removes every record in scope and invalidates the fence.
+ */
+export interface ObservationalMemorySourceWriteGuard {
+  recordId: string;
+  threadId: string | null;
+  resourceId: string;
+}
+
+/**
+ * Conditional successor contract for an authoritative edit/delete.
+ * The successor ID is allocated by the caller and must be reused on retry.
+ */
+export interface ObservationalMemorySourceWriteSuccessor {
+  predecessor: ObservationalMemorySourceWriteGuard;
+  successorRecordId: string;
+}
+
 export interface RetractObservationalMemoryInput {
   resourceId: string;
   threadId: string;
+  /** @internal Replaces the captured predecessor with an idempotent successor row. */
+  sourceWriteSuccessor?: ObservationalMemorySourceWriteSuccessor;
 }
 
 export interface RetractObservationalMemoryResult {
   clearedScopes: Array<'resource' | 'thread'>;
   clearedResourceWorkingMemory: boolean;
   clearedThreadMetadata: boolean;
+  /** Guard for the empty successor row created for the conditional retraction. */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }
 
 /**

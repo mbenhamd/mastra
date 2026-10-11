@@ -194,7 +194,7 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
         })),
     });
 
-    const freshRecord = await this.storage.getObservationalMemory(null, this.resourceId);
+    const freshRecord = await this.getCurrentRecord();
     const existingObservations = freshRecord?.activeObservations ?? record.activeObservations ?? '';
 
     const allMessages = Array.from(this.threadsWithMessages.values()).flat();
@@ -479,6 +479,11 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
       tokenCount: processed.observationTokens,
       lastObservedAt: processed.lastObservedAt,
       observedMessageIds: processed.observedMessageIds,
+      observationalMemoryWriteGuard: {
+        recordId: record.id,
+        threadId: record.threadId,
+        resourceId: record.resourceId,
+      },
     });
 
     if (resourceId) {

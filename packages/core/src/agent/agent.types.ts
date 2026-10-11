@@ -12,6 +12,7 @@ import type { VersionOverrides } from '../mastra/types';
 import type { ObservabilityContext, TracingOptions } from '../observability';
 import type { ErrorProcessorOrWorkflow, InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
 import type { RequestContext } from '../request-context';
+import type { ObservationalMemorySourceWriteGuard } from '../storage';
 import type { MastraStreamTransformOptions } from '../stream/types';
 import type { MCPToolExecutionContext, RequireToolApproval, ToolHooks, ToolPayloadTransformPolicy } from '../tools';
 import type { DynamicArgument } from '../types';
@@ -556,6 +557,13 @@ export type MultiPrimitiveExecutionOptions<OUTPUT = undefined> = NetworkOptions<
 export type PublicNetworkOptions<OUTPUT = undefined> = NetworkOptions<OUTPUT>;
 
 export type AgentExecutionOptionsBase<OUTPUT> = {
+  /**
+   * Prepared OM source-write fence for this execution. The durable preparation
+   * path copies it into MessageList memoryInfo; recovery reuses that serialized
+   * value and never prepares a replacement token.
+   */
+  observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+
   /**
    * Native identity for the admitted user input and the response segments it
    * owns. The preparation layer seeds this before the first MessageList write;

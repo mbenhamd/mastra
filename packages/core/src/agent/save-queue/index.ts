@@ -1,6 +1,7 @@
 import type { IMastraLogger } from '../../logger';
 import type { MemoryConfigInternal } from '../../memory';
 import type { MastraMemory } from '../../memory/memory';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage';
 import type { MessageList } from '../message-list';
 import { noteThreadMessagesSaved } from '../thread-saves';
 
@@ -64,12 +65,19 @@ export class SaveQueueManager {
     threadId: string,
     messageList: MessageList,
     memoryConfig?: MemoryConfigInternal,
-    options?: { strictSnapshot?: UnsavedMessageSnapshot },
+    options?: {
+      strictSnapshot?: UnsavedMessageSnapshot;
+      observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+    },
   ) {
     const prev = this.saveQueues.get(threadId) || Promise.resolve();
     const operation = prev.then(() =>
       options?.strictSnapshot
-        ? this.persistUnsavedMessagesStrict(options.strictSnapshot, memoryConfig)
+        ? this.persistUnsavedMessagesStrict(
+            options.strictSnapshot,
+            memoryConfig,
+            options.observationalMemorySourceWriteGuard,
+          )
         : this.persistUnsavedMessages(threadId, messageList, memoryConfig),
     );
     const next = operation
@@ -116,6 +124,7 @@ export class SaveQueueManager {
       await this.memory.saveMessages({
         messages: snapshot.messages,
         memoryConfig,
+        observationalMemorySourceWriteGuard: messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard,
       });
       noteThreadMessagesSaved({ threadId, resourceId: snapshot.messages.find(m => m.resourceId)?.resourceId, savedAt });
     }
@@ -127,12 +136,20 @@ export class SaveQueueManager {
    * write. Unlike the historical best-effort queue path, errors propagate and
    * the same snapshot remains unsaved for an idempotent retry.
    */
-  private async persistUnsavedMessagesStrict(snapshot: UnsavedMessageSnapshot, memoryConfig?: MemoryConfigInternal) {
+  private async persistUnsavedMessagesStrict(
+    snapshot: UnsavedMessageSnapshot,
+    memoryConfig?: MemoryConfigInternal,
+    observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard,
+  ) {
     if (snapshot.messages.length === 0) return;
     if (!this.memory) {
       throw new Error('Cannot strictly persist messages without a memory backend');
     }
-    await this.memory.saveMessages({ messages: snapshot.messages, memoryConfig });
+    await this.memory.saveMessages({
+      messages: snapshot.messages,
+      memoryConfig,
+      observationalMemorySourceWriteGuard,
+    });
     snapshot.commit();
     // Strict snapshots are captured before waiting in the queue. Their write time
     // is not a safe saved-through watermark for newer parts; do not announce it.
@@ -184,6 +201,9 @@ export class SaveQueueManager {
     // best-effort save takes its own snapshot only when it starts and may
     // otherwise drain this recoverability-critical transition first.
     const strictSnapshot = messageList.snapshotUnsavedMessages({ detached: true });
-    return this.enqueueSave(threadId, messageList, memoryConfig, { strictSnapshot });
+    return this.enqueueSave(threadId, messageList, memoryConfig, {
+      strictSnapshot,
+      observationalMemorySourceWriteGuard: messageList.serialize().memoryInfo?.observationalMemorySourceWriteGuard,
+    });
   }
 }
