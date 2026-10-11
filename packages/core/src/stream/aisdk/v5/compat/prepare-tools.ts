@@ -27,6 +27,18 @@ type PreparedTool =
 type PreparedToolChoice = LanguageModelV2ToolChoice | LanguageModelV3ToolChoice;
 
 /**
+ * The tool-set key each prepared tool came from. A provider-defined tool is
+ * advertised under its own name, which may differ from (or collide with) its
+ * key, so callers that need the advertised keys read them here.
+ */
+const preparedToolKeys = new WeakMap<object, string>();
+
+/** The tool-set key a tool returned by {@link prepareToolsAndToolChoice} was prepared from. */
+export function preparedToolKey(preparedTool: object): string | undefined {
+  return preparedToolKeys.get(preparedTool);
+}
+
+/**
  * Recursively fixes JSON Schema properties that lack a 'type' key.
  * Zod v4's toJSONSchema serializes z.any() to just { description: "..." } with no 'type',
  * which providers like OpenAI reject. This converts such schemas to a permissive type union.
@@ -244,6 +256,10 @@ export function prepareToolsAndToolChoice<TOOLS extends Record<string, Tool>>({
           console.error('Error preparing tool', e);
           return null;
         }
+      })
+      .map((preparedTool, index) => {
+        if (preparedTool) preparedToolKeys.set(preparedTool, filteredTools[index]![0]);
+        return preparedTool;
       })
       .filter((tool): tool is PreparedTool => tool !== null),
     toolChoice:

@@ -27,3 +27,61 @@ export function responseRecoveryToolChoice<T>(
   if (toolChoice !== null && typeof toolChoice === 'object') return 'auto';
   return toolChoice;
 }
+
+/**
+ * Names of the tools a step selects for its provider request: every tool, or
+ * the active subset, and none when the choice is `'none'` (provider preparation
+ * strips them).
+ */
+function selectedToolNames(
+  tools: Record<string, unknown> | undefined,
+  activeTools: readonly string[] | undefined,
+  toolChoice: unknown,
+): string[] {
+  if (toolChoice === 'none') return [];
+  const names = Object.keys(tools ?? {});
+  return activeTools == null ? names : names.filter(name => activeTools.includes(name));
+}
+
+/**
+ * The recovery ceiling after an ordinary step selects its tools (PF-5349).
+ *
+ * A step that reaches the provider replaces the ceiling with the tools it
+ * advertised (reported at dispatch). Until then, and for a step that never
+ * reaches the provider (a cached response, or a failure before dispatch), the
+ * ceiling may only narrow: it keeps the names this step still selects, so a
+ * step that withdrew a tool keeps it withdrawn for a later recovery step.
+ */
+export function narrowRecoveryToolCeiling(
+  ceiling: readonly string[] | undefined,
+  tools: Record<string, unknown> | undefined,
+  activeTools: readonly string[] | undefined,
+  toolChoice: unknown,
+): string[] | undefined {
+  if (ceiling === undefined) return undefined;
+  const selected = selectedToolNames(tools, activeTools, toolChoice);
+  return ceiling.filter(name => selected.includes(name));
+}
+
+/**
+ * Tool selection for an admitted response-only recovery step (PF-5349).
+ *
+ * The step advertises the tools it would offer itself, narrowed to `ceiling`:
+ * the names the latest ordinary request of the run advertised. Processors on
+ * the recovery step therefore cannot offer a tool that request did not, however
+ * they change `tools`, `activeTools` or `toolChoice`. Without a recorded
+ * ceiling, or when nothing survives the bound, the step is tool-free.
+ */
+export function boundResponseRecoveryToolSelection<T>(
+  ceiling: readonly string[] | undefined,
+  tools: Record<string, unknown> | undefined,
+  activeTools: readonly string[] | undefined,
+  toolChoice: T,
+): { activeTools: string[]; toolChoice: T | 'auto' | 'none' } {
+  const allowed =
+    ceiling === undefined
+      ? []
+      : selectedToolNames(tools, activeTools, toolChoice).filter(name => ceiling.includes(name));
+  if (allowed.length === 0) return { activeTools: [], toolChoice: 'none' };
+  return { activeTools: allowed, toolChoice: responseRecoveryToolChoice(toolChoice, tools, allowed) };
+}

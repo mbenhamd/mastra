@@ -115,7 +115,10 @@ import { composeStepInput } from '../../shared/compose-step-input';
 import { injectBackgroundTaskPrompt } from '../../shared/inject-background-task-prompt';
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../shared/merge-llm-call-headers';
 import { recordTerminalErrorMessage } from '../../shared/record-terminal-error-message';
-import { responseRecoveryToolChoice } from '../../shared/response-recovery-tool-choice';
+import {
+  boundResponseRecoveryToolSelection,
+  narrowRecoveryToolCeiling,
+} from '../../shared/response-recovery-tool-choice';
 import type { LocatedStepContent } from '../../shared/step-content';
 import { readStepContent, stepWasRolledBack } from '../../shared/step-content';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../shared/step-content-chunk-types';
@@ -1400,14 +1403,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   const configuredToolCallConcurrency = resolveConfiguredToolCallConcurrency(toolCallConcurrency);
 
   let currentIteration = 0;
-  /**
-   * The tool selection the previous provider request of this run advertised,
-   * after every processor, fence and permission gate. A response-only recovery
-   * step reuses it (PF-5349): processors may decide differently on the recovery
-   * step (for example re-exposing tools a bounded response lane had withdrawn),
-   * and the recovery request must not advertise more than the step before it.
-   */
-  let previousAdvertisedSurface: { toolChoice: unknown; activeTools: string[] | undefined } | undefined;
   let eagerAbortListenerRegistered = false;
   const pendingProviderToolCallsByToolCallId = new Map<string, PendingProviderToolCall>();
 
@@ -1650,6 +1645,28 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       const toolSurfaceFencePassthrough = persistedToolSurfaceFence
         ? { toolSurfaceFence: [...persistedToolSurfaceFence] }
         : {};
+      // PF-5349: names of the tools the latest ordinary request that reached the
+      // provider advertised. They bound a later response-only recovery step.
+      // Carried in iteration state so the bound survives a suspend/resume.
+      let recoveryToolCeiling: string[] | undefined = inputData.recoveryToolCeiling;
+      // An ordinary step narrows the ceiling to what it selects at every point
+      // its selection is settled (after processors, after the fence and the
+      // permission gate, after request processors); only a dispatch replaces
+      // it. A step that is served from a cache, or that fails before dispatch,
+      // therefore never widens it.
+      const narrowRecoveryCeilingToStep = (step: {
+        tools?: unknown;
+        activeTools?: unknown;
+        toolChoice?: unknown;
+      }): void => {
+        if (responseRecoveryStep) return;
+        recoveryToolCeiling = narrowRecoveryToolCeiling(
+          recoveryToolCeiling,
+          step.tools as Record<string, unknown> | undefined,
+          step.activeTools as string[] | undefined,
+          step.toolChoice,
+        );
+      };
       const maxErrorProcessorRetries = resolveMaxProcessorRetries({
         maxProcessorRetries,
         hasErrorProcessors: Boolean(errorProcessors?.length),
@@ -2031,6 +2048,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           }
         }
 
+        // Before the fence or the permission gate can reject this attempt.
+        narrowRecoveryCeilingToStep(currentStep);
+
         const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
         if (toolSurfaceFence) {
           if (currentStep.tools) {
@@ -2120,6 +2140,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             );
           }
         }
+
+        // The fence and the permission gate may have narrowed the selection.
+        narrowRecoveryCeilingToStep(currentStep);
 
         if (currentStep.tools) {
           currentStep.tools = wrapToolsWithHooks(
@@ -2220,6 +2243,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             inputMessages = requestStepResult.prompt;
             cachedResponse = requestStepResult.response;
           } catch (error) {
+            // A request processor may have narrowed the selection before failing.
+            narrowRecoveryCeilingToStep(currentStep);
             if (error instanceof TripWire) {
               logger?.warn('Streaming request processor tripwire triggered', {
                 reason: error.message,
@@ -2263,41 +2288,22 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Recovery owns one freshly fenced provider attempt. A cached response
           // was produced under another tool surface and cannot consume it.
           cachedResponse = undefined;
-          // Bound recovery by the previous request's selection, so it advertises
-          // what the step before it did (the provider cache prefix) and never
-          // more: active tools are intersected, and a 'none' on either side
-          // keeps the recovery request tool-free.
-          if (previousAdvertisedSurface !== undefined) {
-            const previous = previousAdvertisedSurface;
-            const current = currentStep.activeTools as string[] | undefined;
-            currentStep.activeTools = (
-              previous.activeTools === undefined
-                ? current
-                : current === undefined
-                  ? [...previous.activeTools]
-                  : current.filter(name => previous.activeTools!.includes(name))
-            ) as typeof currentStep.activeTools;
-            if (previous.toolChoice === 'none' || currentStep.toolChoice === 'none') {
-              currentStep.toolChoice = 'none' as typeof currentStep.toolChoice;
-            } else {
-              currentStep.toolChoice = previous.toolChoice as typeof currentStep.toolChoice;
-            }
-          }
-          // Chosen after the tool-surface fence and the permission gate, from the
-          // tools this request will actually advertise (PF-5349): the step keeps
-          // their schemas and the loop denies execution below.
-          currentStep.toolChoice = responseRecoveryToolChoice(
-            currentStep.toolChoice,
+          // Bound recovery by the tools the latest ordinary request advertised
+          // (PF-5349), after the tool-surface fence and the permission gate: it
+          // keeps those schemas (the provider cache prefix) and never offers
+          // more. Without a recorded request it is tool-free. The loop denies
+          // execution of any call it emits below.
+          const bounded = boundResponseRecoveryToolSelection(
+            recoveryToolCeiling,
             currentStep.tools as Record<string, unknown> | undefined,
             currentStep.activeTools as string[] | undefined,
-          ) as typeof currentStep.toolChoice;
+            currentStep.toolChoice,
+          );
+          currentStep.activeTools = bounded.activeTools as typeof currentStep.activeTools;
+          currentStep.toolChoice = bounded.toolChoice as typeof currentStep.toolChoice;
         } else {
-          previousAdvertisedSurface = {
-            toolChoice: currentStep.toolChoice,
-            activeTools: Array.isArray(currentStep.activeTools)
-              ? [...(currentStep.activeTools as string[])]
-              : undefined,
-          };
+          // Request processors ran with this selection in reach.
+          narrowRecoveryCeilingToStep(currentStep);
         }
 
         // Execution denial is separate from schema exposure: the admitted
@@ -2427,6 +2433,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 onProviderAttemptStart: providerAttempt => {
                   providerAttemptCount = providerAttempt;
                   modelSpanTracker?.startInference?.(undefined, providerAttempt);
+                },
+                // A request that reaches the provider bounds a later response-only
+                // recovery step by the tools it advertised (PF-5349). Cache
+                // replays and attempts that fail before dispatch do not.
+                onProviderDispatch: advertisedToolKeys => {
+                  if (!responseRecoveryStep) recoveryToolCeiling = advertisedToolKeys;
                 },
                 onProviderAttemptError: ({ error, aborted }) => {
                   const tracingError = asTracingError(error, 'Provider attempt failed');
@@ -3249,6 +3261,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           processorRetryCount: nextProcessorRetryCount,
           ...(activeFallbackModelIndex > 0 ? { fallbackModelIndex: activeFallbackModelIndex } : {}),
           ...toolSurfaceFencePassthrough,
+          ...(recoveryToolCeiling === undefined ? {} : { recoveryToolCeiling }),
         };
       }
 
@@ -3657,6 +3670,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         processorRetryFeedback: retryFeedbackText,
         ...(nextFallbackModelIndex > 0 ? { fallbackModelIndex: nextFallbackModelIndex } : {}),
         ...toolSurfaceFencePassthrough,
+        ...(recoveryToolCeiling === undefined ? {} : { recoveryToolCeiling }),
       };
     },
   });
