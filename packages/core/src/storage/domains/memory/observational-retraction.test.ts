@@ -712,6 +712,35 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
     });
   });
 
+  it.each([
+    ['null', null, 'Profile from elsewhere.'],
+    ['a primitive', 'not-an-object', 'Profile from elsewhere.'],
+    ['an array', [], 'Profile from elsewhere.'],
+    ['an object without the marker (control)', {}, undefined],
+  ])(
+    'applies the policy fallback to a record whose config is %s only when it is a marker-free object',
+    async (_name, config, expected) => {
+      const storage = new InMemoryStore({ id: `memory-observational-config-${_name}` });
+      const memory = await storage.getStore('memory');
+      if (!memory) throw new Error('Expected in-memory storage domain.');
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      const threadId = 'config-shape-thread';
+      const resourceId = 'config-shape-resource';
+      await memory.saveThread({
+        thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt, updatedAt: createdAt },
+      });
+      await memory.updateResource({ resourceId, workingMemory: 'Profile from elsewhere.' });
+      await memory.initializeObservationalMemory({
+        threadId: null,
+        resourceId,
+        scope: 'resource',
+        config: config as any,
+      });
+      await memory.retractObservationalMemory({ resourceId, threadId, managedWorkingMemoryScope: 'resource' });
+      await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: expected });
+    },
+  );
+
   it('never applies the policy fallback to a record explicitly marked as not managing working memory', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-policy-null-marker' });
     const memory = await storage.getStore('memory');

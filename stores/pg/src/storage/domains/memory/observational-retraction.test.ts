@@ -1133,6 +1133,119 @@ describe('MemoryPG observational-memory retraction', () => {
     });
   });
 
+  describe('concurrency of the not-managed marker stamp', () => {
+    const lockWaitOf = async (inspector: Pool, applicationName: string) => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const result = await inspector.query<{ waiting: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'
+           ) AS waiting`,
+          [applicationName],
+        );
+        if (result.rows[0]?.waiting) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      throw new Error(`Timed out waiting for ${applicationName} to block on a row lock.`);
+    };
+    const namedMemory = async (id: string, applicationName: string) => {
+      const url = new URL(connectionString);
+      url.searchParams.set('application_name', applicationName);
+      const store = new PostgresStore({ id, connectionString: url.toString(), disableInit: true, schemaName });
+      await store.init();
+      return { store, memory: (await store.getStore('memory')) as MemoryPG };
+    };
+    const seedNullMarked = async (suffix: string) => {
+      const caseResourceId = `${resourceId}-stamp-concurrency-${suffix}`;
+      await observerMemory.saveResource({
+        resource: { id: caseResourceId, workingMemory: 'Before.', metadata: {}, createdAt, updatedAt: createdAt },
+      });
+      const record = await observerMemory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: null, keep: 'unrelated' },
+        resourceId: caseResourceId,
+        scope: 'resource',
+        threadId: null,
+      });
+      return {
+        resourceId: caseResourceId,
+        record,
+        guard: { recordId: record.id, threadId: null, resourceId: caseResourceId },
+      };
+    };
+
+    it('locks the OM row before the target row in a guarded write', async () => {
+      const { resourceId: id, record, guard } = await seedNullMarked('lock-order');
+      const writerName = `pf5257-stamp-writer-${Date.now()}`;
+      const writer = await namedMemory('stamp-lock-order-writer', writerName);
+      const inspector = new Pool({ connectionString });
+      const blocker = await inspector.connect();
+      const probe = await inspector.connect();
+      let write: Promise<unknown> | undefined;
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(`SELECT 1 FROM "${schemaName}"."mastra_observational_memory" WHERE id = $1 FOR UPDATE`, [
+          record.id,
+        ]);
+        write = writer.memory
+          .updateResourceFromObservationalMemory({ resourceId: id, workingMemory: 'FROM-DELETED-MSG', guard })
+          .catch((error: unknown) => error);
+        await lockWaitOf(inspector, writerName);
+        // Waiting on the OM row, the write holds no lock on its target row yet.
+        await probe.query('BEGIN');
+        await expect(
+          probe.query(`SELECT 1 FROM "${schemaName}"."mastra_resources" WHERE id = $1 FOR UPDATE NOWAIT`, [id]),
+        ).resolves.toMatchObject({ rowCount: 1 });
+        await probe.query('ROLLBACK');
+        await blocker.query('COMMIT');
+        await expect(write).resolves.toMatchObject({ workingMemory: 'FROM-DELETED-MSG' });
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => {});
+        await probe.query('ROLLBACK').catch(() => {});
+        blocker.release();
+        probe.release();
+        await write;
+        await Promise.allSettled([writer.store.close(), inspector.end()]);
+      }
+      await expect(retractorMemory.getObservationalMemory(null, id)).resolves.toMatchObject({
+        config: expect.objectContaining({ _managedWorkingMemoryScope: 'resource' }),
+      });
+    });
+
+    it('keeps a stamp that commits during a concurrent config merge, and the merged fields', async () => {
+      const { resourceId: id, record } = await seedNullMarked('config-merge');
+      const mergerName = `pf5257-config-merger-${Date.now()}`;
+      const merger = await namedMemory('stamp-config-merger', mergerName);
+      const inspector = new Pool({ connectionString });
+      const blocker = await inspector.connect();
+      let merge: Promise<unknown> | undefined;
+      try {
+        // The stamp's transaction holds the OM row while the merge starts.
+        await blocker.query('BEGIN');
+        await blocker.query(`SELECT 1 FROM "${schemaName}"."mastra_observational_memory" WHERE id = $1 FOR UPDATE`, [
+          record.id,
+        ]);
+        merge = merger.memory.updateObservationalMemoryConfig({ id: record.id, config: { merged: true } });
+        await lockWaitOf(inspector, mergerName);
+        await blocker.query(
+          `UPDATE "${schemaName}"."mastra_observational_memory"
+           SET config = jsonb_set(config::jsonb, '{_managedWorkingMemoryScope}', to_jsonb('resource'::text))
+           WHERE id = $1`,
+          [record.id],
+        );
+        await blocker.query('COMMIT');
+        await merge;
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => {});
+        blocker.release();
+        await merge?.catch(() => {});
+        await Promise.allSettled([merger.store.close(), inspector.end()]);
+      }
+      await expect(retractorMemory.getObservationalMemory(null, id)).resolves.toMatchObject({
+        config: expect.objectContaining({ _managedWorkingMemoryScope: 'resource', keep: 'unrelated', merged: true }),
+      });
+    });
+  });
+
   it('forwards the policy through an atomic thread deletion', async () => {
     const deleteResourceId = `${resourceId}-policy-thread-delete`;
     const deleteThreadId = `${threadId}-policy-thread-delete`;
