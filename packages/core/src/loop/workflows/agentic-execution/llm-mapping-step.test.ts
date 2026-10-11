@@ -2358,3 +2358,42 @@ describe('createLLMMappingStep StepResult reconciliation', () => {
     ).toEqual(['call-1']);
   });
 });
+
+describe('createLLMMappingStep latest-step refresh', () => {
+  it('keeps the captured content when the message list no longer holds the step (PF-5364)', async () => {
+    // A durable run rebuilds its MessageList, so re-reading the latest step can find nothing.
+    const steps = [
+      new DefaultStepResult({
+        content: [{ type: 'text', text: 'captured answer' }],
+        finishReason: 'tool-calls',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        warnings: [],
+        request: {},
+        response: { id: 'r', timestamp: new Date(0), modelId: 'm', messages: [] },
+        providerMetadata: undefined,
+      }),
+    ];
+    const executionResult = { stepResult: { isContinued: true, reason: undefined }, metadata: {}, output: { steps } };
+    const mappingStep = createLLMMappingStep(
+      {
+        models: {} as any,
+        controller: { enqueue: vi.fn() },
+        // The rebuilt list never received this step's parts and keeps none of its writes.
+        messageList: Object.assign(new MessageList(), { add: vi.fn(), updateToolInvocation: vi.fn(() => true) }),
+        runId: 'test-run',
+        _internal: { generateId: () => 'test-message-id' },
+      } as any,
+      createStep({ id: 'test-llm-execution', inputSchema: z.any(), outputSchema: z.any(), execute: async () => ({}) }),
+    );
+
+    await mappingStep.execute({
+      runId: 'test-run',
+      getStepResult: vi.fn(() => executionResult),
+      bail: vi.fn(data => data),
+      requestContext: new RequestContext(),
+      inputData: [{ toolCallId: 'call-1', toolName: 'failingTool', args: {}, error: new Error('tool failed') }],
+    } as any);
+
+    expect(steps[0]!.content).toEqual([{ type: 'text', text: 'captured answer' }]);
+  });
+});

@@ -5333,6 +5333,50 @@ describe('Harness v1 real-agent E2E — S23 processor retry after tool results',
     }
   });
 
+  it('keeps the answer that follows iteration feedback on a tool turn', async () => {
+    // Feedback after the tool step opens the next boundary in its own message,
+    // while the answer streams into the earlier response message.
+    let providerCalls = 0;
+    const readFile = createTool({
+      id: 'readFile',
+      description: 'Read one test file.',
+      inputSchema: z.object({}),
+      execute: async () => ({ content: 'hello' }),
+    });
+    const model = new MockLanguageModelV2({
+      doStream: async () => {
+        providerCalls += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: providerCalls === 1 ? toolCallStream('read-1', 'readFile', '{}') : textStream([REPAIRED_ANSWER]),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'read the file and answer with the status line',
+      model,
+      tools: { readFile },
+      outputProcessors: [requireStatusLine],
+      maxProcessorRetries: 2,
+      defaultOptions: {
+        onIterationComplete: async ({ iteration }) => (iteration === 1 ? { feedback: 'Now answer.' } : undefined),
+      },
+    });
+    const harness = newHarness(agent);
+    try {
+      const session = await harness.session({ resourceId: 'u-feedback-answer', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'read it' })) as any;
+
+      expect(providerCalls).toBe(2);
+      expect(result.text).toBe(REPAIRED_ANSWER);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('still recovers once when the repaired step is genuinely silent', async () => {
     const recovered = `Read the file.\n${STATUS_LINE}`;
     const { harness, providerCalls } = retryHarness([[REJECTED_ANSWER], [], [recovered]]);

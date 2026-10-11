@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createSignal } from '../signals';
 import type { MastraStepStartPart } from './state';
 import type { MastraDBMessage } from './types';
 import { MessageList } from './index';
@@ -530,5 +531,43 @@ describe('MessageList#openStepBoundary', () => {
         .find(m => m.id === id)!
         .content.parts!.some(p => p.type === 'step-start'),
     ).toBe(false);
+  });
+});
+
+describe('MessageList#openStepBoundary across trailing signals (PF-5364)', () => {
+  const feedbackSignal = () =>
+    createSignal({ type: 'reactive', tagName: 'system-reminder', contents: 'Answer again.' });
+
+  it('opens no boundary behind a trailing signal by default', () => {
+    const { list, id } = listWith(assistant([toolCall('c1')]));
+    list.addSignal(feedbackSignal());
+
+    expect(list.openStepBoundary().boundary).toBeUndefined();
+    expect(partsOf(list, id)?.map(part => part.type)).toEqual(['tool-invocation']);
+  });
+
+  it('opens the boundary on the assistant message ahead of the signals, and reuses it', () => {
+    const { list, id } = listWith(assistant([toolCall('c1')]));
+    list.addSignal(feedbackSignal());
+
+    const first = list.openStepBoundary({ acrossTrailingSignals: true });
+    expect(first.appended).toBe(true);
+    expect(partsOf(list, id)?.map(part => part.type)).toEqual(['tool-invocation', 'step-start']);
+    expect(partsOf(list, id)?.at(-1)).toBe(first.boundary);
+
+    // A second rejected retry adds another signal; its iteration starts at the same marker.
+    list.addSignal(feedbackSignal());
+    const second = list.openStepBoundary({ acrossTrailingSignals: true });
+    expect(second).toEqual({ boundary: first.boundary, appended: false });
+    expect(partsOf(list, id)?.map(part => part.type)).toEqual(['tool-invocation', 'step-start']);
+  });
+
+  it('opens no boundary when the message ahead of the signals is not an assistant message', () => {
+    // A rejected first iteration is removed whole, leaving the user turn ahead of the signal.
+    const { list, id } = listWith(assistant([text('REJECTED')]));
+    list.removeByIds([id]);
+    list.addSignal(feedbackSignal());
+
+    expect(list.openStepBoundary({ acrossTrailingSignals: true }).boundary).toBeUndefined();
   });
 });

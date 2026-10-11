@@ -249,9 +249,15 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         const latestStep = steps.at(-1);
         // A rolled-back retry attempt has no parts left to re-extract.
         if (!latestStep || stepWasRolledBack(latestStep)) return;
+        const refreshedContent = rest.messageList.get.response.aiV5.modelContent(
+          messageStepNumber(steps, steps.length - 1),
+        );
+        // As in the execution step's refresh: a list that no longer holds this step's
+        // parts (a durable run rebuilds it) must not wipe the content already captured.
+        if (refreshedContent.length === 0) return;
 
         steps[steps.length - 1] = new DefaultStepResult({
-          content: rest.messageList.get.response.aiV5.modelContent(messageStepNumber(steps, steps.length - 1)),
+          content: refreshedContent,
           finishReason: latestStep.finishReason,
           providerMetadata: latestStep.providerMetadata,
           request: latestStep.request,
