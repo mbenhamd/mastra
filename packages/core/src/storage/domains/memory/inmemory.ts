@@ -254,20 +254,6 @@ function getManagedWorkingMemoryScopes(
   return scopes;
 }
 
-/**
- * A guarded observer working-memory write proves its record's observer manages
- * working memory at `scope`: a record marked `null` (created while it did not)
- * is stamped, so a later retraction clears what the write stores. An unmarked
- * (pre-marker) record is left to the caller's policy fallback.
- */
-function markObservationalMemoryManagingWorkingMemory(
-  record: ObservationalMemoryRecord,
-  scope: 'thread' | 'resource',
-): void {
-  if (record.config?._managedWorkingMemoryScope !== null) return;
-  record.config = { ...record.config, _managedWorkingMemoryScope: scope };
-}
-
 function removeObservationalMemoryMetadata(
   metadata: Record<string, unknown> | undefined,
   clearWorkingMemory: boolean,
@@ -1270,7 +1256,6 @@ export class InMemoryMemory extends MemoryStorage {
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
     }
-    markObservationalMemoryManagingWorkingMemory(current, 'resource');
     const resource = this.db.resources.get(resourceId);
     assertWorkingMemorySnapshotUnchanged({
       currentValue: resource?.workingMemory,
@@ -1279,7 +1264,11 @@ export class InMemoryMemory extends MemoryStorage {
       proposedValueProvided: true,
       proposedMetadata: undefined,
     });
-    return this.updateResource({ resourceId, workingMemory });
+    const updated = await this.updateResource({ resourceId, workingMemory });
+    if ((resource?.workingMemory ?? null) !== workingMemory) {
+      this.markObservationalMemoryManagingWorkingMemory(guard, 'resource');
+    }
+    return updated;
   }
 
   async updateThreadFromObservationalMemory({
@@ -1305,9 +1294,6 @@ export class InMemoryMemory extends MemoryStorage {
     )?.[0];
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
-    }
-    if (Object.prototype.hasOwnProperty.call(metadata, 'workingMemory')) {
-      markObservationalMemoryManagingWorkingMemory(current, 'thread');
     }
     return this.updateThread({
       id,
@@ -1375,7 +1361,6 @@ export class InMemoryMemory extends MemoryStorage {
         if (currentGeneration?.id !== guard.recordId) {
           throw new WorkingMemoryValidationError('Observational memory generation is no longer current.');
         }
-        markObservationalMemoryManagingWorkingMemory(currentGeneration, input.scope);
       }
 
       const now = new Date();
@@ -1397,6 +1382,9 @@ export class InMemoryMemory extends MemoryStorage {
             true,
           ),
         );
+        if (input.observationalMemoryGuard) {
+          this.markObservationalMemoryManagingWorkingMemory(input.observationalMemoryGuard, 'resource');
+        }
         return next;
       }
 
@@ -1413,8 +1401,39 @@ export class InMemoryMemory extends MemoryStorage {
       else metadata.workingMemory = next.value;
       this.db.threads.set(input.threadId, cloneThreadBoundary({ ...thread, metadata, updatedAt: now }, true));
       this.rotateThreadGeneration(input.threadId);
+      if (input.observationalMemoryGuard) {
+        this.markObservationalMemoryManagingWorkingMemory(input.observationalMemoryGuard, 'thread');
+      }
       return next;
     });
+  }
+
+  /**
+   * A guarded observer write that changed working memory proves its record's
+   * observer manages working memory at `scope`: a record marked `null`
+   * (created while it did not) is stamped after that write, so a later
+   * retraction clears what the write stored. The record is replaced, not
+   * mutated, so a rolled-back write restores the unstamped record. An unmarked
+   * (pre-marker) record is left to the caller's policy fallback.
+   *
+   * Unlike PG, where the stamp's UPDATE changes the OM row's storage generation
+   * (xmin) so a later thread-clone rollback reports an `observational_memory`
+   * conflict, this does not rotate `memoryObservationalGenerations`: the same
+   * rollback succeeds here. Both are acceptable, since working memory was
+   * written after the clone, and the stamp happens once per `null` record.
+   */
+  private markObservationalMemoryManagingWorkingMemory(
+    guard: ObservationalMemoryWriteGuard,
+    scope: 'thread' | 'resource',
+  ): void {
+    const key = this.getObservationalMemoryKey(guard.threadId, guard.resourceId);
+    const records = this.db.observationalMemory.get(key);
+    const current = records?.[0];
+    if (!records || current?.id !== guard.recordId || current.config?._managedWorkingMemoryScope !== null) return;
+    this.db.observationalMemory.set(key, [
+      { ...current, config: { ...current.config, _managedWorkingMemoryScope: scope } },
+      ...records.slice(1),
+    ]);
   }
 
   async mutateThreadWithWorkingMemory(

@@ -825,13 +825,14 @@ describe('MemoryPG observational-memory retraction', () => {
     let transactionOpen = false;
     const receipts: Array<{ result: { clearedScopes: string[]; clearedResourceWorkingMemory: boolean } }> = [];
     let lateWrite: Promise<unknown> | undefined;
+    let deletion: Promise<void> | undefined;
     try {
       await client.query('BEGIN');
       transactionOpen = true;
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
         `mastra:observational-memory:${policyResourceId}`,
       ]);
-      const deletion = deleter.memory.deleteMessages([deletedMessageId], {
+      deletion = deleter.memory.deleteMessages([deletedMessageId], {
         retractObservationalMemory: true,
         managedWorkingMemoryScope: 'resource',
         observationalMemoryRetractions: receipts as any,
@@ -855,6 +856,7 @@ describe('MemoryPG observational-memory retraction', () => {
     } finally {
       if (transactionOpen) await client.query('ROLLBACK');
       client.release();
+      await deletion?.catch(() => {});
       await lateWrite;
       await Promise.allSettled([blocker.end(), deleter.store.close(), writer.store.close(), inspector.end()]);
     }
@@ -966,38 +968,156 @@ describe('MemoryPG observational-memory retraction', () => {
     });
   });
 
-  it('stamps a not-managed record managed when its observer writes working memory, so a retraction clears it', async () => {
-    const staleResourceId = `${resourceId}-stale-null-marker`;
-    const staleThreadId = `${threadId}-stale-null-marker`;
+  describe('a not-managed (null-marked) record', () => {
+    let caseNumber = 0;
+    const setup = async () => {
+      caseNumber += 1;
+      const caseResourceId = `${resourceId}-null-marker-${caseNumber}`;
+      const caseThreadId = `${threadId}-null-marker-${caseNumber}`;
+      await observerMemory.saveThread({
+        thread: {
+          id: caseThreadId,
+          resourceId: caseResourceId,
+          title: '',
+          metadata: { workingMemory: 'Thread profile from elsewhere.' },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      // Created while the observer did not manage working memory; the policy has since changed.
+      const record = await observerMemory.initializeObservationalMemory({
+        config: { _managedWorkingMemoryScope: null },
+        resourceId: caseResourceId,
+        scope: 'resource',
+        threadId: null,
+      });
+      const guard = { recordId: record.id, threadId: null, resourceId: caseResourceId };
+      const marker = async () =>
+        ((await retractorMemory.getObservationalMemory(null, caseResourceId))?.config as Record<string, unknown>)
+          ._managedWorkingMemoryScope;
+      return { resourceId: caseResourceId, threadId: caseThreadId, guard, marker };
+    };
+    type Case = Awaited<ReturnType<typeof setup>>;
+
+    it.each([
+      [
+        'a guarded resource write',
+        async ({ resourceId: id, guard }: Case) =>
+          observerMemory.updateResourceFromObservationalMemory({
+            resourceId: id,
+            workingMemory: 'FROM-DELETED-MSG',
+            guard,
+          }),
+      ],
+      [
+        'a guarded revisioned update',
+        async ({ resourceId: id, guard }: Case) => {
+          const current = await observerMemory.getWorkingMemorySnapshot({ scope: 'resource', resourceId: id });
+          await observerMemory.applyWorkingMemoryUpdate({
+            scope: 'resource',
+            resourceId: id,
+            value: 'FROM-DELETED-MSG',
+            expectedRevision: current.revision,
+            source: 'observer',
+            observationalMemoryGuard: guard,
+          });
+        },
+      ],
+    ])('is stamped managed by %s, so a retraction clears what it wrote', async (_name, write) => {
+      const context = await setup();
+      await write(context);
+      await expect(context.marker()).resolves.toBe('resource');
+      await expect(
+        retractorMemory.retractObservationalMemory({ resourceId: context.resourceId, threadId: context.threadId }),
+      ).resolves.toMatchObject({ clearedScopes: ['resource'], clearedResourceWorkingMemory: true });
+      await expect(retractorMemory.getResourceById({ resourceId: context.resourceId })).resolves.toMatchObject({
+        workingMemory: null,
+      });
+    });
+
+    it.each([
+      [
+        'a rejected guarded update (stale revision)',
+        async ({ resourceId: id, guard }: Case) => {
+          await observerMemory.updateResource({ resourceId: id, workingMemory: 'Profile from elsewhere.' });
+          await expect(
+            observerMemory.applyWorkingMemoryUpdate({
+              scope: 'resource',
+              resourceId: id,
+              value: 'FROM-DELETED-MSG',
+              expectedRevision: 999,
+              source: 'observer',
+              observationalMemoryGuard: guard,
+            }),
+          ).rejects.toThrow();
+        },
+      ],
+      [
+        'an OM thread-metadata update',
+        async ({ resourceId: id, threadId: tid, guard }: Case) => {
+          await observerMemory.updateResource({ resourceId: id, workingMemory: 'Profile from elsewhere.' });
+          await observerMemory.updateThreadFromObservationalMemory({
+            id: tid,
+            metadata: { workingMemory: 'Thread profile from elsewhere.', mastra: { om: { threadTitle: 'T' } } },
+            guard,
+          });
+        },
+      ],
+    ])('stays not managed after %s, and its retraction keeps memory it never wrote', async (_name, write) => {
+      const context = await setup();
+      await write(context);
+      await expect(context.marker()).resolves.toBeNull();
+      await retractorMemory.retractObservationalMemory({
+        resourceId: context.resourceId,
+        threadId: context.threadId,
+        managedWorkingMemoryScope: 'resource',
+      });
+      await expect(retractorMemory.getResourceById({ resourceId: context.resourceId })).resolves.toMatchObject({
+        workingMemory: 'Profile from elsewhere.',
+      });
+      await expect(retractorMemory.getThreadById({ threadId: context.threadId })).resolves.toMatchObject({
+        metadata: expect.objectContaining({ workingMemory: 'Thread profile from elsewhere.' }),
+      });
+    });
+  });
+
+  it('forwards the policy through an atomic thread deletion', async () => {
+    const deleteResourceId = `${resourceId}-policy-thread-delete`;
+    const deleteThreadId = `${threadId}-policy-thread-delete`;
+    await observerMemory.saveResource({
+      resource: {
+        id: deleteResourceId,
+        workingMemory: 'Learned from the deleted thread.',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
     await observerMemory.saveThread({
       thread: {
-        id: staleThreadId,
-        resourceId: staleResourceId,
+        id: deleteThreadId,
+        resourceId: deleteResourceId,
         title: '',
         metadata: {},
         createdAt,
         updatedAt: createdAt,
       },
     });
-    // Created while the observer did not manage working memory; the policy has since changed.
-    const record = await observerMemory.initializeObservationalMemory({
-      config: { _managedWorkingMemoryScope: null },
-      resourceId: staleResourceId,
+    // Written before the marker existed.
+    await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: deleteResourceId,
       scope: 'resource',
       threadId: null,
     });
-    await observerMemory.updateResourceFromObservationalMemory({
-      resourceId: staleResourceId,
-      workingMemory: 'FROM-DELETED-MSG',
-      guard: { recordId: record.id, threadId: null, resourceId: staleResourceId },
+    const receipts: Array<{ result: { clearedResourceWorkingMemory: boolean } }> = [];
+    await retractorMemory.deleteThread({
+      threadId: deleteThreadId,
+      managedWorkingMemoryScope: 'resource',
+      observationalMemoryRetractions: receipts as any,
     });
-    await expect(observerMemory.getObservationalMemory(null, staleResourceId)).resolves.toMatchObject({
-      config: expect.objectContaining({ _managedWorkingMemoryScope: 'resource' }),
-    });
-    await expect(
-      retractorMemory.retractObservationalMemory({ resourceId: staleResourceId, threadId: staleThreadId }),
-    ).resolves.toMatchObject({ clearedScopes: ['resource'], clearedResourceWorkingMemory: true });
-    await expect(retractorMemory.getResourceById({ resourceId: staleResourceId })).resolves.toMatchObject({
+    expect(receipts).toMatchObject([{ result: { clearedResourceWorkingMemory: true } }]);
+    await expect(retractorMemory.getResourceById({ resourceId: deleteResourceId })).resolves.toMatchObject({
       workingMemory: null,
     });
   });
