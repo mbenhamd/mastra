@@ -78,6 +78,12 @@ export function copyProcessorWorkflowTraits<TWorkflow extends object>(source: ob
   if (declaredPhases) {
     declaredProcessorWorkflowPhases.set(target, declaredPhases);
   }
+  // An Agent-built wrapper records its tool-result hook here rather than in its
+  // declared phases, so a clone without it would stop receiving tool results.
+  const processToolResult = (source as Partial<ProcessorWorkflow>).__processToolResult;
+  if (processToolResult !== undefined) {
+    (target as Partial<ProcessorWorkflow>).__processToolResult = processToolResult;
+  }
   // Some engine integrations intentionally clone into the base Workflow class.
   // Preserve the source's durable boundary without changing the clone's runtime
   // engine, which would otherwise make a phase-restricted clone look transient.

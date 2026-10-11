@@ -113,6 +113,23 @@ export function outputProcessorsSupportResult(outputProcessors: readonly Process
   return Boolean(outputProcessors?.some(outputProcessorSupportsResult));
 }
 
+/**
+ * Whether `runProcessToolResult` dispatches to this processor or workflow.
+ * Agent-built wrappers record the hook in `__processToolResult`, because their
+ * declared phases never list `toolResult`. Other workflows follow their declared
+ * phases, and an unannotated workflow accepts every phase.
+ */
+function outputProcessorSupportsToolResult(processorOrWorkflow: ProcessorOrWorkflow): boolean {
+  if (!isProcessorWorkflow(processorOrWorkflow)) return Boolean(processorOrWorkflow.processToolResult);
+  return processorOrWorkflow.__processToolResult ?? processorWorkflowSupportsPhase(processorOrWorkflow, 'toolResult');
+}
+
+export function outputProcessorsSupportToolResult(
+  outputProcessors: readonly ProcessorOrWorkflow[] | undefined,
+): boolean {
+  return Boolean(outputProcessors?.some(outputProcessorSupportsToolResult));
+}
+
 const measuredPromptRoles = ['user', 'assistant', 'tool', 'other'] as const;
 type MeasuredPromptRole = (typeof measuredPromptRoles)[number];
 const promptMeasurementEncoder = new TextEncoder();
@@ -2887,8 +2904,10 @@ export class ProcessorRunner {
 
       // Handle workflow as processor with toolResult phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
+        if (!outputProcessorSupportsToolResult(processorOrWorkflow)) continue;
+        const messagesBeforeWorkflow = [...processableMessages];
         const currentSystemMessages = messageList.getAllSystemMessages();
-        await this.executeWorkflowAsProcessor(
+        const workflowResult = await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
             phase: 'toolResult',
@@ -2911,6 +2930,21 @@ export class ProcessorRunner {
           writer,
           abortSignal,
         );
+        // Like a plain processor's returned array, returned messages replace the
+        // list. System messages are left alone: a plain processToolResult hook has no
+        // system-message result, and this workflow received tagged and untagged
+        // messages that replaceAllSystemMessages would fold into the untagged bucket.
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: { ...workflowResult, systemMessages: undefined },
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'response',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.all.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getAllSystemMessages(),
+        });
         continue;
       }
 

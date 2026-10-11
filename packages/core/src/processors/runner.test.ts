@@ -12,7 +12,7 @@ import { ChunkFrom } from '../stream/types';
 import * as utils from '../utils';
 import { createStep, createWorkflow } from '../workflows';
 import { setProcessorWorkflowPhases } from './is-processor-workflow';
-import { ProcessorRunner, ProcessorState } from './runner';
+import { ProcessorRunner, ProcessorState, outputProcessorsSupportToolResult } from './runner';
 import { ProcessorStepSchema } from './step-schema';
 import type { Processor, ProcessorWorkflow } from './index';
 
@@ -4460,6 +4460,124 @@ describe('ProcessorRunner', () => {
 
       expect(createRun).toHaveBeenCalledTimes(1);
       expect(start.mock.calls[0]?.[0].inputData).toMatchObject({ phase: 'outputResult' });
+    });
+
+    it('runs tool-result hooks only for workflows that declare or wrap them', async () => {
+      const workflowWithPhases = (id: string, phases: Parameters<typeof setProcessorWorkflowPhases>[1]) => {
+        const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+          status: 'success',
+          result: inputData,
+          steps: {},
+        }));
+        const createRun = vi.fn(async () => ({ start }));
+        const workflow = setProcessorWorkflowPhases(
+          {
+            id,
+            inputSchema: {},
+            outputSchema: {},
+            execute: () => undefined,
+            createRun,
+          } as unknown as ProcessorWorkflow,
+          phases,
+        );
+        return { workflow, createRun, start };
+      };
+      const resultOnly = workflowWithPhases('result-only-workflow', ['outputResult']);
+      // Agent-built wrappers declare only the five non-tool phases and record the hook separately.
+      const wrapper = workflowWithPhases('wrapped-tool-result-workflow', ['outputStream']);
+      wrapper.workflow.__processToolResult = true;
+
+      expect(outputProcessorsSupportToolResult([resultOnly.workflow])).toBe(false);
+      expect(outputProcessorsSupportToolResult([wrapper.workflow])).toBe(true);
+
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [resultOnly.workflow, wrapper.workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      await runner.runProcessToolResult({
+        steps: [],
+        messages: messageList.get.all.db(),
+        messageList,
+        stepNumber: 0,
+        toolName: 'lookup',
+        toolCallId: 'call-1',
+        toolArgs: {},
+        result: 'raw',
+      });
+
+      expect(resultOnly.createRun).not.toHaveBeenCalled();
+      expect(wrapper.createRun).toHaveBeenCalledTimes(1);
+      expect(wrapper.start.mock.calls[0]?.[0].inputData).toMatchObject({ phase: 'toolResult' });
+    });
+
+    it('applies the messages a tool-result workflow returns without mutating the message list', async () => {
+      messageList.add(
+        {
+          id: 'assistant-tool-call',
+          role: 'assistant',
+          createdAt: new Date(0),
+          content: {
+            format: 2,
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: { state: 'result', toolCallId: 'call-1', toolName: 'lookup', args: {}, result: 'raw' },
+              },
+            ],
+          },
+        },
+        'response',
+      );
+      const redactResult = (message: MastraDBMessage): MastraDBMessage => ({
+        ...message,
+        content: {
+          ...message.content,
+          parts: message.content.parts.map(part =>
+            part.type === 'tool-invocation' && part.toolInvocation.toolCallId === 'call-1'
+              ? { ...part, toolInvocation: { ...part.toolInvocation, state: 'result', result: 'REDACTED' } }
+              : part,
+          ),
+        },
+      });
+      const start = vi.fn(async ({ inputData }: { inputData: { messages: MastraDBMessage[] } }) => ({
+        status: 'success',
+        result: { phase: 'toolResult', messages: inputData.messages.map(redactResult) },
+        steps: {},
+      }));
+      const workflow = {
+        id: 'returning-tool-result-workflow',
+        inputSchema: {},
+        outputSchema: {},
+        execute: () => undefined,
+        createRun: vi.fn(async () => ({ start })),
+      } as unknown as ProcessorWorkflow;
+
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      await runner.runProcessToolResult({
+        steps: [],
+        messages: messageList.get.all.db(),
+        messageList,
+        stepNumber: 0,
+        toolName: 'lookup',
+        toolCallId: 'call-1',
+        toolArgs: {},
+        result: 'raw',
+      });
+
+      expect(start).toHaveBeenCalledTimes(1);
+      const toolResults = messageList.get.all
+        .db()
+        .flatMap(message => message.content.parts)
+        .flatMap(part => (part.type === 'tool-invocation' && part.toolInvocation.state === 'result' ? [part] : []))
+        .map(part => (part.toolInvocation as { result?: unknown }).result);
+      expect(toolResults).toEqual(['REDACTED']);
     });
 
     it('skips output-step history preparation for result-only workflows', async () => {

@@ -4,7 +4,11 @@ import { sanitizeToolName } from '../../../agent/message-list/utils/tool-name';
 import { TripWire } from '../../../agent/trip-wire';
 import { createObservabilityContext } from '../../../observability';
 import type { ProcessorState } from '../../../processors';
-import { ProcessorRunner, outputProcessorsSupportStream } from '../../../processors/runner';
+import {
+  ProcessorRunner,
+  outputProcessorsSupportStream,
+  outputProcessorsSupportToolResult,
+} from '../../../processors/runner';
 import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
@@ -48,9 +52,16 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
    * 1. Processors see tool-result chunks in processOutputStream
    * 2. Processor state (streamParts, customState) is shared across all chunks
    * 3. Blocking/tripwire works correctly for tool results
+   *
+   * The same runner also dispatches processToolResult, so it exists whenever any
+   * processor implements either hook. Chunks go through processPart only when a
+   * processor implements processOutputStream; a processor with only
+   * processToolResult must still run.
    */
+  const processorsSupportStream = outputProcessorsSupportStream(rest.outputProcessors);
+  const processorsSupportToolResult = outputProcessorsSupportToolResult(rest.outputProcessors);
   const processorRunner =
-    outputProcessorsSupportStream(rest.outputProcessors) && rest.logger
+    (processorsSupportStream || processorsSupportToolResult) && rest.logger
       ? new ProcessorRunner({
           inputProcessors: [],
           outputProcessors: rest.outputProcessors,
@@ -73,7 +84,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
     chunk: ChunkType<OUTPUT>,
     terminalResolutionState: { toolResultBlocked: boolean },
   ): Promise<ChunkType<OUTPUT> | null> {
-    if (processorRunner && rest.processorStates) {
+    if (processorRunner && processorsSupportStream && rest.processorStates) {
       const {
         part: processed,
         blocked,
@@ -160,7 +171,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
     stepNumber: number;
     steps: Array<StepResult<ToolSet>>;
   }): Promise<{ ok: true } | { ok: false; tripwire: TripWire }> {
-    if (!processorRunner || !rest.outputProcessors?.length) {
+    if (!processorRunner || !processorsSupportToolResult) {
       return { ok: true };
     }
     const { chunk, stepNumber, steps } = args;
