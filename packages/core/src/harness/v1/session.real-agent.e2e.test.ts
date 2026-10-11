@@ -2602,7 +2602,20 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
         },
       ],
     });
-    async function delegate(analysisSucceeds: boolean) {
+    const truthfulFailureReport = JSON.stringify({
+      outcome: 'failed',
+      summary: 'The analysis failed with a NameError.',
+      evidence: [
+        {
+          kind: 'tool-result',
+          toolName: 'runAnalysis',
+          status: 'error',
+          description: 'The analysis returned success false.',
+        },
+      ],
+      issue: { code: 'analysis_failed', message: 'NameError in the analysis code.', retryable: true },
+    });
+    async function delegate(analysisSucceeds: boolean, childReport = report) {
       const runAnalysis = createTool({
         id: 'runAnalysis',
         description: 'run the analysis',
@@ -2612,7 +2625,7 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
       });
       const childStreams = [
         toolCallStream('run-analysis', 'runAnalysis', '{}'),
-        toolCallStream('child-outcome', 'report_subagent_outcome', report),
+        toolCallStream('child-outcome', 'report_subagent_outcome', childReport),
       ];
       let childCalls = 0;
       const childAgent = new Agent({
@@ -2703,6 +2716,16 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
     expect(failed.subagentEnd).toMatchObject({
       isError: true,
       output: { status: 'error', error: { code: 'harness.subagent_evidence_unverified' } },
+    });
+
+    // A child that truthfully reports the failure is accepted.
+    const reportedFailure = await delegate(false, truthfulFailureReport);
+    expect(JSON.stringify(reportedFailure.subagentEnd)).not.toContain('harness.subagent_evidence_unverified');
+    expect(reportedFailure.subagentEnd).toMatchObject({
+      output: {
+        outcome: 'failed',
+        evidence: [{ kind: 'tool-result', toolName: 'runAnalysis', toolCallId: 'run-analysis', status: 'error' }],
+      },
     });
   });
 

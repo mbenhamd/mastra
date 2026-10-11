@@ -2073,6 +2073,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                   };
                 },
                 toModelOutput: mappingTool.toModelOutput,
+                resultStatus: (mappingTool as { resultStatus?: (output: unknown) => unknown }).resultStatus,
                 // Respect a custom idGenerator for the fallback appended message —
                 // parity with main, which reads generateId from its run scope.
                 generateId: mastra ? () => (mastra as Mastra).generateId() : undefined,
@@ -2169,7 +2170,11 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             ...typedInput,
             args: cleanedArgs,
             result: completedTask.result,
-            providerMetadata: backgroundResultMetadata(bgOutcome.taskId, 'completed'),
+            providerMetadata: withToolResultStatusProviderMetadata({
+              tool: tool as { resultStatus?: (output: unknown) => unknown },
+              result: completedTask.result,
+              providerMetadata: backgroundResultMetadata(bgOutcome.taskId, 'completed'),
+            }) as ProviderMetadata | undefined,
             // Fork (PF-4402): the authenticated grant must survive every awaited
             // outcome, not just a fresh `started` dispatch. A resumed/restarted/
             // reattached leg that completes here still needs the grant on this

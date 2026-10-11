@@ -2,6 +2,7 @@ import type { MessageList } from '../../../agent/message-list';
 import type { IMastraLogger } from '../../../logger';
 import type { ProviderMetadata } from '../../../stream/types';
 import { normalizeModelOutput } from '../normalize-model-output';
+import { withToolResultStatusProviderMetadata } from './tool-result-commit-core';
 
 /** Completion payload delivered by the background-task manager's onResult hook. */
 export interface BackgroundToolResultParams {
@@ -73,6 +74,8 @@ export async function applyBackgroundToolResult(deps: {
     providerMetadata: ProviderMetadata | undefined;
   }>;
   toModelOutput?: (output: unknown) => unknown;
+  /** The tool's own classification of a returned output (`ToolAction.resultStatus`). */
+  resultStatus?: (output: unknown) => unknown;
   generateId?: () => string;
   logger?: IMastraLogger;
   /** Engine-specific memory flush (save-queue wiring differs per engine). */
@@ -135,7 +138,7 @@ export async function applyBackgroundToolResult(deps: {
       modelOutput = null;
     }
   }
-  const providerMetadata = {
+  const completionMetadata = {
     ...transformed.providerMetadata,
     mastra: {
       ...(transformed.providerMetadata as any)?.mastra,
@@ -143,6 +146,15 @@ export async function applyBackgroundToolResult(deps: {
       backgroundTask: { taskId: params.taskId, status: failed ? 'failed' : 'completed' },
     },
   } as ProviderMetadata;
+  const providerMetadata = (
+    failed
+      ? completionMetadata
+      : withToolResultStatusProviderMetadata({
+          tool: { resultStatus: deps.resultStatus },
+          result,
+          providerMetadata: completionMetadata as Record<string, unknown>,
+        })
+  ) as ProviderMetadata;
 
   const updated = messageList.updateToolInvocation(
     {

@@ -2393,6 +2393,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                     },
                     toModelOutput: (resolvedTool as { toModelOutput?: (output: unknown) => unknown } | undefined)
                       ?.toModelOutput,
+                    resultStatus: (resolvedTool as { resultStatus?: (output: unknown) => unknown } | undefined)
+                      ?.resultStatus,
                     generateId: readScoped(scopeCtx, GENERATE_ID_KEY, 'generateId'),
                     logger,
                     flush: async () => {

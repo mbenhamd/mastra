@@ -904,7 +904,10 @@ export interface ToolAction<
    * `'error'` when the tool reported a failure as data (for example
    * `{ success: false }`) instead of throwing. It receives the recorded,
    * serialization-safe output. Only the receipt changes: the model, the
-   * stream, and the transcript still see the returned output.
+   * stream, and the transcript still see the returned output. It applies to
+   * tools Mastra executes, including background completions; a
+   * provider-executed tool's result comes from the provider and is not
+   * classified.
    */
   resultStatus?: (output: TSchemaOut) => ToolResultStatus;
 }

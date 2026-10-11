@@ -122,4 +122,63 @@ describeForAllEngines('AIMock loop scenario: tool result status', engine => {
       expect(payload.providerMetadata?.mastra?.resultStatus).toBeUndefined();
     }
   });
+
+  it('never classifies a deferred background dispatch placeholder', async () => {
+    const classified: unknown[] = [];
+    let release!: () => void;
+    const released = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const analysisTool = createTool({
+      id: 'run_deferred_analysis',
+      description: 'Run an analysis in the background.',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ success: z.boolean(), stderr: z.string() }),
+      background: { enabled: true, timeoutMs: 5000 },
+      resultStatus: output => {
+        classified.push(output);
+        return output.success ? 'success' : 'error';
+      },
+      execute: async () => {
+        // Held until the dispatch turn has streamed its placeholder.
+        await released;
+        return { success: false, stderr: 'NameError: total' };
+      },
+    });
+
+    const { chunks } = await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Run the deferred analysis.',
+      tools: { run_deferred_analysis: analysisTool },
+      agentBackgroundTasks: { tools: { run_deferred_analysis: true } },
+      backgroundTasks: { enabled: true },
+      stopWhen: stepCountIs(3),
+      collectChunks: true,
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 0 },
+          { toolCalls: [{ id: 'call_deferred_analysis', name: 'run_deferred_analysis', arguments: {} }] },
+        );
+        llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: 'Deferred analysis dispatched.' });
+      },
+    });
+    release();
+
+    const placeholders = (chunks ?? []).filter(
+      chunk =>
+        chunk.type === 'tool-result' &&
+        (chunk.payload as { providerMetadata?: { mastra?: { backgroundTask?: { status?: unknown } } } })
+          .providerMetadata?.mastra?.backgroundTask?.status === 'running',
+    );
+    expect(chunks?.some(chunk => chunk.type === 'background-task-started')).toBe(true);
+    for (const chunk of placeholders) {
+      expect(
+        (chunk.payload as { providerMetadata?: { mastra?: { resultStatus?: unknown } } }).providerMetadata?.mastra
+          ?.resultStatus,
+      ).toBeUndefined();
+    }
+    // The classifier only ever saw real tool outputs, never the placeholder text.
+    expect(classified.every(output => typeof output === 'object' && output !== null)).toBe(true);
+  });
 });

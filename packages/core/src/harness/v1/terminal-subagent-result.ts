@@ -285,7 +285,16 @@ function normalizeToolReceipt(value: unknown): HarnessSubagentToolReceipt | unde
       : typeof payload?.isError === 'boolean'
         ? payload.isError
         : false;
-  return { toolCallId, toolName, status: explicitStatus ?? (isError ? 'error' : 'success') };
+  // A tool's own classification of a returned failure (`ToolAction.resultStatus`)
+  // marks the call failed here too, so fallback tool results agree with the
+  // framework receipt for the same call.
+  const providerMetadata = isRecord(value.providerMetadata)
+    ? value.providerMetadata
+    : isRecord(payload?.providerMetadata)
+      ? payload.providerMetadata
+      : undefined;
+  const classifiedError = isRecord(providerMetadata?.mastra) && providerMetadata.mastra.resultStatus === 'error';
+  return { toolCallId, toolName, status: explicitStatus ?? (isError || classifiedError ? 'error' : 'success') };
 }
 
 function collectToolReceipts(value: unknown): {
