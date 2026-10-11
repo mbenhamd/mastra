@@ -106,3 +106,59 @@ export function tryFormatTerminalToolResultForModel(value: unknown): string | un
     return undefined;
   }
 }
+
+type TerminalToolResultPart = { type: 'data-terminal-tool-result'; id: string; data: unknown };
+type ResponseMessagesSource = {
+  get: { response: { db(): Array<{ content?: unknown }> } };
+};
+
+function responseTerminalToolResultParts(messageList: ResponseMessagesSource): TerminalToolResultPart[] {
+  return messageList.get.response.db().flatMap(message => {
+    const parts = (message.content as { parts?: unknown } | undefined)?.parts;
+    return Array.isArray(parts)
+      ? (parts.filter(
+          part =>
+            part !== null &&
+            typeof part === 'object' &&
+            (part as { type?: unknown }).type === 'data-terminal-tool-result',
+        ) as TerminalToolResultPart[])
+      : [];
+  });
+}
+
+/**
+ * Count the terminal tool-result parts in the response, by part id. Take this
+ * snapshot before final output processors run, so the retention check can
+ * tell an earlier run's terminal part (recalled history a signal boundary
+ * promoted into the response) from one a processor introduced.
+ */
+export function countResponseTerminalToolResultParts(messageList: ResponseMessagesSource): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const part of responseTerminalToolResultParts(messageList)) {
+    counts.set(String(part.id), (counts.get(String(part.id)) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * Find this run's terminal part after the final output processors ran. The
+ * part is matched by its framework id, not by the id of the message carrying
+ * it, because a processor may re-identify that message (for example a memory
+ * processor that stamps a deterministic storage id). Exactly one part with
+ * `terminalPartId` must remain, and no other terminal part may appear or
+ * multiply beyond the snapshot taken before the processors ran.
+ */
+export function findRetainedTerminalToolResultPart(
+  messageList: ResponseMessagesSource,
+  terminalPartId: string,
+  beforeProcessors: ReadonlyMap<string, number>,
+): TerminalToolResultPart | undefined {
+  const parts = responseTerminalToolResultParts(messageList);
+  const retained = parts.filter(part => part.id === terminalPartId);
+  if (retained.length !== 1) return undefined;
+  const after = countResponseTerminalToolResultParts(messageList);
+  for (const [id, count] of after) {
+    if (id !== terminalPartId && count > (beforeProcessors.get(id) ?? 0)) return undefined;
+  }
+  return retained[0];
+}

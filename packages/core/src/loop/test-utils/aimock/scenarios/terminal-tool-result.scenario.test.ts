@@ -351,6 +351,230 @@ describeForAllEngines('AIMock loop scenario: terminal tool result', engine => {
     });
   });
 
+  it('delivers the terminal result when final-turn MessageHistory re-identifies the response message', async () => {
+    // A memory processor may stamp a deterministic storage id on the assistant
+    // response before it persists the turn. The terminal part keeps its
+    // framework id, so the terminal commit must still find it.
+    const storage = new InMemoryStore();
+    const memory = new MockMemory({ storage, enableMessageHistory: false });
+    const memoryStore = await storage.getStore('memory');
+    const stampedId = `stamped-assistant-${engine}`;
+    class StampingMessageHistory extends MessageHistory {
+      override async processOutputResult(args: Parameters<MessageHistory['processOutputResult']>[0]) {
+        const assistant = args.messageList.get.response.db().findLast(message => message.role === 'assistant');
+        if (assistant) assistant.id = stampedId;
+        return super.processOutputResult(args);
+      }
+    }
+    const stampingHistory = new StampingMessageHistory({
+      storage: memoryStore!,
+      persistence: { mode: 'final-turn' },
+    });
+    const threadId = `terminal-restamped-thread-${engine}`;
+    const resourceId = `terminal-restamped-resource-${engine}`;
+    const answerTool = createTool({
+      id: 'restamped_answer_tool',
+      description: 'Return the complete answer.',
+      inputSchema: z.object({}),
+      terminalResult: {
+        isSuccess: () => true,
+        project: () => ({ text: 'Answer under a stamped message id.' }),
+        outputSchema: z.object({ text: z.string() }),
+      },
+      execute: async () => ({ ok: true }),
+    });
+
+    const { output, chunks } = await runLoopScenario({
+      llm: getMock(),
+      prompt: 'Return the stamped answer.',
+      tools: { restamped_answer_tool: answerTool },
+      engine,
+      memory,
+      threadId,
+      resourceId,
+      outputProcessors: [stampingHistory],
+      collectChunks: true,
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', hasToolResult: false },
+          { toolCalls: [{ id: 'call-restamped', name: 'restamped_answer_tool', arguments: {} }] },
+        );
+      },
+    });
+
+    expect(output.error).toBeUndefined();
+    expect(output.terminalToolResult?.items[0]?.value).toEqual({ text: 'Answer under a stamped message id.' });
+    expect(chunks?.some(chunk => chunk.type === 'data-terminal-tool-result')).toBe(true);
+    const recalled = await memory.recall({ threadId, resourceId, perPage: false });
+    const stamped = recalled.messages.find(message => message.id === stampedId);
+    expect(stamped?.content.parts.filter(part => part.type === 'data-terminal-tool-result')).toEqual([
+      expect.objectContaining({ data: output.terminalToolResult }),
+    ]);
+  });
+
+  it('delivers a new terminal result when a signal boundary keeps an earlier terminal answer in the response', async () => {
+    // A processor signal seals the response boundary, which promotes the
+    // recalled assistant message, with the previous run's terminal part, into
+    // the response set. Only this run's terminal part is checked.
+    const storage = new InMemoryStore();
+    const memory = new MockMemory({ storage, enableMessageHistory: false });
+    const memoryStore = await storage.getStore('memory');
+    const history = new MessageHistory({ storage: memoryStore!, persistence: { mode: 'final-turn' } });
+    const threadId = `terminal-signal-boundary-thread-${engine}`;
+    const resourceId = `terminal-signal-boundary-resource-${engine}`;
+    let answer = 'First terminal answer.';
+    const answerTool = createTool({
+      id: 'signal_boundary_answer_tool',
+      description: 'Return the complete answer.',
+      inputSchema: z.object({}),
+      terminalResult: {
+        isSuccess: () => true,
+        project: () => ({ text: answer }),
+        outputSchema: z.object({ text: z.string() }),
+      },
+      execute: async () => ({ ok: true }),
+    });
+    const fixtures = (llm: Parameters<NonNullable<Parameters<typeof runLoopScenario>[0]['fixtures']>>[0]) => {
+      llm.on(
+        { endpoint: 'chat', hasToolResult: false },
+        { toolCalls: [{ id: 'call-signal-boundary', name: 'signal_boundary_answer_tool', arguments: {} }] },
+      );
+    };
+
+    const first = await runLoopScenario({
+      llm: getMock(),
+      prompt: 'Return the first answer.',
+      tools: { signal_boundary_answer_tool: answerTool },
+      engine,
+      memory,
+      threadId,
+      resourceId,
+      outputProcessors: [history],
+      fixtures,
+    });
+    expect(first.output.error).toBeUndefined();
+    getMock().clearFixtures();
+    getMock().clearRequests();
+    getMock().resetMatchCounts();
+
+    answer = 'Second terminal answer.';
+    const signalOnce = {
+      id: 'signal-once',
+      processInputStep: async ({
+        stepNumber,
+        sendSignal,
+      }: {
+        stepNumber: number;
+        sendSignal: (input: { type: 'system-reminder'; contents: string }) => Promise<unknown>;
+      }) => {
+        if (stepNumber === 0) await sendSignal({ type: 'system-reminder', contents: 'Answer again.' });
+      },
+    };
+    const second = await runLoopScenario({
+      llm: getMock(),
+      prompt: 'Return the second answer.',
+      tools: { signal_boundary_answer_tool: answerTool },
+      engine,
+      memory,
+      threadId,
+      resourceId,
+      inputProcessors: [history, signalOnce],
+      outputProcessors: [history],
+      fixtures,
+    });
+
+    expect(second.output.error).toBeUndefined();
+    expect(second.output.terminalToolResult?.items[0]?.value).toEqual({ text: 'Second terminal answer.' });
+  });
+
+  it('still rejects a final output processor that drops the terminal result', async () => {
+    const answerTool = createTool({
+      id: 'dropped_answer_tool',
+      description: 'Return the complete answer.',
+      inputSchema: z.object({}),
+      terminalResult: {
+        isSuccess: () => true,
+        project: () => ({ text: 'This answer is dropped.' }),
+        outputSchema: z.object({ text: z.string() }),
+      },
+      execute: async () => ({ ok: true }),
+    });
+    const droppingProcessor = {
+      id: 'drop-terminal-part',
+      terminalToolResultPolicy: 'pass-through' as const,
+      processOutputResult: async ({ messageList }: { messageList: import('../../../../agent').MessageList }) => {
+        for (const message of messageList.get.response.db()) {
+          if (typeof message.content === 'object' && Array.isArray(message.content.parts)) {
+            message.content.parts = message.content.parts.filter(part => part.type !== 'data-terminal-tool-result');
+          }
+        }
+        return messageList;
+      },
+    };
+
+    const { output } = await runLoopScenario({
+      llm: getMock(),
+      prompt: 'Return the dropped answer.',
+      tools: { dropped_answer_tool: answerTool },
+      engine,
+      outputProcessors: [droppingProcessor],
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', hasToolResult: false },
+          { toolCalls: [{ id: 'call-dropped', name: 'dropped_answer_tool', arguments: {} }] },
+        );
+      },
+    });
+
+    expect(output.terminalToolResult).toBeUndefined();
+    expect(output.error?.message ?? '').toMatch(/did not retain exactly one/);
+  });
+
+  it('still rejects a final output processor that adds a terminal part under another id', async () => {
+    const answerTool = createTool({
+      id: 'copied_answer_tool',
+      description: 'Return the complete answer.',
+      inputSchema: z.object({}),
+      terminalResult: {
+        isSuccess: () => true,
+        project: () => ({ text: 'This answer is copied.' }),
+        outputSchema: z.object({ text: z.string() }),
+      },
+      execute: async () => ({ ok: true }),
+    });
+    const copyingProcessor = {
+      id: 'copy-terminal-part',
+      terminalToolResultPolicy: 'pass-through' as const,
+      processOutputResult: async ({ messageList }: { messageList: import('../../../../agent').MessageList }) => {
+        for (const message of messageList.get.response.db()) {
+          if (typeof message.content !== 'object' || !Array.isArray(message.content.parts)) continue;
+          const terminal = message.content.parts.find(part => part.type === 'data-terminal-tool-result');
+          if (terminal && 'id' in terminal) {
+            message.content.parts.push({ ...structuredClone(terminal), id: `${terminal.id}:copy` });
+          }
+        }
+        return messageList;
+      },
+    };
+
+    const { output } = await runLoopScenario({
+      llm: getMock(),
+      prompt: 'Return the copied answer.',
+      tools: { copied_answer_tool: answerTool },
+      engine,
+      outputProcessors: [copyingProcessor],
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', hasToolResult: false },
+          { toolCalls: [{ id: 'call-copied', name: 'copied_answer_tool', arguments: {} }] },
+        );
+      },
+    });
+
+    expect(output.terminalToolResult).toBeUndefined();
+    expect(output.error?.message ?? '').toMatch(/did not retain exactly one/);
+  });
+
   it('recalls the terminal answer exactly once in the next provider request', async () => {
     const storage = new InMemoryStore();
     const memory = new MockMemory({ storage, enableMessageHistory: false });

@@ -9,7 +9,12 @@ import type { OutputResult } from '../../../processors';
 import { ProcessorRunner } from '../../../processors/runner';
 import { RequestContext } from '../../../request-context';
 import type { Agent } from '../../agent';
-import { convertMessages, coreContentToString, MessageList } from '../../message-list';
+import {
+  convertMessages,
+  coreContentToString,
+  countResponseTerminalToolResultParts,
+  MessageList,
+} from '../../message-list';
 import type { SerializedMessageListState } from '../../message-list/state';
 import { getBoundRunRegistryEntry } from '../run-registry';
 import { assertTerminalToolResultRetained } from '../stream-adapter';
@@ -153,6 +158,12 @@ export async function runDurableFinishSideEffects({
     );
   }
 
+  // Snapshot the terminal parts before final output processors run, so the
+  // retention check can tell recalled history from a processor's addition.
+  const terminalPartsBeforeProcessors = terminalEnvelope
+    ? countResponseTerminalToolResultParts(messageList)
+    : undefined;
+
   // Keep this MessageList for every later phase. ProcessorRunner applies
   // returned message arrays back onto it, including removals and replacements.
   if (registryEntry?.outputProcessors?.length) {
@@ -189,7 +200,7 @@ export async function runDurableFinishSideEffects({
     }
   }
   if (terminalEnvelope && messageId) {
-    assertTerminalToolResultRetained(messageList, messageId, terminalEnvelope);
+    assertTerminalToolResultRetained(messageList, terminalEnvelope, terminalPartsBeforeProcessors!);
   }
 
   // SaveQueueManager may reclassify flushed response messages as persisted

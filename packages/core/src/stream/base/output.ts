@@ -1,6 +1,11 @@
 import { EventEmitter } from 'node:events';
 import { ReadableStream, TransformStream } from 'node:stream/web';
-import { createTerminalToolResultPartId, materializeTerminalToolResult } from '../../agent/message-list';
+import {
+  countResponseTerminalToolResultParts,
+  createTerminalToolResultPartId,
+  findRetainedTerminalToolResultPart,
+  materializeTerminalToolResult,
+} from '../../agent/message-list';
 import type { MessageList, MastraDBMessage } from '../../agent/message-list';
 import { TripWire } from '../../agent/trip-wire';
 import { MastraBase } from '../../base';
@@ -1147,6 +1152,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 | undefined;
               let terminalMessageListReference: MessageList | undefined;
               let terminalProcessorStateSnapshots: ReturnType<ProcessorRunner['snapshotProcessorStates']> | undefined;
+              let terminalPartsBeforeProcessors: Map<string, number> | undefined;
               let terminalResponseSnapshot: LLMStepResult<OUTPUT>['response'] | undefined;
               let terminalChunkResponseSnapshot: LLMStepResult<OUTPUT>['response'] | undefined;
               let terminalChunkHadResponse = false;
@@ -1279,6 +1285,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
                   if (terminalCommit) {
                     terminalProcessorStateSnapshots = self.processorRunner.snapshotProcessorStates();
+                    terminalPartsBeforeProcessors = countResponseTerminalToolResultParts(self.messageList);
                   }
 
                   // Create a writer from the controller so processOutputResult can emit custom chunks.
@@ -1412,24 +1419,17 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 // text here - let the outer MastraModelOutput handle it
 
                 if (terminalCommit) {
-                  const persistedParts = self.messageList.get.response
-                    .db()
-                    .flatMap(message =>
-                      message.id === terminalCommit.stepFinishChunk.payload.messageId &&
-                      typeof message.content === 'object' &&
-                      Array.isArray(message.content.parts)
-                        ? message.content.parts.filter(
-                            part =>
-                              part.type === 'data-terminal-tool-result' &&
-                              'id' in part &&
-                              part.id === terminalCommit.dataChunk.id,
-                          )
-                        : [],
-                    );
-                  if (persistedParts.length !== 1) {
+                  // Matched by the framework part id across the response, not by the
+                  // id of the message carrying it (see findRetainedTerminalToolResultPart).
+                  const retainedPart = findRetainedTerminalToolResultPart(
+                    self.messageList,
+                    terminalCommit.dataChunk.id,
+                    terminalPartsBeforeProcessors ?? countResponseTerminalToolResultParts(self.messageList),
+                  );
+                  if (retainedPart === undefined) {
                     throw new TypeError('Final output processors did not retain exactly one terminal tool result');
                   }
-                  const persistedTerminal = terminalSignature((persistedParts[0] as { data?: unknown }).data);
+                  const persistedTerminal = terminalSignature(retainedPart.data);
                   if (persistedTerminal.signature !== terminalSignature(terminalCommit.data).signature) {
                     throw new TypeError('Final output processors changed the terminal tool result');
                   }
