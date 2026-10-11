@@ -153,7 +153,7 @@ export class StepContentExtractor {
   /**
    * Convert UI message parts to step content
    */
-  private static convertPartsToContent(
+  static convertPartsToContent(
     parts: AIV5Type.UIMessage['parts'],
     stepId: string,
     stepContentFn: (message?: AIV5Type.ModelMessage) => AIV5Type.StepResult<any>['content'],
