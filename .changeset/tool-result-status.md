@@ -2,11 +2,11 @@
 '@mastra/core': patch
 ---
 
-A tool can now tell the framework that an output it returned is a failure. Add `resultStatus` to `createTool`. It receives the returned output and answers `'success'` or `'error'`.
+Tools can now mark a returned failure as a failed call. Set `resultStatus` on `createTool` to classify each returned output as `'success'` or `'error'`.
 
-This is for tools that return a failure as data, such as `{ success: false, stderr }`, so the model can read the error and try again. Before, Harness v1 recorded every returned output as a successful tool call. A subagent could then report `completed` and cite that call as successful evidence, and the outcome check accepted it.
+Use it when a tool returns errors as data, so the model can read them and retry. The model, the stream and the transcript still receive the output unchanged.
 
-With `resultStatus`, the tool-result chunk carries `providerMetadata.mastra.resultStatus: 'error'` and the Harness tool-call receipt records the call as failed. A `report_subagent_outcome` that claims success for that call is now rejected with `harness.subagent_evidence_unverified`. The model, the stream, the transcript and the `tool_end` event still get the returned output unchanged. The classifier receives the recorded output, the serialization-safe value the stream and transcript carry, on every engine and for awaited background completions; a background dispatch placeholder is never classified. A provider-executed tool's result comes from the provider and is not classified. A truthful `failed` or `blocked` report that cites the call with `status: 'error'` is accepted. A classifier that throws records the call as failed, and the tool-surface fence protects `resultStatus` like the tool's other executable policies. Tools without `resultStatus` behave as before and keep their recovery fingerprints.
+Harness v1 records a call classified as `'error'` as failed. A subagent can no longer report `completed` and cite that call as successful evidence. A truthful `failed` or `blocked` report is still accepted.
 
 ```ts
 const runAnalysis = createTool({

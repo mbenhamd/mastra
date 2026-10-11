@@ -1,8 +1,9 @@
 import { stepCountIs } from '@internal/ai-sdk-v5';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { createTool } from '../../../../tools';
 import { describeForAllEngines, runLoopScenario, useLoopScenarioAimock } from '../aimock-scenario';
+import { isDurableEngineVariant } from '../types';
 
 /**
  * A tool can return a failure as data so the model reads and fixes it.
@@ -164,6 +165,8 @@ describeForAllEngines('AIMock loop scenario: tool result status', engine => {
       },
     });
     release();
+    // The released task completes and is classified on its real output.
+    await vi.waitFor(() => expect(classified.length).toBeGreaterThan(0), { timeout: 5_000 });
 
     const placeholders = (chunks ?? []).filter(
       chunk =>
@@ -172,6 +175,8 @@ describeForAllEngines('AIMock loop scenario: tool result status', engine => {
           .providerMetadata?.mastra?.backgroundTask?.status === 'running',
     );
     expect(chunks?.some(chunk => chunk.type === 'background-task-started')).toBe(true);
+    // The in-process engines stream the dispatch placeholder as a tool-result.
+    if (!isDurableEngineVariant(engine)) expect(placeholders.length).toBeGreaterThan(0);
     for (const chunk of placeholders) {
       expect(
         (chunk.payload as { providerMetadata?: { mastra?: { resultStatus?: unknown } } }).providerMetadata?.mastra
@@ -180,5 +185,38 @@ describeForAllEngines('AIMock loop scenario: tool result status', engine => {
     }
     // The classifier only ever saw real tool outputs, never the placeholder text.
     expect(classified.every(output => typeof output === 'object' && output !== null)).toBe(true);
+  });
+
+  it('classifies a tool the model called by its id rather than its registration key', async () => {
+    const analysisTool = createTool({
+      id: 'run_keyed_analysis',
+      description: 'Run an analysis.',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ success: z.boolean(), stderr: z.string() }),
+      resultStatus: output => (output.success ? 'success' : 'error'),
+      execute: async () => ({ success: false, stderr: 'NameError: total' }),
+    });
+
+    const { chunks } = await runLoopScenario({
+      llm: getMock(),
+      prompt: 'Run the keyed analysis.',
+      tools: { analysisUnderAnotherKey: analysisTool },
+      stopWhen: stepCountIs(3),
+      engine,
+      collectChunks: true,
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', hasToolResult: false },
+          { toolCalls: [{ id: 'call_keyed', name: 'run_keyed_analysis', arguments: {} }] },
+        );
+        llm.on({ endpoint: 'chat', toolCallId: 'call_keyed', hasToolResult: true }, { content: 'Handled.' });
+      },
+    });
+
+    const result = chunks?.find(chunk => chunk.type === 'tool-result')?.payload as
+      | { result?: { success?: unknown }; providerMetadata?: { mastra?: { resultStatus?: unknown } } }
+      | undefined;
+    expect(result?.result?.success).toBe(false);
+    expect(result?.providerMetadata?.mastra?.resultStatus).toBe('error');
   });
 });

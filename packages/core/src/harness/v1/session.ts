@@ -8307,7 +8307,7 @@ export class Session {
           toolName?: string;
           result: unknown;
           isError?: boolean;
-          providerMetadata?: { mastra?: { resultStatus?: unknown } };
+          providerMetadata?: { mastra?: { resultStatus?: unknown; backgroundTask?: { status?: unknown } } };
         };
         // §10.4: the resume segment replays the approved tool's `tool-result`
         // WITHOUT a preceding `tool-call` in this segment, so `_activeTools` (seeded
@@ -8325,16 +8325,20 @@ export class Session {
         if (runId !== undefined) {
           // A tool may classify a failure it returned as data
           // (`ToolAction.resultStatus`); the receipt records it as failed so
-          // subagent evidence cannot claim success for it. The tool_end event
-          // keeps the returned output and its own isError unchanged.
-          this._recordRunToolReceipt(runId, {
-            toolCallId: payload.toolCallId,
-            toolName,
-            status:
-              payload.isError === true || payload.providerMetadata?.mastra?.resultStatus === 'error'
-                ? 'error'
-                : 'success',
-          });
+          // subagent evidence cannot claim success for it. A running background
+          // placeholder is not the tool's result and records no receipt; the
+          // completion does. The tool_end event keeps the returned output and
+          // its own isError unchanged.
+          if (payload.providerMetadata?.mastra?.backgroundTask?.status !== 'running') {
+            this._recordRunToolReceipt(runId, {
+              toolCallId: payload.toolCallId,
+              toolName,
+              status:
+                payload.isError === true || payload.providerMetadata?.mastra?.resultStatus === 'error'
+                  ? 'error'
+                  : 'success',
+            });
+          }
           // Project `output` at emit so live === replay (§10.2). Shared/aliased
           // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.
           this._emitTurnEvent({

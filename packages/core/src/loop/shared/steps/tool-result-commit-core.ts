@@ -105,10 +105,17 @@ export function withToolResultStatusProviderMetadata(deps: {
   const classify = deps.tool?.resultStatus;
   if (typeof classify !== 'function') return deps.providerMetadata;
   const existingMastra = (deps.providerMetadata as { mastra?: Record<string, unknown> } | undefined)?.mastra;
+  // Reclassifying replaces an earlier classification (for example of the
+  // pre-processor result), so drop it first.
+  const { resultStatus: _previous, ...mastraWithoutStatus } = existingMastra ?? {};
+  const unclassified =
+    existingMastra === undefined || !('resultStatus' in existingMastra)
+      ? deps.providerMetadata
+      : { ...deps.providerMetadata, mastra: mastraWithoutStatus };
   // A background dispatch placeholder is not the tool's output; its completion
   // is classified when the real result arrives.
   if ((existingMastra?.backgroundTask as { status?: unknown } | undefined)?.status === 'running') {
-    return deps.providerMetadata;
+    return unclassified;
   }
   let status: unknown;
   try {
@@ -116,8 +123,8 @@ export function withToolResultStatusProviderMetadata(deps: {
   } catch {
     status = 'error';
   }
-  if (status === 'success') return deps.providerMetadata;
-  return { ...deps.providerMetadata, mastra: { ...existingMastra, resultStatus: 'error' } };
+  if (status === 'success') return unclassified;
+  return { ...unclassified, mastra: { ...mastraWithoutStatus, resultStatus: 'error' } };
 }
 
 /** Resolved terminal state for one tool call, as recorded to the transcript. */
