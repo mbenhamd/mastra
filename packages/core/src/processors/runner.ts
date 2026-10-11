@@ -114,13 +114,14 @@ export function outputProcessorsSupportResult(outputProcessors: readonly Process
 }
 
 /**
- * `runProcessToolResult` dispatches to every processor workflow, so a workflow
- * counts unless its wrapper recorded that none of its processors implement the hook.
+ * Whether `runProcessToolResult` dispatches to this processor or workflow.
+ * Agent-built wrappers record the hook in `__processToolResult`, because their
+ * declared phases never list `toolResult`. Other workflows follow their declared
+ * phases, and an unannotated workflow accepts every phase.
  */
 function outputProcessorSupportsToolResult(processorOrWorkflow: ProcessorOrWorkflow): boolean {
-  return isProcessorWorkflow(processorOrWorkflow)
-    ? processorOrWorkflow.__processToolResult !== false
-    : Boolean(processorOrWorkflow.processToolResult);
+  if (!isProcessorWorkflow(processorOrWorkflow)) return Boolean(processorOrWorkflow.processToolResult);
+  return processorOrWorkflow.__processToolResult ?? processorWorkflowSupportsPhase(processorOrWorkflow, 'toolResult');
 }
 
 export function outputProcessorsSupportToolResult(
@@ -2903,6 +2904,7 @@ export class ProcessorRunner {
 
       // Handle workflow as processor with toolResult phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
+        if (!outputProcessorSupportsToolResult(processorOrWorkflow)) continue;
         const currentSystemMessages = messageList.getAllSystemMessages();
         await this.executeWorkflowAsProcessor(
           processorOrWorkflow,

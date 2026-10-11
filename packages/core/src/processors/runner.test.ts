@@ -12,7 +12,7 @@ import { ChunkFrom } from '../stream/types';
 import * as utils from '../utils';
 import { createStep, createWorkflow } from '../workflows';
 import { setProcessorWorkflowPhases } from './is-processor-workflow';
-import { ProcessorRunner, ProcessorState } from './runner';
+import { ProcessorRunner, ProcessorState, outputProcessorsSupportToolResult } from './runner';
 import { ProcessorStepSchema } from './step-schema';
 import type { Processor, ProcessorWorkflow } from './index';
 
@@ -4460,6 +4460,56 @@ describe('ProcessorRunner', () => {
 
       expect(createRun).toHaveBeenCalledTimes(1);
       expect(start.mock.calls[0]?.[0].inputData).toMatchObject({ phase: 'outputResult' });
+    });
+
+    it('runs tool-result hooks only for workflows that declare or wrap them', async () => {
+      const workflowWithPhases = (id: string, phases: Parameters<typeof setProcessorWorkflowPhases>[1]) => {
+        const start = vi.fn(async ({ inputData }: { inputData: Record<string, unknown> }) => ({
+          status: 'success',
+          result: inputData,
+          steps: {},
+        }));
+        const createRun = vi.fn(async () => ({ start }));
+        const workflow = setProcessorWorkflowPhases(
+          {
+            id,
+            inputSchema: {},
+            outputSchema: {},
+            execute: () => undefined,
+            createRun,
+          } as unknown as ProcessorWorkflow,
+          phases,
+        );
+        return { workflow, createRun, start };
+      };
+      const resultOnly = workflowWithPhases('result-only-workflow', ['outputResult']);
+      // Agent-built wrappers declare only the five non-tool phases and record the hook separately.
+      const wrapper = workflowWithPhases('wrapped-tool-result-workflow', ['outputStream']);
+      wrapper.workflow.__processToolResult = true;
+
+      expect(outputProcessorsSupportToolResult([resultOnly.workflow])).toBe(false);
+      expect(outputProcessorsSupportToolResult([wrapper.workflow])).toBe(true);
+
+      runner = new ProcessorRunner({
+        inputProcessors: [],
+        outputProcessors: [resultOnly.workflow, wrapper.workflow],
+        logger: mockLogger,
+        agentName: 'test-agent',
+      });
+      await runner.runProcessToolResult({
+        steps: [],
+        messages: messageList.get.all.db(),
+        messageList,
+        stepNumber: 0,
+        toolName: 'lookup',
+        toolCallId: 'call-1',
+        toolArgs: {},
+        result: 'raw',
+      });
+
+      expect(resultOnly.createRun).not.toHaveBeenCalled();
+      expect(wrapper.createRun).toHaveBeenCalledTimes(1);
+      expect(wrapper.start.mock.calls[0]?.[0].inputData).toMatchObject({ phase: 'toolResult' });
     });
 
     it('skips output-step history preparation for result-only workflows', async () => {
