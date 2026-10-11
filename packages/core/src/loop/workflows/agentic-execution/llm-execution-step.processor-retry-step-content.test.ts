@@ -475,6 +475,62 @@ describe('PF-5364 step content after a processor retry', () => {
     expect(iterationTexts.at(-1)).toBe('FINAL ANSWER');
   });
 
+  it('reads a repeated answer after a processor kept only the latest step of the message', async () => {
+    const itemText = (delta: string, itemId: string) => [
+      { type: 'text-start', id: itemId, providerMetadata: { openai: { itemId } } },
+      { type: 'text-delta', id: itemId, delta, providerMetadata: { openai: { itemId } } },
+      { type: 'text-end', id: itemId, providerMetadata: { openai: { itemId } } },
+    ];
+    const { model, calls } = scriptedModel([
+      [
+        { type: 'tool-call', toolCallId: 'p1', toolName: 'web_search', input: '{}', providerExecuted: true },
+        {
+          type: 'tool-result',
+          toolCallId: 'p1',
+          toolName: 'web_search',
+          result: { found: 'data' },
+          providerExecuted: true,
+        },
+        ...itemText('Done.', 'msg_1'),
+        toolCall('c1'),
+        finish('tool-calls'),
+      ],
+      [...itemText('Done.', 'msg_2'), finish('stop')],
+    ]);
+    const iterationTexts: string[] = [];
+    const agent = new Agent({
+      id: 'a',
+      name: 'a',
+      instructions: 'test',
+      model,
+      tools: { echo: echoTool() },
+      outputProcessors: [
+        {
+          id: 'keep-latest-step',
+          processOutputStep: ({ stepNumber, messages }: any) => {
+            if (stepNumber === 0) return messages;
+            return structuredClone(messages).map((message: any) => {
+              if (message.role !== 'assistant') return message;
+              const parts = message.content.parts;
+              const lastBoundary = parts.map((part: any) => part.type).lastIndexOf('step-start');
+              return { ...message, content: { ...message.content, parts: parts.slice(Math.max(lastBoundary, 0)) } };
+            });
+          },
+        },
+      ] as any,
+    });
+    const stream = await agent.stream('go', {
+      onIterationComplete: ({ text: iterationText }) => {
+        iterationTexts.push(iterationText);
+        return undefined;
+      },
+    });
+    await stream.consumeStream();
+
+    expect(calls()).toBe(2);
+    expect(iterationTexts.at(-1)).toBe('Done.');
+  });
+
   it('returns the repaired structured output after a retry', async () => {
     const { model, calls } = scriptedModel([
       [...text('{"answer":"REJECTED"}'), finish('stop')],

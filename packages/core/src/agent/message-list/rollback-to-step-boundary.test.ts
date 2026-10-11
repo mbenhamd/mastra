@@ -632,6 +632,28 @@ describe('MessageList step content location (PF-5364)', () => {
     expect(contentTypes(list.stepContent(location))).toEqual(['text']);
   });
 
+  it('does not re-create earlier attachments or calls after a processor pruned them from the message', () => {
+    const list = new MessageList();
+    list.add(
+      {
+        role: 'assistant',
+        content: [
+          { type: 'file', data: 'aGVsbG8=', mediaType: 'image/png' },
+          { type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', input: {} },
+          { type: 'text', text: 'first' },
+        ],
+      } as any,
+      'response',
+    );
+    list.openStepBoundary();
+    const location = list.openStepContent();
+    const message = list.get.response.db().at(-1)!;
+    message.content.parts.push(text('FINAL'));
+    message.content.parts = message.content.parts.filter(part => part.type === 'text' && part.text === 'FINAL');
+
+    expect(contentTypes(list.stepContent(location))).toEqual(['text']);
+  });
+
   it("keeps the iteration's parts when a processor clones the message and trims earlier parts", () => {
     const { list, id } = listWith(assistant([toolCall('c1'), toolCall('c2'), text('kept')]));
     openBoundary(list);

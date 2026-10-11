@@ -258,16 +258,20 @@ export type StepContentLocation = {
 };
 
 /**
- * What identifies a part across clones: a tool call by its id (so a result filled in later is the
- * same part), text and reasoning by their content, a file by its data, anything else by its type.
+ * What identifies a part across clones. A tool call is its id, so a result filled in later is the
+ * same part. Anything else is its type, its content (text, reasoning, file data) and the stamp it
+ * got when it was added to the list, which a clone keeps: the same answer written by two steps,
+ * or two step markers, stay distinct.
  */
 function partIdentity(part: MastraMessagePart): string {
-  let identity: string | undefined;
-  if (part.type === 'text') identity = part.text;
-  else if (part.type === 'tool-invocation') identity = part.toolInvocation?.toolCallId;
-  else if (part.type === 'reasoning') identity = part.reasoning;
-  else if (part.type === 'file') identity = typeof part.data === 'string' ? part.data : undefined;
-  return identity === undefined ? part.type : `${part.type}\u0000${identity}`;
+  if (part.type === 'tool-invocation') return `${part.type}\u0000${part.toolInvocation?.toolCallId}`;
+  let content: string | undefined;
+  if (part.type === 'text') content = part.text;
+  else if (part.type === 'reasoning') content = part.reasoning;
+  else if (part.type === 'file') content = typeof part.data === 'string' ? part.data : undefined;
+  // Unary + so a Date, or a string from some storage round trip, compares as a number.
+  const stamp = part.createdAt == null ? '' : String(+part.createdAt);
+  return `${part.type}\u0000${content ?? ''}\u0000${stamp}`;
 }
 
 /**
@@ -2200,7 +2204,8 @@ export class MessageList {
    * The content one loop iteration wrote: in each response message, the parts after those that
    * were there when the iteration began, up to those that were there when it ended. Parts are
    * recognised by identity rather than position, so a processor that clones, trims or rewrites
-   * earlier parts does not move the iteration's.
+   * earlier parts does not move the iteration's. A part a processor adds during the iteration
+   * (a replacement included) is content the list gained in it, and counts as the iteration's.
    *
    * `modelContent(stepNumber)` instead counts `step-start` markers, which goes wrong when a
    * processor retry rolls a rejected attempt's marker back and streams the retry into a fresh
@@ -2219,12 +2224,14 @@ export class MessageList {
       const stop = endParts ? lastRecordedPartIndex(messageParts, endParts) + 1 : messageParts.length;
       if (start >= stop) continue;
 
-      if (start === 0 && stop === messageParts.length) {
+      const startedHere = !location.startParts.has(message.id);
+      if (startedHere && start === 0 && stop === messageParts.length) {
         parts.push(...this.toAIV5UIMessages([message]).flatMap(uiMessage => uiMessage.parts));
         continue;
       }
-      // Other iterations wrote the rest of this message. The legacy mirrors describe the whole
-      // message and would re-synthesize their parts, so only this iteration's parts are converted.
+      // Other iterations wrote (or wrote and a processor pruned) the rest of this message. The
+      // legacy mirrors describe the whole message and would re-synthesize their parts, so only this
+      // iteration's parts are converted.
       const {
         toolInvocations: _toolInvocations,
         reasoning: _reasoning,
