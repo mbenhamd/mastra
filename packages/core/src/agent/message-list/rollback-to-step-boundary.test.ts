@@ -571,3 +571,72 @@ describe('MessageList#openStepBoundary across trailing signals (PF-5364)', () =>
     expect(list.openStepBoundary({ acrossTrailingSignals: true }).boundary).toBeUndefined();
   });
 });
+
+describe('MessageList step content location (PF-5364)', () => {
+  const contentTypes = (content: Array<{ type: string }> | undefined) => content?.map(part => part.type);
+  const texts = (content: Array<{ type: string; text?: string }> | undefined) =>
+    content?.filter(part => part.type === 'text').map(part => part.text);
+
+  it("reads the parts after the iteration's boundary and in messages it started", () => {
+    const { list, id } = listWith(assistant([text('earlier step')]));
+    const location = list.openStepContent(openBoundary(list));
+    list.add([{ ...assistant([text('this step')]), id }], 'response');
+    list.add([assistant([text('fresh message')])], 'response');
+
+    expect(texts(list.stepContent(location))).toEqual(['this step', 'fresh message']);
+  });
+
+  it('counts writes into a message that existed before the iteration began', () => {
+    // An iteration-feedback note opens the boundary in its own message while the answer
+    // merges into the earlier response message.
+    const { list, id } = listWith(assistant([toolCall('c1')]));
+    list.add([assistant([text('feedback note')])], 'response');
+    const location = list.openStepContent(openBoundary(list));
+    list.add([{ ...assistant([text('answer')]), id }], 'response');
+
+    expect(texts(list.stepContent(location))).toEqual(['answer']);
+  });
+
+  it('stops at the end recorded when the iteration closed', () => {
+    const { list, id } = listWith(assistant([text('earlier step')]));
+    const location = list.openStepContent(undefined);
+    list.add([{ ...assistant([toolCall('c1')]), id }], 'response');
+    list.closeStepContent(location);
+    // A later attempt writes into the same message and a fresh one.
+    list.add([{ ...assistant([text('failed partial')]), id }], 'response');
+    list.add([assistant([text('next iteration')])], 'response');
+    list.closeStepContent(location);
+
+    expect(texts(list.stepContent(location))).toEqual([]);
+    expect(contentTypes(list.stepContent(location))).toEqual(['tool-call', 'tool-result']);
+  });
+
+  it('does not re-create attachments of earlier steps in the same message', () => {
+    const list = new MessageList();
+    list.add(
+      {
+        role: 'assistant',
+        content: [
+          { type: 'file', data: 'aGVsbG8=', mediaType: 'image/png' },
+          { type: 'text', text: 'first' },
+        ],
+      } as any,
+      'response',
+    );
+    const location = list.openStepContent(list.openStepBoundary().boundary);
+    list.add({ role: 'assistant', content: 'second' } as any, 'response');
+
+    expect(contentTypes(list.stepContent(location))).toEqual(['text']);
+  });
+
+  it('cannot place the iteration once a processor replaced the parts ahead of its boundary', () => {
+    const { list, id } = listWith(assistant([toolCall('c1'), text('kept')]));
+    const location = list.openStepContent(openBoundary(list));
+    list.add([{ ...assistant([text('answer')]), id }], 'response');
+    const replacement = structuredClone(list.get.response.db().find(message => message.id === id)!);
+    replacement.content.parts = replacement.content.parts.filter(part => part.type !== 'tool-invocation');
+    list.add(replacement, 'response', { merge: false } as any);
+
+    expect(list.stepContent(location)).toBeUndefined();
+  });
+});

@@ -1,3 +1,7 @@
+import type { StepResult } from '@internal/ai-sdk-v5';
+import type { MessageList } from '../../agent/message-list';
+import type { StepContentLocation } from '../../agent/message-list/message-list';
+
 type StepWithTripwire = { readonly tripwire?: { readonly rolledBack?: boolean } };
 
 /**
@@ -26,4 +30,31 @@ export function messageStepNumber(steps: ReadonlyArray<StepWithTripwire>, index:
     if (!stepWasRolledBack(steps[i])) stepNumber++;
   }
   return stepNumber;
+}
+
+/** Where the most recent step of a run writes its response, and which entry of `steps` it is. */
+export type LocatedStepContent = { readonly stepIndex: number; readonly location: StepContentLocation };
+
+/**
+ * The content of `steps[index]` as the MessageList holds it now.
+ *
+ * Read from where the step's iteration wrote its response when that is known
+ * for this step. Otherwise (a durable run that rebuilt its MessageList, or a
+ * boundary a processor replaced beyond recognition) fall back to counting
+ * `step-start` markers.
+ *
+ * @returns the content, or `undefined` when only the fallback was available and
+ *   it found nothing: the list no longer holds the step, which is not the same
+ *   as the step having no content, so callers keep what they captured.
+ */
+export function readStepContent(
+  messageList: MessageList,
+  steps: ReadonlyArray<StepWithTripwire>,
+  index: number,
+  located: LocatedStepContent | undefined,
+): StepResult<any>['content'] | undefined {
+  const locatedContent = located?.stepIndex === index ? messageList.stepContent(located.location) : undefined;
+  if (locatedContent) return locatedContent;
+  const counted = messageList.get.response.aiV5.modelContent(messageStepNumber(steps, index));
+  return counted.length > 0 ? counted : undefined;
 }

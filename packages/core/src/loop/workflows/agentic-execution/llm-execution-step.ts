@@ -99,6 +99,7 @@ import {
   MEMORY_KEY,
   RESOURCE_ID_KEY,
   STEP_ACTIVE_TOOLS_KEY,
+  STEP_CONTENT_KEY,
   STEP_MODEL_MESSAGES_KEY,
   STEP_TOOLS_KEY,
   STEP_USAGE_KEY,
@@ -115,7 +116,8 @@ import { injectBackgroundTaskPrompt } from '../../shared/inject-background-task-
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../shared/merge-llm-call-headers';
 import { recordTerminalErrorMessage } from '../../shared/record-terminal-error-message';
 import { responseRecoveryToolChoice } from '../../shared/response-recovery-tool-choice';
-import { messageStepNumber, stepWasRolledBack } from '../../shared/step-content';
+import { readStepContent, stepWasRolledBack } from '../../shared/step-content';
+import type { LocatedStepContent } from '../../shared/step-content';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../shared/step-content-chunk-types';
 import { TERMINAL_FINISH_REASONS } from '../../shared/terminal-finish-reasons';
 import { isMastraTimeoutError } from '../../timeout';
@@ -1612,6 +1614,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           ? messageList.openStepBoundary({ acrossTrailingSignals: inputData.processorRetryFeedback !== undefined })
               .boundary
           : undefined;
+      // Where this iteration's response goes; its StepResult content is read from here.
+      const iterationContent = messageList.openStepContent(iterationBoundary);
 
       try {
         // Open MODEL_STEP before any step-owned processor work. The outer
@@ -1796,13 +1800,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         const lastPreviousStep = previousSteps[previousSteps.length - 1];
         // A rolled-back retry attempt has no parts left to re-extract.
         if (lastPreviousStep && !stepWasRolledBack(lastPreviousStep)) {
-          const refreshedContent = messageList.get.response.aiV5.modelContent(
-            messageStepNumber(previousSteps, previousSteps.length - 1),
+          const refreshedContent = readStepContent(
+            messageList,
+            previousSteps,
+            previousSteps.length - 1,
+            readScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent'),
           );
           // Durable agents deserialize a fresh MessageList per workflow step, so
           // the re-extraction can legitimately come back empty there. Never let
           // that wipe content we already have.
-          if (refreshedContent.length > 0) {
+          if (refreshedContent && refreshedContent.length > 0) {
             previousSteps[previousSteps.length - 1] = new DefaultStepResult({
               content: refreshedContent,
               finishReason: lastPreviousStep.finishReason,
@@ -3499,16 +3506,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       }
 
       const steps = inputData.output?.steps || [];
-      // StepContentExtractor uses one-based step numbers. The current result is
-      // pushed below, at index `steps.length`; its number skips the attempts a
-      // processor retry rolled back, whose markers are gone (PF-5364). Do not slice the
-      // returned content by `messages.nonUser.length`: that value counts model
-      // messages, while this array contains content parts. Mixing those units
-      // can erase the current step's tool calls (and parallel calls in
-      // particular) from the public StepResult.
-      const currentIterationContent = messageList.get.response.aiV5.modelContent(
-        messageStepNumber(steps, steps.length),
-      );
+      // The current result is pushed below, at index `steps.length`. Its content
+      // is what this iteration wrote, read from where it wrote it rather than by
+      // counting step-start markers (PF-5364). Do not slice the returned content
+      // by `messages.nonUser.length`: that value counts model messages, while this
+      // array contains content parts. Mixing those units can erase the current
+      // step's tool calls (and parallel calls in particular) from the public
+      // StepResult.
+      const currentStepContent: LocatedStepContent = { stepIndex: steps.length, location: iterationContent };
+      writeScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent', currentStepContent);
+      const currentIterationContent = readStepContent(messageList, steps, steps.length, currentStepContent) ?? [];
 
       // Build tripwire data if this step is being rejected
       // This includes both retry scenarios and max retries exceeded

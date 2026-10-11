@@ -308,6 +308,116 @@ describe('PF-5364 step content after a processor retry', () => {
     expect(iterationTexts.at(-1)).toBe('ACCEPTED');
   });
 
+  it('reads text that follows a provider-executed tool result in the same response', async () => {
+    // The response holds an intra-response step-start between the tool result and the text.
+    const { model, calls } = scriptedModel([
+      [
+        { type: 'tool-call', toolCallId: 'p1', toolName: 'web_search', input: '{}', providerExecuted: true },
+        {
+          type: 'tool-result',
+          toolCallId: 'p1',
+          toolName: 'web_search',
+          result: { found: 'data' },
+          providerExecuted: true,
+        },
+        ...text('ANSWER'),
+        finish('stop'),
+      ],
+    ]);
+    const iterationTexts: string[] = [];
+    const agent = new Agent({
+      id: 'a',
+      name: 'a',
+      instructions: 'test',
+      model,
+      outputProcessors: [{ id: 'noop', processOutputStep: ({ messageList }: any) => messageList }] as any,
+    });
+    const stream = await agent.stream('go', {
+      onIterationComplete: ({ text: iterationText }) => {
+        iterationTexts.push(iterationText);
+        return undefined;
+      },
+    });
+    await stream.consumeStream();
+
+    expect(calls()).toBe(1);
+    expect(iterationTexts).toEqual(['ANSWER']);
+  });
+
+  it('reads the answer after a processor pruned the earlier response', async () => {
+    const { model, calls } = scriptedModel([
+      [toolCall('c1'), finish('tool-calls')],
+      [...text('DONE'), finish('stop')],
+    ]);
+    const iterationTexts: string[] = [];
+    const agent = new Agent({
+      id: 'a',
+      name: 'a',
+      instructions: 'test',
+      model,
+      tools: { echo: echoTool() },
+      outputProcessors: [{ id: 'noop', processOutputStep: ({ messageList }: any) => messageList }] as any,
+      inputProcessors: [
+        {
+          id: 'prune',
+          processInputStep: ({ stepNumber, messageList, rotateResponseMessageId }: any) => {
+            if (stepNumber === 1) {
+              rotateResponseMessageId();
+              messageList.removeByIds(messageList.get.response.db().map((message: any) => message.id));
+            }
+            return messageList;
+          },
+        },
+      ] as any,
+    });
+    const stream = await agent.stream('go', {
+      onIterationComplete: ({ text: iterationText }) => {
+        iterationTexts.push(iterationText);
+        return undefined;
+      },
+    });
+    await stream.consumeStream();
+
+    expect(calls()).toBe(2);
+    expect(iterationTexts.at(-1)).toBe('DONE');
+  });
+
+  it('does not restore narration a processor removed when the tool result arrived', async () => {
+    const { model } = scriptedModel([
+      [...text('REMOVED NARRATION'), toolCall('c1'), finish('tool-calls')],
+      [...text('DONE'), finish('stop')],
+    ]);
+    const iterationTexts: string[] = [];
+    const agent = new Agent({
+      id: 'a',
+      name: 'a',
+      instructions: 'test',
+      model,
+      tools: { echo: echoTool() },
+      outputProcessors: [
+        {
+          id: 'redact',
+          processOutputStream: ({ part, messageList }: any) => {
+            if (part.type === 'tool-result') {
+              messageList.removeByIds(messageList.get.response.db().map((message: any) => message.id));
+            }
+            return part;
+          },
+        },
+      ] as any,
+    });
+    const stream = await agent.stream('go', {
+      onIterationComplete: ({ text: iterationText }) => {
+        iterationTexts.push(iterationText);
+        return undefined;
+      },
+    });
+    await stream.consumeStream();
+
+    expect(iterationTexts).not.toContain('REMOVED NARRATION');
+    expect(iterationTexts.at(-1)).toBe('DONE');
+  });
+
   it('returns the repaired structured output after a retry', async () => {
     const { model, calls } = scriptedModel([
       [...text('{"answer":"REJECTED"}'), finish('stop')],

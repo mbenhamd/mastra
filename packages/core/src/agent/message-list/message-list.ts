@@ -246,6 +246,20 @@ type BoundaryToken = [type: string, identity: string | undefined];
 type BoundaryCheckpoint = { messageId: string; prefix: BoundaryToken[] };
 
 /**
+ * Where one loop iteration writes its response, for `MessageList.stepContent`. Opened by
+ * `openStepContent` when the iteration begins and closed by `closeStepContent` once the iteration
+ * has written its last part (its tool results included).
+ */
+export type StepContentLocation = {
+  /** The marker the iteration opened, if any; its parts follow it in that message. */
+  readonly boundary?: MastraStepStartPart;
+  /** How many parts each response message held when the iteration began. */
+  readonly startPartCounts: ReadonlyMap<string, number>;
+  /** How many parts each response message held when the iteration ended; unset while it is open. */
+  endPartCounts?: ReadonlyMap<string, number>;
+};
+
+/**
  * Identify the parts preceding an index — what a splice at that index is actually a statement
  * about. A tool call is named by its id, text and reasoning by their own string, anything else by
  * its type alone. Each token holds that string as-is rather than building one out of it, so the
@@ -2130,6 +2144,87 @@ export class MessageList {
   #rememberBoundaryFingerprint(messageId: string, parts: MastraMessagePart[], boundary: MastraStepStartPart) {
     const index = parts.indexOf(boundary);
     if (index !== -1) this.#boundaryFingerprints.set(boundary, { messageId, prefix: prefixFingerprint(parts, index) });
+  }
+
+  #responsePartCounts(): Map<string, number> {
+    return new Map(this.response.db().map(message => [message.id, message.content.parts?.length ?? 0]));
+  }
+
+  /**
+   * Start recording where a loop iteration writes its response. Call it after the iteration has
+   * opened its boundary (`openStepBoundary()`) and before the model streams.
+   */
+  public openStepContent(boundary?: MastraStepStartPart): StepContentLocation {
+    return { boundary, startPartCounts: this.#responsePartCounts() };
+  }
+
+  /**
+   * Fix the end of an iteration's response once it has written its last part, so later reads do
+   * not pick up what the next iteration writes (a failed partial attempt, feedback notes).
+   * Closing an already-closed location keeps its first end.
+   */
+  public closeStepContent(location: StepContentLocation): void {
+    location.endPartCounts ??= this.#responsePartCounts();
+  }
+
+  /**
+   * The content one loop iteration wrote: the parts each response message gained between the
+   * iteration's start and end. Where the iteration opened a boundary, its parts in that message are
+   * the ones after the marker.
+   *
+   * `modelContent(stepNumber)` instead counts `step-start` markers, which goes wrong when a
+   * processor retry rolls a rejected attempt's marker back and streams the retry into a fresh
+   * message with none (PF-5364), when one response holds an intra-response marker (a tool call
+   * followed by text), or when a processor prunes earlier messages.
+   *
+   * @returns the step content, or `undefined` when the iteration's boundary can no longer be found
+   *   (a processor replaced the parts around it, or the list was rebuilt); callers then fall back
+   *   to counting markers.
+   */
+  public stepContent(location: StepContentLocation): AIV5Type.StepResult<any>['content'] | undefined {
+    const { boundary } = location;
+    const checkpoint = boundary ? this.#boundaryFingerprints.get(boundary) : undefined;
+    if (boundary && !checkpoint) return undefined;
+
+    const parts: AIV5Type.UIMessage['parts'] = [];
+    for (const message of this.response.db()) {
+      const messageParts = message.content.parts ?? [];
+      const end = location.endPartCounts ? location.endPartCounts.get(message.id) : messageParts.length;
+      // Started after the iteration ended.
+      if (end === undefined) continue;
+
+      let start = location.startPartCounts.get(message.id) ?? 0;
+      if (boundary && checkpoint?.messageId === message.id) {
+        const boundaryIndex = findBoundaryIndex(messageParts, boundary, message.id, checkpoint);
+        if (boundaryIndex === -1) return undefined;
+        start = boundaryIndex + 1;
+      }
+      const stop = Math.min(end, messageParts.length);
+      if (start >= stop) continue;
+
+      if (start === 0 && stop === messageParts.length) {
+        parts.push(...this.toAIV5UIMessages([message]).flatMap(uiMessage => uiMessage.parts));
+        continue;
+      }
+      // Other iterations wrote the rest of this message. The legacy mirrors describe the whole
+      // message and would re-synthesize their parts, so only this iteration's parts are converted.
+      const {
+        toolInvocations: _toolInvocations,
+        reasoning: _reasoning,
+        content: _content,
+        experimental_attachments: _attachments,
+        ...stepMessageContent
+      } = message.content;
+      const stepMessage: MastraDBMessage = {
+        ...message,
+        content: { ...stepMessageContent, parts: messageParts.slice(start, stop) },
+      };
+      parts.push(...this.toAIV5UIMessages([stepMessage]).flatMap(uiMessage => uiMessage.parts));
+    }
+    // The next iteration may already have opened its boundary at the end of this step's message.
+    while (parts.at(-1)?.type === 'step-start') parts.pop();
+    if (parts.length === 0) return [];
+    return StepContentExtractor.convertPartsToContent(parts, 'step', this.response.aiV5.stepContent);
   }
 
   /** Sealing is not optional: a moved id whose boundary is missing folds the next response into the previous row. */
