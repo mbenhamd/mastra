@@ -2564,6 +2564,10 @@ export class HarnessPG extends HarnessStorage {
     await this.#ensureChannelBindingsTable();
     await this.#ensurePlanTasksTable();
     await this.#ensureRunSummariesTable();
+    await this.#ensureChannelInboxTable();
+    await this.#ensureChannelActionTables();
+    await this.#ensureChannelOutboxTable();
+    await this.#ensureWakeupTable();
     const tx = await this.#client.transaction('write');
     const attachmentCleanupOperationIds: string[] = [];
     const deleteCandidates = new Map<
@@ -2578,10 +2582,25 @@ export class HarnessPG extends HarnessStorage {
         attachmentRows: Record<string, unknown>[];
       }
     >();
+    // Session rows lock in one canonical (namespace, session id) order, the
+    // order a channel write key-share locks the sessions it names, so a batch
+    // delete and a write naming two of its sessions cannot deadlock.
+    const orderedSessions = sessions
+      .map(opts => ({ opts, namespace: this.#resolveHarnessName(opts.harnessName) }))
+      .sort((left, right) =>
+        left.namespace !== right.namespace
+          ? left.namespace < right.namespace
+            ? -1
+            : 1
+          : left.opts.sessionId < right.opts.sessionId
+            ? -1
+            : left.opts.sessionId > right.opts.sessionId
+              ? 1
+              : 0,
+      );
     try {
-      for (const opts of sessions) {
+      for (const { opts, namespace } of orderedSessions) {
         const { sessionId } = opts;
-        const namespace = this.#resolveHarnessName(opts.harnessName);
         const existing = await tx.execute({
           sql: `SELECT version, session_incarnation, resource_id, thread_id, parent_session_id, created_at, closed_at
 	                FROM ${TABLE_HARNESS_SESSIONS}
@@ -2758,6 +2777,30 @@ export class HarnessPG extends HarnessStorage {
           deletionNow,
         );
       }
+      // An outbox row can name two sessions (session_id and owning_session_id),
+      // so two batch deletes of disjoint sessions can share outbox rows. Lock
+      // the batch's outbox rows once, in id order, before the per-session
+      // deletes below take them one session at a time; otherwise each batch
+      // could hold one shared row and wait for the other's.
+      const outboxSessionsByNamespace = new Map<string, string[]>();
+      for (const { namespace, sessionId } of deleteCandidates.values()) {
+        const ids = outboxSessionsByNamespace.get(namespace) ?? [];
+        ids.push(sessionId);
+        outboxSessionsByNamespace.set(namespace, ids);
+      }
+      for (const [namespace, ids] of [...outboxSessionsByNamespace.entries()].sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0,
+      )) {
+        const placeholders = ids.map(() => '?').join(', ');
+        await tx.execute({
+          sql: `SELECT id FROM ${TABLE_HARNESS_CHANNEL_OUTBOX}
+                WHERE harness_name = ?
+                  AND (session_id IN (${placeholders}) OR owning_session_id IN (${placeholders}))
+                ORDER BY id
+                FOR UPDATE`,
+          args: [namespace, ...ids, ...ids],
+        });
+      }
       for (const {
         namespace,
         sessionId,
@@ -2836,6 +2879,36 @@ export class HarnessPG extends HarnessStorage {
         // node — all rows share session_id, so descendants are covered).
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        // Channel and wakeup rows go with the session: inbox items carry the
+        // inbound content, outbox items the outbound payload (of the session or
+        // owned by it), receipts the action response, tokens the pending action,
+        // and wakeups their scheduled content. The content-free terminal session
+        // fences and grant tombstones stay, so nothing is replayed or resurrected.
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_INBOX}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_OUTBOX}
+                WHERE harness_name = ? AND (session_id = ? OR owning_session_id = ?)`,
+          args: [namespace, sessionId, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
+                WHERE harness_name = ? AND owning_session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}
+                WHERE harness_name = ? AND owning_session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_WAKEUPS}
                 WHERE harness_name = ? AND session_id = ?`,
           args: [namespace, sessionId],
         });
@@ -8072,6 +8145,45 @@ export class HarnessPG extends HarnessStorage {
   // Channel inbox ledger
   // -------------------------------------------------------------------------
 
+  /**
+   * Runs a channel or wakeup ledger write while every session it names
+   * exists. The session rows are key-share locked first (session before
+   * ledger rows, the order deleteSessions takes), so a concurrent delete either
+   * waits for this write and then erases its row, or commits first and the
+   * write fails with HarnessStorageSessionNotFoundError. A deleted session
+   * therefore never regains channel or wakeup rows from a late write. KEY
+   * SHARE conflicts with the delete but not with lease renewals or version
+   * writes. A write naming no session runs as before.
+   */
+  async #writeWhileSessionsExist<T>(
+    namespace: string,
+    sessionIds: readonly (string | undefined)[],
+    write: (client: PgHarnessClient) => Promise<T>,
+  ): Promise<T> {
+    // Sorted: the canonical order deleteSessions locks a batch's sessions in.
+    const named = [...new Set(sessionIds.filter((id): id is string => id !== undefined))].sort();
+    if (named.length === 0) return write(this.#client);
+    const tx = await this.#client.transaction('write');
+    try {
+      for (const sessionId of named) {
+        const live = await tx.execute({
+          sql: `SELECT 1 FROM ${TABLE_HARNESS_SESSIONS}
+                WHERE harness_name = ? AND id = ?
+                FOR KEY SHARE`,
+          args: [namespace, sessionId],
+        });
+        if (live.rows.length === 0) throw new HarnessStorageSessionNotFoundError(sessionId);
+      }
+      const result = await write(tx);
+      await tx.commit();
+      return result;
+    } catch (err) {
+      // The original failure wins; a failed rollback only discards the connection.
+      if (!tx.closed) await tx.rollback().catch(() => undefined);
+      throw err;
+    }
+  }
+
   async saveChannelInboxItem(record: ChannelInboxItem): Promise<void> {
     await this.#ensureChannelInboxTable();
     const namespaced = { ...record, harnessName: this.#resolveHarnessName(record.harnessName) };
@@ -8096,8 +8208,9 @@ export class HarnessPG extends HarnessStorage {
     }
     const cols = channelInboxColumnValues(namespaced);
     try {
-      const result = await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
+      const result = await this.#writeWhileSessionsExist(namespaced.harnessName, [namespaced.sessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})
               ON CONFLICT(id) DO UPDATE SET
@@ -8131,8 +8244,9 @@ export class HarnessPG extends HarnessStorage {
                     AND excluded.status IN ('received', 'admitted', 'failed', 'dead')
                   )
                 )`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       if (result.rowsAffected === 0) {
         const conflict = await this.#loadChannelInboxItemById(namespaced.id);
         if (conflict && channelInboxItemsEqual(conflict, namespaced)) return;
@@ -8183,12 +8297,14 @@ export class HarnessPG extends HarnessStorage {
           };
     const cols = channelInboxColumnValues(insertItem);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
+      await this.#writeWhileSessionsExist(namespace, [incoming.sessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return {
         item: insertItem,
         duplicate: false,
@@ -8366,23 +8482,31 @@ export class HarnessPG extends HarnessStorage {
     const stateCompareNames = cols.names.filter(
       name => name !== 'id' && name !== 'claim_id' && name !== 'claim_expires_at' && name !== 'updated_at',
     );
-    const result = await this.#client.execute({
-      sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
+    const result = await this.#writeWhileSessionsExist(
+      namespace,
+      // Only admission changes a row's session (it binds a row recorded without
+      // one). A row that keeps its session is erased together with it, and this
+      // UPDATE cannot insert one.
+      next.sessionId !== current.sessionId ? [next.sessionId] : [],
+      client =>
+        client.execute({
+          sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
             SET ${updateNames.map(name => `${name} = ?`).join(', ')}
             WHERE harness_name = ? AND id = ? AND claim_id = ?
               AND claim_expires_at IS NOT NULL
               AND claim_expires_at > ?
               AND status NOT IN ('accepted', 'queued', 'dead')
               AND ${stateCompareNames.map(name => `${name} IS ?`).join(' AND ')}`,
-      args: [
-        ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
-        namespace,
-        next.id,
-        opts.claimId,
-        storageNow,
-        ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
-      ],
-    });
+          args: [
+            ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
+            namespace,
+            next.id,
+            opts.claimId,
+            storageNow,
+            ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
+          ],
+        }),
+    );
     if (result.rowsAffected === 0) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);
     }
@@ -8424,12 +8548,14 @@ export class HarnessPG extends HarnessStorage {
     if (existingByPending) return { token: existingByPending, duplicate: true, conflict: true };
     const cols = channelActionTokenColumnValues(token);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}
+      await this.#writeWhileSessionsExist(token.harnessName, [token.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
     } catch (err) {
       if (!isUniqueConstraintError(err)) throw err;
       const raced =
@@ -8587,8 +8713,9 @@ export class HarnessPG extends HarnessStorage {
     }
     const cols = channelActionReceiptColumnValues(receipt);
     try {
-      const result = await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
+      const result = await this.#writeWhileSessionsExist(receipt.harnessName, [receipt.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})
               ON CONFLICT(id) DO UPDATE SET
@@ -8629,8 +8756,9 @@ export class HarnessPG extends HarnessStorage {
                     AND excluded.status IN ('received', 'accepted', 'failed', 'dead')
                   )
                 )`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       if (result.rowsAffected === 0) {
         const conflict = await this.#loadChannelActionReceiptById(receipt.id);
         if (conflict && channelActionReceiptsEqual(conflict, receipt)) return;
@@ -8686,12 +8814,14 @@ export class HarnessPG extends HarnessStorage {
           };
     const cols = channelActionReceiptColumnValues(insertReceipt);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
+      await this.#writeWhileSessionsExist(namespace, [incoming.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return {
         receipt: insertReceipt,
         duplicate: false,
@@ -8918,12 +9048,14 @@ export class HarnessPG extends HarnessStorage {
     assertValidChannelOutboxState(item);
     const cols = channelOutboxColumnValues(item);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_OUTBOX}
+      await this.#writeWhileSessionsExist(item.harnessName, [item.sessionId, item.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_OUTBOX}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return { outboxItemId: item.id, duplicate: false, conflict: false };
     } catch (err) {
       if (!isUniqueConstraintError(err)) throw err;
@@ -9185,12 +9317,14 @@ export class HarnessPG extends HarnessStorage {
     assertValidHarnessWakeupState(insertItem);
     const cols = harnessWakeupColumnValues(insertItem);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_WAKEUPS}
+      await this.#writeWhileSessionsExist(namespace, [incoming.sessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_WAKEUPS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return { item: insertItem, duplicate: false, conflict: false, claimed: canInitialClaim };
     } catch (err) {
       if (!isUniqueConstraintError(err)) throw err;

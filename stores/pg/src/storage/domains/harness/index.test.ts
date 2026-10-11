@@ -20,8 +20,13 @@ import {
   TABLE_HARNESS_WORKSPACE_ACTIONS,
 } from '@mastra/core/storage';
 import type {
+  ChannelActionReceipt,
+  ChannelActionToken,
   ChannelBinding,
+  ChannelInboxItem,
+  ChannelOutboxItem,
   HarnessPlanTask,
+  HarnessWakeupItem,
   HarnessProviderCallbackBinding,
   SessionRecord,
   WorkspaceActionJournalEntry,
@@ -1188,6 +1193,382 @@ describe('HarnessPG', () => {
     }
   });
 
+  const saveClosedSession = (id: string) =>
+    store.stores.harness!.saveSession(
+      createSampleSessionRecord({
+        id,
+        threadId: `thread-${id}`,
+        sessionIncarnation: `incarnation-${id}`,
+        closedAt: 2000,
+        lastActivityAt: 2000,
+      }),
+      { ownerId: 'h', ifVersion: 0 },
+    );
+  const deleteClosedSession = async (id: string) => {
+    const harness = store.stores.harness!;
+    const record = await harness.loadSession({ sessionId: id });
+    if (!record) throw new Error(`expected ${id}`);
+    await harness.deleteSession({
+      sessionId: id,
+      ifVersion: record.version,
+      expectedResourceId: record.resourceId,
+      expectedThreadId: record.threadId,
+      expectedParentSessionId: record.parentSessionId ?? null,
+      expectedCreatedAt: record.createdAt,
+      requireClosed: true,
+    });
+  };
+  const seedLedgerRows = async (id: string) => {
+    const harness = store.stores.harness!;
+    await harness.saveChannelInboxItem(
+      sampleChannelInbox({
+        id: `inbox-${id}`,
+        admissionId: `inbox-${id}`,
+        idempotencyKey: `event-${id}`,
+        externalMessageId: `message-${id}`,
+        resourceId: 'resource-1',
+        threadId: `thread-${id}`,
+        sessionId: id,
+        content: `private note of ${id}`,
+      }),
+    );
+    await harness.enqueueChannelOutbox(
+      sampleChannelOutbox({
+        id: `outbox-${id}`,
+        idempotencyKey: `outbox-${id}`,
+        sessionId: id,
+        owningSessionId: id,
+        payload: { text: `reply to ${id}` },
+      }),
+    );
+    await harness.enqueueChannelOutbox(
+      sampleChannelOutbox({
+        id: `outbox-owned-${id}`,
+        idempotencyKey: `outbox-owned-${id}`,
+        sessionId: undefined,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadChannelActionToken(
+      sampleChannelActionToken({
+        actionTokenId: `token-${id}`,
+        transportHash: `transport-${id}`,
+        itemId: `question-${id}`,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadChannelActionReceipt(
+      sampleChannelActionReceipt({
+        id: `receipt-${id}`,
+        actionTokenId: `token-${id}`,
+        actionId: `action-${id}`,
+        itemId: `question-${id}`,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadHarnessWakeupItem(
+      sampleWakeup({
+        id: `wakeup-${id}`,
+        idempotencyKey: `wake-${id}`,
+        sourceId: `schedule-${id}`,
+        admissionId: `wake-admission-${id}`,
+        threadId: `thread-${id}`,
+        sessionId: id,
+      }),
+    );
+  };
+  const ledgerRows = async (id: string) => {
+    const harness = store.stores.harness!;
+    const rows = await harness.listChannelDiagnosticsRows({ resourceId: 'resource-1', sessionIds: [id], limit: 10 });
+    const wakeup = await harness.loadHarnessWakeupItemByIdempotencyKey({
+      harnessName: 'default',
+      idempotencyKey: `wake-${id}`,
+    });
+    return {
+      inbox: rows.inbox.map(row => row.id),
+      outbox: rows.outbox.map(row => row.id).sort(),
+      actionTokens: rows.actionTokens.map(row => row.actionTokenId),
+      actionReceipts: rows.actionReceipts.map(row => row.id),
+      wakeups: wakeup ? [wakeup.id] : [],
+    };
+  };
+  const seededRows = (id: string) => ({
+    inbox: [`inbox-${id}`],
+    outbox: [`outbox-${id}`, `outbox-owned-${id}`],
+    actionTokens: [`token-${id}`],
+    actionReceipts: [`receipt-${id}`],
+    wakeups: [`wakeup-${id}`],
+  });
+  const noRows = { inbox: [], outbox: [], actionTokens: [], actionReceipts: [], wakeups: [] };
+
+  it("erases the session's channel and wakeup rows and keeps its fences and other sessions' rows (PF-5309)", async () => {
+    for (const id of ['ledger-deleted', 'ledger-kept']) {
+      await saveClosedSession(id);
+      await seedLedgerRows(id);
+    }
+    // A content-free grant tombstone naming the session (a revoked terminal grant).
+    await store.db.none(
+      `INSERT INTO mastra_harness_terminal_tombstones
+         (id, harness_name, grant_key, grant_generation, session_id, session_incarnation,
+          admission_id, admission_hash, reason_json, created_at)
+       VALUES ('tombstone-ledger-deleted', 'default', 'grant-ledger-deleted', 1, 'ledger-deleted', NULL,
+               'admission-ledger-deleted', NULL, '{"code":"revoked","message":"grant revoked"}', 1000)`,
+    );
+    await expect(ledgerRows('ledger-deleted')).resolves.toEqual(seededRows('ledger-deleted'));
+
+    await deleteClosedSession('ledger-deleted');
+
+    await expect(ledgerRows('ledger-deleted')).resolves.toEqual(noRows);
+    await expect(ledgerRows('ledger-kept')).resolves.toEqual(seededRows('ledger-kept'));
+    // The content-free terminal session fence and grant tombstone stay.
+    const kept = await store.db.manyOrNone<{ source: string }>(
+      `SELECT 'fence' AS source FROM mastra_harness_terminal_session_fences
+        WHERE harness_name = 'default' AND session_id = 'ledger-deleted'
+       UNION ALL
+       SELECT 'tombstone' FROM mastra_harness_terminal_tombstones
+        WHERE harness_name = 'default' AND session_id = 'ledger-deleted'`,
+    );
+    expect(kept.map(row => row.source).sort()).toEqual(['fence', 'tombstone']);
+  });
+
+  it('refuses a late channel or wakeup write for a deleted session and stores nothing (PF-5309)', async () => {
+    const harness = store.stores.harness!;
+    await saveClosedSession('ledger-late');
+    // An inbound row recorded before its session resolved (no session yet).
+    const now = Date.now();
+    const recorded = await harness.createOrLoadChannelInboxItem(
+      sampleChannelInbox({
+        id: 'inbox-unresolved',
+        admissionId: 'inbox-unresolved',
+        idempotencyKey: 'event-unresolved',
+      }),
+      { initialClaim: { claimId: 'claim-unresolved', now, claimTtlMs: 60_000 } },
+    );
+    await deleteClosedSession('ledger-late');
+
+    const late = 'ledger-late';
+    await expect(
+      harness.saveChannelInboxItem(
+        sampleChannelInbox({
+          id: 'inbox-late',
+          admissionId: 'inbox-late',
+          idempotencyKey: 'event-late',
+          sessionId: late,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelInboxItem(
+        sampleChannelInbox({
+          id: 'inbox-late-2',
+          admissionId: 'inbox-late-2',
+          idempotencyKey: 'event-late-2',
+          sessionId: late,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    // Admission cannot bind the recorded row to the deleted session.
+    await expect(
+      harness.updateChannelInboxItem(
+        {
+          ...recorded.item,
+          status: 'admitted',
+          resourceId: 'resource-1',
+          threadId: `thread-${late}`,
+          sessionId: late,
+          delivery: 'queue',
+          admittedAt: now,
+          updatedAt: now,
+        },
+        { claimId: 'claim-unresolved' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.enqueueChannelOutbox(
+        sampleChannelOutbox({ id: 'outbox-late', sessionId: late, owningSessionId: undefined }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.enqueueChannelOutbox(
+        sampleChannelOutbox({ id: 'outbox-late-owned', sessionId: undefined, owningSessionId: late }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelActionToken(sampleChannelActionToken({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelActionReceipt(sampleChannelActionReceipt({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.saveChannelActionReceipt(sampleChannelActionReceipt({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadHarnessWakeupItem(sampleWakeup({ idempotencyKey: `wake-${late}`, sessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    await expect(ledgerRows(late)).resolves.toEqual(noRows);
+    const unresolved = await harness.loadChannelInboxItemByIdempotencyKey({
+      harnessName: 'default',
+      channelId: 'support',
+      idempotencyKey: 'event-unresolved',
+    });
+    expect([unresolved?.status, unresolved?.sessionId]).toEqual(['received', undefined]);
+  });
+
+  it('serializes channel rows with a concurrent session delete on the session rows (PF-5309)', async () => {
+    const harness = store.stores.harness!;
+    // A second connection plays the other transaction of each interleaving.
+    const other = new pg.Client({
+      host: (TEST_CONFIG as any).host,
+      port: (TEST_CONFIG as any).port,
+      database: (TEST_CONFIG as any).database,
+      user: (TEST_CONFIG as any).user,
+      password: (TEST_CONFIG as any).password,
+      statement_timeout: 10_000,
+    });
+    await other.connect();
+    const otherPid = (await other.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid;
+    /** Waits until some backend is blocked on a lock `other` holds; never on timing alone. */
+    const blockedByOther = async () => {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const blocked = await store.db.oneOrNone<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`,
+          [otherPid],
+        );
+        if ((blocked?.n ?? 0) > 0) return;
+        if (Date.now() >= deadline) throw new Error('nothing became blocked by the other transaction');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    };
+    const pending: Promise<unknown>[] = [];
+    try {
+      // A: the delete holds the session row first. The outbox write blocks on
+      // it, then finds no session and stores nothing.
+      await saveClosedSession('lock-a');
+      await other.query('BEGIN');
+      await other.query(
+        `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-a' FOR UPDATE`,
+      );
+      const writing = harness.enqueueChannelOutbox(
+        sampleChannelOutbox({
+          id: 'outbox-lock-a',
+          idempotencyKey: 'outbox-lock-a',
+          sessionId: 'lock-a',
+          owningSessionId: 'lock-a',
+        }),
+      );
+      pending.push(writing);
+      await blockedByOther();
+      await other.query(`DELETE FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-a'`);
+      await other.query('COMMIT');
+      await expect(writing).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+      await expect(ledgerRows('lock-a')).resolves.toEqual(noRows);
+
+      // B: a channel write holds the session row first (as the ledger writes
+      // do). The delete blocks on it, then erases the row it wrote.
+      await saveClosedSession('lock-b');
+      await other.query('BEGIN');
+      await other.query(
+        `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-b' FOR KEY SHARE`,
+      );
+      await other.query(
+        `INSERT INTO mastra_harness_channel_inbox
+           (id, harness_name, channel_id, provider_id, idempotency_key, payload_hash, admission_id,
+            resource_id, thread_id, session_id, external_message_id, received_at, updated_at, status,
+            attempts, request_context, content, attachments)
+         VALUES ('inbox-lock-b', 'default', 'support', 'slack', 'event-lock-b', 'payload-hash-1', 'inbox-lock-b',
+                 'resource-1', 'thread-lock-b', 'lock-b', 'message-lock-b', 1000, 1000, 'received',
+                 0, '{}', 'private note of lock-b', '[]')`,
+      );
+      const deleting = deleteClosedSession('lock-b');
+      pending.push(deleting);
+      await blockedByOther();
+      await other.query('COMMIT');
+      await deleting;
+      await expect(ledgerRows('lock-b')).resolves.toEqual(noRows);
+
+      // C: a write naming two sessions key-share locks them in sorted order,
+      // and a batch delete locks its sessions in that same order whatever the
+      // caller passed. The delete blocks on the first session without holding
+      // the second, so the writer's second lock never waits on the delete.
+      await saveClosedSession('lock-c1');
+      await saveClosedSession('lock-c2');
+      const guard = async (id: string) => {
+        const record = await harness.loadSession({ sessionId: id });
+        if (!record) throw new Error(`expected ${id}`);
+        return {
+          sessionId: id,
+          ifVersion: record.version,
+          expectedResourceId: record.resourceId,
+          expectedThreadId: record.threadId,
+          expectedParentSessionId: record.parentSessionId ?? null,
+          expectedCreatedAt: record.createdAt,
+          requireClosed: true,
+        };
+      };
+      const batch = [await guard('lock-c2'), await guard('lock-c1')];
+      await other.query('BEGIN');
+      await other.query(
+        `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-c1' FOR KEY SHARE`,
+      );
+      const deletingBatch = harness.deleteSessions({ sessions: batch });
+      pending.push(deletingBatch);
+      await blockedByOther();
+      await expect(
+        other.query(
+          `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-c2' FOR KEY SHARE`,
+        ),
+      ).resolves.toMatchObject({ rowCount: 1 });
+      await other.query('COMMIT');
+      await deletingBatch;
+      await expect(harness.loadSession({ sessionId: 'lock-c1' })).resolves.toBeNull();
+      await expect(harness.loadSession({ sessionId: 'lock-c2' })).resolves.toBeNull();
+
+      // D: two batch deletes of disjoint sessions share outbox rows (an outbox
+      // row names a session and its owning session). Each batch locks its
+      // outbox rows in id order before deleting them, so the batch holding the
+      // first shared row never waits for a row the other batch holds. `other`
+      // plays the [lock-d3, lock-d4] batch, which locks outbox-d-y first.
+      for (const id of ['lock-d1', 'lock-d2', 'lock-d3', 'lock-d4']) await saveClosedSession(id);
+      await harness.enqueueChannelOutbox(
+        sampleChannelOutbox({
+          id: 'outbox-d-z',
+          idempotencyKey: 'outbox-d-z',
+          sessionId: 'lock-d1',
+          owningSessionId: 'lock-d4',
+        }),
+      );
+      await harness.enqueueChannelOutbox(
+        sampleChannelOutbox({
+          id: 'outbox-d-y',
+          idempotencyKey: 'outbox-d-y',
+          sessionId: 'lock-d2',
+          owningSessionId: 'lock-d3',
+        }),
+      );
+      const disjoint = [await guard('lock-d1'), await guard('lock-d2')];
+      await other.query('BEGIN');
+      await other.query(`SELECT 1 FROM mastra_harness_channel_outbox WHERE id = 'outbox-d-y' FOR UPDATE`);
+      const deletingDisjoint = harness.deleteSessions({ sessions: disjoint });
+      pending.push(deletingDisjoint);
+      await blockedByOther();
+      await expect(
+        other.query(`SELECT 1 FROM mastra_harness_channel_outbox WHERE id = 'outbox-d-z' FOR UPDATE`),
+      ).resolves.toMatchObject({ rowCount: 1 });
+      await other.query('COMMIT');
+      await deletingDisjoint;
+      await expect(ledgerRows('lock-d1')).resolves.toEqual(noRows);
+      await expect(ledgerRows('lock-d2')).resolves.toEqual(noRows);
+    } finally {
+      // Release any lock still held, then let the blocked operation finish
+      // before the next test runs.
+      await other.query('ROLLBACK').catch(() => undefined);
+      await Promise.allSettled(pending);
+      await other.end();
+    }
+  });
+
   it('keeps §15 attachment-reference admission atomic and delete-guarded', async () => {
     const harness = attachmentStore.stores.harness;
     expect(harness).toBeDefined();
@@ -1707,6 +2088,13 @@ describe('HarnessPG', () => {
   it('lists resource and session scoped channel diagnostics rows', async () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();
+    // Channel rows are written only while the sessions they name exist.
+    for (const id of ['session-1', 'child-1']) {
+      await harness!.saveSession(createSampleSessionRecord({ id, threadId: `thread-${id}` }), {
+        ownerId: 'h',
+        ifVersion: 0,
+      });
+    }
 
     await harness!.saveChannelInboxItem({
       id: 'inbox-root',
@@ -3262,3 +3650,146 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
     });
   });
 });
+
+function sampleChannelInbox(overrides: Partial<ChannelInboxItem> = {}): ChannelInboxItem {
+  return {
+    id: 'inbox-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    idempotencyKey: 'provider-event-1',
+    payloadHash: 'payload-hash-1',
+    admissionId: 'inbox-1',
+    externalMessageId: 'message-1',
+    receivedAt: 1000,
+    updatedAt: 1000,
+    status: 'received',
+    attempts: 0,
+    requestContext: {
+      channel: {
+        origin: 'inbound',
+        harnessName: 'default',
+        channelId: 'support',
+        providerId: 'slack',
+        platform: 'slack',
+        externalThreadId: 'thread-ext-1',
+        externalMessageId: 'message-1',
+      },
+    },
+    content: 'hello',
+    attachments: [],
+    ...overrides,
+  };
+}
+
+function sampleWakeup(overrides: Partial<HarnessWakeupItem> = {}): HarnessWakeupItem {
+  return {
+    id: 'wakeup-1',
+    harnessName: 'default',
+    source: 'schedule',
+    sourceId: 'schedule-1',
+    fireId: 'fire-1',
+    idempotencyKey: 'wake-key-1',
+    payloadHash: 'payload-hash-1',
+    admissionId: 'wake-admission-1',
+    resourceId: 'resource-1',
+    threadId: 'thread-1',
+    sessionId: 'session-1',
+    dueAt: 1000,
+    createdAt: 1000,
+    updatedAt: 1000,
+    status: 'due',
+    mode: 'build',
+    model: 'model-1',
+    attempts: 0,
+    content: 'scheduled work',
+    attachments: [],
+    requestContext: { metadata: { source: 'schedule' } },
+    ...overrides,
+  };
+}
+
+function sampleChannelActionToken(overrides: Partial<ChannelActionToken> = {}): ChannelActionToken {
+  return {
+    actionTokenId: 'action-token-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    resourceId: 'resource-1',
+    owningSessionId: 'session-1',
+    itemId: 'question-1',
+    kind: 'question',
+    bindingId: 'binding-1',
+    bindingGeneration: 1,
+    runId: 'run-1',
+    pendingRequestedAt: 1000,
+    audience: { platformUserIds: ['user-1'] },
+    metadataHash: 'metadata-hash-1',
+    transportHash: 'transport-hash-1',
+    keyId: 'key-1',
+    expiresAt: 10_000,
+    createdAt: 1000,
+    updatedAt: 1000,
+    ...overrides,
+  };
+}
+
+function sampleChannelActionReceipt(overrides: Partial<ChannelActionReceipt> = {}): ChannelActionReceipt {
+  return {
+    id: 'receipt-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    actionTokenId: 'action-token-1',
+    actionId: 'provider-action-1',
+    bindingId: 'binding-1',
+    bindingGeneration: 1,
+    resourceId: 'resource-1',
+    owningSessionId: 'session-1',
+    itemId: 'question-1',
+    kind: 'question',
+    runId: 'run-1',
+    pendingRequestedAt: 1000,
+    audience: { platformUserIds: ['user-1'] },
+    verifiedActor: { platformUserId: 'user-1', displayName: 'User One' },
+    responseHash: 'response-hash-1',
+    response: { answer: 'approved' },
+    status: 'received',
+    attempts: 0,
+    createdAt: 1100,
+    updatedAt: 1100,
+    ...overrides,
+  };
+}
+
+function sampleChannelOutbox(overrides: Partial<ChannelOutboxItem> = {}): ChannelOutboxItem {
+  return {
+    id: 'outbox-1',
+    harnessName: 'default',
+    channelId: 'support',
+    providerId: 'slack',
+    bindingId: 'binding-1',
+    bindingGeneration: 1,
+    idempotencyKey: 'outbox-key-1',
+    payloadHash: 'payload-hash-1',
+    resourceId: 'resource-1',
+    threadId: 'thread-1',
+    sessionId: 'session-1',
+    owningSessionId: 'session-1',
+    target: {
+      platform: 'slack',
+      externalTenantId: 'tenant-1',
+      externalChannelId: 'channel-1',
+      externalThreadId: 'thread-ext-1',
+    },
+    kind: 'assistant-message',
+    operationKind: 'message-create',
+    payload: { text: 'hello' },
+    deliverySemantics: 'native-idempotency',
+    status: 'pending',
+    attempts: 0,
+    createdAt: 1000,
+    updatedAt: 1000,
+    ...overrides,
+  };
+}

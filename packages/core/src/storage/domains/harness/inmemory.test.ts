@@ -1673,7 +1673,7 @@ describe('InMemoryHarness provider callback binding ledger', () => {
 
 describe('InMemoryHarness channel inbox ledger', () => {
   it('dedupes exact provider callbacks and does not steal an active initial claim', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const first = await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
       initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
     });
@@ -1691,7 +1691,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('flags same idempotency key with a different payload hash as a conflict', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox());
 
     await expect(
@@ -1705,7 +1705,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('rejects duplicate global ids and save-time idempotency collisions', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox());
 
     await expect(
@@ -1734,7 +1734,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('reclaims crashed received work after claim expiry but respects nextAttemptAt backoff', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox({ nextAttemptAt: 7000 }), {
       initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 1000 },
     });
@@ -1763,7 +1763,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('guards claim renewal and terminal dead updates by owner claim', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
     try {
@@ -1808,7 +1808,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('rejects renewals and updates from expired claims', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
       initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 1000 },
     });
@@ -1831,7 +1831,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('records retryable failed evidence, releases the claim, and reclaims after backoff', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = Date.now();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
       initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5000 },
@@ -1882,7 +1882,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('validates new channel inbox rows before insert', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
 
     await expect(
       storage.createOrLoadChannelInboxItem(sampleChannelInbox({ status: 'admitted' })),
@@ -1902,7 +1902,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('keeps identical terminal channel inbox saves idempotent', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const terminal = sampleChannelInbox({
       status: 'accepted',
       delivery: 'signal',
@@ -1922,7 +1922,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('rejects illegal accepted transitions without message evidence', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = Date.now();
     await storage.createOrLoadChannelInboxItem(
       sampleChannelInbox({ status: 'admitted', delivery: 'signal', admittedAt: now + 50 }),
@@ -1940,7 +1940,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
   });
 
   it('preserves a renewed claim expiry across a status update (heartbeat is not rolled back)', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = Date.now();
     await storage.createOrLoadChannelInboxItem(sampleChannelInbox(), {
       initialClaim: { claimId: 'claim-1', now, claimTtlMs: 5_000 }, // stale expiry: now+5_000
@@ -1996,7 +1996,7 @@ describe('InMemoryHarness channel inbox ledger', () => {
 
 describe('InMemoryHarness wakeup ledger', () => {
   it('dedupes exact wakeups and reports source-fire key conflicts', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
 
     await expect(storage.createOrLoadHarnessWakeupItem(sampleWakeup())).resolves.toMatchObject({
       duplicate: false,
@@ -2018,7 +2018,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('flags same idempotency key with a different payload as a conflict', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadHarnessWakeupItem(sampleWakeup());
 
     await expect(
@@ -2038,7 +2038,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('preserves wakeup yolo admission overrides', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
 
     await expect(storage.createOrLoadHarnessWakeupItem(sampleWakeup({ yolo: true }))).resolves.toMatchObject({
       duplicate: false,
@@ -2051,7 +2051,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('treats omitted and false wakeup yolo overrides as the same idempotent input', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadHarnessWakeupItem(sampleWakeup({ yolo: false }));
 
     await expect(storage.createOrLoadHarnessWakeupItem(sampleWakeup({ id: 'wakeup-retry' }))).resolves.toMatchObject({
@@ -2062,7 +2062,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('claims due and retryable failed wakeups while respecting backoff', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadHarnessWakeupItem(sampleWakeup({ dueAt: 5000, nextAttemptAt: 7000 }));
 
     await expect(
@@ -2097,7 +2097,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('does not initial-claim future wakeups before they are due', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
 
     const result = await storage.createOrLoadHarnessWakeupItem(sampleWakeup({ dueAt: 5000 }), {
       initialClaim: { claimId: 'early', now: 4000, claimTtlMs: 1000 },
@@ -2112,7 +2112,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('initial-claims due wakeups without carrying stale attempt identifiers', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
 
     await expect(
       storage.createOrLoadHarnessWakeupItem(sampleWakeup({ runId: 'stale-run', signalId: 'stale-signal' }), {
@@ -2125,7 +2125,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('reclaims expired claimed wakeups', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadHarnessWakeupItem(sampleWakeup(), {
       initialClaim: { claimId: 'stale', now: 10_000, claimTtlMs: 1000 },
     });
@@ -2162,7 +2162,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('reclaims expired claimed duplicate wakeups on create', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadHarnessWakeupItem(sampleWakeup(), {
       initialClaim: { claimId: 'stale', now: 10_000, claimTtlMs: 1000 },
     });
@@ -2180,7 +2180,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('guards renewal and terminal updates by owner claim', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 100);
     try {
@@ -2248,7 +2248,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('rejects payload mutation while a wakeup claim is held', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 100);
     try {
@@ -2277,7 +2277,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('reclaims retryable failures and clears stale failure metadata', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now + 50);
     try {
@@ -2326,7 +2326,7 @@ describe('InMemoryHarness wakeup ledger', () => {
   });
 
   it('validates wakeup state transitions', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
 
     await expect(storage.createOrLoadHarnessWakeupItem(sampleWakeup({ status: 'queued' }))).rejects.toBeInstanceOf(
       HarnessStorageWakeupTransitionError,
@@ -2379,7 +2379,7 @@ describe('InMemoryHarness wakeup ledger', () => {
 
 describe('InMemoryHarness channel action ledger', () => {
   it('dedupes exact action tokens and flags immutable token mismatches', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await expect(storage.createOrLoadChannelActionToken(sampleChannelActionToken())).resolves.toMatchObject({
       duplicate: false,
       conflict: false,
@@ -2409,7 +2409,7 @@ describe('InMemoryHarness channel action ledger', () => {
   });
 
   it('dedupes exact action receipts and does not steal an active initial claim', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const first = await storage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt(), {
       initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 5000 },
     });
@@ -2427,7 +2427,7 @@ describe('InMemoryHarness channel action ledger', () => {
   });
 
   it('flags same action token with a different response hash as a conflict', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt());
 
     await expect(
@@ -2443,7 +2443,7 @@ describe('InMemoryHarness channel action ledger', () => {
   });
 
   it('treats action receipt provider action ids as immutable identity', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt());
 
     await expect(
@@ -2462,7 +2462,7 @@ describe('InMemoryHarness channel action ledger', () => {
   });
 
   it('reclaims crashed action receipts after claim expiry but respects nextAttemptAt backoff', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt({ nextAttemptAt: 7000 }), {
       initialClaim: { claimId: 'claim-1', now: 1000, claimTtlMs: 1000 },
     });
@@ -2490,7 +2490,7 @@ describe('InMemoryHarness channel action ledger', () => {
   });
 
   it('guards action receipt renewal and applied updates by owner claim', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
     try {
@@ -2551,7 +2551,7 @@ describe('InMemoryHarness channel action ledger', () => {
   });
 
   it('does not let a stale KEEP-claim update roll back a renewed action receipt claim', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
     try {
@@ -2594,7 +2594,7 @@ describe('InMemoryHarness channel action ledger', () => {
   });
 
   it('validates new action receipt rows before insert and keeps terminal saves idempotent', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await expect(
       storage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt({ status: 'accepted' })),
     ).rejects.toBeInstanceOf(HarnessStorageChannelActionReceiptTransitionError);
@@ -2625,7 +2625,7 @@ describe('InMemoryHarness channel action ledger', () => {
 
 describe('InMemoryHarness channel outbox ledger', () => {
   it('dedupes exact outbound projections and flags same-key delivery conflicts', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await expect(storage.enqueueChannelOutbox(sampleChannelOutbox())).resolves.toEqual({
       outboxItemId: 'outbox-1',
       duplicate: false,
@@ -2687,7 +2687,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
   });
 
   it('claims at most the oldest due row for one binding while allowing different bindings', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.enqueueChannelOutbox(
       sampleChannelOutbox({ id: 'outbox-1', idempotencyKey: 'key-1', createdAt: 1000 }),
     );
@@ -2718,7 +2718,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
   });
 
   it('does not starve due rows for other bindings behind one blocked binding', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.enqueueChannelOutbox(
       sampleChannelOutbox({ id: 'outbox-1', idempotencyKey: 'key-1', createdAt: 1000 }),
     );
@@ -2757,7 +2757,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
   });
 
   it('reclaims retryable outbox rows after claim expiry and respects retry backoff', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(6000);
     try {
       await storage.enqueueChannelOutbox(sampleChannelOutbox());
@@ -2808,7 +2808,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
   });
 
   it('guards sent and failed transitions by the active outbox claim', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 10_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
     try {
@@ -2858,7 +2858,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
   });
 
   it('records retryable and terminal outbox delivery failures as durable evidence', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     const now = 20_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
     try {
@@ -2918,7 +2918,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
 
   it('treats non-retryable outbox delivery failures as terminal', async () => {
     const db = new InMemoryDB();
-    const storage = new InMemoryHarness({ db });
+    const storage = await ledgerHarness(db);
     const now = 30_000;
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
     try {
@@ -2958,7 +2958,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
   });
 
   it('validates new outbox rows before insert', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await expect(
       storage.enqueueChannelOutbox(sampleChannelOutbox({ status: 'sent', sentAt: 1001 })),
     ).rejects.toBeInstanceOf(HarnessStorageChannelOutboxTransitionError);
@@ -2967,7 +2967,7 @@ describe('InMemoryHarness channel outbox ledger', () => {
 
 describe('InMemoryHarness channel diagnostics', () => {
   it('lists resource and session scoped diagnostics rows across channel ledgers', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
 
     await storage.saveChannelInboxItem(
       sampleChannelInbox({
@@ -3042,7 +3042,7 @@ describe('InMemoryHarness channel diagnostics', () => {
   });
 
   it('short-circuits empty or non-positive diagnostics requests', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    const storage = await ledgerHarness();
     await storage.saveChannelInboxItem(sampleChannelInbox());
 
     await expect(
@@ -3303,6 +3303,239 @@ describe('InMemoryHarness session delete erases run summaries', () => {
     await expect(harness.loadRunSummary({ runId: 'rs-deleted-late' })).resolves.toBeNull();
   });
 });
+
+describe('InMemoryHarness session delete erases channel and wakeup rows (PF-5309)', () => {
+  const saveClosedSession = (harness: InMemoryHarness, id: string) =>
+    harness.saveSession(
+      sampleSession({
+        id,
+        threadId: `thread-${id}`,
+        sessionIncarnation: `incarnation-${id}`,
+        closedAt: 2000,
+        lastActivityAt: 2000,
+      }),
+      { ownerId: 'h', ifVersion: 0 },
+    );
+  const deleteClosedSession = async (harness: InMemoryHarness, id: string) => {
+    const record = await harness.loadSession({ sessionId: id });
+    if (!record) throw new Error(`expected ${id}`);
+    await harness.deleteSession({
+      sessionId: id,
+      ifVersion: record.version,
+      expectedResourceId: record.resourceId,
+      expectedThreadId: record.threadId,
+      expectedParentSessionId: record.parentSessionId ?? null,
+      expectedCreatedAt: record.createdAt,
+      requireClosed: true,
+    });
+  };
+  const seedLedgerRows = async (harness: InMemoryHarness, id: string) => {
+    await harness.saveChannelInboxItem(
+      sampleChannelInbox({
+        id: `inbox-${id}`,
+        admissionId: `inbox-${id}`,
+        idempotencyKey: `event-${id}`,
+        externalMessageId: `message-${id}`,
+        resourceId: 'resource-1',
+        threadId: `thread-${id}`,
+        sessionId: id,
+        content: `private note of ${id}`,
+      }),
+    );
+    await harness.enqueueChannelOutbox(
+      sampleChannelOutbox({
+        id: `outbox-${id}`,
+        idempotencyKey: `outbox-${id}`,
+        sessionId: id,
+        owningSessionId: id,
+        payload: { text: `reply to ${id}` },
+      }),
+    );
+    await harness.enqueueChannelOutbox(
+      sampleChannelOutbox({
+        id: `outbox-owned-${id}`,
+        idempotencyKey: `outbox-owned-${id}`,
+        sessionId: undefined,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadChannelActionToken(
+      sampleChannelActionToken({
+        actionTokenId: `token-${id}`,
+        transportHash: `transport-${id}`,
+        itemId: `question-${id}`,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadChannelActionReceipt(
+      sampleChannelActionReceipt({
+        id: `receipt-${id}`,
+        actionTokenId: `token-${id}`,
+        actionId: `action-${id}`,
+        itemId: `question-${id}`,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadHarnessWakeupItem(
+      sampleWakeup({
+        id: `wakeup-${id}`,
+        idempotencyKey: `wake-${id}`,
+        sourceId: `schedule-${id}`,
+        admissionId: `wake-admission-${id}`,
+        threadId: `thread-${id}`,
+        sessionId: id,
+      }),
+    );
+  };
+  const ledgerRows = async (harness: InMemoryHarness, id: string) => {
+    const rows = await harness.listChannelDiagnosticsRows({ resourceId: 'resource-1', sessionIds: [id], limit: 10 });
+    const wakeup = await harness.loadHarnessWakeupItemByIdempotencyKey({
+      harnessName: 'default',
+      idempotencyKey: `wake-${id}`,
+    });
+    return {
+      inbox: rows.inbox.map(row => row.id),
+      outbox: rows.outbox.map(row => row.id).sort(),
+      actionTokens: rows.actionTokens.map(row => row.actionTokenId),
+      actionReceipts: rows.actionReceipts.map(row => row.id),
+      wakeups: wakeup ? [wakeup.id] : [],
+    };
+  };
+  const seededRows = (id: string) => ({
+    inbox: [`inbox-${id}`],
+    outbox: [`outbox-${id}`, `outbox-owned-${id}`],
+    actionTokens: [`token-${id}`],
+    actionReceipts: [`receipt-${id}`],
+    wakeups: [`wakeup-${id}`],
+  });
+  const noRows = { inbox: [], outbox: [], actionTokens: [], actionReceipts: [], wakeups: [] };
+
+  it("erases the session's channel and wakeup rows and keeps its fences and other sessions' rows", async () => {
+    const db = new InMemoryDB();
+    const harness = new InMemoryHarness({ db });
+    for (const id of ['ledger-deleted', 'ledger-kept']) {
+      await saveClosedSession(harness, id);
+      await seedLedgerRows(harness, id);
+    }
+    // A content-free grant tombstone naming the session (a revoked terminal grant).
+    db.harnessTerminalTombstones.set('tombstone-ledger-deleted', {
+      id: 'tombstone-ledger-deleted',
+      harnessName: 'default',
+      grant: { key: 'grant-ledger-deleted', generation: 1 },
+      sessionId: 'ledger-deleted',
+      admissionId: 'admission-ledger-deleted',
+      reason: { code: 'revoked', message: 'grant revoked' },
+      createdAt: 1000,
+    } as any);
+    await expect(ledgerRows(harness, 'ledger-deleted')).resolves.toEqual(seededRows('ledger-deleted'));
+
+    await deleteClosedSession(harness, 'ledger-deleted');
+
+    await expect(ledgerRows(harness, 'ledger-deleted')).resolves.toEqual(noRows);
+    await expect(ledgerRows(harness, 'ledger-kept')).resolves.toEqual(seededRows('ledger-kept'));
+    // The content-free terminal session fence and grant tombstone stay.
+    expect(
+      [...db.harnessTerminalSessionFences.keys()].filter(key => key.includes('incarnation-ledger-deleted')),
+    ).toHaveLength(1);
+    expect(db.harnessTerminalTombstones.get('tombstone-ledger-deleted')?.sessionId).toBe('ledger-deleted');
+  });
+
+  it('refuses a late channel or wakeup write for a deleted session and stores nothing', async () => {
+    const harness = new InMemoryHarness({ db: new InMemoryDB() });
+    await saveClosedSession(harness, 'ledger-late');
+    // An inbound row recorded before its session resolved (no session yet).
+    const now = Date.now();
+    const recorded = await harness.createOrLoadChannelInboxItem(
+      sampleChannelInbox({
+        id: 'inbox-unresolved',
+        admissionId: 'inbox-unresolved',
+        idempotencyKey: 'event-unresolved',
+      }),
+      { initialClaim: { claimId: 'claim-unresolved', now, claimTtlMs: 60_000 } },
+    );
+    await deleteClosedSession(harness, 'ledger-late');
+
+    const late = 'ledger-late';
+    await expect(
+      harness.saveChannelInboxItem(
+        sampleChannelInbox({
+          id: 'inbox-late',
+          admissionId: 'inbox-late',
+          idempotencyKey: 'event-late',
+          sessionId: late,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelInboxItem(
+        sampleChannelInbox({
+          id: 'inbox-late-2',
+          admissionId: 'inbox-late-2',
+          idempotencyKey: 'event-late-2',
+          sessionId: late,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    // Admission cannot bind the recorded row to the deleted session.
+    await expect(
+      harness.updateChannelInboxItem(
+        {
+          ...recorded.item,
+          status: 'admitted',
+          resourceId: 'resource-1',
+          threadId: `thread-${late}`,
+          sessionId: late,
+          delivery: 'queue',
+          admittedAt: now,
+          updatedAt: now,
+        },
+        { claimId: 'claim-unresolved' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.enqueueChannelOutbox(
+        sampleChannelOutbox({ id: 'outbox-late', sessionId: late, owningSessionId: undefined }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.enqueueChannelOutbox(
+        sampleChannelOutbox({ id: 'outbox-late-owned', sessionId: undefined, owningSessionId: late }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelActionToken(sampleChannelActionToken({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelActionReceipt(sampleChannelActionReceipt({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.saveChannelActionReceipt(sampleChannelActionReceipt({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadHarnessWakeupItem(sampleWakeup({ idempotencyKey: `wake-${late}`, sessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    await expect(ledgerRows(harness, late)).resolves.toEqual(noRows);
+    const unresolved = await harness.loadChannelInboxItemByIdempotencyKey({
+      harnessName: 'default',
+      channelId: 'support',
+      idempotencyKey: 'event-unresolved',
+    });
+    expect([unresolved?.status, unresolved?.sessionId]).toEqual(['received', undefined]);
+  });
+});
+
+/**
+ * Channel and wakeup rows are written only while the sessions they name exist,
+ * so the ledger tests start with the sessions their sample rows name.
+ */
+async function ledgerHarness(db = new InMemoryDB()): Promise<InMemoryHarness> {
+  const storage = new InMemoryHarness({ db });
+  for (const id of ['session-1', 'child-1', 'hidden-session']) {
+    await storage.saveSession(sampleSession({ id, threadId: `thread-${id}` }), { ownerId: 'h', ifVersion: 0 });
+  }
+  return storage;
+}
 
 function sampleSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {

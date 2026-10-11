@@ -793,6 +793,9 @@ export class InMemoryHarness extends HarnessStorage {
         deletedAt: Date.now(),
       });
       this.db.harnessSessions.delete(sessionKey(namespace, sessionId));
+      // In the same synchronous section as the session removal, so no write can
+      // interleave between the two.
+      this.eraseSessionChannelAndWakeupRows(namespace, sessionId);
     }
 
     for (const { namespace, sessionId, record } of existingSessions.values()) {
@@ -3352,6 +3355,7 @@ export class InMemoryHarness extends HarnessStorage {
       if (channelInboxItemsEqual(existing, namespaced)) return;
       assertLegalChannelInboxUpdate(existing, namespaced);
     }
+    this.assertSessionsExist(namespaced.harnessName, [namespaced.sessionId]);
     this.db.harnessChannelInbox.set(channelInboxKey(namespaced.harnessName, namespaced.id), cloneJson(namespaced));
   }
 
@@ -3362,6 +3366,9 @@ export class InMemoryHarness extends HarnessStorage {
     const namespace = resolveHarnessName(record.harnessName, this.harnessName);
     const incoming: ChannelInboxItem = { ...record, harnessName: namespace };
     assertValidChannelInboxState(incoming);
+    // The SQL adapters guard their first statement (the insert), so the session
+    // check precedes the idempotency lookup here too.
+    this.assertSessionsExist(namespace, [incoming.sessionId]);
     const existing = this.findChannelInboxByIdempotencyKey({
       harnessName: namespace,
       channelId: incoming.channelId,
@@ -3508,6 +3515,11 @@ export class InMemoryHarness extends HarnessStorage {
         ? { ...record, harnessName: namespace }
         : { ...record, harnessName: namespace, claimId: current.claimId, claimExpiresAt: current.claimExpiresAt };
     assertLegalChannelInboxUpdate(current, next);
+    // Admission writes the resolved session onto a row recorded without one.
+    // A row that keeps its session needs no check: it is erased together with
+    // that session, and this update cannot insert a row (the SQL adapters
+    // guard the same way).
+    if (next.sessionId !== current.sessionId) this.assertSessionsExist(namespace, [next.sessionId]);
     this.db.harnessChannelInbox.set(channelInboxKey(namespace, record.id), cloneJson(next));
   }
 
@@ -3548,6 +3560,7 @@ export class InMemoryHarness extends HarnessStorage {
     if (pendingOwner) {
       return { token: cloneJson(pendingOwner), duplicate: true, conflict: true };
     }
+    this.assertSessionsExist(token.harnessName, [token.owningSessionId]);
     this.db.harnessChannelActionTokens.set(
       channelActionTokenKey(token.harnessName, token.channelId, token.actionTokenId),
       cloneJson(token),
@@ -3636,6 +3649,7 @@ export class InMemoryHarness extends HarnessStorage {
         'action token is already owned by another receipt',
       );
     }
+    this.assertSessionsExist(receipt.harnessName, [receipt.owningSessionId]);
     this.db.harnessChannelActionReceipts.set(
       channelActionReceiptKey(receipt.harnessName, receipt.id),
       cloneJson(receipt),
@@ -3670,6 +3684,7 @@ export class InMemoryHarness extends HarnessStorage {
       }
       return { receipt: cloneJson(receipt), duplicate: true, conflict, claimed };
     }
+    this.assertSessionsExist(namespace, [incoming.owningSessionId]);
     const existingById = this.findChannelActionReceiptById(incoming.id);
     if (existingById) {
       throw new HarnessStorageChannelActionReceiptTransitionError(
@@ -3821,6 +3836,7 @@ export class InMemoryHarness extends HarnessStorage {
   }> {
     const item = { ...record, harnessName: resolveHarnessName(record.harnessName, this.harnessName) };
     assertValidChannelOutboxState(item);
+    this.assertSessionsExist(item.harnessName, [item.sessionId, item.owningSessionId]);
     const existing = this.findChannelOutboxByIdempotencyKey({
       harnessName: item.harnessName,
       bindingId: item.bindingId,
@@ -4056,6 +4072,7 @@ export class InMemoryHarness extends HarnessStorage {
       );
     }
     assertValidHarnessWakeupState(incoming);
+    this.assertSessionsExist(namespace, [incoming.sessionId]);
     const existing = this.findHarnessWakeupByIdempotencyKey({
       harnessName: namespace,
       idempotencyKey: incoming.idempotencyKey,
@@ -4347,6 +4364,50 @@ export class InMemoryHarness extends HarnessStorage {
       }
     }
     return null;
+  }
+
+  /**
+   * Erase a deleted session's channel and wakeup rows: inbox items (inbound
+   * content), outbox items (outbound payloads) of the session or owned by it,
+   * action tokens and receipts it owns, and its wakeups. The content-free
+   * fences (terminal session fences and grant tombstones) stay.
+   */
+  private eraseSessionChannelAndWakeupRows(namespace: string, sessionId: string): void {
+    for (const [key, item] of this.db.harnessChannelInbox) {
+      if (item.harnessName === namespace && item.sessionId === sessionId) this.db.harnessChannelInbox.delete(key);
+    }
+    for (const [key, item] of this.db.harnessChannelOutbox) {
+      if (item.harnessName === namespace && (item.sessionId === sessionId || item.owningSessionId === sessionId)) {
+        this.db.harnessChannelOutbox.delete(key);
+      }
+    }
+    for (const [key, receipt] of this.db.harnessChannelActionReceipts) {
+      if (receipt.harnessName === namespace && receipt.owningSessionId === sessionId) {
+        this.db.harnessChannelActionReceipts.delete(key);
+      }
+    }
+    for (const [key, token] of this.db.harnessChannelActionTokens) {
+      if (token.harnessName === namespace && token.owningSessionId === sessionId) {
+        this.db.harnessChannelActionTokens.delete(key);
+      }
+    }
+    for (const [key, item] of this.db.harnessWakeupItems) {
+      if (item.harnessName === namespace && item.sessionId === sessionId) this.db.harnessWakeupItems.delete(key);
+    }
+  }
+
+  /**
+   * Channel and wakeup rows are written only while every session they name
+   * exists, so a late write cannot restore rows `deleteSessions` erased. The
+   * check and the write run in one synchronous section.
+   */
+  private assertSessionsExist(namespace: string, sessionIds: readonly (string | undefined)[]): void {
+    for (const sessionId of sessionIds) {
+      if (sessionId === undefined) continue;
+      if (!this.db.harnessSessions.has(sessionKey(namespace, sessionId))) {
+        throw new HarnessStorageSessionNotFoundError(sessionId);
+      }
+    }
   }
 
   private findChannelInboxById(inboxItemId: string): ChannelInboxItem | null {
