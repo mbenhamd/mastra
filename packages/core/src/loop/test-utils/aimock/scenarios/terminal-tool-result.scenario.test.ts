@@ -530,6 +530,51 @@ describeForAllEngines('AIMock loop scenario: terminal tool result', engine => {
     expect(output.error?.message ?? '').toMatch(/did not retain exactly one/);
   });
 
+  it('still rejects a final output processor that adds a terminal part under another id', async () => {
+    const answerTool = createTool({
+      id: 'copied_answer_tool',
+      description: 'Return the complete answer.',
+      inputSchema: z.object({}),
+      terminalResult: {
+        isSuccess: () => true,
+        project: () => ({ text: 'This answer is copied.' }),
+        outputSchema: z.object({ text: z.string() }),
+      },
+      execute: async () => ({ ok: true }),
+    });
+    const copyingProcessor = {
+      id: 'copy-terminal-part',
+      terminalToolResultPolicy: 'pass-through' as const,
+      processOutputResult: async ({ messageList }: { messageList: import('../../../../agent').MessageList }) => {
+        for (const message of messageList.get.response.db()) {
+          if (typeof message.content !== 'object' || !Array.isArray(message.content.parts)) continue;
+          const terminal = message.content.parts.find(part => part.type === 'data-terminal-tool-result');
+          if (terminal && 'id' in terminal) {
+            message.content.parts.push({ ...structuredClone(terminal), id: `${terminal.id}:copy` });
+          }
+        }
+        return messageList;
+      },
+    };
+
+    const { output } = await runLoopScenario({
+      llm: getMock(),
+      prompt: 'Return the copied answer.',
+      tools: { copied_answer_tool: answerTool },
+      engine,
+      outputProcessors: [copyingProcessor],
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', hasToolResult: false },
+          { toolCalls: [{ id: 'call-copied', name: 'copied_answer_tool', arguments: {} }] },
+        );
+      },
+    });
+
+    expect(output.terminalToolResult).toBeUndefined();
+    expect(output.error?.message ?? '').toMatch(/did not retain exactly one/);
+  });
+
   it('recalls the terminal answer exactly once in the next provider request', async () => {
     const storage = new InMemoryStore();
     const memory = new MockMemory({ storage, enableMessageHistory: false });

@@ -21,7 +21,7 @@ import type {
 } from '../../stream/types';
 import type { TerminalToolResult } from '../../tools/types';
 import type { AgentExecutionOptionsBase } from '../agent.types';
-import { MessageList } from '../message-list';
+import { findRetainedTerminalToolResultPart, MessageList } from '../message-list';
 import { stableStringify } from '../message-list/cache/stable-stringify';
 import type { StructuredOutputOptions } from '../types';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from './constants';
@@ -185,27 +185,18 @@ export function createTerminalToolResultEnvelope(
  * Re-assert the exact terminal marker after every final output processor has
  * run. Pass-through declarations are an eligibility gate, not proof that a
  * processor retained the authoritative message unchanged. The marker is
- * identified by its framework part id across the response, because a final
- * output processor may re-identify the message that carries it (for example a
- * memory processor that stamps a deterministic storage id). Earlier terminal
- * parts of other runs may legitimately sit in the response (a signal boundary
- * promotes recalled history), so only parts with this run's id count.
+ * matched by its framework part id across the response, not by the id of the
+ * message carrying it (see findRetainedTerminalToolResultPart); a terminal
+ * part a processor introduced or multiplied is rejected against the snapshot
+ * taken before the processors ran.
  */
 export function assertTerminalToolResultRetained(
   messageList: MessageList,
   envelope: ReturnType<typeof createTerminalToolResultEnvelope>,
+  beforeProcessors: ReadonlyMap<string, number>,
 ): void {
-  const terminalParts = messageList.get.response
-    .db()
-    .flatMap(message =>
-      typeof message.content === 'object' && Array.isArray(message.content.parts)
-        ? message.content.parts.filter(
-            part => part.type === 'data-terminal-tool-result' && 'id' in part && part.id === envelope.id,
-          )
-        : [],
-    ) as Array<{ type: 'data-terminal-tool-result'; id: string; data: unknown }>;
-  const [retained] = terminalParts;
-  if (terminalParts.length !== 1 || retained === undefined) {
+  const retained = findRetainedTerminalToolResultPart(messageList, envelope.id, beforeProcessors);
+  if (retained === undefined) {
     throw new TerminalToolResultIntegrityError(
       'Final output processors did not retain exactly one authoritative terminal tool result',
     );

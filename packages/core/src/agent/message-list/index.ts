@@ -96,7 +96,9 @@ export { CacheKeyGenerator } from './cache';
 export { MessageMerger } from './merge';
 
 export {
+  countResponseTerminalToolResultParts,
   createTerminalToolResultPartId,
+  findRetainedTerminalToolResultPart,
   MAX_TERMINAL_TOOL_RESULT_ENVELOPE_BYTES,
   MAX_TERMINAL_TOOL_RESULT_MODEL_TEXT_BYTES,
   formatTerminalToolResultForModel,
