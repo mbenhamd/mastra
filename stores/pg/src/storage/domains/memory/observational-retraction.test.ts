@@ -744,6 +744,191 @@ describe('MemoryPG observational-memory retraction', () => {
     });
   });
 
+  it('clears observer working memory of an unmarked record inside the deletion when the caller manages it', async () => {
+    const policyResourceId = `${resourceId}-policy-managed`;
+    const policyThreadId = `${threadId}-policy-managed`;
+    const deletedMessageId = `${policyThreadId}-deleted`;
+    const keptMessageId = `${policyThreadId}-kept`;
+    await observerMemory.saveResource({
+      resource: { id: policyResourceId, workingMemory: null as any, metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    await observerMemory.saveThread({
+      thread: {
+        id: policyThreadId,
+        resourceId: policyResourceId,
+        title: '',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.saveMessages({
+      messages: [deletedMessageId, keptMessageId].map(id => ({
+        id,
+        threadId: policyThreadId,
+        resourceId: policyResourceId,
+        role: 'user' as const,
+        content: { format: 2 as const, parts: [{ type: 'text' as const, text: id }] },
+        createdAt,
+      })),
+    });
+    // Written before the managed-scope marker existed: no `_managedWorkingMemoryScope`.
+    const record = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: policyResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    const guard = { recordId: record.id, threadId: null, resourceId: policyResourceId };
+    // The observer learned the deleted message's fact under the record's generation.
+    await observerMemory.updateResourceFromObservationalMemory({
+      resourceId: policyResourceId,
+      workingMemory: '{"codeword":"KESTREL"}',
+      guard,
+    });
+
+    // The deletion waits on the OM resource lock while a second observer
+    // write queues behind it: the write that lands before the deletion is
+    // cleared by it, and the one after it is fenced off.
+    const blocker = new Pool({ connectionString });
+    const client = await blocker.connect();
+    let transactionOpen = false;
+    const receipts: Array<{ result: { clearedScopes: string[]; clearedResourceWorkingMemory: boolean } }> = [];
+    let lateWrite: Promise<unknown> | undefined;
+    try {
+      await client.query('BEGIN');
+      transactionOpen = true;
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+        `mastra:observational-memory:${policyResourceId}`,
+      ]);
+      const deletion = retractorMemory.deleteMessages([deletedMessageId], {
+        retractObservationalMemory: true,
+        managedWorkingMemoryScope: 'resource',
+        observationalMemoryRetractions: receipts as any,
+      });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      lateWrite = observerMemory
+        .updateResourceFromObservationalMemory({
+          resourceId: policyResourceId,
+          workingMemory: '{"codeword":"KESTREL","resurrected":true}',
+          guard,
+        })
+        .then(
+          () => 'applied',
+          (error: unknown) => error,
+        );
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(receipts).toEqual([]);
+      await client.query('COMMIT');
+      transactionOpen = false;
+      await deletion;
+    } finally {
+      if (transactionOpen) await client.query('ROLLBACK');
+      client.release();
+      await blocker.end();
+    }
+
+    expect(receipts).toMatchObject([{ result: { clearedScopes: ['resource'], clearedResourceWorkingMemory: true } }]);
+    // The late observer write names the retracted generation and is refused.
+    expect(await lateWrite).not.toBe('applied');
+    await expect(retractorMemory.getResourceById({ resourceId: policyResourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    await expect(retractorMemory.getObservationalMemory(null, policyResourceId)).resolves.toBeNull();
+    await expect(retractorMemory.listMessagesById({ messageIds: [deletedMessageId] })).resolves.toEqual({
+      messages: [],
+    });
+    await expect(retractorMemory.listMessagesById({ messageIds: [keptMessageId] })).resolves.toMatchObject({
+      messages: [{ id: keptMessageId }],
+    });
+
+    // Without the caller's policy an unmarked record keeps the stricter
+    // default: working memory it does not provably own stays.
+    await observerMemory.updateResource({ resourceId: policyResourceId, workingMemory: 'Profile from elsewhere.' });
+    await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: policyResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await retractorMemory.deleteMessages([keptMessageId], { retractObservationalMemory: true });
+    await expect(retractorMemory.getResourceById({ resourceId: policyResourceId })).resolves.toMatchObject({
+      workingMemory: 'Profile from elsewhere.',
+    });
+    await expect(retractorMemory.getObservationalMemory(null, policyResourceId)).resolves.toBeNull();
+  });
+
+  it('keeps the source-write successor when a policy-managed retraction clears observer working memory', async () => {
+    const successorResourceId = `${resourceId}-policy-successor`;
+    const successorThreadId = `${threadId}-policy-successor`;
+    await observerMemory.saveResource({
+      resource: {
+        id: successorResourceId,
+        workingMemory: '{"codeword":"ORION"}',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    await observerMemory.saveThread({
+      thread: {
+        id: successorThreadId,
+        resourceId: successorResourceId,
+        title: '',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    const predecessor = await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: successorResourceId,
+      scope: 'thread',
+      threadId: successorThreadId,
+    });
+    const predecessorGuard = { recordId: predecessor.id, threadId: successorThreadId, resourceId: successorResourceId };
+    const successorRecordId = `${predecessor.id}-successor`;
+    const retraction = await retractorMemory.retractObservationalMemory({
+      resourceId: successorResourceId,
+      threadId: successorThreadId,
+      managedWorkingMemoryScope: 'resource',
+      sourceWriteSuccessor: { predecessor: predecessorGuard, successorRecordId },
+    });
+    expect(retraction).toMatchObject({
+      clearedScopes: ['thread'],
+      clearedResourceWorkingMemory: true,
+      sourceWriteGuard: { recordId: successorRecordId },
+    });
+    await expect(retractorMemory.getResourceById({ resourceId: successorResourceId })).resolves.toMatchObject({
+      workingMemory: null,
+    });
+    // The successor survives the retraction and is the generation a source
+    // write now resolves.
+    await expect(
+      retractorMemory.getObservationalMemoryForSourceWrite({
+        threadId: successorThreadId,
+        resourceId: successorResourceId,
+        sourceWriteGuard: { recordId: successorRecordId, threadId: successorThreadId, resourceId: successorResourceId },
+      }),
+    ).resolves.toMatchObject({ id: successorRecordId });
+    // A replay finds the successor and clears nothing again.
+    await observerMemory.updateResource({ resourceId: successorResourceId, workingMemory: 'Learned since.' });
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: successorResourceId,
+        threadId: successorThreadId,
+        managedWorkingMemoryScope: 'resource',
+        sourceWriteSuccessor: { predecessor: predecessorGuard, successorRecordId },
+      }),
+    ).resolves.toMatchObject({
+      clearedResourceWorkingMemory: false,
+      sourceWriteGuard: { recordId: successorRecordId },
+    });
+    await expect(retractorMemory.getResourceById({ resourceId: successorResourceId })).resolves.toMatchObject({
+      workingMemory: 'Learned since.',
+    });
+  });
+
   it('preserves externally managed profile memory when OM does not own it', async () => {
     const externalResourceId = `${resourceId}-external`;
     const externalThreadId = `${threadId}-external`;

@@ -219,10 +219,17 @@ function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 
   return scope === 'thread' || scope === 'resource' ? scope : undefined;
 }
 
-function getManagedWorkingMemoryScopes(records: ReadonlyArray<{ config: unknown }>): Set<'thread' | 'resource'> {
+/**
+ * The working-memory scopes the retracted records manage. An unmarked record
+ * counts as `fallback` when the caller's policy names one.
+ */
+function getManagedWorkingMemoryScopes(
+  records: ReadonlyArray<{ config: unknown }>,
+  fallback?: 'thread' | 'resource',
+): Set<'thread' | 'resource'> {
   const scopes = new Set<'thread' | 'resource'>();
   for (const record of records) {
-    const scope = getManagedWorkingMemoryScope(record.config);
+    const scope = getManagedWorkingMemoryScope(record.config) ?? fallback;
     if (scope) scopes.add(scope);
   }
   return scopes;
@@ -2565,6 +2572,7 @@ export class MemoryPG extends MemoryStorage {
     messageIds: string[],
     options?: {
       retractObservationalMemory?: boolean;
+      managedWorkingMemoryScope?: 'thread' | 'resource';
       observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
     },
   ): Promise<void> {
@@ -2618,6 +2626,7 @@ export class MemoryPG extends MemoryStorage {
                 resourceId: message.resolvedResourceId,
               })),
               messageIds[0],
+              options.managedWorkingMemoryScope,
             )),
           );
         }
@@ -2875,13 +2884,15 @@ export class MemoryPG extends MemoryStorage {
         const row = await t.one<StorageResourceType & { createdAtZ: Date | string; updatedAtZ: Date | string }>(
           `INSERT INTO ${tableName}
              (id, "workingMemory", metadata, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ")
-           VALUES ($1, $2, '{}'::jsonb, $3, $3, $3, $3)
+           VALUES ($1, $2, '{}'::jsonb, $3, $4, $3, $4)
            ON CONFLICT (id) DO UPDATE SET
              "workingMemory" = EXCLUDED."workingMemory",
              "updatedAt" = EXCLUDED."updatedAt",
              "updatedAtZ" = EXCLUDED."updatedAtZ"
            RETURNING *`,
-          [resourceId, workingMemory, nowStr],
+          // One parameter per column type: a parameter shared by the timestamp
+          // and timestamptz columns is refused (42P08, inconsistent types).
+          [resourceId, workingMemory, nowStr, nowStr],
         );
         return {
           id: row.id,
@@ -4998,9 +5009,11 @@ export class MemoryPG extends MemoryStorage {
     const lookupKeys = new Set(records.map(record => record.lookupKey));
     const resourceRecordManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
       records.filter(record => record.lookupKey === resourceLookupKey),
+      input.managedWorkingMemoryScope,
     );
     const threadRecordManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
       records.filter(record => record.lookupKey === threadLookupKey),
+      input.managedWorkingMemoryScope,
     );
     let clearedResourceWorkingMemory = false;
     let clearedThreadMetadata = false;
@@ -5187,6 +5200,7 @@ export class MemoryPG extends MemoryStorage {
     t: TxClient,
     messages: ReadonlyArray<{ threadId?: string | null; resourceId?: string | null }>,
     conflictId?: string,
+    managedWorkingMemoryScope?: 'thread' | 'resource',
   ): Promise<ObservationalMemoryRetractionReceipt[]> {
     const threadIds = sortedUniqueStrings(messages.map(message => message.threadId));
     const lookupKeys = threadIds.map(threadId => this.getOMKey(threadId, ''));
@@ -5222,6 +5236,7 @@ export class MemoryPG extends MemoryStorage {
       coordinates.set(`${resourceId}\u0000${message.threadId}`, {
         resourceId,
         threadId: message.threadId,
+        ...(managedWorkingMemoryScope ? { managedWorkingMemoryScope } : {}),
       });
     }
 

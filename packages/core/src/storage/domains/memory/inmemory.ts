@@ -229,13 +229,19 @@ function mergeObservationalThreadMetadata(
   return { ...existing, mastra: { ...existingMastra, om: updateMastra.om } };
 }
 
-function getManagedWorkingMemoryScopes(records: readonly ObservationalMemoryRecord[]): Set<'thread' | 'resource'> {
+/**
+ * The working-memory scopes the retracted records manage. An unmarked record
+ * counts as `fallback` when the caller's policy names one.
+ */
+function getManagedWorkingMemoryScopes(
+  records: readonly ObservationalMemoryRecord[],
+  fallback?: 'thread' | 'resource',
+): Set<'thread' | 'resource'> {
   const scopes = new Set<'thread' | 'resource'>();
   for (const record of records) {
-    const scope = record.config?._managedWorkingMemoryScope;
-    if (scope === 'thread' || scope === 'resource') {
-      scopes.add(scope);
-    }
+    const marked = record.config?._managedWorkingMemoryScope;
+    const scope = marked === 'thread' || marked === 'resource' ? marked : fallback;
+    if (scope) scopes.add(scope);
   }
   return scopes;
 }
@@ -1014,6 +1020,7 @@ export class InMemoryMemory extends MemoryStorage {
     messageIds: string[],
     options?: {
       retractObservationalMemory?: boolean;
+      managedWorkingMemoryScope?: 'thread' | 'resource';
       observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
     },
   ): Promise<void> {
@@ -1023,7 +1030,7 @@ export class InMemoryMemory extends MemoryStorage {
 
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
     this.withMemoryStateRollback(options?.retractObservationalMemory === true, () => {
-      const retractionCoordinates: Array<{ resourceId: string; threadId: string }> = [];
+      const retractionCoordinates: RetractObservationalMemoryInput[] = [];
       if (options?.retractObservationalMemory) {
         const coordinates = new Map<string, { resourceId: string; threadId: string }>();
         for (const messageId of messageIds) {
@@ -1034,7 +1041,12 @@ export class InMemoryMemory extends MemoryStorage {
             message.resourceId ?? undefined,
           );
           if (!input) continue;
-          coordinates.set(`${input.resourceId}\u0000${input.threadId}`, input);
+          coordinates.set(`${input.resourceId}\u0000${input.threadId}`, {
+            ...input,
+            ...(options.managedWorkingMemoryScope
+              ? { managedWorkingMemoryScope: options.managedWorkingMemoryScope }
+              : {}),
+          });
         }
         retractionCoordinates.push(
           ...[...coordinates.values()].sort((a, b) =>
@@ -2432,8 +2444,14 @@ export class InMemoryMemory extends MemoryStorage {
       this.rotateObservationalMemoryGeneration(successorRecord.id);
     }
 
-    const resourceManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(resourceRecords);
-    const threadManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(threadRecords);
+    const resourceManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
+      resourceRecords,
+      input.managedWorkingMemoryScope,
+    );
+    const threadManagedWorkingMemoryScopes = getManagedWorkingMemoryScopes(
+      threadRecords,
+      input.managedWorkingMemoryScope,
+    );
     const resource = this.db.resources.get(input.resourceId);
     let clearedResourceWorkingMemory = false;
     if (
