@@ -68,6 +68,7 @@ import {
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
+import type { TracingContext } from '../../observability';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
 import {
@@ -250,6 +251,8 @@ import {
 } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
+import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
+import type { DelegationDriveSettlement } from './subagent-tracing';
 import type {
   HarnessSubagentDirectAnswer,
   HarnessSubagentResultSummary,
@@ -2061,6 +2064,11 @@ export class Session {
         maxCustomEventPayloadBytes: () => this._harness._internalMaxEventPayloadBytes,
       },
     );
+  }
+
+  /** Run options that attach this session's runs to its spawning parent's trace. */
+  private _subagentTracingOptions(): { tracingContext?: TracingContext } {
+    return this._subagentTracingContext !== undefined ? { tracingContext: this._subagentTracingContext } : {};
   }
 
   private _createEmptySynthesisOptions() {
@@ -6611,6 +6619,15 @@ export class Session {
    */
   _subagentParentToolCallId?: string;
 
+  /**
+   * @internal — tracing context a spawned/delegated child's runs attach to, so
+   * subagent spans join the parent trace and inherit its span metadata
+   * (`subagent-tracing.ts`). Set by the spawning parent before the child's turn
+   * starts. Process-local: a delegated child re-driven after a restart has no
+   * live parent span and starts its own trace.
+   */
+  _subagentTracingContext?: TracingContext;
+
   /** @internal — writes the latest opaque workspace state into the session record. */
   private async _persistWorkspaceState(state: unknown): Promise<void> {
     const providerId = this._harness._workspaceRegistry.providerId;
@@ -8652,6 +8669,7 @@ export class Session {
       abortSignal: turnAbortSignal,
       requestContext,
       maxSteps: HARNESS_SESSION_MAX_STEPS,
+      ...this._subagentTracingOptions(),
       ...toolSurface,
       ...(turnInstructions ? { instructions: turnInstructions } : {}),
       // §9 per-turn override: caller-supplied model generation settings
@@ -12915,6 +12933,7 @@ export class Session {
           requestContext,
           maxSteps: HARNESS_SESSION_MAX_STEPS,
           ...this._createEmptySynthesisOptions(),
+          ...this._subagentTracingOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
           ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
@@ -13358,6 +13377,7 @@ export class Session {
                 ...(this._currentTurnSourceWriteGuard
                   ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
                   : {}),
+                ...this._subagentTracingOptions(),
                 ...(lineagedWakeAbortController ? { abortSignal: lineagedWakeAbortController.signal } : {}),
                 ...(responseLogicalMessageIdentity ? { logicalMessageIdentity: responseLogicalMessageIdentity } : {}),
               } as never,
@@ -13551,6 +13571,7 @@ export class Session {
           requestContext,
           maxSteps: HARNESS_SESSION_MAX_STEPS,
           ...this._createEmptySynthesisOptions(),
+          ...this._subagentTracingOptions(),
           ...toolSurface,
           ...(turnInstructions ? { instructions: turnInstructions } : {}),
           ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
@@ -13670,6 +13691,7 @@ export class Session {
             ...(this._currentTurnSourceWriteGuard
               ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
               : {}),
+            ...this._subagentTracingOptions(),
           } as never,
         },
       },
@@ -16349,6 +16371,7 @@ export class Session {
         // (the agent-controller documents the identical trap for its lane).
         maxSteps: HARNESS_SESSION_MAX_STEPS,
         ...this._createEmptySynthesisOptions(),
+        ...this._subagentTracingOptions(),
         ...resumeToolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
         ...(pending.observationalMemorySourceWriteGuard
@@ -18706,6 +18729,7 @@ export class Session {
         // must carry the same step ceiling as direct turns — omitting it here
         // capped channel/queued deliveries at the provider's 5-step default.
         maxSteps: HARNESS_SESSION_MAX_STEPS,
+        ...this._subagentTracingOptions(),
         ...toolSurface,
         ...(turnInstructions ? { instructions: turnInstructions } : {}),
         ...(item.observationalMemorySourceWriteGuard
@@ -21197,6 +21221,7 @@ export class Session {
     parentToolCallId?: string,
     parentRunId?: string,
     callerRequestContext?: RequestContext,
+    parentTracingContext?: TracingContext,
   ): Promise<PlanTaskView & { subagentSessionId: string }> {
     this._assertLive('task_delegate');
     const admissionEpoch = this._captureActiveWorkAdmission('task_delegate');
@@ -21404,6 +21429,7 @@ export class Session {
       delegationDeadlineAt,
       delegationParentToolCallId,
       delegatedRequestContext?.app,
+      parentTracingContext,
     );
 
     return { ...view, subagentSessionId: child.id };
@@ -21490,6 +21516,7 @@ export class Session {
     deadlineAt: number,
     parentToolCallId: string,
     requestContextApp?: Record<string, JsonValue>,
+    parentTracingContext?: TracingContext,
   ): Promise<void> {
     let outcome: DelegatedSubagentOutcome = 'failed';
     let rawResult: unknown;
@@ -21578,6 +21605,14 @@ export class Session {
       modelId,
       depth: childDepth,
     });
+    // The delegation outlives the delegating tool call, so its child runs
+    // attach to a detached-lifetime delegation span in the parent trace
+    // (subagent-tracing.ts). It covers the whole drive through settlement and
+    // is started immediately before the try blocks whose last finally ends it.
+    // A restart re-drive has no live parent span; its child runs start their
+    // own trace.
+    const delegationSpan = startDelegatedSubagentSpan(parentTracingContext, agentType);
+    child._subagentTracingContext = delegationSpan !== undefined ? { currentSpan: delegationSpan } : undefined;
     try {
       // The deadline covers admission/dispatch as well as the eventual result.
       // Racing only the returned result leaves a storage/provider stall inside
@@ -21651,12 +21686,16 @@ export class Session {
     } finally {
       unsubProgress();
       this._activeSubagents.delete(`delegate:${child.id}`);
+      child._subagentTracingContext = undefined;
     }
-    const summary = summarizeHarnessSubagentResult(rawResult, {
-      isError: outcome !== 'completed',
-      ...(publicError !== undefined ? { error: publicError } : {}),
-    });
+    // How the drive settled the delegation, recorded on the delegation span.
+    // Anything but `settled` leaves the durable task to restart reconciliation.
+    let settlement: DelegationDriveSettlement = 'error';
     try {
+      const summary = summarizeHarnessSubagentResult(rawResult, {
+        isError: outcome !== 'completed',
+        ...(publicError !== undefined ? { error: publicError } : {}),
+      });
       // Close the terminal child BEFORE clearing its durable plan link. If the
       // process dies after close, recovery can still settle from signal evidence;
       // if close fails, retaining the link keeps ownership discoverable and
@@ -21664,11 +21703,16 @@ export class Session {
       try {
         await child.close();
       } catch {
+        settlement = 'close_failed';
         this._scheduleDelegationReconcileRetry(0);
         return;
       }
       const reconciled = await this._reconcileDelegatedTask(taskId, child.id, outcome, summary);
-      if (!reconciled) return;
+      if (!reconciled) {
+        settlement = 'not_reconciled';
+        return;
+      }
+      settlement = 'settled';
       // A successful subagent_end is a durable settlement notification, not a
       // provider-stop notification. Emit only after child closure and the
       // fenced plan write both committed so reconnecting UI cannot show a
@@ -21686,6 +21730,7 @@ export class Session {
     } finally {
       this._delegationDriverClaims.delete(child.id);
       this._internalReleaseSubagentExecution();
+      endDelegatedSubagentSpan(delegationSpan, outcome, settlement);
     }
   }
 

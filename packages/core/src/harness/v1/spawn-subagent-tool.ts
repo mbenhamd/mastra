@@ -23,6 +23,7 @@ import { HarnessSubagentDepthExceededError, HarnessValidationError } from './err
 import { projectHarnessPublicError } from './events';
 import { projectInheritedRequestContextApp } from './request-context-input';
 import type { Session } from './session';
+import { liveSubagentTracingContext } from './subagent-tracing';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   harnessSubagentResultSummarySchema,
@@ -234,6 +235,9 @@ export function createSpawnSubagentTool(parent: Session) {
         if (def.tools) child._subagentToolsOverride = def.tools;
         if (def.toolAllowlist) child._subagentToolAllowlist = def.toolAllowlist;
         child._subagentParentToolCallId = toolCallId;
+        // The child's runs attach to this tool call's span: subagent spans stay
+        // in the parent trace and inherit its span metadata (subagent-tracing.ts).
+        child._subagentTracingContext = liveSubagentTracingContext(ctx.tracingContext);
 
         // Bridge the child's per-turn events into the parent's subscriber
         // stream as `subagent_*`. `_emitSubagentEvent` stamps `parentId` and
