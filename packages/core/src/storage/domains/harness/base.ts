@@ -1113,6 +1113,9 @@ export abstract class HarnessStorage extends StorageDomain {
    *
    * Implementations should also delete attachments owned by the session
    * (equivalent to `deleteAttachmentsForSession`) to keep the index clean.
+   * They must also erase the session's channel, action and wakeup rows in the
+   * same delete (see "Session erasure" at the channel inbox ledger), since the
+   * default `deleteSessions` delegates a single-session delete here.
    */
   abstract deleteSession(opts: DeleteSessionOptions): Promise<void>;
 
