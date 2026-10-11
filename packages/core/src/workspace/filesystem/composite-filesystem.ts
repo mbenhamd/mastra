@@ -22,7 +22,7 @@
 import posixPath from 'node:path/posix';
 
 import type { RequestContext } from '../../request-context';
-import { FilesystemError, PermissionError } from '../errors';
+import { FilesystemError, IsDirectoryError, PermissionError } from '../errors';
 import { callLifecycle } from '../lifecycle';
 import type { ProviderStatus } from '../lifecycle';
 import type {
@@ -305,10 +305,14 @@ export class CompositeFilesystem<
 
   async readFile(path: string, options?: ReadOptions): Promise<string | Buffer> {
     const r = this.resolveMount(path);
-    // No mount holds this path, so no such file exists (`exists()` reports
-    // false too). Code it ENOENT so callers that treat a missing file as
-    // absent, such as the root `.gitignore` lookup, keep working on a composite.
-    if (!r) throw new FilesystemError(`No mount for path: ${path}`, 'ENOENT', path);
+    if (!r) {
+      // The root and mount parents are virtual directories.
+      if (this.isVirtualPath(path)) throw new IsDirectoryError(path);
+      // No mount holds this path, so no such file exists (`exists()` reports
+      // false too). Code it ENOENT so callers that treat a missing file as
+      // absent, such as the root `.gitignore` lookup, keep working on a composite.
+      throw new FilesystemError(`No mount for path: ${path}`, 'ENOENT', path);
+    }
     return r.fs.readFile(r.fsPath, options);
   }
 
