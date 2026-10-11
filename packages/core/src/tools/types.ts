@@ -76,6 +76,9 @@ export interface ToolTerminalResultContext {
  * Provider-executed, background, denied, suspended, or failed calls are never
  * terminal candidates.
  */
+/** How a framework tool-call receipt records a returned output. */
+export type ToolResultStatus = 'success' | 'error';
+
 export interface ToolTerminalResultConfig<TOutput = unknown, TResult = unknown> {
   /** Return true only when the tool output is a complete caller-facing answer. Required to fail closed. */
   isSuccess: (output: TOutput, context: ToolTerminalResultContext) => boolean | Promise<boolean>;
@@ -583,6 +586,8 @@ export type CoreTool = {
   background?: ToolBackgroundConfig;
   /** Mastra-native terminal-result policy. Never sent to the model provider. */
   terminalResult?: ToolTerminalResultConfig<any, any>;
+  /** Mastra-native receipt classification of a returned output. Never sent to the model provider. */
+  resultStatus?: (output: any) => ToolResultStatus;
 } & (
   | {
       type?: 'function' | undefined;
@@ -894,4 +899,11 @@ export interface ToolAction<
    * of spending another provider call narrating the same value.
    */
   terminalResult?: ToolTerminalResultConfig<TSchemaOut, TTerminalResult>;
+  /**
+   * Classifies a returned output for framework tool-call receipts. Return
+   * `'error'` when the tool reported a failure as data (for example
+   * `{ success: false }`) instead of throwing. Only the receipt changes: the
+   * model, the stream, and the transcript still see the returned output.
+   */
+  resultStatus?: (output: TSchemaOut) => ToolResultStatus;
 }

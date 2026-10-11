@@ -20,7 +20,10 @@ import { readScoped, writeScoped } from '../../run-scope-access';
 import type { RunScopeContext } from '../../run-scope-access';
 import { DELEGATION_BAILED_KEY, STEP_TOOLS_KEY, TOOL_PAYLOAD_TRANSFORM_KEY } from '../../run-scope-keys';
 import { readToolResultFromMessageList } from '../../shared/read-tool-result';
-import { computeModelOutputProviderMetadata } from '../../shared/steps/tool-result-commit-core';
+import {
+  computeModelOutputProviderMetadata,
+  withToolResultStatusProviderMetadata,
+} from '../../shared/steps/tool-result-commit-core';
 import { outputProcessorsAllowTerminalToolResult, resolveTerminalToolResult } from '../../shared/terminal-tool-result';
 import type { OuterLLMRun } from '../../types';
 import { deserializeToolError, getSubAgentErrorResult } from '../errors';
@@ -270,9 +273,9 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             | Record<string, { toModelOutput?: (output: unknown) => unknown }>
             | undefined
         )?.[toolCall.toolName] ?? rest.tools?.[toolCall.toolName]) as
-          | { toModelOutput?: (output: unknown) => unknown }
+          | { toModelOutput?: (output: unknown) => unknown; resultStatus?: (output: unknown) => unknown }
           | undefined;
-        return computeModelOutputProviderMetadata({
+        const providerMetadata = await computeModelOutputProviderMetadata({
           tool,
           toolName: toolCall.toolName,
           toolCallId: toolCall.toolCallId,
@@ -284,6 +287,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           // engine supplies a warn-and-continue handler instead (redelivery
           // would re-run the mapper on every attempt).
         });
+        return withToolResultStatusProviderMetadata({ tool, result: toolCall.result, providerMetadata });
       }
 
       async function transformToolChunk(

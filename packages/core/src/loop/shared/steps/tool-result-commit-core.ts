@@ -87,6 +87,32 @@ export async function computeModelOutputProviderMetadata(deps: {
   return Object.keys(providerMetadata).length > 0 ? providerMetadata : undefined;
 }
 
+/**
+ * Stamp a tool's own classification of a returned output on the result's
+ * `providerMetadata.mastra.resultStatus`, so framework tool-call receipts can
+ * record a failure the tool returned as data. Only `'error'` is stamped; an
+ * unclassified or successful output leaves the metadata unchanged. A classifier
+ * that throws records `'error'`: a receipt must never claim success the tool
+ * could not confirm. The model-facing output is not touched.
+ */
+export function withToolResultStatusProviderMetadata(deps: {
+  tool: { resultStatus?: (output: unknown) => unknown } | undefined;
+  result: unknown;
+  providerMetadata: Record<string, unknown> | undefined;
+}): Record<string, unknown> | undefined {
+  const classify = deps.tool?.resultStatus;
+  if (typeof classify !== 'function') return deps.providerMetadata;
+  let status: unknown;
+  try {
+    status = classify(deps.result);
+  } catch {
+    status = 'error';
+  }
+  if (status === 'success') return deps.providerMetadata;
+  const existingMastra = (deps.providerMetadata as { mastra?: Record<string, unknown> } | undefined)?.mastra;
+  return { ...deps.providerMetadata, mastra: { ...existingMastra, resultStatus: 'error' } };
+}
+
 /** Resolved terminal state for one tool call, as recorded to the transcript. */
 export type ToolResultCommitOutcome =
   | { kind: 'denied'; approval: { id: string; approved: false; reason?: string } }

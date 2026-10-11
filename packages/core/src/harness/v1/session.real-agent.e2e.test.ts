@@ -2586,6 +2586,126 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
     });
   });
 
+  it('records a tool-classified returned failure on the receipt so a child cannot report success for it', async () => {
+    // A tool may return a failure as data (`{ success: false }`) so the model
+    // can read and fix it. `resultStatus` lets the receipt record that call as
+    // failed, so a report claiming its success is rejected.
+    const report = JSON.stringify({
+      outcome: 'completed',
+      summary: 'The analysis succeeded.',
+      evidence: [
+        {
+          kind: 'tool-result',
+          toolName: 'runAnalysis',
+          status: 'success',
+          description: 'The analysis ran.',
+        },
+      ],
+    });
+    async function delegate(analysisSucceeds: boolean) {
+      const runAnalysis = createTool({
+        id: 'runAnalysis',
+        description: 'run the analysis',
+        inputSchema: z.object({}),
+        resultStatus: (output: { success: boolean }) => (output.success ? 'success' : 'error'),
+        execute: async () => ({ success: analysisSucceeds, stderr: analysisSucceeds ? '' : 'NameError' }),
+      });
+      const childStreams = [
+        toolCallStream('run-analysis', 'runAnalysis', '{}'),
+        toolCallStream('child-outcome', 'report_subagent_outcome', report),
+      ];
+      let childCalls = 0;
+      const childAgent = new Agent({
+        id: 'child-agent',
+        name: 'child-agent',
+        instructions: 'Run the analysis, then report the completed outcome.',
+        model: new MockLanguageModelV2({
+          doStream: async () => ({
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: childStreams[childCalls++] ?? textStream(['The outcome report did not complete.']),
+          }),
+        }),
+      });
+      let parentCalls = 0;
+      const parentAgent = new Agent({
+        id: 'parent-agent',
+        name: 'parent-agent',
+        instructions: 'Delegate the analysis.',
+        model: new MockLanguageModelV2({
+          doStream: async () => ({
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream:
+              parentCalls++ === 0
+                ? toolCallStream(
+                    'parent-spawn',
+                    'spawn_subagent',
+                    JSON.stringify({ agentType: 'analyst', task: 'Run the analysis.', delivery: 'final' }),
+                  )
+                : textStream(['The delegation did not complete.']),
+          }),
+        }),
+      });
+      const harness = new Harness({
+        agents: { 'parent-agent': parentAgent, 'child-agent': childAgent },
+        storage: new InMemoryStore(),
+        modes: [
+          { id: 'default', agentId: 'parent-agent' },
+          {
+            id: 'analysis',
+            agentId: 'child-agent',
+            tools: { runAnalysis },
+            harnessBuiltins: 'exclude',
+            permissions: { categories: {}, tools: { runAnalysis: 'allow' } },
+          },
+        ],
+        defaultModeId: 'default',
+        subagents: {
+          maxDepth: 2,
+          types: {
+            analyst: {
+              agentId: 'child-agent',
+              modeId: 'analysis',
+              description: 'Run an analysis',
+              toolAllowlist: ['runAnalysis'],
+            },
+          },
+        },
+      });
+      try {
+        const session = await harness.session({ resourceId: 'analyst-user', threadId: { fresh: true } });
+        const events: HarnessEvent[] = [];
+        session.subscribe(event => events.push(event));
+        await session.message({ content: 'Delegate the analysis.' });
+        return {
+          toolEnd: events.find(event => event.type === 'subagent_tool_end'),
+          subagentEnd: events.find(event => event.type === 'subagent_end'),
+        };
+      } finally {
+        await harness.shutdown();
+      }
+    }
+
+    const succeeded = await delegate(true);
+    expect(succeeded.subagentEnd).toMatchObject({
+      isError: false,
+      output: {
+        status: 'success',
+        outcome: 'completed',
+        evidence: [{ kind: 'tool-result', toolName: 'runAnalysis', toolCallId: 'run-analysis', status: 'success' }],
+      },
+    });
+
+    const failed = await delegate(false);
+    // The returned failure still reaches the child unchanged.
+    expect(failed.toolEnd).toMatchObject({ toolName: 'runAnalysis', isError: false, output: { success: false } });
+    expect(failed.subagentEnd).toMatchObject({
+      isError: true,
+      output: { status: 'error', error: { code: 'harness.subagent_evidence_unverified' } },
+    });
+  });
+
   it('a REAL parent spawning a REAL subagent surfaces the child’s streamed text + real tool round-trip as subagent_* events with correct attribution', async () => {
     // --- REAL child tool (runs inside the child agent's real loop) ----------
     // Returns a non-JSON-native value (Date) to prove the subagent_tool_end

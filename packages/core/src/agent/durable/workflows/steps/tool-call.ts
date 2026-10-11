@@ -9,6 +9,7 @@ import { dispatchBackgroundTool } from '../../../../loop/shared/steps/background
 import { applyBackgroundToolResult } from '../../../../loop/shared/steps/background-task-result-core';
 import { executeToolCall } from '../../../../loop/shared/steps/execute-tool-core';
 import { processAndEmitChunk } from '../../../../loop/shared/steps/process-chunk-core';
+import { withToolResultStatusProviderMetadata } from '../../../../loop/shared/steps/tool-result-commit-core';
 import { resolveFrameworkSuspendedToolIdentity } from '../../../../loop/shared/suspended-tool-run-id';
 import type { ResolvedSuspendedToolIdentity } from '../../../../loop/shared/suspended-tool-run-id';
 import { applyToolPayloadTransformToChunk } from '../../../../loop/shared/tool-payload-transform';
@@ -2288,6 +2289,13 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             logger?.warn?.(`[DurableAgent] toModelOutput failed for tool "${toolName}": ${mappingError}`);
           }
         }
+        // The tool's own classification of a returned failure travels on the
+        // emitted tool-result chunk for framework tool-call receipts.
+        providerMetadata = withToolResultStatusProviderMetadata({
+          tool: mappingTool as { resultStatus?: (output: unknown) => unknown },
+          result: outcome.rawResult,
+          providerMetadata: providerMetadata as Record<string, unknown> | undefined,
+        }) as ProviderMetadata | undefined;
 
         // Run processToolResult hooks before the tool-result chunk is emitted.
         // In this engine subscribers receive tool-result chunks HERE, at
