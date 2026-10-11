@@ -22,7 +22,7 @@
 import posixPath from 'node:path/posix';
 
 import type { RequestContext } from '../../request-context';
-import { PermissionError } from '../errors';
+import { FilesystemError, PermissionError } from '../errors';
 import { callLifecycle } from '../lifecycle';
 import type { ProviderStatus } from '../lifecycle';
 import type {
@@ -305,7 +305,10 @@ export class CompositeFilesystem<
 
   async readFile(path: string, options?: ReadOptions): Promise<string | Buffer> {
     const r = this.resolveMount(path);
-    if (!r) throw new Error(`No mount for path: ${path}`);
+    // No mount holds this path, so no such file exists (`exists()` reports
+    // false too). Code it ENOENT so callers that treat a missing file as
+    // absent, such as the root `.gitignore` lookup, keep working on a composite.
+    if (!r) throw new FilesystemError(`No mount for path: ${path}`, 'ENOENT', path);
     return r.fs.readFile(r.fsPath, options);
   }
 
