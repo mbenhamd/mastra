@@ -1584,6 +1584,38 @@ describe('HarnessPG native terminal handoff', () => {
         signalId: input.signalId,
       }),
     ).resolves.toMatchObject({ status: 'completed', erased: true });
+    // An erased completion never stores a result, and a completed record that
+    // merely carries the marker code as an error is not read back as erased.
+    const both = admissionFor(session, 'erased-with-result');
+    await harness().writeMessageResultEvidence({
+      ...pendingEvidence(both),
+      status: 'completed',
+      runId: both.runId,
+      result: { text: 'must not be stored' },
+      erased: true,
+    });
+    const stored = await store.db.one<{ result: unknown }>(
+      `SELECT result FROM "${schemaName}"."mastra_harness_message_results" WHERE signal_id = $1`,
+      [both.signalId],
+    );
+    expect(stored.result).toBeNull();
+    const lookalike = admissionFor(session, 'erased-lookalike');
+    await harness().writeMessageResultEvidence({
+      ...pendingEvidence(lookalike),
+      status: 'completed',
+      runId: lookalike.runId,
+      result: { text: 'real result' },
+      error: { code: 'harness.message_result_erased', message: 'not erased' },
+    } as AgentSignalResultEvidence);
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: lookalike.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', result: { text: 'real result' } });
   });
 
   it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {

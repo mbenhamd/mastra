@@ -1616,6 +1616,8 @@ export class InMemoryHarness extends HarnessStorage {
   ): Promise<WriteMessageResultEvidenceResult> {
     const namespacedRecord = {
       ...record,
+      // An erased completion never stores a result (as the SQL writers do).
+      ...(record.status === 'completed' && record.erased === true ? { result: undefined } : {}),
       harnessName: resolveHarnessName(record.harnessName, this.harnessName),
     };
     if (options.leaseOwner !== undefined) {

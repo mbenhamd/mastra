@@ -5185,7 +5185,9 @@ export class HarnessPG extends HarnessStorage {
             updated.operationKind ?? null,
             namespacedRecord.status,
             updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
-            'result' in namespacedRecord && namespacedRecord.result !== undefined
+            'result' in namespacedRecord &&
+            namespacedRecord.result !== undefined &&
+            !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
               ? JSON.stringify(namespacedRecord.result)
               : null,
             messageEvidenceErrorColumn(namespacedRecord),
@@ -5224,7 +5226,9 @@ export class HarnessPG extends HarnessStorage {
             namespacedRecord.operationKind ?? null,
             namespacedRecord.status,
             namespacedRecord.dispatch === undefined ? null : JSON.stringify(namespacedRecord.dispatch),
-            'result' in namespacedRecord && namespacedRecord.result !== undefined
+            'result' in namespacedRecord &&
+            namespacedRecord.result !== undefined &&
+            !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
               ? JSON.stringify(namespacedRecord.result)
               : null,
             messageEvidenceErrorColumn(namespacedRecord),
@@ -12232,11 +12236,12 @@ function workspaceActionPathFilterHasSelector(
  * it reads back as erased, never as an empty success.
  */
 function messageEvidenceErrorColumn(record: AgentSignalResultEvidence): string | null {
-  if (record.status === 'completed' && record.erased === true) {
-    return JSON.stringify({
-      code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
-      message: 'The result was erased with its session',
-    });
+  // A completed row's error column carries only the erased marker, and only
+  // for an erased record, so the marker is never ambiguous.
+  if (record.status === 'completed') {
+    return record.erased === true
+      ? JSON.stringify({ code: HARNESS_MESSAGE_RESULT_ERASED_CODE, message: 'The result was erased with its session' })
+      : null;
   }
   return 'error' in record ? JSON.stringify(record.error) : null;
 }
