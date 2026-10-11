@@ -512,7 +512,7 @@ jobs:
             /usr/bin/git show "${HEAD_SHA}:${script_path}" \
               > "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash"
           elif [[ "${HEAD_REPOSITORY}" == "${GITHUB_REPOSITORY}" && \
-            "${PR_NUMBER}" == '__PF4233_POLICY_PR_NUMBER__' && \
+            "${PR_NUMBER}" == '461' && \
             "${HEAD_REF}" == 'pf-4233-memory-integration-validation-target' && \
             "${BASE_REF}" == 'main' ]]; then
             echo 'Bootstrapping the validator from the exact PF-4233 memory PostgreSQL policy PR.'
