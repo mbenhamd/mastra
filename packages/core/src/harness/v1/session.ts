@@ -1752,6 +1752,7 @@ export class Session {
     {
       receipts: HarnessSubagentToolReceipt[];
       exact: Set<string>;
+      replaceable: Set<string>;
       bytes: number;
       overflow: boolean;
     }
@@ -8054,7 +8055,11 @@ export class Session {
    * bounded side channel is required for truthful blocked/failed reports and
    * durable recovery verification.
    */
-  private _recordRunToolReceipt(runId: string, receipt: HarnessSubagentToolReceipt): void {
+  private _recordRunToolReceipt(
+    runId: string,
+    receipt: HarnessSubagentToolReceipt,
+    source: 'tool-result' | 'other' = 'other',
+  ): void {
     if (
       receipt.toolCallId.length === 0 ||
       receipt.toolCallId.length > 1_024 ||
@@ -8066,7 +8071,35 @@ export class Session {
     }
     const state = this._getOrCreateRunToolReceiptState(runId);
     const key = `${receipt.toolCallId}\0${receipt.toolName}\0${receipt.status}`;
+    // Any receipt for the call that did not come from a tool-result chunk (a
+    // tool-error, a synthetic abort, a restored receipt) ends replacement for
+    // that call, even when it duplicates the receipt already held.
+    if (source !== 'tool-result') state.replaceable.delete(`${receipt.toolCallId}\0${receipt.toolName}`);
     if (state.exact.has(key)) return;
+    // An awaited background completion is streamed, then re-emitted after
+    // processToolResult and classification. That later tool-result is the
+    // recorded one, so it replaces the earlier tool-result receipt for the same
+    // call. Nothing else is replaced: a tool-error, a synthetic abort error or a
+    // restored receipt stays, and success never replaces an error. Those
+    // contradictions keep both receipts, so the call is never bound.
+    const callKey = `${receipt.toolCallId}\0${receipt.toolName}`;
+    const previous = state.receipts.find(
+      existing => existing.toolCallId === receipt.toolCallId && existing.toolName === receipt.toolName,
+    );
+    if (
+      previous !== undefined &&
+      source === 'tool-result' &&
+      state.replaceable.has(callKey) &&
+      !(previous.status === 'error' && receipt.status === 'success')
+    ) {
+      const previousBytes = new TextEncoder().encode(JSON.stringify(previous)).byteLength;
+      state.exact.delete(`${previous.toolCallId}\0${previous.toolName}\0${previous.status}`);
+      previous.status = receipt.status;
+      state.exact.add(key);
+      state.bytes += new TextEncoder().encode(JSON.stringify(previous)).byteLength - previousBytes;
+      return;
+    }
+    if (previous !== undefined) state.replaceable.delete(callKey);
     const bytes = new TextEncoder().encode(JSON.stringify(receipt)).byteLength;
     if (
       state.receipts.length >= MAX_HARNESS_RUN_TOOL_RECEIPTS ||
@@ -8078,11 +8111,14 @@ export class Session {
     state.exact.add(key);
     state.receipts.push({ ...receipt });
     state.bytes += bytes;
+    if (previous === undefined && source === 'tool-result') state.replaceable.add(callKey);
   }
 
   private _getOrCreateRunToolReceiptState(runId: string): {
     receipts: HarnessSubagentToolReceipt[];
     exact: Set<string>;
+    /** Calls whose only receipt came from a tool-result chunk; a later tool-result may replace it. */
+    replaceable: Set<string>;
     bytes: number;
     overflow: boolean;
   } {
@@ -8093,7 +8129,13 @@ export class Session {
       if (oldest === undefined) break;
       this._runToolReceipts.delete(oldest);
     }
-    const state = { receipts: [], exact: new Set<string>(), bytes: 0, overflow: false };
+    const state = {
+      receipts: [],
+      exact: new Set<string>(),
+      replaceable: new Set<string>(),
+      bytes: 0,
+      overflow: false,
+    };
     this._runToolReceipts.set(runId, state);
     return state;
   }
@@ -8308,7 +8350,7 @@ export class Session {
           toolName?: string;
           result: unknown;
           isError?: boolean;
-          providerMetadata?: { mastra?: { resultStatus?: unknown } };
+          providerMetadata?: { mastra?: { resultStatus?: unknown; backgroundTask?: { status?: unknown } } };
         };
         // §10.4: the resume segment replays the approved tool's `tool-result`
         // WITHOUT a preceding `tool-call` in this segment, so `_activeTools` (seeded
@@ -8326,16 +8368,24 @@ export class Session {
         if (runId !== undefined) {
           // A tool may classify a failure it returned as data
           // (`ToolAction.resultStatus`); the receipt records it as failed so
-          // subagent evidence cannot claim success for it. The tool_end event
-          // keeps the returned output and its own isError unchanged.
-          this._recordRunToolReceipt(runId, {
-            toolCallId: payload.toolCallId,
-            toolName,
-            status:
-              payload.isError === true || payload.providerMetadata?.mastra?.resultStatus === 'error'
-                ? 'error'
-                : 'success',
-          });
+          // subagent evidence cannot claim success for it. A running background
+          // placeholder is not the tool's result and records no receipt; the
+          // completion does. The tool_end event keeps the returned output and
+          // its own isError unchanged.
+          if (payload.providerMetadata?.mastra?.backgroundTask?.status !== 'running') {
+            this._recordRunToolReceipt(
+              runId,
+              {
+                toolCallId: payload.toolCallId,
+                toolName,
+                status:
+                  payload.isError === true || payload.providerMetadata?.mastra?.resultStatus === 'error'
+                    ? 'error'
+                    : 'success',
+              },
+              'tool-result',
+            );
+          }
           // Project `output` at emit so live === replay (§10.2). Shared/aliased
           // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.
           this._emitTurnEvent({

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { MastraDBMessage } from '../../../agent/message-list';
 import { MessageList } from '../../../agent/message-list';
-import { commitToolResult } from './tool-result-commit-core';
+import { commitToolResult, withToolResultStatusProviderMetadata } from './tool-result-commit-core';
 
 function makeMessageList() {
   const messageList = new MessageList();
@@ -47,5 +47,42 @@ describe('commitToolResult', () => {
       type: 'tool-invocation',
       toolInvocation: { state: 'output-error', errorText: 'failed', result },
     });
+  });
+});
+
+describe('withToolResultStatusProviderMetadata', () => {
+  const classify = (output: unknown) => ((output as { success?: boolean }).success ? 'success' : 'error');
+
+  it('replaces an earlier error classification when the recorded result succeeds', () => {
+    // A background completion carries the classification of its raw result;
+    // the recorded result is classified again after processToolResult.
+    const metadata = withToolResultStatusProviderMetadata({
+      tool: { resultStatus: classify },
+      result: { success: true },
+      providerMetadata: { openai: { itemId: 'item-1' }, mastra: { resultStatus: 'error', modelOutput: 'x' } },
+    });
+
+    expect(metadata).toEqual({ openai: { itemId: 'item-1' }, mastra: { modelOutput: 'x' } });
+  });
+
+  it('marks a recorded failure and records a throwing classifier as a failure', () => {
+    expect(
+      withToolResultStatusProviderMetadata({
+        tool: { resultStatus: classify },
+        result: { success: false },
+        providerMetadata: undefined,
+      }),
+    ).toEqual({ mastra: { resultStatus: 'error' } });
+    expect(
+      withToolResultStatusProviderMetadata({
+        tool: {
+          resultStatus: () => {
+            throw new Error('classifier bug');
+          },
+        },
+        result: { success: true },
+        providerMetadata: undefined,
+      }),
+    ).toEqual({ mastra: { resultStatus: 'error' } });
   });
 });

@@ -1315,6 +1315,116 @@ describe('Session synthetic tool_end on unsettled tools (§10.2)', () => {
     }
   });
 
+  it('records the last framework result of a call and never a running background placeholder', async () => {
+    const { harness, agent } = setup();
+    // An awaited background completion is streamed first, then re-emitted after
+    // processToolResult with the tool's classification (PF-5286).
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc-bg', toolName: 'analyze', args: {} } },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'tc-bg',
+          toolName: 'analyze',
+          result: 'Background task started.',
+          providerMetadata: { mastra: { backgroundTask: { taskId: 't1', status: 'running' } } },
+        },
+      },
+      {
+        type: 'tool-result',
+        payload: { toolCallId: 'tc-bg', toolName: 'analyze', result: { success: true } },
+      },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'tc-bg',
+          toolName: 'analyze',
+          result: { success: false },
+          providerMetadata: { mastra: { resultStatus: 'error' } },
+        },
+      },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const result = (await session.message({ content: 'hi' })) as any;
+      expect(result.harnessToolReceipts).toEqual([{ toolCallId: 'tc-bg', toolName: 'analyze', status: 'error' }]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('never lets a later tool-result turn a tool-error receipt into success', async () => {
+    const { harness, agent } = setup();
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc-x', toolName: 'analyze', args: {} } },
+      { type: 'tool-error', payload: { toolCallId: 'tc-x', toolName: 'analyze', error: new Error('boom') } },
+      { type: 'tool-result', payload: { toolCallId: 'tc-x', toolName: 'analyze', result: { ok: true } } },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const result = (await session.message({ content: 'hi' })) as any;
+      // Contradictory receipts for one call: the call is never bound as a success.
+      expect(result.harnessToolReceipts).toEqual(
+        expect.arrayContaining([{ toolCallId: 'tc-x', toolName: 'analyze', status: 'error' }]),
+      );
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('keeps a restored receipt from being replaced after a resume in the same session', async () => {
+    const { harness } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const internal = session as any;
+      // A tool-result receipt, then a suspension that persists and restores it.
+      internal._recordRunToolReceipt(
+        'run-r',
+        { toolCallId: 'tc-r', toolName: 'analyze', status: 'success' },
+        'tool-result',
+      );
+      internal._restorePendingRunToolReceipts({
+        runId: 'run-r',
+        ...internal._pendingRunToolReceiptProjection('run-r'),
+      });
+      internal._recordRunToolReceipt(
+        'run-r',
+        { toolCallId: 'tc-r', toolName: 'analyze', status: 'error' },
+        'tool-result',
+      );
+
+      expect(internal._runToolReceipts.get('run-r').receipts).toEqual([
+        { toolCallId: 'tc-r', toolName: 'analyze', status: 'success' },
+        { toolCallId: 'tc-r', toolName: 'analyze', status: 'error' },
+      ]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('records no receipt for a background placeholder whose completion never arrives', async () => {
+    const { harness, agent } = setup();
+    agent.chunks = [
+      { type: 'tool-call', payload: { toolCallId: 'tc-bg', toolName: 'analyze', args: {} } },
+      {
+        type: 'tool-result',
+        payload: {
+          toolCallId: 'tc-bg',
+          toolName: 'analyze',
+          result: 'Background task started.',
+          providerMetadata: { mastra: { backgroundTask: { taskId: 't1', status: 'running' } } },
+        },
+      },
+    ];
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const result = (await session.message({ content: 'hi' })) as any;
+      expect(result.harnessToolReceipts).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('suppresses (one-shot) a late real tool_end that arrives after a synthetic aborted tool_end', async () => {
     const { harness } = setup();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

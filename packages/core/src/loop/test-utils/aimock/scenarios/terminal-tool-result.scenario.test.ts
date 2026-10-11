@@ -412,16 +412,20 @@ describeForAllEngines('AIMock loop scenario: terminal tool result', engine => {
     ]);
   });
 
-  it('delivers a new terminal result when a signal boundary keeps an earlier terminal answer in the response', async () => {
-    // A processor signal seals the response boundary, which promotes the
-    // recalled assistant message, with the previous run's terminal part, into
-    // the response set. Only this run's terminal part is checked.
+  // A processor signal seals the response boundary, which promotes the recalled
+  // assistant message, with the previous run's terminal part, into the response
+  // set. Only this run's terminal part is checked; the earlier one must stay as
+  // it was.
+  async function runAfterSignalBoundary(
+    name: string,
+    earlierPartProcessor: (earlierPartIds: string[], firstPartId: string) => Record<string, unknown>,
+  ) {
     const storage = new InMemoryStore();
     const memory = new MockMemory({ storage, enableMessageHistory: false });
     const memoryStore = await storage.getStore('memory');
     const history = new MessageHistory({ storage: memoryStore!, persistence: { mode: 'final-turn' } });
-    const threadId = `terminal-signal-boundary-thread-${engine}`;
-    const resourceId = `terminal-signal-boundary-resource-${engine}`;
+    const threadId = `terminal-signal-${name}-thread-${engine}`;
+    const resourceId = `terminal-signal-${name}-resource-${engine}`;
     let answer = 'First terminal answer.';
     const answerTool = createTool({
       id: 'signal_boundary_answer_tool',
@@ -450,9 +454,13 @@ describeForAllEngines('AIMock loop scenario: terminal tool result', engine => {
       threadId,
       resourceId,
       outputProcessors: [history],
+      collectChunks: true,
       fixtures,
     });
     expect(first.output.error).toBeUndefined();
+    const firstPartId = (first.chunks?.find(chunk => chunk.type === 'data-terminal-tool-result') as { id?: string })
+      ?.id;
+    expect(firstPartId).toBeDefined();
     getMock().clearFixtures();
     getMock().clearRequests();
     getMock().resetMatchCounts();
@@ -470,6 +478,7 @@ describeForAllEngines('AIMock loop scenario: terminal tool result', engine => {
         if (stepNumber === 0) await sendSignal({ type: 'system-reminder', contents: 'Answer again.' });
       },
     };
+    const earlierPartIds: string[] = [];
     const second = await runLoopScenario({
       llm: getMock(),
       prompt: 'Return the second answer.',
@@ -479,12 +488,52 @@ describeForAllEngines('AIMock loop scenario: terminal tool result', engine => {
       threadId,
       resourceId,
       inputProcessors: [history, signalOnce],
-      outputProcessors: [history],
+      outputProcessors: [earlierPartProcessor(earlierPartIds, firstPartId!), history],
       fixtures,
     });
+    return { firstPartId: firstPartId!, earlierPartIds, second };
+  }
 
+  const responseTerminalParts = (messageList: import('../../../../agent').MessageList) =>
+    messageList.get.response
+      .db()
+      .flatMap(message =>
+        typeof message.content === 'object' && Array.isArray(message.content.parts)
+          ? message.content.parts.filter(part => part.type === 'data-terminal-tool-result')
+          : [],
+      ) as Array<{ id: string; data: unknown }>;
+
+  it('delivers a new terminal result when a signal boundary keeps an earlier terminal answer in the response', async () => {
+    const { firstPartId, earlierPartIds, second } = await runAfterSignalBoundary('kept', seen => ({
+      id: 'observe-terminal-parts',
+      terminalToolResultPolicy: 'pass-through' as const,
+      processOutputResult: async ({ messageList }: { messageList: import('../../../../agent').MessageList }) => {
+        seen.push(...responseTerminalParts(messageList).map(part => part.id));
+        return messageList;
+      },
+    }));
+
+    // The earlier run's terminal part really sits in this run's response.
+    expect(earlierPartIds).toContain(firstPartId);
     expect(second.output.error).toBeUndefined();
     expect(second.output.terminalToolResult?.items[0]?.value).toEqual({ text: 'Second terminal answer.' });
+  });
+
+  it('still rejects a final output processor that rewrites an earlier terminal answer', async () => {
+    const { second } = await runAfterSignalBoundary('rewritten', (_seen, firstPartId) => ({
+      id: 'rewrite-earlier-terminal-part',
+      terminalToolResultPolicy: 'pass-through' as const,
+      processOutputResult: async ({ messageList }: { messageList: import('../../../../agent').MessageList }) => {
+        const parts = responseTerminalParts(messageList);
+        const current = parts.find(part => part.id !== firstPartId);
+        const earlier = parts.find(part => part.id === firstPartId);
+        if (current && earlier) earlier.data = structuredClone(current.data);
+        return messageList;
+      },
+    }));
+
+    expect(second.output.terminalToolResult).toBeUndefined();
+    expect(second.output.error?.message ?? '').toMatch(/did not retain exactly one/);
   });
 
   it('still rejects a final output processor that drops the terminal result', async () => {

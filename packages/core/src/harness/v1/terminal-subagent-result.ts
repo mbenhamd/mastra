@@ -293,7 +293,10 @@ function normalizeToolReceipt(value: unknown): HarnessSubagentToolReceipt | unde
     : isRecord(payload?.providerMetadata)
       ? payload.providerMetadata
       : undefined;
-  const classifiedError = isRecord(providerMetadata?.mastra) && providerMetadata.mastra.resultStatus === 'error';
+  const mastraMetadata = isRecord(providerMetadata?.mastra) ? providerMetadata.mastra : undefined;
+  // A running background placeholder is not the tool's result.
+  if (isRecord(mastraMetadata?.backgroundTask) && mastraMetadata.backgroundTask.status === 'running') return undefined;
+  const classifiedError = mastraMetadata?.resultStatus === 'error';
   return { toolCallId, toolName, status: explicitStatus ?? (isError || classifiedError ? 'error' : 'success') };
 }
 
@@ -303,16 +306,27 @@ function collectToolReceipts(value: unknown): {
 } {
   const source = isRecord(value) ? value : undefined;
   if (source === undefined) return { receipts: [], overflow: false };
-  const candidates = [...itemArray(source[HARNESS_SUBAGENT_TOOL_RECEIPTS_FIELD]), ...itemArray(source.toolResults)];
+  // Framework receipts are authoritative: the session records the last
+  // framework result of each call. Run tool results only fill in calls the
+  // receipts do not name; contradictory fallback results for one call stay
+  // contradictory, so such a call is never bound.
+  const framework = itemArray(source[HARNESS_SUBAGENT_TOOL_RECEIPTS_FIELD]).flatMap(candidate => {
+    const receipt = normalizeToolReceipt(candidate);
+    return receipt === undefined ? [] : [receipt];
+  });
+  const frameworkCalls = new Set(framework.map(receipt => `${receipt.toolCallId}\0${receipt.toolName}`));
+  const fallbackCandidates = [...itemArray(source.toolResults)];
   for (const step of itemArray(source.steps)) {
-    if (isRecord(step)) candidates.push(...itemArray(step.toolResults));
+    if (isRecord(step)) fallbackCandidates.push(...itemArray(step.toolResults));
   }
+  const fallback = fallbackCandidates.flatMap(candidate => {
+    const receipt = normalizeToolReceipt(candidate);
+    return receipt === undefined || frameworkCalls.has(`${receipt.toolCallId}\0${receipt.toolName}`) ? [] : [receipt];
+  });
 
   const receipts: HarnessSubagentToolReceipt[] = [];
   const exact = new Set<string>();
-  for (const candidate of candidates) {
-    const receipt = normalizeToolReceipt(candidate);
-    if (receipt === undefined) continue;
+  for (const receipt of [...framework, ...fallback]) {
     const key = `${receipt.toolCallId}\0${receipt.toolName}\0${receipt.status}`;
     if (exact.has(key)) continue;
     exact.add(key);

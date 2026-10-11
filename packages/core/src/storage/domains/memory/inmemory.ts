@@ -1276,15 +1276,18 @@ export class InMemoryMemory extends MemoryStorage {
       proposedValueProvided: true,
       proposedMetadata: undefined,
     });
-    // The write and the stamp land together, with no await between them, so a
-    // concurrent retraction sees both or neither.
-    return this.withMemoryStateRollback(true, () => {
-      const updated = this.updateResourceState({ resourceId, workingMemory });
-      if ((resource?.workingMemory ?? null) !== workingMemory) {
-        this.markObservationalMemoryManagingWorkingMemory(guard, 'resource');
-      }
-      return updated;
-    });
+    // The write and the stamp land together in one synchronous step, with no
+    // await between them, so a concurrent retraction sees both or neither.
+    // Like the PG adapter, this guarded write is its own storage operation and
+    // deliberately does not dispatch through `updateResource`: an override may
+    // await before writing, which would split the write from its stamp. The
+    // check above is the only way updateResourceState can throw, so no
+    // rollback snapshot is needed.
+    const updated = this.updateResourceState({ resourceId, workingMemory });
+    if ((resource?.workingMemory ?? null) !== workingMemory) {
+      this.markObservationalMemoryManagingWorkingMemory(guard, 'resource');
+    }
+    return updated;
   }
 
   async updateThreadFromObservationalMemory({

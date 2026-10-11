@@ -696,7 +696,7 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
 
     it('never lets a guarded write and a concurrent retraction leave its working memory unretracted', async () => {
       const context = await setup('race-legacy-write');
-      const [write] = await Promise.allSettled([
+      await Promise.allSettled([
         context.memory.updateResourceFromObservationalMemory({
           resourceId: context.resourceId,
           workingMemory: 'FROM-DELETED-MSG',
@@ -708,9 +708,56 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
       // Either the write landed first (stamped, then cleared) or the
       // retraction did (the write is refused); never stored and unretracted.
       expect(resource?.workingMemory).not.toBe('FROM-DELETED-MSG');
-      expect(['fulfilled', 'rejected']).toContain(write.status);
+    });
+
+    it('keeps a guarded write atomic with its stamp when updateResource is overridden to await before writing', async () => {
+      const context = await setup('race-async-override');
+      const updateResource = context.memory.updateResource.bind(context.memory);
+      context.memory.updateResource = async args => {
+        await Promise.resolve();
+        return updateResource(args);
+      };
+      await Promise.allSettled([
+        context.memory.updateResourceFromObservationalMemory({
+          resourceId: context.resourceId,
+          workingMemory: 'FROM-DELETED-MSG',
+          guard: context.guard,
+        }),
+        context.memory.retractObservationalMemory({ resourceId: context.resourceId, threadId: context.threadId }),
+      ]);
+      const resource = await context.memory.getResourceById({ resourceId: context.resourceId });
+      expect(resource?.workingMemory).not.toBe('FROM-DELETED-MSG');
     });
   });
+
+  it.each([
+    ['null', null, 'Profile from elsewhere.'],
+    ['a primitive', 'not-an-object', 'Profile from elsewhere.'],
+    ['an array', [], 'Profile from elsewhere.'],
+    ['an object without the marker (control)', {}, undefined],
+  ])(
+    'applies the policy fallback to a record whose config is %s only when it is a marker-free object',
+    async (_name, config, expected) => {
+      const storage = new InMemoryStore({ id: `memory-observational-config-${_name}` });
+      const memory = await storage.getStore('memory');
+      if (!memory) throw new Error('Expected in-memory storage domain.');
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      const threadId = 'config-shape-thread';
+      const resourceId = 'config-shape-resource';
+      await memory.saveThread({
+        thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt, updatedAt: createdAt },
+      });
+      await memory.updateResource({ resourceId, workingMemory: 'Profile from elsewhere.' });
+      await memory.initializeObservationalMemory({
+        threadId: null,
+        resourceId,
+        scope: 'resource',
+        config: config as any,
+      });
+      await memory.retractObservationalMemory({ resourceId, threadId, managedWorkingMemoryScope: 'resource' });
+      await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: expected });
+    },
+  );
 
   it('never applies the policy fallback to a record explicitly marked as not managing working memory', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-policy-null-marker' });

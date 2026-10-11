@@ -684,6 +684,23 @@ describe('Provider-defined Tool Handling', () => {
     expect(builtV5Tool).not.toHaveProperty('_mastraFgaResourceId');
   });
 
+  it('keeps the result classifier of a provider-defined tool that executes locally', () => {
+    const resultStatus = vi.fn((output: { success: boolean }) => (output.success ? 'success' : 'error'));
+    const providerTool = {
+      type: 'provider-defined' as const,
+      id: 'provider.bash' as const,
+      description: 'Run a command locally',
+      inputSchema: z.object({ command: z.string() }),
+      execute: vi.fn().mockResolvedValue({ success: false }),
+      resultStatus,
+    };
+    const createBuilder = () =>
+      new CoreToolBuilder({ originalTool: providerTool as any, options: { name: 'bash', agentId: 'agent-1' } });
+
+    expect((createBuilder().build() as { resultStatus?: unknown }).resultStatus).toBe(resultStatus);
+    expect((createBuilder().buildV5() as { resultStatus?: unknown }).resultStatus).toBe(resultStatus);
+  });
+
   it('should not crash when autoResumeSuspendedTools is enabled with openai.tools.webSearch()', () => {
     const webSearchTool = openai.tools.webSearch({});
 

@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { TerminalToolResult } from '../../tools/types';
 import { materializeWorkflowTerminalCanonicalJson } from '../../workflows/terminal-recovery/canonical-json';
 import type { WorkflowTerminalCanonicalJsonValue } from '../../workflows/terminal-recovery/types';
+import { stableStringify } from './cache/stable-stringify';
 
 export const MAX_TERMINAL_TOOL_RESULT_ENVELOPE_BYTES = 64 * 1024;
 export const MAX_TERMINAL_TOOL_RESULT_MODEL_TEXT_BYTES = 128 * 1024;
@@ -126,16 +127,27 @@ function responseTerminalToolResultParts(messageList: ResponseMessagesSource): T
   });
 }
 
+function terminalPartFingerprint(part: TerminalToolResultPart): string {
+  let data: string;
+  try {
+    data = stableStringify(part.data);
+  } catch {
+    data = '\u0000unserializable';
+  }
+  return `${String(part.id)}\u0000${data}`;
+}
+
 /**
- * Count the terminal tool-result parts in the response, by part id. Take this
- * snapshot before final output processors run, so the retention check can
- * tell an earlier run's terminal part (recalled history a signal boundary
- * promoted into the response) from one a processor introduced.
+ * Snapshot the terminal tool-result parts in the response by identity and
+ * content. Take it before final output processors run, so the retention check
+ * can tell an earlier run's terminal part (recalled history a signal boundary
+ * promoted into the response) from one a processor introduced or rewrote.
  */
 export function countResponseTerminalToolResultParts(messageList: ResponseMessagesSource): Map<string, number> {
   const counts = new Map<string, number>();
   for (const part of responseTerminalToolResultParts(messageList)) {
-    counts.set(String(part.id), (counts.get(String(part.id)) ?? 0) + 1);
+    const fingerprint = terminalPartFingerprint(part);
+    counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
   }
   return counts;
 }
@@ -145,8 +157,9 @@ export function countResponseTerminalToolResultParts(messageList: ResponseMessag
  * part is matched by its framework id, not by the id of the message carrying
  * it, because a processor may re-identify that message (for example a memory
  * processor that stamps a deterministic storage id). Exactly one part with
- * `terminalPartId` must remain, and no other terminal part may appear or
- * multiply beyond the snapshot taken before the processors ran.
+ * `terminalPartId` must remain, and every other terminal part must already
+ * have been in the response, unchanged, before the processors ran: none may
+ * appear, multiply, or have its data rewritten.
  */
 export function findRetainedTerminalToolResultPart(
   messageList: ResponseMessagesSource,
@@ -156,9 +169,14 @@ export function findRetainedTerminalToolResultPart(
   const parts = responseTerminalToolResultParts(messageList);
   const retained = parts.filter(part => part.id === terminalPartId);
   if (retained.length !== 1) return undefined;
-  const after = countResponseTerminalToolResultParts(messageList);
-  for (const [id, count] of after) {
-    if (id !== terminalPartId && count > (beforeProcessors.get(id) ?? 0)) return undefined;
+  const others = new Map<string, number>();
+  for (const part of parts) {
+    if (part.id === terminalPartId) continue;
+    const fingerprint = terminalPartFingerprint(part);
+    others.set(fingerprint, (others.get(fingerprint) ?? 0) + 1);
+  }
+  for (const [fingerprint, count] of others) {
+    if (count > (beforeProcessors.get(fingerprint) ?? 0)) return undefined;
   }
   return retained[0];
 }

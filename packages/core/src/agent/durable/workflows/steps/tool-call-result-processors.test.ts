@@ -145,6 +145,34 @@ afterEach(() => {
 });
 
 describe('durable tool-call: processToolResult hook (Option B)', () => {
+  it('classifies the processed result for tool-call receipts, not the raw tool return', async () => {
+    // A tool's resultStatus describes the result the run records (PF-5286):
+    // here the raw return is a success and the processor replaces it.
+    const messageList = seedMessageList();
+    setupRegistry(
+      {
+        id: 'redactor',
+        name: 'redactor',
+        processToolResult: async ({ messageList: ml, toolCallId, toolName, args }: any) => {
+          ml.updateToolInvocation({
+            type: 'tool-invocation',
+            toolInvocation: { state: 'result', toolCallId, toolName, args, result: REDACTED_RESULT },
+          });
+        },
+      },
+      messageList,
+    );
+    const tool = globalRunRegistry.get(RUN_ID)!.tools![TOOL_NAME] as Record<string, unknown>;
+    tool.resultStatus = (output: { secret?: unknown }) => (output.secret === RAW_RESULT.secret ? 'success' : 'error');
+
+    const output = await runToolCallStep();
+
+    expect(output.result).toEqual(REDACTED_RESULT);
+    expect(output.providerMetadata?.mastra?.resultStatus).toBe('error');
+    const [toolResult] = emittedChunksOfType('tool-result');
+    expect(toolResult.payload.providerMetadata?.mastra?.resultStatus).toBe('error');
+  });
+
   it('syncs a processor mutation into the emitted chunk and the step output', async () => {
     const messageList = seedMessageList();
     setupRegistry(
