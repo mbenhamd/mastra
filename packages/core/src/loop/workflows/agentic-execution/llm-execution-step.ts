@@ -115,7 +115,10 @@ import { composeStepInput } from '../../shared/compose-step-input';
 import { injectBackgroundTaskPrompt } from '../../shared/inject-background-task-prompt';
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../shared/merge-llm-call-headers';
 import { recordTerminalErrorMessage } from '../../shared/record-terminal-error-message';
-import { boundResponseRecoveryToolSelection } from '../../shared/response-recovery-tool-choice';
+import {
+  boundResponseRecoveryToolSelection,
+  narrowRecoveryToolCeiling,
+} from '../../shared/response-recovery-tool-choice';
 import type { LocatedStepContent } from '../../shared/step-content';
 import { readStepContent, stepWasRolledBack } from '../../shared/step-content';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../shared/step-content-chunk-types';
@@ -1646,6 +1649,24 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // provider advertised. They bound a later response-only recovery step.
       // Carried in iteration state so the bound survives a suspend/resume.
       let recoveryToolCeiling: string[] | undefined = inputData.recoveryToolCeiling;
+      // An ordinary step narrows the ceiling to what it selects at every point
+      // its selection is settled (after processors, after the fence and the
+      // permission gate, after request processors); only a dispatch replaces
+      // it. A step that is served from a cache, or that fails before dispatch,
+      // therefore never widens it.
+      const narrowRecoveryCeilingToStep = (step: {
+        tools?: unknown;
+        activeTools?: unknown;
+        toolChoice?: unknown;
+      }): void => {
+        if (responseRecoveryStep) return;
+        recoveryToolCeiling = narrowRecoveryToolCeiling(
+          recoveryToolCeiling,
+          step.tools as Record<string, unknown> | undefined,
+          step.activeTools as string[] | undefined,
+          step.toolChoice,
+        );
+      };
       const maxErrorProcessorRetries = resolveMaxProcessorRetries({
         maxProcessorRetries,
         hasErrorProcessors: Boolean(errorProcessors?.length),
@@ -2027,6 +2048,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           }
         }
 
+        // Before the fence or the permission gate can reject this attempt.
+        narrowRecoveryCeilingToStep(currentStep);
+
         const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
         if (toolSurfaceFence) {
           if (currentStep.tools) {
@@ -2116,6 +2140,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             );
           }
         }
+
+        // The fence and the permission gate may have narrowed the selection.
+        narrowRecoveryCeilingToStep(currentStep);
 
         if (currentStep.tools) {
           currentStep.tools = wrapToolsWithHooks(
@@ -2216,6 +2243,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             inputMessages = requestStepResult.prompt;
             cachedResponse = requestStepResult.response;
           } catch (error) {
+            // A request processor may have narrowed the selection before failing.
+            narrowRecoveryCeilingToStep(currentStep);
             if (error instanceof TripWire) {
               logger?.warn('Streaming request processor tripwire triggered', {
                 reason: error.message,
@@ -2272,6 +2301,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           );
           currentStep.activeTools = bounded.activeTools as typeof currentStep.activeTools;
           currentStep.toolChoice = bounded.toolChoice as typeof currentStep.toolChoice;
+        } else {
+          // Request processors ran with this selection in reach.
+          narrowRecoveryCeilingToStep(currentStep);
         }
 
         // Execution denial is separate from schema exposure: the admitted

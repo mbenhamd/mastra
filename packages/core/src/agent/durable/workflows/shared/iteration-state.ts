@@ -105,8 +105,8 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     modelConfig: currentState.modelConfig,
     options: currentState.options,
     responseRecovery: executionOutput.responseRecoveryConsumed ? undefined : currentState.responseRecovery,
-    // The latest ordinary provider request bounds a later recovery step
-    // (PF-5349); an iteration that sent none keeps the previous bound.
+    // The recovery tool ceiling (PF-5349). The LLM step carries it forward on
+    // every output once set; the fallback covers outputs that end before it.
     recoveryToolCeiling: executionOutput.recoveryToolCeiling ?? currentState.recoveryToolCeiling,
     state: executionOutput.state,
     messageId: executionOutput.messageId,

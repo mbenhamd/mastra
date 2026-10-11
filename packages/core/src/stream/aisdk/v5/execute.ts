@@ -740,7 +740,11 @@ export function execute<OUTPUT = undefined>({
               } catch {
                 // Tracing must never prevent the provider call.
               }
-              onProviderDispatch?.((toolsAndToolChoice.tools ?? []).map(tool => preparedToolKey(tool) ?? tool.name));
+              try {
+                onProviderDispatch?.((toolsAndToolChoice.tools ?? []).map(tool => preparedToolKey(tool) ?? tool.name));
+              } catch {
+                // Observers must never prevent the provider call.
+              }
               // Cast needed: V2 and V3 call options are structurally compatible but typed differently
               // (e.g., tool types differ: V2 uses 'provider-defined', V3 uses 'provider')
               const providerDispatchTimestampMs = Date.now();

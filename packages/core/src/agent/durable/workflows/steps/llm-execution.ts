@@ -15,7 +15,10 @@ import { injectBackgroundTaskPrompt } from '../../../../loop/shared/inject-backg
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../../../loop/shared/merge-llm-call-headers';
 import { readToolResultFromMessageList } from '../../../../loop/shared/read-tool-result';
 import { recordTerminalErrorMessage } from '../../../../loop/shared/record-terminal-error-message';
-import { boundResponseRecoveryToolSelection } from '../../../../loop/shared/response-recovery-tool-choice';
+import {
+  boundResponseRecoveryToolSelection,
+  narrowRecoveryToolCeiling,
+} from '../../../../loop/shared/response-recovery-tool-choice';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../../../loop/shared/step-content-chunk-types';
 import { TERMINAL_FINISH_REASONS } from '../../../../loop/shared/terminal-finish-reasons';
 import { applyToolPayloadTransformToChunk } from '../../../../loop/shared/tool-payload-transform';
@@ -313,10 +316,10 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         throw new Error(`Durable response recovery reservation for run "${runId}" does not match step ${stepIndex}`);
       }
       let responseRecoveryAdmitted = false;
-      // PF-5349: tools advertised by this iteration's latest ordinary request
-      // that reached the provider. They bound a later response-only recovery
-      // step; the iteration state keeps the previous bound when none was sent.
-      let recoveryToolCeiling: string[] | undefined;
+      // PF-5349: tools advertised by the latest ordinary request of the run
+      // that reached the provider, narrowed by any later ordinary step that did
+      // not. They bound a later response-only recovery step.
+      let recoveryToolCeiling: string[] | undefined = typedInput.recoveryToolCeiling;
       const logger = mastra?.getLogger?.();
 
       // 1. Resolve runtime dependencies (tools from Mastra)
@@ -824,6 +827,19 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 currentModelSettings = merged.modelSettings ?? {};
                 structuredOutput = merged.structuredOutput;
                 processorSelectedTools = merged.tools as unknown as Record<string, unknown>;
+                // Narrow the recovery ceiling to the names the processors selected
+                // before the executable check or a selection fence can reject this
+                // attempt (PF-5349). Only names are read, and narrowing can only
+                // remove names, so a container that changes between reads cannot
+                // widen it.
+                if (!responseRecoveryReserved) {
+                  recoveryToolCeiling = narrowRecoveryToolCeiling(
+                    recoveryToolCeiling,
+                    merged.tools as unknown as Record<string, unknown> | undefined,
+                    currentActiveTools ?? undefined,
+                    currentToolChoice,
+                  );
+                }
                 // This must run after the untrusted selection controls above:
                 // their traps may have mutated one of the retained tools.
                 currentTools = enforceReconstructibleToolSurface(
@@ -998,6 +1014,19 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 responseRecoveryReserved
                   ? `Durable response recovery for run "${runId}" lost its live one-shot admission`
                   : `Run "${runId}" produced a response-recovery admission without a durable reservation`,
+              );
+            }
+
+            // An ordinary step narrows the recovery ceiling to what it selects as
+            // soon as the processors and fences have fixed that selection, before
+            // any download or request processor can fail; a dispatch later
+            // replaces it with what the request advertised (PF-5349).
+            if (!responseRecoveryReserved) {
+              recoveryToolCeiling = narrowRecoveryToolCeiling(
+                recoveryToolCeiling,
+                currentTools as Record<string, unknown> | undefined,
+                currentActiveTools ?? undefined,
+                currentToolChoice,
               );
             }
 
@@ -1208,13 +1237,22 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // no recorded request it is tool-free (PF-5349).
             if (responseRecoveryReserved) {
               const bounded = boundResponseRecoveryToolSelection(
-                typedInput.recoveryToolCeiling,
+                recoveryToolCeiling,
                 currentTools as Record<string, unknown> | undefined,
                 currentActiveTools ?? undefined,
                 currentToolChoice,
               );
               currentActiveTools = bounded.activeTools;
               currentToolChoice = bounded.toolChoice as ToolChoice<ToolSet> | undefined;
+            } else {
+              // The last processor boundary may have narrowed the selection
+              // again; the ceiling follows it (PF-5349).
+              recoveryToolCeiling = narrowRecoveryToolCeiling(
+                recoveryToolCeiling,
+                currentTools as Record<string, unknown> | undefined,
+                currentActiveTools ?? undefined,
+                currentToolChoice,
+              );
             }
             const toolExecutionDisabled =
               responseRecoveryReserved ||

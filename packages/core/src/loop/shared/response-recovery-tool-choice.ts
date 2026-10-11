@@ -44,6 +44,26 @@ function selectedToolNames(
 }
 
 /**
+ * The recovery ceiling after an ordinary step selects its tools (PF-5349).
+ *
+ * A step that reaches the provider replaces the ceiling with the tools it
+ * advertised (reported at dispatch). Until then, and for a step that never
+ * reaches the provider (a cached response, or a failure before dispatch), the
+ * ceiling may only narrow: it keeps the names this step still selects, so a
+ * step that withdrew a tool keeps it withdrawn for a later recovery step.
+ */
+export function narrowRecoveryToolCeiling(
+  ceiling: readonly string[] | undefined,
+  tools: Record<string, unknown> | undefined,
+  activeTools: readonly string[] | undefined,
+  toolChoice: unknown,
+): string[] | undefined {
+  if (ceiling === undefined) return undefined;
+  const selected = selectedToolNames(tools, activeTools, toolChoice);
+  return ceiling.filter(name => selected.includes(name));
+}
+
+/**
  * Tool selection for an admitted response-only recovery step (PF-5349).
  *
  * The step advertises the tools it would offer itself, narrowed to `ceiling`:
