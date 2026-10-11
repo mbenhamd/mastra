@@ -5164,8 +5164,10 @@ export class HarnessPG extends HarnessStorage {
             updated.operationKind ?? null,
             namespacedRecord.status,
             updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
-            'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-            'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+            'result' in namespacedRecord && namespacedRecord.result !== undefined
+              ? JSON.stringify(namespacedRecord.result)
+              : null,
+            messageEvidenceErrorColumn(namespacedRecord),
             namespacedRecord.updatedAt,
             id,
             current.operationKind ?? null,
@@ -5201,8 +5203,10 @@ export class HarnessPG extends HarnessStorage {
             namespacedRecord.operationKind ?? null,
             namespacedRecord.status,
             namespacedRecord.dispatch === undefined ? null : JSON.stringify(namespacedRecord.dispatch),
-            'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-            'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+            'result' in namespacedRecord && namespacedRecord.result !== undefined
+              ? JSON.stringify(namespacedRecord.result)
+              : null,
+            messageEvidenceErrorColumn(namespacedRecord),
             namespacedRecord.createdAt,
             namespacedRecord.updatedAt,
           ],
@@ -12180,6 +12184,21 @@ function workspaceActionPathFilterHasSelector(
   filter: NonNullable<ListWorkspaceActionJournalInput['affectedPath']>,
 ): boolean {
   return filter.rootId !== undefined || filter.path !== undefined || filter.relativePath !== undefined;
+}
+
+/**
+ * The `error` column of a message result row. A completed row whose result a
+ * session delete erased stores the reserved erased marker there (PF-5309), so
+ * it reads back as erased, never as an empty success.
+ */
+function messageEvidenceErrorColumn(record: AgentSignalResultEvidence): string | null {
+  if (record.status === 'completed' && record.erased === true) {
+    return JSON.stringify({
+      code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
+      message: 'The result was erased with its session',
+    });
+  }
+  return 'error' in record ? JSON.stringify(record.error) : null;
 }
 
 function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalResultEvidence {

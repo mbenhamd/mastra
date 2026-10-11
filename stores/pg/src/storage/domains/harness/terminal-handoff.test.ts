@@ -1447,6 +1447,27 @@ describe('HarnessPG native terminal handoff', () => {
     ).resolves.toMatchObject({ status: 'completed' });
   });
 
+  it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
+    const session = await createNativeSession(harness(), 'session-erased-roundtrip');
+    const input = admissionFor(session, 'erased-roundtrip');
+    await harness().writeMessageResultEvidence({
+      ...pendingEvidence(input),
+      status: 'completed',
+      runId: input.runId,
+      result: undefined,
+      erased: true,
+    });
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+  });
+
   it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {
     const session = await createNativeSession(harness(), 'session-delete-acked');
     const input = admissionFor(session, 'delete-acked');

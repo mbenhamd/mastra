@@ -1763,6 +1763,31 @@ describe('HarnessLibSQL message result evidence', () => {
     await storage.init();
   });
 
+  it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
+    await storage.writeMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-erased',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      signalId: 'signal-erased',
+      runId: 'run-erased',
+      status: 'completed',
+      result: undefined,
+      erased: true,
+      createdAt: 1000,
+      updatedAt: 2000,
+    });
+    await expect(
+      storage.loadMessageResultEvidence({
+        harnessName: 'default',
+        sessionId: 'session-erased',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        signalId: 'signal-erased',
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+  });
+
   it('stores retained message evidence and resolves duplicate/conflict admissions', async () => {
     await expect(
       storage.writeMessageResultEvidence({

@@ -1073,6 +1073,26 @@ describe('native chat terminal handoff', () => {
     expect(JSON.stringify([...db.harnessTerminalTombstones.values()])).not.toContain('private revoke note');
   });
 
+  it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    const input = admission();
+    await storage.writeMessageResultEvidence({
+      ...pendingEvidence(input),
+      status: 'completed',
+      result: undefined,
+      erased: true,
+    });
+    await expect(
+      storage.loadMessageResultEvidence({
+        harnessName: input.harnessName,
+        sessionId: input.sessionId,
+        resourceId: input.resourceId,
+        threadId: input.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+  });
+
   it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
     await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });

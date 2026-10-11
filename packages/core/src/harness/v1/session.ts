@@ -10089,6 +10089,9 @@ export class Session {
           // A committed terminal admission must replay its durable receipt to
           // this retry's observers before reporting the stream as unavailable —
           // the throw below is not a substitute for the terminal outcome.
+          if (evidence.status === 'completed' && evidence.erased === true) {
+            await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
+          }
           if (
             evidence.status === 'completed' &&
             this._terminalFinalizer !== undefined &&
@@ -10108,6 +10111,7 @@ export class Session {
           // A terminal caller still needs its durable receipt replayed — the
           // committed fast-path converges on the stored winner without
           // recomputing it.
+          if (evidence.erased === true) await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
           const completedResult = this._completedEvidenceResult(evidence);
           if (this._terminalFinalizer !== undefined && opts.executionAuthorityGrant !== undefined) {
             await this._commitCachedDuplicateTerminal(
@@ -10274,6 +10278,7 @@ export class Session {
     evidence: AgentSignalResultEvidence,
     opts: MessageOptions,
     activeDeleted?: Promise<never>,
+    replay: { includeCompleted?: true } = {},
   ): Promise<void> {
     const grant = opts.executionAuthorityGrant;
     if (
@@ -10295,7 +10300,12 @@ export class Session {
         }),
         activeDeleted,
       );
-      if (admission?.status !== 'committed' || admission.terminalResult?.status === 'completed') return;
+      if (
+        admission?.status !== 'committed' ||
+        (replay.includeCompleted !== true && admission.terminalResult?.status === 'completed')
+      ) {
+        return;
+      }
       const intent = await this._raceActiveTurnWaiter(
         this._storage.loadTerminalIntent({
           harnessName: admission.harnessName,
@@ -11639,6 +11649,22 @@ export class Session {
     if (evidence.status === 'completed') return this._completedEvidenceResult(evidence);
     if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
     return this._awaitDurableSignalResult({ signalId }, abortSignal, { waitIndefinitely: true });
+  }
+
+  /**
+   * A duplicate of a turn whose session was deleted (PF-5309): its result is
+   * erased, but its committed terminal receipt is still durable. Replay that
+   * receipt to the caller's terminal observers, then fail with the typed
+   * erased error, so no observer is left waiting and no caller sees an empty
+   * success.
+   */
+  private async _rejectErasedDuplicate(
+    evidence: AgentSignalResultEvidence & { status: 'completed' },
+    opts: MessageOptions,
+    activeDeleted?: Promise<never>,
+  ): Promise<never> {
+    await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted, { includeCompleted: true });
+    throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
   }
 
   /**

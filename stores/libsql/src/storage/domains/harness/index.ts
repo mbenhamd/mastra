@@ -50,6 +50,7 @@ import {
   getSqlType,
   normalizePendingInteractionDueScanInput,
   walkPlanTaskSubtree,
+  HARNESS_MESSAGE_RESULT_ERASED_CODE,
 } from '@mastra/core/storage';
 import type {
   AcquireSessionLeaseInput,
@@ -1733,8 +1734,10 @@ export class HarnessLibSQL extends HarnessStorage {
         namespacedRecord.operationKind ?? null,
         namespacedRecord.status,
         namespacedRecord.dispatch === undefined ? null : JSON.stringify(namespacedRecord.dispatch),
-        'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-        'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+        'result' in namespacedRecord && namespacedRecord.result !== undefined
+          ? JSON.stringify(namespacedRecord.result)
+          : null,
+        messageEvidenceErrorColumn(namespacedRecord),
         namespacedRecord.createdAt,
         namespacedRecord.updatedAt,
       ],
@@ -1785,8 +1788,10 @@ export class HarnessLibSQL extends HarnessStorage {
         updated.operationKind ?? null,
         namespacedRecord.status,
         updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
-        'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-        'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+        'result' in namespacedRecord && namespacedRecord.result !== undefined
+          ? JSON.stringify(namespacedRecord.result)
+          : null,
+        messageEvidenceErrorColumn(namespacedRecord),
         namespacedRecord.updatedAt,
         id,
         current.operationKind ?? null,
@@ -7217,6 +7222,17 @@ function workspaceActionPathFilterHasSelector(
   return filter.rootId !== undefined || filter.path !== undefined || filter.relativePath !== undefined;
 }
 
+/** The `error` column of a message result row; an erased completed row stores the reserved marker (PF-5309). */
+function messageEvidenceErrorColumn(record: AgentSignalResultEvidence): string | null {
+  if (record.status === 'completed' && record.erased === true) {
+    return JSON.stringify({
+      code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
+      message: 'The result was erased with its session',
+    });
+  }
+  return 'error' in record ? JSON.stringify(record.error) : null;
+}
+
 function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalResultEvidence {
   const base = {
     harnessName: String(row.harness_name),
@@ -7239,6 +7255,10 @@ function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalRe
   const status = String(row.status);
   if (status === 'completed') {
     const runId = completedMessageEvidenceRunId(base);
+    // PF-5309: a completed row carrying the erased marker has no result.
+    if ((parseJson(row.error) as { code?: unknown } | undefined)?.code === HARNESS_MESSAGE_RESULT_ERASED_CODE) {
+      return { ...base, status: 'completed', runId, result: undefined, erased: true };
+    }
     return {
       ...base,
       status: 'completed',
