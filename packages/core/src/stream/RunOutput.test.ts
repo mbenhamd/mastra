@@ -467,6 +467,20 @@ describe('WorkflowRunOutput', () => {
     expect((finish?.payload as { workflowStatus?: string }).workflowStatus).toBe('failed');
   });
 
+  it('rejects usage with the pipeline error when the run already failed', async () => {
+    const { stream, controller } = createControlledStream();
+    const output = new WorkflowRunOutput({ runId: 'run-1', workflowId: 'workflow-1', stream });
+    const resultPromise = output.result;
+    const usagePromise = output.usage;
+
+    // The engine reports the run failed, then the transport fails before a terminal.
+    output.rejectResults(new Error('engine failure'));
+    controller.error(new Error('transport failure'));
+
+    await expect(resultPromise).rejects.toThrow('engine failure');
+    await expect(usagePromise).rejects.toThrow('transport failure');
+  });
+
   it('rejects result/usage and closes consumers when the pipeline errors after resume()', async () => {
     // First leg of the run: stream ends cleanly (e.g. the run suspends).
     const first = createControlledStream();
