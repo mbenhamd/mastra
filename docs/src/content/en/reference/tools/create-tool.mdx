@@ -98,6 +98,13 @@ The first `execute` parameter is the validated value from `inputSchema`. Destruc
     isOptional: true,
   },
   {
+    name: 'resultStatus',
+    type: "(output: TSchemaOut) => 'success' | 'error'",
+    description:
+      "Optional classification of a returned output for framework tool-call receipts. Return `'error'` when the tool reports a failure as data, such as `{ success: false, stderr }`, instead of throwing. The model, the stream and the transcript still receive the returned output; only the receipt records the call as failed, so a Harness subagent cannot cite it as successful evidence. It receives the recorded output, including a background task's completed result. Provider-executed tools are not classified.",
+    isOptional: true,
+  },
+  {
     name: 'transform',
     type: 'ToolPayloadTransform',
     description:

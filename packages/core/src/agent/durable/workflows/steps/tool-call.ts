@@ -2298,14 +2298,6 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             logger?.warn?.(`[DurableAgent] toModelOutput failed for tool "${toolName}": ${mappingError}`);
           }
         }
-        // The tool's own classification of a returned failure travels on the
-        // emitted tool-result chunk for framework tool-call receipts.
-        providerMetadata = withToolResultStatusProviderMetadata({
-          tool: mappingTool as { resultStatus?: (output: unknown) => unknown },
-          result: outcome.result,
-          providerMetadata: providerMetadata as Record<string, unknown> | undefined,
-        }) as ProviderMetadata | undefined;
-
         // Run processToolResult hooks before the tool-result chunk is emitted.
         // In this engine subscribers receive tool-result chunks HERE, at
         // tool-call time — running the hook later in llm-mapping would protect
@@ -2407,6 +2399,15 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             result = { error: 'Tool result processing failed' };
           }
         }
+
+        // The tool's own classification of the final recorded result (after
+        // processToolResult replaced or failed it) travels on the emitted
+        // tool-result chunk and the step output for framework tool-call receipts.
+        providerMetadata = withToolResultStatusProviderMetadata({
+          tool: mappingTool as { resultStatus?: (output: unknown) => unknown },
+          result,
+          providerMetadata: providerMetadata as Record<string, unknown> | undefined,
+        }) as ProviderMetadata | undefined;
 
         // Emit tool-result chunk (non-fatal — result is returned regardless).
         // Skip emission when the tool called suspend() — the workflow engine's

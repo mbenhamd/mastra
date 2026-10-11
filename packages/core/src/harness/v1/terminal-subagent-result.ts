@@ -293,7 +293,10 @@ function normalizeToolReceipt(value: unknown): HarnessSubagentToolReceipt | unde
     : isRecord(payload?.providerMetadata)
       ? payload.providerMetadata
       : undefined;
-  const classifiedError = isRecord(providerMetadata?.mastra) && providerMetadata.mastra.resultStatus === 'error';
+  const mastraMetadata = isRecord(providerMetadata?.mastra) ? providerMetadata.mastra : undefined;
+  // A running background placeholder is not the tool's result.
+  if (isRecord(mastraMetadata?.backgroundTask) && mastraMetadata.backgroundTask.status === 'running') return undefined;
+  const classifiedError = mastraMetadata?.resultStatus === 'error';
   return { toolCallId, toolName, status: explicitStatus ?? (isError || classifiedError ? 'error' : 'success') };
 }
 
