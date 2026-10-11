@@ -62,4 +62,64 @@ describeForAllEngines('AIMock loop scenario: tool result status', engine => {
     expect(chunks?.some(chunk => chunk.type === 'tool-result')).toBe(true);
     expect(toolResultStatus(chunks as never)).toBeUndefined();
   });
+
+  it('classifies a background completion and never its dispatch placeholder', async () => {
+    const analysisTool = createTool({
+      id: 'run_background_analysis',
+      description: 'Run an analysis in the background.',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ success: z.boolean(), stderr: z.string() }),
+      background: { enabled: true, timeoutMs: 5000 },
+      resultStatus: output => (output.success ? 'success' : 'error'),
+      execute: async () => {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return { success: false, stderr: 'NameError: total' };
+      },
+    });
+
+    const { chunks } = await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Run the background analysis.',
+      tools: { run_background_analysis: analysisTool },
+      agentBackgroundTasks: { tools: { run_background_analysis: true } },
+      backgroundTasks: { enabled: true },
+      stopWhen: stepCountIs(3),
+      collectChunks: true,
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 0 },
+          {
+            toolCalls: [
+              {
+                id: 'call_background_analysis',
+                name: 'run_background_analysis',
+                // The awaited disposition blocks the turn on the authoritative result.
+                arguments: { _background: { disposition: 'awaited' } },
+              },
+            ],
+          },
+        );
+        llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: 'Background analysis failed.' });
+      },
+    });
+
+    const results = (chunks ?? [])
+      .filter(chunk => chunk.type === 'tool-result')
+      .map(
+        chunk =>
+          chunk.payload as {
+            result?: unknown;
+            providerMetadata?: { mastra?: { resultStatus?: unknown; backgroundTask?: { status?: unknown } } };
+          },
+      );
+    const completions = results.filter(
+      payload => typeof payload.result === 'object' && (payload.result as { success?: unknown }).success === false,
+    );
+    expect(completions.length).toBeGreaterThan(0);
+    for (const payload of completions) expect(payload.providerMetadata?.mastra?.resultStatus).toBe('error');
+    for (const payload of results.filter(p => p.providerMetadata?.mastra?.backgroundTask?.status === 'running')) {
+      expect(payload.providerMetadata?.mastra?.resultStatus).toBeUndefined();
+    }
+  });
 });

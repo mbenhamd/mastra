@@ -376,8 +376,9 @@ export class Tool<
   /**
    * Classifies a returned output for framework tool-call receipts. Return
    * `'error'` when the tool reported a failure as data (for example
-   * `{ success: false }`) instead of throwing. Only the receipt changes: the
-   * model, the stream, and the transcript still see the returned output.
+   * `{ success: false }`) instead of throwing. It receives the recorded,
+   * serialization-safe output. Only the receipt changes: the model, the
+   * stream, and the transcript still see the returned output.
    */
   resultStatus?: (output: TSchemaOut) => ToolResultStatus;
 

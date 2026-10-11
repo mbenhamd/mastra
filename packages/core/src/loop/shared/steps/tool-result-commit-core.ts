@@ -90,7 +90,9 @@ export async function computeModelOutputProviderMetadata(deps: {
 /**
  * Stamp a tool's own classification of a returned output on the result's
  * `providerMetadata.mastra.resultStatus`, so framework tool-call receipts can
- * record a failure the tool returned as data. Only `'error'` is stamped; an
+ * record a failure the tool returned as data. Every engine and the background
+ * completion path classify the recorded, serialization-safe output, the same
+ * value the stream and the transcript carry. Only `'error'` is stamped; an
  * unclassified or successful output leaves the metadata unchanged. A classifier
  * that throws records `'error'`: a receipt must never claim success the tool
  * could not confirm. The model-facing output is not touched.
@@ -102,6 +104,12 @@ export function withToolResultStatusProviderMetadata(deps: {
 }): Record<string, unknown> | undefined {
   const classify = deps.tool?.resultStatus;
   if (typeof classify !== 'function') return deps.providerMetadata;
+  const existingMastra = (deps.providerMetadata as { mastra?: Record<string, unknown> } | undefined)?.mastra;
+  // A background dispatch placeholder is not the tool's output; its completion
+  // is classified when the real result arrives.
+  if ((existingMastra?.backgroundTask as { status?: unknown } | undefined)?.status === 'running') {
+    return deps.providerMetadata;
+  }
   let status: unknown;
   try {
     status = classify(deps.result);
@@ -109,7 +117,6 @@ export function withToolResultStatusProviderMetadata(deps: {
     status = 'error';
   }
   if (status === 'success') return deps.providerMetadata;
-  const existingMastra = (deps.providerMetadata as { mastra?: Record<string, unknown> } | undefined)?.mastra;
   return { ...deps.providerMetadata, mastra: { ...existingMastra, resultStatus: 'error' } };
 }
 

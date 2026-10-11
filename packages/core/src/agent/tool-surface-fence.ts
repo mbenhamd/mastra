@@ -72,6 +72,7 @@ const PROTECTED_TOOL_DEFINITION_KEYS = Object.freeze([
   'background',
   'backgroundConfig',
   'terminalResult',
+  'resultStatus',
   'mcp',
   'mcpMetadata',
   'annotations',

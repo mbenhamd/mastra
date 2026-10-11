@@ -1969,7 +1969,11 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                     toolName: chunk.payload.toolName,
                     args: cleanedArgs,
                     result: chunk.payload.result,
-                    providerMetadata: backgroundResultMetadata(chunk.payload.taskId, 'completed'),
+                    providerMetadata: withToolResultStatusProviderMetadata({
+                      tool: tool as { resultStatus?: (output: unknown) => unknown },
+                      result: chunk.payload.result,
+                      providerMetadata: backgroundResultMetadata(chunk.payload.taskId, 'completed'),
+                    }) as ProviderMetadata | undefined,
                   },
                 });
               } else if (chunk.type === 'background-task-failed') {
@@ -2293,7 +2297,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         // emitted tool-result chunk for framework tool-call receipts.
         providerMetadata = withToolResultStatusProviderMetadata({
           tool: mappingTool as { resultStatus?: (output: unknown) => unknown },
-          result: outcome.rawResult,
+          result: outcome.result,
           providerMetadata: providerMetadata as Record<string, unknown> | undefined,
         }) as ProviderMetadata | undefined;
 
