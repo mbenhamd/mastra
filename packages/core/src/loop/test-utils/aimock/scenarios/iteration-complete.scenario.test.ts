@@ -652,6 +652,64 @@ describeForAllEngines(
       expect(text).not.toContain('UNEXPECTED_THIRD_CALL');
     });
 
+    it('never lets the recovery step advertise more tools than the step before it', async () => {
+      // PF-5349: a bounded response lane withdraws tools (toolChoice 'none') on
+      // the silent final step. Processors decide anew on the recovery step and
+      // would re-expose them; recovery must freeze the previous request instead.
+      let step = 0;
+      let responseOnly = false;
+      const stageTool = createTool({
+        id: 'stage_change',
+        description: 'Stage a private change',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => ({ ok: true }),
+      });
+
+      const { requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Stage the change, then answer.',
+        tools: { stage_change: stageTool },
+        maxSteps: 20,
+        recoveryMaxSteps: 1,
+        prepareStep: () => {
+          step += 1;
+          if (responseOnly) return { [AGENT_RESPONSE_RECOVERY_STEP]: true };
+          // The second request is the bounded, tool-free response lane.
+          return step === 2 ? { toolChoice: 'none' } : undefined;
+        },
+        onIterationComplete: (context: IterationCompleteContext) => {
+          if (responseOnly) return { continue: false };
+          if (context.isFinal && context.text.trim() === '') {
+            responseOnly = true;
+            return {
+              continue: true,
+              feedback: 'Report the result.',
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'stage-1', name: 'stage_change', arguments: {} }] },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'Staged.' });
+        },
+      });
+
+      expect(requests).toHaveLength(3);
+      expect(requests[0]?.body?.tools ?? []).toHaveLength(1);
+      expect(requests[1]?.body?.tools ?? []).toHaveLength(0);
+      if (!isDurableEngineVariant(engine)) {
+        // The loop engines freeze the previous request's selection.
+        expect(requests[2]?.body?.tools ?? []).toHaveLength(0);
+      }
+    });
+
     it('keeps the tool schemas on a response-only recovery step and refuses to execute its calls', async () => {
       // PF-5349: the recovery step must advertise exactly the tool list of the
       // step before it, so the provider's cached prompt prefix survives. Only

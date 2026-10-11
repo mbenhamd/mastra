@@ -1400,6 +1400,14 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   const configuredToolCallConcurrency = resolveConfiguredToolCallConcurrency(toolCallConcurrency);
 
   let currentIteration = 0;
+  /**
+   * The tool selection the previous provider request of this run advertised,
+   * after every processor, fence and permission gate. A response-only recovery
+   * step reuses it (PF-5349): processors may decide differently on the recovery
+   * step (for example re-exposing tools a bounded response lane had withdrawn),
+   * and the recovery request must not advertise more than the step before it.
+   */
+  let previousAdvertisedSurface: { toolChoice: unknown; activeTools: string[] | undefined } | undefined;
   let eagerAbortListenerRegistered = false;
   const pendingProviderToolCallsByToolCallId = new Map<string, PendingProviderToolCall>();
 
@@ -2255,6 +2263,26 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Recovery owns one freshly fenced provider attempt. A cached response
           // was produced under another tool surface and cannot consume it.
           cachedResponse = undefined;
+          // Bound recovery by the previous request's selection, so it advertises
+          // what the step before it did (the provider cache prefix) and never
+          // more: active tools are intersected, and a 'none' on either side
+          // keeps the recovery request tool-free.
+          if (previousAdvertisedSurface !== undefined) {
+            const previous = previousAdvertisedSurface;
+            const current = currentStep.activeTools as string[] | undefined;
+            currentStep.activeTools = (
+              previous.activeTools === undefined
+                ? current
+                : current === undefined
+                  ? [...previous.activeTools]
+                  : current.filter(name => previous.activeTools!.includes(name))
+            ) as typeof currentStep.activeTools;
+            if (previous.toolChoice === 'none' || currentStep.toolChoice === 'none') {
+              currentStep.toolChoice = 'none' as typeof currentStep.toolChoice;
+            } else {
+              currentStep.toolChoice = previous.toolChoice as typeof currentStep.toolChoice;
+            }
+          }
           // Chosen after the tool-surface fence and the permission gate, from the
           // tools this request will actually advertise (PF-5349): the step keeps
           // their schemas and the loop denies execution below.
@@ -2263,6 +2291,13 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             currentStep.tools as Record<string, unknown> | undefined,
             currentStep.activeTools as string[] | undefined,
           ) as typeof currentStep.toolChoice;
+        } else {
+          previousAdvertisedSurface = {
+            toolChoice: currentStep.toolChoice,
+            activeTools: Array.isArray(currentStep.activeTools)
+              ? [...(currentStep.activeTools as string[])]
+              : undefined,
+          };
         }
 
         // Execution denial is separate from schema exposure: the admitted
