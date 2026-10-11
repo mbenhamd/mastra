@@ -220,8 +220,7 @@ function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 
       return undefined;
     }
   }
-  if (parsed === null || parsed === undefined) return 'unmarked';
-  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     return undefined;
   }
   if (!Object.prototype.hasOwnProperty.call(parsed, '_managedWorkingMemoryScope')) return 'unmarked';
@@ -2889,8 +2888,7 @@ export class MemoryPG extends MemoryStorage {
       return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
-        await this.assertCurrentObservationalMemoryGeneration(t, guard);
-        await this.markObservationalMemoryManagingWorkingMemory(t, guard, 'resource');
+        const generation = await this.assertCurrentObservationalMemoryGeneration(t, guard);
         const currentRow = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
           `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
           [resourceId],
@@ -2917,6 +2915,9 @@ export class MemoryPG extends MemoryStorage {
           // and timestamptz columns is refused (42P08, inconsistent types).
           [resourceId, workingMemory, nowStr, nowStr],
         );
+        if ((currentRow?.workingMemory ?? null) !== workingMemory) {
+          await this.markObservationalMemoryManagingWorkingMemory(t, guard, 'resource', generation);
+        }
         return {
           id: row.id,
           workingMemory: row.workingMemory,
@@ -2962,9 +2963,6 @@ export class MemoryPG extends MemoryStorage {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.lockWorkingMemoryTarget(t, 'thread', id);
         await this.assertCurrentObservationalMemoryGeneration(t, guard);
-        if (Object.prototype.hasOwnProperty.call(metadata, 'workingMemory')) {
-          await this.markObservationalMemoryManagingWorkingMemory(t, guard, 'thread');
-        }
         const currentRow = await t.oneOrNone<{ metadata: unknown }>(
           `SELECT metadata FROM ${tableName} WHERE id = $1 AND "resourceId" = $2 FOR UPDATE`,
           [id, guard.resourceId],
@@ -3059,6 +3057,7 @@ export class MemoryPG extends MemoryStorage {
           input.scope,
           input.scope === 'resource' ? input.resourceId : input.threadId,
         );
+        let guardedGeneration: { config: unknown } | undefined;
         if (input.observationalMemoryGuard) {
           if (input.source !== 'observer') {
             throw new WorkingMemoryValidationError('Only observer updates may carry an observational-memory guard.');
@@ -3069,8 +3068,7 @@ export class MemoryPG extends MemoryStorage {
               'Observational memory guard does not match the working-memory target.',
             );
           }
-          await this.assertCurrentObservationalMemoryGeneration(t, guard);
-          await this.markObservationalMemoryManagingWorkingMemory(t, guard, input.scope);
+          guardedGeneration = await this.assertCurrentObservationalMemoryGeneration(t, guard);
         }
 
         const now = new Date();
@@ -3105,6 +3103,14 @@ export class MemoryPG extends MemoryStorage {
               [input.resourceId, next.value, JSON.stringify(nextMetadata), nowString, nowString, nowString, nowString],
             );
           }
+          if (input.observationalMemoryGuard && guardedGeneration) {
+            await this.markObservationalMemoryManagingWorkingMemory(
+              t,
+              input.observationalMemoryGuard,
+              'resource',
+              guardedGeneration,
+            );
+          }
           return next;
         }
 
@@ -3130,6 +3136,14 @@ export class MemoryPG extends MemoryStorage {
            WHERE id = $4 AND "resourceId" = $5`,
           [JSON.stringify(nextMetadata), nowString, nowString, input.threadId, input.resourceId],
         );
+        if (input.observationalMemoryGuard && guardedGeneration) {
+          await this.markObservationalMemoryManagingWorkingMemory(
+            t,
+            input.observationalMemoryGuard,
+            'thread',
+            guardedGeneration,
+          );
+        }
         return next;
       });
     } catch (error) {
@@ -4029,24 +4043,21 @@ export class MemoryPG extends MemoryStorage {
   }
 
   /**
-   * A guarded observer working-memory write proves its record's observer
-   * manages working memory at `scope`. A record marked `null` (created while
-   * the observer did not manage it) is stamped in the write's transaction,
-   * under the OM-resource lock and before the target row, so a later
-   * retraction clears what this write stores. An unmarked (pre-marker) record
+   * A guarded observer write that changed working memory proves its record's
+   * observer manages working memory at `scope`. A record marked `null`
+   * (created while the observer did not manage it) is stamped after that
+   * write, in its transaction and under the OM-resource lock, so a later
+   * retraction clears what the write stored and a rejected write stamps
+   * nothing. An unmarked (pre-marker) record
    * is left to the caller's policy fallback, and a marked one keeps its scope.
    */
   private async markObservationalMemoryManagingWorkingMemory(
     t: TxClient,
     guard: ObservationalMemoryWriteGuard,
     scope: 'thread' | 'resource',
+    current: { config: unknown },
   ): Promise<void> {
-    const tableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
-    const row = await t.oneOrNone<{ config: unknown }>(`SELECT config FROM ${tableName} WHERE id = $1 FOR UPDATE`, [
-      guard.recordId,
-    ]);
-    if (!row) return;
-    let config: unknown = row.config;
+    let config: unknown = current.config;
     if (typeof config === 'string') {
       try {
         config = JSON.parse(config);
@@ -4062,30 +4073,37 @@ export class MemoryPG extends MemoryStorage {
     ) {
       return;
     }
-    await t.none(`UPDATE ${tableName} SET config = $1 WHERE id = $2`, [
-      toPgJson({ ...(config as Record<string, unknown>), _managedWorkingMemoryScope: scope }),
-      guard.recordId,
-    ]);
+    // Only for a `null`-marked record (rare): a conditional update on the
+    // stored value, so a concurrent config merge is neither lost nor clobbered.
+    const tableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
+    await t.none(
+      `UPDATE ${tableName}
+       SET config = jsonb_set(config::jsonb, '{_managedWorkingMemoryScope}', to_jsonb($2::text))
+       WHERE id = $1 AND config::jsonb -> '_managedWorkingMemoryScope' = 'null'::jsonb`,
+      [guard.recordId, scope],
+    );
   }
 
+  /** Throws unless the guard names the current generation; answers that record's config. */
   private async assertCurrentObservationalMemoryGeneration(
     t: TxClient,
     guard: ObservationalMemoryWriteGuard,
-  ): Promise<void> {
+  ): Promise<{ config: unknown }> {
     const tableName = getTableName({
       indexName: OM_TABLE,
       schemaName: getSchemaName(this.#schema),
     });
-    const current = await t.oneOrNone<{ id: string }>(
-      `SELECT id FROM ${tableName}
+    const current = await t.oneOrNone<{ id: string; config: unknown }>(
+      `SELECT id, config FROM ${tableName}
        WHERE "lookupKey" = $1
        ORDER BY ${OM_GENERATION_ORDER}
        LIMIT 1`,
       [this.getOMKey(guard.threadId, guard.resourceId)],
     );
-    if (current?.id !== guard.recordId) {
+    if (!current || current.id !== guard.recordId) {
       throw new ObservationalMemoryGenerationConflictError();
     }
+    return current;
   }
 
   /**

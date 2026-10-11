@@ -519,32 +519,114 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
     await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: 'Learned since.' });
   });
 
-  it('stamps a not-managed record managed when its observer writes working memory, so a retraction clears it', async () => {
-    const storage = new InMemoryStore({ id: 'memory-observational-stale-null-marker' });
-    const memory = await storage.getStore('memory');
-    if (!memory) throw new Error('Expected in-memory storage domain.');
-    const createdAt = new Date('2026-01-01T00:00:00.000Z');
-    const threadId = 'stale-null-thread';
-    const resourceId = 'stale-null-resource';
-    await memory.saveThread({
-      thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt, updatedAt: createdAt },
+  describe('a not-managed (null-marked) record', () => {
+    const setup = async (id: string) => {
+      const storage = new InMemoryStore({ id });
+      const memory = await storage.getStore('memory');
+      if (!memory) throw new Error('Expected in-memory storage domain.');
+      const createdAt = new Date('2026-01-01T00:00:00.000Z');
+      const threadId = `${id}-thread`;
+      const resourceId = `${id}-resource`;
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: '',
+          metadata: { workingMemory: 'Thread profile from elsewhere.' },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+      // Created while the observer did not manage working memory; the policy has since changed.
+      const record = await memory.initializeObservationalMemory({
+        threadId: null,
+        resourceId,
+        scope: 'resource',
+        config: { _managedWorkingMemoryScope: null },
+      });
+      const guard = { recordId: record.id, threadId: null, resourceId };
+      const marker = async () =>
+        ((await memory.getObservationalMemory(null, resourceId))?.config as Record<string, unknown>)
+          ._managedWorkingMemoryScope;
+      return { memory, threadId, resourceId, guard, marker };
+    };
+
+    it.each([
+      [
+        'a guarded resource write',
+        async ({ memory, resourceId, guard }: Awaited<ReturnType<typeof setup>>) =>
+          memory.updateResourceFromObservationalMemory({ resourceId, workingMemory: 'FROM-DELETED-MSG', guard }),
+      ],
+      [
+        'a guarded revisioned update',
+        async ({ memory, resourceId, guard }: Awaited<ReturnType<typeof setup>>) => {
+          const current = await memory.getWorkingMemorySnapshot({ scope: 'resource', resourceId });
+          await memory.applyWorkingMemoryUpdate({
+            scope: 'resource',
+            resourceId,
+            value: 'FROM-DELETED-MSG',
+            expectedRevision: current.revision,
+            source: 'observer',
+            observationalMemoryGuard: guard,
+          });
+        },
+      ],
+    ])('is stamped managed by %s, so a retraction clears what it wrote', async (_name, write) => {
+      const context = await setup(`stamp-${_name.replaceAll(' ', '-')}`);
+      await write(context);
+      await expect(context.marker()).resolves.toBe('resource');
+      await expect(
+        context.memory.retractObservationalMemory({ resourceId: context.resourceId, threadId: context.threadId }),
+      ).resolves.toMatchObject({ clearedScopes: ['resource'], clearedResourceWorkingMemory: true });
+      await expect(context.memory.getResourceById({ resourceId: context.resourceId })).resolves.toMatchObject({
+        workingMemory: undefined,
+      });
     });
-    const record = await memory.initializeObservationalMemory({
-      threadId: null,
-      resourceId,
-      scope: 'resource',
-      config: { _managedWorkingMemoryScope: null },
+
+    it.each([
+      [
+        'a rejected guarded update (stale revision)',
+        async ({ memory, resourceId, guard }: Awaited<ReturnType<typeof setup>>) => {
+          await memory.updateResource({ resourceId, workingMemory: 'Profile from elsewhere.' });
+          await expect(
+            memory.applyWorkingMemoryUpdate({
+              scope: 'resource',
+              resourceId,
+              value: 'FROM-DELETED-MSG',
+              expectedRevision: 999,
+              source: 'observer',
+              observationalMemoryGuard: guard,
+            }),
+          ).rejects.toThrow();
+        },
+      ],
+      [
+        'an OM thread-metadata update',
+        async ({ memory, threadId, resourceId, guard }: Awaited<ReturnType<typeof setup>>) => {
+          await memory.updateResource({ resourceId, workingMemory: 'Profile from elsewhere.' });
+          await memory.updateThreadFromObservationalMemory({
+            id: threadId,
+            metadata: { workingMemory: 'Thread profile from elsewhere.', mastra: { om: { threadTitle: 'T' } } },
+            guard: { ...guard, threadId: null },
+          });
+        },
+      ],
+    ])('stays not managed after %s, and its retraction keeps memory it never wrote', async (_name, write) => {
+      const context = await setup(`keep-${_name.replaceAll(' ', '-')}`);
+      await write(context);
+      await expect(context.marker()).resolves.toBeNull();
+      await context.memory.retractObservationalMemory({
+        resourceId: context.resourceId,
+        threadId: context.threadId,
+        managedWorkingMemoryScope: 'resource',
+      });
+      await expect(context.memory.getResourceById({ resourceId: context.resourceId })).resolves.toMatchObject({
+        workingMemory: 'Profile from elsewhere.',
+      });
+      await expect(context.memory.getThreadById({ threadId: context.threadId })).resolves.toMatchObject({
+        metadata: expect.objectContaining({ workingMemory: 'Thread profile from elsewhere.' }),
+      });
     });
-    await memory.updateResourceFromObservationalMemory({
-      resourceId,
-      workingMemory: 'FROM-DELETED-MSG',
-      guard: { recordId: record.id, threadId: null, resourceId },
-    });
-    await expect(memory.retractObservationalMemory({ resourceId, threadId })).resolves.toMatchObject({
-      clearedScopes: ['resource'],
-      clearedResourceWorkingMemory: true,
-    });
-    await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: undefined });
   });
 
   it('never applies the policy fallback to a record explicitly marked as not managing working memory', async () => {
