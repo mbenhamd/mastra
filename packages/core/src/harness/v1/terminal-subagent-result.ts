@@ -517,8 +517,9 @@ type HarnessSubagentOutcomeEvidence = HarnessSubagentOutcomeReport['evidence'][n
  *   name and status;
  * - a claim without an id (models are never shown framework call ids) binds to
  *   one distinct recorded call with the same tool name and status, in
- *   execution order. A call whose receipts disagree on name/status is never
- *   bound this way, and a claim with no unbound matching call is rejected.
+ *   execution order that no other item already cites. A call whose receipts
+ *   disagree on name/status is never bound this way, and a claim with no
+ *   unclaimed matching call is rejected.
  *
  * Returns the report with every `tool-result` item carrying its bound
  * framework id, or undefined when any claim is not backed by the ledger.
@@ -540,7 +541,12 @@ function bindHarnessSubagentOutcomeEvidence(
       ? [{ toolCallId, toolName: first.toolName, status: first.status }]
       : [];
   });
-  const boundByName = new Set<string>();
+  // Calls cited by exact id are already claimed; id-less claims bind elsewhere.
+  const claimed = new Set(
+    report.evidence.flatMap(item =>
+      item.kind === 'tool-result' && item.toolCallId !== undefined ? [item.toolCallId] : [],
+    ),
+  );
 
   const evidence: HarnessSubagentOutcomeEvidence[] = [];
   let citesSuccessfulTool = false;
@@ -563,12 +569,12 @@ function bindHarnessSubagentOutcomeEvidence(
     } else {
       const call = unambiguousCalls.find(
         candidate =>
-          !boundByName.has(candidate.toolCallId) &&
+          !claimed.has(candidate.toolCallId) &&
           candidate.toolName === item.toolName &&
           candidate.status === item.status,
       );
       if (call === undefined) return undefined;
-      boundByName.add(call.toolCallId);
+      claimed.add(call.toolCallId);
       evidence.push({ ...item, toolCallId: call.toolCallId });
     }
     if (item.status === 'success') citesSuccessfulTool = true;

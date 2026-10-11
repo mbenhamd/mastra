@@ -391,6 +391,8 @@ describe('Harness subagent outcome terminal contract', () => {
       ),
       // Two claimed runs, one recorded run.
       claimsMoreRunsThanRecorded: resultFor([pythonClaim, pythonClaim], ranOnce),
+      // The one recorded run is already cited by its exact id.
+      reclaimsCitedRun: resultFor([{ ...pythonClaim, toolCallId: 'call_py' }, pythonClaim], ranOnce),
       // An id that is not in the ledger, such as a sandbox request id.
       unknownId: resultFor([{ ...pythonClaim, toolCallId: 'sandbox-request-7' }], ranOnce),
       // A call whose recorded receipts disagree is never bound by name.
