@@ -143,7 +143,7 @@ export class ToolResultSupersedeProcessor implements Processor {
         result: occurrence.result,
       });
       if (key === undefined) continue;
-      keyed.push({ part, step: occurrence.step, scopedKey: `${config.group ?? part.toolName}\u0000${key}` });
+      keyed.push({ part, step: occurrence.step, scopedKey: scopedSupersedeKey(config.group ?? part.toolName, key) });
     }
 
     // The newest result per key is the one from the latest step.
@@ -184,6 +184,14 @@ export class ToolResultSupersedeProcessor implements Processor {
  * are ordered by their position in the recorded history.
  */
 type StepPosition = { run?: number; history: number };
+
+/**
+ * Key space plus key, JSON-encoded so no group/key pair can collide with
+ * another, whatever characters either contains.
+ */
+export function scopedSupersedeKey(group: string, key: string): string {
+  return JSON.stringify([group, key]);
+}
 
 function compareSteps(left: StepPosition, right: StepPosition): number {
   if (left.run !== undefined && right.run !== undefined) return left.run - right.run;

@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import { MessageList } from '../../agent/message-list';
 import type { ToolResultSupersedeCall, ToolResultSupersedeOptions } from './tool-result-supersede';
-import { ToolResultSupersedeProcessor } from './tool-result-supersede';
+import { scopedSupersedeKey, ToolResultSupersedeProcessor } from './tool-result-supersede';
 
 type Call = {
   id: string;
@@ -175,6 +175,41 @@ describe('ToolResultSupersedeProcessor', () => {
     expect(String((toolMessages[0]!.content[0]!.output as any).value)).toContain('[superseded]');
     expect(toolMessages[1]!.content[0]!.output).toEqual({ type: 'text', value: 'body-call_0' });
     expect(toolMessages[2]!.content[0]!.output).toEqual({ type: 'text', value: 'body-x' });
+  });
+
+  it('keeps a reused id whose recorded and prompt occurrences disagree (trimmed history)', () => {
+    // Memory trimmed the first turn from the prompt but the message list still
+    // records it: call_0 has two recorded occurrences and one prompt result.
+    // Pairing by position would give the prompt's b.tex result the a.tex input
+    // and let the later a.tex read supersede it.
+    const built = build([[read('call_0', 'a.tex')], [read('call_0', 'b.tex')], [read('x', 'a.tex')]]);
+    const trimmed = { ...built, prompt: built.prompt.slice(2) };
+    expect(run(byPath, trimmed)).toBeUndefined();
+  });
+
+  it("orders this run's results by their model step, not by recorded position", () => {
+    // Recorded history lists r2 before r1, but this run's steps say r1 came
+    // first. The newest result is r2, so only r1 is replaced.
+    const built = build([[read('r2')], [read('r1')]]);
+    const runOrdered = {
+      ...built,
+      steps: [{ toolCalls: [{ toolCallId: 'r1' }] }, { toolCalls: [{ toolCallId: 'r2' }] }],
+    };
+    expect(superseded(run(byPath, runOrdered))).toEqual(['r1']);
+  });
+
+  it('keeps group and key pairs apart even when they contain the separator characters', () => {
+    expect(scopedSupersedeKey('a\u0000b', 'c')).not.toBe(scopedSupersedeKey('a', 'b\u0000c'));
+    // Through the processor: two tools in different groups whose group+key
+    // would concatenate to the same string never supersede each other.
+    const options = {
+      tools: {
+        first: { group: 'a\u0000b', key: () => 'c' },
+        second: { group: 'a', key: () => 'b\u0000c' },
+      },
+    };
+    const built = build([[{ id: 'g1', tool: 'first', input: {} }], [{ id: 'g2', tool: 'second', input: {} }]]);
+    expect(run(options, built)).toBeUndefined();
   });
 
   it('keeps every result without a recorded occurrence', () => {
