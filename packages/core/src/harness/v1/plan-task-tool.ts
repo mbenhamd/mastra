@@ -386,6 +386,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
                 context?.agent?.toolCallId,
                 context?.agent?.runId,
                 context?.requestContext,
+                context?.tracingContext,
               )) as any;
             } catch (err) {
               return toToolError(err) as any;

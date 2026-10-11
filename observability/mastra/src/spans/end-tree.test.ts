@@ -293,4 +293,25 @@ describe('Span.endTree', () => {
     expect(step.endTime).toBeUndefined();
     expect(testExporter.events).toHaveLength(0);
   });
+
+  it('leaves a detached-lifetime child and its descendants open, still in the parent trace', () => {
+    const tracing = createInstance();
+
+    const root = tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'root', metadata: { requestId: 'r-1' } });
+    const tool = root.createChildSpan({ type: SpanType.TOOL_CALL, name: 'tool' });
+    const detached = tool.createChildSpan({ type: SpanType.GENERIC, name: 'background', detachedLifetime: true });
+    const backgroundRun = detached.createChildSpan({ type: SpanType.AGENT_RUN, name: 'background-run' });
+
+    root.endTree();
+
+    expect(endedIds().sort()).toEqual([root.id, tool.id].sort());
+    expect(detached.endTime).toBeUndefined();
+    expect(backgroundRun.endTime).toBeUndefined();
+    expect(detached.traceId).toBe(root.traceId);
+    expect(detached.parent).toBe(tool);
+    expect(backgroundRun.metadata?.requestId).toBe('r-1');
+
+    detached.endTree();
+    expect(endedIds()).toEqual(expect.arrayContaining([detached.id, backgroundRun.id]));
+  });
 });
