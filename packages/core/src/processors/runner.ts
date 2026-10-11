@@ -113,6 +113,22 @@ export function outputProcessorsSupportResult(outputProcessors: readonly Process
   return Boolean(outputProcessors?.some(outputProcessorSupportsResult));
 }
 
+/**
+ * `runProcessToolResult` dispatches to every processor workflow, so a workflow
+ * counts unless its wrapper recorded that none of its processors implement the hook.
+ */
+function outputProcessorSupportsToolResult(processorOrWorkflow: ProcessorOrWorkflow): boolean {
+  return isProcessorWorkflow(processorOrWorkflow)
+    ? processorOrWorkflow.__processToolResult !== false
+    : Boolean(processorOrWorkflow.processToolResult);
+}
+
+export function outputProcessorsSupportToolResult(
+  outputProcessors: readonly ProcessorOrWorkflow[] | undefined,
+): boolean {
+  return Boolean(outputProcessors?.some(outputProcessorSupportsToolResult));
+}
+
 const measuredPromptRoles = ['user', 'assistant', 'tool', 'other'] as const;
 type MeasuredPromptRole = (typeof measuredPromptRoles)[number];
 const promptMeasurementEncoder = new TextEncoder();

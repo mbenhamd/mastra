@@ -639,4 +639,39 @@ describe('processToolResult lifecycle hook', () => {
     }
     expect(outputStreamChunks).toBeGreaterThan(0);
   });
+
+  it('runs a call-time processor that implements only processToolResult', async () => {
+    class CallTimeRedactor implements Processor {
+      readonly id = 'call-time-redactor';
+      async processToolResult({ messageList, toolCallId, toolName, args }: any) {
+        messageList.updateToolInvocation({
+          type: 'tool-invocation',
+          toolInvocation: { state: 'result', toolCallId, toolName, args, result: '[CALL-TIME REDACTED]' },
+        });
+      }
+    }
+
+    const echoTool = createTool({
+      id: 'echoTool',
+      description: 'echo',
+      inputSchema: z.object({ text: z.string() }),
+      execute: async ({ text }) => `Echo: ${text}`,
+    });
+
+    const agent = new Agent({
+      id: 'tr-agent-call-time',
+      name: 'Test Agent',
+      instructions: 'tr',
+      model: makeMockToolCallModel('echoTool') as any,
+      tools: { echoTool },
+    });
+
+    const stream = await agent.stream('go', { maxSteps: 5, outputProcessors: [new CallTimeRedactor()] });
+    const toolResults: unknown[] = [];
+    for await (const chunk of stream.fullStream) {
+      if (chunk.type === 'tool-result') toolResults.push((chunk as any).payload?.result);
+    }
+
+    expect(toolResults).toEqual(['[CALL-TIME REDACTED]']);
+  });
 });
