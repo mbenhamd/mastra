@@ -713,6 +713,8 @@ export class CoreToolBuilder extends MastraBase {
             )
           : undefined,
         toModelOutput: 'toModelOutput' in this.originalTool ? this.originalTool.toModelOutput : undefined,
+        // A provider-defined tool can still execute locally; its classifier then applies.
+        resultStatus: 'resultStatus' in this.originalTool ? this.originalTool.resultStatus : undefined,
         transform: 'transform' in this.originalTool ? this.originalTool.transform : undefined,
         inputExamples: 'inputExamples' in this.originalTool ? this.originalTool.inputExamples : undefined,
       } as unknown as CoreTool & { id: `${string}.${string}` };
