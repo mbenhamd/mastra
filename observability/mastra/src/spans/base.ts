@@ -229,7 +229,9 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     this.tracingPolicy = options.tracingPolicy;
     this.traceState = options.traceState;
     const parent = options.parent;
-    if (!this.isEvent && parent instanceof BaseSpan && parent.isValid) {
+    // A detached child outlives its parent by design: the parent's endTree()
+    // must not reach it, so it is never registered as an open child.
+    if (!this.isEvent && !options.detachedLifetime && parent instanceof BaseSpan && parent.isValid) {
       (parent.#openChildren ??= new Set()).add(this);
       this.#openChildrenOwner = parent;
     }
