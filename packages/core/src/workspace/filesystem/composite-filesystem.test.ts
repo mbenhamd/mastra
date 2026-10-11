@@ -891,6 +891,11 @@ describe('CompositeFilesystem', () => {
       await expect(cfs.readFile('/unknown/file.txt')).rejects.toThrow('No mount for path');
     });
 
+    it('should report an unmounted file as ENOENT but the virtual root as EISDIR', async () => {
+      await expect(cfs.readFile('/unknown/file.txt')).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(cfs.readFile('/')).rejects.toMatchObject({ code: 'EISDIR' });
+    });
+
     it('should throw on writeFile for unmounted path', async () => {
       await expect(cfs.writeFile('/unknown/file.txt', 'data')).rejects.toThrow('No mount for path');
     });
