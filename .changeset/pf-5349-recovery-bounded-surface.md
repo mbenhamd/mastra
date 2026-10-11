@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-Fixed the Harness v1 reply step that runs after a silent tool turn advertising tools the step before it had withdrawn. The reply step now offers at most the tools of the previous request, so a step that sent no tools keeps sending none. Tool calls on the reply step still never run.
+Fixed a follow-up reply offering tools that the previous request had removed. When an agent asks the model for one more reply after a turn with no answer, that reply now offers at most the tools the previous request sent, on regular and durable agents, also after a tool approval resumes the run. If the previous request sent no tools, the follow-up reply sends none. Tool calls in the follow-up reply still never run.

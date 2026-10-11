@@ -158,6 +158,7 @@ const durableAgenticInputSchema = z.object({
       modelEntryId: z.string().optional(),
     })
     .optional(),
+  recoveryToolCeiling: z.array(z.string()).optional(),
   state: z.any(),
   messageId: z.string(),
   // Exported AGENT_RUN / MODEL_GENERATION span data, threaded so the run shares one trace

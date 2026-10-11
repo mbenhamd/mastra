@@ -105,6 +105,9 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     modelConfig: currentState.modelConfig,
     options: currentState.options,
     responseRecovery: executionOutput.responseRecoveryConsumed ? undefined : currentState.responseRecovery,
+    // The latest ordinary provider request bounds a later recovery step
+    // (PF-5349); an iteration that sent none keeps the previous bound.
+    recoveryToolCeiling: executionOutput.recoveryToolCeiling ?? currentState.recoveryToolCeiling,
     state: executionOutput.state,
     messageId: executionOutput.messageId,
     // Carried, not recomputed: the request context is fixed for the run, and
