@@ -2888,7 +2888,7 @@ export class MemoryPG extends MemoryStorage {
       return await this.#db.client.tx(async t => {
         await this.lockObservationalMemoryResource(t, guard.resourceId);
         await this.lockWorkingMemoryTarget(t, 'resource', resourceId);
-        const generation = await this.assertCurrentObservationalMemoryGeneration(t, guard);
+        const generation = await this.assertCurrentObservationalMemoryGeneration(t, guard, { lockRow: true });
         const currentRow = await t.oneOrNone<{ workingMemory: string | null; metadata: unknown }>(
           `SELECT "workingMemory", metadata FROM ${tableName} WHERE id = $1 FOR UPDATE`,
           [resourceId],
@@ -3068,7 +3068,7 @@ export class MemoryPG extends MemoryStorage {
               'Observational memory guard does not match the working-memory target.',
             );
           }
-          guardedGeneration = await this.assertCurrentObservationalMemoryGeneration(t, guard);
+          guardedGeneration = await this.assertCurrentObservationalMemoryGeneration(t, guard, { lockRow: true });
         }
 
         const now = new Date();
@@ -4074,7 +4074,9 @@ export class MemoryPG extends MemoryStorage {
       return;
     }
     // Only for a `null`-marked record (rare): a conditional update on the
-    // stored value, so a concurrent config merge is neither lost nor clobbered.
+    // stored value, so it does not clobber a concurrent config merge, and
+    // updateObservationalMemoryConfig locks the row for its read-modify-write
+    // so it cannot drop this stamp either.
     const tableName = getTableName({ indexName: OM_TABLE, schemaName: getSchemaName(this.#schema) });
     await t.none(
       `UPDATE ${tableName}
@@ -4084,10 +4086,16 @@ export class MemoryPG extends MemoryStorage {
     );
   }
 
-  /** Throws unless the guard names the current generation; answers that record's config. */
+  /**
+   * Throws unless the guard names the current generation; answers that
+   * record's config. `lockRow` locks the current OM row before the caller
+   * touches its target rows (the OM rows -> target rows order a later
+   * working-memory marker stamp keeps).
+   */
   private async assertCurrentObservationalMemoryGeneration(
     t: TxClient,
     guard: ObservationalMemoryWriteGuard,
+    options: { lockRow?: boolean } = {},
   ): Promise<{ config: unknown }> {
     const tableName = getTableName({
       indexName: OM_TABLE,
@@ -4097,7 +4105,8 @@ export class MemoryPG extends MemoryStorage {
       `SELECT id, config FROM ${tableName}
        WHERE "lookupKey" = $1
        ORDER BY ${OM_GENERATION_ORDER}
-       LIMIT 1`,
+       LIMIT 1
+       ${options.lockRow ? 'FOR UPDATE' : ''}`,
       [this.getOMKey(guard.threadId, guard.resourceId)],
     );
     if (!current || current.id !== guard.recordId) {
@@ -5419,32 +5428,37 @@ export class MemoryPG extends MemoryStorage {
         schemaName: getSchemaName(this.#schema),
       });
 
-      // Read current config
-      const selectResult = await this.#db.client.query(`SELECT config FROM ${tableName} WHERE id = $1`, [input.id]);
+      // Read-modify-write under the row lock, so a concurrent writer of the
+      // same config (a working-memory marker stamp) is not lost.
+      await this.#db.client.tx(async t => {
+        const selectResult = await t.query(`SELECT config FROM ${tableName} WHERE id = $1 FOR UPDATE`, [input.id]);
 
-      if (selectResult.rowCount === 0) {
-        throw new MastraError({
-          id: createStorageErrorId('PG', 'UPDATE_OM_CONFIG', 'NOT_FOUND'),
-          text: `Observational memory record not found: ${input.id}`,
-          domain: ErrorDomain.STORAGE,
-          category: ErrorCategory.THIRD_PARTY,
-          details: { id: input.id },
-        });
-      }
+        if (selectResult.rowCount === 0) {
+          throw new MastraError({
+            id: createStorageErrorId('PG', 'UPDATE_OM_CONFIG', 'NOT_FOUND'),
+            text: `Observational memory record not found: ${input.id}`,
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.THIRD_PARTY,
+            details: { id: input.id },
+          });
+        }
 
-      const row = selectResult.rows[0];
-      const existing: Record<string, unknown> = row.config
-        ? typeof row.config === 'string'
-          ? JSON.parse(row.config)
-          : row.config
-        : {};
-      const merged = this.deepMergeConfig(existing, input.config);
-      const nowStr = new Date().toISOString();
+        const row = selectResult.rows[0];
+        const existing: Record<string, unknown> = row.config
+          ? typeof row.config === 'string'
+            ? JSON.parse(row.config)
+            : row.config
+          : {};
+        const merged = this.deepMergeConfig(existing, input.config);
+        const nowStr = new Date().toISOString();
 
-      await this.#db.client.query(
-        `UPDATE ${tableName} SET config = $1, "updatedAt" = $2, "updatedAtZ" = $3 WHERE id = $4`,
-        [toPgJson(merged), nowStr, nowStr, input.id],
-      );
+        await t.query(`UPDATE ${tableName} SET config = $1, "updatedAt" = $2, "updatedAtZ" = $3 WHERE id = $4`, [
+          toPgJson(merged),
+          nowStr,
+          nowStr,
+          input.id,
+        ]);
+      });
     } catch (error) {
       if (error instanceof MastraError) {
         throw error;

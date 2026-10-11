@@ -1063,6 +1063,36 @@ describe('MemoryPG observational-memory retraction', () => {
           });
         },
       ],
+      [
+        'a guarded resource write that changes nothing',
+        async ({ resourceId: id, guard }: Case) => {
+          await observerMemory.updateResource({ resourceId: id, workingMemory: 'Profile from elsewhere.' });
+          await observerMemory.updateResourceFromObservationalMemory({
+            resourceId: id,
+            workingMemory: 'Profile from elsewhere.',
+            guard,
+          });
+        },
+      ],
+      [
+        'a rejected guarded resource write (revisioned working memory)',
+        async ({ resourceId: id, guard }: Case) => {
+          await observerMemory.applyWorkingMemoryUpdate({
+            scope: 'resource',
+            resourceId: id,
+            value: 'Profile from elsewhere.',
+            expectedRevision: 0,
+            source: 'owner',
+          });
+          await expect(
+            observerMemory.updateResourceFromObservationalMemory({
+              resourceId: id,
+              workingMemory: 'FROM-DELETED-MSG',
+              guard,
+            }),
+          ).rejects.toThrow();
+        },
+      ],
     ])('stays not managed after %s, and its retraction keeps memory it never wrote', async (_name, write) => {
       const context = await setup();
       await write(context);
@@ -1078,6 +1108,28 @@ describe('MemoryPG observational-memory retraction', () => {
       await expect(retractorMemory.getThreadById({ threadId: context.threadId })).resolves.toMatchObject({
         metadata: expect.objectContaining({ workingMemory: 'Thread profile from elsewhere.' }),
       });
+    });
+
+    it('is stamped thread-managed by a guarded thread-scope update, so a retraction clears every thread profile', async () => {
+      const context = await setup();
+      const current = await observerMemory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: context.resourceId,
+        threadId: context.threadId,
+      });
+      await observerMemory.applyWorkingMemoryUpdate({
+        scope: 'thread',
+        resourceId: context.resourceId,
+        threadId: context.threadId,
+        value: 'FROM-DELETED-MSG',
+        expectedRevision: current.revision,
+        source: 'observer',
+        observationalMemoryGuard: context.guard,
+      });
+      await expect(context.marker()).resolves.toBe('thread');
+      await retractorMemory.retractObservationalMemory({ resourceId: context.resourceId, threadId: context.threadId });
+      const thread = await retractorMemory.getThreadById({ threadId: context.threadId });
+      expect(thread?.metadata).not.toHaveProperty('workingMemory');
     });
   });
 
