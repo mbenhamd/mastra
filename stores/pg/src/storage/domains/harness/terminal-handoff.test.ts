@@ -1464,7 +1464,7 @@ describe('HarnessPG native terminal handoff', () => {
           [sessionId],
         ),
       );
-    for (const mode of ['nul-payload', 'nul-error', 'extra-field'] as const) {
+    for (const mode of ['nul-payload', 'nul-error', 'extra-field', 'malformed-error'] as const) {
       const session = await createNativeSession(harness(), `session-redact-${mode}`);
       const input = admissionFor(session, `redact-${mode}`);
       await harness().writeMessageResultEvidence(pendingEvidence(input));
@@ -1501,6 +1501,17 @@ describe('HarnessPG native terminal handoff', () => {
           : {}),
       });
       expect(committed.status).toBe('committed');
+      if (mode === 'malformed-error') {
+        // A stored result whose error is not an object (written outside the API).
+        for (const table of [TABLE_HARNESS_TERMINAL_ADMISSIONS, TABLE_HARNESS_TERMINAL_INTENTS]) {
+          await store.db.none(
+            `UPDATE "${schemaName}"."${table}"
+                SET terminal_result_json = '{"status":"completed","runId":"run","completedAt":1,"error":null,"note":"private"}'
+              WHERE session_id = $1`,
+            [session.id],
+          );
+        }
+      }
 
       // The delete succeeds (no jsonb cast can reject the stored text) and
       // keeps only the allowed metadata.

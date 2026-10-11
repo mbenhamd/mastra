@@ -2958,6 +2958,16 @@ export class HarnessPG extends HarnessStorage {
                   WHERE harness_name = ? AND session_id = ? AND session_incarnation = ?`,
             args: ['deleted', version, Date.now(), namespace, sessionId, sessionIncarnation],
           });
+        } else if (projectionIntentsTableExists) {
+          // PF-5309: a fence written while projection was enabled is closed too,
+          // so a late acknowledgement of an intent this delete retired resolves
+          // as fenced (the projection tables are created together).
+          await tx.execute({
+            sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_FENCES}
+                  SET state = ?, updated_at = ?
+                  WHERE harness_name = ? AND session_id = ? AND state <> ?`,
+            args: ['deleted', Date.now(), namespace, sessionId, 'deleted'],
+          });
         }
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_WORKSPACE_ACTIONS}

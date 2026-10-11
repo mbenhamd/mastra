@@ -455,7 +455,11 @@ export function redactHarnessTerminalResult(result: HarnessTerminalResult): Harn
     runId: result.runId,
     completedAt: result.completedAt,
     ...(result.finishReason !== undefined ? { finishReason: result.finishReason } : {}),
-    ...(result.error !== undefined ? { error: { code: result.error.code, message: '' } } : {}),
+    // Tolerates a malformed stored error (null, or not an object) so a delete
+    // can always erase it.
+    ...(result.error !== null && typeof result.error === 'object'
+      ? { error: { code: typeof result.error.code === 'string' ? result.error.code : '', message: '' } }
+      : {}),
   };
 }
 

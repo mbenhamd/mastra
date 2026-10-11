@@ -816,6 +816,19 @@ export class InMemoryHarness extends HarnessStorage {
             updatedAt: Date.now(),
           }),
         );
+      } else {
+        // PF-5309: a fence written while projection was enabled is closed too,
+        // so a late acknowledgement of an intent retired below resolves as
+        // fenced (PG mirrors this).
+        const fenceKey = projectionFenceKey(namespace, sessionId);
+        const fence = this.db.harnessSessionRecordProjectionFences.get(fenceKey);
+        if (fence !== undefined && fence.state !== 'deleted') {
+          this.db.harnessSessionRecordProjectionFences.set(fenceKey, {
+            ...fence,
+            state: 'deleted',
+            updatedAt: Date.now(),
+          });
+        }
       }
       // Every still-claimable intent of the session id is retired, whatever
       // its incarnation and whatever this store's projection setting (rows

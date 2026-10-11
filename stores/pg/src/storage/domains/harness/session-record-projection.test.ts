@@ -52,6 +52,14 @@ describe('HarnessPG native session record projection', () => {
       ownerId: 'owner-1',
       ifVersion: 0,
     });
+    // A projection worker holds a claim on the first intent when the session is deleted.
+    const [claim] = await harness.claimSessionRecordProjectionIntents({
+      claimId: 'claim-before-disabled-delete',
+      limit: 10,
+      now: Date.now() + 1_000,
+      claimTtlMs: 60_000,
+    });
+    if (!claim) throw new Error('expected a projection intent to claim');
     const disabledStore = new PostgresStore({
       ...TEST_CONFIG,
       id: 'pg-harness-projection-disabled-delete-store',
@@ -74,6 +82,19 @@ describe('HarnessPG native session record projection', () => {
     expect(rows.length).toBeGreaterThan(0);
     // Nothing is left to claim, and no post-image survives.
     expect(rows.every(row => row.status === 'dead' && row.payload === null)).toBe(true);
+    // The delete closed the projection fence too: the late acknowledgement
+    // resolves as fenced instead of failing on its retired claim.
+    await expect(
+      harness.ackSessionRecordProjection({
+        operationId: claim.operationId,
+        sessionId: claim.sessionId,
+        sessionIncarnation: claim.sessionIncarnation,
+        revision: claim.revision,
+        payloadDigest: claim.payloadDigest,
+        claimId: 'claim-before-disabled-delete',
+        acknowledgedAt: Date.now() + 2_000,
+      }),
+    ).resolves.toMatchObject({ status: 'fenced' });
     await expect(
       harness.claimSessionRecordProjectionIntents({
         claimId: 'after-delete',
