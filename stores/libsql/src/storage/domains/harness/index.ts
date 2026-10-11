@@ -3743,24 +3743,30 @@ export class HarnessLibSQL extends HarnessStorage {
     const stateCompareNames = cols.names.filter(
       name => name !== 'id' && name !== 'claim_id' && name !== 'claim_expires_at' && name !== 'updated_at',
     );
-    const result = await this.#writeWhileSessionsExist(namespace, [next.sessionId], client =>
-      client.execute({
-        sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
+    const result = await this.#writeWhileSessionsExist(
+      namespace,
+      // Only admission changes a row's session (it binds a row recorded without
+      // one). A row that keeps its session is erased together with it, and this
+      // UPDATE cannot insert one.
+      next.sessionId !== current.sessionId ? [next.sessionId] : [],
+      client =>
+        client.execute({
+          sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
             SET ${updateNames.map(name => `${name} = ?`).join(', ')}
             WHERE harness_name = ? AND id = ? AND claim_id = ?
               AND claim_expires_at IS NOT NULL
               AND claim_expires_at > ?
               AND status NOT IN ('accepted', 'queued', 'dead')
               AND ${stateCompareNames.map(name => `${name} IS ?`).join(' AND ')}`,
-        args: [
-          ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
-          namespace,
-          next.id,
-          opts.claimId,
-          storageNow,
-          ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
-        ],
-      }),
+          args: [
+            ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
+            namespace,
+            next.id,
+            opts.claimId,
+            storageNow,
+            ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
+          ],
+        }),
     );
     if (result.rowsAffected === 0) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);

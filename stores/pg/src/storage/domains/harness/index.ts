@@ -2582,10 +2582,25 @@ export class HarnessPG extends HarnessStorage {
         attachmentRows: Record<string, unknown>[];
       }
     >();
+    // Session rows lock in one canonical (namespace, session id) order, the
+    // order a channel write key-share locks the sessions it names, so a batch
+    // delete and a write naming two of its sessions cannot deadlock.
+    const orderedSessions = sessions
+      .map(opts => ({ opts, namespace: this.#resolveHarnessName(opts.harnessName) }))
+      .sort((left, right) =>
+        left.namespace !== right.namespace
+          ? left.namespace < right.namespace
+            ? -1
+            : 1
+          : left.opts.sessionId < right.opts.sessionId
+            ? -1
+            : left.opts.sessionId > right.opts.sessionId
+              ? 1
+              : 0,
+      );
     try {
-      for (const opts of sessions) {
+      for (const { opts, namespace } of orderedSessions) {
         const { sessionId } = opts;
-        const namespace = this.#resolveHarnessName(opts.harnessName);
         const existing = await tx.execute({
           sql: `SELECT version, session_incarnation, resource_id, thread_id, parent_session_id, created_at, closed_at
 	                FROM ${TABLE_HARNESS_SESSIONS}
@@ -8121,6 +8136,7 @@ export class HarnessPG extends HarnessStorage {
     sessionIds: readonly (string | undefined)[],
     write: (client: PgHarnessClient) => Promise<T>,
   ): Promise<T> {
+    // Sorted: the canonical order deleteSessions locks a batch's sessions in.
     const named = [...new Set(sessionIds.filter((id): id is string => id !== undefined))].sort();
     if (named.length === 0) return write(this.#client);
     const tx = await this.#client.transaction('write');
@@ -8442,24 +8458,30 @@ export class HarnessPG extends HarnessStorage {
     const stateCompareNames = cols.names.filter(
       name => name !== 'id' && name !== 'claim_id' && name !== 'claim_expires_at' && name !== 'updated_at',
     );
-    const result = await this.#writeWhileSessionsExist(namespace, [next.sessionId], client =>
-      client.execute({
-        sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
+    const result = await this.#writeWhileSessionsExist(
+      namespace,
+      // Only admission changes a row's session (it binds a row recorded without
+      // one). A row that keeps its session is erased together with it, and this
+      // UPDATE cannot insert one.
+      next.sessionId !== current.sessionId ? [next.sessionId] : [],
+      client =>
+        client.execute({
+          sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
             SET ${updateNames.map(name => `${name} = ?`).join(', ')}
             WHERE harness_name = ? AND id = ? AND claim_id = ?
               AND claim_expires_at IS NOT NULL
               AND claim_expires_at > ?
               AND status NOT IN ('accepted', 'queued', 'dead')
               AND ${stateCompareNames.map(name => `${name} IS ?`).join(' AND ')}`,
-        args: [
-          ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
-          namespace,
-          next.id,
-          opts.claimId,
-          storageNow,
-          ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
-        ],
-      }),
+          args: [
+            ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
+            namespace,
+            next.id,
+            opts.claimId,
+            storageNow,
+            ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
+          ],
+        }),
     );
     if (result.rowsAffected === 0) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);

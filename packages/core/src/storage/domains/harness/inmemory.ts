@@ -793,6 +793,9 @@ export class InMemoryHarness extends HarnessStorage {
         deletedAt: Date.now(),
       });
       this.db.harnessSessions.delete(sessionKey(namespace, sessionId));
+      // In the same synchronous section as the session removal, so no write can
+      // interleave between the two.
+      this.eraseSessionChannelAndWakeupRows(namespace, sessionId);
     }
 
     for (const { namespace, sessionId, record } of existingSessions.values()) {
@@ -1242,7 +1245,6 @@ export class InMemoryHarness extends HarnessStorage {
         this.db.harnessPlanTasks.delete(key);
       }
     }
-    this.eraseSessionChannelAndWakeupRows(namespace, sessionId);
     const refPrefix = `${namespace}\u0000${sessionId}\u0000`;
     for (const key of this.db.harnessAttachmentReferences.keys()) {
       if (key.startsWith(refPrefix)) {
@@ -3514,7 +3516,10 @@ export class InMemoryHarness extends HarnessStorage {
         : { ...record, harnessName: namespace, claimId: current.claimId, claimExpiresAt: current.claimExpiresAt };
     assertLegalChannelInboxUpdate(current, next);
     // Admission writes the resolved session onto a row recorded without one.
-    this.assertSessionsExist(namespace, [next.sessionId]);
+    // A row that keeps its session needs no check: it is erased together with
+    // that session, and this update cannot insert a row (the SQL adapters
+    // guard the same way).
+    if (next.sessionId !== current.sessionId) this.assertSessionsExist(namespace, [next.sessionId]);
     this.db.harnessChannelInbox.set(channelInboxKey(namespace, record.id), cloneJson(next));
   }
 

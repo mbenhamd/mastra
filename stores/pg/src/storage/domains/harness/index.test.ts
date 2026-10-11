@@ -1415,7 +1415,7 @@ describe('HarnessPG', () => {
     expect([unresolved?.status, unresolved?.sessionId]).toEqual(['received', undefined]);
   });
 
-  it('serializes channel rows with a concurrent session delete on the session row (PF-5309)', async () => {
+  it('serializes channel rows with a concurrent session delete on the session rows (PF-5309)', async () => {
     const harness = store.stores.harness!;
     // A second connection plays the other transaction of each interleaving.
     const other = new pg.Client({
@@ -1487,6 +1487,43 @@ describe('HarnessPG', () => {
       await other.query('COMMIT');
       await deleting;
       await expect(ledgerRows('lock-b')).resolves.toEqual(noRows);
+
+      // C: a write naming two sessions key-share locks them in sorted order,
+      // and a batch delete locks its sessions in that same order whatever the
+      // caller passed. The delete blocks on the first session without holding
+      // the second, so the writer's second lock never waits on the delete.
+      await saveClosedSession('lock-c1');
+      await saveClosedSession('lock-c2');
+      const guard = async (id: string) => {
+        const record = await harness.loadSession({ sessionId: id });
+        if (!record) throw new Error(`expected ${id}`);
+        return {
+          sessionId: id,
+          ifVersion: record.version,
+          expectedResourceId: record.resourceId,
+          expectedThreadId: record.threadId,
+          expectedParentSessionId: record.parentSessionId ?? null,
+          expectedCreatedAt: record.createdAt,
+          requireClosed: true,
+        };
+      };
+      const batch = [await guard('lock-c2'), await guard('lock-c1')];
+      await other.query('BEGIN');
+      await other.query(
+        `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-c1' FOR KEY SHARE`,
+      );
+      const deletingBatch = harness.deleteSessions({ sessions: batch });
+      pending.push(deletingBatch);
+      await blockedByOther();
+      await expect(
+        other.query(
+          `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-c2' FOR KEY SHARE`,
+        ),
+      ).resolves.toMatchObject({ rowCount: 1 });
+      await other.query('COMMIT');
+      await deletingBatch;
+      await expect(harness.loadSession({ sessionId: 'lock-c1' })).resolves.toBeNull();
+      await expect(harness.loadSession({ sessionId: 'lock-c2' })).resolves.toBeNull();
     } finally {
       // Release any lock still held, then let the blocked operation finish
       // before the next test runs.
