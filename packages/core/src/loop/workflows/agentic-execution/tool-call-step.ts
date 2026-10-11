@@ -59,6 +59,7 @@ import {
   STEP_ACTIVE_TOOLS_KEY,
   STEP_MODEL_MESSAGES_KEY,
   STEP_TOOLS_KEY,
+  STEP_USAGE_KEY,
   STEP_WORKSPACE_KEY,
   THREAD_EXISTS_KEY,
   THREAD_ID_KEY,
@@ -319,10 +320,14 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               ? displayInputTransform.transformed
               : transformInput;
 
+        const stepUsage = readScoped(scopeCtx, STEP_USAGE_KEY, 'stepUsage');
         return {
           ...transformedChunk,
           payload: {
             ...transformedChunk.payload,
+            // The suspending step's step-finish (and its usage) is emitted only on
+            // resume; the run output reports it on the suspended result (PF-5349).
+            ...(stepUsage !== undefined ? { stepUsage } : {}),
             resumeIdentityDigest: createToolCallIdentityDigest({
               toolCallId: transformToolCallId,
               toolName: transformToolName,

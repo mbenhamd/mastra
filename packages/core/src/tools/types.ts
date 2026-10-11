@@ -63,6 +63,17 @@ export interface ToolTerminalResultContext {
   batchSize: number;
   /** Zero-based position of this tool call in provider order. */
   batchIndex: number;
+  /**
+   * True when the call ran after an identity-verified approval grant. Reported
+   * only to tools that opted in with {@link ToolTerminalResultConfig.afterApproval}.
+   */
+  approvalGranted?: true;
+  /**
+   * True when the call's result came from resuming an in-tool suspension (which
+   * may or may not have been a human decision). Reported only to tools that
+   * opted in with {@link ToolTerminalResultConfig.afterApproval}.
+   */
+  resumedFromSuspension?: true;
   runId?: string;
   /** Aborts when the parent run is canceled or the terminal-policy budget expires. */
   abortSignal: AbortSignal;
@@ -74,8 +85,10 @@ export interface ToolTerminalResultContext {
  * The policy is evaluated only after every tool call selected in the provider
  * turn has settled. A false predicate keeps the ordinary repair loop running.
  * Provider-executed, background, denied, suspended, or failed calls are never
- * terminal candidates.
+ * terminal candidates. Approved and resumed calls are candidates only for tools
+ * that set `afterApproval`.
  */
+
 /** How a framework tool-call receipt records a returned output. */
 export type ToolResultStatus = 'success' | 'error';
 
@@ -90,6 +103,15 @@ export interface ToolTerminalResultConfig<TOutput = unknown, TResult = unknown> 
   maxBytes?: number;
   /** Shared budget for success, projection, and schema validation. Defaults to 1 second; maximum 10 seconds. */
   evaluationTimeoutMs?: number;
+  /**
+   * Allow a call that ran after an approval (`approved: true`) or was resumed from
+   * an in-tool suspension to end the run. Off by default: such calls return to the
+   * model once. Enable it only when `isSuccess` verifies the applied outcome, since
+   * the terminal value then replaces the model's closing reply. Declined, denied,
+   * failed, background, provider-executed and mixed batches stay non-terminal, and
+   * the output-processor and payload-transform gates still apply.
+   */
+  afterApproval?: boolean;
 }
 
 export interface TerminalToolResultItem<TResult = unknown> {

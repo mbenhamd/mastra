@@ -282,6 +282,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     outputTokens: undefined,
     totalTokens: undefined,
   };
+  /**
+   * Usage of the model step whose tool calls suspended the run. That step's
+   * `step-finish` is emitted only after its tools settle, i.e. on resume, so a
+   * suspended snapshot would otherwise omit tokens the provider already billed
+   * (PF-5349). It is reported on the suspended result only and never enters
+   * `#usageCount`, which is what a resumed run restores and continues.
+   */
+  #pendingSuspendedStepUsage: LanguageModelUsage | undefined = undefined;
   #tripwire: StepTripwireData | undefined = undefined;
   #wasSuspended = false;
   #terminalToolResult: TerminalToolResult | undefined;
@@ -595,7 +603,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
           let suppressChunkEmission = false;
           switch (chunk.type) {
             case 'tool-call-suspended':
-            case 'tool-call-approval':
+            case 'tool-call-approval': {
+              const { stepUsage, ...publicPayload } = chunk.payload;
+              if (stepUsage !== undefined) {
+                // Parallel suspensions of one step carry the same step usage.
+                self.#pendingSuspendedStepUsage ??= stepUsage;
+                // Internal accounting only: consumers never see it.
+                outboundChunk = { ...chunk, payload: publicPayload } as typeof chunk;
+              }
               self.#status = 'suspended';
               self.#wasSuspended = true;
               self.#delayedPromises.suspendPayload.resolve(chunk.payload);
@@ -605,6 +620,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 await options?.onFinish?.(self.#createSuspendedOnFinishPayload(chunk));
               }
               break;
+            }
             case 'data-terminal-tool-result': {
               if (typeof chunk.id !== 'string' || chunk.id.length === 0) {
                 throw new TypeError('Terminal tool-result data part is missing its stable id');
@@ -1748,8 +1764,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               sources: self.#bufferedSources,
               files: self.#bufferedFiles,
               steps: self.#bufferedSteps,
-              usage: self.#usageCount,
-              totalUsage: self.#getTotalUsage(),
+              usage: self.#suspendedUsage(),
+              totalUsage: self.#getTotalUsage(self.#suspendedUsage()),
               warnings: self.#warnings,
               finishReason: 'suspended',
               content: self.messageList.get.response.aiV5.stepContent(),
@@ -2337,26 +2353,45 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     });
   }
 
-  #getTotalUsage(): LanguageModelUsage {
-    let total = this.#usageCount.totalTokens;
+  #getTotalUsage(usage: LanguageModelUsage = this.#usageCount): LanguageModelUsage {
+    let total = usage.totalTokens;
 
     if (total === undefined) {
-      const input = this.#usageCount.inputTokens ?? 0;
-      const output = this.#usageCount.outputTokens ?? 0;
-      const reasoning = this.#usageCount.reasoningTokens ?? 0;
+      const input = usage.inputTokens ?? 0;
+      const output = usage.outputTokens ?? 0;
+      const reasoning = usage.reasoningTokens ?? 0;
       total = input + output + reasoning;
     }
 
     return {
-      inputTokens: this.#usageCount.inputTokens,
-      outputTokens: this.#usageCount.outputTokens,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
       totalTokens: total,
-      reasoningTokens: this.#usageCount.reasoningTokens,
-      cachedInputTokens: this.#usageCount.cachedInputTokens,
-      cacheCreationInputTokens: this.#usageCount.cacheCreationInputTokens,
-      cacheCreationInputTokens5m: this.#usageCount.cacheCreationInputTokens5m,
-      cacheCreationInputTokens1h: this.#usageCount.cacheCreationInputTokens1h,
-      ...(this.#usageCount.raw !== undefined && { raw: this.#usageCount.raw }),
+      reasoningTokens: usage.reasoningTokens,
+      cachedInputTokens: usage.cachedInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      cacheCreationInputTokens5m: usage.cacheCreationInputTokens5m,
+      cacheCreationInputTokens1h: usage.cacheCreationInputTokens1h,
+      ...(usage.raw !== undefined && { raw: usage.raw }),
+    };
+  }
+
+  /** Completed-step usage plus the billed step that suspended (see `#pendingSuspendedStepUsage`). */
+  #suspendedUsage(): LanguageModelUsage {
+    const pending = this.#pendingSuspendedStepUsage;
+    if (pending === undefined) return this.#usageCount;
+    const sum = (left: number | undefined, right: number | undefined) =>
+      left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0);
+    return {
+      ...this.#usageCount,
+      inputTokens: sum(this.#usageCount.inputTokens, pending.inputTokens),
+      outputTokens: sum(this.#usageCount.outputTokens, pending.outputTokens),
+      totalTokens: sum(this.#usageCount.totalTokens, pending.totalTokens),
+      reasoningTokens: sum(this.#usageCount.reasoningTokens, pending.reasoningTokens),
+      cachedInputTokens: sum(this.#usageCount.cachedInputTokens, pending.cachedInputTokens),
+      cacheCreationInputTokens: sum(this.#usageCount.cacheCreationInputTokens, pending.cacheCreationInputTokens),
+      cacheCreationInputTokens5m: sum(this.#usageCount.cacheCreationInputTokens5m, pending.cacheCreationInputTokens5m),
+      cacheCreationInputTokens1h: sum(this.#usageCount.cacheCreationInputTokens1h, pending.cacheCreationInputTokens1h),
     };
   }
 

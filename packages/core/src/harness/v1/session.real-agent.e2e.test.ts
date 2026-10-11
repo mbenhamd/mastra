@@ -1580,7 +1580,9 @@ describe('Harness v1 real-agent E2E — S3 approval suspend/resume', () => {
       expect(visibleText).toBe('Approved action completed.');
       expect(execute).toHaveBeenCalledOnce();
       expect(providerCalls).toBe(3);
-      expect(providerOptions[2]?.tools ?? []).toHaveLength(0);
+      // PF-5349: the recovery request keeps the step's tool schemas (cache prefix)
+      // and only execution is denied.
+      expect(providerOptions[2]?.tools).toEqual(providerOptions[1]?.tools);
       expect(session.getRecord().pendingResume).toBeUndefined();
     } finally {
       await harness.shutdown();
@@ -4970,7 +4972,7 @@ describe('Harness v1 real-agent E2E — S21 reasoning_delta streams (GAP-B)', ()
 // ===========================================================================
 
 describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
-  it('adds one tool-free response step while preserving configured agent hooks', async () => {
+  it('adds one execution-free response step that keeps the configured tool schemas and hooks', async () => {
     let providerCalls = 0;
     let toolExecutions = 0;
     let configuredIterations = 0;
@@ -5029,7 +5031,10 @@ describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
       expect(configuredIterations).toBe(3);
       expect(configuredPrepareSteps).toBe(3);
       expect(providerOptions[0]?.tools).toHaveLength(1);
-      expect(providerOptions[2]?.tools ?? []).toHaveLength(0);
+      // PF-5349: identical tool schemas on the recovery request keep the
+      // provider's cached prompt prefix; the loop refuses execution instead.
+      expect(providerOptions[2]?.tools).toEqual(providerOptions[1]?.tools);
+      expect(providerOptions[2]?.tools).toHaveLength(1);
     } finally {
       await harness.shutdown();
     }

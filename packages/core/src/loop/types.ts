@@ -151,6 +151,8 @@ export type StreamInternal = {
   // Active tools from prepareStep - used by toolCallStep to reject calls to hidden tools
   /** @deprecated Use `runScope.get(STEP_ACTIVE_TOOLS_KEY)` from `loop/run-scope-keys`. */
   stepActiveTools?: string[];
+  /** @deprecated Use `runScope.get(STEP_USAGE_KEY)` from `loop/run-scope-keys`. */
+  stepUsage?: import('../stream/types').LanguageModelUsage;
   // Workspace from prepareStep/processInputStep - stored here to avoid workflow serialization
   /** @deprecated Use `runScope.get(STEP_WORKSPACE_KEY)` from `loop/run-scope-keys`. */
   stepWorkspace?: Workspace;

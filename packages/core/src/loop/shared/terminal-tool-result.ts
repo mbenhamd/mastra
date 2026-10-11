@@ -181,6 +181,7 @@ export async function resolveTerminalToolResult(options: {
     const candidates: Array<{
       call: SettledToolCall;
       batchIndex: number;
+      intervention: { approvalGranted?: true; resumedFromSuspension?: true };
       policy: ToolTerminalResultConfig;
       maxBytes: number;
       timeoutMs: number;
@@ -190,12 +191,9 @@ export async function resolveTerminalToolResult(options: {
         call.providerExecuted ||
         call.error !== undefined ||
         call.result === undefined ||
-        // Human intervention is an explicit semantic boundary. Even an
-        // approved call must return to the model once so approval/suspension
-        // context cannot be bypassed by the terminal optimization.
-        call.approval !== undefined ||
-        call.resumedFromSuspension === true ||
         call.disposition === 'denied' ||
+        // A declined approval is never a terminal success, opt-in or not.
+        (call.approval !== undefined && call.approval.approved !== true) ||
         isValidationError(call.result)
       ) {
         return undefined;
@@ -203,6 +201,19 @@ export async function resolveTerminalToolResult(options: {
 
       const tool = resolveTool(options.tools, call.toolName) ?? resolveTool(options.fallbackTools, call.toolName);
       const policy = tool?.terminalResult;
+      // Human intervention is an explicit semantic boundary. By default even an
+      // approved call returns to the model once so approval/suspension context
+      // cannot be bypassed by the terminal optimization. A tool may opt in with
+      // `afterApproval` when its own success predicate verifies the applied
+      // outcome (PF-2246/PF-5291): then an approved or resumed call may end the
+      // run, under every other gate below.
+      const intervention = {
+        ...(call.approval?.approved === true ? { approvalGranted: true as const } : {}),
+        ...(call.resumedFromSuspension === true ? { resumedFromSuspension: true as const } : {}),
+      };
+      if (Object.keys(intervention).length > 0 && policy?.afterApproval !== true) {
+        return undefined;
+      }
       // A background-capable converted tool can return a dispatch placeholder.
       // V1 fails closed even when a particular call happened to run inline.
       if (
@@ -224,6 +235,7 @@ export async function resolveTerminalToolResult(options: {
       candidates.push({
         call,
         batchIndex,
+        intervention,
         policy,
         maxBytes: resolveMaxBytes(call.toolName, policy),
         timeoutMs: resolveEvaluationTimeoutMs(call.toolName, policy),
@@ -242,7 +254,7 @@ export async function resolveTerminalToolResult(options: {
     let evaluatedItems: Array<TerminalToolResult<WorkflowTerminalCanonicalJsonValue>['items'][number] | undefined>;
     try {
       evaluatedItems = await Promise.all(
-        candidates.map(async ({ call, batchIndex, policy, maxBytes, timeoutMs }) => {
+        candidates.map(async ({ call, batchIndex, intervention, policy, maxBytes, timeoutMs }) => {
           try {
             const evaluated = await evaluateTerminalPolicy({
               parentSignal: batchController.signal,
@@ -254,6 +266,7 @@ export async function resolveTerminalToolResult(options: {
                   args: call.args,
                   batchSize: options.calls.length,
                   batchIndex,
+                  ...intervention,
                   ...(options.runId ? { runId: options.runId } : {}),
                   abortSignal,
                 };

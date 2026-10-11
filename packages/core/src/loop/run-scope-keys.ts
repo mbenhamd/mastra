@@ -20,7 +20,7 @@ import type { CreatedAgentSignal } from '../agent/signals';
 import type { AgentBackgroundConfig, BackgroundTaskManager, BackgroundTaskManagerConfig } from '../background-tasks';
 import { createRunScopeKey } from '../mastra/run-scope';
 import type { MastraMemory, MemoryConfigInternal } from '../memory';
-import type { StreamTransportRef } from '../stream/types';
+import type { LanguageModelUsage, StreamTransportRef } from '../stream/types';
 import type { ToolHooks, ToolPayloadTransformPolicy } from '../tools';
 import type { ResolvedToolApproval } from '../tools/approval';
 import type { Workspace } from '../workspace/workspace';
@@ -46,6 +46,8 @@ export const THREAD_EXISTS_KEY = createRunScopeKey<boolean>('loop:threadExists')
 
 export const STEP_TOOLS_KEY = createRunScopeKey<ToolSet>('loop:stepTools');
 export const STEP_ACTIVE_TOOLS_KEY = createRunScopeKey<string[]>('loop:stepActiveTools');
+/** Usage of the current model step, for suspension chunks emitted before its step-finish. */
+export const STEP_USAGE_KEY = createRunScopeKey<LanguageModelUsage>('loop:stepUsage');
 export const STEP_WORKSPACE_KEY = createRunScopeKey<Workspace>('loop:stepWorkspace');
 export const TOOL_APPROVAL_VERDICTS_KEY =
   createRunScopeKey<Map<string, ResolvedToolApproval>>('loop:toolApprovalVerdicts');

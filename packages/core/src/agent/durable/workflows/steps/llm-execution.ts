@@ -15,6 +15,7 @@ import { injectBackgroundTaskPrompt } from '../../../../loop/shared/inject-backg
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../../../loop/shared/merge-llm-call-headers';
 import { readToolResultFromMessageList } from '../../../../loop/shared/read-tool-result';
 import { recordTerminalErrorMessage } from '../../../../loop/shared/record-terminal-error-message';
+import { responseRecoveryToolChoice } from '../../../../loop/shared/response-recovery-tool-choice';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../../../loop/shared/step-content-chunk-types';
 import { TERMINAL_FINISH_REASONS } from '../../../../loop/shared/terminal-finish-reasons';
 import { applyToolPayloadTransformToChunk } from '../../../../loop/shared/tool-payload-transform';
@@ -992,8 +993,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               );
             }
             if (responseRecoveryReserved) {
-              currentActiveTools = [];
-              currentToolChoice = 'none';
+              // Deny execution, keep the advertised tool schemas (PF-5349).
+              currentToolChoice = responseRecoveryToolChoice(
+                currentToolChoice,
+                currentTools as Record<string, unknown> | undefined,
+                currentActiveTools ?? undefined,
+              ) as ToolChoice<ToolSet> | undefined;
             }
 
             // ── Signal echo & pre-run drain ───────────────────────────────
@@ -1194,12 +1199,19 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // Apply the response-only fence again after every configured
             // processor boundary. The serialized reservation is only a guard;
             // the process-local prepareStep admission above is the authority.
+            // Execution denial is keyed on the admitted recovery step, not on an
+            // emptied tool list: the step keeps the schemas the previous step
+            // advertised so the provider prompt cache survives (PF-5349).
             if (responseRecoveryReserved) {
-              currentActiveTools = [];
-              currentToolChoice = 'none';
+              currentToolChoice = responseRecoveryToolChoice(
+                currentToolChoice,
+                currentTools as Record<string, unknown> | undefined,
+                currentActiveTools ?? undefined,
+              ) as ToolChoice<ToolSet> | undefined;
             }
             const toolExecutionDisabled =
-              currentToolChoice === 'none' && Array.isArray(currentActiveTools) && currentActiveTools.length === 0;
+              responseRecoveryReserved ||
+              (currentToolChoice === 'none' && Array.isArray(currentActiveTools) && currentActiveTools.length === 0);
             let providerToolChunkSuppressed = false;
 
             // 7. Track state during streaming

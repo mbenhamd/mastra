@@ -122,6 +122,51 @@ describe('plan-task tool execution mid-turn', () => {
     expect(instructions).not.toContain('inspect source');
   });
 
+  it.each([
+    ['deny', 'include', false],
+    ['ask', 'include', true],
+    ['allow', 'include', true],
+    ['allow', 'exclude', false],
+  ] as const)(
+    'gates the durable-plan orientation on plan_task_check being exposed (policy %s, built-ins %s)',
+    async (policy, harnessBuiltins, expectsOrientation) => {
+      // PF-5349: a mode that denies plan_task_check (removed before exposure)
+      // must not be told to call it.
+      const { harness, agent } = setupHarness({
+        modes: [
+          {
+            id: 'default',
+            agentId: 'default',
+            instructions: 'Edit the document.',
+            permissions: { categories: {}, tools: { [TASK_CHECK_TOOL_ID]: policy } },
+            harnessBuiltins,
+          },
+        ],
+      });
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+      let release!: () => void;
+      const holdUntil = new Promise<void>(resolve => (release = resolve));
+      agent.enqueueRun({ holdUntil, finishReason: 'stop', text: 'planning' });
+      const firstTurn = session.message({ content: 'make a plan' });
+      await vitestPoll(() => agent.streamCalls.length === 1);
+      const ctx = {
+        abortSignal: new AbortController().signal,
+        agent: { toolCallId: 'tc-gated', runId: 'mock-run' },
+        requestContext: { get: () => undefined },
+      } as any;
+      await createPlanTaskTools(session)[TASK_ADD_TOOL_ID]!.execute!({ content: 'older task' } as any, ctx);
+      release();
+      await firstTurn;
+
+      await session.message({ content: 'continue' });
+      const instructions = agent.streamCalls.at(-1)!.options.instructions as string;
+      expect(instructions).toContain('Edit the document.');
+      expect(instructions.includes('<harness_durable_plan_state>')).toBe(expectsOrientation);
+      expect(instructions.includes('plan_task_check')).toBe(expectsOrientation);
+    },
+  );
+
   it('task_add mutates the tree and emits papersflow.plan_task.updated through the live session', async () => {
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

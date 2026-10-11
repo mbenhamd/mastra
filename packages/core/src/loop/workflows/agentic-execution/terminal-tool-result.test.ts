@@ -128,6 +128,66 @@ describe('resolveTerminalToolResult', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('lets an afterApproval tool end the run after an approved or resumed call', async () => {
+    const seen: unknown[] = [];
+    const applyTool = tool({
+      afterApproval: true,
+      isSuccess: (_output, context) => {
+        seen.push({ approvalGranted: context.approvalGranted, resumed: context.resumedFromSuspension });
+        return true;
+      },
+    });
+    for (const call of [
+      { result: { applied: true }, approval: { approved: true } },
+      { result: { applied: true }, resumedFromSuspension: true },
+      { result: { applied: true } },
+    ]) {
+      await expect(
+        resolveTerminalToolResult({
+          calls: [{ toolName: 'apply', toolCallId: 'call-1', args: {}, ...call }],
+          tools: { apply: applyTool } as any,
+        }),
+      ).resolves.toEqual({
+        status: 'success',
+        items: [{ toolName: 'apply', toolCallId: 'call-1', status: 'success', value: { applied: true } }],
+      });
+    }
+    expect(seen).toEqual([
+      { approvalGranted: true, resumed: undefined },
+      { approvalGranted: undefined, resumed: true },
+      { approvalGranted: undefined, resumed: undefined },
+    ]);
+  });
+
+  it.each([
+    ['declined approval', { result: 'declined', approval: { approved: false } }],
+    ['approval without a decision', { result: 'done', approval: {} }],
+    ['permission denial', { result: 'denied', disposition: 'denied' as const, approval: { approved: true } }],
+    ['failed apply', { error: new Error('conflict'), approval: { approved: true } }],
+  ])('keeps an afterApproval tool non-terminal for a %s', async (_label, call) => {
+    await expect(
+      resolveTerminalToolResult({
+        calls: [{ toolName: 'apply', toolCallId: 'call-1', args: {}, ...call }],
+        tools: { apply: tool({ afterApproval: true, isSuccess: () => true }) } as any,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('keeps a mixed batch non-terminal when only one approved tool opted in', async () => {
+    await expect(
+      resolveTerminalToolResult({
+        calls: [
+          { toolName: 'apply', toolCallId: 'call-1', args: {}, result: 'done', approval: { approved: true } },
+          { toolName: 'other', toolCallId: 'call-2', args: {}, result: 'done', approval: { approved: true } },
+        ],
+        tools: {
+          apply: tool({ afterApproval: true, isSuccess: () => true }),
+          other: tool({ isSuccess: () => true }),
+        } as any,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it('does not confuse a domain result containing error: true with framework validation failure', async () => {
     await expect(
       resolveTerminalToolResult({

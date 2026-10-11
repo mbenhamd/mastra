@@ -1033,6 +1033,115 @@ describeForAllEngines(
       expect(await output.text).toBe('The approved edit was applied.');
     });
 
+    it('ends the run on an approved call when the tool opts in with afterApproval', async () => {
+      // PF-2246/PF-5291: a verified apply after approval may end the turn, so no
+      // provider call follows the approved apply.
+      let executions = 0;
+      const approvedTool = createTool({
+        id: 'approved_terminal_tool',
+        description: 'Apply the approved edit and return the verified result.',
+        inputSchema: z.object({ path: z.string() }),
+        outputSchema: z.object({ applied: z.boolean(), path: z.string() }),
+        requireApproval: true,
+        terminalResult: {
+          afterApproval: true,
+          isSuccess: (output, context) => output.applied && context.approvalGranted === true,
+          outputSchema: z.object({ applied: z.boolean(), path: z.string() }),
+          project: output => output,
+        },
+        execute: async ({ path }) => {
+          executions++;
+          return { applied: true, path };
+        },
+      });
+
+      const { output, approvals, requests, chunks } = await runApprovalScenario({
+        llm: getMock(),
+        engine,
+        prompt: 'Apply the edit.',
+        tools: { approved_terminal_tool: approvedTool },
+        stopWhen: stepCountIs(5),
+        decision: () => true,
+        requireToolApproval: false,
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', hasToolResult: false },
+            {
+              toolCalls: [{ id: 'call-approved', name: 'approved_terminal_tool', arguments: { path: 'main.tex' } }],
+            },
+          );
+          llm.on({ endpoint: 'chat', hasToolResult: true }, { content: 'UNEXPECTED_POST_APPROVAL_CALL' });
+        },
+      });
+
+      expect(approvals).toEqual(['approve:call-approved']);
+      expect(requests).toHaveLength(1);
+      expect(executions).toBe(1);
+      expect(output.terminalToolResult).toEqual({
+        status: 'success',
+        items: [
+          {
+            toolName: 'approved_terminal_tool',
+            toolCallId: 'call-approved',
+            status: 'success',
+            value: { applied: true, path: 'main.tex' },
+          },
+        ],
+      });
+      expect(chunks.filter(chunk => chunk.type === 'data-terminal-tool-result')).toHaveLength(1);
+      expect(await output.text).not.toContain('UNEXPECTED_POST_APPROVAL_CALL');
+    });
+
+    it.each([
+      ['a declined approval', false, true],
+      ['an approved apply its predicate does not verify', true, false],
+    ] as const)(
+      'returns %s to the model even when the tool opts in with afterApproval',
+      async (_label, approve, verified) => {
+        let executions = 0;
+        const applyTool = createTool({
+          id: 'opt_in_terminal_tool',
+          description: 'Apply an edit and verify it.',
+          inputSchema: z.object({ path: z.string() }),
+          outputSchema: z.object({ applied: z.boolean(), verified: z.boolean() }),
+          requireApproval: true,
+          terminalResult: {
+            afterApproval: true,
+            isSuccess: output => output.applied && output.verified,
+            outputSchema: z.object({ applied: z.boolean(), verified: z.boolean() }),
+            project: output => output,
+          },
+          execute: async () => {
+            executions++;
+            return { applied: true, verified };
+          },
+        });
+
+        const { output, requests, chunks } = await runApprovalScenario({
+          llm: getMock(),
+          engine,
+          prompt: 'Apply the edit.',
+          tools: { opt_in_terminal_tool: applyTool },
+          stopWhen: stepCountIs(5),
+          decision: () => approve,
+          requireToolApproval: false,
+          fixtures: llm => {
+            llm.on(
+              { endpoint: 'chat', hasToolResult: false },
+              { toolCalls: [{ id: 'call-opt-in', name: 'opt_in_terminal_tool', arguments: { path: 'main.tex' } }] },
+            );
+            llm.on({ endpoint: 'chat', hasToolResult: true }, { content: 'The edit is not confirmed.' });
+          },
+        });
+
+        expect(executions).toBe(approve ? 1 : 0);
+        expect(requests).toHaveLength(2);
+        expect(output.terminalToolResult).toBeUndefined();
+        expect(chunks.filter(chunk => chunk.type === 'data-terminal-tool-result')).toHaveLength(0);
+        expect(await output.text).toBe('The edit is not confirmed.');
+      },
+    );
+
     it('declines without executing or committing a terminal result', async () => {
       let executions = 0;
       const declinedTool = createTool({
