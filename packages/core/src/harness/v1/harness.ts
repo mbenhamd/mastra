@@ -6262,6 +6262,10 @@ export class Harness {
     deletedLiveSessions = new Map<string, Session>(),
   ): Promise<void> {
     const bottomUp = [...tree].sort((a, b) => b.depth - a.depth);
+    // A closed live session may still be writing its last run summary; let it
+    // land first so the delete erases it (storage also drops a write that
+    // arrives after the delete).
+    await Promise.all([...deletedLiveSessions.values()].map(live => live._internalFlushRunSummaries()));
     const sessions = bottomUp.map(node => ({
       harnessName: node.record.harnessName,
       sessionId: node.record.id,
