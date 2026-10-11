@@ -2715,7 +2715,7 @@ export class Session {
       );
   }
 
-  /** @internal — await all in-flight run-summary writes (tests). */
+  /** @internal — await all in-flight run-summary writes (session delete, tests). */
   async _internalFlushRunSummaries(): Promise<void> {
     await this._runSummaryPersistence;
   }

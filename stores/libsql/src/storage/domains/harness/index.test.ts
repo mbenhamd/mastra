@@ -236,6 +236,11 @@ describe('HarnessLibSQL attachments', () => {
   });
 
   it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {
+    // Summaries are written only for an existing session.
+    await storage.saveSession(sampleSession({ id: 'session-rs', resourceId: 'u1', threadId: 'thread-rs' }), {
+      ownerId: 'h',
+      ifVersion: 0,
+    });
     const mk = (runId: string, completedAt: number, over: Record<string, unknown> = {}) => ({
       harnessName: 'default',
       runId,
@@ -310,6 +315,77 @@ describe('HarnessLibSQL attachments', () => {
     expect(seen).toEqual(['rs-3', 'rs-2b', 'rs-2', 'rs-1']);
   });
 
+  it('deletes a batch of sessions with their run summaries, all or nothing (PF-5301)', async () => {
+    const harness = storage;
+    const summary = (runId: string, sessionId: string, harnessName = 'default') => ({
+      harnessName,
+      runId,
+      sessionId,
+      resourceId: 'u-batch',
+      threadId: `thread-${sessionId}`,
+      agentId: 'agent-x',
+      modeId: 'default',
+      modelId: 'openai/gpt-4o-mini',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      startedAt: 90,
+      completedAt: 100,
+      durationMs: 10,
+      usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+      createdAt: 100,
+    });
+    const save = (id: string, harnessName = 'default') =>
+      harness.saveSession(
+        sampleSession({
+          harnessName,
+          id,
+          resourceId: 'u-batch',
+          threadId: `thread-${id}`,
+          sessionIncarnation: `incarnation-${id}`,
+          closedAt: 2000,
+          lastActivityAt: 2000,
+        }),
+        { ownerId: 'h', ifVersion: 0 },
+      );
+    for (const id of ['batch-a', 'batch-b', 'batch-c']) {
+      await save(id);
+      await harness.saveRunSummary({ summary: summary(`${id}-run`, id) as any });
+    }
+    // The same session id in another harness namespace.
+    await save('batch-a', 'other-harness');
+    await harness.saveRunSummary({ summary: summary('other-a-run', 'batch-a', 'other-harness') as any });
+    const guard = async (id: string, staleVersion = false) => {
+      const record = await harness.loadSession({ sessionId: id });
+      if (!record) throw new Error(`expected ${id}`);
+      return {
+        sessionId: id,
+        ifVersion: staleVersion ? record.version + 1 : record.version,
+        expectedResourceId: record.resourceId,
+        expectedThreadId: record.threadId,
+        expectedParentSessionId: record.parentSessionId ?? null,
+        expectedCreatedAt: record.createdAt,
+        requireClosed: true,
+      };
+    };
+
+    // A later candidate's failed guard rolls the whole batch back.
+    await expect(
+      harness.deleteSessions({ sessions: [await guard('batch-c'), await guard('batch-b', true)] }),
+    ).rejects.toThrow();
+    await expect(harness.loadRunSummary({ runId: 'batch-c-run' })).resolves.toMatchObject({
+      sessionId: 'batch-c',
+    });
+
+    await harness.deleteSessions({ sessions: [await guard('batch-a'), await guard('batch-b')] });
+    await expect(harness.loadRunSummary({ runId: 'batch-a-run' })).resolves.toBeNull();
+    await expect(harness.loadRunSummary({ runId: 'batch-b-run' })).resolves.toBeNull();
+    await expect(harness.loadRunSummary({ runId: 'batch-c-run' })).resolves.not.toBeNull();
+    await expect(harness.loadRunSummary({ harnessName: 'other-harness', runId: 'other-a-run' })).resolves.toMatchObject(
+      { sessionId: 'batch-a' },
+    );
+  });
+
   it("deletes a session with its run summaries and keeps other sessions' (PF-5301)", async () => {
     const harness = storage;
     const summary = (runId: string, sessionId: string) => ({
@@ -340,6 +416,10 @@ describe('HarnessLibSQL attachments', () => {
       }),
       { ownerId: 'h', ifVersion: 0 },
     );
+    await harness.saveSession(sampleSession({ id: 'rs-kept', resourceId: 'u-del', threadId: 'thread-rs-kept' }), {
+      ownerId: 'h',
+      ifVersion: 0,
+    });
     await harness.saveRunSummary({ summary: summary('rs-deleted-1', 'rs-deleted') as any });
     await harness.saveRunSummary({ summary: summary('rs-deleted-2', 'rs-deleted') as any });
     await harness.saveRunSummary({ summary: summary('rs-kept-1', 'rs-kept') as any });
@@ -363,6 +443,9 @@ describe('HarnessLibSQL attachments', () => {
     await expect(harness.loadRunSummary({ runId: 'rs-kept-1' })).resolves.toMatchObject({
       sessionId: 'rs-kept',
     });
+    // A run that finishes after its session was deleted writes no summary.
+    await harness.saveRunSummary({ summary: summary('rs-deleted-late', 'rs-deleted') as any });
+    await expect(harness.loadRunSummary({ runId: 'rs-deleted-late' })).resolves.toBeNull();
   });
 
   it('keeps §15 attachment-reference admission atomic and delete-guarded', async () => {

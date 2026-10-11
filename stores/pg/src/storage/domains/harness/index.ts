@@ -704,6 +704,13 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       columns: ['harness_name', 'source', 'status', 'due_at', 'next_attempt_at', 'claim_expires_at'],
     },
     {
+      // listRunSummaries pages a session's summaries newest first, and
+      // deleteSessions deletes them by session.
+      name: harnessIndexName(schemaPrefix, 'idx_harness_run_summaries_session'),
+      table: TABLE_HARNESS_RUN_SUMMARIES,
+      columns: ['harness_name', 'session_id', 'completed_at', 'run_id'],
+    },
+    {
       // §5.1k: listPlanTasks orders by (parentTaskId, order) within a session;
       // loadPlanTaskSubtree + deletePlanTaskSubtree walk parent_task_id. This
       // index serves the ordered listing and the recursive subtree walk.
@@ -6983,14 +6990,36 @@ export class HarnessPG extends HarnessStorage {
     const namespace = this.#resolveHarnessName(summary.harnessName);
     const stored: HarnessRunSummary = { ...summary, harnessName: namespace };
     const cols = runSummaryColumnValues(stored);
-    // First-terminal-wins idempotency: a later write for the same (harness, run)
-    // is a no-op.
-    await this.#client.execute({
-      sql: `INSERT INTO ${TABLE_HARNESS_RUN_SUMMARIES} (${cols.names.join(', ')})
-            VALUES (${cols.names.map(() => '?').join(', ')})
-            ON CONFLICT (harness_name, run_id) DO NOTHING`,
-      args: cols.values,
-    });
+    // A summary is written only while its session exists: the session row is
+    // share locked (session before summaries, as deleteSessions locks them),
+    // so a concurrent delete either waits for this write and then deletes it,
+    // or commits first and this write is dropped. A deleted session never
+    // regains a summary from a late write.
+    const tx = await this.#client.transaction('write');
+    try {
+      const live = await tx.execute({
+        sql: `SELECT 1 FROM ${TABLE_HARNESS_SESSIONS}
+              WHERE harness_name = ? AND id = ? AND resource_id = ? AND thread_id = ?
+              FOR SHARE`,
+        args: [namespace, summary.sessionId, summary.resourceId, summary.threadId],
+      });
+      if (live.rows.length === 0) {
+        await tx.rollback();
+        return stored;
+      }
+      // First-terminal-wins idempotency: a later write for the same (harness, run)
+      // is a no-op.
+      await tx.execute({
+        sql: `INSERT INTO ${TABLE_HARNESS_RUN_SUMMARIES} (${cols.names.join(', ')})
+              VALUES (${cols.names.map(() => '?').join(', ')})
+              ON CONFLICT (harness_name, run_id) DO NOTHING`,
+        args: cols.values,
+      });
+      await tx.commit();
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
     // Return the authoritative stored row (the existing one on a no-op).
     const existing = await this.loadRunSummary({ harnessName: namespace, runId: summary.runId });
     return existing ?? stored;
@@ -9697,6 +9726,7 @@ export class HarnessPG extends HarnessStorage {
         schema: TABLE_SCHEMAS[TABLE_HARNESS_RUN_SUMMARIES],
         compositePrimaryKey: config?.compositePrimaryKey,
       });
+      await this.#createDefaultIndexes(['idx_harness_run_summaries_session']);
     })().catch(error => {
       this.#runSummariesReady = undefined;
       throw error;

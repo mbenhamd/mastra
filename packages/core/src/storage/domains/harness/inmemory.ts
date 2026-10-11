@@ -4725,6 +4725,10 @@ export class InMemoryHarness extends HarnessStorage {
     // Idempotent: first terminal wins; a later write is a no-op.
     if (existing) return cloneJson(existing);
     const stored: HarnessRunSummary = cloneJson({ ...summary, harnessName: namespace });
+    // Written only while its session exists: a deleted session never regains
+    // a summary from a late write.
+    const session = this.db.harnessSessions.get(sessionKey(namespace, summary.sessionId));
+    if (session?.resourceId !== summary.resourceId || session.threadId !== summary.threadId) return stored;
     this.db.harnessRunSummaries.set(key, stored);
     return cloneJson(stored);
   }
