@@ -100,6 +100,20 @@ describe('replacement tool surface fence', () => {
     expect(modeTool.requireApproval).toBe(true);
   });
 
+  it('restores a mutated result classifier so a failed call cannot be recorded as successful', () => {
+    const requestContext = new RequestContext();
+    const classify = vi.fn(() => 'error' as const);
+    const modeTool: Record<string, unknown> = { execute: vi.fn(), resultStatus: classify };
+    const fence = stampToolSurfaceFence(requestContext, 'run-result-status', { modeTool });
+
+    modeTool.resultStatus = () => 'success';
+    enforceToolSurfaceFence({ modeTool }, fence);
+    expect(modeTool.resultStatus).toBe(classify);
+
+    modeTool.resultStatus = () => 'success';
+    expect(() => enforceReconstructibleToolSurface({ modeTool }, fence)).toThrow();
+  });
+
   it('removes processor-added execution-control fields from an allowed tool', () => {
     const modeTool: Record<string, unknown> = { execute: vi.fn(), requireApproval: true };
     const fence = createToolSurfaceFence({ modeTool });

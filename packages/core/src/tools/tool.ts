@@ -19,6 +19,7 @@ import type {
   ToolExecuteFunction,
   ToolExecutionContext,
   ToolPayloadTransform,
+  ToolResultStatus,
   ToolTerminalResultConfig,
 } from './types';
 import { validateToolInput, validateToolOutput, validateToolSuspendData, validateRequestContext } from './validation';
@@ -373,6 +374,18 @@ export class Tool<
   terminalResult?: ToolTerminalResultConfig<TSchemaOut, TTerminalResult>;
 
   /**
+   * Classifies a returned output for framework tool-call receipts. Return
+   * `'error'` when the tool reported a failure as data (for example
+   * `{ success: false }`) instead of throwing. It receives the recorded,
+   * serialization-safe output. Only the receipt changes: the model, the
+   * stream, and the transcript still see the returned output. It applies to
+   * tools Mastra executes, including background completions; a
+   * provider-executed tool's result comes from the provider and is not
+   * classified.
+   */
+  resultStatus?: (output: TSchemaOut) => ToolResultStatus;
+
+  /**
    * Creates a new Tool instance with input validation wrapper.
    *
    * @param opts - Tool configuration and execute function
@@ -417,6 +430,9 @@ export class Tool<
       mcpMetadata: opts.mcpMetadata,
       background: opts.background,
       terminalResult: opts.terminalResult,
+      // Only a declared classifier joins the identity, so existing tools keep
+      // their recovery fingerprints.
+      ...(opts.resultStatus === undefined ? {} : { resultStatus: opts.resultStatus }),
       onInputStart: opts.onInputStart,
       onInputDelta: opts.onInputDelta,
       onInputAvailable: opts.onInputAvailable,
@@ -452,6 +468,7 @@ export class Tool<
     this.mcpMetadata = opts.mcpMetadata;
     this.background = opts.background;
     this.terminalResult = opts.terminalResult;
+    this.resultStatus = opts.resultStatus;
     this.onInputStart = opts.onInputStart;
     this.onInputDelta = opts.onInputDelta;
     this.onInputAvailable = opts.onInputAvailable;

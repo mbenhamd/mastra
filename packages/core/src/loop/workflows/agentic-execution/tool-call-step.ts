@@ -68,6 +68,7 @@ import {
 import { dispatchBackgroundTool } from '../../shared/steps/background-dispatch-core';
 import { applyBackgroundToolResult } from '../../shared/steps/background-task-result-core';
 import { executeToolCall } from '../../shared/steps/execute-tool-core';
+import { withToolResultStatusProviderMetadata } from '../../shared/steps/tool-result-commit-core';
 import { resolveFrameworkSuspendedToolIdentity } from '../../shared/suspended-tool-run-id';
 import type { ResolvedSuspendedToolIdentity } from '../../shared/suspended-tool-run-id';
 import { applyToolPayloadTransformToChunk } from '../../shared/tool-payload-transform';
@@ -2283,7 +2284,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                               toolName: chunk.payload.toolName,
                               args: inputData.args,
                               result: chunk.payload.result,
-                              providerMetadata: backgroundResultMetadata(chunk.payload.taskId, 'completed'),
+                              providerMetadata: withToolResultStatusProviderMetadata({
+                                tool: resolvedTool as { resultStatus?: (output: unknown) => unknown },
+                                result: chunk.payload.result,
+                                providerMetadata: backgroundResultMetadata(chunk.payload.taskId, 'completed'),
+                              }) as ProviderMetadata | undefined,
                               providerExecuted: inputData.providerExecuted,
                             },
                           },
@@ -2388,6 +2393,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                     },
                     toModelOutput: (resolvedTool as { toModelOutput?: (output: unknown) => unknown } | undefined)
                       ?.toModelOutput,
+                    resultStatus: (resolvedTool as { resultStatus?: (output: unknown) => unknown } | undefined)
+                      ?.resultStatus,
                     generateId: readScoped(scopeCtx, GENERATE_ID_KEY, 'generateId'),
                     logger,
                     flush: async () => {

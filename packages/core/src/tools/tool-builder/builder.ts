@@ -192,6 +192,7 @@ function createToolRecoveryFingerprint(
     background: candidate.background,
     backgroundConfig: options.backgroundConfig,
     terminalResult: candidate.terminalResult,
+    ...(candidate.resultStatus === undefined ? {} : { resultStatus: candidate.resultStatus }),
     onInputStart: candidate.onInputStart,
     onInputDelta: candidate.onInputDelta,
     onInputAvailable: candidate.onInputAvailable,
@@ -1440,6 +1441,7 @@ export class CoreToolBuilder extends MastraBase {
       // from the converted CoreTool at dispatch time.
       backgroundConfig: this.options.backgroundConfig,
       terminalResult: 'terminalResult' in this.originalTool ? this.originalTool.terminalResult : undefined,
+      resultStatus: 'resultStatus' in this.originalTool ? this.originalTool.resultStatus : undefined,
     } as unknown as CoreTool;
     const recoveryOriginalTool = this.originalTool;
     const recoverySchemas = {

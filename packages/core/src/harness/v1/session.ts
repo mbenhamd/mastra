@@ -8302,7 +8302,13 @@ export class Session {
         return;
       }
       case 'tool-result': {
-        const payload = chunk.payload as { toolCallId: string; toolName?: string; result: unknown; isError?: boolean };
+        const payload = chunk.payload as {
+          toolCallId: string;
+          toolName?: string;
+          result: unknown;
+          isError?: boolean;
+          providerMetadata?: { mastra?: { resultStatus?: unknown } };
+        };
         // §10.4: the resume segment replays the approved tool's `tool-result`
         // WITHOUT a preceding `tool-call` in this segment, so `_activeTools` (seeded
         // only by `tool-call`) misses on resume and `tool_end.toolName` would be ''.
@@ -8317,10 +8323,17 @@ export class Session {
           return;
         }
         if (runId !== undefined) {
+          // A tool may classify a failure it returned as data
+          // (`ToolAction.resultStatus`); the receipt records it as failed so
+          // subagent evidence cannot claim success for it. The tool_end event
+          // keeps the returned output and its own isError unchanged.
           this._recordRunToolReceipt(runId, {
             toolCallId: payload.toolCallId,
             toolName,
-            status: payload.isError === true ? 'error' : 'success',
+            status:
+              payload.isError === true || payload.providerMetadata?.mastra?.resultStatus === 'error'
+                ? 'error'
+                : 'success',
           });
           // Project `output` at emit so live === replay (§10.2). Shared/aliased
           // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.

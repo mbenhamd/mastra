@@ -9,6 +9,7 @@ import { dispatchBackgroundTool } from '../../../../loop/shared/steps/background
 import { applyBackgroundToolResult } from '../../../../loop/shared/steps/background-task-result-core';
 import { executeToolCall } from '../../../../loop/shared/steps/execute-tool-core';
 import { processAndEmitChunk } from '../../../../loop/shared/steps/process-chunk-core';
+import { withToolResultStatusProviderMetadata } from '../../../../loop/shared/steps/tool-result-commit-core';
 import { resolveFrameworkSuspendedToolIdentity } from '../../../../loop/shared/suspended-tool-run-id';
 import type { ResolvedSuspendedToolIdentity } from '../../../../loop/shared/suspended-tool-run-id';
 import { applyToolPayloadTransformToChunk } from '../../../../loop/shared/tool-payload-transform';
@@ -1968,7 +1969,11 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                     toolName: chunk.payload.toolName,
                     args: cleanedArgs,
                     result: chunk.payload.result,
-                    providerMetadata: backgroundResultMetadata(chunk.payload.taskId, 'completed'),
+                    providerMetadata: withToolResultStatusProviderMetadata({
+                      tool: tool as { resultStatus?: (output: unknown) => unknown },
+                      result: chunk.payload.result,
+                      providerMetadata: backgroundResultMetadata(chunk.payload.taskId, 'completed'),
+                    }) as ProviderMetadata | undefined,
                   },
                 });
               } else if (chunk.type === 'background-task-failed') {
@@ -2068,6 +2073,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                   };
                 },
                 toModelOutput: mappingTool.toModelOutput,
+                resultStatus: (mappingTool as { resultStatus?: (output: unknown) => unknown }).resultStatus,
                 // Respect a custom idGenerator for the fallback appended message —
                 // parity with main, which reads generateId from its run scope.
                 generateId: mastra ? () => (mastra as Mastra).generateId() : undefined,
@@ -2164,7 +2170,11 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             ...typedInput,
             args: cleanedArgs,
             result: completedTask.result,
-            providerMetadata: backgroundResultMetadata(bgOutcome.taskId, 'completed'),
+            providerMetadata: withToolResultStatusProviderMetadata({
+              tool: tool as { resultStatus?: (output: unknown) => unknown },
+              result: completedTask.result,
+              providerMetadata: backgroundResultMetadata(bgOutcome.taskId, 'completed'),
+            }) as ProviderMetadata | undefined,
             // Fork (PF-4402): the authenticated grant must survive every awaited
             // outcome, not just a fresh `started` dispatch. A resumed/restarted/
             // reattached leg that completes here still needs the grant on this
@@ -2288,6 +2298,13 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             logger?.warn?.(`[DurableAgent] toModelOutput failed for tool "${toolName}": ${mappingError}`);
           }
         }
+        // The tool's own classification of a returned failure travels on the
+        // emitted tool-result chunk for framework tool-call receipts.
+        providerMetadata = withToolResultStatusProviderMetadata({
+          tool: mappingTool as { resultStatus?: (output: unknown) => unknown },
+          result: outcome.result,
+          providerMetadata: providerMetadata as Record<string, unknown> | undefined,
+        }) as ProviderMetadata | undefined;
 
         // Run processToolResult hooks before the tool-result chunk is emitted.
         // In this engine subscribers receive tool-result chunks HERE, at
