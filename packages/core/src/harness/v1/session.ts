@@ -8066,6 +8066,19 @@ export class Session {
     const state = this._getOrCreateRunToolReceiptState(runId);
     const key = `${receipt.toolCallId}\0${receipt.toolName}\0${receipt.status}`;
     if (state.exact.has(key)) return;
+    // A later framework result for the same call is the recorded one: an
+    // awaited background completion is streamed, then re-emitted after
+    // processToolResult and classification. Replace the earlier status rather
+    // than keep two contradictory receipts for one call.
+    const previous = state.receipts.find(
+      existing => existing.toolCallId === receipt.toolCallId && existing.toolName === receipt.toolName,
+    );
+    if (previous !== undefined) {
+      state.exact.delete(`${previous.toolCallId}\0${previous.toolName}\0${previous.status}`);
+      previous.status = receipt.status;
+      state.exact.add(key);
+      return;
+    }
     const bytes = new TextEncoder().encode(JSON.stringify(receipt)).byteLength;
     if (
       state.receipts.length >= MAX_HARNESS_RUN_TOOL_RECEIPTS ||
