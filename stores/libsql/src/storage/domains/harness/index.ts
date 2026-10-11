@@ -2478,14 +2478,20 @@ export class HarnessLibSQL extends HarnessStorage {
               ON CONFLICT (harness_name, run_id) DO NOTHING`,
         args: cols.values,
       });
+      // The authoritative stored row (the existing one on a no-op), read
+      // while the session fence is still held.
+      const row = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_RUN_SUMMARIES} WHERE harness_name = ? AND run_id = ? LIMIT 1`,
+        args: [namespace, summary.runId],
+      });
       await tx.commit();
+      const persisted = row.rows[0] as Record<string, unknown> | undefined;
+      return persisted === undefined ? null : rowToRunSummary(persisted);
     } catch (err) {
       // The original failure wins over a failed rollback.
       if (!tx.closed) await tx.rollback().catch(() => undefined);
       throw err;
     }
-    const existing = await this.loadRunSummary({ harnessName: namespace, runId: summary.runId });
-    return existing ?? stored;
   }
 
   async loadRunSummary({ harnessName, runId }: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {

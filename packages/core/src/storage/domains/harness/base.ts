@@ -2000,7 +2000,8 @@ export abstract class HarnessStorage extends StorageDomain {
    * check atomic with `deleteSessions` (which deletes the session's summaries),
    * so a run that finishes after its session was deleted cannot bring the
    * deleted identifiers back. Such a write is dropped and returns `null`,
-   * never the unstored input.
+   * never the unstored input; the session check comes before idempotency.
+   * The returned row is read while the session check still holds.
    */
   async saveRunSummary(_opts: SaveRunSummaryInput): Promise<HarnessRunSummary | null> {
     throw new HarnessStorageRunSummaryUnsupportedError();

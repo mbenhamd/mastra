@@ -1085,8 +1085,23 @@ describe('HarnessPG', () => {
       database: (TEST_CONFIG as any).database,
       user: (TEST_CONFIG as any).user,
       password: (TEST_CONFIG as any).password,
+      statement_timeout: 10_000,
     });
     await other.connect();
+    const otherPid = (await other.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid;
+    /** Waits until some backend is blocked on a lock `other` holds; never on timing alone. */
+    const blockedByOther = async () => {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const blocked = await store.db.oneOrNone<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`,
+          [otherPid],
+        );
+        if ((blocked?.n ?? 0) > 0) return;
+        if (Date.now() >= deadline) throw new Error('nothing became blocked by the other transaction');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    };
     const summary = (runId: string, sessionId: string) => ({
       harnessName: 'default',
       runId,
@@ -1114,18 +1129,18 @@ describe('HarnessPG', () => {
         }),
         { ownerId: 'h', ifVersion: 0 },
       );
-    const settledWithin = async (promise: Promise<unknown>, ms: number) =>
-      Promise.race([promise.then(() => true), new Promise(resolve => setTimeout(() => resolve(false), ms))]);
+    const pending: Promise<unknown>[] = [];
     try {
-      // A: the delete holds the session row first. The summary write waits on
-      // it, then finds no session and stores nothing.
+      // A: the delete holds the session row first. The summary write blocks
+      // on it, then finds no session and stores nothing.
       await save('lock-a');
       await other.query('BEGIN');
       await other.query(
         `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-a' FOR UPDATE`,
       );
       const writing = harness.saveRunSummary({ summary: summary('lock-a-run', 'lock-a') as any });
-      expect(await settledWithin(writing, 300)).toBe(false);
+      pending.push(writing);
+      await blockedByOther();
       await other.query(`DELETE FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-a'`);
       await other.query(
         `DELETE FROM mastra_harness_run_summaries WHERE harness_name = 'default' AND session_id = 'lock-a'`,
@@ -1135,7 +1150,7 @@ describe('HarnessPG', () => {
       await expect(harness.loadRunSummary({ runId: 'lock-a-run' })).resolves.toBeNull();
 
       // B: the summary write holds the session row first (as saveRunSummary
-      // does). The delete waits for it, then deletes the summary it wrote.
+      // does). The delete blocks on it, then deletes the summary it wrote.
       await save('lock-b');
       await other.query('BEGIN');
       await other.query(
@@ -1159,12 +1174,16 @@ describe('HarnessPG', () => {
         expectedCreatedAt: closed.createdAt,
         requireClosed: true,
       });
-      expect(await settledWithin(deleting, 300)).toBe(false);
+      pending.push(deleting);
+      await blockedByOther();
       await other.query('COMMIT');
       await deleting;
       await expect(harness.loadRunSummary({ runId: 'lock-b-run' })).resolves.toBeNull();
     } finally {
+      // Release any lock still held, then let the blocked operation finish
+      // before the next test runs.
       await other.query('ROLLBACK').catch(() => undefined);
+      await Promise.allSettled(pending);
       await other.end();
     }
   });

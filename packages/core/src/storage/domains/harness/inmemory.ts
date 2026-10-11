@@ -4721,14 +4721,15 @@ export class InMemoryHarness extends HarnessStorage {
   async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary | null> {
     const namespace = resolveHarnessName(summary.harnessName, this.harnessName);
     const key = `${namespace}::${summary.runId}`;
+    // Written only while its session exists (checked before idempotency, as
+    // the SQL adapters do): a deleted session never regains a summary from a
+    // late write.
+    const session = this.db.harnessSessions.get(sessionKey(namespace, summary.sessionId));
+    if (session?.resourceId !== summary.resourceId || session.threadId !== summary.threadId) return null;
     const existing = this.db.harnessRunSummaries.get(key);
     // Idempotent: first terminal wins; a later write is a no-op.
     if (existing) return cloneJson(existing);
     const stored: HarnessRunSummary = cloneJson({ ...summary, harnessName: namespace });
-    // Written only while its session exists: a deleted session never regains
-    // a summary from a late write.
-    const session = this.db.harnessSessions.get(sessionKey(namespace, summary.sessionId));
-    if (session?.resourceId !== summary.resourceId || session.threadId !== summary.threadId) return null;
     this.db.harnessRunSummaries.set(key, stored);
     return cloneJson(stored);
   }
