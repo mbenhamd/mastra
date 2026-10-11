@@ -4118,8 +4118,12 @@ export class MemoryPG extends MemoryStorage {
    * its target rows (the OM row -> target row order the later
    * working-memory marker stamp keeps). A marked or pre-marker record is
    * never stamped, so it stays unlocked and unguarded OM writers do not
-   * queue behind the write. The caller must already hold the OM-resource
-   * advisory lock (see lockThreadLifecycles).
+   * queue behind the write. The engine sets the marker only when it creates
+   * a record, and only this write's stamp moves it (`null` -> scope); a
+   * direct storage-level config merge that downgrades a marked record to
+   * `null` while the write runs takes effect as if it committed after the
+   * write, which then stays unstamped. The caller must already hold the
+   * OM-resource advisory lock (see lockThreadLifecycles).
    */
   private async assertCurrentObservationalMemoryGeneration(
     t: TxClient,
