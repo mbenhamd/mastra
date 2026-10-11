@@ -347,6 +347,67 @@ describe('Harness subagent outcome terminal contract', () => {
     ]);
   });
 
+  it('binds id-less tool evidence to distinct recorded calls with the claimed name and status', () => {
+    const pythonClaim = {
+      kind: 'tool-result',
+      toolName: 'run_python_analysis',
+      status: 'success',
+      description: 'The sandbox computed the mean.',
+    };
+    const resultFor = (evidence: unknown[], receipts: Parameters<typeof withHarnessSubagentToolReceipts>[1]) =>
+      withHarnessSubagentToolReceipts(
+        { finishReason: 'tool-calls', terminalToolResult: outcomeEnvelope(outcomeReport('completed', { evidence })) },
+        receipts,
+      );
+    const ranOnce = [
+      { toolCallId: 'call_read', toolName: 'read_file', status: 'success' as const },
+      { toolCallId: 'call_py', toolName: 'run_python_analysis', status: 'success' as const },
+    ];
+
+    const honest = resultFor([pythonClaim], ranOnce);
+    expect(verifyHarnessSubagentOutcomeReport(honest)?.evidence).toEqual([{ ...pythonClaim, toolCallId: 'call_py' }]);
+    expect(projectHarnessSubagentOutcomeReceipts(honest)).toEqual([ranOnce[1]]);
+    expect(summarizeHarnessSubagentResult(honest)).toMatchObject({
+      status: 'success',
+      outcome: 'completed',
+      evidence: [{ toolName: 'run_python_analysis', toolCallId: 'call_py', status: 'success' }],
+    });
+    // The compacted projection keeps enough of the ledger to re-verify.
+    expect(
+      verifyHarnessSubagentOutcomeReport({
+        finishReason: 'tool-calls',
+        terminalToolResult: outcomeEnvelope(outcomeReport('completed', { evidence: [pythonClaim] })),
+        toolResults: { items: projectHarnessSubagentOutcomeReceipts(honest), verificationOnly: true },
+      })?.evidence,
+    ).toEqual([{ ...pythonClaim, toolCallId: 'call_py' }]);
+
+    const rejected = {
+      // The child never ran the tool it names.
+      neverRan: resultFor([pythonClaim], [ranOnce[0]!]),
+      // The only recorded call failed, so a success claim is fabricated.
+      failedRun: resultFor(
+        [pythonClaim],
+        [{ toolCallId: 'call_py', toolName: 'run_python_analysis', status: 'error' }],
+      ),
+      // Two claimed runs, one recorded run.
+      claimsMoreRunsThanRecorded: resultFor([pythonClaim, pythonClaim], ranOnce),
+      // An id that is not in the ledger, such as a sandbox request id.
+      unknownId: resultFor([{ ...pythonClaim, toolCallId: 'sandbox-request-7' }], ranOnce),
+      // A call whose recorded receipts disagree is never bound by name.
+      ambiguousCall: resultFor(
+        [pythonClaim],
+        [
+          { toolCallId: 'call_py', toolName: 'run_python_analysis', status: 'success' },
+          { toolCallId: 'call_py', toolName: 'run_python_analysis', status: 'error' },
+        ],
+      ),
+    };
+    for (const [name, rawResult] of Object.entries(rejected)) {
+      expect(verifyHarnessSubagentOutcomeReport(rawResult), name).toBeUndefined();
+      expect(summarizeHarnessSubagentResult(rawResult), name).toMatchObject({ status: 'error' });
+    }
+  });
+
   it('verifies failed tool evidence from bounded Harness stream receipts omitted by FullOutput.toolResults', () => {
     const report = outcomeReport('blocked');
     const rawResult = withHarnessSubagentToolReceipts(

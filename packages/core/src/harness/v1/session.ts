@@ -20832,6 +20832,7 @@ export class Session {
           'A normal text response or provider stop does not prove that the assigned task completed.',
           'Use completed only when the work is actually complete with concrete evidence; use blocked for unavailable external services, missing required input, or unmet dependencies; use failed for an unrecoverable work failure.',
           'Never claim a source repair when only a compiler/service failure was observed.',
+          'For tool-result evidence, give the toolName and observed status of a tool you actually called; the Harness binds it to its own record of your tool calls. Omit toolCallId unless you were shown the exact framework id.',
           '</harness_subagent_outcome_contract>',
         ].join('\n'),
       );

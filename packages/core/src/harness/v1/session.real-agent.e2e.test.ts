@@ -2470,6 +2470,122 @@ describe('Harness v1 real-agent E2E — S7 real subagent streaming', () => {
     }
   });
 
+  it('binds id-less tool evidence to the child’s recorded tool calls and rejects claims of tools it never ran', async () => {
+    // Models are never shown framework tool-call ids, so a real report names
+    // the tool and its observed status and the Harness binds it to its ledger.
+    const idlessReport = JSON.stringify({
+      outcome: 'completed',
+      summary: 'The answer is 42.',
+      evidence: [
+        {
+          kind: 'tool-result',
+          toolName: 'lookupFact',
+          status: 'success',
+          description: 'The fact read returned 42.',
+        },
+      ],
+    });
+    async function delegate(childStreams: Array<ReturnType<typeof toolCallStream>>) {
+      const readFact = vi.fn(async () => ({ answer: 42 }));
+      const lookupFact = createTool({
+        id: 'lookupFact',
+        description: 'read the answer',
+        inputSchema: z.object({}),
+        execute: readFact,
+      });
+      let childCalls = 0;
+      const childAgent = new Agent({
+        id: 'child-agent',
+        name: 'child-agent',
+        instructions: 'Read the fact, then report the completed outcome.',
+        model: new MockLanguageModelV2({
+          doStream: async () => ({
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: childStreams[childCalls++] ?? textStream(['The outcome report did not complete.']),
+          }),
+        }),
+      });
+      let parentCalls = 0;
+      const parentAgent = new Agent({
+        id: 'parent-agent',
+        name: 'parent-agent',
+        instructions: 'Delegate the fact lookup.',
+        model: new MockLanguageModelV2({
+          doStream: async () => ({
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream:
+              parentCalls++ === 0
+                ? toolCallStream(
+                    'parent-spawn',
+                    'spawn_subagent',
+                    JSON.stringify({ agentType: 'reader', task: 'Read the answer.', delivery: 'final' }),
+                  )
+                : textStream(['The delegation did not complete.']),
+          }),
+        }),
+      });
+      const harness = new Harness({
+        agents: { 'parent-agent': parentAgent, 'child-agent': childAgent },
+        storage: new InMemoryStore(),
+        modes: [
+          { id: 'default', agentId: 'parent-agent' },
+          {
+            id: 'read-only',
+            agentId: 'child-agent',
+            tools: { lookupFact },
+            harnessBuiltins: 'exclude',
+            permissions: { categories: {}, tools: { lookupFact: 'allow' } },
+          },
+        ],
+        defaultModeId: 'default',
+        subagents: {
+          maxDepth: 2,
+          types: {
+            reader: {
+              agentId: 'child-agent',
+              modeId: 'read-only',
+              description: 'Read a fact',
+              toolAllowlist: ['lookupFact'],
+            },
+          },
+        },
+      });
+      try {
+        const session = await harness.session({ resourceId: 'reader-user', threadId: { fresh: true } });
+        const events: HarnessEvent[] = [];
+        session.subscribe(event => events.push(event));
+        await session.message({ content: 'Delegate the answer lookup.' });
+        return { readFact, subagentEnd: events.find(event => event.type === 'subagent_end') };
+      } finally {
+        await harness.shutdown();
+      }
+    }
+
+    const honest = await delegate([
+      toolCallStream('read-fact', 'lookupFact', '{}'),
+      toolCallStream('child-outcome', 'report_subagent_outcome', idlessReport),
+    ]);
+    expect(honest.readFact).toHaveBeenCalledOnce();
+    expect(honest.subagentEnd).toMatchObject({
+      isError: false,
+      output: {
+        status: 'success',
+        outcome: 'completed',
+        evidence: [{ kind: 'tool-result', toolName: 'lookupFact', toolCallId: 'read-fact', status: 'success' }],
+      },
+    });
+
+    // The same report from a child that never ran the tool has no ledger entry.
+    const fabricated = await delegate([toolCallStream('child-outcome', 'report_subagent_outcome', idlessReport)]);
+    expect(fabricated.readFact).not.toHaveBeenCalled();
+    expect(fabricated.subagentEnd).toMatchObject({
+      isError: true,
+      output: { status: 'error', error: { code: 'harness.subagent_evidence_unverified' } },
+    });
+  });
+
   it('a REAL parent spawning a REAL subagent surfaces the child’s streamed text + real tool round-trip as subagent_* events with correct attribution', async () => {
     // --- REAL child tool (runs inside the child agent's real loop) ----------
     // Returns a non-JSON-native value (Date) to prove the subagent_tool_end

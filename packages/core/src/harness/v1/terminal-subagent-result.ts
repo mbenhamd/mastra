@@ -55,20 +55,33 @@ export const harnessSubagentOutcomeEvidenceSchema = z
   .object({
     kind: z.enum(['tool-result', 'artifact', 'source', 'analysis']),
     description: z.string().min(1).max(MAX_HARNESS_SUBAGENT_EVIDENCE_DESCRIPTION_LENGTH),
-    toolName: z.string().min(1).max(MAX_HARNESS_SUBAGENT_LABEL_LENGTH).optional(),
-    toolCallId: z.string().min(1).max(1_024).optional(),
-    status: z.enum(['success', 'error']).optional(),
+    toolName: z
+      .string()
+      .min(1)
+      .max(MAX_HARNESS_SUBAGENT_LABEL_LENGTH)
+      .optional()
+      .describe('For tool-result evidence: the exact name of the tool you called.'),
+    toolCallId: z
+      .string()
+      .min(1)
+      .max(1_024)
+      .optional()
+      .describe(
+        'Optional framework tool-call id. Omit it unless the exact id was shown to you; never substitute a ' +
+          'request, job, or provider id. The Harness binds tool-result evidence to its own record of your tool calls.',
+      ),
+    status: z
+      .enum(['success', 'error'])
+      .optional()
+      .describe('For tool-result evidence: the observed result status of that tool call.'),
     reference: z.string().min(1).max(MAX_HARNESS_SUBAGENT_EVIDENCE_REFERENCE_LENGTH).optional(),
   })
   .strict()
   .superRefine((evidence, ctx) => {
-    if (
-      evidence.kind === 'tool-result' &&
-      (evidence.toolName === undefined || evidence.toolCallId === undefined || evidence.status === undefined)
-    ) {
+    if (evidence.kind === 'tool-result' && (evidence.toolName === undefined || evidence.status === undefined)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'tool-result evidence requires toolName, toolCallId, and status',
+        message: 'tool-result evidence requires toolName and status',
       });
     }
   });
@@ -493,31 +506,106 @@ export function parseHarnessSubagentOutcomeReport(value: unknown): HarnessSubage
   return report;
 }
 
+type HarnessSubagentOutcomeEvidence = HarnessSubagentOutcomeReport['evidence'][number];
+
+/**
+ * Bind every `tool-result` claim in a report to the framework-observed receipt
+ * ledger. The model may describe evidence, but it cannot mint its identity or
+ * status:
+ *
+ * - a claim that cites a `toolCallId` must match that exact call's recorded
+ *   name and status;
+ * - a claim without an id (models are never shown framework call ids) binds to
+ *   one distinct recorded call with the same tool name and status, in
+ *   execution order. A call whose receipts disagree on name/status is never
+ *   bound this way, and a claim with no unbound matching call is rejected.
+ *
+ * Returns the report with every `tool-result` item carrying its bound
+ * framework id, or undefined when any claim is not backed by the ledger.
+ */
+function bindHarnessSubagentOutcomeEvidence(
+  report: HarnessSubagentOutcomeReport,
+  receipts: readonly HarnessSubagentToolReceipt[],
+): HarnessSubagentOutcomeReport | undefined {
+  const byCallId = new Map<string, HarnessSubagentToolReceipt[]>();
+  for (const receipt of receipts) {
+    const existing = byCallId.get(receipt.toolCallId) ?? [];
+    existing.push(receipt);
+    byCallId.set(receipt.toolCallId, existing);
+  }
+  const unambiguousCalls = [...byCallId.entries()].flatMap(([toolCallId, candidates]) => {
+    const [first] = candidates;
+    return first !== undefined &&
+      candidates.every(candidate => candidate.toolName === first.toolName && candidate.status === first.status)
+      ? [{ toolCallId, toolName: first.toolName, status: first.status }]
+      : [];
+  });
+  const boundByName = new Set<string>();
+
+  const evidence: HarnessSubagentOutcomeEvidence[] = [];
+  let citesSuccessfulTool = false;
+  for (const item of report.evidence) {
+    if (item.kind !== 'tool-result') {
+      evidence.push(item);
+      continue;
+    }
+    // The schema requires both for tool-result evidence; fail closed regardless.
+    if (item.toolName === undefined || item.status === undefined) return undefined;
+    if (item.toolCallId !== undefined) {
+      const candidates = byCallId.get(item.toolCallId) ?? [];
+      if (
+        candidates.length === 0 ||
+        candidates.some(candidate => candidate.toolName !== item.toolName || candidate.status !== item.status)
+      ) {
+        return undefined;
+      }
+      evidence.push(item);
+    } else {
+      const call = unambiguousCalls.find(
+        candidate =>
+          !boundByName.has(candidate.toolCallId) &&
+          candidate.toolName === item.toolName &&
+          candidate.status === item.status,
+      );
+      if (call === undefined) return undefined;
+      boundByName.add(call.toolCallId);
+      evidence.push({ ...item, toolCallId: call.toolCallId });
+    }
+    if (item.status === 'success') citesSuccessfulTool = true;
+  }
+
+  // A completed tool-using run must cite at least one successful tool receipt.
+  if (report.outcome === 'completed' && receipts.length > 0 && !citesSuccessfulTool) return undefined;
+  return { ...report, evidence };
+}
+
 /**
  * Return the bounded, framework-observed receipts cited by a terminal report.
  * The projection contains identity and status only; raw tool inputs/outputs are
  * intentionally excluded so durable adapters can retain verification evidence
- * without retaining provider/tool payloads.
+ * without retaining provider/tool payloads. Receipts bound to id-less claims
+ * are included, so a compacted result can still be re-verified.
  */
 export function projectHarnessSubagentOutcomeReceipts(value: unknown): HarnessSubagentToolReceipt[] {
   const report = parseHarnessSubagentOutcomeReport(value);
   if (report === undefined) return [];
+  const { receipts, overflow } = collectToolReceipts(value);
+  if (overflow) return [];
+  const bound = bindHarnessSubagentOutcomeEvidence(report, receipts);
   const citedIds = new Set(
-    report.evidence.flatMap(evidence =>
+    [...report.evidence, ...(bound?.evidence ?? [])].flatMap(evidence =>
       evidence.kind === 'tool-result' && evidence.toolCallId !== undefined ? [evidence.toolCallId] : [],
     ),
   );
   if (citedIds.size === 0) return [];
-  const { receipts, overflow } = collectToolReceipts(value);
-  if (overflow) return [];
   return receipts.filter(receipt => citedIds.has(receipt.toolCallId));
 }
 
 /**
- * Validate semantic tool evidence against framework-observed execution receipts.
- * The model may describe evidence, but it cannot mint its identity or status:
- * every `tool-result` item must bind to the exact tool call and observed result.
- * A completed tool-using run must cite at least one successful tool receipt.
+ * Validate semantic tool evidence against framework-observed execution receipts
+ * (see `bindHarnessSubagentOutcomeEvidence`). Every `tool-result` item must bind
+ * to a real recorded call with the claimed tool name and status, and a
+ * completed tool-using run must cite at least one successful tool receipt.
  */
 export function verifyHarnessSubagentOutcomeReport(value: unknown): HarnessSubagentOutcomeReport | undefined {
   const report = parseHarnessSubagentOutcomeReport(value);
@@ -525,44 +613,7 @@ export function verifyHarnessSubagentOutcomeReport(value: unknown): HarnessSubag
 
   const { receipts, overflow } = collectToolReceipts(value);
   if (overflow) return undefined;
-  const byCallId = new Map<string, HarnessSubagentToolReceipt[]>();
-  for (const receipt of receipts) {
-    const existing = byCallId.get(receipt.toolCallId) ?? [];
-    existing.push(receipt);
-    byCallId.set(receipt.toolCallId, existing);
-  }
-
-  const toolEvidence = report.evidence.filter(
-    (
-      evidence,
-    ): evidence is typeof evidence & {
-      toolName: string;
-      toolCallId: string;
-      status: 'success' | 'error';
-    } =>
-      evidence.kind === 'tool-result' &&
-      evidence.toolName !== undefined &&
-      evidence.toolCallId !== undefined &&
-      evidence.status !== undefined,
-  );
-  for (const evidence of toolEvidence) {
-    const candidates = byCallId.get(evidence.toolCallId) ?? [];
-    if (
-      candidates.length === 0 ||
-      candidates.some(candidate => candidate.toolName !== evidence.toolName || candidate.status !== evidence.status)
-    ) {
-      return undefined;
-    }
-  }
-
-  if (
-    report.outcome === 'completed' &&
-    receipts.length > 0 &&
-    !toolEvidence.some(evidence => evidence.status === 'success')
-  ) {
-    return undefined;
-  }
-  return report;
+  return bindHarnessSubagentOutcomeEvidence(report, receipts);
 }
 
 function parseGenericHarnessTerminalToolResult(value: unknown) {
