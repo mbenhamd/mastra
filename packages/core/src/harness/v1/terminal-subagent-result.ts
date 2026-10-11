@@ -582,7 +582,10 @@ function bindHarnessSubagentOutcomeEvidence(
 
   // A completed tool-using run must cite at least one successful tool receipt.
   if (report.outcome === 'completed' && receipts.length > 0 && !citesSuccessfulTool) return undefined;
-  return { ...report, evidence };
+  // Bound ids come from the ledger, not the validated claim: re-check the
+  // id length and aggregate byte budget so every consumer schema still holds.
+  const bound = harnessSubagentOutcomeReportSchema.safeParse({ ...report, evidence });
+  return bound.success ? bound.data : undefined;
 }
 
 /**
