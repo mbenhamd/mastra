@@ -12,6 +12,7 @@ import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
+import { Mastra } from '../../mastra';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
 
@@ -139,5 +140,78 @@ describe('run usage across suspension (PF-5349 #5)', () => {
     expect(await stream.finishReason).toBe('suspended');
     expect((await stream.totalUsage).inputTokens).toBe(100);
     expect((await stream.usage).outputTokens).toBe(10);
+  });
+
+  it('keeps reporting the suspending step after a cold resume that suspends again', async () => {
+    // Two approval-gated calls in one billed step: the run suspends on the first,
+    // resumes in a fresh Mastra (no in-process run scope), and suspends on the
+    // second. Both suspended results report that step once; the final total
+    // counts it once.
+    const storage = new InMemoryStore();
+    let calls = 0;
+    const twoCalls = () =>
+      convertArrayToReadableStream([
+        { type: 'stream-start', warnings: [] },
+        { type: 'response-metadata', id: 'id-tools', modelId: 'mock-model-id', timestamp: new Date(0) },
+        {
+          type: 'tool-call',
+          toolCallId: 'call-1',
+          toolName: 'applyEdit',
+          input: '{"text":"a"}',
+          providerExecuted: false,
+        },
+        {
+          type: 'tool-call',
+          toolCallId: 'call-2',
+          toolName: 'applyEdit',
+          input: '{"text":"b"}',
+          providerExecuted: false,
+        },
+        { type: 'finish', finishReason: 'tool-calls', usage: stepOneUsage },
+      ]);
+    const freshAgent = () => {
+      const applyEdit = createTool({
+        id: 'applyEdit',
+        description: 'apply an edit',
+        inputSchema: z.object({ text: z.string() }),
+        requireApproval: true,
+        execute: async () => ({ applied: true }),
+      });
+      const model = new MockLanguageModelV2({
+        doStream: async () => {
+          calls++;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: calls === 1 ? twoCalls() : textStream('done'),
+          };
+        },
+      });
+      const agent = new Agent({ id: 'editor', name: 'editor', instructions: 'edit', model, tools: { applyEdit } });
+      new Mastra({ agents: { editor: agent }, logger: false, storage });
+      return agent;
+    };
+
+    const first = await freshAgent().stream('edit both');
+    for await (const _chunk of first.fullStream) {
+      // drain
+    }
+    expect(await first.finishReason).toBe('suspended');
+    expect((await first.totalUsage).inputTokens).toBe(100);
+
+    // Cold: a new Mastra and agent over the same storage.
+    const resumed = await freshAgent().approveToolCall({ runId: first.runId, toolCallId: 'call-1' });
+    for await (const _chunk of resumed.fullStream) {
+      // drain
+    }
+    expect(await resumed.finishReason).toBe('suspended');
+    expect((await resumed.totalUsage).inputTokens).toBe(100);
+
+    const finished = await freshAgent().approveToolCall({ runId: first.runId, toolCallId: 'call-2' });
+    for await (const _chunk of finished.fullStream) {
+      // drain
+    }
+    expect(await finished.finishReason).not.toBe('suspended');
+    expect((await finished.totalUsage).inputTokens).toBe(300);
   });
 });

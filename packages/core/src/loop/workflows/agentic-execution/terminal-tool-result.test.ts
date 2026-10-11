@@ -163,7 +163,7 @@ describe('resolveTerminalToolResult', () => {
     ['declined approval', { result: 'declined', approval: { approved: false } }],
     ['approval without a decision', { result: 'done', approval: {} }],
     ['permission denial', { result: 'denied', disposition: 'denied' as const, approval: { approved: true } }],
-    ['failed apply', { error: new Error('conflict'), approval: { approved: true } }],
+    ['failed apply', { result: 'done', error: new Error('conflict'), approval: { approved: true } }],
   ])('keeps an afterApproval tool non-terminal for a %s', async (_label, call) => {
     await expect(
       resolveTerminalToolResult({
@@ -171,6 +171,28 @@ describe('resolveTerminalToolResult', () => {
         tools: { apply: tool({ afterApproval: true, isSuccess: () => true }) } as any,
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it('keeps a batch that mixes an approved call with an ordinary call non-terminal', async () => {
+    const optIn = tool({ afterApproval: true, isSuccess: () => true });
+    await expect(
+      resolveTerminalToolResult({
+        calls: [
+          { toolName: 'apply', toolCallId: 'call-1', args: {}, result: 'done', approval: { approved: true } },
+          { toolName: 'apply', toolCallId: 'call-2', args: {}, result: 'done' },
+        ],
+        tools: { apply: optIn } as any,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      resolveTerminalToolResult({
+        calls: [
+          { toolName: 'apply', toolCallId: 'call-1', args: {}, result: 'done', resumedFromSuspension: true },
+          { toolName: 'apply', toolCallId: 'call-2', args: {}, result: 'done', approval: { approved: true } },
+        ],
+        tools: { apply: optIn } as any,
+      }),
+    ).resolves.toMatchObject({ status: 'success' });
   });
 
   it('keeps a mixed batch non-terminal when only one approved tool opted in', async () => {

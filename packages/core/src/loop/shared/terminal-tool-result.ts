@@ -242,6 +242,11 @@ export async function resolveTerminalToolResult(options: {
       });
     }
 
+    // An approval or resume is a per-call boundary: a batch that mixes intervened
+    // and ordinary calls returns to the model so it can reconcile them.
+    const intervened = candidates.filter(candidate => Object.keys(candidate.intervention).length > 0).length;
+    if (intervened > 0 && intervened < candidates.length) return undefined;
+
     // A provider may select many tools in one step. Evaluate independent,
     // side-effect-free terminal policies concurrently so the latency is bounded
     // by one policy timeout rather than batchSize × timeout. One refusal or

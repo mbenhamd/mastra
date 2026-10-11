@@ -34,6 +34,7 @@ import type {
   ProcessorState,
 } from '../processors';
 import type { RequestContext } from '../request-context';
+import type { PendingStepUsage } from '../stream/pending-step-usage';
 import type {
   ChunkType,
   MastraOnFinishCallback,
@@ -356,6 +357,12 @@ export type LoopRun<Tools extends ToolSet = ToolSet, OUTPUT = undefined> = LoopO
   rotateResponseMessageId: (sealMessageId?: string) => string;
   streamState: {
     serialize: () => any;
+    /**
+     * @internal Record the usage of the model step whose tool call is about to
+     * suspend the run, so the suspended result (and its serialized state, for a
+     * cold resume) reports tokens that step already billed (PF-5349).
+     */
+    recordPendingStepUsage?: (usage: PendingStepUsage | undefined) => void;
     deserialize: (state: any) => void;
   };
   methodType: ModelMethodType;

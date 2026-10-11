@@ -746,6 +746,7 @@ const sidebars = {
         { type: 'doc', id: 'processors/token-cost-control', label: 'TokenCostControl' },
         { type: 'doc', id: 'processors/token-limiter-processor', label: 'TokenLimiterProcessor' },
         { type: 'doc', id: 'processors/tool-call-filter', label: 'ToolCallFilter' },
+        { type: 'doc', id: 'processors/tool-result-supersede-processor', label: 'ToolResultSupersedeProcessor' },
         { type: 'doc', id: 'processors/tool-search-processor', label: 'ToolSearchProcessor' },
         { type: 'doc', id: 'processors/unicode-normalizer', label: 'UnicodeNormalizer' },
         { type: 'doc', id: 'processors/working-memory-processor', label: 'WorkingMemory' },

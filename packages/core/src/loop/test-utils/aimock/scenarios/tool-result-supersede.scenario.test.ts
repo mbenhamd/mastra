@@ -62,4 +62,55 @@ describeForAllEngines('AIMock loop scenario: keyed supersede compaction', engine
     // The stored run keeps the full first result.
     expect(JSON.stringify((await output.getFullOutput()).steps)).toContain('BODY-1-');
   });
+
+  it('keeps both results of one step that read the same file, then supersedes them from a later step', async () => {
+    let reads = 0;
+    const readFile = createTool({
+      id: 'read_file',
+      description: 'Read a file',
+      inputSchema: z.object({ path: z.string() }),
+      outputSchema: z.object({ path: z.string(), text: z.string() }),
+      execute: async ({ path }) => {
+        reads += 1;
+        return { path, text: `BODY-${reads}-` };
+      },
+    });
+
+    const { requests } = await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Read main.tex, then answer.',
+      tools: { read_file: readFile },
+      maxSteps: 5,
+      inputProcessors: [
+        new ToolResultSupersedeProcessor({
+          tools: { read_file: { key: ({ input }) => (input as { path?: string }).path } },
+        }),
+      ],
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 0 },
+          {
+            content: 'Reading.',
+            toolCalls: [
+              { id: 'read-a', name: 'read_file', arguments: { path: 'main.tex' } },
+              { id: 'read-b', name: 'read_file', arguments: { path: 'main.tex' } },
+            ],
+          },
+        );
+        llm.on(
+          { endpoint: 'chat', sequenceIndex: 1 },
+          { toolCalls: [{ id: 'read-c', name: 'read_file', arguments: { path: 'main.tex' } }] },
+        );
+        llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'Done.' });
+      },
+    });
+
+    expect(requests).toHaveLength(3);
+    const second = JSON.stringify(requests[1]?.body?.messages ?? []);
+    expect(second).not.toContain('[superseded]');
+    const third = JSON.stringify(requests[2]?.body?.messages ?? []);
+    expect(third.match(/\[superseded\]/g)).toHaveLength(2);
+    expect(third).toContain('BODY-3-');
+  });
 });

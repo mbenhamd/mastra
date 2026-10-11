@@ -14,13 +14,13 @@ const MAX_SUPERSEDE_KEY_LENGTH = 1024;
 export interface ToolResultSupersedeCall {
   toolName: string;
   toolCallId: string;
-  /** The tool-call input the model sent. */
+  /** The recorded tool-call input (arguments) of this occurrence. */
   input: unknown;
   /** The model-facing result in the prompt (after `toModelOutput`). */
   output: unknown;
   /**
-   * The recorded tool result (after `processToolResult`) from the request's
-   * message list, when it carries one. `undefined` otherwise.
+   * The recorded tool result (after `processToolResult`) of this occurrence in
+   * the request's message list.
    */
   result: unknown;
 }
@@ -42,6 +42,11 @@ export interface ToolResultSupersedeToolConfig {
    * equal coverage. Defaults to the tool name.
    */
   group?: string;
+  /**
+   * Allow results with media content (for example an image) to be keyed. Off by
+   * default: such results are kept.
+   */
+  includeMedia?: boolean;
 }
 
 export interface ToolResultSupersedeOptions {
@@ -49,7 +54,7 @@ export interface ToolResultSupersedeOptions {
   tools: Record<string, ToolResultSupersedeToolConfig>;
 }
 
-type KeyedResult = { messageIndex: number; partIndex: number; part: ToolResultPart; scopedKey: string };
+type KeyedResult = { part: ToolResultPart; step: StepPosition; scopedKey: string };
 
 /**
  * Replaces stale tool results in model context when a later result shows the
@@ -58,12 +63,15 @@ type KeyedResult = { messageIndex: number; partIndex: number; part: ToolResultPa
  * Each step re-sends every earlier tool result. When a tool reads the same
  * resource again, the earlier copy is dead weight: this processor keeps the
  * newest successful result for each key verbatim and replaces the output of
- * every result with the same key from an earlier step by a fixed one-line
- * pointer. The tool-call part and its input stay, so the call/result pairing and
+ * every result with the same key from an earlier model step by a fixed one-line
+ * pointer. Each prompt result is paired with its recorded occurrence in the
+ * message list (by occurrence, since tool-call ids can repeat across turns);
+ * a result without an unambiguous recorded occurrence is never keyed. The tool-call part and its input stay, so the call/result pairing and
  * provenance survive. Results of the latest step are never replaced, and
  * results of the same step never replace each other. Error results (including
  * results the tool classified as failures), provider-executed results and
- * results that passed through an approval are never keyed.
+ * results that passed through an approval are never keyed, and media results
+ * only when the tool sets `includeMedia`.
  *
  * Supersession is opt-in per tool and keyed by the caller, so evidence the
  * model still needs (a different version, span or resource) keeps a different
@@ -95,63 +103,62 @@ export class ToolResultSupersedeProcessor implements Processor {
           `ToolResultSupersedeProcessor options.tools["${toolName}"].group must be a non-empty string`,
         );
       }
-      entries.set(toolName, { key: config.key, ...(config.group !== undefined ? { group: config.group } : {}) });
+      entries.set(toolName, {
+        key: config.key,
+        ...(config.group !== undefined ? { group: config.group } : {}),
+        ...(config.includeMedia === true ? { includeMedia: true } : {}),
+      });
     }
     this.tools = entries;
   }
 
-  processLLMRequest({ prompt, messageList }: ProcessLLMRequestArgs): ProcessLLMRequestResult {
+  processLLMRequest({ prompt, messageList, steps }: ProcessLLMRequestArgs): ProcessLLMRequestResult {
     if (this.tools.size === 0) return undefined;
 
-    const inputs = new Map<string, unknown>();
-    const candidates: Array<{ messageIndex: number; partIndex: number; part: ToolResultPart }> = [];
-    prompt.forEach((message, messageIndex) => {
-      if (message.role === 'assistant') {
-        for (const part of message.content) {
-          if (part.type === 'tool-call') inputs.set(part.toolCallId, part.input);
-        }
-        return;
+    // Candidates in prompt order. Provider-executed results live in assistant
+    // messages and are never keyed; only client tool results in tool messages.
+    const candidates: ToolResultPart[] = [];
+    for (const message of prompt) {
+      if (message.role !== 'tool') continue;
+      for (const part of message.content) {
+        if (part.type === 'tool-result' && this.tools.has(part.toolName)) candidates.push(part);
       }
-      // Provider-executed results live in assistant messages and are never
-      // keyed; only client tool results in tool messages are candidates.
-      if (message.role !== 'tool') return;
-      message.content.forEach((part, partIndex) => {
-        if (part.type === 'tool-result' && this.tools.has(part.toolName) && isSuccessfulOutput(part.output)) {
-          candidates.push({ messageIndex, partIndex, part });
-        }
-      });
-    });
+    }
     if (candidates.length < 2) return undefined;
 
-    const recorded = collectRecordedToolResults(messageList);
+    const occurrences = pairWithRecordedOccurrences(candidates, messageList, steps);
     const keyed: KeyedResult[] = [];
-    for (const candidate of candidates) {
-      const record = recorded.get(candidate.part.toolCallId);
-      // A failure the tool classified, or a result that passed through an
-      // approval, is evidence of its own and is never compacted.
-      if (record?.preserve || isClassifiedFailure(candidate.part.providerOptions)) continue;
-      const config = this.tools.get(candidate.part.toolName)!;
+    for (const part of candidates) {
+      const occurrence = occurrences.get(part);
+      // No unambiguous recorded occurrence means no provenance: keep it.
+      if (!occurrence || occurrence.preserve) continue;
+      if (!isSuccessfulOutput(part.output, this.tools.get(part.toolName)!.includeMedia === true)) continue;
+      if (isClassifiedFailure(part.providerOptions)) continue;
+      const config = this.tools.get(part.toolName)!;
       const key = resolveKey(config, {
-        toolName: candidate.part.toolName,
-        toolCallId: candidate.part.toolCallId,
-        input: inputs.get(candidate.part.toolCallId),
-        output: candidate.part.output,
-        result: record?.result,
+        toolName: part.toolName,
+        toolCallId: part.toolCallId,
+        input: occurrence.input,
+        output: part.output,
+        result: occurrence.result,
       });
       if (key === undefined) continue;
-      keyed.push({ ...candidate, scopedKey: `${config.group ?? candidate.part.toolName}\u0000${key}` });
+      keyed.push({ part, step: occurrence.step, scopedKey: `${config.group ?? part.toolName}\u0000${key}` });
     }
 
-    // Prompt order is chronological, so the last result per key is the newest.
+    // The newest result per key is the one from the latest step.
     const newest = new Map<string, KeyedResult>();
-    for (const entry of keyed) newest.set(entry.scopedKey, entry);
+    for (const entry of keyed) {
+      const current = newest.get(entry.scopedKey);
+      if (!current || compareSteps(entry.step, current.step) >= 0) newest.set(entry.scopedKey, entry);
+    }
 
     const replacements = new Map<ToolResultPart, ToolResultPart>();
     for (const entry of keyed) {
-      // Only a result from a later step supersedes: same-step duplicates were
-      // produced together, and the newest step's results are what the model has
-      // not seen yet.
-      if (newest.get(entry.scopedKey)!.messageIndex <= entry.messageIndex) continue;
+      // Only a result from a strictly later model step supersedes: results of
+      // one step were produced together, and the latest step's results are what
+      // the model has not seen yet.
+      if (compareSteps(newest.get(entry.scopedKey)!.step, entry.step) <= 0) continue;
       replacements.set(entry.part, {
         ...entry.part,
         // The pointer names no later call id, so it stays byte-identical when a
@@ -171,6 +178,20 @@ export class ToolResultSupersedeProcessor implements Processor {
   }
 }
 
+/**
+ * Model-step position of a recorded tool call: `run` is its index among this
+ * run's completed steps; history calls (earlier runs) have no `run` index and
+ * are ordered by their position in the recorded history.
+ */
+type StepPosition = { run?: number; history: number };
+
+function compareSteps(left: StepPosition, right: StepPosition): number {
+  if (left.run !== undefined && right.run !== undefined) return left.run - right.run;
+  if (left.run !== undefined) return 1;
+  if (right.run !== undefined) return -1;
+  return left.history - right.history;
+}
+
 function supersededText(toolName: string): string {
   return `[superseded] A later ${toolName} result for the same resource replaced this one; use the latest result.`;
 }
@@ -180,11 +201,16 @@ function isClassifiedFailure(metadata: unknown): boolean {
   return mastra?.resultStatus === 'error';
 }
 
-/** Only a result the model could use as evidence may supersede or be superseded. */
-function isSuccessfulOutput(output: unknown): boolean {
+/**
+ * Only a result the model could use as evidence may supersede or be superseded.
+ * Media (non-text content parts) is preserved unless the tool opted in.
+ */
+function isSuccessfulOutput(output: unknown, includeMedia: boolean): boolean {
   if (output === null || typeof output !== 'object') return false;
-  const type = (output as { type?: unknown }).type;
-  return type === 'text' || type === 'json' || type === 'content';
+  const { type, value } = output as { type?: unknown; value?: unknown };
+  if (type === 'text' || type === 'json') return true;
+  if (type !== 'content' || !Array.isArray(value)) return false;
+  return includeMedia || value.every(part => (part as { type?: unknown })?.type === 'text');
 }
 
 function resolveKey(config: ToolResultSupersedeToolConfig, call: ToolResultSupersedeCall): string | undefined {
@@ -198,30 +224,93 @@ function resolveKey(config: ToolResultSupersedeToolConfig, call: ToolResultSuper
   return key;
 }
 
-type RecordedToolResult = { result: unknown; preserve: boolean };
+type RecordedOccurrence = {
+  toolName: string;
+  input: unknown;
+  result: unknown;
+  step: StepPosition;
+  /** Passed through an approval, or the tool classified the result as a failure. */
+  preserve: boolean;
+};
 
 /**
- * The recorded (post-processor) result for each tool call in the message list,
- * and whether the call must be preserved: one that passed through an approval or
- * whose tool classified the recorded result as a failure.
+ * Pair each prompt tool result with its recorded occurrence in the message list.
+ *
+ * Tool-call ids are not unique across turns (providers reuse ids such as
+ * `call_0`), so results are paired by occurrence: the n-th prompt result with an
+ * id matches the n-th recorded result with that id. When the counts or tool
+ * names differ (for example, history trimmed by memory), every result with that
+ * id is left unpaired and therefore kept. A call's step comes from this run's
+ * completed steps when it belongs to them, otherwise from its position in the
+ * recorded history, where each assistant message and each `step-start` part
+ * begins a new step.
  */
-function collectRecordedToolResults(messageList: MessageList | undefined): Map<string, RecordedToolResult> {
-  const results = new Map<string, RecordedToolResult>();
-  if (!messageList) return results;
+function pairWithRecordedOccurrences(
+  candidates: readonly ToolResultPart[],
+  messageList: MessageList | undefined,
+  steps: ProcessLLMRequestArgs['steps'],
+): Map<ToolResultPart, RecordedOccurrence> {
+  const paired = new Map<ToolResultPart, RecordedOccurrence>();
+  if (!messageList) return paired;
+
+  const recorded = new Map<string, RecordedOccurrence[]>();
+  let historyStep = 0;
   for (const message of messageList.get.all.db()) {
+    if (message.role !== 'assistant') continue;
+    historyStep += 1;
     const parts = message.content?.parts;
     if (!Array.isArray(parts)) continue;
     for (const part of parts) {
+      if (part.type === 'step-start') {
+        historyStep += 1;
+        continue;
+      }
       if (part.type !== 'tool-invocation') continue;
       const invocation = part.toolInvocation as typeof part.toolInvocation & { approval?: unknown };
       if (invocation.state !== 'result') continue;
-      results.set(invocation.toolCallId, {
+      const list = recorded.get(invocation.toolCallId) ?? [];
+      list.push({
+        toolName: invocation.toolName,
+        input: invocation.args,
         result: invocation.result,
+        step: { history: historyStep },
         preserve:
           invocation.approval !== undefined ||
           isClassifiedFailure((part as { providerMetadata?: unknown }).providerMetadata),
       });
+      recorded.set(invocation.toolCallId, list);
     }
   }
-  return results;
+
+  // This run's calls are the latest recorded occurrences of their ids.
+  const runStepsById = new Map<string, number[]>();
+  (steps ?? []).forEach((step, index) => {
+    for (const call of (step as { toolCalls?: Array<{ toolCallId?: string; payload?: { toolCallId?: string } }> })
+      .toolCalls ?? []) {
+      const id = call.toolCallId ?? call.payload?.toolCallId;
+      if (typeof id !== 'string') continue;
+      runStepsById.set(id, [...(runStepsById.get(id) ?? []), index]);
+    }
+  });
+  for (const [id, runSteps] of runStepsById) {
+    const list = recorded.get(id);
+    if (!list) continue;
+    const offset = list.length - runSteps.length;
+    runSteps.forEach((run, index) => {
+      const occurrence = list[offset + index];
+      if (occurrence) occurrence.step = { ...occurrence.step, run };
+    });
+  }
+
+  const promptById = new Map<string, ToolResultPart[]>();
+  for (const part of candidates) {
+    promptById.set(part.toolCallId, [...(promptById.get(part.toolCallId) ?? []), part]);
+  }
+  for (const [id, parts] of promptById) {
+    const list = recorded.get(id);
+    if (!list || list.length !== parts.length) continue;
+    if (parts.some((part, index) => part.toolName !== list[index]!.toolName)) continue;
+    parts.forEach((part, index) => paired.set(part, list[index]!));
+  }
+  return paired;
 }

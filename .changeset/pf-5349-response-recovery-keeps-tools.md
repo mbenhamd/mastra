@@ -2,6 +2,6 @@
 '@mastra/core': patch
 ---
 
-Harness v1's response-only recovery step now keeps the tool schemas of the step before it. Before, the step that asks a silent model to report a completed tool result removed every tool from the request, so the provider's cached prompt prefix was lost and a short reply re-sent the whole context uncached.
+Improved the Harness v1 reply step that runs after a silent tool turn. The step now keeps the configured tools available to the model, so the request matches the one before it and reuses the provider's cache. It never runs a tool call.
 
-The step still cannot run tools: the loop refuses every tool call it emits. A forced tool choice (`'required'` or a named tool) is relaxed to `'auto'` so the model can reply, and a surface that includes provider-executed tools falls back to sending no tools, because the provider would run them. If a configured `prepareStep` throws on the recovery call, the step stays tool-free.
+If the tool choice forces a tool, it becomes `'auto'` for this step so the model can reply. If any available tool runs on the provider side, the step sends no tools.

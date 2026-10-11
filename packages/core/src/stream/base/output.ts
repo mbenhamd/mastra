@@ -28,6 +28,8 @@ import type { TerminalToolResult } from '../../tools';
 import type { WorkflowRunStatus } from '../../workflows';
 import { DelayedPromise, consumeStream } from '../aisdk/v5/compat';
 import type { ConsumeStreamOptions } from '../aisdk/v5/compat';
+import { addPendingStepUsage, toPendingStepUsage } from '../pending-step-usage';
+import type { PendingStepUsage } from '../pending-step-usage';
 import { isSignalChunkExcluded } from '../signal-exclusions';
 import type {
   ChunkType,
@@ -286,10 +288,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * Usage of the model step whose tool calls suspended the run. That step's
    * `step-finish` is emitted only after its tools settle, i.e. on resume, so a
    * suspended snapshot would otherwise omit tokens the provider already billed
-   * (PF-5349). It is reported on the suspended result only and never enters
-   * `#usageCount`, which is what a resumed run restores and continues.
+   * (PF-5349). The tool-call step records it out of band (never on a chunk), it
+   * is serialized with the suspension state so a cold resume that suspends again
+   * still reports it, and the step's own `step-finish` clears it. It is reported
+   * on the suspended result only and never enters `#usageCount`.
    */
-  #pendingSuspendedStepUsage: LanguageModelUsage | undefined = undefined;
+  #pendingSuspendedStepUsage: PendingStepUsage | undefined = undefined;
   #tripwire: StepTripwireData | undefined = undefined;
   #wasSuspended = false;
   #terminalToolResult: TerminalToolResult | undefined;
@@ -604,13 +608,6 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
           switch (chunk.type) {
             case 'tool-call-suspended':
             case 'tool-call-approval': {
-              const { stepUsage, ...publicPayload } = chunk.payload;
-              if (stepUsage !== undefined) {
-                // Parallel suspensions of one step carry the same step usage.
-                self.#pendingSuspendedStepUsage ??= stepUsage;
-                // Internal accounting only: consumers never see it.
-                outboundChunk = { ...chunk, payload: publicPayload } as typeof chunk;
-              }
               self.#status = 'suspended';
               self.#wasSuspended = true;
               self.#delayedPromises.suspendPayload.resolve(chunk.payload);
@@ -878,6 +875,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               }
 
               self.updateUsageCount(chunk.payload.output.usage);
+              // The first step-finish after a suspension is the suspending step's:
+              // its usage is now counted, so it is no longer pending.
+              self.#pendingSuspendedStepUsage = undefined;
               // chunk.payload.totalUsage = self.totalUsage;
               self.#warnings = chunk.payload.stepResult.warnings || [];
 
@@ -2378,21 +2378,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
   /** Completed-step usage plus the billed step that suspended (see `#pendingSuspendedStepUsage`). */
   #suspendedUsage(): LanguageModelUsage {
-    const pending = this.#pendingSuspendedStepUsage;
-    if (pending === undefined) return this.#usageCount;
-    const sum = (left: number | undefined, right: number | undefined) =>
-      left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0);
-    return {
-      ...this.#usageCount,
-      inputTokens: sum(this.#usageCount.inputTokens, pending.inputTokens),
-      outputTokens: sum(this.#usageCount.outputTokens, pending.outputTokens),
-      totalTokens: sum(this.#usageCount.totalTokens, pending.totalTokens),
-      reasoningTokens: sum(this.#usageCount.reasoningTokens, pending.reasoningTokens),
-      cachedInputTokens: sum(this.#usageCount.cachedInputTokens, pending.cachedInputTokens),
-      cacheCreationInputTokens: sum(this.#usageCount.cacheCreationInputTokens, pending.cacheCreationInputTokens),
-      cacheCreationInputTokens5m: sum(this.#usageCount.cacheCreationInputTokens5m, pending.cacheCreationInputTokens5m),
-      cacheCreationInputTokens1h: sum(this.#usageCount.cacheCreationInputTokens1h, pending.cacheCreationInputTokens1h),
-    };
+    return addPendingStepUsage(this.#usageCount, this.#pendingSuspendedStepUsage);
+  }
+
+  /**
+   * @internal Record the usage of the model step whose tool call is suspending
+   * the run. The first record for a pending step wins: parallel suspensions of
+   * one step, and a cold resume that suspends again, report it once.
+   */
+  _recordPendingSuspendedStepUsage(usage: PendingStepUsage | undefined): void {
+    if (usage !== undefined) this.#pendingSuspendedStepUsage ??= usage;
   }
 
   #createAbortedOnFinishPayload(): MastraOnFinishCallbackArgs<OUTPUT> {
@@ -2580,6 +2575,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       tripwire: this.#tripwire,
       wasSuspended: this.#wasSuspended,
       terminalToolResult: this.#terminalToolResult,
+      ...(this.#pendingSuspendedStepUsage ? { pendingSuspendedStepUsage: this.#pendingSuspendedStepUsage } : {}),
       messageList: this.messageList.serialize(),
     };
   }
@@ -2603,6 +2599,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     this.#finishReason = state.finishReason;
     this.#request = state.request;
     this.#usageCount = state.usageCount;
+    this.#pendingSuspendedStepUsage = toPendingStepUsage(state.pendingSuspendedStepUsage);
     this.#tripwire = state.tripwire;
     this.#wasSuspended = state.wasSuspended ?? state.status === 'suspended';
     this.#terminalToolResult = state.terminalToolResult

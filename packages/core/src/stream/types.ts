@@ -836,12 +836,6 @@ interface ToolCallApprovalPayload {
   approvalReasons?: readonly string[];
   /** Epoch ms when approval was requested; matches the tool part's `updatedAt`. */
   updatedAt?: number;
-  /**
-   * @internal Usage of the model step that emitted this call, so a suspended run
-   * reports the tokens that step already billed. Stripped by the run output
-   * before the chunk reaches consumers.
-   */
-  stepUsage?: LanguageModelUsage;
 }
 
 interface ToolCallSuspendedPayload {
@@ -857,8 +851,6 @@ interface ToolCallSuspendedPayload {
   args: Record<string, any>;
   resumeSchema: string;
   approval?: { id: string; approved: true; reason?: string };
-  /** @internal See {@link ToolCallApprovalPayload.stepUsage}. */
-  stepUsage?: LanguageModelUsage;
 }
 
 export type DataChunkType = {

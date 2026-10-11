@@ -25,6 +25,7 @@ import { BACKGROUND_WORK_CONTEXT, notifyBackgroundWorkTerminal } from '../../../
 import { RequestContext } from '../../../request-context';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../../../schema';
 import { safeEnqueue } from '../../../stream/base';
+import { toPendingStepUsage } from '../../../stream/pending-step-usage';
 import { ChunkFrom } from '../../../stream/types';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { resolveToolApprovalRequirement } from '../../../tools/approval';
@@ -320,14 +321,15 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               ? displayInputTransform.transformed
               : transformInput;
 
-        const stepUsage = readScoped(scopeCtx, STEP_USAGE_KEY, 'stepUsage');
+        // The suspending step's step-finish (and its usage) is emitted only on
+        // resume, so hand its billed usage to the run output out of band, before
+        // the suspension snapshot serializes that output state (PF-5349). A cold
+        // resume has no scoped usage; the output restored it from that snapshot.
+        streamState.recordPendingStepUsage?.(toPendingStepUsage(readScoped(scopeCtx, STEP_USAGE_KEY, 'stepUsage')));
         return {
           ...transformedChunk,
           payload: {
             ...transformedChunk.payload,
-            // The suspending step's step-finish (and its usage) is emitted only on
-            // resume; the run output reports it on the suspended result (PF-5349).
-            ...(stepUsage !== undefined ? { stepUsage } : {}),
             resumeIdentityDigest: createToolCallIdentityDigest({
               toolCallId: transformToolCallId,
               toolName: transformToolName,

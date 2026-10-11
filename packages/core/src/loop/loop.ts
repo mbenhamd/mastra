@@ -131,6 +131,7 @@ export function loop<Tools extends ToolSet = ToolSet, OUTPUT = undefined>({
     streamState: {
       serialize: serializeStreamState,
       deserialize: deserializeStreamState,
+      recordPendingStepUsage: usage => modelOutput?._recordPendingSuspendedStepUsage(usage),
     },
     processorStates,
     ...rest,

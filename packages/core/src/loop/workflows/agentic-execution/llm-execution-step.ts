@@ -2011,16 +2011,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           }
         }
 
-        if (responseRecoveryStep) {
-          // Response-only recovery denies execution but keeps the step's tool
-          // schemas: a changed tool set breaks the provider prompt cache (PF-5349).
-          currentStep.toolChoice = responseRecoveryToolChoice(
-            currentStep.toolChoice,
-            currentStep.tools as Record<string, unknown> | undefined,
-            currentStep.activeTools as string[] | undefined,
-          ) as typeof currentStep.toolChoice;
-        }
-
         const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
         if (toolSurfaceFence) {
           if (currentStep.tools) {
@@ -2253,6 +2243,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Recovery owns one freshly fenced provider attempt. A cached response
           // was produced under another tool surface and cannot consume it.
           cachedResponse = undefined;
+          // Chosen after the tool-surface fence and the permission gate, from the
+          // tools this request will actually advertise (PF-5349): the step keeps
+          // their schemas and the loop denies execution below.
           currentStep.toolChoice = responseRecoveryToolChoice(
             currentStep.toolChoice,
             currentStep.tools as Record<string, unknown> | undefined,

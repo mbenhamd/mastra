@@ -1,5 +1,5 @@
 ---
-'@mastra/core': patch
+'@mastra/core': minor
 ---
 
 Tools with a `terminalResult` can now end the run after an approval. Set `afterApproval: true` when your success check verifies the applied outcome. An approved call, or a call resumed from a suspension, then ends the run with its result instead of returning to the model once more. The success check receives `approvalGranted` and `resumedFromSuspension` in its context.

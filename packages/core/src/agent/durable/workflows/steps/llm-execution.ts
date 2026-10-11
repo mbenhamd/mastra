@@ -992,14 +992,6 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   : `Run "${runId}" produced a response-recovery admission without a durable reservation`,
               );
             }
-            if (responseRecoveryReserved) {
-              // Deny execution, keep the advertised tool schemas (PF-5349).
-              currentToolChoice = responseRecoveryToolChoice(
-                currentToolChoice,
-                currentTools as Record<string, unknown> | undefined,
-                currentActiveTools ?? undefined,
-              ) as ToolChoice<ToolSet> | undefined;
-            }
 
             // ── Signal echo & pre-run drain ───────────────────────────────
             // Mirror the non-durable llm-execution-step:
