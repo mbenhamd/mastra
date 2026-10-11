@@ -410,8 +410,14 @@ class PgHarnessClient {
       };
       tx.rollback = async () => {
         if (closed) return;
-        await client.query('ROLLBACK');
         closed = true;
+        try {
+          await client.query('ROLLBACK');
+        } catch (err) {
+          // A connection whose ROLLBACK failed is discarded, never reused.
+          client.release(err instanceof Error ? err : true);
+          throw err;
+        }
         client.release();
       };
       return tx;
@@ -7017,7 +7023,8 @@ export class HarnessPG extends HarnessStorage {
       });
       await tx.commit();
     } catch (err) {
-      if (!tx.closed) await tx.rollback();
+      // The original failure wins; a failed rollback only discards the connection.
+      if (!tx.closed) await tx.rollback().catch(() => undefined);
       throw err;
     }
     // Return the authoritative stored row (the existing one on a no-op).
