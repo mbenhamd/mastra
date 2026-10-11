@@ -2905,8 +2905,9 @@ export class ProcessorRunner {
       // Handle workflow as processor with toolResult phase
       if (isProcessorWorkflow(processorOrWorkflow)) {
         if (!outputProcessorSupportsToolResult(processorOrWorkflow)) continue;
+        const messagesBeforeWorkflow = [...processableMessages];
         const currentSystemMessages = messageList.getAllSystemMessages();
-        await this.executeWorkflowAsProcessor(
+        const workflowResult = await this.executeWorkflowAsProcessor(
           processorOrWorkflow,
           {
             phase: 'toolResult',
@@ -2929,6 +2930,21 @@ export class ProcessorRunner {
           writer,
           abortSignal,
         );
+        // Like a plain processor's returned array, returned messages replace the
+        // list. System messages are left alone: a plain processToolResult hook has no
+        // system-message result, and this workflow received tagged and untagged
+        // messages that replaceAllSystemMessages would fold into the untagged bucket.
+        ProcessorRunner.applyWorkflowResultToMessageList({
+          result: { ...workflowResult, systemMessages: undefined },
+          messageList,
+          idsBeforeProcessing,
+          check,
+          defaultSource: 'response',
+          messagesBeforeWorkflow,
+          messagesAfterWorkflow: messageList.get.all.db(),
+          systemMessagesBeforeWorkflow: currentSystemMessages,
+          systemMessagesAfterWorkflow: messageList.getAllSystemMessages(),
+        });
         continue;
       }
 
