@@ -4998,6 +4998,66 @@ describe('Memory', () => {
       await expectDerivedObservationStateRetracted(memoryStore, resourceId, threadId);
     });
 
+    it('forwards its observer working-memory policy so an unmarked record retracts working memory atomically', async () => {
+      for (const mutation of ['delete', 'edit'] as const) {
+        const storage = new InMemoryStore();
+        const memory = new Memory({
+          storage,
+          options: {
+            workingMemory: { enabled: true, scope: 'resource' },
+            observationalMemory: { enabled: true, observation: { manageWorkingMemory: true } },
+          },
+        });
+        const unmanaged = new Memory({ storage });
+        const memoryStore = (await storage.getStore('memory'))!;
+        const now = new Date('2026-01-01T00:00:00.000Z');
+        const threadId = `thread-policy-${mutation}`;
+        const resourceId = `resource-policy-${mutation}`;
+        await memoryStore.saveThread({
+          thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt: now, updatedAt: now },
+        });
+        await memoryStore.saveMessages({
+          messages: ['first', 'second'].map(suffix => ({
+            id: `message-policy-${mutation}-${suffix}`,
+            threadId,
+            resourceId,
+            role: 'user' as const,
+            content: { format: 2 as const, parts: [{ type: 'text' as const, text: 'My fact is ZEPHYR-9.' }] },
+            createdAt: now,
+          })),
+        });
+        const seed = async () => {
+          await memoryStore.updateResource({ resourceId, workingMemory: '{"privateFact":"ZEPHYR-9"}' });
+          // Written before the managed-scope marker existed.
+          await memoryStore.initializeObservationalMemory({
+            config: {},
+            threadId: null,
+            resourceId,
+            scope: 'resource',
+          });
+        };
+        const mutate = async (target: Memory, id: string) =>
+          mutation === 'delete'
+            ? await target.deleteMessages([id])
+            : await target.updateMessages({
+                messages: [{ id, content: { format: 2, parts: [{ type: 'text', text: 'Corrected.' }] } }],
+              });
+
+        // A memory whose observer does not manage working memory leaves it alone.
+        await seed();
+        await mutate(unmanaged, `message-policy-${mutation}-first`);
+        await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.toBeNull();
+        await expect(memoryStore.getResourceById({ resourceId })).resolves.toMatchObject({
+          workingMemory: '{"privateFact":"ZEPHYR-9"}',
+        });
+
+        await seed();
+        await mutate(memory, `message-policy-${mutation}-second`);
+        await expect(memoryStore.getObservationalMemory(null, resourceId)).resolves.toBeNull();
+        await expect(memoryStore.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: undefined });
+      }
+    });
+
     it('retracts source and destination observations when a stored message moves', async () => {
       const storage = new InMemoryStore();
       const memory = new Memory({ storage });

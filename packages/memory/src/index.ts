@@ -1682,7 +1682,10 @@ export class Memory extends MastraMemory {
     const threadVectorScopes = new Map<string, { resourceId: string; threadId: string }>();
     for (const coordinate of coordinates) {
       if (memoryStore.supportsAtomicObservationalMemoryRetraction) {
-        const result = await memoryStore.retractObservationalMemory(coordinate);
+        const result = await memoryStore.retractObservationalMemory({
+          ...coordinate,
+          ...this.managedWorkingMemoryScopeOption(),
+        });
         receipts.push({ input: coordinate, result });
         continue;
       }
@@ -3120,6 +3123,27 @@ ${workingMemory}`;
    * One-time initialization of the shared ObservationalMemory engine.
    * Called lazily by the `omEngine` getter on first access.
    */
+  /**
+   * The working-memory scope this memory's observer manages, if any. Records
+   * the observer writes carry it as their `_managedWorkingMemoryScope` marker,
+   * and an authoritative message edit or delete passes it to the store so a
+   * record written before that marker existed retracts the same working
+   * memory atomically.
+   */
+  private managedWorkingMemoryScopeOption(): { managedWorkingMemoryScope?: 'thread' | 'resource' } {
+    const managedWorkingMemoryScope = this.observerManagedWorkingMemoryScope();
+    return managedWorkingMemoryScope ? { managedWorkingMemoryScope } : {};
+  }
+
+  private observerManagedWorkingMemoryScope(): 'thread' | 'resource' | undefined {
+    const omConfig = normalizeObservationalMemoryConfig(this.threadConfig.observationalMemory);
+    if (!omConfig) return undefined;
+    return this.threadConfig.workingMemory?.enabled &&
+      (omConfig.observation?.manageWorkingMemory || hasWorkingMemoryExtractor(omConfig.observation?.extract))
+      ? (this.threadConfig.workingMemory.scope ?? 'resource')
+      : undefined;
+  }
+
   private async _initOMEngine(): Promise<ObservationalMemory | null> {
     const omConfig = normalizeObservationalMemoryConfig(this.threadConfig.observationalMemory);
     if (!omConfig) return null;
@@ -3178,11 +3202,7 @@ ${workingMemory}`;
     return new OMClass({
       storage: memoryStore,
       memory: this,
-      managedWorkingMemoryScope:
-        this.threadConfig.workingMemory?.enabled &&
-        (omConfig.observation?.manageWorkingMemory || hasWorkingMemoryExtractor(omConfig.observation?.extract))
-          ? (this.threadConfig.workingMemory.scope ?? 'resource')
-          : undefined,
+      managedWorkingMemoryScope: this.observerManagedWorkingMemoryScope(),
       scope: omConfig.scope,
       retrieval: omConfig.retrieval,
       sourceWriteFencing: omConfig.sourceWriteFencing,
@@ -4167,6 +4187,7 @@ Notes:
         ...(atomicRetraction
           ? {
               retractObservationalMemory: true,
+              ...this.managedWorkingMemoryScopeOption(),
               observationalMemoryRetractions: receipts,
             }
           : {}),
@@ -4242,6 +4263,7 @@ Notes:
           atomicRetraction
             ? {
                 retractObservationalMemory: true,
+                ...this.managedWorkingMemoryScopeOption(),
                 observationalMemoryRetractions: receipts,
               }
             : undefined,

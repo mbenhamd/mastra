@@ -230,8 +230,10 @@ function mergeObservationalThreadMetadata(
 }
 
 /**
- * The working-memory scopes the retracted records manage. An unmarked record
- * counts as `fallback` when the caller's policy names one.
+ * The working-memory scopes the retracted records manage. A record with no
+ * marker at all (written before the marker existed) counts as `fallback` when
+ * the caller's policy names one; an explicit `null` marker means the observer
+ * did not manage working memory and is never overridden.
  */
 function getManagedWorkingMemoryScopes(
   records: readonly ObservationalMemoryRecord[],
@@ -239,8 +241,14 @@ function getManagedWorkingMemoryScopes(
 ): Set<'thread' | 'resource'> {
   const scopes = new Set<'thread' | 'resource'>();
   for (const record of records) {
-    const marked = record.config?._managedWorkingMemoryScope;
-    const scope = marked === 'thread' || marked === 'resource' ? marked : fallback;
+    const config = record.config;
+    const marked = config?._managedWorkingMemoryScope;
+    const scope =
+      marked === 'thread' || marked === 'resource'
+        ? marked
+        : config && Object.prototype.hasOwnProperty.call(config, '_managedWorkingMemoryScope')
+          ? undefined
+          : fallback;
     if (scope) scopes.add(scope);
   }
   return scopes;
@@ -891,17 +899,22 @@ export class InMemoryMemory extends MemoryStorage {
   async updateMessages(args: {
     messages: (Partial<MastraDBMessage> & { id: string })[];
     retractObservationalMemory?: boolean;
+    managedWorkingMemoryScope?: 'thread' | 'resource';
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<MastraDBMessage[]> {
     const canonicalUpdates = [...new Map(args.messages.map(message => [message.id, message])).values()];
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
     const updatedMessages = this.withMemoryStateRollback(args.retractObservationalMemory === true, () => {
-      const retractionCoordinates: Array<{ resourceId: string; threadId: string }> = [];
+      const retractionCoordinates: RetractObservationalMemoryInput[] = [];
       if (args.retractObservationalMemory) {
-        const coordinates = new Map<string, { resourceId: string; threadId: string }>();
+        const coordinates = new Map<string, RetractObservationalMemoryInput>();
         const addCoordinate = (resourceId: string | undefined, threadId: string | undefined) => {
           if (!resourceId || !threadId) return;
-          coordinates.set(`${resourceId}\u0000${threadId}`, { resourceId, threadId });
+          coordinates.set(`${resourceId}\u0000${threadId}`, {
+            resourceId,
+            threadId,
+            ...(args.managedWorkingMemoryScope ? { managedWorkingMemoryScope: args.managedWorkingMemoryScope } : {}),
+          });
         };
         for (const update of canonicalUpdates) {
           const message = this.db.messages.get(update.id);

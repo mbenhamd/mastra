@@ -2499,6 +2499,13 @@ describe('record management', () => {
     expect(record.activeObservations).toBeFalsy();
   });
 
+  it('getOrCreateRecord marks a record whose observer does not manage working memory', async () => {
+    // Explicit `null`: a retraction's policy fallback, which reaches only
+    // records written before the marker existed, must never treat it as managed.
+    const record = await om.getOrCreateRecord(threadId);
+    expect(record.config).toHaveProperty('_managedWorkingMemoryScope', null);
+  });
+
   it('getOrCreateRecord should return existing record', async () => {
     const first = await om.getOrCreateRecord(threadId);
     const second = await om.getOrCreateRecord(threadId);

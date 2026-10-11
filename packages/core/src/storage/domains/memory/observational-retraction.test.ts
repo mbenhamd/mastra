@@ -461,6 +461,89 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
     await expect(memory.getObservationalMemory(null, resourceId)).resolves.toBeNull();
   });
 
+  it('fences a late observer write and keeps the successor through a policy-managed retraction', async () => {
+    const storage = new InMemoryStore({ id: 'memory-observational-policy-successor' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const threadId = 'policy-successor-thread';
+    const resourceId = 'policy-successor-resource';
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    const predecessor = await memory.initializeObservationalMemory({
+      threadId,
+      resourceId,
+      scope: 'thread',
+      config: {},
+    });
+    const writeGuard = { recordId: predecessor.id, threadId, resourceId };
+    await memory.updateResourceFromObservationalMemory({
+      resourceId,
+      workingMemory: '{"codeword":"ORION"}',
+      guard: writeGuard,
+    });
+    const successorRecordId = `${predecessor.id}-successor`;
+    const retract = () =>
+      memory.retractObservationalMemory({
+        resourceId,
+        threadId,
+        managedWorkingMemoryScope: 'resource',
+        sourceWriteSuccessor: { predecessor: writeGuard, successorRecordId },
+      });
+
+    await expect(retract()).resolves.toMatchObject({
+      clearedResourceWorkingMemory: true,
+      sourceWriteGuard: { recordId: successorRecordId },
+    });
+    // A late observer write naming the retracted generation cannot resurrect it.
+    await expect(
+      memory.updateResourceFromObservationalMemory({
+        resourceId,
+        workingMemory: '{"codeword":"ORION","resurrected":true}',
+        guard: writeGuard,
+      }),
+    ).rejects.toThrow();
+    await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: undefined });
+    // The successor survives and is the generation a source write resolves.
+    await expect(
+      memory.getObservationalMemoryForSourceWrite({
+        threadId,
+        resourceId,
+        sourceWriteGuard: { recordId: successorRecordId, threadId, resourceId },
+      }),
+    ).resolves.toMatchObject({ id: successorRecordId });
+    // A replay finds the successor and clears nothing learned since.
+    await memory.updateResource({ resourceId, workingMemory: 'Learned since.' });
+    await expect(retract()).resolves.toMatchObject({ clearedResourceWorkingMemory: false });
+    await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: 'Learned since.' });
+  });
+
+  it('never applies the policy fallback to a record explicitly marked as not managing working memory', async () => {
+    const storage = new InMemoryStore({ id: 'memory-observational-policy-null-marker' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const threadId = 'null-marker-thread';
+    const resourceId = 'null-marker-resource';
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    await memory.updateResource({ resourceId, workingMemory: 'Profile the observer never wrote.' });
+    await memory.initializeObservationalMemory({
+      threadId: null,
+      resourceId,
+      scope: 'resource',
+      config: { _managedWorkingMemoryScope: null },
+    });
+    await expect(
+      memory.retractObservationalMemory({ resourceId, threadId, managedWorkingMemoryScope: 'resource' }),
+    ).resolves.toMatchObject({ clearedScopes: ['resource'], clearedResourceWorkingMemory: false });
+    await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({
+      workingMemory: 'Profile the observer never wrote.',
+    });
+  });
+
   it('does not clear sibling thread memory when a resource record owns only resource memory', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-retraction-mixed-scope' });
     const memory = await storage.getStore('memory');

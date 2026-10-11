@@ -1435,7 +1435,10 @@ export class ObservationalMemory {
           observation: this.observationConfig,
           reflection: this.reflectionConfig,
           scope: this.scope,
-          ...(this.managedWorkingMemoryScope ? { _managedWorkingMemoryScope: this.managedWorkingMemoryScope } : {}),
+          // An explicit `null` records that this observer does not manage working
+          // memory, so a retraction's policy fallback (which reaches only records
+          // written before the marker existed) never clears memory it never wrote.
+          _managedWorkingMemoryScope: this.managedWorkingMemoryScope ?? null,
         },
         observedTimezone,
       });

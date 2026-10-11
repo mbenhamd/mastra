@@ -787,9 +787,39 @@ describe('MemoryPG observational-memory retraction', () => {
       guard,
     });
 
-    // The deletion waits on the OM resource lock while a second observer
-    // write queues behind it: the write that lands before the deletion is
-    // cleared by it, and the one after it is fenced off.
+    // The deletion waits on the OM resource lock, and a second observer write
+    // queues behind it: the write that landed before the deletion is cleared
+    // by it, and the one after it is fenced off. Each wait is observed in
+    // pg_stat_activity before the next step.
+    const runId = Date.now();
+    const deleterName = `pf5257-deleter-${runId}`;
+    const writerName = `pf5257-writer-${runId}`;
+    const namedStore = async (id: string, applicationName: string) => {
+      const url = new URL(connectionString);
+      url.searchParams.set('application_name', applicationName);
+      const store = new PostgresStore({ id, connectionString: url.toString(), disableInit: true, schemaName });
+      await store.init();
+      return { store, memory: (await store.getStore('memory')) as MemoryPG };
+    };
+    const deleter = await namedStore('om-retraction-deleter', deleterName);
+    const writer = await namedStore('om-retraction-writer', writerName);
+    const inspector = new Pool({ connectionString });
+    const waitForAdvisoryLockWait = async (applicationName: string) => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const result = await inspector.query<{ waiting: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_stat_activity
+             WHERE application_name = $1 AND wait_event_type = 'Lock'
+               AND query LIKE '%pg_advisory_xact_lock%'
+           ) AS waiting`,
+          [applicationName],
+        );
+        if (result.rows[0]?.waiting) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      throw new Error(`Timed out waiting for ${applicationName} to block on the OM resource lock.`);
+    };
     const blocker = new Pool({ connectionString });
     const client = await blocker.connect();
     let transactionOpen = false;
@@ -801,13 +831,13 @@ describe('MemoryPG observational-memory retraction', () => {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
         `mastra:observational-memory:${policyResourceId}`,
       ]);
-      const deletion = retractorMemory.deleteMessages([deletedMessageId], {
+      const deletion = deleter.memory.deleteMessages([deletedMessageId], {
         retractObservationalMemory: true,
         managedWorkingMemoryScope: 'resource',
         observationalMemoryRetractions: receipts as any,
       });
-      await new Promise(resolve => setTimeout(resolve, 150));
-      lateWrite = observerMemory
+      await waitForAdvisoryLockWait(deleterName);
+      lateWrite = writer.memory
         .updateResourceFromObservationalMemory({
           resourceId: policyResourceId,
           workingMemory: '{"codeword":"KESTREL","resurrected":true}',
@@ -817,7 +847,7 @@ describe('MemoryPG observational-memory retraction', () => {
           () => 'applied',
           (error: unknown) => error,
         );
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await waitForAdvisoryLockWait(writerName);
       expect(receipts).toEqual([]);
       await client.query('COMMIT');
       transactionOpen = false;
@@ -827,10 +857,14 @@ describe('MemoryPG observational-memory retraction', () => {
       client.release();
       await blocker.end();
     }
+    // The late observer write names the retracted generation and is refused.
+    const refused = await lateWrite;
+    await Promise.allSettled([deleter.store.close(), writer.store.close(), inspector.end()]);
+    expect((refused as { cause?: { name?: string } } | undefined)?.cause?.name).toBe(
+      'ObservationalMemoryGenerationConflictError',
+    );
 
     expect(receipts).toMatchObject([{ result: { clearedScopes: ['resource'], clearedResourceWorkingMemory: true } }]);
-    // The late observer write names the retracted generation and is refused.
-    expect(await lateWrite).not.toBe('applied');
     await expect(retractorMemory.getResourceById({ resourceId: policyResourceId })).resolves.toMatchObject({
       workingMemory: null,
     });
@@ -856,6 +890,80 @@ describe('MemoryPG observational-memory retraction', () => {
       workingMemory: 'Profile from elsewhere.',
     });
     await expect(retractorMemory.getObservationalMemory(null, policyResourceId)).resolves.toBeNull();
+  });
+
+  it('applies a thread-scope policy to an unmarked resource record across the resource, and never to a not-managed marker', async () => {
+    const scopeResourceId = `${resourceId}-policy-thread-scope`;
+    const threads = [`${threadId}-policy-thread-a`, `${threadId}-policy-thread-b`];
+    await observerMemory.saveResource({
+      resource: {
+        id: scopeResourceId,
+        workingMemory: 'Resource profile.',
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+      },
+    });
+    for (const id of threads) {
+      await observerMemory.saveThread({
+        thread: {
+          id,
+          resourceId: scopeResourceId,
+          title: '',
+          metadata: { workingMemory: `Observed in ${id}.`, preserved: true },
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
+    }
+    // An explicit "not managed" marker is never overridden by the policy.
+    await observerMemory.initializeObservationalMemory({
+      config: { _managedWorkingMemoryScope: null },
+      resourceId: scopeResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: scopeResourceId,
+        threadId: threads[0]!,
+        managedWorkingMemoryScope: 'thread',
+      }),
+    ).resolves.toMatchObject({ clearedScopes: ['resource'], clearedResourceWorkingMemory: false });
+    for (const id of threads) {
+      await expect(retractorMemory.getThreadById({ threadId: id })).resolves.toMatchObject({
+        metadata: { workingMemory: `Observed in ${id}.` },
+      });
+    }
+
+    // A record written before the marker existed takes the thread-scope policy:
+    // every thread of the resource loses its observer working memory, the
+    // resource document stays.
+    await observerMemory.initializeObservationalMemory({
+      config: {},
+      resourceId: scopeResourceId,
+      scope: 'resource',
+      threadId: null,
+    });
+    await expect(
+      retractorMemory.retractObservationalMemory({
+        resourceId: scopeResourceId,
+        threadId: threads[0]!,
+        managedWorkingMemoryScope: 'thread',
+      }),
+    ).resolves.toMatchObject({
+      clearedScopes: ['resource'],
+      clearedResourceWorkingMemory: false,
+      clearedThreadMetadata: true,
+    });
+    for (const id of threads) {
+      const thread = await retractorMemory.getThreadById({ threadId: id });
+      expect(thread?.metadata).toMatchObject({ preserved: true });
+      expect(thread?.metadata).not.toHaveProperty('workingMemory');
+    }
+    await expect(retractorMemory.getResourceById({ resourceId: scopeResourceId })).resolves.toMatchObject({
+      workingMemory: 'Resource profile.',
+    });
   });
 
   it('keeps the source-write successor when a policy-managed retraction clears observer working memory', async () => {

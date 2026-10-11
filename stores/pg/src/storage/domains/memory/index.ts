@@ -203,7 +203,13 @@ type MessageRowFromDB = {
 
 type MessageCoordinateRow = Pick<MessageRowFromDB, 'id' | 'threadId' | 'resourceId'>;
 
-function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | undefined {
+/**
+ * The working-memory scope a record's `_managedWorkingMemoryScope` marker
+ * names: `'unmarked'` when the record carries no marker at all (written before
+ * the marker existed), `undefined` when it marks working memory as not managed
+ * (`null`) or its config is unreadable.
+ */
+function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 'unmarked' | undefined {
   let parsed = config;
   if (typeof parsed === 'string') {
     try {
@@ -212,16 +218,19 @@ function getManagedWorkingMemoryScope(config: unknown): 'thread' | 'resource' | 
       return undefined;
     }
   }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+  if (parsed === null || parsed === undefined) return 'unmarked';
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
     return undefined;
   }
+  if (!Object.prototype.hasOwnProperty.call(parsed, '_managedWorkingMemoryScope')) return 'unmarked';
   const scope = (parsed as Record<string, unknown>)._managedWorkingMemoryScope;
   return scope === 'thread' || scope === 'resource' ? scope : undefined;
 }
 
 /**
- * The working-memory scopes the retracted records manage. An unmarked record
- * counts as `fallback` when the caller's policy names one.
+ * The working-memory scopes the retracted records manage. A record with no
+ * marker at all counts as `fallback` when the caller's policy names one; an
+ * explicit `null` ("not managed") marker is never overridden.
  */
 function getManagedWorkingMemoryScopes(
   records: ReadonlyArray<{ config: unknown }>,
@@ -229,7 +238,8 @@ function getManagedWorkingMemoryScopes(
 ): Set<'thread' | 'resource'> {
   const scopes = new Set<'thread' | 'resource'>();
   for (const record of records) {
-    const scope = getManagedWorkingMemoryScope(record.config) ?? fallback;
+    const marked = getManagedWorkingMemoryScope(record.config);
+    const scope = marked === 'unmarked' ? fallback : marked;
     if (scope) scopes.add(scope);
   }
   return scopes;
@@ -2356,6 +2366,7 @@ export class MemoryPG extends MemoryStorage {
   async updateMessages({
     messages,
     retractObservationalMemory,
+    managedWorkingMemoryScope,
     observationalMemoryRetractions,
   }: {
     messages: (Partial<Omit<MastraDBMessage, 'createdAt'>> & {
@@ -2366,6 +2377,7 @@ export class MemoryPG extends MemoryStorage {
       };
     })[];
     retractObservationalMemory?: boolean;
+    managedWorkingMemoryScope?: 'thread' | 'resource';
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<MastraDBMessage[]> {
     if (messages.length === 0) {
@@ -2440,7 +2452,12 @@ export class MemoryPG extends MemoryStorage {
           ];
         });
         committedRetractions.push(
-          ...(await this.retractObservationalMemoryForMessageRowsInTransaction(t, retractionRows, messageIds[0])),
+          ...(await this.retractObservationalMemoryForMessageRowsInTransaction(
+            t,
+            retractionRows,
+            messageIds[0],
+            managedWorkingMemoryScope,
+          )),
         );
       }
 

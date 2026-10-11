@@ -335,6 +335,8 @@ export abstract class MemoryStorage extends StorageDomain {
      * observational-memory retraction act on this internal flag.
      */
     retractObservationalMemory?: boolean;
+    /** @internal See RetractObservationalMemoryInput.managedWorkingMemoryScope. */
+    managedWorkingMemoryScope?: 'thread' | 'resource';
     /** @internal Receives retractions only after the edit commits. */
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<MastraDBMessage[]>;
