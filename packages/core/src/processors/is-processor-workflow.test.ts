@@ -89,4 +89,12 @@ describe('processor workflow phase capabilities', () => {
     expect(processorWorkflowRequiresDurableExecution(firstClone)).toBe(true);
     expect(processorWorkflowRequiresDurableExecution(secondClone)).toBe(true);
   });
+
+  it('keeps a wrapper tool-result hook on clones, whose declared phases never list it', () => {
+    const wrapper = setProcessorWorkflowPhases(processorWorkflowStub({ __processToolResult: true }), []);
+    const clone = copyProcessorWorkflowTraits(wrapper, processorWorkflowStub());
+
+    expect(processorWorkflowSupportsPhase(clone, 'toolResult')).toBe(false);
+    expect(clone.__processToolResult).toBe(true);
+  });
 });

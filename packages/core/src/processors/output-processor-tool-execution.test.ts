@@ -640,6 +640,46 @@ describe('processToolResult lifecycle hook', () => {
     expect(outputStreamChunks).toBeGreaterThan(0);
   });
 
+  it('runs every processToolResult-only processor when the agent wraps them together', async () => {
+    const calls: string[] = [];
+    const makeProcessor = (id: string, replacement?: string): Processor => ({
+      id,
+      async processToolResult({ messageList, toolCallId, toolName, args }: any) {
+        calls.push(id);
+        if (replacement === undefined) return;
+        messageList.updateToolInvocation({
+          type: 'tool-invocation',
+          toolInvocation: { state: 'result', toolCallId, toolName, args, result: replacement },
+        });
+      },
+    });
+
+    const echoTool = createTool({
+      id: 'echoTool',
+      description: 'echo',
+      inputSchema: z.object({ text: z.string() }),
+      execute: async ({ text }) => `Echo: ${text}`,
+    });
+
+    const agent = new Agent({
+      id: 'tr-agent-wrapped',
+      name: 'Test Agent',
+      instructions: 'tr',
+      model: makeMockToolCallModel('echoTool') as any,
+      tools: { echoTool },
+      outputProcessors: [makeProcessor('auditor'), makeProcessor('redactor', '[WRAPPED REDACTED]')],
+    });
+
+    const stream = await agent.stream('go', { maxSteps: 5 });
+    const toolResults: unknown[] = [];
+    for await (const chunk of stream.fullStream) {
+      if (chunk.type === 'tool-result') toolResults.push((chunk as any).payload?.result);
+    }
+
+    expect(calls).toEqual(['auditor', 'redactor']);
+    expect(toolResults).toEqual(['[WRAPPED REDACTED]']);
+  });
+
   it('runs a call-time processor that implements only processToolResult', async () => {
     class CallTimeRedactor implements Processor {
       readonly id = 'call-time-redactor';
