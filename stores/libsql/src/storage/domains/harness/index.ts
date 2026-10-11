@@ -2451,20 +2451,47 @@ export class HarnessLibSQL extends HarnessStorage {
   // Run summaries (span-summary O1/O2)
   // -------------------------------------------------------------------------
 
-  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+  async saveRunSummary({ summary }: SaveRunSummaryInput): Promise<HarnessRunSummary | null> {
     await this.#ensureRunSummariesTable();
     const namespace = this.#resolveHarnessName(summary.harnessName);
     const stored: HarnessRunSummary = { ...summary, harnessName: namespace };
     const cols = runSummaryColumnValues(stored);
-    // First-terminal-wins idempotency.
-    await this.#client.execute({
-      sql: `INSERT INTO ${TABLE_HARNESS_RUN_SUMMARIES} (${cols.names.join(', ')})
-            VALUES (${cols.names.map(() => '?').join(', ')})
-            ON CONFLICT (harness_name, run_id) DO NOTHING`,
-      args: cols.values,
-    });
-    const existing = await this.loadRunSummary({ harnessName: namespace, runId: summary.runId });
-    return existing ?? stored;
+    // A summary is written only while its session exists, in one write
+    // transaction (SQLite serializes writers), so a session deleted before
+    // this write never regains a summary from it.
+    const tx = await this.#client.transaction('write');
+    try {
+      const live = await tx.execute({
+        sql: `SELECT 1 FROM ${TABLE_HARNESS_SESSIONS}
+              WHERE harness_name = ? AND id = ? AND resource_id = ? AND thread_id = ?
+              LIMIT 1`,
+        args: [namespace, summary.sessionId, summary.resourceId, summary.threadId],
+      });
+      if (live.rows.length === 0) {
+        await tx.rollback();
+        return null;
+      }
+      // First-terminal-wins idempotency.
+      await tx.execute({
+        sql: `INSERT INTO ${TABLE_HARNESS_RUN_SUMMARIES} (${cols.names.join(', ')})
+              VALUES (${cols.names.map(() => '?').join(', ')})
+              ON CONFLICT (harness_name, run_id) DO NOTHING`,
+        args: cols.values,
+      });
+      // The authoritative stored row (the existing one on a no-op), read
+      // while the session fence is still held.
+      const row = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_RUN_SUMMARIES} WHERE harness_name = ? AND run_id = ? LIMIT 1`,
+        args: [namespace, summary.runId],
+      });
+      await tx.commit();
+      const persisted = row.rows[0] as Record<string, unknown> | undefined;
+      return persisted === undefined ? null : rowToRunSummary(persisted);
+    } catch (err) {
+      // The original failure wins over a failed rollback.
+      if (!tx.closed) await tx.rollback().catch(() => undefined);
+      throw err;
+    }
   }
 
   async loadRunSummary({ harnessName, runId }: LoadRunSummaryInput): Promise<HarnessRunSummary | null> {

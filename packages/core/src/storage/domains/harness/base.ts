@@ -1994,8 +1994,16 @@ export abstract class HarnessStorage extends StorageDomain {
    * a later write for the same `(harnessName, runId)` is a no-op (so duplicate
    * terminal paths and cross-instance retries cannot clobber or duplicate the
    * row). Returns the stored summary (the existing one on a no-op).
+   *
+   * A summary is written only while its session exists with the same
+   * `(harnessName, sessionId, resourceId, threadId)`. Adapters must make that
+   * check atomic with `deleteSessions` (which deletes the session's summaries),
+   * so a run that finishes after its session was deleted cannot bring the
+   * deleted identifiers back. Such a write is dropped and returns `null`,
+   * never the unstored input; the session check comes before idempotency.
+   * The returned row is read while the session check still holds.
    */
-  async saveRunSummary(_opts: SaveRunSummaryInput): Promise<HarnessRunSummary> {
+  async saveRunSummary(_opts: SaveRunSummaryInput): Promise<HarnessRunSummary | null> {
     throw new HarnessStorageRunSummaryUnsupportedError();
   }
 

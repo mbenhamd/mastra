@@ -26,6 +26,7 @@ import type {
   SessionRecord,
   WorkspaceActionJournalEntry,
 } from '@mastra/core/storage';
+import pg from 'pg';
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from 'vitest';
 
 import { exportSchemas, HarnessPG, PostgresStore } from '../..';
@@ -84,6 +85,7 @@ describe('HarnessPG', () => {
     expect(ddl).toContain('idx_harness_workspace_actions_page');
     expect(ddl).toContain('idx_harness_workspace_actions_session');
     expect(ddl).toContain('idx_harness_channel_outbox_idempotency');
+    expect(ddl).toContain('idx_harness_run_summaries_session');
 
     const indexes = await store.db.manyOrNone<{ indexname: string }>(
       `SELECT indexname FROM pg_indexes
@@ -96,6 +98,7 @@ describe('HarnessPG', () => {
           'idx_harness_sessions_pending_resume_expiry',
           'idx_harness_channel_inbox_idempotency',
           'idx_harness_channel_outbox_idempotency',
+          'idx_harness_run_summaries_session',
           'idx_harness_session_events_replay',
           'idx_harness_wakeups_idempotency',
           'idx_harness_workspace_actions_page',
@@ -106,6 +109,7 @@ describe('HarnessPG', () => {
     expect(indexes.map(row => row.indexname)).toEqual([
       'idx_harness_channel_inbox_idempotency',
       'idx_harness_channel_outbox_idempotency',
+      'idx_harness_run_summaries_session',
       'idx_harness_session_events_replay',
       'idx_harness_sessions_active_key',
       'idx_harness_sessions_pending_resume_expiry',
@@ -849,6 +853,14 @@ describe('HarnessPG', () => {
 
   it('round-trips run summaries with idempotent first-write-wins + keyset listing (span-summary)', async () => {
     const harness = store.stores.harness!;
+    // Summaries are written only for an existing session.
+    await harness.saveSession(
+      createSampleSessionRecord({ id: 'session-rs', resourceId: 'u1', threadId: 'thread-rs' }),
+      {
+        ownerId: 'h',
+        ifVersion: 0,
+      },
+    );
     const mk = (runId: string, completedAt: number, over: Record<string, unknown> = {}) => ({
       harnessName: 'default',
       runId,
@@ -877,13 +889,13 @@ describe('HarnessPG', () => {
     });
 
     const saved = await harness.saveRunSummary({ summary: mk('rs-1', 100) as any });
-    expect(saved.durationMs).toBe(10);
+    expect(saved?.durationMs).toBe(10);
     // Idempotent: a later write for the same runId is a no-op.
     const again = await harness.saveRunSummary({
       summary: mk('rs-1', 100, { durationMs: 999, status: 'failed' }) as any,
     });
-    expect(again.durationMs).toBe(10);
-    expect(again.status).toBe('completed');
+    expect(again?.durationMs).toBe(10);
+    expect(again?.status).toBe('completed');
 
     const loaded = await harness.loadRunSummary({ runId: 'rs-1' });
     expect(loaded?.toolRollup?.perTool.lookup?.count).toBe(1);
@@ -955,6 +967,10 @@ describe('HarnessPG', () => {
       }),
       { ownerId: 'h', ifVersion: 0 },
     );
+    await harness.saveSession(
+      createSampleSessionRecord({ id: 'rs-kept', resourceId: 'u-del', threadId: 'thread-rs-kept' }),
+      { ownerId: 'h', ifVersion: 0 },
+    );
     await harness.saveRunSummary({ summary: summary('rs-deleted-1', 'rs-deleted') as any });
     await harness.saveRunSummary({ summary: summary('rs-deleted-2', 'rs-deleted') as any });
     await harness.saveRunSummary({ summary: summary('rs-kept-1', 'rs-kept') as any });
@@ -978,6 +994,198 @@ describe('HarnessPG', () => {
     await expect(harness.loadRunSummary({ runId: 'rs-kept-1' })).resolves.toMatchObject({
       sessionId: 'rs-kept',
     });
+    // A run that finishes after its session was deleted writes no summary.
+    await harness.saveRunSummary({ summary: summary('rs-deleted-late', 'rs-deleted') as any });
+    await expect(harness.loadRunSummary({ runId: 'rs-deleted-late' })).resolves.toBeNull();
+  });
+
+  it('deletes a batch of sessions with their run summaries, all or nothing (PF-5301)', async () => {
+    const harness = store.stores.harness!;
+    const summary = (runId: string, sessionId: string, harnessName = 'default') => ({
+      harnessName,
+      runId,
+      sessionId,
+      resourceId: 'u-batch',
+      threadId: `thread-${sessionId}`,
+      agentId: 'agent-x',
+      modeId: 'default',
+      modelId: 'openai/gpt-4o-mini',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      startedAt: 90,
+      completedAt: 100,
+      durationMs: 10,
+      usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+      createdAt: 100,
+    });
+    const save = (id: string, harnessName = 'default') =>
+      harness.saveSession(
+        createSampleSessionRecord({
+          harnessName,
+          id,
+          resourceId: 'u-batch',
+          threadId: `thread-${id}`,
+          sessionIncarnation: `incarnation-${id}`,
+          closedAt: 2000,
+          lastActivityAt: 2000,
+        }),
+        { ownerId: 'h', ifVersion: 0 },
+      );
+    for (const id of ['batch-a', 'batch-b', 'batch-c']) {
+      await save(id);
+      await harness.saveRunSummary({ summary: summary(`${id}-run`, id) as any });
+    }
+    // The same session id in another harness namespace.
+    await save('batch-a', 'other-harness');
+    await harness.saveRunSummary({ summary: summary('other-a-run', 'batch-a', 'other-harness') as any });
+    const guard = async (id: string, staleVersion = false) => {
+      const record = await harness.loadSession({ sessionId: id });
+      if (!record) throw new Error(`expected ${id}`);
+      return {
+        sessionId: id,
+        ifVersion: staleVersion ? record.version + 1 : record.version,
+        expectedResourceId: record.resourceId,
+        expectedThreadId: record.threadId,
+        expectedParentSessionId: record.parentSessionId ?? null,
+        expectedCreatedAt: record.createdAt,
+        requireClosed: true,
+      };
+    };
+
+    // A later candidate's failed guard rolls the whole batch back.
+    await expect(
+      harness.deleteSessions({ sessions: [await guard('batch-c'), await guard('batch-b', true)] }),
+    ).rejects.toThrow();
+    await expect(harness.loadRunSummary({ runId: 'batch-c-run' })).resolves.toMatchObject({
+      sessionId: 'batch-c',
+    });
+
+    await harness.deleteSessions({ sessions: [await guard('batch-a'), await guard('batch-b')] });
+    await expect(harness.loadRunSummary({ runId: 'batch-a-run' })).resolves.toBeNull();
+    await expect(harness.loadRunSummary({ runId: 'batch-b-run' })).resolves.toBeNull();
+    await expect(harness.loadRunSummary({ runId: 'batch-c-run' })).resolves.not.toBeNull();
+    await expect(harness.loadRunSummary({ harnessName: 'other-harness', runId: 'other-a-run' })).resolves.toMatchObject(
+      { sessionId: 'batch-a' },
+    );
+    // The terminal session fence of a deleted incarnation stays as the tombstone.
+    const fences = await store.db.manyOrNone<{ session_id: string }>(
+      `SELECT session_id FROM mastra_harness_terminal_session_fences
+        WHERE harness_name = 'default' AND session_incarnation = 'incarnation-batch-a'`,
+    );
+    expect(fences.map(row => row.session_id)).toEqual(['batch-a']);
+  });
+
+  it('serializes a run-summary write with a concurrent session delete on the session row (PF-5301)', async () => {
+    const harness = store.stores.harness!;
+    // A second connection plays the other transaction of each interleaving.
+    const other = new pg.Client({
+      host: (TEST_CONFIG as any).host,
+      port: (TEST_CONFIG as any).port,
+      database: (TEST_CONFIG as any).database,
+      user: (TEST_CONFIG as any).user,
+      password: (TEST_CONFIG as any).password,
+      statement_timeout: 10_000,
+    });
+    await other.connect();
+    const otherPid = (await other.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid;
+    /** Waits until some backend is blocked on a lock `other` holds; never on timing alone. */
+    const blockedByOther = async () => {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const blocked = await store.db.oneOrNone<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`,
+          [otherPid],
+        );
+        if ((blocked?.n ?? 0) > 0) return;
+        if (Date.now() >= deadline) throw new Error('nothing became blocked by the other transaction');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    };
+    const summary = (runId: string, sessionId: string) => ({
+      harnessName: 'default',
+      runId,
+      sessionId,
+      resourceId: 'u-lock',
+      threadId: `thread-${sessionId}`,
+      agentId: 'agent-x',
+      modeId: 'default',
+      modelId: 'openai/gpt-4o-mini',
+      status: 'completed' as const,
+      finishReason: 'complete',
+      reconstructed: false,
+      completedAt: 100,
+      usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+      createdAt: 100,
+    });
+    const save = (id: string) =>
+      harness.saveSession(
+        createSampleSessionRecord({
+          id,
+          resourceId: 'u-lock',
+          threadId: `thread-${id}`,
+          closedAt: 2000,
+          lastActivityAt: 2000,
+        }),
+        { ownerId: 'h', ifVersion: 0 },
+      );
+    const pending: Promise<unknown>[] = [];
+    try {
+      // A: the delete holds the session row first. The summary write blocks
+      // on it, then finds no session and stores nothing.
+      await save('lock-a');
+      await other.query('BEGIN');
+      await other.query(
+        `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-a' FOR UPDATE`,
+      );
+      const writing = harness.saveRunSummary({ summary: summary('lock-a-run', 'lock-a') as any });
+      pending.push(writing);
+      await blockedByOther();
+      await other.query(`DELETE FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-a'`);
+      await other.query(
+        `DELETE FROM mastra_harness_run_summaries WHERE harness_name = 'default' AND session_id = 'lock-a'`,
+      );
+      await other.query('COMMIT');
+      await expect(writing).resolves.toBeNull();
+      await expect(harness.loadRunSummary({ runId: 'lock-a-run' })).resolves.toBeNull();
+
+      // B: the summary write holds the session row first (as saveRunSummary
+      // does). The delete blocks on it, then deletes the summary it wrote.
+      await save('lock-b');
+      await other.query('BEGIN');
+      await other.query(
+        `SELECT 1 FROM mastra_harness_sessions WHERE harness_name = 'default' AND id = 'lock-b' FOR KEY SHARE`,
+      );
+      await other.query(
+        `INSERT INTO mastra_harness_run_summaries
+           (harness_name, run_id, session_id, resource_id, thread_id, agent_id, mode_id, model_id,
+            status, finish_reason, reconstructed, completed_at, usage, created_at)
+         VALUES ('default', 'lock-b-run', 'lock-b', 'u-lock', 'thread-lock-b', 'a', 'm', 'mm',
+                 'completed', 'complete', false, 100, '{}', 100)`,
+      );
+      const closed = await harness.loadSession({ sessionId: 'lock-b' });
+      if (!closed) throw new Error('expected the closed session');
+      const deleting = harness.deleteSession({
+        sessionId: 'lock-b',
+        ifVersion: closed.version,
+        expectedResourceId: closed.resourceId,
+        expectedThreadId: closed.threadId,
+        expectedParentSessionId: closed.parentSessionId ?? null,
+        expectedCreatedAt: closed.createdAt,
+        requireClosed: true,
+      });
+      pending.push(deleting);
+      await blockedByOther();
+      await other.query('COMMIT');
+      await deleting;
+      await expect(harness.loadRunSummary({ runId: 'lock-b-run' })).resolves.toBeNull();
+    } finally {
+      // Release any lock still held, then let the blocked operation finish
+      // before the next test runs.
+      await other.query('ROLLBACK').catch(() => undefined);
+      await Promise.allSettled(pending);
+      await other.end();
+    }
   });
 
   it('keeps §15 attachment-reference admission atomic and delete-guarded', async () => {
