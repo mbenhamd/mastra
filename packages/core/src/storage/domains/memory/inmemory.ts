@@ -241,12 +241,15 @@ function getManagedWorkingMemoryScopes(
 ): Set<'thread' | 'resource'> {
   const scopes = new Set<'thread' | 'resource'>();
   for (const record of records) {
-    const config = record.config;
-    const marked = config?._managedWorkingMemoryScope;
+    const config: unknown = record.config;
+    // Only a readable config object without the marker key is a pre-marker
+    // record the policy fallback may reach (as in PG).
+    if (typeof config !== 'object' || config === null || Array.isArray(config)) continue;
+    const marked = (config as Record<string, unknown>)._managedWorkingMemoryScope;
     const scope =
       marked === 'thread' || marked === 'resource'
         ? marked
-        : config && Object.prototype.hasOwnProperty.call(config, '_managedWorkingMemoryScope')
+        : Object.prototype.hasOwnProperty.call(config, '_managedWorkingMemoryScope')
           ? undefined
           : fallback;
     if (scope) scopes.add(scope);
@@ -1185,7 +1188,16 @@ export class InMemoryMemory extends MemoryStorage {
     return cloneResourceBoundary(stored);
   }
 
-  async updateResource({
+  async updateResource(args: {
+    resourceId: string;
+    workingMemory?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<StorageResourceType> {
+    return this.updateResourceState(args);
+  }
+
+  /** The synchronous body of updateResource, so a caller can pair it with other state changes atomically. */
+  private updateResourceState({
     resourceId,
     workingMemory,
     metadata,
@@ -1193,7 +1205,7 @@ export class InMemoryMemory extends MemoryStorage {
     resourceId: string;
     workingMemory?: string;
     metadata?: Record<string, unknown>;
-  }): Promise<StorageResourceType> {
+  }): StorageResourceType {
     const current = this.db.resources.get(resourceId);
 
     assertWorkingMemorySnapshotUnchanged({
@@ -1264,11 +1276,15 @@ export class InMemoryMemory extends MemoryStorage {
       proposedValueProvided: true,
       proposedMetadata: undefined,
     });
-    const updated = await this.updateResource({ resourceId, workingMemory });
-    if ((resource?.workingMemory ?? null) !== workingMemory) {
-      this.markObservationalMemoryManagingWorkingMemory(guard, 'resource');
-    }
-    return updated;
+    // The write and the stamp land together, with no await between them, so a
+    // concurrent retraction sees both or neither.
+    return this.withMemoryStateRollback(true, () => {
+      const updated = this.updateResourceState({ resourceId, workingMemory });
+      if ((resource?.workingMemory ?? null) !== workingMemory) {
+        this.markObservationalMemoryManagingWorkingMemory(guard, 'resource');
+      }
+      return updated;
+    });
   }
 
   async updateThreadFromObservationalMemory({

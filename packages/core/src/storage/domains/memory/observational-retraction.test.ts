@@ -611,6 +611,32 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
           });
         },
       ],
+      [
+        'a guarded resource write that changes nothing',
+        async ({ memory, resourceId, guard }: Awaited<ReturnType<typeof setup>>) => {
+          await memory.updateResource({ resourceId, workingMemory: 'Profile from elsewhere.' });
+          await memory.updateResourceFromObservationalMemory({
+            resourceId,
+            workingMemory: 'Profile from elsewhere.',
+            guard,
+          });
+        },
+      ],
+      [
+        'a rejected guarded resource write (revisioned working memory)',
+        async ({ memory, resourceId, guard }: Awaited<ReturnType<typeof setup>>) => {
+          await memory.applyWorkingMemoryUpdate({
+            scope: 'resource',
+            resourceId,
+            value: 'Profile from elsewhere.',
+            expectedRevision: 0,
+            source: 'owner',
+          });
+          await expect(
+            memory.updateResourceFromObservationalMemory({ resourceId, workingMemory: 'FROM-DELETED-MSG', guard }),
+          ).rejects.toThrow();
+        },
+      ],
     ])('stays not managed after %s, and its retraction keeps memory it never wrote', async (_name, write) => {
       const context = await setup(`keep-${_name.replaceAll(' ', '-')}`);
       await write(context);
@@ -626,6 +652,63 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
       await expect(context.memory.getThreadById({ threadId: context.threadId })).resolves.toMatchObject({
         metadata: expect.objectContaining({ workingMemory: 'Thread profile from elsewhere.' }),
       });
+    });
+
+    it('is stamped thread-managed by a guarded thread-scope update, so a retraction clears every thread profile', async () => {
+      const context = await setup('stamp-thread-scope');
+      const current = await context.memory.getWorkingMemorySnapshot({
+        scope: 'thread',
+        resourceId: context.resourceId,
+        threadId: context.threadId,
+      });
+      await context.memory.applyWorkingMemoryUpdate({
+        scope: 'thread',
+        resourceId: context.resourceId,
+        threadId: context.threadId,
+        value: 'FROM-DELETED-MSG',
+        expectedRevision: current.revision,
+        source: 'observer',
+        observationalMemoryGuard: context.guard,
+      });
+      await expect(context.marker()).resolves.toBe('thread');
+      await context.memory.retractObservationalMemory({ resourceId: context.resourceId, threadId: context.threadId });
+      const thread = await context.memory.getThreadById({ threadId: context.threadId });
+      expect(thread?.metadata).not.toHaveProperty('workingMemory');
+    });
+
+    it('stays not managed after a guarded update that changes nothing', async () => {
+      const context = await setup('keep-no-op');
+      await context.memory.updateResource({ resourceId: context.resourceId, workingMemory: 'Profile from elsewhere.' });
+      const current = await context.memory.getWorkingMemorySnapshot({
+        scope: 'resource',
+        resourceId: context.resourceId,
+      });
+      await context.memory.applyWorkingMemoryUpdate({
+        scope: 'resource',
+        resourceId: context.resourceId,
+        value: 'Profile from elsewhere.',
+        expectedRevision: current.revision,
+        source: 'observer',
+        observationalMemoryGuard: context.guard,
+      });
+      await expect(context.marker()).resolves.toBeNull();
+    });
+
+    it('never lets a guarded write and a concurrent retraction leave its working memory unretracted', async () => {
+      const context = await setup('race-legacy-write');
+      const [write] = await Promise.allSettled([
+        context.memory.updateResourceFromObservationalMemory({
+          resourceId: context.resourceId,
+          workingMemory: 'FROM-DELETED-MSG',
+          guard: context.guard,
+        }),
+        context.memory.retractObservationalMemory({ resourceId: context.resourceId, threadId: context.threadId }),
+      ]);
+      const resource = await context.memory.getResourceById({ resourceId: context.resourceId });
+      // Either the write landed first (stamped, then cleared) or the
+      // retraction did (the write is refused); never stored and unretracted.
+      expect(resource?.workingMemory).not.toBe('FROM-DELETED-MSG');
+      expect(['fulfilled', 'rejected']).toContain(write.status);
     });
   });
 
