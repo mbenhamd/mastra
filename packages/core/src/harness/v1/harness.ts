@@ -916,6 +916,20 @@ function projectChannelOutboxDiagnostic(item: ChannelOutboxItem): HarnessChannel
   };
 }
 
+/** How long a session-tree delete waits for its live sessions' pending run-summary writes. */
+const RUN_SUMMARY_FLUSH_BEFORE_DELETE_MS = 5_000;
+
+async function waitForRunSummaryFlush(sessions: readonly Session[]): Promise<void> {
+  if (sessions.length === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.all(sessions.map(session => session._internalFlushRunSummaries())),
+    new Promise<void>(resolve => {
+      timer = setTimeout(resolve, RUN_SUMMARY_FLUSH_BEFORE_DELETE_MS);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 export class Harness {
   /** Process-scoped owner id used as the lease holder for all sessions. */
   readonly ownerId: string;
@@ -6262,10 +6276,11 @@ export class Harness {
     deletedLiveSessions = new Map<string, Session>(),
   ): Promise<void> {
     const bottomUp = [...tree].sort((a, b) => b.depth - a.depth);
-    // A closed live session may still be writing its last run summary; let it
-    // land first so the delete erases it (storage also drops a write that
-    // arrives after the delete).
-    await Promise.all([...deletedLiveSessions.values()].map(live => live._internalFlushRunSummaries()));
+    // A closed live session may still be writing its last run summary; give it
+    // a bounded moment to land so the delete erases it. A write that is still
+    // pending afterwards cannot recreate it: storage drops a summary whose
+    // session no longer exists.
+    await waitForRunSummaryFlush([...deletedLiveSessions.values()]);
     const sessions = bottomUp.map(node => ({
       harnessName: node.record.harnessName,
       sessionId: node.record.id,
