@@ -1276,14 +1276,15 @@ export class InMemoryMemory extends MemoryStorage {
       proposedValueProvided: true,
       proposedMetadata: undefined,
     });
-    // The write goes through the public updateResource, so an override or spy
-    // sees it. Its in-memory body writes before its first await, so the write
-    // and the stamp below land together with no await between them and a
-    // concurrent retraction sees both or neither. The stamp follows the
-    // stored value, so a write that did not land in this turn stamps nothing.
-    const previous = resource?.workingMemory ?? null;
-    const updated = this.updateResource({ resourceId, workingMemory });
-    if (previous !== workingMemory && (this.db.resources.get(resourceId)?.workingMemory ?? null) === workingMemory) {
+    // The write and the stamp land together in one synchronous step, with no
+    // await between them, so a concurrent retraction sees both or neither.
+    // Like the PG adapter, this guarded write is its own storage operation and
+    // deliberately does not dispatch through `updateResource`: an override may
+    // await before writing, which would split the write from its stamp. The
+    // check above is the only way updateResourceState can throw, so no
+    // rollback snapshot is needed.
+    const updated = this.updateResourceState({ resourceId, workingMemory });
+    if ((resource?.workingMemory ?? null) !== workingMemory) {
       this.markObservationalMemoryManagingWorkingMemory(guard, 'resource');
     }
     return updated;
