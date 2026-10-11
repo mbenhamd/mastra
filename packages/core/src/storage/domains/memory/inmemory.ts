@@ -230,8 +230,10 @@ function mergeObservationalThreadMetadata(
 }
 
 /**
- * The working-memory scopes the retracted records manage. An unmarked record
- * counts as `fallback` when the caller's policy names one.
+ * The working-memory scopes the retracted records manage. A record with no
+ * marker at all (written before the marker existed) counts as `fallback` when
+ * the caller's policy names one; an explicit `null` marker means the observer
+ * did not manage working memory and is never overridden.
  */
 function getManagedWorkingMemoryScopes(
   records: readonly ObservationalMemoryRecord[],
@@ -239,11 +241,31 @@ function getManagedWorkingMemoryScopes(
 ): Set<'thread' | 'resource'> {
   const scopes = new Set<'thread' | 'resource'>();
   for (const record of records) {
-    const marked = record.config?._managedWorkingMemoryScope;
-    const scope = marked === 'thread' || marked === 'resource' ? marked : fallback;
+    const config = record.config;
+    const marked = config?._managedWorkingMemoryScope;
+    const scope =
+      marked === 'thread' || marked === 'resource'
+        ? marked
+        : config && Object.prototype.hasOwnProperty.call(config, '_managedWorkingMemoryScope')
+          ? undefined
+          : fallback;
     if (scope) scopes.add(scope);
   }
   return scopes;
+}
+
+/**
+ * A guarded observer working-memory write proves its record's observer manages
+ * working memory at `scope`: a record marked `null` (created while it did not)
+ * is stamped, so a later retraction clears what the write stores. An unmarked
+ * (pre-marker) record is left to the caller's policy fallback.
+ */
+function markObservationalMemoryManagingWorkingMemory(
+  record: ObservationalMemoryRecord,
+  scope: 'thread' | 'resource',
+): void {
+  if (record.config?._managedWorkingMemoryScope !== null) return;
+  record.config = { ...record.config, _managedWorkingMemoryScope: scope };
 }
 
 function removeObservationalMemoryMetadata(
@@ -481,9 +503,11 @@ export class InMemoryMemory extends MemoryStorage {
 
   async deleteThread({
     threadId,
+    managedWorkingMemoryScope,
     observationalMemoryRetractions,
   }: {
     threadId: string;
+    managedWorkingMemoryScope?: 'thread' | 'resource';
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<void> {
     const thread = this.db.threads.get(threadId);
@@ -499,9 +523,12 @@ export class InMemoryMemory extends MemoryStorage {
         }
       });
 
-      const input = thread?.resourceId
+      const coordinate = thread?.resourceId
         ? { resourceId: thread.resourceId, threadId }
         : this.resolveObservationalMemoryRetractionInput(threadId);
+      const input = coordinate
+        ? { ...coordinate, ...(managedWorkingMemoryScope ? { managedWorkingMemoryScope } : {}) }
+        : undefined;
       if (input) {
         const result = this.retractObservationalMemoryState(input);
         committedRetraction = { input, result };
@@ -891,17 +918,22 @@ export class InMemoryMemory extends MemoryStorage {
   async updateMessages(args: {
     messages: (Partial<MastraDBMessage> & { id: string })[];
     retractObservationalMemory?: boolean;
+    managedWorkingMemoryScope?: 'thread' | 'resource';
     observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
   }): Promise<MastraDBMessage[]> {
     const canonicalUpdates = [...new Map(args.messages.map(message => [message.id, message])).values()];
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
     const updatedMessages = this.withMemoryStateRollback(args.retractObservationalMemory === true, () => {
-      const retractionCoordinates: Array<{ resourceId: string; threadId: string }> = [];
+      const retractionCoordinates: RetractObservationalMemoryInput[] = [];
       if (args.retractObservationalMemory) {
-        const coordinates = new Map<string, { resourceId: string; threadId: string }>();
+        const coordinates = new Map<string, RetractObservationalMemoryInput>();
         const addCoordinate = (resourceId: string | undefined, threadId: string | undefined) => {
           if (!resourceId || !threadId) return;
-          coordinates.set(`${resourceId}\u0000${threadId}`, { resourceId, threadId });
+          coordinates.set(`${resourceId}\u0000${threadId}`, {
+            resourceId,
+            threadId,
+            ...(args.managedWorkingMemoryScope ? { managedWorkingMemoryScope: args.managedWorkingMemoryScope } : {}),
+          });
         };
         for (const update of canonicalUpdates) {
           const message = this.db.messages.get(update.id);
@@ -1238,6 +1270,7 @@ export class InMemoryMemory extends MemoryStorage {
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
     }
+    markObservationalMemoryManagingWorkingMemory(current, 'resource');
     const resource = this.db.resources.get(resourceId);
     assertWorkingMemorySnapshotUnchanged({
       currentValue: resource?.workingMemory,
@@ -1272,6 +1305,9 @@ export class InMemoryMemory extends MemoryStorage {
     )?.[0];
     if (current?.id !== guard.recordId) {
       throw new Error('Observational memory generation is no longer current.');
+    }
+    if (Object.prototype.hasOwnProperty.call(metadata, 'workingMemory')) {
+      markObservationalMemoryManagingWorkingMemory(current, 'thread');
     }
     return this.updateThread({
       id,
@@ -1339,6 +1375,7 @@ export class InMemoryMemory extends MemoryStorage {
         if (currentGeneration?.id !== guard.recordId) {
           throw new WorkingMemoryValidationError('Observational memory generation is no longer current.');
         }
+        markObservationalMemoryManagingWorkingMemory(currentGeneration, input.scope);
       }
 
       const now = new Date();

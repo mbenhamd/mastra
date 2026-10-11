@@ -2440,10 +2440,13 @@ export interface RetractObservationalMemoryInput {
   sourceWriteSuccessor?: ObservationalMemorySourceWriteSuccessor;
   /**
    * @internal The caller's memory policy has the observer manage working memory
-   * at this scope. A retracted record without its own managed-scope marker
-   * (written before the marker existed) is retracted as if it carried this
-   * scope, in the same storage mutation. Omitted, an unmarked record leaves
-   * working memory untouched.
+   * at this scope. A retracted record with no `_managedWorkingMemoryScope`
+   * marker at all, which only a record written before the marker existed
+   * lacks, is retracted as if it carried this scope, in the same storage
+   * mutation. A record's own marker always wins, including the explicit
+   * `null` "not managed" marker a non-managing observer writes. The caller
+   * asserts its policy also held when its unmarked records were written.
+   * Omitted, an unmarked record leaves working memory untouched.
    */
   managedWorkingMemoryScope?: 'thread' | 'resource';
 }
