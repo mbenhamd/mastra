@@ -68,6 +68,7 @@ import type {
   ChunkType,
   ExecuteStreamModelManager,
   ModelManagerModelConfig,
+  StepTripwireData,
   StreamChunkType,
   StreamTransport,
   StreamTransportRef,
@@ -3519,13 +3520,13 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
       // Build tripwire data if this step is being rejected
       // This includes both retry scenarios and max retries exceeded
-      const stepTripwireData = processOutputStepTripwire
+      // `rolledBack` is added below, once the rollback has actually removed the response.
+      const stepTripwireData: StepTripwireData | undefined = processOutputStepTripwire
         ? {
             reason: processOutputStepTripwire.message,
             retry: processOutputStepTripwire.options?.retry,
             metadata: processOutputStepTripwire.options?.metadata,
             processorId: processOutputStepTripwire.processorId,
-            ...(shouldRetry ? { rolledBack: true } : {}),
           }
         : undefined;
 
@@ -3560,7 +3561,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // goes back into the carry buffer for the next attempt to write again rather than
         // disappearing with the rejected response.
         eagerCoordinator?.recarryCommittedWork(outputStream.messageId);
-        messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary);
+        // Only a response that was found and removed counts as rolled back; a rejected response
+        // that stays in the conversation must keep its place when later steps are numbered.
+        if (messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary) && stepTripwireData) {
+          stepTripwireData.rolledBack = true;
+        }
         // A processor retry throws this attempt away like the error paths do, so it gets
         // the same treatment: cancel what is still running, keep what finished.
         //

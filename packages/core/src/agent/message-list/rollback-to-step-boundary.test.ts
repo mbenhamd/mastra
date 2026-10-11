@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createSignal } from '../signals';
 import type { MastraStepStartPart } from './state';
 import type { MastraDBMessage } from './types';
@@ -652,6 +652,30 @@ describe('MessageList step content location (PF-5364)', () => {
     message.content.parts = message.content.parts.filter(part => part.type === 'text' && part.text === 'FINAL');
 
     expect(contentTypes(list.stepContent(location))).toEqual(['text']);
+  });
+
+  it('tells apart identical answers added in the same millisecond', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    try {
+      const itemText = (t: string, itemId: string) => ({
+        type: 'text' as const,
+        text: t,
+        providerMetadata: { openai: { itemId } },
+      });
+      const { list, id } = listWith(assistant([itemText('Done.', 'msg_1')]));
+      const location = list.openStepContent();
+      // The next step writes the same answer into the same message, in the same millisecond.
+      list.add([{ ...assistant([itemText('Done.', 'msg_2')]), id }], 'response');
+      // A processor keeps only the latest answer.
+      const message = list.get.response.db().find(candidate => candidate.id === id)!;
+      message.content.parts = message.content.parts.filter(
+        part => !(part.type === 'text' && part.providerMetadata?.openai?.itemId === 'msg_1'),
+      );
+
+      expect(texts(list.stepContent(location))).toEqual(['Done.']);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("keeps the iteration's parts when a processor clones the message and trims earlier parts", () => {

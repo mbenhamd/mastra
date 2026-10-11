@@ -259,9 +259,11 @@ export type StepContentLocation = {
 
 /**
  * What identifies a part across clones. A tool call is its id, so a result filled in later is the
- * same part. Anything else is its type, its content (text, reasoning, file data) and the stamp it
- * got when it was added to the list, which a clone keeps: the same answer written by two steps,
- * or two step markers, stay distinct.
+ * same part. Anything else is its type, its content (text, reasoning, file data), its provider
+ * metadata (which carries the provider's item id) and the stamp it got when it was added to the
+ * list. A clone keeps all of these, so the same answer written by two steps, or two step markers,
+ * stay distinct. Two parts can still collide only with identical content and metadata stamped in
+ * the same millisecond.
  */
 function partIdentity(part: MastraMessagePart): string {
   if (part.type === 'tool-invocation') return `${part.type}\u0000${part.toolInvocation?.toolCallId}`;
@@ -269,9 +271,10 @@ function partIdentity(part: MastraMessagePart): string {
   if (part.type === 'text') content = part.text;
   else if (part.type === 'reasoning') content = part.reasoning;
   else if (part.type === 'file') content = typeof part.data === 'string' ? part.data : undefined;
+  const metadata = 'providerMetadata' in part && part.providerMetadata ? JSON.stringify(part.providerMetadata) : '';
   // Unary + so a Date, or a string from some storage round trip, compares as a number.
   const stamp = part.createdAt == null ? '' : String(+part.createdAt);
-  return `${part.type}\u0000${content ?? ''}\u0000${stamp}`;
+  return `${part.type}\u0000${content ?? ''}\u0000${metadata}\u0000${stamp}`;
 }
 
 /**
@@ -2219,8 +2222,10 @@ export class MessageList {
    * The content one loop iteration wrote: in each response message, the parts after those that
    * were there when the iteration began, up to those that were there when it ended. Parts are
    * recognised by identity rather than position, so a processor that clones, trims or rewrites
-   * earlier parts does not move the iteration's. A part a processor adds during the iteration
-   * (a replacement included) is content the list gained in it, and counts as the iteration's.
+   * earlier parts does not move the iteration's. A part a processor adds after every recorded part
+   * counts as the iteration's; a part it puts among the recorded ones (a replacement of earlier
+   * narration) stays with the earlier step, so a rewrite of history is never read as this step's
+   * answer.
    *
    * `modelContent(stepNumber)` instead counts `step-start` markers, which goes wrong when a
    * processor retry rolls a rejected attempt's marker back and streams the retry into a fresh
