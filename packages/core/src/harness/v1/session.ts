@@ -243,7 +243,7 @@ import {
   PLAN_TASK_UPDATED_EVENT,
   readDelegationAttemptMetadata,
 } from './plan-task-session';
-import { createPlanTaskTools } from './plan-task-tool';
+import { createPlanTaskTools, TASK_CHECK_TOOL_ID } from './plan-task-tool';
 import {
   callerRequestContextToPersisted,
   projectInheritedRequestContextApp,
@@ -497,9 +497,11 @@ type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepare
  * and silence. When the final iteration has no text after completed tools,
  * force exactly ONE response-only continuation step so the model states the
  * outcome. Text from an earlier tool-call iteration is not a terminal answer
- * and must not suppress synthesis. The continuation has no active tools and
- * uses toolChoice `none`, so this remains true even if the model ignores the
- * feedback and attempts to repeat an action. One nudge per run segment — a
+ * and must not suppress synthesis. The loop refuses to execute any tool call
+ * the continuation emits, so this remains true even if the model ignores the
+ * feedback and attempts to repeat an action. The continuation keeps the step's
+ * tool schemas so the provider prompt cache survives (PF-5349); the loop only
+ * relaxes a forced tool choice to `auto`. One nudge per run segment — a
  * model that stays silent twice is allowed to finish (never loop). The loop
  * ignores continuation results for terminal tool delivery, and error, abort,
  * safety, and output-length finishes are left alone.
@@ -630,13 +632,20 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
               // tool work or bypass the response-only recovery fence.
               if (!responseOnly) throw error;
               reportConfiguredHookError('prepareStep', error);
-              configuredResult = undefined;
+              // The configured tool selection is unknown, so advertising the
+              // default surface could expose schemas the hook would have hidden.
+              // Fail closed to a tool-free recovery call (a cache miss is the
+              // lesser cost on this error path).
+              return { activeTools: [], [AGENT_RESPONSE_RECOVERY_STEP]: true };
             }
             if (!responseOnly) return configuredResult;
+            // Keep the step's tool schemas exactly as configured: changing the
+            // advertised tool set invalidates the provider's cached prompt prefix,
+            // so a 50-token reply would re-send the whole uncached context
+            // (PF-5349). Execution is denied by the loop for the admitted
+            // recovery step instead, independent of what the schemas expose.
             return {
               ...(configuredResult ?? {}),
-              activeTools: [],
-              toolChoice: 'none',
               [AGENT_RESPONSE_RECOVERY_STEP]: true,
             };
           };
@@ -8707,15 +8716,15 @@ export class Session {
     let turnInstructions: string | undefined;
     try {
       [requestContext, turnInstructions] = await Promise.race([
-        Promise.all([
-          this._buildRequestContext({
+        this._buildTurnContextAndInstructions(
+          {
             modeId: effectiveModeId,
             modelId: effectiveModelId,
             abortSignal: turnAbortSignal,
             ...(persistedRequestContext ? { persistedRequestContext } : {}),
-          }),
-          this._turnInstructions(mode.instructions),
-        ]),
+          },
+          mode,
+        ),
         activeTurnWaiter.promise,
       ]);
     } catch (err) {
@@ -13024,15 +13033,15 @@ export class Session {
         const toolSurface = this._buildToolSurface(mode, opts.additionalTools);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
         const [requestContext, turnInstructions] = await Promise.race([
-          Promise.all([
-            this._buildRequestContext({
+          this._buildTurnContextAndInstructions(
+            {
               modeId: effectiveModeId,
               modelId: effectiveModelId,
               abortSignal: turnAbortSignal,
               ...(persistedRequestContext ? { persistedRequestContext } : {}),
-            }),
-            this._turnInstructions(mode.instructions),
-          ]),
+            },
+            mode,
+          ),
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
@@ -13663,14 +13672,14 @@ export class Session {
         const toolSurface = this._buildToolSurface(mode, undefined);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
         const [requestContext, turnInstructions] = await Promise.race([
-          Promise.all([
-            this._buildRequestContext({
+          this._buildTurnContextAndInstructions(
+            {
               modeId: effectiveModeId,
               modelId: this._record.modelId,
               abortSignal: turnAbortSignal,
-            }),
-            this._turnInstructions(mode.instructions),
-          ]),
+            },
+            mode,
+          ),
           activeTurnWaiter.promise,
         ]);
         const baseExecOptions: AgentExecutionOptionsBase<unknown> = {
@@ -16448,8 +16457,8 @@ export class Session {
       // §4.2e pre-action gate must re-evaluate before resume/execute, not just on the
       // initial turn.
       const [resumeRequestContext, turnInstructions] = await Promise.race([
-        Promise.all([
-          this._buildRequestContext({
+        this._buildTurnContextAndInstructions(
+          {
             modeId: resumeModeId,
             modelId: resumeRuntimeDependencies.modelId ?? this._record.modelId,
             abortSignal: turnAbortController.signal,
@@ -16459,9 +16468,9 @@ export class Session {
             // resumed turn re-persists it. Absent on legacy pendings ⇒ no app bag.
             ...(pending.requestContext ? { persistedRequestContext: pending.requestContext } : {}),
             yolo: pending.yolo === true,
-          }),
-          this._turnInstructions(resumeMode.instructions),
-        ]),
+          },
+          resumeMode,
+        ),
         activeTurnWaiter.promise,
       ]);
       if (pending.toolSurfaceFence) {
@@ -18816,16 +18825,16 @@ export class Session {
 
     try {
       const [requestContext, turnInstructions] = await Promise.race([
-        Promise.all([
-          this._buildRequestContext({
+        this._buildTurnContextAndInstructions(
+          {
             modeId: effectiveModeId,
             modelId: this._modelIdForQueuedItem(item.id),
             abortSignal: turnAbortController.signal,
             persistedRequestContext: item.requestContext,
             yolo: item.yolo === true,
-          }),
-          this._turnInstructions(mode.instructions),
-        ]),
+          },
+          mode,
+        ),
         activeTurnWaiter.promise,
       ]);
       assertQueuedTurnNotDeleted();
@@ -21149,6 +21158,18 @@ export class Session {
   }
 
   /**
+   * Build a turn's request context and its instructions together. The
+   * instructions read the same frozen permission resolver the context carries.
+   */
+  private _buildTurnContextAndInstructions(
+    turn: Parameters<Session['_buildRequestContext']>[0],
+    mode: Pick<HarnessMode, 'instructions' | 'harnessBuiltins'>,
+  ): Promise<[RequestContext<unknown>, string | undefined]> {
+    const requestContext = this._buildRequestContext(turn);
+    return Promise.all([requestContext, this._turnInstructions(mode, requestContext)]);
+  }
+
+  /**
    * Framework-owned, content-free plan orientation appended to every owned turn.
    * The summary contains only fixed status labels, counts, and generated task ids;
    * user task bodies/results remain behind the bounded `plan_task_check` tool.
@@ -21156,11 +21177,24 @@ export class Session {
    * a process restart, while adding storage I/O only for the first turn on a
    * freshly hydrated Session.
    */
-  private async _turnInstructions(modeInstructions?: string): Promise<string | undefined> {
-    const summary = await this._ensurePlanTaskSummary();
+  private async _turnInstructions(
+    mode: Pick<HarnessMode, 'instructions' | 'harnessBuiltins'>,
+    turnRequestContext: Promise<RequestContext<unknown>>,
+  ): Promise<string | undefined> {
+    const [summary, requestContext] = await Promise.all([this._ensurePlanTaskSummary(), turnRequestContext]);
     const parts: string[] = [];
-    if (modeInstructions) parts.push(modeInstructions);
-    if (summary !== undefined && summary.total > 0) {
+    if (mode.instructions) parts.push(mode.instructions);
+    // The orientation tells the model to call plan_task_check. When this turn's
+    // frozen permission resolver denies that tool, the pre-exposure gate removes
+    // it, and a mode that excludes the Harness built-ins never registers it; in
+    // both cases the instruction could not be followed and is omitted (PF-5349).
+    // The resolver is the one the turn's request context carries, so the
+    // instructions and the exposed surface always agree.
+    const permissionPolicy = requestContext.get(TOOL_PERMISSION_POLICY_KEY) as
+      | ((toolName: string) => 'allow' | 'ask' | 'deny')
+      | undefined;
+    const planCheckDenied = mode.harnessBuiltins === 'exclude' || permissionPolicy?.(TASK_CHECK_TOOL_ID) === 'deny';
+    if (summary !== undefined && summary.total > 0 && !planCheckDenied) {
       const statuses = Object.entries(summary.byStatus)
         .filter((entry): entry is [HarnessPlanTaskStatus, number] => typeof entry[1] === 'number' && entry[1] > 0)
         .sort(([left], [right]) => left.localeCompare(right))

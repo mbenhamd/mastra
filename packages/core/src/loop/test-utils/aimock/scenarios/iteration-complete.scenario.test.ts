@@ -652,6 +652,81 @@ describeForAllEngines(
       expect(text).not.toContain('UNEXPECTED_THIRD_CALL');
     });
 
+    it('keeps the tool schemas on a response-only recovery step and refuses to execute its calls', async () => {
+      // PF-5349: the recovery step must advertise exactly the tool list of the
+      // step before it, so the provider's cached prompt prefix survives. Only
+      // execution is denied: a tool call the model emits anyway never runs.
+      let responseOnly = false;
+      let createExecutions = 0;
+      const createThing = createTool({
+        id: 'create_thing',
+        description: 'Create a thing',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          createExecutions += 1;
+          return { ok: true };
+        },
+      });
+      const readThing = createTool({
+        id: 'read_thing',
+        description: 'Read a thing',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ name: z.string() }),
+        execute: async ({ name }) => ({ name }),
+      });
+
+      const { requests, chunks } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Create a thing named probe and report it.',
+        tools: { create_thing: createThing, read_thing: readThing },
+        maxSteps: 20,
+        recoveryMaxSteps: 1,
+        collectChunks: true,
+        prepareStep: () => (responseOnly ? { [AGENT_RESPONSE_RECOVERY_STEP]: true } : undefined),
+        onIterationComplete: (context: IterationCompleteContext) => {
+          if (responseOnly) return { continue: false };
+          if (context.isFinal && context.text.trim() === '') {
+            responseOnly = true;
+            return {
+              continue: true,
+              feedback: 'Report the result without tools.',
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'call_create_1', name: 'create_thing', arguments: { name: 'probe' } }] },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          // The recovery step ignores the feedback and repeats the action.
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 2 },
+            { toolCalls: [{ id: 'call_create_2', name: 'create_thing', arguments: { name: 'probe' } }] },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 3 }, { content: 'UNEXPECTED_EXTRA_RECOVERY_STEP' });
+        },
+      });
+
+      expect(requests).toHaveLength(3);
+      const toolNames = (request: (typeof requests)[number] | undefined) =>
+        (request?.body?.tools ?? []).map((tool: any) => tool.function?.name ?? tool.name);
+      expect(toolNames(requests[1]).sort()).toEqual(['create_thing', 'read_thing']);
+      // Byte-identical schemas: the cached prefix includes the tool definitions.
+      expect(JSON.stringify(requests[2]?.body?.tools)).toBe(JSON.stringify(requests[1]?.body?.tools));
+      expect(requests[2]?.body?.tool_choice).toBe(requests[1]?.body?.tool_choice);
+      expect(createExecutions).toBe(1);
+      expect(
+        (chunks ?? []).some(
+          chunk => chunk.type.startsWith('tool-') && (chunk as any).payload?.toolCallId === 'call_create_2',
+        ),
+      ).toBe(false);
+    });
+
     it('does not continue when the recovery hook aborts the run', async () => {
       const abortController = new AbortController();
       let responseOnly = false;

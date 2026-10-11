@@ -25,6 +25,7 @@ import { BACKGROUND_WORK_CONTEXT, notifyBackgroundWorkTerminal } from '../../../
 import { RequestContext } from '../../../request-context';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../../../schema';
 import { safeEnqueue } from '../../../stream/base';
+import { toPendingStepUsage } from '../../../stream/pending-step-usage';
 import { ChunkFrom } from '../../../stream/types';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { resolveToolApprovalRequirement } from '../../../tools/approval';
@@ -59,6 +60,7 @@ import {
   STEP_ACTIVE_TOOLS_KEY,
   STEP_MODEL_MESSAGES_KEY,
   STEP_TOOLS_KEY,
+  STEP_USAGE_KEY,
   STEP_WORKSPACE_KEY,
   THREAD_EXISTS_KEY,
   THREAD_ID_KEY,
@@ -319,6 +321,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               ? displayInputTransform.transformed
               : transformInput;
 
+        // The suspending step's step-finish (and its usage) is emitted only on
+        // resume, so hand its billed usage to the run output out of band, before
+        // the suspension snapshot serializes that output state (PF-5349). A cold
+        // resume has no scoped usage; the output restored it from that snapshot.
+        streamState.recordPendingStepUsage?.(toPendingStepUsage(readScoped(scopeCtx, STEP_USAGE_KEY, 'stepUsage')));
         return {
           ...transformedChunk,
           payload: {

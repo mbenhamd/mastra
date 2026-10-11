@@ -1,0 +1,122 @@
+---
+title: 'Reference: ToolResultSupersedeProcessor | Processors'
+description: 'The ToolResultSupersedeProcessor is an input processor that replaces earlier tool results with a short pointer when a later result shows the same resource.'
+packages:
+  - '@mastra/core'
+---
+
+# ToolResultSupersedeProcessor
+
+The `ToolResultSupersedeProcessor` is an **input processor** that keeps only the newest result for a resource in the prompt. Each agent step sends every earlier tool result again. When a tool reads the same file, page or record a second time, the earlier copy no longer helps the model. This processor replaces it with a one-line pointer to the newer result.
+
+The rewrite happens in the `processLLMRequest` hook and is transient: it changes only the prompt sent to the model on that call. Stored messages, memory and UI history keep every result.
+
+## Usage example
+
+```typescript
+import { ToolResultSupersedeProcessor } from '@mastra/core/processors'
+
+const supersede = new ToolResultSupersedeProcessor({
+  tools: {
+    // A later read of the same file replaces the earlier one.
+    read_file: { key: ({ input }) => (input as { path?: string }).path },
+    // Keep a paper's abstract and its full text apart: coverage is part of the key.
+    read_paper: {
+      key: ({ input, result }) => {
+        const id = (input as { id?: string }).id
+        const coverage = (result as { coverage?: string } | undefined)?.coverage
+        return id && coverage ? `${id}:${coverage}` : undefined
+      },
+    },
+  },
+})
+
+const agent = new Agent({
+  id: 'writer',
+  // ...
+  inputProcessors: [supersede],
+})
+```
+
+## Constructor parameters
+
+<PropertiesTable
+  content={[
+  {
+    name: 'options',
+    type: 'Options',
+    description: 'Configuration options for the processor',
+    isOptional: false,
+    properties: [
+      {
+        type: 'Options',
+        parameters: [
+          {
+            name: 'tools',
+            type: 'Record<string, ToolConfig>',
+            description:
+              'The tools whose results may be replaced, keyed by tool name. Results of other tools are never changed',
+            isOptional: false,
+          },
+        ],
+      },
+    ],
+  },
+  {
+    name: 'ToolConfig',
+    type: 'object',
+    description: 'Per-tool configuration',
+    isOptional: false,
+    properties: [
+      {
+        type: 'ToolConfig',
+        parameters: [
+          {
+            name: 'key',
+            type: '(call: { toolName; toolCallId; input; output; result }) => string | undefined',
+            description:
+              'Names the resource and the coverage of a result. `input` and `result` are the recorded arguments and result of the call; `output` is what the model sees. Return undefined to keep the result. The function must be pure, because it runs on every model call. A throwing function, an empty key or a key over 1024 characters keeps the result',
+            isOptional: false,
+          },
+          {
+            name: 'group',
+            type: 'string',
+            description:
+              'Tools with the same group share one key space, so a result of one tool can replace a result of another. Use it only when equal keys mean equal coverage. Defaults to the tool name',
+            isOptional: true,
+          },
+          {
+            name: 'includeMedia',
+            type: 'boolean',
+            description: 'Allow results that contain images or other media to be replaced',
+            isOptional: true,
+            defaultValue: 'false',
+          },
+        ],
+      },
+    ],
+  },
+]}
+/>
+
+## Which results are replaced
+
+A result is replaced only when a successful result with the same key comes from a **later model step**. Results of the same step never replace each other, and the latest step's results are always sent in full.
+
+These results are always kept:
+
+- errors, and results that the tool's `resultStatus` marks as failures;
+- results of calls that passed through an approval;
+- provider-executed results;
+- results with media, unless `includeMedia` is set;
+- results the processor can't match to exactly one recorded call. Tool-call IDs can repeat across turns, so each prompt result is matched to its recorded occurrence in the message list.
+
+The pointer text doesn't name the newer call, so the replaced result reads the same on every later step. This keeps the provider's prompt cache valid after the first replacement.
+
+## Choosing a key
+
+The key decides what counts as "the same resource". Include everything that changes what the result covers: the project or workspace, the path, a line range, a truncation limit or whether the result is an image. Leave out values that only change between versions of the same resource, such as a content hash, when the newest version is the only one the model should use.
+
+## Ordering with other processors
+
+Put `ToolResultSupersedeProcessor` before any processor that caches responses by prompt, so the cache key reflects the shorter prompt. It works independently of [`ToolCallFilter`](/reference/processors/tool-call-filter): a call that filter removes isn't in the prompt and is ignored.

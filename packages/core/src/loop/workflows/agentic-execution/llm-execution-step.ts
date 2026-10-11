@@ -101,6 +101,7 @@ import {
   STEP_ACTIVE_TOOLS_KEY,
   STEP_MODEL_MESSAGES_KEY,
   STEP_TOOLS_KEY,
+  STEP_USAGE_KEY,
   STEP_WORKSPACE_KEY,
   THREAD_ID_KEY,
   TOOL_HOOKS_KEY,
@@ -113,6 +114,7 @@ import { composeStepInput } from '../../shared/compose-step-input';
 import { injectBackgroundTaskPrompt } from '../../shared/inject-background-task-prompt';
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../shared/merge-llm-call-headers';
 import { recordTerminalErrorMessage } from '../../shared/record-terminal-error-message';
+import { responseRecoveryToolChoice } from '../../shared/response-recovery-tool-choice';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../shared/step-content-chunk-types';
 import { TERMINAL_FINISH_REASONS } from '../../shared/terminal-finish-reasons';
 import { isMastraTimeoutError } from '../../timeout';
@@ -1417,6 +1419,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // Resolve run-scoped state from either the Mastra-managed RunScope or
       // the legacy `_internal` bag (back-compat for tests).
       const scopeCtx: RunScopeContext = { mastra, runId, _internal };
+      // A step's usage is published only once its provider response finished.
+      writeScoped(scopeCtx, STEP_USAGE_KEY, 'stepUsage', undefined);
 
       /**
        * This attempt is being thrown away: the error handling either retries the request
@@ -2007,11 +2011,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           }
         }
 
-        if (responseRecoveryStep) {
-          currentStep.activeTools = [];
-          currentStep.toolChoice = 'none';
-        }
-
         const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
         if (toolSurfaceFence) {
           if (currentStep.tools) {
@@ -2244,14 +2243,24 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Recovery owns one freshly fenced provider attempt. A cached response
           // was produced under another tool surface and cannot consume it.
           cachedResponse = undefined;
-          currentStep.activeTools = [];
-          currentStep.toolChoice = 'none';
+          // Chosen after the tool-surface fence and the permission gate, from the
+          // tools this request will actually advertise (PF-5349): the step keeps
+          // their schemas and the loop denies execution below.
+          currentStep.toolChoice = responseRecoveryToolChoice(
+            currentStep.toolChoice,
+            currentStep.tools as Record<string, unknown> | undefined,
+            currentStep.activeTools as string[] | undefined,
+          ) as typeof currentStep.toolChoice;
         }
 
+        // Execution denial is separate from schema exposure: the admitted
+        // recovery step advertises the same tools as the step before it, but no
+        // tool call it emits may run.
         toolExecutionDisabled =
-          currentStep.toolChoice === 'none' &&
-          Array.isArray(currentStep.activeTools) &&
-          currentStep.activeTools.length === 0;
+          responseRecoveryStep ||
+          (currentStep.toolChoice === 'none' &&
+            Array.isArray(currentStep.activeTools) &&
+            currentStep.activeTools.length === 0);
 
         const omContinuation = messageList.get.all.db().find(message => message.id === 'om-continuation');
         const omContinuationText = omContinuation?.content.parts
@@ -3386,6 +3395,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       const finishReason = runState?.state?.stepResult?.reason ?? outputStream._getImmediateFinishReason();
       const hasErrored = runState.state.hasErrored;
       const usage = outputStream._getImmediateUsage();
+      // Tool calls of this step that suspend report it (PF-5349): the step's own
+      // step-finish is emitted only after its tools settle.
+      writeScoped(scopeCtx, STEP_USAGE_KEY, 'stepUsage', usage);
       const responseMetadata = runState.state.responseMetadata;
       const text = outputStream._getImmediateText();
       const object = outputStream._getImmediateObject();

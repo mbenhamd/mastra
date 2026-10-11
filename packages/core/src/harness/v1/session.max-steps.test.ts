@@ -108,7 +108,10 @@ describe('Session empty-final-synthesis nudge', () => {
       },
     );
     const recoveryStep = await prepareStep();
-    expect(recoveryStep).toMatchObject({ activeTools: [], toolChoice: 'none' });
+    // PF-5349: the recovery step keeps the configured tool schemas (none were
+    // configured here); the loop denies execution for the admitted step.
+    expect(recoveryStep).not.toHaveProperty('activeTools');
+    expect(recoveryStep).not.toHaveProperty('toolChoice');
     expect(recoveryStep?.[AGENT_RESPONSE_RECOVERY_STEP]).toBe(true);
     await expect(prepareStep()).rejects.toThrow('already admitted its one provider attempt');
     // A durable predicate replay of the same iteration returns the same
@@ -158,15 +161,13 @@ describe('Session empty-final-synthesis nudge', () => {
     };
 
     // A configured ordinary continuation cannot consume step 1001. The exact
-    // silent terminal arms recovery instead, and that call is tool-free.
+    // silent terminal arms recovery instead, and that call cannot execute tools.
     await expect(nudge(ceilingContext)).resolves.toMatchObject({
       continue: true,
       feedback: expect.stringContaining('no reply'),
     });
-    await expect(prepareStep({ stepNumber: 1000 })).resolves.toMatchObject({
-      activeTools: [],
-      toolChoice: 'none',
-    });
+    const ceilingRecovery = await prepareStep({ stepNumber: 1000 });
+    expect(ceilingRecovery?.[AGENT_RESPONSE_RECOVERY_STEP]).toBe(true);
     await expect(
       nudge({ ...ceilingContext, iteration: 1001, text: 'Recovered.', toolResults: [], isFinal: true }),
     ).resolves.toEqual({ continue: false });
@@ -218,7 +219,7 @@ describe('Session empty-final-synthesis nudge', () => {
     expect(firstPrepare).not.toBe(secondPrepare);
   });
 
-  it('preserves configured hooks while forcing the recovery step tool-free', async () => {
+  it('preserves configured hooks and their tool selection on the recovery step', async () => {
     const configuredIteration = vi.fn(async () => ({ feedback: 'Configured feedback.' }));
     const configuredPrepare = vi.fn(async () => ({ activeTools: ['safe_tool'], workspace: 'configured-workspace' }));
     const { nudge, prepareStep } = await capturedSynthesisOptions({
@@ -243,10 +244,11 @@ describe('Session empty-final-synthesis nudge', () => {
         feedback: expect.stringContaining('Configured feedback.'),
       },
     );
-    await expect(prepareStep()).resolves.toMatchObject({
-      activeTools: [],
-      toolChoice: 'none',
+    const recoveryStep = await prepareStep();
+    expect(recoveryStep).toEqual({
+      activeTools: ['safe_tool'],
       workspace: 'configured-workspace',
+      [AGENT_RESPONSE_RECOVERY_STEP]: true,
     });
     await expect(
       nudge({ iteration: 3, text: '', toolResults: [], isFinal: false, finishReason: 'tool-calls' }),
@@ -279,7 +281,7 @@ describe('Session empty-final-synthesis nudge', () => {
     await expect(nudge({ text: '', toolResults: [], isFinal: true, finishReason: 'stop' })).resolves.toMatchObject({
       continue: true,
     });
-    await expect(prepareStep()).resolves.toMatchObject({ activeTools: [], toolChoice: 'none' });
+    expect((await prepareStep())?.[AGENT_RESPONSE_RECOVERY_STEP]).toBe(true);
     expect(configuredIteration).toHaveBeenCalledTimes(2);
   });
 
@@ -302,7 +304,7 @@ describe('Session empty-final-synthesis nudge', () => {
       continue: true,
       feedback: expect.stringContaining('no reply'),
     });
-    await expect(prepareStep()).resolves.toMatchObject({ activeTools: [], toolChoice: 'none' });
+    expect((await prepareStep())?.[AGENT_RESPONSE_RECOVERY_STEP]).toBe(true);
     await expect(
       nudge({ iteration: 3, text: 'Recovered.', toolResults: [], isFinal: true, finishReason: 'stop' }),
     ).resolves.toEqual({
@@ -332,7 +334,11 @@ describe('Session empty-final-synthesis nudge', () => {
     await expect(
       nudge({ text: '', toolResults: [toolResult], isFinal: true, finishReason: 'stop' }),
     ).resolves.toMatchObject({ continue: true });
-    await expect(prepareStep()).resolves.toMatchObject({ activeTools: [], toolChoice: 'none' });
+    // The failed hook's tool selection is unknown, so recovery fails closed to
+    // a tool-free call instead of advertising the default surface.
+    const recoveryStep = await prepareStep();
+    expect(recoveryStep).toMatchObject({ activeTools: [] });
+    expect(recoveryStep?.[AGENT_RESPONSE_RECOVERY_STEP]).toBe(true);
     expect(loggerError).toHaveBeenCalledWith('Error in prepareStep hook:', prepareError);
     loggerError.mockRestore();
   });

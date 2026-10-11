@@ -93,6 +93,12 @@ export {
   type RegexRedactionDetail,
 } from './regex-filter';
 export { ToolCallFilter, type ToolCallFilterOptions } from './tool-call-filter';
+export {
+  ToolResultSupersedeProcessor,
+  type ToolResultSupersedeCall,
+  type ToolResultSupersedeOptions,
+  type ToolResultSupersedeToolConfig,
+} from './tool-result-supersede';
 
 export { AgentsMDInjector, type ToolResultReminderOptions, type ReminderFileReader } from '../tool-result-reminder';
 
