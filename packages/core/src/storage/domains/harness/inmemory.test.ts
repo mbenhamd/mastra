@@ -1218,7 +1218,19 @@ describe('InMemoryHarness admission storage contract', () => {
         threadId: 'thread-2',
         signalId: 'signal-2',
       }),
-    ).resolves.toMatchObject({ status: 'completed', result: { text: 'new' } });
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+    // PF-5309: the row of the other thread scope survives the scoped cleanup,
+    // but its result content goes with the deleted session id.
+    expect(
+      JSON.stringify(
+        await storage.loadMessageResultEvidence({
+          sessionId: 'session-1',
+          resourceId: 'resource-1',
+          threadId: 'thread-2',
+          signalId: 'signal-2',
+        }),
+      ),
+    ).not.toContain('new');
   });
 
   it('reports only the durable unfenced terminal evidence writer as applied', async () => {

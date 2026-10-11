@@ -44,6 +44,46 @@ describe('HarnessPG native session record projection', () => {
     await store.close();
   });
 
+  it('retires and erases projection intents when a store without projections deletes the session (PF-5309)', async () => {
+    // Intents written while projection was enabled; the deployment now runs
+    // without it and deletes the session.
+    const harness = store.stores.harness!;
+    await harness.saveSession(createSampleSessionRecord({ id: 'projection-disabled-delete' }), {
+      ownerId: 'owner-1',
+      ifVersion: 0,
+    });
+    const disabledStore = new PostgresStore({
+      ...TEST_CONFIG,
+      id: 'pg-harness-projection-disabled-delete-store',
+      schemaName,
+      enabledDomains: ['harness'],
+    });
+    try {
+      const disabled = disabledStore.stores.harness!;
+      const record = await disabled.loadSession({ sessionId: 'projection-disabled-delete' });
+      if (!record) throw new Error('expected the session');
+      await disabled.deleteSession({ sessionId: record.id, ifVersion: record.version });
+    } finally {
+      await disabledStore.close();
+    }
+    const rows = await store.db.manyOrNone<{ status: string; payload: unknown }>(
+      `SELECT status, payload FROM "${schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}"
+        WHERE session_id = $1`,
+      ['projection-disabled-delete'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    // Nothing is left to claim, and no post-image survives.
+    expect(rows.every(row => row.status === 'dead' && row.payload === null)).toBe(true);
+    await expect(
+      harness.claimSessionRecordProjectionIntents({
+        claimId: 'after-delete',
+        limit: 10,
+        now: Date.now() + 1,
+        claimTtlMs: 60_000,
+      }),
+    ).resolves.toHaveLength(0);
+  });
+
   it('rolls back a session row when its post-image cannot be built', async () => {
     const harness = store.stores.harness!;
     const id = 'x'.repeat(1025);

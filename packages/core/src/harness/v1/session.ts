@@ -10233,7 +10233,14 @@ export class Session {
             } catch (err) {
               // The admission may have committed a failed or interrupted
               // terminal meanwhile: replay its durable receipt to this retry.
-              await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
+              // A completed turn whose result a session delete erased mid-wait
+              // replays its completed receipt too (PF-5309).
+              await this._replayCommittedTerminalFailure(
+                evidence,
+                opts,
+                activeDeleted,
+                err instanceof HarnessMessageResultErasedError ? { includeCompleted: true } : {},
+              );
               throw err;
             }
             // The durable wait resolved because the admission committed — the

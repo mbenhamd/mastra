@@ -1554,11 +1554,17 @@ describe('Session.signal() admissionId', () => {
     });
     // The waiter polls the durable row while another instance completes the
     // turn and deletes the session, which erases the result.
+    const loads = vi.spyOn(storage, 'loadMessageResultEvidence');
     const waiting = (session as any)._awaitDurableSignalResult({ signalId: identity.signalId }) as Promise<unknown>;
     const settled = waiting.then(
       value => ({ value }),
       (error: unknown) => ({ error }),
     );
+    // The waiter has read the row while it was still pending.
+    await vi.waitFor(async () => {
+      expect(loads).toHaveBeenCalled();
+      await expect(loads.mock.results[0]!.value).resolves.toMatchObject({ status: 'pending' });
+    });
     // The other instance's commit and delete leave the row completed with the
     // erased marker; mutate it the way the in-memory delete does.
     const rows = (storage as unknown as { db: { harnessMessageResultEvidence: Map<string, Record<string, unknown>> } })

@@ -87,8 +87,6 @@ import {
   harnessTerminalGrantTombstoneId,
   harnessTerminalSeedHash,
   HARNESS_MESSAGE_RESULT_ERASED_CODE,
-  redactHarnessTerminalResult,
-  redactStoredHarnessTerminalProjection,
   contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
   prepareHarnessTerminalAdmission,
@@ -211,7 +209,6 @@ import type {
   HarnessTerminalQueuePressure,
   HarnessTerminalRenewReceipt,
   HarnessTerminalResult,
-  StoredHarnessTerminalProjection,
   HarnessTerminalProjection,
   HarnessTerminalAdmissionRecord,
   AckSessionRecordProjectionInput,
@@ -2283,14 +2280,17 @@ export class HarnessPG extends HarnessStorage {
     tx: PgHarnessClient,
     harnessName: string,
     sessionId: string,
-    sessionIncarnation: string,
+    sessionIncarnation: string | undefined,
     updatedAt: number,
   ): Promise<{ pendingIntents: number; pendingBytes: number }> {
+    // Without an incarnation every lifetime of the session id is retired
+    // (PF-5309: a delete erases all of them).
+    const incarnationPredicate = sessionIncarnation === undefined ? '' : ' AND session_incarnation = ?';
     const result = await tx.execute({
       sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
             SET status = ?, dead_at = ?, failed_at = ?, claim_id = NULL, claim_expires_at = NULL,
                 next_attempt_at = NULL, last_error = ?, updated_at = ?
-            WHERE harness_name = ? AND session_id = ? AND session_incarnation = ?
+            WHERE harness_name = ? AND session_id = ?${incarnationPredicate}
               AND status IN (?, ?, ?)
             RETURNING payload_bytes`,
       args: [
@@ -2301,7 +2301,7 @@ export class HarnessPG extends HarnessStorage {
         updatedAt,
         harnessName,
         sessionId,
-        sessionIncarnation,
+        ...(sessionIncarnation === undefined ? [] : [sessionIncarnation]),
         'pending',
         'claimed',
         'failed',
@@ -2782,7 +2782,7 @@ export class HarnessPG extends HarnessStorage {
         });
         const fencedIntents = await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-                SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, updated_at = ?
+                SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ?
                 WHERE harness_name = ? AND session_id = ?
                   AND status IN ('pending', 'claimed', 'failed')
                 RETURNING payload_bytes`,
@@ -2871,11 +2871,20 @@ export class HarnessPG extends HarnessStorage {
           retired = await this.#retireProjectionIntentsTx(tx, namespace, sessionId, sessionIncarnation, Date.now());
         }
         if (projectionIntentsTableExists) {
-          // PF-5309: settled intents (applied, or dead, which includes those
-          // retired just above) keep revision and digest but lose the session
-          // post-image and error. A still-claimable intent of a store without
-          // projections keeps its payload, so a consumer never claims an empty
-          // one. Runs whatever this store's projection setting is.
+          // PF-5309: every still-claimable intent of the session id is retired
+          // too (other incarnations, and rows written while projection was
+          // enabled when this store now runs without it), so none can be
+          // claimed and projected for the deleted session later. Then the
+          // settled intents (applied or dead) keep revision and digest but lose
+          // the session post-image and error. Runs whatever this store's
+          // projection setting is.
+          const retiredAll = await this.#retireProjectionIntentsTx(tx, namespace, sessionId, undefined, Date.now());
+          if (retiredAll.pendingIntents > 0) {
+            retired = {
+              pendingIntents: (retired?.pendingIntents ?? 0) + retiredAll.pendingIntents,
+              pendingBytes: (retired?.pendingBytes ?? 0) + retiredAll.pendingBytes,
+            };
+          }
           await tx.execute({
             sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
                   SET payload = 'null'::jsonb, last_error = NULL
@@ -2905,12 +2914,13 @@ export class HarnessPG extends HarnessStorage {
           args: [namespace, sessionId, resourceId, threadId],
         });
         // The committed results kept above answer a committed retry by status;
-        // their result and error content goes with the session (PF-5309).
+        // their result and error content goes with the session (PF-5309), in
+        // every resource and thread scope the session id was used under.
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
                 SET result = NULL,
                     error = CASE WHEN status = 'completed' THEN ?::jsonb ELSE NULL END
-                WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
+                WHERE harness_name = ? AND session_id = ?`,
           args: [
             JSON.stringify({
               code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
@@ -2918,8 +2928,6 @@ export class HarnessPG extends HarnessStorage {
             }),
             namespace,
             sessionId,
-            resourceId,
-            threadId,
           ],
         });
         await tx.execute({
@@ -8236,46 +8244,41 @@ export class HarnessPG extends HarnessStorage {
   // Channel inbox ledger
   // -------------------------------------------------------------------------
 
-  /** PF-5309: erases the content of a deleted session's terminal admissions and intents (see deleteSessions). */
+  /**
+   * PF-5309: erases the content of a deleted session's terminal admissions and
+   * intents (see deleteSessions) in two set-based statements. A projection
+   * keeps every field but its payload and canonical bytes (kind, id, byte count
+   * and payload hash stay); a terminal result keeps every field but its error
+   * message. Mirrors `redactStoredHarnessTerminalProjection` and
+   * `redactHarnessTerminalResult`, which the in-memory store applies.
+   */
   async #redactTerminalRowsTx(tx: PgHarnessClient, namespace: string, sessionId: string): Promise<void> {
-    const admissions = await tx.execute({
-      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
-            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
+    // `-> 'error' IS NOT NULL`, not the jsonb `?` operator: every `?` in this
+    // client's SQL is a bind placeholder.
+    const redactedResult = (column: string) => `((${column}::jsonb - 'error')
+      || CASE WHEN (${column}::jsonb -> 'error') IS NOT NULL
+              THEN jsonb_build_object('error', jsonb_build_object('code', ${column}::jsonb -> 'error' -> 'code', 'message', ''))
+              ELSE '{}'::jsonb END)::text`;
+    const redactedProjection = (column: string) =>
+      `((${column}::jsonb - 'payload' - 'payloadJson') || '{"payload":null,"payloadJson":"null"}'::jsonb)::text`;
+    await tx.execute({
+      sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+            SET seed_json = 'null',
+                terminal_result_json = CASE WHEN terminal_result_json IS NULL THEN NULL
+                                            ELSE ${redactedResult('terminal_result_json')} END,
+                projection_json = CASE WHEN projection_json IS NULL THEN NULL
+                                       ELSE ${redactedProjection('projection_json')} END
+            WHERE harness_name = ? AND session_id = ?`,
       args: [namespace, sessionId],
     });
-    for (const row of admissions.rows) {
-      const result = parseJson(row.terminal_result_json) as HarnessTerminalResult | undefined;
-      const projection = parseJson(row.projection_json) as StoredHarnessTerminalProjection | undefined;
-      await tx.execute({
-        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
-              SET seed_json = 'null', terminal_result_json = ?, projection_json = ?
-              WHERE id = ?`,
-        args: [
-          result == null ? null : JSON.stringify(redactHarnessTerminalResult(result)),
-          projection == null ? null : JSON.stringify(redactStoredHarnessTerminalProjection(projection)),
-          String(row.id),
-        ],
-      });
-    }
-    const intents = await tx.execute({
-      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_INTENTS}
-            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
+    await tx.execute({
+      sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
+            SET terminal_result_json = ${redactedResult('terminal_result_json')},
+                projection_json = ${redactedProjection('projection_json')},
+                last_error_json = NULL
+            WHERE harness_name = ? AND session_id = ?`,
       args: [namespace, sessionId],
     });
-    for (const row of intents.rows) {
-      const result = parseJson(row.terminal_result_json) as HarnessTerminalResult;
-      const projection = parseJson(row.projection_json) as StoredHarnessTerminalProjection;
-      await tx.execute({
-        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-              SET terminal_result_json = ?, projection_json = ?, last_error_json = NULL
-              WHERE id = ?`,
-        args: [
-          JSON.stringify(redactHarnessTerminalResult(result)),
-          JSON.stringify(redactStoredHarnessTerminalProjection(projection)),
-          String(row.id),
-        ],
-      });
-    }
   }
 
   /**

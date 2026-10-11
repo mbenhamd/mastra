@@ -1421,6 +1421,11 @@ describe('HarnessPG native terminal handoff', () => {
     await expect(harness().ackTerminalIntent(claimIdentityOf(claimed, 'delivery-worker-1'))).resolves.toMatchObject({
       status: 'fenced',
     });
+    const claimedConsumer = await store.db.one<{ consumer_id: string | null }>(
+      `SELECT consumer_id FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" WHERE id = $1`,
+      [claimed.id],
+    );
+    expect(claimedConsumer.consumer_id).toBeNull();
     const tombstoneNote = await store.db.one<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}"
         WHERE reason_json LIKE '%private revoke note%'`,

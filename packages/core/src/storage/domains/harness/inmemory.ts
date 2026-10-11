@@ -816,35 +816,38 @@ export class InMemoryHarness extends HarnessStorage {
             updatedAt: Date.now(),
           }),
         );
-        for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
-          if (
-            intent.harnessName !== namespace ||
-            intent.sessionId !== sessionId ||
-            intent.sessionIncarnation !== record.sessionIncarnation ||
-            intent.status === 'applied' ||
-            intent.status === 'dead'
-          ) {
-            continue;
-          }
-          intent.status = 'dead';
-          intent.deadAt = Date.now();
-          intent.failedAt = intent.deadAt;
-          intent.claimId = undefined;
-          intent.claimExpiresAt = undefined;
-          intent.nextAttemptAt = undefined;
-          intent.updatedAt = intent.deadAt;
-          intent.lastError = {
-            code: 'session_projection.deleted',
-            message: 'Session lifetime was deleted',
-          };
+      }
+      // Every still-claimable intent of the session id is retired, whatever
+      // its incarnation and whatever this store's projection setting (rows
+      // written while projection was enabled), so none can be claimed and
+      // projected for the deleted session later (PF-5309; PG mirrors this).
+      for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
+        if (
+          intent.harnessName !== namespace ||
+          intent.sessionId !== sessionId ||
+          intent.status === 'applied' ||
+          intent.status === 'dead'
+        ) {
+          continue;
         }
+        intent.status = 'dead';
+        intent.deadAt = Date.now();
+        intent.failedAt = intent.deadAt;
+        intent.claimId = undefined;
+        intent.claimExpiresAt = undefined;
+        intent.nextAttemptAt = undefined;
+        intent.updatedAt = intent.deadAt;
+        intent.lastError = {
+          code: 'session_projection.deleted',
+          message: 'Session lifetime was deleted',
+        };
       }
     }
 
     // Still before the first await, and after the projection retirement above,
     // so the retired intents are redacted too (PF-5309).
-    for (const { namespace, sessionId, record } of existingSessions.values()) {
-      this.redactRetainedSessionContent(namespace, sessionId, record.resourceId, record.threadId);
+    for (const { namespace, sessionId } of existingSessions.values()) {
+      this.redactRetainedSessionContent(namespace, sessionId);
     }
 
     for (const { namespace, sessionId, record } of existingSessions.values()) {
@@ -4416,12 +4419,7 @@ export class InMemoryHarness extends HarnessStorage {
    * and hash fields keep refusing and resolving replays. Mirrors the SQL
    * adapters' redaction (an intent keeps only its projection's byte count).
    */
-  private redactRetainedSessionContent(
-    namespace: string,
-    sessionId: string,
-    resourceId: string,
-    threadId: string,
-  ): void {
+  private redactRetainedSessionContent(namespace: string, sessionId: string): void {
     for (const admission of this.db.harnessTerminalAdmissions.values()) {
       if (admission.harnessName !== namespace || admission.sessionId !== sessionId) continue;
       admission.seed = null;
@@ -4451,15 +4449,9 @@ export class InMemoryHarness extends HarnessStorage {
       delete intent.lastError;
     }
     for (const evidence of this.db.harnessMessageResultEvidence.values()) {
-      // Scoped like the evidence delete: the session's own resource and thread.
-      if (
-        evidence.harnessName !== namespace ||
-        evidence.sessionId !== sessionId ||
-        evidence.resourceId !== resourceId ||
-        evidence.threadId !== threadId
-      ) {
-        continue;
-      }
+      // Every resource and thread scope the session id was used under (the
+      // delete itself only removes the current scope's uncommitted rows).
+      if (evidence.harnessName !== namespace || evidence.sessionId !== sessionId) continue;
       const mutable = evidence as { status: string; result?: unknown; error?: unknown; erased?: true };
       if (mutable.status === 'completed') {
         // The row keeps proving the turn completed; readers see the erased
