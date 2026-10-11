@@ -960,7 +960,8 @@ describe('native chat terminal handoff', () => {
   });
 
   it('preserves committed terminal evidence across session deletion for the committed retry', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
     await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
     const input = admission();
     await storage.writeMessageResultEvidence(pendingEvidence(input));
@@ -979,6 +980,22 @@ describe('native chat terminal handoff', () => {
     };
     const committed = await storage.commitTerminalHandoff(args);
     expect(committed.status).toBe('committed');
+    // A delivery worker holds a claim on the intent when the session is deleted.
+    const claim = await storage.claimTerminalIntents({
+      harnessName: input.harnessName,
+      consumerId: 'delivery-worker-1',
+      limit: 1,
+      now: 4_000,
+    });
+    expect(claim.intents).toHaveLength(1);
+    // A revoked grant of the session leaves a tombstone; its reason message is not kept.
+    await storage.revokeTerminalGrant({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      admissionId: 'admission-revoked',
+      executionGrant: { key: 'grant-revoked', generation: 1 },
+      reason: { code: 'harness.terminal_cancelled', message: 'private revoke note' },
+    });
 
     await storage.deleteSession({
       harnessName: 'default',
@@ -1035,8 +1052,24 @@ describe('native chat terminal handoff', () => {
     expect(retained).not.toContain('"text":"done"');
     expect(retained).not.toContain('\\"text\\":\\"done\\"');
     expect(retained).not.toContain('"mode":"build"');
-    // The fences still refuse a late admission of the deleted session.
+    // The fences still refuse a late admission of the deleted session, and the
+    // late acknowledgement of the claimed intent resolves as fenced: the
+    // payload hash it validates is kept.
     await expect(storage.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'fenced' });
+    await expect(
+      storage.ackTerminalIntent({
+        harnessName: input.harnessName,
+        intentId: claim.intents[0]!.id,
+        sessionId: input.sessionId,
+        sessionIncarnation: input.sessionIncarnation,
+        revision: claim.intents[0]!.revision,
+        payloadHash: claim.intents[0]!.projection.payloadHash,
+        claimId: claim.intents[0]!.claimId!,
+        consumerId: 'delivery-worker-1',
+        now: 4_001,
+      }),
+    ).resolves.toMatchObject({ status: 'fenced' });
+    expect(JSON.stringify([...db.harnessTerminalTombstones.values()])).not.toContain('private revoke note');
   });
 
   it('reports terminal handoff as unsupported and rejects terminal operations when disabled', async () => {

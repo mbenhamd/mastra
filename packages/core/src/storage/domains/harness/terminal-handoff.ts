@@ -441,6 +441,48 @@ export function harnessTerminalSeedHash(seed: JsonValue): string {
   return sha256(canonicalJson(seed));
 }
 
+/**
+ * PF-5309: the content-free remainder of a deleted session's terminal result.
+ * Status, run, completion time, finish reason and error code stay (replays
+ * and delivery bookkeeping read them); the error message goes.
+ */
+export function redactHarnessTerminalResult(result: HarnessTerminalResult): HarnessTerminalResult {
+  return {
+    status: result.status,
+    runId: result.runId,
+    completedAt: result.completedAt,
+    ...(result.finishReason !== undefined ? { finishReason: result.finishReason } : {}),
+    ...(result.error !== undefined ? { error: { code: result.error.code, message: '' } } : {}),
+  };
+}
+
+/**
+ * PF-5309: the content-free remainder of a deleted session's stored
+ * projection. Kind, id, byte count and payload hash stay (acknowledgement and
+ * failure replays validate the hash); the payload and its canonical bytes go.
+ */
+export function redactStoredHarnessTerminalProjection(
+  projection: StoredHarnessTerminalProjection,
+): StoredHarnessTerminalProjection {
+  return {
+    projectionKind: projection.projectionKind,
+    projectionId: projection.projectionId,
+    payload: null,
+    payloadBytes: projection.payloadBytes,
+    payloadHash: projection.payloadHash,
+    payloadJson: 'null',
+  };
+}
+
+/**
+ * PF-5309: a grant tombstone is a content-free fence, so it stores only the
+ * reason code. No reader uses the stored reason; the message stays with the
+ * caller's receipt and logs.
+ */
+export function contentFreeHarnessTerminalReason(reason: HarnessTerminalError): HarnessTerminalError {
+  return { code: reason.code, message: '' };
+}
+
 export function prepareHarnessTerminalAdmission(
   input: HarnessTerminalAdmissionInput,
   options: Pick<NormalizedHarnessTerminalHandoffOption, 'maxSeedBytes'>,

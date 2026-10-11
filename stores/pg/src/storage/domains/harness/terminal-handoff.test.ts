@@ -1342,6 +1342,16 @@ describe('HarnessPG native terminal handoff', () => {
     await harness().admitTerminalHandoff(input);
     const committed = await harness().commitTerminalHandoff(commitInput(input, 'delete-evidence'));
     expect(committed.status).toBe('committed');
+    // A delivery worker holds a claim on the intent when the session is deleted.
+    const claimed = await claimFirst(harness(), 'delivery-worker-1', Date.now());
+    // A revoked grant of the session leaves a tombstone; its reason message is not kept.
+    await harness().revokeTerminalGrant({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      admissionId: 'admission-revoked',
+      executionGrant: { key: 'grant-revoked-delete-evidence', generation: 1 },
+      reason: { code: 'harness.terminal_cancelled', message: 'private revoke note' },
+    });
 
     await harness().deleteSession({
       harnessName: HARNESS,
@@ -1397,6 +1407,16 @@ describe('HarnessPG native terminal handoff', () => {
       }),
     ).resolves.toMatchObject({ status: 'committed', seed: null, seedHash: committed.admission.seedHash });
     await expect(harness().admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'fenced' });
+    // The late acknowledgement of the claimed intent resolves as fenced: the
+    // payload hash it validates is kept.
+    await expect(harness().ackTerminalIntent(claimIdentityOf(claimed, 'delivery-worker-1'))).resolves.toMatchObject({
+      status: 'fenced',
+    });
+    const tombstoneNote = await store.db.one<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}"
+        WHERE reason_json LIKE '%private revoke note%'`,
+    );
+    expect(Number(tombstoneNote.count)).toBe(0);
 
     // Evidence bound to a committed admission also survives the per-signal
     // tombstone cleanup that post-delete bookkeeping runs.

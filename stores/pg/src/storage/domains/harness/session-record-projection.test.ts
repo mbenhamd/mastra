@@ -239,6 +239,13 @@ describe('HarnessPG native session record projection', () => {
     );
     expect(retained.map(row => row.revision)).toEqual([1, 2, 3]);
     expect(retained.every(row => row.payload === null && row.payload_digest.length > 0)).toBe(true);
+    expect(
+      await store.db.one<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM "${schemaName}".mastra_harness_session_projection_intents
+          WHERE session_id = $1 AND last_error IS NOT NULL`,
+        [session.id],
+      ),
+    ).toEqual({ count: '0' });
 
     await harness.saveSession(createSampleSessionRecord({ id: session.id }), { ownerId: 'owner-2', ifVersion: 0 });
     const recreated = await harness.loadSession({ sessionId: session.id });

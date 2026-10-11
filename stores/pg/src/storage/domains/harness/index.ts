@@ -86,6 +86,9 @@ import {
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
   harnessTerminalSeedHash,
+  redactHarnessTerminalResult,
+  redactStoredHarnessTerminalProjection,
+  contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
   prepareHarnessTerminalAdmission,
   prepareHarnessTerminalProjection,
@@ -207,6 +210,7 @@ import type {
   HarnessTerminalQueuePressure,
   HarnessTerminalRenewReceipt,
   HarnessTerminalResult,
+  StoredHarnessTerminalProjection,
   HarnessTerminalProjection,
   HarnessTerminalAdmissionRecord,
   AckSessionRecordProjectionInput,
@@ -2743,10 +2747,10 @@ export class HarnessPG extends HarnessStorage {
       // accounting.
       for (const key of [...deleteCandidates.keys()].sort()) {
         const candidate = deleteCandidates.get(key)!;
+        // Every incarnation of the deleted session is fenced, not only the
+        // current one: their content is erased below, so none may stay
+        // claimable or committable (PF-5309).
         const terminalArgs: (string | number)[] = [candidate.namespace, candidate.sessionId];
-        const terminalIncarnationPredicate =
-          candidate.sessionIncarnation === undefined ? '' : ' AND session_incarnation = ?';
-        if (candidate.sessionIncarnation !== undefined) terminalArgs.push(candidate.sessionIncarnation);
         // Persist durable per-incarnation fence markers before sweeping rows:
         // the UPDATEs only cover admissions that already exist, so a later
         // admitTerminalHandoff for the deleted incarnation must reject on the
@@ -2771,14 +2775,14 @@ export class HarnessPG extends HarnessStorage {
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
                 SET status = 'fenced', updated_at = ?
-                WHERE harness_name = ? AND session_id = ?${terminalIncarnationPredicate}
+                WHERE harness_name = ? AND session_id = ?
                   AND status = 'pending'`,
           args: [deletionNow, ...terminalArgs],
         });
         const fencedIntents = await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
                 SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, updated_at = ?
-                WHERE harness_name = ? AND session_id = ?${terminalIncarnationPredicate}
+                WHERE harness_name = ? AND session_id = ?
                   AND status IN ('pending', 'claimed', 'failed')
                 RETURNING payload_bytes`,
           args: [deletionNow, ...terminalArgs],
@@ -2796,22 +2800,12 @@ export class HarnessPG extends HarnessStorage {
           retiredTerminalCapacity.set(candidate.namespace, previous);
         }
         // PF-5309: the admissions and intents stay as content-free fences.
-        // Their content (the admission seed, the terminal result and the
-        // projection payload) is erased; the identity, status and hash columns
-        // keep refusing and resolving replays. Same lock order as the fence
-        // updates above: session, then these rows, before any pressure row.
-        await tx.execute({
-          sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
-                SET seed_json = 'null', terminal_result_json = NULL, projection_json = NULL
-                WHERE harness_name = ? AND session_id = ?`,
-          args: [candidate.namespace, candidate.sessionId],
-        });
-        await tx.execute({
-          sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-                SET terminal_result_json = 'null', projection_json = 'null', last_error_json = NULL
-                WHERE harness_name = ? AND session_id = ?`,
-          args: [candidate.namespace, candidate.sessionId],
-        });
+        // Their content (the admission seed, the terminal result's error
+        // message, the projection payload, an intent's last error) is erased;
+        // identity, status, revision and the seed and payload hashes keep
+        // refusing and resolving replays. Same lock order as the fence updates
+        // above: session, then these rows, before any pressure row.
+        await this.#redactTerminalRowsTx(tx, candidate.namespace, candidate.sessionId);
       }
       // Retire the fenced capacity once per namespace — after every intent row
       // in the batch is locked — and in sorted order so concurrent batches take
@@ -2873,7 +2867,7 @@ export class HarnessPG extends HarnessStorage {
           // post-image payload goes with the session (PF-5309).
           await tx.execute({
             sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
-                  SET payload = 'null'::jsonb
+                  SET payload = 'null'::jsonb, last_error = NULL
                   WHERE harness_name = ? AND session_id = ?`,
             args: [namespace, sessionId],
           });
@@ -5875,7 +5869,7 @@ export class HarnessPG extends HarnessStorage {
           input.sessionIncarnation,
           input.admissionId,
           input.admissionHash,
-          JSON.stringify(input.reason),
+          JSON.stringify(contentFreeHarnessTerminalReason(input.reason)),
           now,
         ],
       });
@@ -5976,7 +5970,7 @@ export class HarnessPG extends HarnessStorage {
           grant.generation,
           input.sessionId,
           input.admissionId,
-          JSON.stringify(input.reason),
+          JSON.stringify(contentFreeHarnessTerminalReason(input.reason)),
           now,
         ],
       });
@@ -8216,6 +8210,48 @@ export class HarnessPG extends HarnessStorage {
   // -------------------------------------------------------------------------
   // Channel inbox ledger
   // -------------------------------------------------------------------------
+
+  /** PF-5309: erases the content of a deleted session's terminal admissions and intents (see deleteSessions). */
+  async #redactTerminalRowsTx(tx: PgHarnessClient, namespace: string, sessionId: string): Promise<void> {
+    const admissions = await tx.execute({
+      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
+      args: [namespace, sessionId],
+    });
+    for (const row of admissions.rows) {
+      const result = parseJson(row.terminal_result_json) as HarnessTerminalResult | undefined;
+      const projection = parseJson(row.projection_json) as StoredHarnessTerminalProjection | undefined;
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+              SET seed_json = 'null', terminal_result_json = ?, projection_json = ?
+              WHERE id = ?`,
+        args: [
+          result == null ? null : JSON.stringify(redactHarnessTerminalResult(result)),
+          projection == null ? null : JSON.stringify(redactStoredHarnessTerminalProjection(projection)),
+          String(row.id),
+        ],
+      });
+    }
+    const intents = await tx.execute({
+      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_INTENTS}
+            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
+      args: [namespace, sessionId],
+    });
+    for (const row of intents.rows) {
+      const result = parseJson(row.terminal_result_json) as HarnessTerminalResult;
+      const projection = parseJson(row.projection_json) as StoredHarnessTerminalProjection;
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
+              SET terminal_result_json = ?, projection_json = ?, last_error_json = NULL
+              WHERE id = ?`,
+        args: [
+          JSON.stringify(redactHarnessTerminalResult(result)),
+          JSON.stringify(redactStoredHarnessTerminalProjection(projection)),
+          String(row.id),
+        ],
+      });
+    }
+  }
 
   /**
    * Runs a channel or wakeup ledger write while every session it names

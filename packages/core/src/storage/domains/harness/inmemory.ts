@@ -72,6 +72,9 @@ import {
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
   harnessTerminalSeedHash,
+  redactHarnessTerminalResult,
+  redactStoredHarnessTerminalProjection,
+  contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
   canonicalJson,
   prepareHarnessTerminalAdmission,
@@ -787,10 +790,12 @@ export class InMemoryHarness extends HarnessStorage {
     for (const { namespace, sessionId, record } of existingSessions.values()) {
       // Synchronous within the delete critical section — awaiting here would
       // let a concurrent saveSession interleave between guard and removal.
+      // Every incarnation of the session is fenced (no `sessionIncarnation`):
+      // the content of all of them is erased below, so none may stay
+      // claimable or committable (PF-5309).
       this.fenceTerminalHandoffsForSessionSync({
         harnessName: namespace,
         sessionId,
-        sessionIncarnation: record.sessionIncarnation,
         deletedAt: Date.now(),
       });
       this.db.harnessSessions.delete(sessionKey(namespace, sessionId));
@@ -2079,7 +2084,7 @@ export class InMemoryHarness extends HarnessStorage {
       sessionIncarnation: input.sessionIncarnation,
       admissionId: input.admissionId,
       admissionHash: input.admissionHash,
-      reason: cloneHarnessTerminal(input.reason),
+      reason: contentFreeHarnessTerminalReason(input.reason),
       createdAt: now,
     };
     this.db.harnessTerminalTombstones.set(tombstoneId, tombstone);
@@ -2139,7 +2144,7 @@ export class InMemoryHarness extends HarnessStorage {
       grant: { ...grant },
       sessionId: input.sessionId,
       admissionId: input.admissionId,
-      reason: cloneHarnessTerminal(input.reason),
+      reason: contentFreeHarnessTerminalReason(input.reason),
       createdAt: now,
     });
     return { status: 'revoked', grant, tombstoneId, revokedAt: now };
@@ -4415,20 +4420,25 @@ export class InMemoryHarness extends HarnessStorage {
     for (const admission of this.db.harnessTerminalAdmissions.values()) {
       if (admission.harnessName !== namespace || admission.sessionId !== sessionId) continue;
       admission.seed = null;
-      delete admission.terminalResult;
-      delete admission.projection;
+      if (admission.terminalResult !== undefined) {
+        admission.terminalResult = redactHarnessTerminalResult(admission.terminalResult);
+      }
+      if (admission.projection !== undefined) {
+        admission.projection = redactStoredHarnessTerminalProjection(admission.projection);
+      }
     }
     for (const intent of this.db.harnessTerminalIntents.values()) {
       if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
-      intent.terminalResult = null as unknown as typeof intent.terminalResult;
-      intent.projection = { payloadBytes: intent.projection.payloadBytes } as typeof intent.projection;
+      intent.terminalResult = redactHarnessTerminalResult(intent.terminalResult);
+      intent.projection = redactStoredHarnessTerminalProjection(intent.projection);
+      delete intent.lastError;
       // The in-memory intent also carries its admission's seed.
       if ('seed' in intent) (intent as { seed?: unknown }).seed = null;
-      delete intent.lastError;
     }
     for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
       if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
       intent.payload = null as unknown as typeof intent.payload;
+      delete intent.lastError;
     }
     for (const evidence of this.db.harnessMessageResultEvidence.values()) {
       // Scoped like the evidence delete: the session's own resource and thread.
