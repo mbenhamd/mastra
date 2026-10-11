@@ -72,7 +72,9 @@ describe('native session record projection', () => {
     });
     const incarnation = created.record.sessionIncarnation;
     expect(incarnation).toBeTruthy();
-    const firstNow = Date.now() + 1;
+    // Ahead of every write below, so a slow run cannot place an intent after
+    // the claim clock (the intents are stamped with the wall clock).
+    const firstNow = Date.now() + 10_000;
 
     const firstClaim = await storage.claimSessionRecordProjectionIntents({
       claimId: 'claim-1',
