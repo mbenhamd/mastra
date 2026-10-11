@@ -531,6 +531,41 @@ describe('PF-5364 step content after a processor retry', () => {
     expect(iterationTexts.at(-1)).toBe('Done.');
   });
 
+  it('keeps a silent final step silent when a processor cloned earlier unstamped narration', async () => {
+    const { model, calls } = scriptedModel([[toolCall('c1'), finish('tool-calls')], [finish('stop')]]);
+    const iterationTexts: string[] = [];
+    const agent = new Agent({
+      id: 'a',
+      name: 'a',
+      instructions: 'test',
+      model,
+      tools: { echo: echoTool() },
+      outputProcessors: [
+        {
+          id: 'narrate-then-clone',
+          processOutputStep: ({ stepNumber, messageList, messages }: any) => {
+            if (stepNumber === 0) {
+              // Pushed straight onto the parts, so the list never stamped it.
+              messageList.get.response.db().at(-1).content.parts.push({ type: 'text', text: 'Checking the result.' });
+              return messageList;
+            }
+            return structuredClone(messages);
+          },
+        },
+      ] as any,
+    });
+    const stream = await agent.stream('go', {
+      onIterationComplete: ({ iteration, text: iterationText }) => {
+        iterationTexts.push(iterationText);
+        return iteration === 1 ? { feedback: 'Now report the result.' } : undefined;
+      },
+    });
+    await stream.consumeStream();
+
+    expect(calls()).toBe(2);
+    expect(iterationTexts.at(-1)).toBe('');
+  });
+
   it('returns the repaired structured output after a retry', async () => {
     const { model, calls } = scriptedModel([
       [...text('{"answer":"REJECTED"}'), finish('stop')],

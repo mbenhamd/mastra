@@ -2179,8 +2179,23 @@ export class MessageList {
     if (index !== -1) this.#boundaryFingerprints.set(boundary, { messageId, prefix: prefixFingerprint(parts, index) });
   }
 
+  /**
+   * Each response message's parts as identity tokens. A part that reached the list unstamped (a
+   * processor pushed it onto `parts`) is stamped here first: otherwise a later clone of it, stamped
+   * when re-added, would no longer match and would read as new. Tool parts are identified by call
+   * id and are left as they are, since their stamp would surface in provider options.
+   */
   #responsePartIdentities(): Map<string, string[]> {
-    return new Map(this.response.db().map(message => [message.id, (message.content.parts ?? []).map(partIdentity)]));
+    return new Map(
+      this.response
+        .db()
+        .map(message => [
+          message.id,
+          (message.content.parts ?? []).map(part =>
+            partIdentity(part.type === 'tool-invocation' ? part : stampPart(part)),
+          ),
+        ]),
+    );
   }
 
   /**
