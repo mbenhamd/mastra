@@ -432,6 +432,15 @@ export function validateHarnessTerminalIdentity(identity: HarnessTerminalIdentit
   validateHarnessTerminalExecutionGrant(identity.executionGrant, 'executionGrant');
 }
 
+/**
+ * The admission seed's identity: sha256 of its canonical JSON. Admission
+ * replays compare seeds through it, so a duplicate or committed replay still
+ * resolves after a session delete erased the stored seed (PF-5309).
+ */
+export function harnessTerminalSeedHash(seed: JsonValue): string {
+  return sha256(canonicalJson(seed));
+}
+
 export function prepareHarnessTerminalAdmission(
   input: HarnessTerminalAdmissionInput,
   options: Pick<NormalizedHarnessTerminalHandoffOption, 'maxSeedBytes'>,

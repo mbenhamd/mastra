@@ -71,6 +71,7 @@ import {
   cloneHarnessTerminal,
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
+  harnessTerminalSeedHash,
   harnessTerminalIntentId,
   canonicalJson,
   prepareHarnessTerminalAdmission,
@@ -796,6 +797,7 @@ export class InMemoryHarness extends HarnessStorage {
       // In the same synchronous section as the session removal, so no write can
       // interleave between the two.
       this.eraseSessionChannelAndWakeupRows(namespace, sessionId);
+      this.redactRetainedSessionContent(namespace, sessionId, record.resourceId, record.threadId);
     }
 
     for (const { namespace, sessionId, record } of existingSessions.values()) {
@@ -4397,6 +4399,56 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   /**
+   * A deleted session's terminal admissions and intents, projection intents
+   * and committed message results stay as content-free fences (PF-5309): the
+   * admission seed, terminal results, projection payloads, session post-images
+   * and message result/error content are erased; identity, status, revision
+   * and hash fields keep refusing and resolving replays. Mirrors the SQL
+   * adapters' redaction (an intent keeps only its projection's byte count).
+   */
+  private redactRetainedSessionContent(
+    namespace: string,
+    sessionId: string,
+    resourceId: string,
+    threadId: string,
+  ): void {
+    for (const admission of this.db.harnessTerminalAdmissions.values()) {
+      if (admission.harnessName !== namespace || admission.sessionId !== sessionId) continue;
+      admission.seed = null;
+      delete admission.terminalResult;
+      delete admission.projection;
+    }
+    for (const intent of this.db.harnessTerminalIntents.values()) {
+      if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
+      intent.terminalResult = null as unknown as typeof intent.terminalResult;
+      intent.projection = { payloadBytes: intent.projection.payloadBytes } as typeof intent.projection;
+      // The in-memory intent also carries its admission's seed.
+      if ('seed' in intent) (intent as { seed?: unknown }).seed = null;
+      delete intent.lastError;
+    }
+    for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
+      if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
+      intent.payload = null as unknown as typeof intent.payload;
+    }
+    for (const evidence of this.db.harnessMessageResultEvidence.values()) {
+      // Scoped like the evidence delete: the session's own resource and thread.
+      if (
+        evidence.harnessName !== namespace ||
+        evidence.sessionId !== sessionId ||
+        evidence.resourceId !== resourceId ||
+        evidence.threadId !== threadId
+      ) {
+        continue;
+      }
+      const mutable = evidence as { status: string; result?: unknown; error?: unknown };
+      delete mutable.result;
+      // The SQL adapters read a failed row without error content as this
+      // generic failure.
+      if (mutable.status === 'failed') mutable.error = { code: 'harness.message_failed', message: 'Message failed' };
+    }
+  }
+
+  /**
    * Channel and wakeup rows are written only while every session they name
    * exists, so a late write cannot restore rows `deleteSessions` erased. The
    * check and the write run in one synchronous section.
@@ -5194,7 +5246,9 @@ function sameTerminalAdmissionInput(
     left.executionGrant.generation === right.executionGrant.generation &&
     left.finalizerId === right.finalizerId &&
     left.finalizerVersion === right.finalizerVersion &&
-    canonicalJson(left.seed) === canonicalJson(right.seed)
+    // Through the seed hash: a deleted session's admission keeps the hash but
+    // not the seed (PF-5309), and its replays must still match.
+    left.seedHash === harnessTerminalSeedHash(right.seed)
   );
 }
 

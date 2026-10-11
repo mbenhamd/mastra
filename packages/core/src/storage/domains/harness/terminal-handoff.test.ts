@@ -1007,6 +1007,36 @@ describe('native chat terminal handoff', () => {
     const replay = await storage.commitTerminalHandoff(args);
     expect(replay.status).toBe('duplicate');
     expect(replay.intent?.id).toBe(committed.intent!.id);
+
+    // PF-5309: what stays is content-free. The evidence keeps its status, the
+    // admission and intent keep identity, status and hashes, but the provider
+    // output, the projection payload and the admission seed are gone.
+    const keptEvidence = await storage.loadMessageResultEvidence({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      resourceId: input.resourceId,
+      threadId: input.threadId,
+      signalId: input.signalId,
+    });
+    const keptAdmission = await storage.loadTerminalAdmission({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      admissionId: input.admissionId,
+      executionGrant: input.executionGrant,
+    });
+    const keptIntent = await storage.loadTerminalIntent({
+      harnessName: input.harnessName,
+      intentId: committed.intent!.id,
+    });
+    expect(keptAdmission).toMatchObject({ status: 'committed', seed: null, seedHash: committed.admission.seedHash });
+    expect(keptIntent).toMatchObject({ id: committed.intent!.id, status: 'fenced' });
+    const retained = JSON.stringify([keptEvidence, keptAdmission, keptIntent, replay]);
+    expect(retained).not.toContain('provider output');
+    expect(retained).not.toContain('"text":"done"');
+    expect(retained).not.toContain('\\"text\\":\\"done\\"');
+    expect(retained).not.toContain('"mode":"build"');
+    // The fences still refuse a late admission of the deleted session.
+    await expect(storage.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'fenced' });
   });
 
   it('reports terminal handoff as unsupported and rejects terminal operations when disabled', async () => {

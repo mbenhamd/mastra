@@ -1370,6 +1370,34 @@ describe('HarnessPG native terminal handoff', () => {
     expect(replay.status).toBe('duplicate');
     expect(replay.intent?.id).toBe(committed.intent!.id);
 
+    // PF-5309: what stays is content-free. No retained row (admission, intent,
+    // message result) still holds the provider output, the projection payload
+    // or the admission seed, while identity, status and hashes still resolve
+    // the committed replay above and refuse a late admission.
+    for (const table of [
+      TABLE_HARNESS_TERMINAL_ADMISSIONS,
+      TABLE_HARNESS_TERMINAL_INTENTS,
+      'mastra_harness_message_results',
+    ]) {
+      const content = await store.db.one<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM "${schemaName}"."${table}" t
+          WHERE row_to_json(t)::text LIKE '%provider output delete-evidence%'
+             OR row_to_json(t)::text LIKE '%done delete-evidence%'
+             OR row_to_json(t)::text LIKE '%\\"mode\\":\\"build\\"%'
+             OR row_to_json(t)::text LIKE '%"mode":"build"%'`,
+      );
+      expect({ table, count: Number(content.count) }).toEqual({ table, count: 0 });
+    }
+    await expect(
+      harness().loadTerminalAdmission({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        admissionId: input.admissionId,
+        executionGrant: input.executionGrant,
+      }),
+    ).resolves.toMatchObject({ status: 'committed', seed: null, seedHash: committed.admission.seedHash });
+    await expect(harness().admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'fenced' });
+
     // Evidence bound to a committed admission also survives the per-signal
     // tombstone cleanup that post-delete bookkeeping runs.
     await harness().deleteOperationAdmissionTombstonesForSession({

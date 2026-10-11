@@ -127,6 +127,12 @@ describe('native session record projection', () => {
         acknowledgedAt: firstNow + 5,
       }),
     ).resolves.toMatchObject({ status: 'fenced' });
+    // PF-5309: the intents keep revision and digest but not the post-image.
+    const retained = [...db.harnessSessionRecordProjectionIntents.values()].filter(
+      intent => intent.sessionId === record.id,
+    );
+    expect(retained.map(intent => intent.revision).sort()).toEqual([1, 2]);
+    expect(retained.every(intent => intent.payload === null && intent.payloadDigest.length > 0)).toBe(true);
 
     const recreated = await storage.saveSession(sampleSession({}), { ownerId: 'owner-2', ifVersion: 0 });
     expect(recreated.version).toBe(1);

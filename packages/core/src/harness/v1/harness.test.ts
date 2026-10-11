@@ -5991,6 +5991,55 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
     expect(failedEvents).toHaveLength(1);
   });
 
+  it('worker dead-letters a row whose session a pre-PF-5309 delete left behind and finishes its batch', async () => {
+    // Deletes before PF-5309 removed the session but kept its inbox rows. The
+    // worker's dead-letter write keeps the row's (deleted) session; it must not
+    // be refused by the session guard, or the batch would abort on every tick
+    // and the rows behind it would never be processed.
+    const { harness, storage } = setup();
+    await saveChannelFixtureSession(storage);
+    await storage.saveChannelInboxItem(
+      channelInboxRow({
+        id: 'inbox-orphan',
+        idempotencyKey: 'event-orphan',
+        admissionId: 'admission-orphan',
+        status: 'failed',
+        attempts: 10, // == default maxAttempts
+        claimId: undefined,
+        claimExpiresAt: undefined,
+        admissionHash: 'persisted-hash',
+        externalMessageId: 'm-orphan',
+        receivedAt: 1000,
+      }),
+    );
+    await storage.saveChannelInboxItem(
+      channelInboxRow({
+        id: 'inbox-behind',
+        idempotencyKey: 'event-behind',
+        admissionId: 'admission-behind',
+        sessionId: undefined,
+        status: 'failed',
+        attempts: 10,
+        claimId: undefined,
+        claimExpiresAt: undefined,
+        admissionHash: 'persisted-hash-behind',
+        externalMessageId: 'm-behind',
+        receivedAt: 2000,
+      }),
+    );
+    // Remove the session the way the old delete did: the session row only.
+    const sessions = (storage as unknown as { db: InMemoryDB }).db.harnessSessions;
+    for (const [key, record] of sessions) if (record.id === 'session-1') sessions.delete(key);
+
+    const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;
+    expect(res).toMatchObject({ claimed: 2, dead: 2 });
+    for (const idempotencyKey of ['event-orphan', 'event-behind']) {
+      await expect(
+        storage.loadChannelInboxItemByIdempotencyKey({ harnessName: 'primary', channelId: 'support', idempotencyKey }),
+      ).resolves.toMatchObject({ status: 'dead' });
+    }
+  });
+
   it('worker is a no-op when there are no claimable rows', async () => {
     const { harness } = setup();
     const res = (await harness.recoverChannelInboxOnce({ channelId: 'support', now: WORKER_NOW })) as RecoverResult;

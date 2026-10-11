@@ -85,6 +85,7 @@ import {
   canonicalJson,
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
+  harnessTerminalSeedHash,
   harnessTerminalIntentId,
   prepareHarnessTerminalAdmission,
   prepareHarnessTerminalProjection,
@@ -708,6 +709,39 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       name: harnessIndexName(schemaPrefix, 'idx_harness_wakeups_claim'),
       table: TABLE_HARNESS_WAKEUPS,
       columns: ['harness_name', 'source', 'status', 'due_at', 'next_attempt_at', 'claim_expires_at'],
+    },
+    // PF-5309: deleteSessions erases a session's channel and wakeup rows by
+    // session; these keep each erase (and listChannelDiagnosticsRows) off a
+    // full scan.
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_inbox_session'),
+      table: TABLE_HARNESS_CHANNEL_INBOX,
+      columns: ['harness_name', 'session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_outbox_session'),
+      table: TABLE_HARNESS_CHANNEL_OUTBOX,
+      columns: ['harness_name', 'session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_outbox_owning_session'),
+      table: TABLE_HARNESS_CHANNEL_OUTBOX,
+      columns: ['harness_name', 'owning_session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_action_tokens_owning_session'),
+      table: TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
+      columns: ['harness_name', 'owning_session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_action_receipts_owning_session'),
+      table: TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
+      columns: ['harness_name', 'owning_session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_wakeups_session'),
+      table: TABLE_HARNESS_WAKEUPS,
+      columns: ['harness_name', 'session_id'],
     },
     {
       // listRunSummaries pages a session's summaries newest first, and
@@ -2761,6 +2795,23 @@ export class HarnessPG extends HarnessStorage {
           );
           retiredTerminalCapacity.set(candidate.namespace, previous);
         }
+        // PF-5309: the admissions and intents stay as content-free fences.
+        // Their content (the admission seed, the terminal result and the
+        // projection payload) is erased; the identity, status and hash columns
+        // keep refusing and resolving replays. Same lock order as the fence
+        // updates above: session, then these rows, before any pressure row.
+        await tx.execute({
+          sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+                SET seed_json = 'null', terminal_result_json = NULL, projection_json = NULL
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [candidate.namespace, candidate.sessionId],
+        });
+        await tx.execute({
+          sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
+                SET terminal_result_json = 'null', projection_json = 'null', last_error_json = NULL
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [candidate.namespace, candidate.sessionId],
+        });
       }
       // Retire the fenced capacity once per namespace — after every intent row
       // in the batch is locked — and in sorted order so concurrent batches take
@@ -2781,7 +2832,10 @@ export class HarnessPG extends HarnessStorage {
       // so two batch deletes of disjoint sessions can share outbox rows. Lock
       // the batch's outbox rows once, in id order, before the per-session
       // deletes below take them one session at a time; otherwise each batch
-      // could hold one shared row and wait for the other's.
+      // could hold one shared row and wait for the other's. This lock must stay
+      // after the session FOR UPDATE locks above: channel writers key-share
+      // lock their sessions before touching an outbox row, so taking outbox
+      // rows first would invert that order.
       const outboxSessionsByNamespace = new Map<string, string[]>();
       for (const { namespace, sessionId } of deleteCandidates.values()) {
         const ids = outboxSessionsByNamespace.get(namespace) ?? [];
@@ -2814,6 +2868,16 @@ export class HarnessPG extends HarnessStorage {
         if (this.sessionRecordProjection.enabled && sessionIncarnation !== undefined) {
           retired = await this.#retireProjectionIntentsTx(tx, namespace, sessionId, sessionIncarnation, Date.now());
         }
+        if (this.sessionRecordProjection.enabled) {
+          // The retired intents keep their digest and revision; the session
+          // post-image payload goes with the session (PF-5309).
+          await tx.execute({
+            sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
+                  SET payload = 'null'::jsonb
+                  WHERE harness_name = ? AND session_id = ?`,
+            args: [namespace, sessionId],
+          });
+        }
         const result = await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND id = ?`,
@@ -2833,6 +2897,14 @@ export class HarnessPG extends HarnessStorage {
                       AND adm.admission_id IS NOT DISTINCT FROM mr.admission_id
                       AND adm.status = 'committed'
                   )`,
+          args: [namespace, sessionId, resourceId, threadId],
+        });
+        // The committed results kept above answer a committed retry by status;
+        // their result and error content goes with the session (PF-5309).
+        await tx.execute({
+          sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+                SET result = NULL, error = NULL
+                WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
           args: [namespace, sessionId, resourceId, threadId],
         });
         await tx.execute({
@@ -9984,7 +10056,11 @@ export class HarnessPG extends HarnessStorage {
   }
 
   async #createChannelInboxIndexes(): Promise<void> {
-    await this.#createDefaultIndexes(['idx_harness_channel_inbox_idempotency', 'idx_harness_channel_inbox_claim']);
+    await this.#createDefaultIndexes([
+      'idx_harness_channel_inbox_idempotency',
+      'idx_harness_channel_inbox_claim',
+      'idx_harness_channel_inbox_session',
+    ]);
   }
 
   async #ensureChannelActionTables(): Promise<void> {
@@ -10021,6 +10097,8 @@ export class HarnessPG extends HarnessStorage {
       'idx_harness_channel_action_receipts_token',
       'idx_harness_channel_action_receipts_action',
       'idx_harness_channel_action_receipts_claim',
+      'idx_harness_channel_action_tokens_owning_session',
+      'idx_harness_channel_action_receipts_owning_session',
     ]);
   }
 
@@ -10050,6 +10128,8 @@ export class HarnessPG extends HarnessStorage {
       'idx_harness_channel_outbox_idempotency',
       'idx_harness_channel_outbox_claim',
       'idx_harness_channel_outbox_binding_order',
+      'idx_harness_channel_outbox_session',
+      'idx_harness_channel_outbox_owning_session',
     ]);
   }
 
@@ -10084,6 +10164,7 @@ export class HarnessPG extends HarnessStorage {
       'idx_harness_wakeups_idempotency',
       'idx_harness_wakeups_source_fire',
       'idx_harness_wakeups_claim',
+      'idx_harness_wakeups_session',
     ]);
   }
 
@@ -12177,7 +12258,9 @@ function sameHarnessTerminalAdmissionInput(
     stored.executionGrant.generation === input.executionGrant.generation &&
     stored.finalizerId === input.finalizerId &&
     stored.finalizerVersion === input.finalizerVersion &&
-    canonicalJson(stored.seed) === canonicalJson(input.seed)
+    // Through the seed hash: a deleted session's admission keeps the hash but
+    // not the seed (PF-5309), and its replays must still match.
+    stored.seedHash === harnessTerminalSeedHash(input.seed)
   );
 }
 

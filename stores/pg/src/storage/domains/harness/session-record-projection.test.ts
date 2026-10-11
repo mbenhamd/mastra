@@ -229,6 +229,16 @@ describe('HarnessPG native session record projection', () => {
         acknowledgedAt: now + 6,
       }),
     ).resolves.toMatchObject({ status: 'fenced' });
+    // PF-5309: the retired and applied intents keep revision and digest (the
+    // fence above still refuses the late ack) but no longer hold the session
+    // post-image.
+    const retained = await store.db.manyOrNone<{ revision: number; payload_digest: string; payload: unknown }>(
+      `SELECT revision, payload_digest, payload FROM "${schemaName}".mastra_harness_session_projection_intents
+        WHERE session_id = $1 ORDER BY revision`,
+      [session.id],
+    );
+    expect(retained.map(row => row.revision)).toEqual([1, 2, 3]);
+    expect(retained.every(row => row.payload === null && row.payload_digest.length > 0)).toBe(true);
 
     await harness.saveSession(createSampleSessionRecord({ id: session.id }), { ownerId: 'owner-2', ifVersion: 0 });
     const recreated = await harness.loadSession({ sessionId: session.id });

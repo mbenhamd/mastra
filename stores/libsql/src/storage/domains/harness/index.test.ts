@@ -2686,9 +2686,13 @@ describe('HarnessLibSQL channel inbox ledger', () => {
     });
 
     await expect(indexNames(client, TABLE_HARNESS_CHANNEL_INBOX)).resolves.toEqual(
-      expect.arrayContaining(['idx_harness_channel_inbox_idempotency', 'idx_harness_channel_inbox_claim']),
+      expect.arrayContaining([
+        'idx_harness_channel_inbox_idempotency',
+        'idx_harness_channel_inbox_claim',
+        'idx_harness_channel_inbox_session',
+      ]),
     );
-    expect(indexCreateStatements(executeSpy.mock.calls)).toHaveLength(2);
+    expect(indexCreateStatements(executeSpy.mock.calls)).toHaveLength(3);
   });
 
   it('flags same idempotency key with a different payload hash as a conflict', async () => {
@@ -3089,9 +3093,10 @@ describe('HarnessLibSQL wakeup ledger', () => {
         'idx_harness_wakeups_idempotency',
         'idx_harness_wakeups_source_fire',
         'idx_harness_wakeups_claim',
+        'idx_harness_wakeups_session',
       ]),
     );
-    expect(indexCreateStatements(executeSpy.mock.calls, 'idx_harness_wakeups_')).toHaveLength(3);
+    expect(indexCreateStatements(executeSpy.mock.calls, 'idx_harness_wakeups_')).toHaveLength(4);
   });
 
   it('flags same idempotency key with a different payload as a conflict', async () => {

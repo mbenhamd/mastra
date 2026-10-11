@@ -91,6 +91,12 @@ describe('HarnessPG', () => {
     expect(ddl).toContain('idx_harness_workspace_actions_session');
     expect(ddl).toContain('idx_harness_channel_outbox_idempotency');
     expect(ddl).toContain('idx_harness_run_summaries_session');
+    expect(ddl).toContain('idx_harness_channel_action_receipts_owning_session');
+    expect(ddl).toContain('idx_harness_channel_action_tokens_owning_session');
+    expect(ddl).toContain('idx_harness_channel_inbox_session');
+    expect(ddl).toContain('idx_harness_channel_outbox_owning_session');
+    expect(ddl).toContain('idx_harness_channel_outbox_session');
+    expect(ddl).toContain('idx_harness_wakeups_session');
 
     const indexes = await store.db.manyOrNone<{ indexname: string }>(
       `SELECT indexname FROM pg_indexes
@@ -108,17 +114,29 @@ describe('HarnessPG', () => {
           'idx_harness_wakeups_idempotency',
           'idx_harness_workspace_actions_page',
           'idx_harness_workspace_actions_session',
+          'idx_harness_channel_action_receipts_owning_session',
+          'idx_harness_channel_action_tokens_owning_session',
+          'idx_harness_channel_inbox_session',
+          'idx_harness_channel_outbox_owning_session',
+          'idx_harness_channel_outbox_session',
+          'idx_harness_wakeups_session',
         ],
       ],
     );
     expect(indexes.map(row => row.indexname)).toEqual([
+      'idx_harness_channel_action_receipts_owning_session',
+      'idx_harness_channel_action_tokens_owning_session',
       'idx_harness_channel_inbox_idempotency',
+      'idx_harness_channel_inbox_session',
       'idx_harness_channel_outbox_idempotency',
+      'idx_harness_channel_outbox_owning_session',
+      'idx_harness_channel_outbox_session',
       'idx_harness_run_summaries_session',
       'idx_harness_session_events_replay',
       'idx_harness_sessions_active_key',
       'idx_harness_sessions_pending_resume_expiry',
       'idx_harness_wakeups_idempotency',
+      'idx_harness_wakeups_session',
       'idx_harness_workspace_actions_page',
       'idx_harness_workspace_actions_session',
     ]);

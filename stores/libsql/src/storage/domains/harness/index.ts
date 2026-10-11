@@ -5334,6 +5334,11 @@ export class HarnessLibSQL extends HarnessStorage {
             ON "${TABLE_HARNESS_CHANNEL_INBOX}" ("harness_name", "channel_id", "status", "next_attempt_at", "claim_expires_at", "received_at")`,
       args: [],
     });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_inbox_session
+            ON "${TABLE_HARNESS_CHANNEL_INBOX}" ("harness_name", "session_id")`,
+      args: [],
+    });
   }
 
   async #ensureChannelBindingsTable(): Promise<void> {
@@ -5479,6 +5484,16 @@ export class HarnessLibSQL extends HarnessStorage {
             ON "${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}" ("harness_name", "channel_id", "status", "next_attempt_at", "claim_expires_at", "created_at")`,
       args: [],
     });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_action_tokens_owning_session
+            ON "${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}" ("harness_name", "owning_session_id")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_action_receipts_owning_session
+            ON "${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}" ("harness_name", "owning_session_id")`,
+      args: [],
+    });
   }
 
   async #ensureChannelOutboxTable(): Promise<void> {
@@ -5516,6 +5531,16 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#client.execute({
       sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_outbox_binding_order
             ON "${TABLE_HARNESS_CHANNEL_OUTBOX}" ("harness_name", "binding_id", "status", "created_at", "id")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_outbox_session
+            ON "${TABLE_HARNESS_CHANNEL_OUTBOX}" ("harness_name", "session_id")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_outbox_owning_session
+            ON "${TABLE_HARNESS_CHANNEL_OUTBOX}" ("harness_name", "owning_session_id")`,
       args: [],
     });
   }
@@ -5560,6 +5585,11 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#client.execute({
       sql: `CREATE INDEX IF NOT EXISTS idx_harness_wakeups_claim
             ON "${TABLE_HARNESS_WAKEUPS}" ("harness_name", "source", "status", "due_at", "next_attempt_at", "claim_expires_at")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_wakeups_session
+            ON "${TABLE_HARNESS_WAKEUPS}" ("harness_name", "session_id")`,
       args: [],
     });
   }
