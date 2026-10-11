@@ -192,8 +192,15 @@ export function createTerminalToolResultEnvelope(
  */
 export function assertTerminalToolResultRetained(
   messageList: MessageList,
+  /** The step's response message id. Kept for callers; the part is found by its own id. */
+  _messageId: string,
   envelope: ReturnType<typeof createTerminalToolResultEnvelope>,
-  beforeProcessors: ReadonlyMap<string, number>,
+  /**
+   * `countResponseTerminalToolResultParts` taken before the final output
+   * processors ran. Without it, any other terminal part in the response fails
+   * the check.
+   */
+  beforeProcessors: ReadonlyMap<string, number> = new Map(),
 ): void {
   const retained = findRetainedTerminalToolResultPart(messageList, envelope.id, beforeProcessors);
   if (retained === undefined) {

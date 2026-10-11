@@ -275,7 +275,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         )?.[toolCall.toolName] ?? rest.tools?.[toolCall.toolName]) as
           | { toModelOutput?: (output: unknown) => unknown; resultStatus?: (output: unknown) => unknown }
           | undefined;
-        const providerMetadata = await computeModelOutputProviderMetadata({
+        return computeModelOutputProviderMetadata({
           tool,
           toolName: toolCall.toolName,
           toolCallId: toolCall.toolCallId,
@@ -287,7 +287,27 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           // engine supplies a warn-and-continue handler instead (redelivery
           // would re-run the mapper on every attempt).
         });
-        return withToolResultStatusProviderMetadata({ tool, result: toolCall.result, providerMetadata });
+      }
+
+      /**
+       * Classify the final recorded result with the executed tool's own
+       * `resultStatus`. The tool is resolved with the same ladder the
+       * tool-call step executes it with (key, provider name, then id).
+       */
+      function classifyRecordedToolResult(
+        toolName: string,
+        result: unknown,
+        providerMetadata: Record<string, unknown> | undefined,
+      ) {
+        const findTool = (tools: ToolSet | undefined) =>
+          tools?.[toolName] ??
+          findProviderToolByName(tools, toolName) ??
+          Object.values(tools ?? {}).find(candidate => (candidate as { id?: unknown })?.id === toolName);
+        const stepTools = readScoped(scopeCtx, STEP_TOOLS_KEY, 'stepTools') as ToolSet | undefined;
+        const tool = (findTool(stepTools) ?? findTool(rest.tools as ToolSet | undefined)) as
+          | { resultStatus?: (output: unknown) => unknown }
+          | undefined;
+        return withToolResultStatusProviderMetadata({ tool, result, providerMetadata });
       }
 
       async function transformToolChunk(
@@ -684,6 +704,20 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
               continue;
             }
 
+            // Classify the final recorded result (after processToolResult) with the
+            // tool's own resultStatus for framework tool-call receipts.
+            const recordedProviderMetadata = toolCall.providerExecuted
+              ? providerMetadata
+              : classifyRecordedToolResult(
+                  toolCall.toolName,
+                  (chunk as { payload: { result: unknown } }).payload.result,
+                  providerMetadata,
+                );
+            if (recordedProviderMetadata !== providerMetadata) {
+              (chunk as { payload: { providerMetadata?: unknown } }).payload.providerMetadata =
+                recordedProviderMetadata;
+            }
+
             if (!toolCall.providerExecuted) {
               // Update tool invocations from state:'call' to state:'result' for successful client tools.
               // Provider-executed tools are handled by llm-execution-step.
@@ -699,10 +733,10 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                   // turn (one tool errored, another approved) so it round-trips on recall too.
                   ...(toolCall.approval ? { approval: toolCall.approval } : {}),
                 },
-                ...(withToolPayloadTransformProviderMetadata(providerMetadata, chunk.metadata)
+                ...(withToolPayloadTransformProviderMetadata(recordedProviderMetadata, chunk.metadata)
                   ? {
                       providerMetadata: withToolPayloadTransformProviderMetadata(
-                        providerMetadata,
+                        recordedProviderMetadata,
                         chunk.metadata,
                       ) as ProviderMetadata,
                     }
@@ -819,6 +853,19 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             continue;
           }
 
+          // Classify the final recorded result (after processToolResult) with the
+          // tool's own resultStatus for framework tool-call receipts.
+          const recordedProviderMetadata = toolCall.providerExecuted
+            ? providerMetadata
+            : classifyRecordedToolResult(
+                toolCall.toolName,
+                (chunk as { payload: { result: unknown } }).payload.result,
+                providerMetadata,
+              );
+          if (recordedProviderMetadata !== providerMetadata) {
+            (chunk as { payload: { providerMetadata?: unknown } }).payload.providerMetadata = recordedProviderMetadata;
+          }
+
           // Provider-executed tools are handled by llm-execution-step; for client-executed
           // tools we patch state:'call' -> state:'result' here after processors have run.
           // The approval decision for an approved approval-gated tool is preserved so it
@@ -836,10 +883,10 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
                 // round-trips on recall as `approval: { approved: true }`.
                 ...(toolCall.approval ? { approval: toolCall.approval } : {}),
               },
-              ...(withToolPayloadTransformProviderMetadata(providerMetadata, chunk.metadata)
+              ...(withToolPayloadTransformProviderMetadata(recordedProviderMetadata, chunk.metadata)
                 ? {
                     providerMetadata: withToolPayloadTransformProviderMetadata(
-                      providerMetadata,
+                      recordedProviderMetadata,
                       chunk.metadata,
                     ) as ProviderMetadata,
                   }

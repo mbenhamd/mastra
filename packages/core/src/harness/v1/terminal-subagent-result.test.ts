@@ -347,6 +347,59 @@ describe('Harness subagent outcome terminal contract', () => {
     ]);
   });
 
+  it('records a classified returned failure as failed and never a running background placeholder', () => {
+    const report = outcomeReport('completed');
+    const toolResult = (providerMetadata: Record<string, unknown>) => ({
+      finishReason: 'tool-calls',
+      terminalToolResult: outcomeEnvelope(report),
+      toolResults: [
+        {
+          type: 'tool-result',
+          payload: {
+            toolCallId: 'compile-1',
+            toolName: 'compile_latex',
+            result: { success: false },
+            isError: false,
+            providerMetadata,
+          },
+        },
+      ],
+    });
+
+    // The tool classified its returned output as a failure (`resultStatus`).
+    const classified = toolResult({ mastra: { resultStatus: 'error' } });
+    expect(verifyHarnessSubagentOutcomeReport(classified)).toBeUndefined();
+    expect(projectHarnessSubagentOutcomeReceipts(classified)).toEqual([
+      { toolCallId: 'compile-1', toolName: 'compile_latex', status: 'error' },
+    ]);
+    // A running background placeholder is not the tool's result.
+    const placeholder = toolResult({ mastra: { backgroundTask: { taskId: 'task-1', status: 'running' } } });
+    expect(verifyHarnessSubagentOutcomeReport(placeholder)).toBeUndefined();
+    expect(projectHarnessSubagentOutcomeReceipts(placeholder)).toEqual([]);
+  });
+
+  it('lets the framework receipt for a call override an earlier run tool result', () => {
+    // An awaited background completion is streamed before processToolResult,
+    // then recorded again after it; the framework receipt holds the recorded status.
+    const report = outcomeReport('failed');
+    const result = {
+      finishReason: 'tool-calls',
+      terminalToolResult: outcomeEnvelope(report),
+      harnessToolReceipts: [{ toolCallId: 'compile-1', toolName: 'compile_latex', status: 'error' }],
+      toolResults: [
+        {
+          type: 'tool-result',
+          payload: { toolCallId: 'compile-1', toolName: 'compile_latex', result: { success: true }, isError: false },
+        },
+      ],
+    };
+
+    expect(verifyHarnessSubagentOutcomeReport(result)).toMatchObject({ outcome: 'failed' });
+    expect(projectHarnessSubagentOutcomeReceipts(result)).toEqual([
+      { toolCallId: 'compile-1', toolName: 'compile_latex', status: 'error' },
+    ]);
+  });
+
   it('binds id-less tool evidence to distinct recorded calls with the claimed name and status', () => {
     const pythonClaim = {
       kind: 'tool-result',
