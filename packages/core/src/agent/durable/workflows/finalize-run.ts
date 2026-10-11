@@ -200,7 +200,7 @@ export async function runDurableFinishSideEffects({
     }
   }
   if (terminalEnvelope && messageId) {
-    assertTerminalToolResultRetained(messageList, terminalEnvelope, terminalPartsBeforeProcessors!);
+    assertTerminalToolResultRetained(messageList, messageId, terminalEnvelope, terminalPartsBeforeProcessors);
   }
 
   // SaveQueueManager may reclassify flushed response messages as persisted
