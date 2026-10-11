@@ -86,6 +86,7 @@ import {
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
   harnessTerminalSeedHash,
+  HARNESS_MESSAGE_RESULT_ERASED_CODE,
   redactHarnessTerminalResult,
   redactStoredHarnessTerminalProjection,
   contentFreeHarnessTerminalReason,
@@ -2822,6 +2823,13 @@ export class HarnessPG extends HarnessStorage {
           deletionNow,
         );
       }
+      const projectionIntentsTableExists =
+        (
+          await tx.execute({
+            sql: `SELECT to_regclass(?) IS NOT NULL AS present`,
+            args: [`"${this.#schema}"."${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}"`],
+          })
+        ).rows[0]?.present === true;
       // An outbox row can name two sessions (session_id and owning_session_id),
       // so two batch deletes of disjoint sessions can share outbox rows. Lock
       // the batch's outbox rows once, in id order, before the per-session
@@ -2862,13 +2870,16 @@ export class HarnessPG extends HarnessStorage {
         if (this.sessionRecordProjection.enabled && sessionIncarnation !== undefined) {
           retired = await this.#retireProjectionIntentsTx(tx, namespace, sessionId, sessionIncarnation, Date.now());
         }
-        if (this.sessionRecordProjection.enabled) {
-          // The retired intents keep their digest and revision; the session
-          // post-image payload goes with the session (PF-5309).
+        if (projectionIntentsTableExists) {
+          // PF-5309: settled intents (applied, or dead, which includes those
+          // retired just above) keep revision and digest but lose the session
+          // post-image and error. A still-claimable intent of a store without
+          // projections keeps its payload, so a consumer never claims an empty
+          // one. Runs whatever this store's projection setting is.
           await tx.execute({
             sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
                   SET payload = 'null'::jsonb, last_error = NULL
-                  WHERE harness_name = ? AND session_id = ?`,
+                  WHERE harness_name = ? AND session_id = ? AND status IN ('applied', 'dead')`,
             args: [namespace, sessionId],
           });
         }
@@ -2897,9 +2908,19 @@ export class HarnessPG extends HarnessStorage {
         // their result and error content goes with the session (PF-5309).
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
-                SET result = NULL, error = NULL
+                SET result = NULL,
+                    error = CASE WHEN status = 'completed' THEN ?::jsonb ELSE NULL END
                 WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
-          args: [namespace, sessionId, resourceId, threadId],
+          args: [
+            JSON.stringify({
+              code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
+              message: 'The result was erased with its session',
+            }),
+            namespace,
+            sessionId,
+            resourceId,
+            threadId,
+          ],
         });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_OPERATION_TOMBSTONES}
@@ -12183,6 +12204,11 @@ function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalRe
   const status = String(row.status);
   if (status === 'completed') {
     const runId = completedMessageEvidenceRunId(base);
+    // PF-5309: a deleted session's completed row keeps its status but carries
+    // the erased marker instead of the result.
+    if ((parseJson(row.error) as { code?: unknown } | undefined)?.code === HARNESS_MESSAGE_RESULT_ERASED_CODE) {
+      return { ...base, status: 'completed', runId, result: undefined, erased: true };
+    }
     return {
       ...base,
       status: 'completed',

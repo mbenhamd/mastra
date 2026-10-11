@@ -441,6 +441,9 @@ export function harnessTerminalSeedHash(seed: JsonValue): string {
   return sha256(canonicalJson(seed));
 }
 
+/** PF-5309: the error code stored on a message result whose content a session delete erased. */
+export const HARNESS_MESSAGE_RESULT_ERASED_CODE = 'harness.message_result_erased';
+
 /**
  * PF-5309: the content-free remainder of a deleted session's terminal result.
  * Status, run, completion time, finish reason and error code stay (replays

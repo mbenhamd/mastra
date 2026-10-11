@@ -802,7 +802,6 @@ export class InMemoryHarness extends HarnessStorage {
       // In the same synchronous section as the session removal, so no write can
       // interleave between the two.
       this.eraseSessionChannelAndWakeupRows(namespace, sessionId);
-      this.redactRetainedSessionContent(namespace, sessionId, record.resourceId, record.threadId);
     }
 
     for (const { namespace, sessionId, record } of existingSessions.values()) {
@@ -840,6 +839,12 @@ export class InMemoryHarness extends HarnessStorage {
           };
         }
       }
+    }
+
+    // Still before the first await, and after the projection retirement above,
+    // so the retired intents are redacted too (PF-5309).
+    for (const { namespace, sessionId, record } of existingSessions.values()) {
+      this.redactRetainedSessionContent(namespace, sessionId, record.resourceId, record.threadId);
     }
 
     for (const { namespace, sessionId, record } of existingSessions.values()) {
@@ -4435,9 +4440,14 @@ export class InMemoryHarness extends HarnessStorage {
       // The in-memory intent also carries its admission's seed.
       if ('seed' in intent) (intent as { seed?: unknown }).seed = null;
     }
+    // Only settled projection intents (applied, or dead, which includes those
+    // the delete retired): a still-claimable intent of a store without
+    // projections keeps its payload. The payload reads back as absent, as in
+    // the PG adapter.
     for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
       if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
-      intent.payload = null as unknown as typeof intent.payload;
+      if (intent.status !== 'applied' && intent.status !== 'dead') continue;
+      delete (intent as { payload?: unknown }).payload;
       delete intent.lastError;
     }
     for (const evidence of this.db.harnessMessageResultEvidence.values()) {
@@ -4450,11 +4460,17 @@ export class InMemoryHarness extends HarnessStorage {
       ) {
         continue;
       }
-      const mutable = evidence as { status: string; result?: unknown; error?: unknown };
-      delete mutable.result;
-      // The SQL adapters read a failed row without error content as this
-      // generic failure.
-      if (mutable.status === 'failed') mutable.error = { code: 'harness.message_failed', message: 'Message failed' };
+      const mutable = evidence as { status: string; result?: unknown; error?: unknown; erased?: true };
+      if (mutable.status === 'completed') {
+        // The row keeps proving the turn completed; readers see the erased
+        // marker, never an empty success (the PG mapper reads it the same way).
+        mutable.result = undefined;
+        mutable.erased = true;
+      } else if (mutable.status === 'failed') {
+        // The SQL adapters read a failed row without error content as this
+        // generic failure.
+        mutable.error = { code: 'harness.message_failed', message: 'Message failed' };
+      }
     }
   }
 

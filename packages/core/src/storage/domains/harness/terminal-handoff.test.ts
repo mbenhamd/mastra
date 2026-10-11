@@ -1046,6 +1046,7 @@ describe('native chat terminal handoff', () => {
       intentId: committed.intent!.id,
     });
     expect(keptAdmission).toMatchObject({ status: 'committed', seed: null, seedHash: committed.admission.seedHash });
+    expect(keptEvidence).toMatchObject({ status: 'completed', erased: true });
     expect(keptIntent).toMatchObject({ id: committed.intent!.id, status: 'fenced' });
     const retained = JSON.stringify([keptEvidence, keptAdmission, keptIntent, replay]);
     expect(retained).not.toContain('provider output');
@@ -1070,6 +1071,59 @@ describe('native chat terminal handoff', () => {
       }),
     ).resolves.toMatchObject({ status: 'fenced' });
     expect(JSON.stringify([...db.harnessTerminalTombstones.values()])).not.toContain('private revoke note');
+  });
+
+  it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    const committed = await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: {
+        ...pendingEvidence(input),
+        status: 'completed',
+        result: { text: 'provider output' },
+        updatedAt: 3_000,
+      },
+      terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: { text: 'done' } },
+    });
+    expect(committed.status).toBe('committed');
+    const claim = await storage.claimTerminalIntents({
+      harnessName: input.harnessName,
+      consumerId: 'delivery-worker-1',
+      limit: 1,
+      now: 4_000,
+    });
+    const identity = {
+      harnessName: input.harnessName,
+      intentId: claim.intents[0]!.id,
+      sessionId: input.sessionId,
+      sessionIncarnation: input.sessionIncarnation,
+      revision: claim.intents[0]!.revision,
+      payloadHash: claim.intents[0]!.projection.payloadHash,
+      claimId: claim.intents[0]!.claimId!,
+      consumerId: 'delivery-worker-1',
+      now: 4_001,
+    };
+    await expect(storage.ackTerminalIntent(identity)).resolves.toMatchObject({ status: 'acked' });
+
+    await storage.deleteSession({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      ifVersion: 1,
+      expectedResourceId: 'resource-1',
+      expectedThreadId: 'thread-1',
+      expectedParentSessionId: null,
+      expectedCreatedAt: 1_000,
+    });
+
+    // A consumer retrying its lost ack still gets the duplicate receipt.
+    await expect(storage.ackTerminalIntent({ ...identity, now: 4_002 })).resolves.toMatchObject({
+      status: 'duplicate',
+    });
   });
 
   it('reports terminal handoff as unsupported and rejects terminal operations when disabled', async () => {

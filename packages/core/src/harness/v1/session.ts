@@ -175,6 +175,7 @@ import {
   HarnessSessionCorruptError,
   harnessSessionClosingError,
   HarnessSessionDeletedError,
+  HarnessMessageResultErasedError,
   HarnessSessionLockedError,
   HarnessStateConflictError,
   HarnessStateSerializationError,
@@ -10094,7 +10095,7 @@ export class Session {
             opts.executionAuthorityGrant !== undefined
           ) {
             await this._commitCachedDuplicateTerminal(
-              evidence.result as FullOutput<unknown>,
+              this._completedEvidenceResult(evidence) as FullOutput<unknown>,
               evidence,
               opts,
               activeDeleted,
@@ -10107,15 +10108,16 @@ export class Session {
           // A terminal caller still needs its durable receipt replayed — the
           // committed fast-path converges on the stored winner without
           // recomputing it.
+          const completedResult = this._completedEvidenceResult(evidence);
           if (this._terminalFinalizer !== undefined && opts.executionAuthorityGrant !== undefined) {
             await this._commitCachedDuplicateTerminal(
-              evidence.result as FullOutput<unknown>,
+              completedResult as FullOutput<unknown>,
               evidence,
               opts,
               activeDeleted,
             );
           }
-          return evidence.result as AgentResult;
+          return completedResult;
         }
         if (evidence.status === 'failed') {
           await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
@@ -10808,7 +10810,7 @@ export class Session {
         throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
       }
       if ('status' in latest) {
-        if (latest.status === 'completed') return latest.result as AgentResult;
+        if (latest.status === 'completed') return this._completedEvidenceResult(latest);
         if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
         // While canonical evidence stays pending, consult the durable terminal
         // admission each pass — a cancelled/fenced grant can never produce the
@@ -11634,9 +11636,19 @@ export class Session {
       if (local.status === 'completed') return local.result;
       throw local.error;
     }
-    if (evidence.status === 'completed') return evidence.result as AgentResult;
+    if (evidence.status === 'completed') return this._completedEvidenceResult(evidence);
     if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
     return this._awaitDurableSignalResult({ signalId }, abortSignal, { waitIndefinitely: true });
+  }
+
+  /**
+   * The result a completed durable evidence row reports. A row whose content a
+   * session delete erased (PF-5309) still proves completion but has no result:
+   * it fails with a typed error instead of resolving as an empty success.
+   */
+  private _completedEvidenceResult(evidence: { signalId: string; result: unknown; erased?: true }): AgentResult {
+    if (evidence.erased === true) throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
+    return evidence.result as AgentResult;
   }
 
   private _computeMessageAdmissionHashes(
@@ -12044,7 +12056,7 @@ export class Session {
       if (!latest || !('status' in latest)) {
         throw new HarnessValidationError('signal().admissionId', 'duplicate signal result evidence has expired');
       }
-      if (latest.status === 'completed') return latest.result as AgentResult;
+      if (latest.status === 'completed') return this._completedEvidenceResult(latest);
       if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
       if (deadline !== undefined && Date.now() >= deadline) {
         throw new HarnessValidationError('signal().admissionId', 'pending signal admission is not live');
@@ -12077,7 +12089,7 @@ export class Session {
 
     let result: Promise<AgentResult>;
     if (evidence.status === 'completed') {
-      result = Promise.resolve(evidence.result as AgentResult);
+      result = Promise.resolve().then(() => this._completedEvidenceResult(evidence));
     } else if (evidence.status === 'failed') {
       result = Promise.reject(publicErrorProjectionToError(evidence.error));
     } else {

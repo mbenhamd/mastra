@@ -1406,6 +1406,15 @@ describe('HarnessPG native terminal handoff', () => {
         executionGrant: input.executionGrant,
       }),
     ).resolves.toMatchObject({ status: 'committed', seed: null, seedHash: committed.admission.seedHash });
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
     await expect(harness().admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'fenced' });
     // The late acknowledgement of the claimed intent resolves as fenced: the
     // payload hash it validates is kept.
@@ -1436,6 +1445,29 @@ describe('HarnessPG native terminal handoff', () => {
         signalId: input.signalId,
       }),
     ).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {
+    const session = await createNativeSession(harness(), 'session-delete-acked');
+    const input = admissionFor(session, 'delete-acked');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    expect((await harness().commitTerminalHandoff(commitInput(input, 'delete-acked'))).status).toBe('committed');
+    const claimed = await claimFirst(harness(), 'delivery-worker-1', Date.now());
+    const identity = claimIdentityOf(claimed, 'delivery-worker-1');
+    await expect(harness().ackTerminalIntent(identity)).resolves.toMatchObject({ status: 'acked' });
+
+    await harness().deleteSession({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      ifVersion: session.version,
+      expectedResourceId: session.resourceId,
+      expectedThreadId: session.threadId,
+      expectedCreatedAt: session.createdAt,
+    });
+
+    // A consumer retrying its lost ack still gets the duplicate receipt.
+    await expect(harness().ackTerminalIntent(identity)).resolves.toMatchObject({ status: 'duplicate' });
   });
 
   it('reports terminal handoff as unsupported and rejects terminal operations when disabled', async () => {

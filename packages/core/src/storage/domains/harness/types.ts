@@ -1011,7 +1011,18 @@ export type AgentSignalDispatchState =
 
 export type AgentSignalResultStatus = (
   | { status: 'pending'; signalId: string; runId?: string }
-  | { status: 'completed'; signalId: string; runId: string; result: unknown }
+  | {
+      status: 'completed';
+      signalId: string;
+      runId: string;
+      result: unknown;
+      /**
+       * PF-5309: the session was deleted and the result content erased; the
+       * row only proves the turn completed. Readers must not report it as a
+       * successful (empty) result.
+       */
+      erased?: true;
+    }
   | { status: 'failed'; signalId: string; runId?: string; error: HarnessStoredPublicError }
 ) & {
   modeId?: string;
