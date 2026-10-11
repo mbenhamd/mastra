@@ -395,6 +395,11 @@ describe('Harness subagent outcome terminal contract', () => {
       reclaimsCitedRun: resultFor([{ ...pythonClaim, toolCallId: 'call_py' }, pythonClaim], ranOnce),
       // An id that is not in the ledger, such as a sandbox request id.
       unknownId: resultFor([{ ...pythonClaim, toolCallId: 'sandbox-request-7' }], ranOnce),
+      // A bound id must still satisfy the report schema's id limit.
+      oversizedLedgerId: resultFor(
+        [pythonClaim],
+        [{ toolCallId: 'x'.repeat(1_025), toolName: 'run_python_analysis', status: 'success' }],
+      ),
       // A call whose recorded receipts disagree is never bound by name.
       ambiguousCall: resultFor(
         [pythonClaim],
