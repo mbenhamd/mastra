@@ -2777,6 +2777,30 @@ export class HarnessPG extends HarnessStorage {
           deletionNow,
         );
       }
+      // An outbox row can name two sessions (session_id and owning_session_id),
+      // so two batch deletes of disjoint sessions can share outbox rows. Lock
+      // the batch's outbox rows once, in id order, before the per-session
+      // deletes below take them one session at a time; otherwise each batch
+      // could hold one shared row and wait for the other's.
+      const outboxSessionsByNamespace = new Map<string, string[]>();
+      for (const { namespace, sessionId } of deleteCandidates.values()) {
+        const ids = outboxSessionsByNamespace.get(namespace) ?? [];
+        ids.push(sessionId);
+        outboxSessionsByNamespace.set(namespace, ids);
+      }
+      for (const [namespace, ids] of [...outboxSessionsByNamespace.entries()].sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0,
+      )) {
+        const placeholders = ids.map(() => '?').join(', ');
+        await tx.execute({
+          sql: `SELECT id FROM ${TABLE_HARNESS_CHANNEL_OUTBOX}
+                WHERE harness_name = ?
+                  AND (session_id IN (${placeholders}) OR owning_session_id IN (${placeholders}))
+                ORDER BY id
+                FOR UPDATE`,
+          args: [namespace, ...ids, ...ids],
+        });
+      }
       for (const {
         namespace,
         sessionId,

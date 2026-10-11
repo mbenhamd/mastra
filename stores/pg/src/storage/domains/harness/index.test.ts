@@ -1524,6 +1524,42 @@ describe('HarnessPG', () => {
       await deletingBatch;
       await expect(harness.loadSession({ sessionId: 'lock-c1' })).resolves.toBeNull();
       await expect(harness.loadSession({ sessionId: 'lock-c2' })).resolves.toBeNull();
+
+      // D: two batch deletes of disjoint sessions share outbox rows (an outbox
+      // row names a session and its owning session). Each batch locks its
+      // outbox rows in id order before deleting them, so the batch holding the
+      // first shared row never waits for a row the other batch holds. `other`
+      // plays the [lock-d3, lock-d4] batch, which locks outbox-d-y first.
+      for (const id of ['lock-d1', 'lock-d2', 'lock-d3', 'lock-d4']) await saveClosedSession(id);
+      await harness.enqueueChannelOutbox(
+        sampleChannelOutbox({
+          id: 'outbox-d-z',
+          idempotencyKey: 'outbox-d-z',
+          sessionId: 'lock-d1',
+          owningSessionId: 'lock-d4',
+        }),
+      );
+      await harness.enqueueChannelOutbox(
+        sampleChannelOutbox({
+          id: 'outbox-d-y',
+          idempotencyKey: 'outbox-d-y',
+          sessionId: 'lock-d2',
+          owningSessionId: 'lock-d3',
+        }),
+      );
+      const disjoint = [await guard('lock-d1'), await guard('lock-d2')];
+      await other.query('BEGIN');
+      await other.query(`SELECT 1 FROM mastra_harness_channel_outbox WHERE id = 'outbox-d-y' FOR UPDATE`);
+      const deletingDisjoint = harness.deleteSessions({ sessions: disjoint });
+      pending.push(deletingDisjoint);
+      await blockedByOther();
+      await expect(
+        other.query(`SELECT 1 FROM mastra_harness_channel_outbox WHERE id = 'outbox-d-z' FOR UPDATE`),
+      ).resolves.toMatchObject({ rowCount: 1 });
+      await other.query('COMMIT');
+      await deletingDisjoint;
+      await expect(ledgerRows('lock-d1')).resolves.toEqual(noRows);
+      await expect(ledgerRows('lock-d2')).resolves.toEqual(noRows);
     } finally {
       // Release any lock still held, then let the blocked operation finish
       // before the next test runs.
