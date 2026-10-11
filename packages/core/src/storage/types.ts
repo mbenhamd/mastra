@@ -2438,6 +2438,14 @@ export interface RetractObservationalMemoryInput {
   threadId: string;
   /** @internal Replaces the captured predecessor with an idempotent successor row. */
   sourceWriteSuccessor?: ObservationalMemorySourceWriteSuccessor;
+  /**
+   * @internal The caller's memory policy has the observer manage working memory
+   * at this scope. A retracted record without its own managed-scope marker
+   * (written before the marker existed) is retracted as if it carried this
+   * scope, in the same storage mutation. Omitted, an unmarked record leaves
+   * working memory untouched.
+   */
+  managedWorkingMemoryScope?: 'thread' | 'resource';
 }
 
 export interface RetractObservationalMemoryResult {

@@ -408,6 +408,59 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
     ).rejects.toThrow('captured observational memory predecessor');
   });
 
+  it('clears unmarked observer working memory inside a deletion only under the caller policy', async () => {
+    const storage = new InMemoryStore({ id: 'memory-observational-policy-managed-delete' });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('Expected in-memory storage domain.');
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const threadId = 'policy-thread';
+    const resourceId = 'policy-resource';
+    await memory.saveThread({
+      thread: { id: threadId, resourceId, title: '', metadata: {}, createdAt, updatedAt: createdAt },
+    });
+    await memory.saveMessages({
+      messages: ['policy-deleted', 'policy-kept'].map(id => ({
+        id,
+        threadId,
+        resourceId,
+        role: 'user' as const,
+        content: { format: 2 as const, parts: [{ type: 'text' as const, text: id }] },
+        createdAt,
+      })),
+    });
+    const seed = async (workingMemory: string) => {
+      const record = await memory.initializeObservationalMemory({
+        threadId: null,
+        resourceId,
+        scope: 'resource',
+        config: {},
+      });
+      await memory.updateResourceFromObservationalMemory({
+        resourceId,
+        workingMemory,
+        guard: { recordId: record.id, threadId: null, resourceId },
+      });
+    };
+
+    // Without the policy an unmarked record leaves working memory alone.
+    await seed('{"codeword":"KEPT"}');
+    await memory.deleteMessages(['policy-kept'], { retractObservationalMemory: true });
+    await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({
+      workingMemory: '{"codeword":"KEPT"}',
+    });
+
+    await seed('{"codeword":"KESTREL"}');
+    const receipts: Array<{ result: { clearedResourceWorkingMemory: boolean } }> = [];
+    await memory.deleteMessages(['policy-deleted'], {
+      retractObservationalMemory: true,
+      managedWorkingMemoryScope: 'resource',
+      observationalMemoryRetractions: receipts as any,
+    });
+    expect(receipts).toMatchObject([{ result: { clearedResourceWorkingMemory: true } }]);
+    await expect(memory.getResourceById({ resourceId })).resolves.toMatchObject({ workingMemory: undefined });
+    await expect(memory.getObservationalMemory(null, resourceId)).resolves.toBeNull();
+  });
+
   it('does not clear sibling thread memory when a resource record owns only resource memory', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-retraction-mixed-scope' });
     const memory = await storage.getStore('memory');

@@ -344,6 +344,8 @@ export abstract class MemoryStorage extends StorageDomain {
     _options?: {
       /** @internal See updateMessages.retractObservationalMemory. */
       retractObservationalMemory?: boolean;
+      /** @internal See RetractObservationalMemoryInput.managedWorkingMemoryScope. */
+      managedWorkingMemoryScope?: 'thread' | 'resource';
       /** @internal Receives retractions only after the deletion commits. */
       observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
     },
