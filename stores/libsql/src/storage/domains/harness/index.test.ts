@@ -1788,6 +1788,38 @@ describe('HarnessLibSQL message result evidence', () => {
     ).resolves.toMatchObject({ status: 'completed', erased: true });
   });
 
+  it("erases a deleted session id's results kept under another thread scope (PF-5309)", async () => {
+    await storage.saveSession(sampleSession({ id: 'session-scope', threadId: 'thread-scope-a' }), {
+      ownerId: 'h',
+      ifVersion: 0,
+    });
+    // A result recorded under another thread scope of the same session id.
+    await storage.writeMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-scope',
+      resourceId: 'resource-1',
+      threadId: 'thread-scope-b',
+      signalId: 'signal-scope-b',
+      runId: 'run-scope-b',
+      status: 'completed',
+      result: { text: 'other scope secret' },
+      createdAt: 1000,
+      updatedAt: 2000,
+    });
+    const record = await storage.loadSession({ sessionId: 'session-scope' });
+    if (!record) throw new Error('expected the session');
+    await storage.deleteSession({ sessionId: record.id, ifVersion: record.version });
+    const kept = await storage.loadMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-scope',
+      resourceId: 'resource-1',
+      threadId: 'thread-scope-b',
+      signalId: 'signal-scope-b',
+    });
+    expect(kept).toMatchObject({ status: 'completed', erased: true });
+    expect(JSON.stringify(kept)).not.toContain('other scope secret');
+  });
+
   it('stores retained message evidence and resolves duplicate/conflict admissions', async () => {
     await expect(
       storage.writeMessageResultEvidence({

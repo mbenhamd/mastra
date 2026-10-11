@@ -1163,6 +1163,22 @@ export class HarnessLibSQL extends HarnessStorage {
                 WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
           args: [namespace, sessionId, resourceId, threadId],
         });
+        // PF-5309: a result kept under another resource or thread scope of the
+        // same session id loses its content too (PG and in-memory do the same).
+        await tx.execute({
+          sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+                SET result = NULL,
+                    error = CASE WHEN status = 'completed' THEN ? ELSE NULL END
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [
+            JSON.stringify({
+              code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
+              message: 'The result was erased with its session',
+            }),
+            namespace,
+            sessionId,
+          ],
+        });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_OPERATION_TOMBSTONES}
                 WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
