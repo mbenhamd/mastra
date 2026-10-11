@@ -1412,21 +1412,23 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 // text here - let the outer MastraModelOutput handle it
 
                 if (terminalCommit) {
+                  // The terminal part is identified by its framework part id, not by
+                  // the id of the message that carries it: a final output processor
+                  // may re-identify the response message (for example a memory
+                  // processor that stamps a deterministic storage id). The response
+                  // must still hold exactly one terminal part, and it must be this one.
                   const persistedParts = self.messageList.get.response
                     .db()
                     .flatMap(message =>
-                      message.id === terminalCommit.stepFinishChunk.payload.messageId &&
-                      typeof message.content === 'object' &&
-                      Array.isArray(message.content.parts)
-                        ? message.content.parts.filter(
-                            part =>
-                              part.type === 'data-terminal-tool-result' &&
-                              'id' in part &&
-                              part.id === terminalCommit.dataChunk.id,
-                          )
+                      typeof message.content === 'object' && Array.isArray(message.content.parts)
+                        ? message.content.parts.filter(part => part.type === 'data-terminal-tool-result')
                         : [],
                     );
-                  if (persistedParts.length !== 1) {
+                  if (
+                    persistedParts.length !== 1 ||
+                    !('id' in persistedParts[0]!) ||
+                    persistedParts[0].id !== terminalCommit.dataChunk.id
+                  ) {
                     throw new TypeError('Final output processors did not retain exactly one terminal tool result');
                   }
                   const persistedTerminal = terminalSignature((persistedParts[0] as { data?: unknown }).data);

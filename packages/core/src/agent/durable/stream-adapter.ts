@@ -184,17 +184,19 @@ export function createTerminalToolResultEnvelope(
 /**
  * Re-assert the exact terminal marker after every final output processor has
  * run. Pass-through declarations are an eligibility gate, not proof that a
- * processor retained the authoritative message unchanged.
+ * processor retained the authoritative message unchanged. The marker is
+ * identified by its framework part id across the response, because a final
+ * output processor may re-identify the message that carries it (for example a
+ * memory processor that stamps a deterministic storage id).
  */
 export function assertTerminalToolResultRetained(
   messageList: MessageList,
-  messageId: string,
   envelope: ReturnType<typeof createTerminalToolResultEnvelope>,
 ): void {
   const terminalParts = messageList.get.response
     .db()
     .flatMap(message =>
-      message.id === messageId && typeof message.content === 'object' && Array.isArray(message.content.parts)
+      typeof message.content === 'object' && Array.isArray(message.content.parts)
         ? message.content.parts.filter(part => part.type === 'data-terminal-tool-result')
         : [],
     ) as Array<{ type: 'data-terminal-tool-result'; id: string; data: unknown }>;
