@@ -175,6 +175,7 @@ import {
   HarnessSessionCorruptError,
   harnessSessionClosingError,
   HarnessSessionDeletedError,
+  HarnessMessageResultErasedError,
   HarnessSessionLockedError,
   HarnessStateConflictError,
   HarnessStateSerializationError,
@@ -10138,13 +10139,16 @@ export class Session {
           // A committed terminal admission must replay its durable receipt to
           // this retry's observers before reporting the stream as unavailable —
           // the throw below is not a substitute for the terminal outcome.
+          if (evidence.status === 'completed' && evidence.erased === true) {
+            await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
+          }
           if (
             evidence.status === 'completed' &&
             this._terminalFinalizer !== undefined &&
             opts.executionAuthorityGrant !== undefined
           ) {
             await this._commitCachedDuplicateTerminal(
-              evidence.result as FullOutput<unknown>,
+              this._completedEvidenceResult(evidence) as FullOutput<unknown>,
               evidence,
               opts,
               activeDeleted,
@@ -10157,15 +10161,17 @@ export class Session {
           // A terminal caller still needs its durable receipt replayed — the
           // committed fast-path converges on the stored winner without
           // recomputing it.
+          if (evidence.erased === true) await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
+          const completedResult = this._completedEvidenceResult(evidence);
           if (this._terminalFinalizer !== undefined && opts.executionAuthorityGrant !== undefined) {
             await this._commitCachedDuplicateTerminal(
-              evidence.result as FullOutput<unknown>,
+              completedResult as FullOutput<unknown>,
               evidence,
               opts,
               activeDeleted,
             );
           }
-          return evidence.result as AgentResult;
+          return completedResult;
         }
         if (evidence.status === 'failed') {
           await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
@@ -10227,7 +10233,14 @@ export class Session {
             } catch (err) {
               // The admission may have committed a failed or interrupted
               // terminal meanwhile: replay its durable receipt to this retry.
-              await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
+              // A completed turn whose result a session delete erased mid-wait
+              // replays its completed receipt too (PF-5309).
+              await this._replayCommittedTerminalFailure(
+                evidence,
+                opts,
+                activeDeleted,
+                err instanceof HarnessMessageResultErasedError ? { includeCompleted: true } : {},
+              );
               throw err;
             }
             // The durable wait resolved because the admission committed — the
@@ -10322,6 +10335,7 @@ export class Session {
     evidence: AgentSignalResultEvidence,
     opts: MessageOptions,
     activeDeleted?: Promise<never>,
+    replay: { includeCompleted?: true } = {},
   ): Promise<void> {
     const grant = opts.executionAuthorityGrant;
     if (
@@ -10343,7 +10357,12 @@ export class Session {
         }),
         activeDeleted,
       );
-      if (admission?.status !== 'committed' || admission.terminalResult?.status === 'completed') return;
+      if (
+        admission?.status !== 'committed' ||
+        (replay.includeCompleted !== true && admission.terminalResult?.status === 'completed')
+      ) {
+        return;
+      }
       const intent = await this._raceActiveTurnWaiter(
         this._storage.loadTerminalIntent({
           harnessName: admission.harnessName,
@@ -10858,7 +10877,7 @@ export class Session {
         throw new HarnessValidationError('message().admissionId', 'duplicate message result evidence has expired');
       }
       if ('status' in latest) {
-        if (latest.status === 'completed') return latest.result as AgentResult;
+        if (latest.status === 'completed') return this._completedEvidenceResult(latest);
         if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
         // While canonical evidence stays pending, consult the durable terminal
         // admission each pass — a cancelled/fenced grant can never produce the
@@ -11684,9 +11703,35 @@ export class Session {
       if (local.status === 'completed') return local.result;
       throw local.error;
     }
-    if (evidence.status === 'completed') return evidence.result as AgentResult;
+    if (evidence.status === 'completed') return this._completedEvidenceResult(evidence);
     if (evidence.status === 'failed') throw publicErrorProjectionToError(evidence.error);
     return this._awaitDurableSignalResult({ signalId }, abortSignal, { waitIndefinitely: true });
+  }
+
+  /**
+   * A duplicate of a turn whose session was deleted (PF-5309): its result is
+   * erased, but its committed terminal receipt is still durable. Replay that
+   * receipt to the caller's terminal observers, then fail with the typed
+   * erased error, so no observer is left waiting and no caller sees an empty
+   * success.
+   */
+  private async _rejectErasedDuplicate(
+    evidence: AgentSignalResultEvidence & { status: 'completed' },
+    opts: MessageOptions,
+    activeDeleted?: Promise<never>,
+  ): Promise<never> {
+    await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted, { includeCompleted: true });
+    throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
+  }
+
+  /**
+   * The result a completed durable evidence row reports. A row whose content a
+   * session delete erased (PF-5309) still proves completion but has no result:
+   * it fails with a typed error instead of resolving as an empty success.
+   */
+  private _completedEvidenceResult(evidence: { signalId: string; result: unknown; erased?: true }): AgentResult {
+    if (evidence.erased === true) throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
+    return evidence.result as AgentResult;
   }
 
   private _computeMessageAdmissionHashes(
@@ -12094,7 +12139,7 @@ export class Session {
       if (!latest || !('status' in latest)) {
         throw new HarnessValidationError('signal().admissionId', 'duplicate signal result evidence has expired');
       }
-      if (latest.status === 'completed') return latest.result as AgentResult;
+      if (latest.status === 'completed') return this._completedEvidenceResult(latest);
       if (latest.status === 'failed') throw publicErrorProjectionToError(latest.error);
       if (deadline !== undefined && Date.now() >= deadline) {
         throw new HarnessValidationError('signal().admissionId', 'pending signal admission is not live');
@@ -12127,7 +12172,7 @@ export class Session {
 
     let result: Promise<AgentResult>;
     if (evidence.status === 'completed') {
-      result = Promise.resolve(evidence.result as AgentResult);
+      result = Promise.resolve().then(() => this._completedEvidenceResult(evidence));
     } else if (evidence.status === 'failed') {
       result = Promise.reject(publicErrorProjectionToError(evidence.error));
     } else {

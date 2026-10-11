@@ -281,6 +281,22 @@ export class HarnessSessionDeletedError extends Error {
   }
 }
 
+/**
+ * PF-5309: a duplicate or waiting caller asked for a turn's result after its
+ * session was deleted. The durable row still proves the turn completed, but its
+ * content was erased with the session, so there is no result to return.
+ */
+export class HarnessMessageResultErasedError extends HarnessError {
+  readonly name = 'HarnessMessageResultErasedError';
+  readonly code = 'harness.message_result_erased';
+  constructor(
+    public readonly sessionId: string,
+    public readonly signalId: string,
+  ) {
+    super(`The result of signal "${signalId}" was erased with session "${sessionId}"`);
+  }
+}
+
 export type HarnessSessionCorruptReason =
   | 'parse_failed'
   | 'schema_incompatible'

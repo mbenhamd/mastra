@@ -1763,6 +1763,85 @@ describe('HarnessLibSQL message result evidence', () => {
     await storage.init();
   });
 
+  it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
+    await storage.writeMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-erased',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      signalId: 'signal-erased',
+      runId: 'run-erased',
+      status: 'completed',
+      result: undefined,
+      erased: true,
+      createdAt: 1000,
+      updatedAt: 2000,
+    });
+    await expect(
+      storage.loadMessageResultEvidence({
+        harnessName: 'default',
+        sessionId: 'session-erased',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        signalId: 'signal-erased',
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+  });
+
+  it("erases a deleted session id's results kept under another thread scope (PF-5309)", async () => {
+    await storage.saveSession(sampleSession({ id: 'session-scope', threadId: 'thread-scope-a' }), {
+      ownerId: 'h',
+      ifVersion: 0,
+    });
+    // A result recorded under another thread scope of the same session id.
+    await storage.writeMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-scope',
+      resourceId: 'resource-1',
+      threadId: 'thread-scope-b',
+      signalId: 'signal-scope-b',
+      runId: 'run-scope-b',
+      status: 'completed',
+      result: { text: 'other scope secret' },
+      createdAt: 1000,
+      updatedAt: 2000,
+    });
+    // Another session's result in the same harness stays untouched.
+    await storage.writeMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-other',
+      resourceId: 'resource-1',
+      threadId: 'thread-scope-b',
+      signalId: 'signal-other',
+      runId: 'run-other',
+      status: 'completed',
+      result: { text: 'other session result' },
+      createdAt: 1000,
+      updatedAt: 2000,
+    });
+    const record = await storage.loadSession({ sessionId: 'session-scope' });
+    if (!record) throw new Error('expected the session');
+    await storage.deleteSession({ sessionId: record.id, ifVersion: record.version });
+    const kept = await storage.loadMessageResultEvidence({
+      harnessName: 'default',
+      sessionId: 'session-scope',
+      resourceId: 'resource-1',
+      threadId: 'thread-scope-b',
+      signalId: 'signal-scope-b',
+    });
+    expect(kept).toMatchObject({ status: 'completed', erased: true });
+    expect(JSON.stringify(kept)).not.toContain('other scope secret');
+    await expect(
+      storage.loadMessageResultEvidence({
+        harnessName: 'default',
+        sessionId: 'session-other',
+        resourceId: 'resource-1',
+        threadId: 'thread-scope-b',
+        signalId: 'signal-other',
+      }),
+    ).resolves.toMatchObject({ status: 'completed', result: { text: 'other session result' } });
+  });
+
   it('stores retained message evidence and resolves duplicate/conflict admissions', async () => {
     await expect(
       storage.writeMessageResultEvidence({
@@ -2686,9 +2765,13 @@ describe('HarnessLibSQL channel inbox ledger', () => {
     });
 
     await expect(indexNames(client, TABLE_HARNESS_CHANNEL_INBOX)).resolves.toEqual(
-      expect.arrayContaining(['idx_harness_channel_inbox_idempotency', 'idx_harness_channel_inbox_claim']),
+      expect.arrayContaining([
+        'idx_harness_channel_inbox_idempotency',
+        'idx_harness_channel_inbox_claim',
+        'idx_harness_channel_inbox_session',
+      ]),
     );
-    expect(indexCreateStatements(executeSpy.mock.calls)).toHaveLength(2);
+    expect(indexCreateStatements(executeSpy.mock.calls)).toHaveLength(3);
   });
 
   it('flags same idempotency key with a different payload hash as a conflict', async () => {
@@ -3089,9 +3172,10 @@ describe('HarnessLibSQL wakeup ledger', () => {
         'idx_harness_wakeups_idempotency',
         'idx_harness_wakeups_source_fire',
         'idx_harness_wakeups_claim',
+        'idx_harness_wakeups_session',
       ]),
     );
-    expect(indexCreateStatements(executeSpy.mock.calls, 'idx_harness_wakeups_')).toHaveLength(3);
+    expect(indexCreateStatements(executeSpy.mock.calls, 'idx_harness_wakeups_')).toHaveLength(4);
   });
 
   it('flags same idempotency key with a different payload as a conflict', async () => {

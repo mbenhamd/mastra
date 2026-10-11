@@ -1342,6 +1342,16 @@ describe('HarnessPG native terminal handoff', () => {
     await harness().admitTerminalHandoff(input);
     const committed = await harness().commitTerminalHandoff(commitInput(input, 'delete-evidence'));
     expect(committed.status).toBe('committed');
+    // A delivery worker holds a claim on the intent when the session is deleted.
+    const claimed = await claimFirst(harness(), 'delivery-worker-1', Date.now());
+    // A revoked grant of the session leaves a tombstone; its reason message is not kept.
+    await harness().revokeTerminalGrant({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      admissionId: 'admission-revoked',
+      executionGrant: { key: 'grant-revoked-delete-evidence', generation: 1 },
+      reason: { code: 'harness.terminal_cancelled', message: 'private revoke note' },
+    });
 
     await harness().deleteSession({
       harnessName: HARNESS,
@@ -1370,6 +1380,58 @@ describe('HarnessPG native terminal handoff', () => {
     expect(replay.status).toBe('duplicate');
     expect(replay.intent?.id).toBe(committed.intent!.id);
 
+    // PF-5309: what stays is content-free. No retained row (admission, intent,
+    // message result) still holds the provider output, the projection payload
+    // or the admission seed, while identity, status and hashes still resolve
+    // the committed replay above and refuse a late admission.
+    for (const table of [
+      TABLE_HARNESS_TERMINAL_ADMISSIONS,
+      TABLE_HARNESS_TERMINAL_INTENTS,
+      'mastra_harness_message_results',
+    ]) {
+      const content = await store.db.one<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM "${schemaName}"."${table}" t
+          WHERE row_to_json(t)::text LIKE '%provider output delete-evidence%'
+             OR row_to_json(t)::text LIKE '%done delete-evidence%'
+             OR row_to_json(t)::text LIKE '%\\"mode\\":\\"build\\"%'
+             OR row_to_json(t)::text LIKE '%"mode":"build"%'`,
+      );
+      expect({ table, count: Number(content.count) }).toEqual({ table, count: 0 });
+    }
+    await expect(
+      harness().loadTerminalAdmission({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        admissionId: input.admissionId,
+        executionGrant: input.executionGrant,
+      }),
+    ).resolves.toMatchObject({ status: 'committed', seed: null, seedHash: committed.admission.seedHash });
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+    await expect(harness().admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'fenced' });
+    // The late acknowledgement of the claimed intent resolves as fenced: the
+    // payload hash it validates is kept.
+    await expect(harness().ackTerminalIntent(claimIdentityOf(claimed, 'delivery-worker-1'))).resolves.toMatchObject({
+      status: 'fenced',
+    });
+    const claimedConsumer = await store.db.one<{ consumer_id: string | null }>(
+      `SELECT consumer_id FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" WHERE id = $1`,
+      [claimed.id],
+    );
+    expect(claimedConsumer.consumer_id).toBeNull();
+    const tombstoneNote = await store.db.one<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}"
+        WHERE reason_json LIKE '%private revoke note%'`,
+    );
+    expect(Number(tombstoneNote.count)).toBe(0);
+
     // Evidence bound to a committed admission also survives the per-signal
     // tombstone cleanup that post-delete bookkeeping runs.
     await harness().deleteOperationAdmissionTombstonesForSession({
@@ -1388,6 +1450,195 @@ describe('HarnessPG native terminal handoff', () => {
         signalId: input.signalId,
       }),
     ).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('deletes a session whose terminal rows hold NUL text or extra fields, keeping only allowed metadata (PF-5309)', async () => {
+    const remaining = async (sessionId: string) =>
+      JSON.stringify(
+        await store.db.any(
+          `SELECT a.terminal_result_json AS admission_result, a.projection_json AS admission_projection,
+                  i.terminal_result_json AS intent_result, i.projection_json AS intent_projection
+             FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_ADMISSIONS}" a
+             JOIN "${schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" i ON i.session_id = a.session_id AND i.admission_id = a.admission_id
+            WHERE a.session_id = $1`,
+          [sessionId],
+        ),
+      );
+    for (const mode of ['nul-payload', 'nul-error', 'extra-field', 'malformed-error'] as const) {
+      const session = await createNativeSession(harness(), `session-redact-${mode}`);
+      const input = admissionFor(session, `redact-${mode}`);
+      await harness().writeMessageResultEvidence(pendingEvidence(input));
+      await harness().admitTerminalHandoff(input);
+      const base = commitInput(input, `redact-${mode}`);
+      const committed = await harness().commitTerminalHandoff({
+        ...base,
+        ...(mode === 'nul-payload'
+          ? { projection: { ...base.projection, payload: { text: 'private\u0000payload' } } }
+          : {}),
+        ...(mode === 'nul-error'
+          ? {
+              resultEvidence: {
+                ...pendingEvidence(input),
+                status: 'failed' as const,
+                error: { code: 'harness.message_failed', message: 'failed' },
+                updatedAt: Date.now(),
+              },
+              terminalResult: {
+                status: 'failed' as const,
+                runId: input.runId,
+                completedAt: Date.now(),
+                error: { code: 'provider.error', message: 'private\u0000error' },
+              },
+            }
+          : {}),
+        ...(mode === 'extra-field'
+          ? {
+              terminalResult: {
+                ...base.terminalResult,
+                providerOutput: 'private output',
+              } as typeof base.terminalResult,
+            }
+          : {}),
+      });
+      expect(committed.status).toBe('committed');
+      // The private text really is stored before the delete.
+      if (mode !== 'malformed-error') expect(await remaining(session.id)).toContain('private');
+      if (mode === 'malformed-error') {
+        // A stored result whose error is not an object (written outside the API).
+        for (const table of [TABLE_HARNESS_TERMINAL_ADMISSIONS, TABLE_HARNESS_TERMINAL_INTENTS]) {
+          await store.db.none(
+            `UPDATE "${schemaName}"."${table}"
+                SET terminal_result_json = '{"status":"completed","runId":"run","completedAt":1,"error":null,"note":"private"}'
+              WHERE session_id = $1`,
+            [session.id],
+          );
+        }
+      }
+
+      // The delete succeeds (no jsonb cast can reject the stored text) and
+      // keeps only the allowed metadata.
+      await harness().deleteSession({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        ifVersion: session.version,
+        expectedResourceId: session.resourceId,
+        expectedThreadId: session.threadId,
+        expectedCreatedAt: session.createdAt,
+      });
+      const left = await remaining(session.id);
+      expect(left).not.toContain('private');
+      expect(left).toContain(committed.intent!.projection.payloadHash);
+      if (mode === 'nul-error') expect(left).toContain('provider.error');
+    }
+  });
+
+  it("erases a deleted session id's results kept under another thread scope (PF-5309)", async () => {
+    const session = await createNativeSession(harness(), 'session-other-scope');
+    await harness().writeMessageResultEvidence({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: 'thread-other-scope',
+      signalId: 'signal-other-scope',
+      runId: 'run-other-scope',
+      status: 'completed',
+      result: { text: 'other scope secret' },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    await harness().deleteSession({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      ifVersion: session.version,
+      expectedResourceId: session.resourceId,
+      expectedThreadId: session.threadId,
+      expectedCreatedAt: session.createdAt,
+    });
+    const kept = await harness().loadMessageResultEvidence({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: 'thread-other-scope',
+      signalId: 'signal-other-scope',
+    });
+    expect(kept).toMatchObject({ status: 'completed', erased: true });
+    expect(JSON.stringify(kept)).not.toContain('other scope secret');
+  });
+
+  it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
+    const session = await createNativeSession(harness(), 'session-erased-roundtrip');
+    const input = admissionFor(session, 'erased-roundtrip');
+    await harness().writeMessageResultEvidence({
+      ...pendingEvidence(input),
+      status: 'completed',
+      runId: input.runId,
+      result: undefined,
+      erased: true,
+    });
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+    // An erased completion never stores a result, and a completed record that
+    // merely carries the marker code as an error is not read back as erased.
+    const both = admissionFor(session, 'erased-with-result');
+    await harness().writeMessageResultEvidence({
+      ...pendingEvidence(both),
+      status: 'completed',
+      runId: both.runId,
+      result: { text: 'must not be stored' },
+      erased: true,
+    });
+    const stored = await store.db.one<{ result: unknown }>(
+      `SELECT result FROM "${schemaName}"."mastra_harness_message_results" WHERE signal_id = $1`,
+      [both.signalId],
+    );
+    expect(stored.result).toBeNull();
+    const lookalike = admissionFor(session, 'erased-lookalike');
+    await harness().writeMessageResultEvidence({
+      ...pendingEvidence(lookalike),
+      status: 'completed',
+      runId: lookalike.runId,
+      result: { text: 'real result' },
+      error: { code: 'harness.message_result_erased', message: 'not erased' },
+    } as AgentSignalResultEvidence);
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: lookalike.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', result: { text: 'real result' } });
+  });
+
+  it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {
+    const session = await createNativeSession(harness(), 'session-delete-acked');
+    const input = admissionFor(session, 'delete-acked');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    expect((await harness().commitTerminalHandoff(commitInput(input, 'delete-acked'))).status).toBe('committed');
+    const claimed = await claimFirst(harness(), 'delivery-worker-1', Date.now());
+    const identity = claimIdentityOf(claimed, 'delivery-worker-1');
+    await expect(harness().ackTerminalIntent(identity)).resolves.toMatchObject({ status: 'acked' });
+
+    await harness().deleteSession({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      ifVersion: session.version,
+      expectedResourceId: session.resourceId,
+      expectedThreadId: session.threadId,
+      expectedCreatedAt: session.createdAt,
+    });
+
+    // A consumer retrying its lost ack still gets the duplicate receipt.
+    await expect(harness().ackTerminalIntent(identity)).resolves.toMatchObject({ status: 'duplicate' });
   });
 
   it('reports terminal handoff as unsupported and rejects terminal operations when disabled', async () => {

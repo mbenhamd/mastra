@@ -72,7 +72,9 @@ describe('native session record projection', () => {
     });
     const incarnation = created.record.sessionIncarnation;
     expect(incarnation).toBeTruthy();
-    const firstNow = Date.now() + 1;
+    // Ahead of every write below, so a slow run cannot place an intent after
+    // the claim clock (the intents are stamped with the wall clock).
+    const firstNow = Date.now() + 10_000;
 
     const firstClaim = await storage.claimSessionRecordProjectionIntents({
       claimId: 'claim-1',
@@ -127,6 +129,12 @@ describe('native session record projection', () => {
         acknowledgedAt: firstNow + 5,
       }),
     ).resolves.toMatchObject({ status: 'fenced' });
+    // PF-5309: the intents keep revision and digest but not the post-image.
+    const retained = [...db.harnessSessionRecordProjectionIntents.values()].filter(
+      intent => intent.sessionId === record.id,
+    );
+    expect(retained.map(intent => intent.revision).sort()).toEqual([1, 2]);
+    expect(retained.every(intent => intent.payload === undefined && intent.payloadDigest.length > 0)).toBe(true);
 
     const recreated = await storage.saveSession(sampleSession({}), { ownerId: 'owner-2', ifVersion: 0 });
     expect(recreated.version).toBe(1);
@@ -135,7 +143,7 @@ describe('native session record projection', () => {
     expect(recreatedRecord?.sessionIncarnation).not.toBe(incarnation);
   });
 
-  it('rejects invalid projection inputs and fails closed on legacy rows without provenance', async () => {
+  it('rejects invalid projection inputs and repairs legacy rows without provenance on load', async () => {
     expect(() =>
       buildHarnessSessionRecordPostImage(sampleSession({ id: 'x'.repeat(1025) }), { maxPayloadBytes: 64 * 1024 }),
     ).toThrow(RangeError);
@@ -160,8 +168,11 @@ describe('native session record projection', () => {
     const legacy = new InMemoryHarness({ db });
     await legacy.saveSession(sampleSession(), { ownerId: 'legacy-owner', ifVersion: 0 });
     const projected = new InMemoryHarness({ db, sessionRecordProjection: true });
+    // PF-4279: a legacy row without provenance is repaired on load (an
+    // incarnation is minted and stored), so the projected store can adopt it.
     const existing = await projected.loadSession({ sessionId: 'session-1' });
     if (!existing) throw new Error('expected legacy session');
+    expect(existing.sessionIncarnation).toBeTruthy();
     await expect(
       projected.saveSession(
         { ...existing, lastActivityAt: existing.lastActivityAt + 1 },
@@ -170,8 +181,25 @@ describe('native session record projection', () => {
           ifVersion: existing.version,
         },
       ),
+    ).resolves.toMatchObject({ version: existing.version + 1 });
+
+    // A legacy row that was never loaded through the projected store keeps no
+    // incarnation, so writing or deleting it without a load fails closed.
+    await legacy.saveSession(sampleSession({ id: 'session-unloaded', threadId: 'thread-unloaded' }), {
+      ownerId: 'legacy-owner',
+      ifVersion: 0,
+    });
+    const unloaded = db.harnessSessions.get(
+      [...db.harnessSessions.keys()].find(key => key.endsWith('session-unloaded'))!,
+    )!;
+    expect(unloaded.sessionIncarnation).toBeUndefined();
+    await expect(
+      projected.saveSession(
+        { ...unloaded, lastActivityAt: unloaded.lastActivityAt + 1 },
+        { ownerId: 'legacy-owner', ifVersion: unloaded.version },
+      ),
     ).rejects.toBeInstanceOf(HarnessStorageSessionProjectionIncarnationError);
-    await expect(projected.deleteSession({ sessionId: existing.id })).rejects.toBeInstanceOf(
+    await expect(projected.deleteSession({ sessionId: 'session-unloaded' })).rejects.toBeInstanceOf(
       HarnessStorageSessionProjectionIncarnationError,
     );
   });

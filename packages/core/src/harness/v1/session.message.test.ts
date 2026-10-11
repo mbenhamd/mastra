@@ -34,6 +34,7 @@ import {
   HarnessAdmissionConflictError,
   HarnessBusyError,
   HarnessConfigError,
+  HarnessMessageResultErasedError,
   HarnessOutputGenerationError,
   HarnessSessionLockedError,
   HarnessValidationError,
@@ -912,6 +913,92 @@ describe('Session.message() — default path', () => {
     expect(retry.text).toBe('done');
     expect(receipts).toEqual(['duplicate']);
     expect(agent.streamCalls).toHaveLength(1);
+  });
+
+  it('replays the receipt, then rejects typed, for a retry whose result a session delete erased (PF-5309)', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({
+      db,
+      terminalHandoff: { enabled: true },
+      sessionRecordProjection: { enabled: true },
+    });
+    const { harness } = setupHarness({
+      agents: { default: new MockAgent({ id: 'default', defaultOutput: { text: 'done' } }) },
+      sessions: {
+        storage,
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({ projectionKind: 'chat.summary', projectionId: 'response-1', payload: {} }),
+          },
+        },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const opts = {
+      content: 'once',
+      admissionId: 'erased-admission',
+      executionAuthorityGrant: { key: 'usage-claim-erased', generation: 1 },
+      terminalAdmissionSeed: { v: 1 },
+    } as const;
+    await session.message({ ...opts });
+    // Another instance deleted the session: the committed evidence row stays
+    // but its result is erased (as the delete leaves it).
+    for (const evidence of db.harnessMessageResultEvidence.values()) {
+      if (evidence.sessionId !== session.id || evidence.status !== 'completed') continue;
+      Object.assign(evidence, { result: undefined, erased: true });
+    }
+    (session as unknown as { _completedRuns: Map<string, unknown> })._completedRuns.clear();
+
+    const receipts: string[] = [];
+    await expect(
+      session.message({ ...opts, onTerminalCommit: receipt => receipts.push(receipt.status) }),
+    ).rejects.toBeInstanceOf(HarnessMessageResultErasedError);
+    expect(receipts).toEqual(['duplicate']);
+  });
+
+  it('replays the receipt, then rejects typed, for a stream retry whose result a session delete erased (PF-5309)', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({
+      db,
+      terminalHandoff: { enabled: true },
+      sessionRecordProjection: { enabled: true },
+    });
+    const { harness } = setupHarness({
+      agents: { default: new MockAgent({ id: 'default', defaultOutput: { text: 'streamed' } }) },
+      sessions: {
+        storage,
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({ projectionKind: 'chat.summary', projectionId: 'response-1', payload: {} }),
+          },
+        },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const opts = {
+      content: 'once streamed',
+      admissionId: 'erased-stream-admission',
+      executionAuthorityGrant: { key: 'usage-claim-erased-stream', generation: 1 },
+      terminalAdmissionSeed: { v: 1 },
+    } as const;
+    await session.message({ ...opts });
+    for (const evidence of db.harnessMessageResultEvidence.values()) {
+      if (evidence.sessionId !== session.id || evidence.status !== 'completed') continue;
+      Object.assign(evidence, { result: undefined, erased: true });
+    }
+    (session as unknown as { _completedRuns: Map<string, unknown> })._completedRuns.clear();
+
+    // The stream retry (the path PapersFlow uses) gets the durable receipt,
+    // then the typed erased error rather than an empty or stale result.
+    const receipts: string[] = [];
+    await expect(
+      session.message({ ...opts, stream: true, onTerminalCommit: receipt => receipts.push(receipt.status) }),
+    ).rejects.toBeInstanceOf(HarnessMessageResultErasedError);
+    expect(receipts).toEqual(['duplicate']);
   });
 
   it('notifies a live stream duplicate’s terminal observers when the winner commits', async () => {

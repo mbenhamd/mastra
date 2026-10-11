@@ -2,6 +2,7 @@ import {
   TABLE_HARNESS_ATTACHMENT_OPERATIONS,
   TABLE_HARNESS_ATTACHMENTS,
   TABLE_HARNESS_CHANNEL_INBOX,
+  TABLE_HARNESS_CHANNEL_OUTBOX,
   TABLE_HARNESS_RUN_SUMMARIES,
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_SESSION_EVENTS,
@@ -150,11 +151,18 @@ describe('PostgresStore Domain Performance Indexes', () => {
 
       const indexes = harness.getDefaultIndexDefinitions();
 
-      expect(indexes.length).toBe(44);
+      // 44 (with the run-summary index) + the six PF-5309 channel and wakeup
+      // session indexes.
+      expect(indexes.length).toBe(50);
       expect(indexes).toContainEqual({
         name: 'test_schema_idx_harness_run_summaries_session',
         table: TABLE_HARNESS_RUN_SUMMARIES,
         columns: ['harness_name', 'session_id', 'completed_at', 'run_id'],
+      });
+      expect(indexes).toContainEqual({
+        name: 'test_schema_idx_harness_channel_outbox_owning_session',
+        table: TABLE_HARNESS_CHANNEL_OUTBOX,
+        columns: ['harness_name', 'owning_session_id'],
       });
       expect(indexes).toContainEqual({
         name: 'test_schema_idx_harness_sessions_active_key',
@@ -304,7 +312,7 @@ describe('PostgresStore Domain Performance Indexes', () => {
         observability.getDefaultIndexDefinitions().length +
         harness.getDefaultIndexDefinitions().length;
 
-      expect(totalIndexes).toBe(57);
+      expect(totalIndexes).toBe(63);
     });
   });
 });

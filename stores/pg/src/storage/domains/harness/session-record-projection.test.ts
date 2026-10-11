@@ -44,6 +44,67 @@ describe('HarnessPG native session record projection', () => {
     await store.close();
   });
 
+  it('retires and erases projection intents when a store without projections deletes the session (PF-5309)', async () => {
+    // Intents written while projection was enabled; the deployment now runs
+    // without it and deletes the session.
+    const harness = store.stores.harness!;
+    await harness.saveSession(createSampleSessionRecord({ id: 'projection-disabled-delete' }), {
+      ownerId: 'owner-1',
+      ifVersion: 0,
+    });
+    // A projection worker holds a claim on the first intent when the session is deleted.
+    const [claim] = await harness.claimSessionRecordProjectionIntents({
+      claimId: 'claim-before-disabled-delete',
+      limit: 10,
+      now: Date.now() + 1_000,
+      claimTtlMs: 60_000,
+    });
+    if (!claim) throw new Error('expected a projection intent to claim');
+    const disabledStore = new PostgresStore({
+      ...TEST_CONFIG,
+      id: 'pg-harness-projection-disabled-delete-store',
+      schemaName,
+      enabledDomains: ['harness'],
+    });
+    try {
+      const disabled = disabledStore.stores.harness!;
+      const record = await disabled.loadSession({ sessionId: 'projection-disabled-delete' });
+      if (!record) throw new Error('expected the session');
+      await disabled.deleteSession({ sessionId: record.id, ifVersion: record.version });
+    } finally {
+      await disabledStore.close();
+    }
+    const rows = await store.db.manyOrNone<{ status: string; payload: unknown }>(
+      `SELECT status, payload FROM "${schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}"
+        WHERE session_id = $1`,
+      ['projection-disabled-delete'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    // Nothing is left to claim, and no post-image survives.
+    expect(rows.every(row => row.status === 'dead' && row.payload === null)).toBe(true);
+    // The delete closed the projection fence too: the late acknowledgement
+    // resolves as fenced instead of failing on its retired claim.
+    await expect(
+      harness.ackSessionRecordProjection({
+        operationId: claim.operationId,
+        sessionId: claim.sessionId,
+        sessionIncarnation: claim.sessionIncarnation,
+        revision: claim.revision,
+        payloadDigest: claim.payloadDigest,
+        claimId: 'claim-before-disabled-delete',
+        acknowledgedAt: Date.now() + 2_000,
+      }),
+    ).resolves.toMatchObject({ status: 'fenced' });
+    await expect(
+      harness.claimSessionRecordProjectionIntents({
+        claimId: 'after-delete',
+        limit: 10,
+        now: Date.now() + 1,
+        claimTtlMs: 60_000,
+      }),
+    ).resolves.toHaveLength(0);
+  });
+
   it('rolls back a session row when its post-image cannot be built', async () => {
     const harness = store.stores.harness!;
     const id = 'x'.repeat(1025);
@@ -229,6 +290,23 @@ describe('HarnessPG native session record projection', () => {
         acknowledgedAt: now + 6,
       }),
     ).resolves.toMatchObject({ status: 'fenced' });
+    // PF-5309: the retired and applied intents keep revision and digest (the
+    // fence above still refuses the late ack) but no longer hold the session
+    // post-image.
+    const retained = await store.db.manyOrNone<{ revision: number; payload_digest: string; payload: unknown }>(
+      `SELECT revision, payload_digest, payload FROM "${schemaName}".mastra_harness_session_projection_intents
+        WHERE session_id = $1 ORDER BY revision`,
+      [session.id],
+    );
+    expect(retained.map(row => row.revision)).toEqual([1, 2, 3]);
+    expect(retained.every(row => row.payload === null && row.payload_digest.length > 0)).toBe(true);
+    expect(
+      await store.db.one<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM "${schemaName}".mastra_harness_session_projection_intents
+          WHERE session_id = $1 AND last_error IS NOT NULL`,
+        [session.id],
+      ),
+    ).toEqual({ count: '0' });
 
     await harness.saveSession(createSampleSessionRecord({ id: session.id }), { ownerId: 'owner-2', ifVersion: 0 });
     const recreated = await harness.loadSession({ sessionId: session.id });

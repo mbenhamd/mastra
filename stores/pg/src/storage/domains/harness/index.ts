@@ -85,6 +85,11 @@ import {
   canonicalJson,
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
+  harnessTerminalSeedHash,
+  redactHarnessTerminalResult,
+  redactStoredHarnessTerminalProjection,
+  HARNESS_MESSAGE_RESULT_ERASED_CODE,
+  contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
   prepareHarnessTerminalAdmission,
   prepareHarnessTerminalProjection,
@@ -206,6 +211,7 @@ import type {
   HarnessTerminalQueuePressure,
   HarnessTerminalRenewReceipt,
   HarnessTerminalResult,
+  StoredHarnessTerminalProjection,
   HarnessTerminalProjection,
   HarnessTerminalAdmissionRecord,
   AckSessionRecordProjectionInput,
@@ -708,6 +714,39 @@ function harnessIndexDefs(schemaPrefix: string): CreateIndexOptions[] {
       name: harnessIndexName(schemaPrefix, 'idx_harness_wakeups_claim'),
       table: TABLE_HARNESS_WAKEUPS,
       columns: ['harness_name', 'source', 'status', 'due_at', 'next_attempt_at', 'claim_expires_at'],
+    },
+    // PF-5309: deleteSessions erases a session's channel and wakeup rows by
+    // session; these keep each erase (and listChannelDiagnosticsRows) off a
+    // full scan.
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_inbox_session'),
+      table: TABLE_HARNESS_CHANNEL_INBOX,
+      columns: ['harness_name', 'session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_outbox_session'),
+      table: TABLE_HARNESS_CHANNEL_OUTBOX,
+      columns: ['harness_name', 'session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_outbox_owning_session'),
+      table: TABLE_HARNESS_CHANNEL_OUTBOX,
+      columns: ['harness_name', 'owning_session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_action_tokens_owning_session'),
+      table: TABLE_HARNESS_CHANNEL_ACTION_TOKENS,
+      columns: ['harness_name', 'owning_session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_channel_action_receipts_owning_session'),
+      table: TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS,
+      columns: ['harness_name', 'owning_session_id'],
+    },
+    {
+      name: harnessIndexName(schemaPrefix, 'idx_harness_wakeups_session'),
+      table: TABLE_HARNESS_WAKEUPS,
+      columns: ['harness_name', 'session_id'],
     },
     {
       // listRunSummaries pages a session's summaries newest first, and
@@ -2244,14 +2283,17 @@ export class HarnessPG extends HarnessStorage {
     tx: PgHarnessClient,
     harnessName: string,
     sessionId: string,
-    sessionIncarnation: string,
+    sessionIncarnation: string | undefined,
     updatedAt: number,
   ): Promise<{ pendingIntents: number; pendingBytes: number }> {
+    // Without an incarnation every lifetime of the session id is retired
+    // (PF-5309: a delete erases all of them).
+    const incarnationPredicate = sessionIncarnation === undefined ? '' : ' AND session_incarnation = ?';
     const result = await tx.execute({
       sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
             SET status = ?, dead_at = ?, failed_at = ?, claim_id = NULL, claim_expires_at = NULL,
                 next_attempt_at = NULL, last_error = ?, updated_at = ?
-            WHERE harness_name = ? AND session_id = ? AND session_incarnation = ?
+            WHERE harness_name = ? AND session_id = ?${incarnationPredicate}
               AND status IN (?, ?, ?)
             RETURNING payload_bytes`,
       args: [
@@ -2262,7 +2304,7 @@ export class HarnessPG extends HarnessStorage {
         updatedAt,
         harnessName,
         sessionId,
-        sessionIncarnation,
+        ...(sessionIncarnation === undefined ? [] : [sessionIncarnation]),
         'pending',
         'claimed',
         'failed',
@@ -2709,10 +2751,10 @@ export class HarnessPG extends HarnessStorage {
       // accounting.
       for (const key of [...deleteCandidates.keys()].sort()) {
         const candidate = deleteCandidates.get(key)!;
+        // Every incarnation of the deleted session is fenced, not only the
+        // current one: their content is erased below, so none may stay
+        // claimable or committable (PF-5309).
         const terminalArgs: (string | number)[] = [candidate.namespace, candidate.sessionId];
-        const terminalIncarnationPredicate =
-          candidate.sessionIncarnation === undefined ? '' : ' AND session_incarnation = ?';
-        if (candidate.sessionIncarnation !== undefined) terminalArgs.push(candidate.sessionIncarnation);
         // Persist durable per-incarnation fence markers before sweeping rows:
         // the UPDATEs only cover admissions that already exist, so a later
         // admitTerminalHandoff for the deleted incarnation must reject on the
@@ -2737,14 +2779,14 @@ export class HarnessPG extends HarnessStorage {
         await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
                 SET status = 'fenced', updated_at = ?
-                WHERE harness_name = ? AND session_id = ?${terminalIncarnationPredicate}
+                WHERE harness_name = ? AND session_id = ?
                   AND status = 'pending'`,
           args: [deletionNow, ...terminalArgs],
         });
         const fencedIntents = await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS}
-                SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, updated_at = ?
-                WHERE harness_name = ? AND session_id = ?${terminalIncarnationPredicate}
+                SET status = 'fenced', claim_id = NULL, claim_expires_at = NULL, consumer_id = NULL, updated_at = ?
+                WHERE harness_name = ? AND session_id = ?
                   AND status IN ('pending', 'claimed', 'failed')
                 RETURNING payload_bytes`,
           args: [deletionNow, ...terminalArgs],
@@ -2761,6 +2803,13 @@ export class HarnessPG extends HarnessStorage {
           );
           retiredTerminalCapacity.set(candidate.namespace, previous);
         }
+        // PF-5309: the admissions and intents stay as content-free fences.
+        // Their content (the admission seed, the terminal result's error
+        // message, the projection payload, an intent's last error) is erased;
+        // identity, status, revision and the seed and payload hashes keep
+        // refusing and resolving replays. Same lock order as the fence updates
+        // above: session, then these rows, before any pressure row.
+        await this.#redactTerminalRowsTx(tx, candidate.namespace, candidate.sessionId);
       }
       // Retire the fenced capacity once per namespace — after every intent row
       // in the batch is locked — and in sorted order so concurrent batches take
@@ -2777,11 +2826,21 @@ export class HarnessPG extends HarnessStorage {
           deletionNow,
         );
       }
+      const projectionIntentsTableExists =
+        (
+          await tx.execute({
+            sql: `SELECT to_regclass(?) IS NOT NULL AS present`,
+            args: [`"${this.#schema}"."${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}"`],
+          })
+        ).rows[0]?.present === true;
       // An outbox row can name two sessions (session_id and owning_session_id),
       // so two batch deletes of disjoint sessions can share outbox rows. Lock
       // the batch's outbox rows once, in id order, before the per-session
       // deletes below take them one session at a time; otherwise each batch
-      // could hold one shared row and wait for the other's.
+      // could hold one shared row and wait for the other's. This lock must stay
+      // after the session FOR UPDATE locks above: channel writers key-share
+      // lock their sessions before touching an outbox row, so taking outbox
+      // rows first would invert that order.
       const outboxSessionsByNamespace = new Map<string, string[]>();
       for (const { namespace, sessionId } of deleteCandidates.values()) {
         const ids = outboxSessionsByNamespace.get(namespace) ?? [];
@@ -2814,6 +2873,28 @@ export class HarnessPG extends HarnessStorage {
         if (this.sessionRecordProjection.enabled && sessionIncarnation !== undefined) {
           retired = await this.#retireProjectionIntentsTx(tx, namespace, sessionId, sessionIncarnation, Date.now());
         }
+        if (projectionIntentsTableExists) {
+          // PF-5309: every still-claimable intent of the session id is retired
+          // too (other incarnations, and rows written while projection was
+          // enabled when this store now runs without it), so none can be
+          // claimed and projected for the deleted session later. Then the
+          // settled intents (applied or dead) keep revision and digest but lose
+          // the session post-image and error. Runs whatever this store's
+          // projection setting is.
+          const retiredAll = await this.#retireProjectionIntentsTx(tx, namespace, sessionId, undefined, Date.now());
+          if (retiredAll.pendingIntents > 0) {
+            retired = {
+              pendingIntents: (retired?.pendingIntents ?? 0) + retiredAll.pendingIntents,
+              pendingBytes: (retired?.pendingBytes ?? 0) + retiredAll.pendingBytes,
+            };
+          }
+          await tx.execute({
+            sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_INTENTS}
+                  SET payload = 'null'::jsonb, last_error = NULL
+                  WHERE harness_name = ? AND session_id = ? AND status IN ('applied', 'dead')`,
+            args: [namespace, sessionId],
+          });
+        }
         const result = await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND id = ?`,
@@ -2834,6 +2915,23 @@ export class HarnessPG extends HarnessStorage {
                       AND adm.status = 'committed'
                   )`,
           args: [namespace, sessionId, resourceId, threadId],
+        });
+        // The committed results kept above answer a committed retry by status;
+        // their result and error content goes with the session (PF-5309), in
+        // every resource and thread scope the session id was used under.
+        await tx.execute({
+          sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+                SET result = NULL,
+                    error = CASE WHEN status = 'completed' THEN ?::jsonb ELSE NULL END
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [
+            JSON.stringify({
+              code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
+              message: 'The result was erased with its session',
+            }),
+            namespace,
+            sessionId,
+          ],
         });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_OPERATION_TOMBSTONES}
@@ -2859,6 +2957,16 @@ export class HarnessPG extends HarnessStorage {
                   SET state = ?, revision = ?, updated_at = ?
                   WHERE harness_name = ? AND session_id = ? AND session_incarnation = ?`,
             args: ['deleted', version, Date.now(), namespace, sessionId, sessionIncarnation],
+          });
+        } else if (projectionIntentsTableExists) {
+          // PF-5309: a fence written while projection was enabled is closed too,
+          // so a late acknowledgement of an intent this delete retired resolves
+          // as fenced (the projection tables are created together).
+          await tx.execute({
+            sql: `UPDATE ${TABLE_HARNESS_SESSION_PROJECTION_FENCES}
+                  SET state = ?, updated_at = ?
+                  WHERE harness_name = ? AND session_id = ? AND state <> ?`,
+            args: ['deleted', Date.now(), namespace, sessionId, 'deleted'],
           });
         }
         await tx.execute({
@@ -5077,8 +5185,12 @@ export class HarnessPG extends HarnessStorage {
             updated.operationKind ?? null,
             namespacedRecord.status,
             updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
-            'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-            'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+            'result' in namespacedRecord &&
+            namespacedRecord.result !== undefined &&
+            !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
+              ? JSON.stringify(namespacedRecord.result)
+              : null,
+            messageEvidenceErrorColumn(namespacedRecord),
             namespacedRecord.updatedAt,
             id,
             current.operationKind ?? null,
@@ -5114,8 +5226,12 @@ export class HarnessPG extends HarnessStorage {
             namespacedRecord.operationKind ?? null,
             namespacedRecord.status,
             namespacedRecord.dispatch === undefined ? null : JSON.stringify(namespacedRecord.dispatch),
-            'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-            'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+            'result' in namespacedRecord &&
+            namespacedRecord.result !== undefined &&
+            !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
+              ? JSON.stringify(namespacedRecord.result)
+              : null,
+            messageEvidenceErrorColumn(namespacedRecord),
             namespacedRecord.createdAt,
             namespacedRecord.updatedAt,
           ],
@@ -5803,7 +5919,7 @@ export class HarnessPG extends HarnessStorage {
           input.sessionIncarnation,
           input.admissionId,
           input.admissionHash,
-          JSON.stringify(input.reason),
+          JSON.stringify(contentFreeHarnessTerminalReason(input.reason)),
           now,
         ],
       });
@@ -5904,7 +6020,7 @@ export class HarnessPG extends HarnessStorage {
           grant.generation,
           input.sessionId,
           input.admissionId,
-          JSON.stringify(input.reason),
+          JSON.stringify(contentFreeHarnessTerminalReason(input.reason)),
           now,
         ],
       });
@@ -8146,6 +8262,67 @@ export class HarnessPG extends HarnessStorage {
   // -------------------------------------------------------------------------
 
   /**
+   * PF-5309: erases the content of a deleted session's terminal admissions and
+   * intents (see deleteSessions). Each table is read once and rewritten in one
+   * set-based UPDATE. The kept values are built in JS by the shared core
+   * helpers from an allow-list of fields (kind, id, byte count and payload
+   * hash of a projection; status, run, time, finish reason and error code of a
+   * terminal result), the same values the in-memory store keeps. Parsing in JS
+   * also accepts text PostgreSQL's jsonb rejects (an escaped NUL), so such a
+   * row can never make the session undeletable.
+   */
+  async #redactTerminalRowsTx(tx: PgHarnessClient, namespace: string, sessionId: string): Promise<void> {
+    const redactResult = (value: unknown): string | null => {
+      const parsed = parseJson(value) as HarnessTerminalResult | undefined;
+      return parsed !== null && typeof parsed === 'object' ? JSON.stringify(redactHarnessTerminalResult(parsed)) : null;
+    };
+    const redactProjection = (value: unknown): string | null => {
+      const parsed = parseJson(value) as StoredHarnessTerminalProjection | undefined;
+      return parsed !== null && typeof parsed === 'object'
+        ? JSON.stringify(redactStoredHarnessTerminalProjection(parsed))
+        : null;
+    };
+    const admissions = await tx.execute({
+      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
+      args: [namespace, sessionId],
+    });
+    if (admissions.rows.length > 0) {
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_ADMISSIONS} AS a
+              SET seed_json = 'null', terminal_result_json = u.result_json, projection_json = u.projection_json
+              FROM unnest(?::text[], ?::text[], ?::text[]) AS u(id, result_json, projection_json)
+              WHERE a.id = u.id`,
+        args: [
+          admissions.rows.map(row => String(row.id)),
+          admissions.rows.map(row => redactResult(row.terminal_result_json)),
+          admissions.rows.map(row => redactProjection(row.projection_json)),
+        ],
+      });
+    }
+    const intents = await tx.execute({
+      sql: `SELECT id, terminal_result_json, projection_json FROM ${TABLE_HARNESS_TERMINAL_INTENTS}
+            WHERE harness_name = ? AND session_id = ? ORDER BY id FOR UPDATE`,
+      args: [namespace, sessionId],
+    });
+    if (intents.rows.length > 0) {
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_TERMINAL_INTENTS} AS i
+              SET terminal_result_json = COALESCE(u.result_json, 'null'),
+                  projection_json = COALESCE(u.projection_json, 'null'),
+                  last_error_json = NULL
+              FROM unnest(?::text[], ?::text[], ?::text[]) AS u(id, result_json, projection_json)
+              WHERE i.id = u.id`,
+        args: [
+          intents.rows.map(row => String(row.id)),
+          intents.rows.map(row => redactResult(row.terminal_result_json)),
+          intents.rows.map(row => redactProjection(row.projection_json)),
+        ],
+      });
+    }
+  }
+
+  /**
    * Runs a channel or wakeup ledger write while every session it names
    * exists. The session rows are key-share locked first (session before
    * ledger rows, the order deleteSessions takes), so a concurrent delete either
@@ -9984,7 +10161,11 @@ export class HarnessPG extends HarnessStorage {
   }
 
   async #createChannelInboxIndexes(): Promise<void> {
-    await this.#createDefaultIndexes(['idx_harness_channel_inbox_idempotency', 'idx_harness_channel_inbox_claim']);
+    await this.#createDefaultIndexes([
+      'idx_harness_channel_inbox_idempotency',
+      'idx_harness_channel_inbox_claim',
+      'idx_harness_channel_inbox_session',
+    ]);
   }
 
   async #ensureChannelActionTables(): Promise<void> {
@@ -10021,6 +10202,8 @@ export class HarnessPG extends HarnessStorage {
       'idx_harness_channel_action_receipts_token',
       'idx_harness_channel_action_receipts_action',
       'idx_harness_channel_action_receipts_claim',
+      'idx_harness_channel_action_tokens_owning_session',
+      'idx_harness_channel_action_receipts_owning_session',
     ]);
   }
 
@@ -10050,6 +10233,8 @@ export class HarnessPG extends HarnessStorage {
       'idx_harness_channel_outbox_idempotency',
       'idx_harness_channel_outbox_claim',
       'idx_harness_channel_outbox_binding_order',
+      'idx_harness_channel_outbox_session',
+      'idx_harness_channel_outbox_owning_session',
     ]);
   }
 
@@ -10084,6 +10269,7 @@ export class HarnessPG extends HarnessStorage {
       'idx_harness_wakeups_idempotency',
       'idx_harness_wakeups_source_fire',
       'idx_harness_wakeups_claim',
+      'idx_harness_wakeups_session',
     ]);
   }
 
@@ -12044,6 +12230,22 @@ function workspaceActionPathFilterHasSelector(
   return filter.rootId !== undefined || filter.path !== undefined || filter.relativePath !== undefined;
 }
 
+/**
+ * The `error` column of a message result row. A completed row whose result a
+ * session delete erased stores the reserved erased marker there (PF-5309), so
+ * it reads back as erased, never as an empty success.
+ */
+function messageEvidenceErrorColumn(record: AgentSignalResultEvidence): string | null {
+  // A completed row's error column carries only the erased marker, and only
+  // for an erased record, so the marker is never ambiguous.
+  if (record.status === 'completed') {
+    return record.erased === true
+      ? JSON.stringify({ code: HARNESS_MESSAGE_RESULT_ERASED_CODE, message: 'The result was erased with its session' })
+      : null;
+  }
+  return 'error' in record ? JSON.stringify(record.error) : null;
+}
+
 function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalResultEvidence {
   const base = {
     harnessName: String(row.harness_name),
@@ -12066,6 +12268,11 @@ function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalRe
   const status = String(row.status);
   if (status === 'completed') {
     const runId = completedMessageEvidenceRunId(base);
+    // PF-5309: a deleted session's completed row keeps its status but carries
+    // the erased marker instead of the result.
+    if ((parseJson(row.error) as { code?: unknown } | undefined)?.code === HARNESS_MESSAGE_RESULT_ERASED_CODE) {
+      return { ...base, status: 'completed', runId, result: undefined, erased: true };
+    }
     return {
       ...base,
       status: 'completed',
@@ -12177,7 +12384,9 @@ function sameHarnessTerminalAdmissionInput(
     stored.executionGrant.generation === input.executionGrant.generation &&
     stored.finalizerId === input.finalizerId &&
     stored.finalizerVersion === input.finalizerVersion &&
-    canonicalJson(stored.seed) === canonicalJson(input.seed)
+    // Through the seed hash: a deleted session's admission keeps the hash but
+    // not the seed (PF-5309), and its replays must still match.
+    stored.seedHash === harnessTerminalSeedHash(input.seed)
   );
 }
 

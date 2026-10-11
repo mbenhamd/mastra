@@ -102,6 +102,7 @@ export {
   HarnessSessionDeleteBlockedError,
   type HarnessSessionDeleteBlocker,
   HarnessSessionDeletedError,
+  HarnessMessageResultErasedError,
   HarnessSessionLockedError,
   HarnessSessionNotFoundError,
   HarnessSkillNotFoundError,

@@ -71,6 +71,10 @@ import {
   cloneHarnessTerminal,
   harnessTerminalAdmissionId,
   harnessTerminalGrantTombstoneId,
+  harnessTerminalSeedHash,
+  redactHarnessTerminalResult,
+  redactStoredHarnessTerminalProjection,
+  contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
   canonicalJson,
   prepareHarnessTerminalAdmission,
@@ -786,10 +790,12 @@ export class InMemoryHarness extends HarnessStorage {
     for (const { namespace, sessionId, record } of existingSessions.values()) {
       // Synchronous within the delete critical section — awaiting here would
       // let a concurrent saveSession interleave between guard and removal.
+      // Every incarnation of the session is fenced (no `sessionIncarnation`):
+      // the content of all of them is erased below, so none may stay
+      // claimable or committable (PF-5309).
       this.fenceTerminalHandoffsForSessionSync({
         harnessName: namespace,
         sessionId,
-        sessionIncarnation: record.sessionIncarnation,
         deletedAt: Date.now(),
       });
       this.db.harnessSessions.delete(sessionKey(namespace, sessionId));
@@ -810,29 +816,51 @@ export class InMemoryHarness extends HarnessStorage {
             updatedAt: Date.now(),
           }),
         );
-        for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
-          if (
-            intent.harnessName !== namespace ||
-            intent.sessionId !== sessionId ||
-            intent.sessionIncarnation !== record.sessionIncarnation ||
-            intent.status === 'applied' ||
-            intent.status === 'dead'
-          ) {
-            continue;
-          }
-          intent.status = 'dead';
-          intent.deadAt = Date.now();
-          intent.failedAt = intent.deadAt;
-          intent.claimId = undefined;
-          intent.claimExpiresAt = undefined;
-          intent.nextAttemptAt = undefined;
-          intent.updatedAt = intent.deadAt;
-          intent.lastError = {
-            code: 'session_projection.deleted',
-            message: 'Session lifetime was deleted',
-          };
+      } else {
+        // PF-5309: a fence written while projection was enabled is closed too,
+        // so a late acknowledgement of an intent retired below resolves as
+        // fenced (PG mirrors this).
+        const fenceKey = projectionFenceKey(namespace, sessionId);
+        const fence = this.db.harnessSessionRecordProjectionFences.get(fenceKey);
+        if (fence !== undefined && fence.state !== 'deleted') {
+          this.db.harnessSessionRecordProjectionFences.set(fenceKey, {
+            ...fence,
+            state: 'deleted',
+            updatedAt: Date.now(),
+          });
         }
       }
+      // Every still-claimable intent of the session id is retired, whatever
+      // its incarnation and whatever this store's projection setting (rows
+      // written while projection was enabled), so none can be claimed and
+      // projected for the deleted session later (PF-5309; PG mirrors this).
+      for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
+        if (
+          intent.harnessName !== namespace ||
+          intent.sessionId !== sessionId ||
+          intent.status === 'applied' ||
+          intent.status === 'dead'
+        ) {
+          continue;
+        }
+        intent.status = 'dead';
+        intent.deadAt = Date.now();
+        intent.failedAt = intent.deadAt;
+        intent.claimId = undefined;
+        intent.claimExpiresAt = undefined;
+        intent.nextAttemptAt = undefined;
+        intent.updatedAt = intent.deadAt;
+        intent.lastError = {
+          code: 'session_projection.deleted',
+          message: 'Session lifetime was deleted',
+        };
+      }
+    }
+
+    // Still before the first await, and after the projection retirement above,
+    // so the retired intents are redacted too (PF-5309).
+    for (const { namespace, sessionId } of existingSessions.values()) {
+      this.redactRetainedSessionContent(namespace, sessionId);
     }
 
     for (const { namespace, sessionId, record } of existingSessions.values()) {
@@ -1588,6 +1616,8 @@ export class InMemoryHarness extends HarnessStorage {
   ): Promise<WriteMessageResultEvidenceResult> {
     const namespacedRecord = {
       ...record,
+      // An erased completion never stores a result (as the SQL writers do).
+      ...(record.status === 'completed' && record.erased === true ? { result: undefined } : {}),
       harnessName: resolveHarnessName(record.harnessName, this.harnessName),
     };
     if (options.leaseOwner !== undefined) {
@@ -2077,7 +2107,7 @@ export class InMemoryHarness extends HarnessStorage {
       sessionIncarnation: input.sessionIncarnation,
       admissionId: input.admissionId,
       admissionHash: input.admissionHash,
-      reason: cloneHarnessTerminal(input.reason),
+      reason: contentFreeHarnessTerminalReason(input.reason),
       createdAt: now,
     };
     this.db.harnessTerminalTombstones.set(tombstoneId, tombstone);
@@ -2137,7 +2167,7 @@ export class InMemoryHarness extends HarnessStorage {
       grant: { ...grant },
       sessionId: input.sessionId,
       admissionId: input.admissionId,
-      reason: cloneHarnessTerminal(input.reason),
+      reason: contentFreeHarnessTerminalReason(input.reason),
       createdAt: now,
     });
     return { status: 'revoked', grant, tombstoneId, revokedAt: now };
@@ -4397,6 +4427,64 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   /**
+   * A deleted session's terminal admissions and intents, projection intents
+   * and committed message results stay as content-free fences (PF-5309): the
+   * admission seed, terminal results, projection payloads, session post-images
+   * and message result/error content are erased; identity, status, revision
+   * and hash fields keep refusing and resolving replays. Mirrors the SQL
+   * adapters' redaction (an intent keeps only its projection's byte count).
+   */
+  private redactRetainedSessionContent(namespace: string, sessionId: string): void {
+    for (const admission of this.db.harnessTerminalAdmissions.values()) {
+      if (admission.harnessName !== namespace || admission.sessionId !== sessionId) continue;
+      keepOnlyFields(admission, RETAINED_TERMINAL_ADMISSION_FIELDS);
+      admission.seed = null;
+      if (admission.terminalResult !== undefined) {
+        admission.terminalResult = redactHarnessTerminalResult(admission.terminalResult);
+      }
+      if (admission.projection !== undefined) {
+        admission.projection = redactStoredHarnessTerminalProjection(admission.projection);
+      }
+    }
+    for (const intent of this.db.harnessTerminalIntents.values()) {
+      if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
+      keepOnlyFields(intent, RETAINED_TERMINAL_INTENT_FIELDS);
+      intent.terminalResult = redactHarnessTerminalResult(intent.terminalResult);
+      intent.projection = redactStoredHarnessTerminalProjection(intent.projection);
+      delete intent.lastError;
+      // The in-memory intent also carries its admission's seed.
+      if ('seed' in intent) (intent as { seed?: unknown }).seed = null;
+    }
+    // Only settled projection intents (applied, or dead, which includes those
+    // the delete retired): a still-claimable intent of a store without
+    // projections keeps its payload. The payload reads back as absent, as in
+    // the PG adapter.
+    for (const intent of this.db.harnessSessionRecordProjectionIntents.values()) {
+      if (intent.harnessName !== namespace || intent.sessionId !== sessionId) continue;
+      if (intent.status !== 'applied' && intent.status !== 'dead') continue;
+      delete (intent as { payload?: unknown }).payload;
+      delete intent.lastError;
+    }
+    for (const evidence of this.db.harnessMessageResultEvidence.values()) {
+      // Every resource and thread scope the session id was used under (the
+      // delete itself only removes the current scope's uncommitted rows).
+      if (evidence.harnessName !== namespace || evidence.sessionId !== sessionId) continue;
+      keepOnlyFields(evidence, RETAINED_MESSAGE_EVIDENCE_FIELDS);
+      const mutable = evidence as { status: string; result?: unknown; error?: unknown; erased?: true };
+      if (mutable.status === 'completed') {
+        // The row keeps proving the turn completed; readers see the erased
+        // marker, never an empty success (the PG mapper reads it the same way).
+        mutable.result = undefined;
+        mutable.erased = true;
+      } else if (mutable.status === 'failed') {
+        // The SQL adapters read a failed row without error content as this
+        // generic failure.
+        mutable.error = { code: 'harness.message_failed', message: 'Message failed' };
+      }
+    }
+  }
+
+  /**
    * Channel and wakeup rows are written only while every session they name
    * exists, so a late write cannot restore rows `deleteSessions` erased. The
    * check and the write run in one synchronous section.
@@ -4880,6 +4968,75 @@ export class InMemoryHarness extends HarnessStorage {
  * separator means session-prefix scans for `deleteAttachmentsForSession` are
  * unambiguous regardless of the contents of the ids.
  */
+/**
+ * PF-5309: the fields a deleted session's retained terminal and evidence rows
+ * keep. The in-memory store keeps whole caller objects, so the redaction
+ * removes every other property (a caller's extra field never survives a
+ * delete); the SQL adapters only ever store these columns.
+ */
+const RETAINED_TERMINAL_ADMISSION_FIELDS = new Set([
+  'harnessName',
+  'sessionId',
+  'resourceId',
+  'threadId',
+  'sessionIncarnation',
+  'admissionId',
+  'admissionHash',
+  'signalId',
+  'runId',
+  'executionGrant',
+  'id',
+  'protocolVersion',
+  'finalizerId',
+  'finalizerVersion',
+  'seed',
+  'seedBytes',
+  'seedHash',
+  'status',
+  'terminalResult',
+  'projection',
+  'revision',
+  'createdAt',
+  'updatedAt',
+]);
+const RETAINED_TERMINAL_INTENT_FIELDS = new Set([
+  ...RETAINED_TERMINAL_ADMISSION_FIELDS,
+  'attempts',
+  'claimId',
+  'claimExpiresAt',
+  'consumerId',
+  'nextAttemptAt',
+  'lastError',
+  'ackedAt',
+  'deadAt',
+]);
+const RETAINED_MESSAGE_EVIDENCE_FIELDS = new Set([
+  'status',
+  'signalId',
+  'runId',
+  'result',
+  'error',
+  'erased',
+  'modeId',
+  'modelId',
+  'operationKind',
+  'dispatch',
+  'harnessName',
+  'sessionId',
+  'resourceId',
+  'threadId',
+  'admissionId',
+  'admissionHash',
+  'createdAt',
+  'updatedAt',
+]);
+
+function keepOnlyFields(record: object, allowed: ReadonlySet<string>): void {
+  for (const key of Object.keys(record)) {
+    if (!allowed.has(key)) delete (record as Record<string, unknown>)[key];
+  }
+}
+
 function sessionKey(harnessName: string, sessionId: string): string {
   return `${harnessName}\u0000${sessionId}`;
 }
@@ -5194,7 +5351,9 @@ function sameTerminalAdmissionInput(
     left.executionGrant.generation === right.executionGrant.generation &&
     left.finalizerId === right.finalizerId &&
     left.finalizerVersion === right.finalizerVersion &&
-    canonicalJson(left.seed) === canonicalJson(right.seed)
+    // Through the seed hash: a deleted session's admission keeps the hash but
+    // not the seed (PF-5309), and its replays must still match.
+    left.seedHash === harnessTerminalSeedHash(right.seed)
   );
 }
 

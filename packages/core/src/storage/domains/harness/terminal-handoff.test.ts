@@ -960,7 +960,8 @@ describe('native chat terminal handoff', () => {
   });
 
   it('preserves committed terminal evidence across session deletion for the committed retry', async () => {
-    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
     await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
     const input = admission();
     await storage.writeMessageResultEvidence(pendingEvidence(input));
@@ -979,6 +980,22 @@ describe('native chat terminal handoff', () => {
     };
     const committed = await storage.commitTerminalHandoff(args);
     expect(committed.status).toBe('committed');
+    // A delivery worker holds a claim on the intent when the session is deleted.
+    const claim = await storage.claimTerminalIntents({
+      harnessName: input.harnessName,
+      consumerId: 'delivery-worker-1',
+      limit: 1,
+      now: 4_000,
+    });
+    expect(claim.intents).toHaveLength(1);
+    // A revoked grant of the session leaves a tombstone; its reason message is not kept.
+    await storage.revokeTerminalGrant({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      admissionId: 'admission-revoked',
+      executionGrant: { key: 'grant-revoked', generation: 1 },
+      reason: { code: 'harness.terminal_cancelled', message: 'private revoke note' },
+    });
 
     await storage.deleteSession({
       harnessName: 'default',
@@ -1007,6 +1024,170 @@ describe('native chat terminal handoff', () => {
     const replay = await storage.commitTerminalHandoff(args);
     expect(replay.status).toBe('duplicate');
     expect(replay.intent?.id).toBe(committed.intent!.id);
+
+    // PF-5309: what stays is content-free. The evidence keeps its status, the
+    // admission and intent keep identity, status and hashes, but the provider
+    // output, the projection payload and the admission seed are gone.
+    const keptEvidence = await storage.loadMessageResultEvidence({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      resourceId: input.resourceId,
+      threadId: input.threadId,
+      signalId: input.signalId,
+    });
+    const keptAdmission = await storage.loadTerminalAdmission({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      admissionId: input.admissionId,
+      executionGrant: input.executionGrant,
+    });
+    const keptIntent = await storage.loadTerminalIntent({
+      harnessName: input.harnessName,
+      intentId: committed.intent!.id,
+    });
+    expect(keptAdmission).toMatchObject({ status: 'committed', seed: null, seedHash: committed.admission.seedHash });
+    expect(keptEvidence).toMatchObject({ status: 'completed', erased: true });
+    expect(keptIntent).toMatchObject({ id: committed.intent!.id, status: 'fenced' });
+    const retained = JSON.stringify([keptEvidence, keptAdmission, keptIntent, replay]);
+    expect(retained).not.toContain('provider output');
+    expect(retained).not.toContain('"text":"done"');
+    expect(retained).not.toContain('\\"text\\":\\"done\\"');
+    expect(retained).not.toContain('"mode":"build"');
+    // The fences still refuse a late admission of the deleted session, and the
+    // late acknowledgement of the claimed intent resolves as fenced: the
+    // payload hash it validates is kept.
+    await expect(storage.admitTerminalHandoff(input)).resolves.toMatchObject({ status: 'fenced' });
+    await expect(
+      storage.ackTerminalIntent({
+        harnessName: input.harnessName,
+        intentId: claim.intents[0]!.id,
+        sessionId: input.sessionId,
+        sessionIncarnation: input.sessionIncarnation,
+        revision: claim.intents[0]!.revision,
+        payloadHash: claim.intents[0]!.projection.payloadHash,
+        claimId: claim.intents[0]!.claimId!,
+        consumerId: 'delivery-worker-1',
+        now: 4_001,
+      }),
+    ).resolves.toMatchObject({ status: 'fenced' });
+    expect(JSON.stringify([...db.harnessTerminalTombstones.values()])).not.toContain('private revoke note');
+  });
+
+  it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    const input = admission();
+    await storage.writeMessageResultEvidence({
+      ...pendingEvidence(input),
+      status: 'completed',
+      result: undefined,
+      erased: true,
+    });
+    await expect(
+      storage.loadMessageResultEvidence({
+        harnessName: input.harnessName,
+        sessionId: input.sessionId,
+        resourceId: input.resourceId,
+        threadId: input.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', erased: true });
+  });
+
+  it("drops a caller's extra fields from a deleted session's retained rows (PF-5309)", async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    // Structurally typed callers can pass extra properties through a variable.
+    const input = { ...admission(), providerOutput: 'extra secret' } as HarnessTerminalAdmissionInput;
+    const pending = { ...pendingEvidence(input), providerOutput: 'extra secret' } as AgentSignalResultEvidence;
+    await storage.writeMessageResultEvidence(pending);
+    await storage.admitTerminalHandoff(input);
+    await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: { ...pending, status: 'completed', result: { text: 'provider output' }, updatedAt: 3_000 },
+      terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: { text: 'done' } },
+    });
+    expect(JSON.stringify([...db.harnessTerminalAdmissions.values()])).toContain('extra secret');
+
+    await storage.deleteSession({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      ifVersion: 1,
+      expectedResourceId: 'resource-1',
+      expectedThreadId: 'thread-1',
+      expectedParentSessionId: null,
+      expectedCreatedAt: 1_000,
+    });
+
+    const retained = JSON.stringify([
+      ...db.harnessTerminalAdmissions.values(),
+      ...db.harnessTerminalIntents.values(),
+      ...db.harnessMessageResultEvidence.values(),
+    ]);
+    expect(retained).not.toContain('extra secret');
+    expect(retained).not.toContain('provider output');
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pending, status: 'completed', result: { text: 'provider output' }, updatedAt: 3_000 },
+        terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+        projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: { text: 'done' } },
+      }),
+    ).resolves.toMatchObject({ status: 'duplicate' });
+  });
+
+  it('re-acknowledges an intent acked before its session was deleted as a duplicate (PF-5309)', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    const committed = await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: {
+        ...pendingEvidence(input),
+        status: 'completed',
+        result: { text: 'provider output' },
+        updatedAt: 3_000,
+      },
+      terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: { text: 'done' } },
+    });
+    expect(committed.status).toBe('committed');
+    const claim = await storage.claimTerminalIntents({
+      harnessName: input.harnessName,
+      consumerId: 'delivery-worker-1',
+      limit: 1,
+      now: 4_000,
+    });
+    const identity = {
+      harnessName: input.harnessName,
+      intentId: claim.intents[0]!.id,
+      sessionId: input.sessionId,
+      sessionIncarnation: input.sessionIncarnation,
+      revision: claim.intents[0]!.revision,
+      payloadHash: claim.intents[0]!.projection.payloadHash,
+      claimId: claim.intents[0]!.claimId!,
+      consumerId: 'delivery-worker-1',
+      now: 4_001,
+    };
+    await expect(storage.ackTerminalIntent(identity)).resolves.toMatchObject({ status: 'acked' });
+
+    await storage.deleteSession({
+      harnessName: 'default',
+      sessionId: 'session-1',
+      ifVersion: 1,
+      expectedResourceId: 'resource-1',
+      expectedThreadId: 'thread-1',
+      expectedParentSessionId: null,
+      expectedCreatedAt: 1_000,
+    });
+
+    // A consumer retrying its lost ack still gets the duplicate receipt.
+    await expect(storage.ackTerminalIntent({ ...identity, now: 4_002 })).resolves.toMatchObject({
+      status: 'duplicate',
+    });
   });
 
   it('reports terminal handoff as unsupported and rejects terminal operations when disabled', async () => {

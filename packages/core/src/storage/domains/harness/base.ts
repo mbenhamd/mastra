@@ -1687,14 +1687,23 @@ export abstract class HarnessStorage extends StorageDomain {
   // Session erasure (channel, action and wakeup ledgers): `deleteSessions`
   // erases, in the same delete, every inbox item and wakeup of the session,
   // every outbox item whose `sessionId` or `owningSessionId` is the session,
-  // and every action token and receipt it owns. A write that names a session
-  // (inbox `sessionId`, outbox `sessionId`/`owningSessionId`, token or receipt
-  // `owningSessionId`, wakeup `sessionId`) stores its row only while that
-  // session exists, atomically with the check, and otherwise rejects with
-  // `HarnessStorageSessionNotFoundError`; a deleted session therefore never
-  // regains these rows from a late write. Rows naming no session are
-  // unaffected. The content-free terminal session fences and grant tombstones
-  // are not erased.
+  // and every action token and receipt it owns. An operation that can create a
+  // row naming a session (inbox `sessionId`, outbox `sessionId`/
+  // `owningSessionId`, token or receipt `owningSessionId`, wakeup `sessionId`),
+  // or that changes an existing row's session, checks that session atomically
+  // with the write and otherwise rejects with
+  // `HarnessStorageSessionNotFoundError`. An update that keeps a row's session
+  // cannot create or rebind a row and runs without the check (it may still
+  // update a row a pre-erasure delete left behind). A deleted session
+  // therefore never regains these rows from a late write. Rows naming no
+  // session are unaffected.
+  //
+  // What a delete keeps is content-free: the terminal session fences and grant
+  // tombstones, and the session's terminal admissions and intents, projection
+  // intents and committed message results with their content erased (seed,
+  // terminal result, projection payload, session post-image, message result
+  // and error); their identity, status, revision and hash fields keep refusing
+  // and resolving replays.
 
   abstract saveChannelInboxItem(record: ChannelInboxItem): Promise<void>;
 

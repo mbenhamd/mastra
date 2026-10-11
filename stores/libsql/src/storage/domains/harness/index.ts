@@ -50,6 +50,7 @@ import {
   getSqlType,
   normalizePendingInteractionDueScanInput,
   walkPlanTaskSubtree,
+  HARNESS_MESSAGE_RESULT_ERASED_CODE,
 } from '@mastra/core/storage';
 import type {
   AcquireSessionLeaseInput,
@@ -1162,6 +1163,22 @@ export class HarnessLibSQL extends HarnessStorage {
                 WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
           args: [namespace, sessionId, resourceId, threadId],
         });
+        // PF-5309: a result kept under another resource or thread scope of the
+        // same session id loses its content too (PG and in-memory do the same).
+        await tx.execute({
+          sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
+                SET result = NULL,
+                    error = CASE WHEN status = 'completed' THEN ? ELSE NULL END
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [
+            JSON.stringify({
+              code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
+              message: 'The result was erased with its session',
+            }),
+            namespace,
+            sessionId,
+          ],
+        });
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_OPERATION_TOMBSTONES}
                 WHERE harness_name = ? AND session_id = ? AND resource_id = ? AND thread_id = ?`,
@@ -1733,8 +1750,12 @@ export class HarnessLibSQL extends HarnessStorage {
         namespacedRecord.operationKind ?? null,
         namespacedRecord.status,
         namespacedRecord.dispatch === undefined ? null : JSON.stringify(namespacedRecord.dispatch),
-        'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-        'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+        'result' in namespacedRecord &&
+        namespacedRecord.result !== undefined &&
+        !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
+          ? JSON.stringify(namespacedRecord.result)
+          : null,
+        messageEvidenceErrorColumn(namespacedRecord),
         namespacedRecord.createdAt,
         namespacedRecord.updatedAt,
       ],
@@ -1785,8 +1806,12 @@ export class HarnessLibSQL extends HarnessStorage {
         updated.operationKind ?? null,
         namespacedRecord.status,
         updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
-        'result' in namespacedRecord ? JSON.stringify(namespacedRecord.result) : null,
-        'error' in namespacedRecord ? JSON.stringify(namespacedRecord.error) : null,
+        'result' in namespacedRecord &&
+        namespacedRecord.result !== undefined &&
+        !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
+          ? JSON.stringify(namespacedRecord.result)
+          : null,
+        messageEvidenceErrorColumn(namespacedRecord),
         namespacedRecord.updatedAt,
         id,
         current.operationKind ?? null,
@@ -5334,6 +5359,11 @@ export class HarnessLibSQL extends HarnessStorage {
             ON "${TABLE_HARNESS_CHANNEL_INBOX}" ("harness_name", "channel_id", "status", "next_attempt_at", "claim_expires_at", "received_at")`,
       args: [],
     });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_inbox_session
+            ON "${TABLE_HARNESS_CHANNEL_INBOX}" ("harness_name", "session_id")`,
+      args: [],
+    });
   }
 
   async #ensureChannelBindingsTable(): Promise<void> {
@@ -5479,6 +5509,16 @@ export class HarnessLibSQL extends HarnessStorage {
             ON "${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}" ("harness_name", "channel_id", "status", "next_attempt_at", "claim_expires_at", "created_at")`,
       args: [],
     });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_action_tokens_owning_session
+            ON "${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}" ("harness_name", "owning_session_id")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_action_receipts_owning_session
+            ON "${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}" ("harness_name", "owning_session_id")`,
+      args: [],
+    });
   }
 
   async #ensureChannelOutboxTable(): Promise<void> {
@@ -5516,6 +5556,16 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#client.execute({
       sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_outbox_binding_order
             ON "${TABLE_HARNESS_CHANNEL_OUTBOX}" ("harness_name", "binding_id", "status", "created_at", "id")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_outbox_session
+            ON "${TABLE_HARNESS_CHANNEL_OUTBOX}" ("harness_name", "session_id")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_channel_outbox_owning_session
+            ON "${TABLE_HARNESS_CHANNEL_OUTBOX}" ("harness_name", "owning_session_id")`,
       args: [],
     });
   }
@@ -5560,6 +5610,11 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#client.execute({
       sql: `CREATE INDEX IF NOT EXISTS idx_harness_wakeups_claim
             ON "${TABLE_HARNESS_WAKEUPS}" ("harness_name", "source", "status", "due_at", "next_attempt_at", "claim_expires_at")`,
+      args: [],
+    });
+    await this.#client.execute({
+      sql: `CREATE INDEX IF NOT EXISTS idx_harness_wakeups_session
+            ON "${TABLE_HARNESS_WAKEUPS}" ("harness_name", "session_id")`,
       args: [],
     });
   }
@@ -7187,6 +7242,18 @@ function workspaceActionPathFilterHasSelector(
   return filter.rootId !== undefined || filter.path !== undefined || filter.relativePath !== undefined;
 }
 
+/** The `error` column of a message result row; an erased completed row stores the reserved marker (PF-5309). */
+function messageEvidenceErrorColumn(record: AgentSignalResultEvidence): string | null {
+  // A completed row's error column carries only the erased marker, and only
+  // for an erased record, so the marker is never ambiguous.
+  if (record.status === 'completed') {
+    return record.erased === true
+      ? JSON.stringify({ code: HARNESS_MESSAGE_RESULT_ERASED_CODE, message: 'The result was erased with its session' })
+      : null;
+  }
+  return 'error' in record ? JSON.stringify(record.error) : null;
+}
+
 function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalResultEvidence {
   const base = {
     harnessName: String(row.harness_name),
@@ -7209,6 +7276,10 @@ function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalRe
   const status = String(row.status);
   if (status === 'completed') {
     const runId = completedMessageEvidenceRunId(base);
+    // PF-5309: a completed row carrying the erased marker has no result.
+    if ((parseJson(row.error) as { code?: unknown } | undefined)?.code === HARNESS_MESSAGE_RESULT_ERASED_CODE) {
+      return { ...base, status: 'completed', runId, result: undefined, erased: true };
+    }
     return {
       ...base,
       status: 'completed',

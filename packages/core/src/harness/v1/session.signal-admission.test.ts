@@ -7,6 +7,7 @@ import { setupHarness } from './__test-utils__/setup';
 import {
   HarnessAdmissionConflictError,
   HarnessConfigError,
+  HarnessMessageResultErasedError,
   HarnessSessionNotFoundError,
   HarnessValidationError,
 } from './errors';
@@ -1510,6 +1511,71 @@ describe('Session.signal() admissionId', () => {
     await expect(duplicate.result).resolves.toEqual(result);
     expect(agent.streamCalls).toHaveLength(0);
   });
+
+  it('rejects a duplicate whose completed result a session delete erased instead of resolving it empty (PF-5309)', async () => {
+    const { harness, storage, agent } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const admissionId = 'erased-terminal';
+    const content = 'erased answer';
+    const admissionHash = (session as any)._computeSignalAdmissionHash({ content }, [], undefined) as string;
+    const identity = (session as any)._signalAdmissionIdentity(admissionId) as { signalId: string; idleRunId: string };
+    const now = Date.now();
+    await storage.writeMessageResultEvidence({
+      status: 'completed',
+      erased: true,
+      harnessName: session.getRecord().harnessName,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      signalId: identity.signalId,
+      runId: identity.idleRunId,
+      modeId: session.getRecord().modeId,
+      modelId: session.getRecord().modelId,
+      admissionId,
+      admissionHash,
+      result: undefined,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const duplicate = await session.signal({ content, admissionId });
+    await expect(duplicate.result).rejects.toBeInstanceOf(HarnessMessageResultErasedError);
+    expect(agent.streamCalls).toHaveLength(0);
+  });
+
+  it('rejects a waiting duplicate when the result it waits for is erased mid-wait (PF-5309)', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const runId = (session as any)._signalAdmissionIdentity('erased-mid-wait').idleRunId as string;
+    const identity = await seedPendingSignalAdmission(session, storage, {
+      admissionId: 'erased-mid-wait',
+      content: 'wait for me',
+      runId,
+    });
+    // The waiter polls the durable row while another instance completes the
+    // turn and deletes the session, which erases the result.
+    const loads = vi.spyOn(storage, 'loadMessageResultEvidence');
+    const waiting = (session as any)._awaitDurableSignalResult({ signalId: identity.signalId }) as Promise<unknown>;
+    const settled = waiting.then(
+      value => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    // The waiter has read the row while it was still pending.
+    await vi.waitFor(async () => {
+      expect(loads).toHaveBeenCalled();
+      await expect(loads.mock.results[0]!.value).resolves.toMatchObject({ status: 'pending' });
+    });
+    // The other instance's commit and delete leave the row completed with the
+    // erased marker; mutate it the way the in-memory delete does.
+    const rows = (storage as unknown as { db: { harnessMessageResultEvidence: Map<string, Record<string, unknown>> } })
+      .db.harnessMessageResultEvidence;
+    const row = [...rows.values()].find(candidate => candidate.signalId === identity.signalId);
+    if (!row) throw new Error('expected the pending evidence');
+    Object.assign(row, { status: 'completed', runId, result: undefined, erased: true, updatedAt: Date.now() });
+    const outcome = await settled;
+    expect(outcome).not.toHaveProperty('value');
+    expect((outcome as { error: unknown }).error).toBeInstanceOf(HarnessMessageResultErasedError);
+  }, 30_000);
 
   it('keeps an admitted suspended signal pending across restart and settles it on resume', async () => {
     const first = setupHarness();
