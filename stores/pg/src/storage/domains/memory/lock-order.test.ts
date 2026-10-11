@@ -366,7 +366,10 @@ describe('MemoryPG lock ordering', () => {
     }
   });
 
-  async function seedCloneWithObservationalMemory(suffix: string): Promise<{
+  async function seedCloneWithObservationalMemory(
+    suffix: string,
+    managedWorkingMemoryScope: 'thread' | null = 'thread',
+  ): Promise<{
     clone: StorageCloneThreadOutput & {
       rollbackReceipt: NonNullable<StorageCloneThreadOutput['rollbackReceipt']>;
     };
@@ -378,7 +381,7 @@ describe('MemoryPG lock ordering', () => {
       mastra: { om: { threadTitle: 'Clone of Source' } },
     });
     const record = await rollbackMemory.initializeObservationalMemory({
-      config: { _managedWorkingMemoryScope: 'thread' },
+      config: { _managedWorkingMemoryScope: managedWorkingMemoryScope },
       resourceId: clone.thread.resourceId,
       scope: 'thread',
       threadId: clone.thread.id,
@@ -420,6 +423,68 @@ describe('MemoryPG lock ordering', () => {
     } finally {
       await blocker.close();
       if (rollbackPromise) await Promise.allSettled([rollbackPromise]);
+    }
+  });
+
+  function describeOutcome(outcome: PromiseSettledResult<unknown>): string {
+    if (outcome.status === 'fulfilled') return String((outcome.value as { status?: unknown })?.status ?? 'fulfilled');
+    const parts: string[] = [];
+    let error: unknown = outcome.reason;
+    for (let depth = 0; error && depth < 4; depth++) {
+      const { name, code, details } = error as { name?: string; code?: unknown; details?: { failureCode?: unknown } };
+      parts.push([name, code, details?.failureCode].filter(Boolean).join('/'));
+      error = (error as { cause?: unknown }).cause;
+    }
+    return parts.join(' <- ');
+  }
+
+  it('keeps clone rollback and a stamping observer write apart with the OM-resource advisory lock', async () => {
+    // Rollback locks the thread row, then OM rows; an observer write that may
+    // stamp a not-managed record locks its OM row, then the thread row. Only
+    // rollback's OM-resource advisory lock breaks that cycle: without it this
+    // interleaving deadlocks (40P01).
+    const { clone, record, receipt } = await seedCloneWithObservationalMemory('advisory-fence', null);
+    const { revision } = await competitorMemory.getWorkingMemorySnapshot({
+      scope: 'thread',
+      resourceId: clone.thread.resourceId,
+      threadId: clone.thread.id,
+    });
+    const messages = await blockMessageDeletes();
+    let rollbackPromise: ReturnType<MemoryPG['rollbackThreadClone']> | undefined;
+    let observerPromise: ReturnType<MemoryPG['applyWorkingMemoryUpdate']> | undefined;
+    try {
+      rollbackPromise = rollbackMemory.rollbackThreadClone({
+        thread: clone.rollbackReceipt,
+        observationalMemory: receipt,
+        unverifiedObservationalMemoryRecordId: record.id,
+      });
+      // Rollback now holds the cloned thread row and waits on its messages.
+      await waitForLockWait(rollbackApplicationName, '%mastra_messages%', 'the cloned messages');
+      observerPromise = competitorMemory.applyWorkingMemoryUpdate({
+        scope: 'thread',
+        resourceId: clone.thread.resourceId,
+        threadId: clone.thread.id,
+        value: 'Observer-derived update',
+        expectedRevision: revision,
+        source: 'observer',
+        observationalMemoryGuard: {
+          recordId: record.id,
+          threadId: clone.thread.id,
+          resourceId: clone.thread.resourceId,
+        },
+      });
+      await waitForLockWait(competitorApplicationName, '%', 'a lock');
+      await messages.release();
+
+      const outcomes = await within(
+        Promise.allSettled([rollbackPromise, observerPromise]),
+        'clone rollback and stamping observer write',
+      );
+      expect(outcomes.map(describeOutcome)).toEqual(['rolled_back', 'ObservationalMemoryGenerationConflictError']);
+      await expect(rollbackMemory.getThreadById({ threadId: clone.thread.id })).resolves.toBeNull();
+    } finally {
+      await messages.close();
+      await Promise.allSettled([rollbackPromise, observerPromise].filter(Boolean) as Promise<unknown>[]);
     }
   });
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { InMemoryStore } from '../../mock';
 
@@ -696,7 +696,7 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
 
     it('never lets a guarded write and a concurrent retraction leave its working memory unretracted', async () => {
       const context = await setup('race-legacy-write');
-      const [write] = await Promise.allSettled([
+      await Promise.allSettled([
         context.memory.updateResourceFromObservationalMemory({
           resourceId: context.resourceId,
           workingMemory: 'FROM-DELETED-MSG',
@@ -708,7 +708,21 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
       // Either the write landed first (stamped, then cleared) or the
       // retraction did (the write is refused); never stored and unretracted.
       expect(resource?.workingMemory).not.toBe('FROM-DELETED-MSG');
-      expect(['fulfilled', 'rejected']).toContain(write.status);
+    });
+
+    it('routes a guarded resource write through an updateResource override and still stamps it', async () => {
+      const context = await setup('legacy-write-override');
+      const updateResource = vi.spyOn(context.memory, 'updateResource');
+      await context.memory.updateResourceFromObservationalMemory({
+        resourceId: context.resourceId,
+        workingMemory: 'FROM-DELETED-MSG',
+        guard: context.guard,
+      });
+      expect(updateResource).toHaveBeenCalledWith({
+        resourceId: context.resourceId,
+        workingMemory: 'FROM-DELETED-MSG',
+      });
+      await expect(context.marker()).resolves.toBe('resource');
     });
   });
 
