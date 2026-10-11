@@ -3053,6 +3053,7 @@ describe('HarnessLibSQL wakeup ledger', () => {
     client = createHarnessTestClient();
     storage = createHarnessStorage(client);
     await storage.init();
+    await seedLedgerSessions(storage);
   });
 
   it('dedupes exact wakeups and reports source-fire key conflicts', async () => {
@@ -3078,6 +3079,7 @@ describe('HarnessLibSQL wakeup ledger', () => {
   it('creates wakeup idempotency, source-fire, and claim indexes on the lazy ensure path', async () => {
     const client = createHarnessTestClient();
     const lazyStorage = new HarnessLibSQL({ client });
+    await insertBareSessionRow(client, 'session-1');
     const executeSpy = vi.spyOn(client, 'execute');
 
     await lazyStorage.createOrLoadHarnessWakeupItem(sampleWakeup());
@@ -3531,6 +3533,7 @@ describe('HarnessLibSQL channel action ledger', () => {
     client = createHarnessTestClient();
     storage = createHarnessStorage(client);
     await storage.init();
+    await seedLedgerSessions(storage);
   });
 
   it('dedupes exact action tokens and flags immutable token mismatches', async () => {
@@ -3565,6 +3568,7 @@ describe('HarnessLibSQL channel action ledger', () => {
   it('creates receipt indexes on the lazy ensure path', async () => {
     const client = createHarnessTestClient();
     const lazyStorage = new HarnessLibSQL({ client });
+    await insertBareSessionRow(client, 'session-1');
 
     await lazyStorage.createOrLoadChannelActionReceipt(sampleChannelActionReceipt());
     await lazyStorage.loadChannelActionReceiptByTokenId({
@@ -3818,6 +3822,7 @@ describe('HarnessLibSQL channel outbox ledger', () => {
     client = createHarnessTestClient();
     storage = createHarnessStorage(client);
     await storage.init();
+    await seedLedgerSessions(storage);
   });
 
   it('dedupes exact outbound projections and flags same-key delivery conflicts', async () => {
@@ -4156,6 +4161,7 @@ describe('HarnessLibSQL channel diagnostics', () => {
     const client = createHarnessTestClient();
     storage = createHarnessStorage(client);
     await storage.init();
+    await seedLedgerSessions(storage);
   });
 
   it('lists resource and session scoped diagnostics rows across channel ledgers', async () => {
@@ -4250,6 +4256,216 @@ describe('HarnessLibSQL channel diagnostics', () => {
         limit: 0,
       }),
     ).resolves.toEqual({ inbox: [], actionTokens: [], actionReceipts: [], outbox: [] });
+  });
+});
+
+describe('HarnessLibSQL session delete erases channel and wakeup rows (PF-5309)', () => {
+  let harness: HarnessLibSQL;
+
+  beforeEach(async () => {
+    harness = createHarnessStorage(createHarnessTestClient());
+    await harness.init();
+  });
+
+  const saveClosedSession = (id: string) =>
+    harness.saveSession(
+      sampleSession({
+        id,
+        threadId: `thread-${id}`,
+        sessionIncarnation: `incarnation-${id}`,
+        closedAt: 2000,
+        lastActivityAt: 2000,
+      }),
+      { ownerId: 'h', ifVersion: 0 },
+    );
+  const deleteClosedSession = async (id: string) => {
+    const record = await harness.loadSession({ sessionId: id });
+    if (!record) throw new Error(`expected ${id}`);
+    await harness.deleteSession({
+      sessionId: id,
+      ifVersion: record.version,
+      expectedResourceId: record.resourceId,
+      expectedThreadId: record.threadId,
+      expectedParentSessionId: record.parentSessionId ?? null,
+      expectedCreatedAt: record.createdAt,
+      requireClosed: true,
+    });
+  };
+  const seedLedgerRows = async (id: string) => {
+    await harness.saveChannelInboxItem(
+      sampleChannelInbox({
+        id: `inbox-${id}`,
+        admissionId: `inbox-${id}`,
+        idempotencyKey: `event-${id}`,
+        externalMessageId: `message-${id}`,
+        resourceId: 'resource-1',
+        threadId: `thread-${id}`,
+        sessionId: id,
+        content: `private note of ${id}`,
+      }),
+    );
+    await harness.enqueueChannelOutbox(
+      sampleChannelOutbox({
+        id: `outbox-${id}`,
+        idempotencyKey: `outbox-${id}`,
+        sessionId: id,
+        owningSessionId: id,
+        payload: { text: `reply to ${id}` },
+      }),
+    );
+    await harness.enqueueChannelOutbox(
+      sampleChannelOutbox({
+        id: `outbox-owned-${id}`,
+        idempotencyKey: `outbox-owned-${id}`,
+        sessionId: undefined,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadChannelActionToken(
+      sampleChannelActionToken({
+        actionTokenId: `token-${id}`,
+        transportHash: `transport-${id}`,
+        itemId: `question-${id}`,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadChannelActionReceipt(
+      sampleChannelActionReceipt({
+        id: `receipt-${id}`,
+        actionTokenId: `token-${id}`,
+        actionId: `action-${id}`,
+        itemId: `question-${id}`,
+        owningSessionId: id,
+      }),
+    );
+    await harness.createOrLoadHarnessWakeupItem(
+      sampleWakeup({
+        id: `wakeup-${id}`,
+        idempotencyKey: `wake-${id}`,
+        sourceId: `schedule-${id}`,
+        admissionId: `wake-admission-${id}`,
+        threadId: `thread-${id}`,
+        sessionId: id,
+      }),
+    );
+  };
+  const ledgerRows = async (id: string) => {
+    const rows = await harness.listChannelDiagnosticsRows({ resourceId: 'resource-1', sessionIds: [id], limit: 10 });
+    const wakeup = await harness.loadHarnessWakeupItemByIdempotencyKey({
+      harnessName: 'default',
+      idempotencyKey: `wake-${id}`,
+    });
+    return {
+      inbox: rows.inbox.map(row => row.id),
+      outbox: rows.outbox.map(row => row.id).sort(),
+      actionTokens: rows.actionTokens.map(row => row.actionTokenId),
+      actionReceipts: rows.actionReceipts.map(row => row.id),
+      wakeups: wakeup ? [wakeup.id] : [],
+    };
+  };
+  const seededRows = (id: string) => ({
+    inbox: [`inbox-${id}`],
+    outbox: [`outbox-${id}`, `outbox-owned-${id}`],
+    actionTokens: [`token-${id}`],
+    actionReceipts: [`receipt-${id}`],
+    wakeups: [`wakeup-${id}`],
+  });
+  const noRows = { inbox: [], outbox: [], actionTokens: [], actionReceipts: [], wakeups: [] };
+
+  it("erases the session's channel and wakeup rows and keeps other sessions' rows", async () => {
+    for (const id of ['ledger-deleted', 'ledger-kept']) {
+      await saveClosedSession(id);
+      await seedLedgerRows(id);
+    }
+    await expect(ledgerRows('ledger-deleted')).resolves.toEqual(seededRows('ledger-deleted'));
+
+    await deleteClosedSession('ledger-deleted');
+
+    await expect(ledgerRows('ledger-deleted')).resolves.toEqual(noRows);
+    await expect(ledgerRows('ledger-kept')).resolves.toEqual(seededRows('ledger-kept'));
+  });
+
+  it('refuses a late channel or wakeup write for a deleted session and stores nothing', async () => {
+    await saveClosedSession('ledger-late');
+    // An inbound row recorded before its session resolved (no session yet).
+    const now = Date.now();
+    const recorded = await harness.createOrLoadChannelInboxItem(
+      sampleChannelInbox({
+        id: 'inbox-unresolved',
+        admissionId: 'inbox-unresolved',
+        idempotencyKey: 'event-unresolved',
+      }),
+      { initialClaim: { claimId: 'claim-unresolved', now, claimTtlMs: 60_000 } },
+    );
+    await deleteClosedSession('ledger-late');
+
+    const late = 'ledger-late';
+    await expect(
+      harness.saveChannelInboxItem(
+        sampleChannelInbox({
+          id: 'inbox-late',
+          admissionId: 'inbox-late',
+          idempotencyKey: 'event-late',
+          sessionId: late,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelInboxItem(
+        sampleChannelInbox({
+          id: 'inbox-late-2',
+          admissionId: 'inbox-late-2',
+          idempotencyKey: 'event-late-2',
+          sessionId: late,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    // Admission cannot bind the recorded row to the deleted session.
+    await expect(
+      harness.updateChannelInboxItem(
+        {
+          ...recorded.item,
+          status: 'admitted',
+          resourceId: 'resource-1',
+          threadId: `thread-${late}`,
+          sessionId: late,
+          delivery: 'queue',
+          admittedAt: now,
+          updatedAt: now,
+        },
+        { claimId: 'claim-unresolved' },
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.enqueueChannelOutbox(
+        sampleChannelOutbox({ id: 'outbox-late', sessionId: late, owningSessionId: undefined }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.enqueueChannelOutbox(
+        sampleChannelOutbox({ id: 'outbox-late-owned', sessionId: undefined, owningSessionId: late }),
+      ),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelActionToken(sampleChannelActionToken({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadChannelActionReceipt(sampleChannelActionReceipt({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.saveChannelActionReceipt(sampleChannelActionReceipt({ owningSessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness.createOrLoadHarnessWakeupItem(sampleWakeup({ idempotencyKey: `wake-${late}`, sessionId: late })),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    await expect(ledgerRows(late)).resolves.toEqual(noRows);
+    const unresolved = await harness.loadChannelInboxItemByIdempotencyKey({
+      harnessName: 'default',
+      channelId: 'support',
+      idempotencyKey: 'event-unresolved',
+    });
+    expect([unresolved?.status, unresolved?.sessionId]).toEqual(['received', undefined]);
   });
 });
 
@@ -5077,6 +5293,27 @@ describe('HarnessLibSQL plan tasks (§5.1k)', () => {
     expect(afterSub.tasks[0]!.delegatedSubagentSessionId).toBe('sub-xyz');
   });
 });
+
+/**
+ * Channel and wakeup rows are written only while the sessions they name exist,
+ * so the ledger tests start with the sessions their sample rows name.
+ */
+async function seedLedgerSessions(storage: HarnessLibSQL): Promise<void> {
+  for (const id of ['session-1', 'child-1', 'hidden-session']) {
+    await storage.saveSession(sampleSession({ id, threadId: `thread-${id}` }), { ownerId: 'h', ifVersion: 0 });
+  }
+}
+
+/** A bare session row for the lazy-ensure tests, which never run init(). */
+async function insertBareSessionRow(client: Client, id: string): Promise<void> {
+  await client.execute(
+    `CREATE TABLE IF NOT EXISTS ${TABLE_HARNESS_SESSIONS} (harness_name TEXT NOT NULL, id TEXT NOT NULL)`,
+  );
+  await client.execute({
+    sql: `INSERT INTO ${TABLE_HARNESS_SESSIONS} (harness_name, id) VALUES (?, ?)`,
+    args: ['default', id],
+  });
+}
 
 function sampleSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {

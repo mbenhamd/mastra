@@ -75,6 +75,39 @@ function makeStorage() {
   return storage;
 }
 
+/**
+ * Channel rows are written only while the sessions they name exist, so the
+ * outbox tests store the session `channelOutboxInput()` names first.
+ */
+async function saveChannelFixtureSession(
+  storage: InMemoryHarness,
+  id = 'session-1',
+  resourceId = 'resource-1',
+): Promise<void> {
+  await storage.saveSession(
+    {
+      harnessName: 'primary',
+      id,
+      resourceId,
+      threadId: `thread-${id}`,
+      origin: 'top-level',
+      ownsThread: false,
+      modeId: 'default',
+      modelId: 'model-1',
+      subagentModelOverrides: {},
+      permissionRules: { categories: {}, tools: {} },
+      sessionGrants: { categories: [], tools: [] },
+      tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      pendingQueue: [],
+      state: {},
+      createdAt: 1000,
+      lastActivityAt: 1000,
+      version: 0,
+    },
+    { harnessName: 'primary', ownerId: 'fixture', ifVersion: 0 },
+  );
+}
+
 class CloseAfterLeaseStorage extends InMemoryHarness {
   readonly closeAfterLeaseSessionIds = new Set<string>();
 
@@ -1756,6 +1789,7 @@ describe('Harness v1 — construction', () => {
       if (e.type.startsWith('channel_')) channelEvents.push(e as never);
     });
 
+    await saveChannelFixtureSession(storage);
     await expect(harness.channels.enqueueOutbox(channelOutboxInput())).resolves.toMatchObject({
       duplicate: false,
       conflict: false,
@@ -1818,6 +1852,7 @@ describe('Harness v1 — construction', () => {
       harnesses: { primary: harness },
     });
 
+    await saveChannelFixtureSession(storage);
     await expect(
       harness.channels.enqueueOutbox(
         channelOutboxInput({
@@ -1880,6 +1915,7 @@ describe('Harness v1 — construction', () => {
     );
     await storage.createOrLoadChannelActionReceipt(channelActionReceiptRow({ owningSessionId: child.id }));
     await storage.enqueueChannelOutbox(channelOutboxRow());
+    await saveChannelFixtureSession(storage, 'foreign-session', 'resource-2');
     await storage.saveChannelInboxItem(
       channelInboxRow({
         id: 'foreign-inbox',
@@ -2013,6 +2049,7 @@ describe('Harness v1 — construction', () => {
       harnesses: { primary: harness },
     });
 
+    await saveChannelFixtureSession(storage);
     await harness.channels.enqueueOutbox(channelOutboxInput({ deliverySemantics: 'lookup-reconcile' }));
 
     await expect(harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-lookup-1' })).resolves.toEqual(
@@ -2075,6 +2112,7 @@ describe('Harness v1 — construction', () => {
         harnesses: { primary: harness },
       });
 
+      await saveChannelFixtureSession(storage);
       await harness.channels.enqueueOutbox(channelOutboxInput());
       const firstDispatch = harness.channels.dispatchOutbox({
         channelId: 'support',
@@ -2118,6 +2156,7 @@ describe('Harness v1 — construction', () => {
       channels: { slack: makeChannelProvider('slack') },
       harnesses: { primary: harness },
     });
+    await saveChannelFixtureSession(storage);
     const enqueued = await harness.channels.enqueueOutbox(channelOutboxInput());
     const outboxItemId = enqueued.outboxItemId;
     const dispatchNow = Date.now();
@@ -2216,6 +2255,7 @@ describe('Harness v1 — construction', () => {
       if (e.type === 'channel_outbox_failed') failedEvents.push(e as never);
     });
 
+    await saveChannelFixtureSession(storage);
     await harness.channels.enqueueOutbox(channelOutboxInput());
 
     await expect(harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-dead' })).resolves.toEqual({
@@ -2266,6 +2306,7 @@ describe('Harness v1 — construction', () => {
         harnesses: { primary: harness },
       });
 
+      await saveChannelFixtureSession(storage);
       await harness.channels.enqueueOutbox(channelOutboxInput());
 
       await expect(
@@ -2330,6 +2371,7 @@ describe('Harness v1 — construction', () => {
         harnesses: { primary: harness },
       });
 
+      await saveChannelFixtureSession(storage);
       await harness.channels.enqueueOutbox(channelOutboxInput());
       const firstDispatch = harness.channels.dispatchOutbox({ channelId: 'support', claimId: 'claim-delayed-1' });
       await vi.advanceTimersByTimeAsync(10_000);
@@ -5928,6 +5970,7 @@ describe('Harness.admitChannelInbound (§14.2 ingress admission core / C4)', () 
 
   it('worker dead-letters a row already at maxAttempts (no further admission attempt)', async () => {
     const { harness, storage } = setup();
+    await saveChannelFixtureSession(storage);
     await storage.saveChannelInboxItem(
       channelInboxRow({
         id: 'inbox-dead-1',

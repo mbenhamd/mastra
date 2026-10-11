@@ -1107,6 +1107,10 @@ export class HarnessLibSQL extends HarnessStorage {
     await this.#ensureChannelBindingsTable();
     await this.#ensurePlanTasksTable();
     await this.#ensureRunSummariesTable();
+    await this.#ensureChannelInboxTable();
+    await this.#ensureChannelActionTables();
+    await this.#ensureChannelOutboxTable();
+    await this.#ensureWakeupTable();
     const tx = await this.#client.transaction('write');
     const deleteCandidates = new Map<
       string,
@@ -1191,6 +1195,36 @@ export class HarnessLibSQL extends HarnessStorage {
         // §5.2g: cascade the whole plan-task tree owned by this session.
         await tx.execute({
           sql: `DELETE FROM ${TABLE_HARNESS_PLAN_TASKS}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        // Channel and wakeup rows go with the session: inbox items carry the
+        // inbound content, outbox items the outbound payload (of the session or
+        // owned by it), receipts the action response, tokens the pending action,
+        // and wakeups their scheduled content. The content-free terminal session
+        // fences and grant tombstones stay, so nothing is replayed or resurrected.
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_INBOX}
+                WHERE harness_name = ? AND session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_OUTBOX}
+                WHERE harness_name = ? AND (session_id = ? OR owning_session_id = ?)`,
+          args: [namespace, sessionId, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
+                WHERE harness_name = ? AND owning_session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}
+                WHERE harness_name = ? AND owning_session_id = ?`,
+          args: [namespace, sessionId],
+        });
+        await tx.execute({
+          sql: `DELETE FROM ${TABLE_HARNESS_WAKEUPS}
                 WHERE harness_name = ? AND session_id = ?`,
           args: [namespace, sessionId],
         });
@@ -3367,6 +3401,42 @@ export class HarnessLibSQL extends HarnessStorage {
   // Channel inbox ledger
   // -------------------------------------------------------------------------
 
+  /**
+   * Runs a channel or wakeup ledger write while every session it names
+   * exists: the check and the write share one write transaction (SQLite
+   * serializes writers), so a session deleted before this write never regains
+   * channel or wakeup rows from it; the write fails with
+   * HarnessStorageSessionNotFoundError instead. A write naming no session runs
+   * as before.
+   */
+  async #writeWhileSessionsExist<T>(
+    namespace: string,
+    sessionIds: readonly (string | undefined)[],
+    write: (client: Pick<Client, 'execute'>) => Promise<T>,
+  ): Promise<T> {
+    const named = [...new Set(sessionIds.filter((id): id is string => id !== undefined))].sort();
+    if (named.length === 0) return write(this.#client);
+    const tx = await this.#client.transaction('write');
+    try {
+      for (const sessionId of named) {
+        const live = await tx.execute({
+          sql: `SELECT 1 FROM ${TABLE_HARNESS_SESSIONS}
+                WHERE harness_name = ? AND id = ?
+                LIMIT 1`,
+          args: [namespace, sessionId],
+        });
+        if (live.rows.length === 0) throw new HarnessStorageSessionNotFoundError(sessionId);
+      }
+      const result = await write(tx);
+      await tx.commit();
+      return result;
+    } catch (err) {
+      // The original failure wins over a failed rollback.
+      if (!tx.closed) await tx.rollback().catch(() => undefined);
+      throw err;
+    }
+  }
+
   async saveChannelInboxItem(record: ChannelInboxItem): Promise<void> {
     await this.#ensureChannelInboxTable();
     const namespaced = { ...record, harnessName: this.#resolveHarnessName(record.harnessName) };
@@ -3391,8 +3461,9 @@ export class HarnessLibSQL extends HarnessStorage {
     }
     const cols = channelInboxColumnValues(namespaced);
     try {
-      const result = await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
+      const result = await this.#writeWhileSessionsExist(namespaced.harnessName, [namespaced.sessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})
               ON CONFLICT(id) DO UPDATE SET
@@ -3426,8 +3497,9 @@ export class HarnessLibSQL extends HarnessStorage {
                     AND excluded.status IN ('received', 'admitted', 'failed', 'dead')
                   )
                 )`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       if (result.rowsAffected === 0) {
         const conflict = await this.#loadChannelInboxItemById(namespaced.id);
         if (conflict && channelInboxItemsEqual(conflict, namespaced)) return;
@@ -3478,12 +3550,14 @@ export class HarnessLibSQL extends HarnessStorage {
           };
     const cols = channelInboxColumnValues(insertItem);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
+      await this.#writeWhileSessionsExist(namespace, [incoming.sessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_INBOX}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return {
         item: insertItem,
         duplicate: false,
@@ -3669,23 +3743,25 @@ export class HarnessLibSQL extends HarnessStorage {
     const stateCompareNames = cols.names.filter(
       name => name !== 'id' && name !== 'claim_id' && name !== 'claim_expires_at' && name !== 'updated_at',
     );
-    const result = await this.#client.execute({
-      sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
+    const result = await this.#writeWhileSessionsExist(namespace, [next.sessionId], client =>
+      client.execute({
+        sql: `UPDATE ${TABLE_HARNESS_CHANNEL_INBOX}
             SET ${updateNames.map(name => `${name} = ?`).join(', ')}
             WHERE harness_name = ? AND id = ? AND claim_id = ?
               AND claim_expires_at IS NOT NULL
               AND claim_expires_at > ?
               AND status NOT IN ('accepted', 'queued', 'dead')
               AND ${stateCompareNames.map(name => `${name} IS ?`).join(' AND ')}`,
-      args: [
-        ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
-        namespace,
-        next.id,
-        opts.claimId,
-        storageNow,
-        ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
-      ],
-    });
+        args: [
+          ...updateNames.map(name => cols.values[cols.names.indexOf(name)]),
+          namespace,
+          next.id,
+          opts.claimId,
+          storageNow,
+          ...stateCompareNames.map(name => currentCols.values[currentCols.names.indexOf(name)]),
+        ],
+      }),
+    );
     if (result.rowsAffected === 0) {
       throw new HarnessStorageChannelInboxClaimConflictError(record.id, opts.claimId);
     }
@@ -3727,12 +3803,14 @@ export class HarnessLibSQL extends HarnessStorage {
     if (existingByPending) return { token: existingByPending, duplicate: true, conflict: true };
     const cols = channelActionTokenColumnValues(token);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}
+      await this.#writeWhileSessionsExist(token.harnessName, [token.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_TOKENS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
     } catch (err) {
       if (!isUniqueConstraintError(err)) throw err;
       const raced =
@@ -3890,8 +3968,9 @@ export class HarnessLibSQL extends HarnessStorage {
     }
     const cols = channelActionReceiptColumnValues(receipt);
     try {
-      const result = await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
+      const result = await this.#writeWhileSessionsExist(receipt.harnessName, [receipt.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})
               ON CONFLICT(id) DO UPDATE SET
@@ -3932,8 +4011,9 @@ export class HarnessLibSQL extends HarnessStorage {
                     AND excluded.status IN ('received', 'accepted', 'failed', 'dead')
                   )
                 )`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       if (result.rowsAffected === 0) {
         const conflict = await this.#loadChannelActionReceiptById(receipt.id);
         if (conflict && channelActionReceiptsEqual(conflict, receipt)) return;
@@ -3989,12 +4069,14 @@ export class HarnessLibSQL extends HarnessStorage {
           };
     const cols = channelActionReceiptColumnValues(insertReceipt);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
+      await this.#writeWhileSessionsExist(namespace, [incoming.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_ACTION_RECEIPTS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return {
         receipt: insertReceipt,
         duplicate: false,
@@ -4229,12 +4311,14 @@ export class HarnessLibSQL extends HarnessStorage {
     assertValidChannelOutboxState(item);
     const cols = channelOutboxColumnValues(item);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_OUTBOX}
+      await this.#writeWhileSessionsExist(item.harnessName, [item.sessionId, item.owningSessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_CHANNEL_OUTBOX}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return { outboxItemId: item.id, duplicate: false, conflict: false };
     } catch (err) {
       if (!isUniqueConstraintError(err)) throw err;
@@ -4516,12 +4600,14 @@ export class HarnessLibSQL extends HarnessStorage {
     assertValidHarnessWakeupState(insertItem);
     const cols = harnessWakeupColumnValues(insertItem);
     try {
-      await this.#client.execute({
-        sql: `INSERT INTO ${TABLE_HARNESS_WAKEUPS}
+      await this.#writeWhileSessionsExist(namespace, [incoming.sessionId], client =>
+        client.execute({
+          sql: `INSERT INTO ${TABLE_HARNESS_WAKEUPS}
               (${cols.names.join(', ')})
               VALUES (${cols.names.map(() => '?').join(', ')})`,
-        args: cols.values,
-      });
+          args: cols.values,
+        }),
+      );
       return { item: insertItem, duplicate: false, conflict: false, claimed: canInitialClaim };
     } catch (err) {
       if (!isUniqueConstraintError(err)) throw err;

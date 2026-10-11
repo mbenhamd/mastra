@@ -1119,7 +1119,8 @@ export abstract class HarnessStorage extends StorageDomain {
   /**
    * Hard-delete a collected session subtree under one guarded adapter boundary.
    * Adapters must either delete every still-existing guarded row or reject
-   * without deleting any of them. The default preserves single-session legacy
+   * without deleting any of them. Each deleted session's channel, action and
+   * wakeup rows go with it (see "Session erasure" at the channel inbox ledger). The default preserves single-session legacy
    * adapter compatibility; adapters must override this for multi-session
    * all-or-nothing batch semantics.
    */
@@ -1679,6 +1680,18 @@ export abstract class HarnessStorage extends StorageDomain {
   // -------------------------------------------------------------------------
   // Channel inbox ledger
   // -------------------------------------------------------------------------
+  //
+  // Session erasure (channel, action and wakeup ledgers): `deleteSessions`
+  // erases, in the same delete, every inbox item and wakeup of the session,
+  // every outbox item whose `sessionId` or `owningSessionId` is the session,
+  // and every action token and receipt it owns. A write that names a session
+  // (inbox `sessionId`, outbox `sessionId`/`owningSessionId`, token or receipt
+  // `owningSessionId`, wakeup `sessionId`) stores its row only while that
+  // session exists, atomically with the check, and otherwise rejects with
+  // `HarnessStorageSessionNotFoundError`; a deleted session therefore never
+  // regains these rows from a late write. Rows naming no session are
+  // unaffected. The content-free terminal session fences and grant tombstones
+  // are not erased.
 
   abstract saveChannelInboxItem(record: ChannelInboxItem): Promise<void>;
 
