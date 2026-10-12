@@ -315,7 +315,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   /**
    * How many loop StepResults the `step-finish` chunks seen so far carried. The loop adds one per
    * step it completes; an attempt retried after an API error adds none, so its `step-finish`
-   * carries the previous step last (PF-5399).
+   * carries the previous step last (PF-5399). Saved with the stream state, so a restored output
+   * does not take that previous step for a new one.
    */
   #loopStepCount = 0;
   #tripwire: StepTripwireData | undefined = undefined;
@@ -2613,6 +2614,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       tripwire: this.#tripwire,
       wasSuspended: this.#wasSuspended,
       terminalToolResult: this.#terminalToolResult,
+      loopStepCount: this.#loopStepCount,
       ...(this.#pendingSuspendedStepUsage ? { pendingSuspendedStepUsage: this.#pendingSuspendedStepUsage } : {}),
       messageList: this.messageList.serialize(),
     };
@@ -2651,5 +2653,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       rehydrateStepRequests(state.bufferedSteps, state.bufferedStepRequests),
       this.messageList,
     );
+    // A state saved before the count was kept: every loop step has a public step, so the public
+    // step count is never below it. Overcounting only sends a step to the marker count; undercounting
+    // would read the previous step's content for an attempt retried after an API error.
+    this.#loopStepCount = typeof state.loopStepCount === 'number' ? state.loopStepCount : this.#bufferedSteps.length;
   }
 }

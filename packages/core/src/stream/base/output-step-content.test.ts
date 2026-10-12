@@ -9,13 +9,18 @@
  * loop's StepResult already holds the right content; these cases pin that `out.steps` agrees,
  * except that a rolled-back attempt reports no content, as its parts left the response.
  */
+import { ReadableStream } from 'node:stream/web';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 import { MockLanguageModelV2, convertArrayToReadableStream } from '../../agent/__tests__/mock-model';
 import { Agent } from '../../agent/agent';
+import { MessageList } from '../../agent/message-list';
 import { Mastra } from '../../mastra';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
+import { ChunkFrom } from '../types';
+import type { ChunkType } from '../types';
+import { MastraModelOutput } from './output';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const finish = (finishReason: string) => ({ type: 'finish', finishReason, usage });
@@ -52,6 +57,53 @@ const tools = {
     execute: async () => 'applied',
   }),
 };
+
+/** A loop step-finish chunk that carries the given loop StepResults. */
+function stepFinishChunk(steps: Array<{ content: Array<Record<string, unknown>> }>, reason: string): ChunkType {
+  return {
+    type: 'step-finish',
+    runId: 'r',
+    from: ChunkFrom.AGENT,
+    payload: {
+      id: 'step',
+      output: { steps, usage },
+      stepResult: { reason, warnings: [], isContinued: reason === 'retry' },
+      metadata: {},
+      messages: { nonUser: [], all: [] },
+    },
+  } as unknown as ChunkType;
+}
+
+function finishChunk(): ChunkType {
+  return {
+    type: 'finish',
+    runId: 'r',
+    from: ChunkFrom.AGENT,
+    payload: {
+      id: 'finish',
+      output: { steps: [], usage },
+      stepResult: { reason: 'stop', warnings: [], isContinued: false },
+      metadata: {},
+      messages: { nonUser: [], all: [] },
+    },
+  } as unknown as ChunkType;
+}
+
+function modelOutput(chunks: ChunkType[], messageList: MessageList, initialState?: unknown) {
+  return new MastraModelOutput({
+    model: { modelId: 'test-model', provider: 'test', version: 'v2' },
+    stream: new ReadableStream<ChunkType>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    }),
+    messageList,
+    messageId: 'msg-1',
+    options: { runId: 'r' },
+    initialState,
+  });
+}
 
 /** Each step's content as part type plus the tool call id or text it carries. */
 async function stepContents(out: { steps: Promise<Array<{ content: Array<any> }>> }) {
@@ -138,6 +190,28 @@ describe('PF-5399 public step content', () => {
       ['text:FAILED PARTIAL'],
       ['text:recovered'],
     ]);
+  });
+
+  it.each([
+    ['carries the loop step count', (state: Record<string, unknown>) => state],
+    ['predates the loop step count', ({ loopStepCount: _count, ...state }: Record<string, unknown>) => state],
+  ])('keeps the previous step out of an API-error retry after restoring a state that %s', async (_label, saved) => {
+    const toolStep = { content: [{ type: 'text', text: 'loop step one' }] };
+    const first = modelOutput([stepFinishChunk([toolStep], 'tool-calls'), finishChunk()], new MessageList());
+    await first.consumeStream();
+    expect((await first.steps).map(step => step.content)).toEqual([toolStep.content]);
+    const state = saved(JSON.parse(JSON.stringify(first.serializeState())));
+
+    // The attempt retried after an API error adds no loop StepResult, so its chunk carries the
+    // same steps as before the state was saved.
+    const messageList = new MessageList();
+    const restored = modelOutput([stepFinishChunk([toolStep], 'retry'), finishChunk()], messageList, state);
+    messageList.add({ role: 'assistant', content: [{ type: 'text', text: 'FAILED PARTIAL' }] }, 'response');
+    await restored.consumeStream();
+
+    const retried = (await restored.steps).at(-1)!;
+    expect(retried.content).not.toContainEqual(toolStep.content[0]);
+    expect(retried.content).toContainEqual(expect.objectContaining({ type: 'text', text: 'FAILED PARTIAL' }));
   });
 
   it('leaves a feedback note added after a step out of that step', async () => {
