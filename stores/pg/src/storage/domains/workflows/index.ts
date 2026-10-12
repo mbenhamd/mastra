@@ -68,6 +68,7 @@ import {
   rollbackWorkflowResumeRecord,
   WorkflowSnapshotHandoffFenceError,
   WorkflowStaleSnapshotPersistError,
+  isWorkflowSnapshotHandoffReleasable,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
   validateWorkflowSnapshotHandoffFence,
@@ -141,6 +142,8 @@ import type {
   TransitionWorkflowSnapshotHandoffResult,
   CompleteWorkflowSnapshotHandoffInput,
   CompleteWorkflowSnapshotHandoffResult,
+  ReleaseWorkflowSnapshotHandoffInput,
+  ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
   WorkflowTerminalRecoveryAncestryRecord,
@@ -425,7 +428,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1 };
+    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1 };
   }
 
   private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
@@ -5530,6 +5533,37 @@ export class WorkflowsPG extends WorkflowsStorage {
       });
     } catch (error) {
       throw this.snapshotHandoffError('COMPLETE_WORKFLOW_SNAPSHOT_HANDOFF', workflowName, runId, error);
+    }
+  }
+
+  async releaseWorkflowSnapshotHandoff(
+    input: ReleaseWorkflowSnapshotHandoffInput,
+  ): Promise<ReleaseWorkflowSnapshotHandoffResult> {
+    const { workflowName, runId, mutationFence } = input;
+    if (mutationFence !== undefined) validateWorkflowSnapshotHandoffFence(mutationFence);
+    validateWorkflowSnapshotHandoffIdentity(workflowName, runId);
+    try {
+      return await this.#db.client.tx(async t => {
+        // Same lock order as claim, transition, complete and run deletion:
+        // parent revision first, then the handoff row.
+        await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        const existing = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
+        if (!existing) return { status: 'missing' };
+        if (!isWorkflowSnapshotHandoffReleasable(existing, mutationFence)) {
+          return { status: 'conflict', record: existing };
+        }
+        const result = await t.query(
+          `DELETE FROM ${this.workflowSnapshotHandoffTableName()}
+           WHERE workflow_name = $1 AND run_id = $2`,
+          [workflowName, runId],
+        );
+        if ((result.rowCount ?? 0) !== 1) {
+          throw new TypeError('Workflow snapshot handoff release did not remove the locked row');
+        }
+        return { status: 'released', record: existing };
+      });
+    } catch (error) {
+      throw this.snapshotHandoffError('RELEASE_WORKFLOW_SNAPSHOT_HANDOFF', workflowName, runId, error);
     }
   }
 

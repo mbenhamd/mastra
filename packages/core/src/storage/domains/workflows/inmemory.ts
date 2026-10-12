@@ -80,6 +80,8 @@ import type {
   TransitionWorkflowSnapshotHandoffResult,
   CompleteWorkflowSnapshotHandoffInput,
   CompleteWorkflowSnapshotHandoffResult,
+  ReleaseWorkflowSnapshotHandoffInput,
+  ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
   WorkflowExecutionState,
@@ -95,6 +97,7 @@ import {
   WorkflowSnapshotHandoffFenceError,
   WorkflowStaleSnapshotPersistError,
   compareWorkflowSnapshotHandoffCursors,
+  isWorkflowSnapshotHandoffReleasable,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
   validateWorkflowSnapshotHandoffFence,
@@ -533,7 +536,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1 };
+    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1 };
   }
 
   private getWorkflowSnapshotHandoff(workflowName: string, runId: string): WorkflowSnapshotHandoffRecord | undefined {
@@ -1911,6 +1914,22 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     };
     this.db.workflowSnapshotHandoffs.set(key, completed);
     return { status: 'completed', record: this.copyWorkflowSnapshotHandoff(completed) };
+  }
+
+  async releaseWorkflowSnapshotHandoff(
+    input: ReleaseWorkflowSnapshotHandoffInput,
+  ): Promise<ReleaseWorkflowSnapshotHandoffResult> {
+    const { workflowName, runId, mutationFence } = input;
+    if (mutationFence !== undefined) validateWorkflowSnapshotHandoffFence(mutationFence);
+    validateWorkflowSnapshotHandoffIdentity(workflowName, runId);
+    const key = this.getWorkflowKey(workflowName, runId);
+    const existing = this.db.workflowSnapshotHandoffs.get(key);
+    if (!existing) return { status: 'missing' };
+    if (!isWorkflowSnapshotHandoffReleasable(existing, mutationFence)) {
+      return { status: 'conflict', record: this.copyWorkflowSnapshotHandoff(existing) };
+    }
+    this.db.workflowSnapshotHandoffs.delete(key);
+    return { status: 'released', record: this.copyWorkflowSnapshotHandoff(existing) };
   }
 
   async listWorkflowSnapshotHandoffs(

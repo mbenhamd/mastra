@@ -105,6 +105,8 @@ export interface WorkflowSnapshotHandoffRecord {
 export interface WorkflowSnapshotHandoffCapabilities {
   handoffVersion?: 1;
   recoveryVersion?: 1;
+  /** Fenced handoff release (`releaseWorkflowSnapshotHandoff`), which lifts the run's deletion fence. */
+  releaseVersion?: 1;
 }
 
 /** The canonical native snapshot state a handoff claim must compare under the parent lock. */
@@ -158,6 +160,34 @@ export interface CompleteWorkflowSnapshotHandoffInput {
 
 export type CompleteWorkflowSnapshotHandoffResult =
   | { status: 'completed' | 'already_completed'; record: WorkflowSnapshotHandoffRecord }
+  | { status: 'missing' }
+  | { status: 'conflict'; record: WorkflowSnapshotHandoffRecord }
+  | { status: 'unsupported' };
+
+/**
+ * Removes a run's handoff row so the run is no longer fenced (deletion,
+ * retention and native writes proceed as if no handoff had been claimed).
+ *
+ * A completed handoff may be released without `mutationFence`. A pending
+ * handoff is released only by the caller holding its exact `mutationFence`.
+ * When `mutationFence` is supplied it must match exactly, even for a completed
+ * handoff, so a caller cannot release a handoff re-claimed by another owner.
+ */
+export interface ReleaseWorkflowSnapshotHandoffInput {
+  workflowName: string;
+  runId: string;
+  mutationFence?: string;
+}
+
+/**
+ * - `released`: this call removed the row; `record` is the row as it stood when released.
+ * - `missing`: no row exists (never claimed, or already released). Repeating a
+ *   release therefore converges on `missing` without changing anything.
+ * - `conflict`: the row was kept; `record` is the stored row that refused the release.
+ * - `unsupported`: the adapter does not implement `releaseVersion: 1`.
+ */
+export type ReleaseWorkflowSnapshotHandoffResult =
+  | { status: 'released'; record: WorkflowSnapshotHandoffRecord }
   | { status: 'missing' }
   | { status: 'conflict'; record: WorkflowSnapshotHandoffRecord }
   | { status: 'unsupported' };

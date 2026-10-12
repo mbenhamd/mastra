@@ -59,6 +59,8 @@ import type {
   TransitionWorkflowSnapshotHandoffResult,
   CompleteWorkflowSnapshotHandoffInput,
   CompleteWorkflowSnapshotHandoffResult,
+  ReleaseWorkflowSnapshotHandoffInput,
+  ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
   WorkflowExecutionState,
@@ -110,6 +112,16 @@ export abstract class WorkflowsStorage extends StorageDomain {
   async completeWorkflowSnapshotHandoff(
     _input: CompleteWorkflowSnapshotHandoffInput,
   ): Promise<CompleteWorkflowSnapshotHandoffResult> {
+    return { status: 'unsupported' };
+  }
+
+  /**
+   * Removes the run's handoff row so the run is no longer fenced. Adapters
+   * implementing this advertise `releaseVersion: 1`.
+   */
+  async releaseWorkflowSnapshotHandoff(
+    _input: ReleaseWorkflowSnapshotHandoffInput,
+  ): Promise<ReleaseWorkflowSnapshotHandoffResult> {
     return { status: 'unsupported' };
   }
 

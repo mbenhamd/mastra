@@ -1,5 +1,9 @@
 import type { WorkflowRunState } from '../workflows';
-import type { WorkflowSnapshotHandoffCanonicalState, WorkflowSnapshotHandoffCursor } from './types';
+import type {
+  WorkflowSnapshotHandoffCanonicalState,
+  WorkflowSnapshotHandoffCursor,
+  WorkflowSnapshotHandoffRecord,
+} from './types';
 
 const WORKFLOW_HANDOFF_UNSAFE_JSON_UNICODE_ESCAPE_RE = new RegExp(
   String.raw`(?<!\\)((?:\\\\)*)(?:(\\u[Dd][89AaBb][0-9A-Fa-f]{2}\\u[Dd][CcDdEeFf][0-9A-Fa-f]{2})|\\u(?:0000|[Dd][89A-Fa-f][0-9A-Fa-f]{2}))`,
@@ -174,6 +178,19 @@ function hasUnsafeIdentityChar(value: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * The release rule shared by every adapter: a supplied fence must match the
+ * stored fence exactly (pending or completed); without a fence only a
+ * completed handoff may be released.
+ */
+export function isWorkflowSnapshotHandoffReleasable(
+  record: Pick<WorkflowSnapshotHandoffRecord, 'status' | 'mutationFence'>,
+  mutationFence: string | undefined,
+): boolean {
+  if (mutationFence !== undefined) return record.mutationFence === mutationFence;
+  return record.status === 'completed';
 }
 
 /** Rejects handoff identity fields that cannot round-trip through UTF-8 encoding. */
