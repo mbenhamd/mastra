@@ -740,3 +740,44 @@ describe('MessageList step content location (PF-5364)', () => {
     expect(texts(list.stepContent(location))).toEqual(['Done.']);
   });
 });
+
+describe('MessageList step content across input-step processors (PF-5415)', () => {
+  const contentTypes = (content: Array<{ type: string }> | undefined) => content?.map(part => part.type);
+  const texts = (content: Array<{ type: string; text?: string }> | undefined) =>
+    content?.filter(part => part.type === 'text').map(part => part.text);
+  const messageOf = (list: MessageList, id: string) => list.get.response.db().find(message => message.id === id)!;
+
+  it('keeps carried tool work in the step when a processor appends history after it', () => {
+    const { list, id } = listWith(assistant([text('earlier step')]));
+    const location = list.openStepContent();
+    // Carried tool work is committed into the message before the input processors run.
+    messageOf(list, id).content.parts.push(toolCall('c1'));
+    const held = list.holdStepContent(location);
+    messageOf(list, id).content.parts.push(text('processor note'));
+    const rebased = list.rebaseStepContent(location, held);
+    messageOf(list, id).content.parts.push(text('answer'));
+
+    expect(contentTypes(list.stepContent(rebased))?.sort()).toEqual(['text', 'tool-call', 'tool-result']);
+    expect(texts(list.stepContent(rebased))).toEqual(['answer']);
+  });
+
+  it("keeps a held part the iteration's own when a processor replaces it with a changed copy", () => {
+    const { list, id } = listWith(assistant([text('earlier step')]));
+    const location = list.openStepContent();
+    // A failed attempt's text, still in the message when the next attempt's processors run.
+    messageOf(list, id).content.parts.push(text('partial attempt'));
+    const held = list.holdStepContent(location);
+    // A redacting processor replaces every part with a changed copy.
+    messageOf(list, id).content.parts = messageOf(list, id).content.parts.map(part =>
+      part.type === 'text' ? { ...part, text: `${part.text} [redacted]` } : part,
+    );
+    const rebased = list.rebaseStepContent(location, held);
+    messageOf(list, id).content.parts.push(text('answer'));
+
+    expect(texts(list.stepContent(rebased))).toEqual(['partial attempt [redacted]', 'answer']);
+
+    // Rejecting the step rolls back everything it wrote, the rewritten held part included.
+    expect(list.rollbackToStepBoundary(id, undefined, rebased)).toBe(true);
+    expect(partsOf(list, id)?.map(part => (part as { text?: string }).text)).toEqual(['earlier step [redacted]']);
+  });
+});

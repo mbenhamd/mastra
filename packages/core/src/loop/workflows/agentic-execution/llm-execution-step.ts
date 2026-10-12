@@ -1612,7 +1612,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           : undefined;
       // Where this iteration's response goes; its StepResult content is read from here. Input-step
       // processors may still rewrite history, so each attempt rebases it once they have run.
-      const iterationContent = messageList.openStepContent();
+      let iterationContent = messageList.openStepContent();
 
       try {
         // Open MODEL_STEP before any step-owned processor work. The outer
@@ -1898,7 +1898,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               writer: inputStepWriter,
               abortSignal: options?.abortSignal,
             });
-            messageList.rebaseStepContent(iterationContent, heldStepContent);
+            iterationContent = messageList.rebaseStepContent(iterationContent, heldStepContent);
             const admittedResponseRecovery =
               (processInputStepResult as Record<PropertyKey, unknown>)[AGENT_RESPONSE_RECOVERY_STEP] === true;
             if (admittedResponseRecovery) responseRecoveryStep = true;

@@ -253,9 +253,15 @@ type BoundaryCheckpoint = { messageId: string; prefix: BoundaryToken[] };
 export type StepContentLocation = {
   /**
    * Each response message's parts when the iteration began, as its input-step processors left them
-   * (`rebaseStepContent`).
+   * (`rebaseStepContent`), less the parts the iteration itself had already written.
    */
-  startParts: ReadonlyMap<string, RecordedParts>;
+  readonly startParts: ReadonlyMap<string, RecordedParts>;
+  /**
+   * Parts the iteration wrote before its input-step processors ran (carried tool work, a failed
+   * fallback attempt). They are the iteration's wherever they sit, even with history a processor
+   * added after them. Set by `rebaseStepContent`.
+   */
+  readonly ownedParts?: RecordedParts;
   /** Each response message's parts when the iteration ended; unset while it is open. */
   endParts?: ReadonlyMap<string, RecordedParts>;
 };
@@ -267,10 +273,12 @@ export type StepContentLocation = {
 type RecordedParts = { readonly tokens: readonly string[]; readonly objects: readonly MastraMessagePart[] };
 
 /**
- * What an iteration had written when its input-step processors started, from `holdStepContent`. Only
- * `rebaseStepContent` reads it.
+ * Each response message as an iteration's input-step processors found it, from `holdStepContent`:
+ * its parts, and for each part whether the iteration wrote it. Only `rebaseStepContent` reads it.
  */
-export type HeldStepContent = { readonly owned: RecordedParts };
+export type HeldStepContent = {
+  readonly messages: ReadonlyMap<string, RecordedParts & { readonly owned: readonly boolean[] }>;
+};
 
 /**
  * A short stand-in for a part's content in its identity, so recording a step does not copy every
@@ -349,6 +357,51 @@ function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: RecordedPar
     next = match + 1;
   }
   return last;
+}
+
+/** Whether `part` stands for one of `recorded`: the same object, or failing that the same identity. */
+function isRecordedPart(recorded: RecordedParts | undefined, part: MastraMessagePart): boolean {
+  if (!recorded || recorded.objects.length === 0) return false;
+  return recorded.objects.includes(part) || recorded.tokens.includes(partIdentity(part));
+}
+
+/**
+ * Which of a message's parts the iteration wrote, after input-step processors had the message.
+ *
+ * Parts are matched in order to the held ones, as `lastRecordedPartIndex` matches them, and a
+ * matched part keeps the held part's provenance. A processor that replaces a part with a changed
+ * copy leaves a part that matches nothing; it sits where the held part it replaced went missing,
+ * between the same matched neighbours. So unmatched parts are paired, in order, with the held parts
+ * missing between those neighbours, and take their provenance. Unmatched parts beyond that pairing
+ * are what the processor added, which is history. A rewrite therefore keeps its provenance whether
+ * it was history (PF-5415) or the iteration's own work.
+ */
+function ownedAfterInputProcessors(
+  parts: MastraMessagePart[],
+  held: RecordedParts & { readonly owned: readonly boolean[] },
+): boolean[] {
+  const owned = parts.map(() => false);
+  let next = 0;
+  let unmatched: number[] = [];
+  // Held parts `next` up to `anchor` were replaced or removed: pair the replacements in order.
+  const pairUnmatched = (anchor: number) => {
+    for (let i = 0; i < unmatched.length && next + i < anchor; i++) owned[unmatched[i]!] = held.owned[next + i]!;
+    unmatched = [];
+  };
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index]!;
+    let match = held.objects.indexOf(part, next);
+    if (match === -1) match = held.tokens.indexOf(partIdentity(part), next);
+    if (match === -1) {
+      unmatched.push(index);
+      continue;
+    }
+    pairUnmatched(match);
+    owned[index] = held.owned[match]!;
+    next = match + 1;
+  }
+  pairUnmatched(held.objects.length);
+  return owned;
 }
 
 /**
@@ -1082,24 +1135,25 @@ export class MessageList {
     // into this message, when that was recorded: the boundary goes on the last assistant message,
     // and an iteration can write into an earlier one (a feedback note sits after the message the
     // answer merges into), so its boundary is not in this message (PF-5404).
-    let boundaryIndex = boundary
+    const boundaryIndex = boundary
       ? findBoundaryIndex(parts, boundary, messageId, this.#boundaryFingerprints.get(boundary))
       : -1;
-    if (boundaryIndex === -1 && content) {
-      boundaryIndex = lastRecordedPartIndex(parts, content.startParts.get(messageId)) + 1;
-      // Nothing recorded before the attempt's parts: the message is all the attempt's.
-      if (boundaryIndex === 0) boundaryIndex = -1;
-    }
 
-    // Nowhere to splice: discard the message rather than guess which parts were accepted.
-    if (boundaryIndex === -1) {
+    if (boundaryIndex !== -1) {
+      // Drop the marker itself along with the step it opened, so the next iteration's
+      // openStepBoundary() writes a fresh marker for the retry rather than reusing the rejected one.
+      parts.splice(boundaryIndex);
+    } else if (content && content.startParts.has(messageId)) {
+      // Keep only what was there before the step began; the step's own parts, the ones it wrote
+      // before its input processors included, go wherever they sit.
+      const start = lastRecordedPartIndex(parts, content.startParts.get(messageId)) + 1;
+      const kept = parts.filter((part, index) => index < start && !isRecordedPart(content.ownedParts, part));
+      parts.splice(0, parts.length, ...kept);
+    } else {
+      // Nowhere to splice: discard the message rather than guess which parts were accepted.
       this.removeByIds([messageId]);
       return true;
     }
-
-    // Drop the marker itself along with the step it opened, so the next iteration's
-    // openStepBoundary() writes a fresh marker for the retry rather than reusing the rejected one.
-    parts.splice(boundaryIndex);
 
     if (parts.length === 0) {
       this.removeByIds([messageId]);
@@ -2282,40 +2336,48 @@ export class MessageList {
   }
 
   /**
-   * Call before the iteration's input-step processors run. Returns the parts the iteration has
-   * already written (carried tool work, a failed fallback attempt), for `rebaseStepContent`.
+   * Call before the iteration's input-step processors run. Records each response message and which
+   * of its parts the iteration has already written (carried tool work, a failed fallback attempt),
+   * for `rebaseStepContent`.
    */
   public holdStepContent(location: StepContentLocation): HeldStepContent {
-    const objects: MastraMessagePart[] = [];
+    const messages = new Map<string, RecordedParts & { readonly owned: readonly boolean[] }>();
     for (const message of this.response.db()) {
-      const parts = message.content.parts ?? [];
-      const start = lastRecordedPartIndex(parts, location.startParts.get(message.id)) + 1;
-      objects.push(...parts.slice(start));
+      const objects = (message.content.parts ?? []).map(part =>
+        part.type === 'tool-invocation' ? part : stampPart(part),
+      );
+      const start = lastRecordedPartIndex(objects, location.startParts.get(message.id)) + 1;
+      const owned = objects.map((part, index) => index >= start || isRecordedPart(location.ownedParts, part));
+      messages.set(message.id, { tokens: objects.map(partIdentity), objects, owned });
     }
-    return { owned: { tokens: objects.map(partIdentity), objects } };
+    return { messages };
   }
 
   /**
-   * Call once the iteration's input-step processors have run, before the model streams. Moves the
-   * start of the iteration's content past whatever the processors left in the response, keeping
-   * the parts `holdStepContent` saw the iteration write. A processor that replaces an earlier part
-   * with a changed copy under the same message id leaves a part that matches nothing recorded at
-   * `openStepContent`; without this it would be read as the iteration's own output (PF-5415).
+   * Call once the iteration's input-step processors have run, before the model streams. Returns the
+   * location to read the iteration's content from: whatever the processors left in the response is
+   * history, except the parts `holdStepContent` saw the iteration write, which stay the iteration's
+   * even when a processor replaced them with a changed copy or added history after them. A
+   * processor that replaces an earlier part with a changed copy under the same message id leaves a
+   * part that matches nothing recorded at `openStepContent`; without this it would be read as the
+   * iteration's own output (PF-5415).
    */
-  public rebaseStepContent(location: StepContentLocation, held: HeldStepContent): void {
-    const owned = held.owned;
-    const isOwned = (part: MastraMessagePart) =>
-      owned.objects.includes(part) || (owned.tokens.length > 0 && owned.tokens.includes(partIdentity(part)));
+  public rebaseStepContent(location: StepContentLocation, held: HeldStepContent): StepContentLocation {
     const startParts = new Map<string, RecordedParts>();
+    const ownedObjects: MastraMessagePart[] = [];
     for (const message of this.response.db()) {
-      const objects = (message.content.parts ?? [])
-        .filter(part => !isOwned(part))
-        .map(part => (part.type === 'tool-invocation' ? part : stampPart(part)));
+      const parts = (message.content.parts ?? []).map(part =>
+        part.type === 'tool-invocation' ? part : stampPart(part),
+      );
+      const before = held.messages.get(message.id);
+      const owned = before?.owned.includes(true) ? ownedAfterInputProcessors(parts, before) : undefined;
+      const history = owned ? parts.filter((_, index) => !owned[index]) : parts;
+      if (owned) ownedObjects.push(...parts.filter((_, index) => owned[index]));
       // A message the iteration started stays the iteration's.
-      if (objects.length === 0 && !location.startParts.has(message.id)) continue;
-      startParts.set(message.id, { tokens: objects.map(partIdentity), objects });
+      if (history.length === 0 && !location.startParts.has(message.id)) continue;
+      startParts.set(message.id, { tokens: history.map(partIdentity), objects: history });
     }
-    location.startParts = startParts;
+    return { startParts, ownedParts: { tokens: ownedObjects.map(partIdentity), objects: ownedObjects } };
   }
 
   /**
@@ -2353,10 +2415,15 @@ export class MessageList {
 
       const start = lastRecordedPartIndex(messageParts, location.startParts.get(message.id)) + 1;
       const stop = endParts ? lastRecordedPartIndex(messageParts, endParts) + 1 : messageParts.length;
-      if (start >= stop) continue;
+      // The iteration's parts: those after the recorded ones, and those it wrote before its input
+      // processors ran wherever they sit.
+      const stepParts = messageParts.filter(
+        (part, index) => index < stop && (index >= start || isRecordedPart(location.ownedParts, part)),
+      );
+      if (stepParts.length === 0) continue;
 
       const startedHere = !location.startParts.has(message.id);
-      if (startedHere && start === 0 && stop === messageParts.length) {
+      if (startedHere && stepParts.length === messageParts.length) {
         parts.push(...this.toAIV5UIMessages([message]).flatMap(uiMessage => uiMessage.parts));
         continue;
       }
@@ -2372,7 +2439,7 @@ export class MessageList {
       } = message.content;
       const stepMessage: MastraDBMessage = {
         ...message,
-        content: { ...stepMessageContent, parts: messageParts.slice(start, stop) },
+        content: { ...stepMessageContent, parts: stepParts },
       };
       parts.push(...this.toAIV5UIMessages([stepMessage]).flatMap(uiMessage => uiMessage.parts));
     }
