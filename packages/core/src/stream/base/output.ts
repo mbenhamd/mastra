@@ -12,6 +12,7 @@ import { MastraBase } from '../../base';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import { getErrorFromUnknown } from '../../error/utils.js';
 import type { ScorerRunInputForAgent, ScorerRunOutputForAgent } from '../../evals';
+import { stepWasRolledBack } from '../../loop/shared/step-content';
 import type { ObservabilityContext } from '../../observability';
 import { getRootExportSpan, resolveObservabilityContext } from '../../observability';
 import type { OutputResult, ProcessorStreamWriter } from '../../processors';
@@ -198,6 +199,36 @@ export type FullOutput<OUTPUT = undefined> = {
   terminalToolResult?: TerminalToolResult;
 };
 
+/**
+ * The public content of the step a `step-finish` chunk closes, taken from the loop's StepResult
+ * for it (the last entry of the chunk's `output.steps`).
+ *
+ * A retry attempt a processor rejected and rolled back keeps its parts in the loop's StepResult
+ * so later processors can see what was rejected, but its parts are gone from the response, so
+ * the public step reports no content (its `text` is already empty).
+ *
+ * @returns the content, or `undefined` when the chunk carries no StepResult with content.
+ */
+function stepContentFromLoop(
+  step: { readonly content?: LLMStepResult<unknown>['content']; readonly tripwire?: StepTripwireData } | undefined,
+): LLMStepResult<unknown>['content'] | undefined {
+  if (!step?.content) return undefined;
+  return stepWasRolledBack(step) ? [] : [...step.content];
+}
+
+/**
+ * How many loop StepResults restored public steps came from, for a state saved before
+ * `loopStepCount` was kept. Every public step comes from one loop step, except an attempt retried
+ * after an API error: its step is `retry` and has a tripwire only when it inherits the previous
+ * loop step's. A processor retry is also `retry` but always has its own tripwire, so a `retry`
+ * step with a tripwire is counted. Only an API-error retry right after a processor retry is
+ * overcounted, and an overcount sends a later step to the marker count, never to an earlier
+ * step's content.
+ */
+function countLoopSteps(steps: ReadonlyArray<{ finishReason?: unknown; tripwire?: unknown }>): number {
+  return steps.filter(step => step.finishReason !== 'retry' || step.tripwire !== undefined).length;
+}
+
 export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   #status: WorkflowRunStatus = 'running';
   #error: Error | undefined;
@@ -294,6 +325,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * on the suspended result only and never enters `#usageCount`.
    */
   #pendingSuspendedStepUsage: PendingStepUsage | undefined = undefined;
+  /**
+   * How many loop StepResults the `step-finish` chunks seen so far carried. The loop adds one per
+   * step it completes; an attempt retried after an API error adds none, so its `step-finish`
+   * carries the previous step last (PF-5399). Saved with the stream state, so a restored output
+   * does not take that previous step for a new one.
+   */
+  #loopStepCount = 0;
   #tripwire: StepTripwireData | undefined = undefined;
   #wasSuspended = false;
   #terminalToolResult: TerminalToolResult | undefined;
@@ -892,6 +930,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               const payloadSteps = chunk.payload.output?.steps || [];
               const currentPayloadStep = payloadSteps[payloadSteps.length - 1];
               const stepTripwire = currentPayloadStep?.tripwire;
+              // The loop's StepResult for this step, only when the chunk added one.
+              const loopStep = payloadSteps.length > self.#loopStepCount ? currentPayloadStep : undefined;
+              self.#loopStepCount = Math.max(self.#loopStepCount, payloadSteps.length);
 
               // If step has tripwire, text should be empty (rejected response)
               const stepText = stepTripwire ? '' : self.#bufferedByStep.text;
@@ -906,9 +947,20 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 // Durable agents attach pre-computed step content on the
                 // step-finish chunk because the stream adapter's messageList
                 // may be a stale reference (each workflow step deserializes
-                // a fresh instance).  Fall back to the live messageList for
-                // non-durable agents.
-                content: (chunk.payload as any)?._durableStepContent ?? messageList.get.response.aiV5.modelContent(-1),
+                // a fresh instance). Otherwise the loop's own StepResult for
+                // this step holds what the step wrote, read from where its
+                // iteration wrote it. Counting `step-start` markers back from
+                // the end of the response instead picks up an earlier step's
+                // parts when the step has no marker of its own (the answer
+                // after a resumed tool approval, a rolled-back retry attempt)
+                // and a feedback note added after the step (PF-5399). The
+                // count remains the fallback for chunks that add no step (an
+                // attempt retried after an API error, AI SDK v4 streams,
+                // durable error chunks).
+                content:
+                  (chunk.payload as any)?._durableStepContent ??
+                  stepContentFromLoop(loopStep) ??
+                  messageList.get.response.aiV5.modelContent(-1),
                 text: stepText,
                 // Include tripwire data if present
                 tripwire: stepTripwire,
@@ -2575,6 +2627,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       tripwire: this.#tripwire,
       wasSuspended: this.#wasSuspended,
       terminalToolResult: this.#terminalToolResult,
+      loopStepCount: this.#loopStepCount,
       ...(this.#pendingSuspendedStepUsage ? { pendingSuspendedStepUsage: this.#pendingSuspendedStepUsage } : {}),
       messageList: this.messageList.serialize(),
     };
@@ -2613,5 +2666,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       rehydrateStepRequests(state.bufferedSteps, state.bufferedStepRequests),
       this.messageList,
     );
+    this.#loopStepCount =
+      typeof state.loopStepCount === 'number' ? state.loopStepCount : countLoopSteps(this.#bufferedSteps);
   }
 }
