@@ -4,7 +4,7 @@
 
 **Fixed:** A turn that finishes after its Harness session was deleted no longer saves its result. The late result is dropped, and the caller gets `HarnessSessionDeletedError`.
 
-**Fixed:** A deleted session's kept turn record now says "The error message is not retained" instead of an empty message, so it stays a valid record.
+**Fixed:** Deleting a session now removes the error text of its failed turns but keeps their error code. In place of the text, the turn reports "The error message is not retained".
 
 **Added:** `deleteMessages` can now refuse to run when the caller no longer owns the chat session. Pass `sessionLeaseFence`, and check `supportsSessionLeaseFencedMessageDeletion` first. If another process took the session over, the call throws `HarnessStorageLeaseConflictError` and deletes nothing.
 
