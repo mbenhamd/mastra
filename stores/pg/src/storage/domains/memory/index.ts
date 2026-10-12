@@ -2642,7 +2642,7 @@ export class MemoryPG extends MemoryStorage {
         const assertHoldsSessionLease = options?.sessionLeaseFence
           ? await this.lockSessionLeaseFence(t, options.sessionLeaseFence)
           : () => {};
-        assertHoldsSessionLease();
+        assertHoldsSessionLease([]);
         const placeholders = messageIds.map((_, idx) => `$${idx + 1}`).join(',');
         const coordinateQuery = `SELECT
              messages.id,
@@ -2674,7 +2674,7 @@ export class MemoryPG extends MemoryStorage {
           throw new MessageMutationConflictError(messageIds[0]!);
         }
 
-        assertHoldsSessionLease();
+        assertHoldsSessionLease(messages);
         if (options?.retractObservationalMemory) {
           committedRetractions.push(
             ...(await this.retractObservationalMemoryForMessageRowsInTransaction(
@@ -4023,26 +4023,39 @@ export class MemoryPG extends MemoryStorage {
   /**
    * PF-5373: share-lock the Harness session row of a lease-fenced deletion
    * and return its judge. The deletion's owner must hold an unexpired lease
-   * (by the clock leases are stamped with) on an open session; otherwise the
+   * (by the clock leases are stamped with) on an open session, and every
+   * message it deletes must belong to that session's thread; otherwise the
    * judge throws and the transaction rolls back with nothing deleted. The
    * share lock keeps another owner from taking the lease until commit.
    */
-  private async lockSessionLeaseFence(t: TxClient, fence: MessageDeletionSessionLeaseFence): Promise<() => void> {
+  private async lockSessionLeaseFence(
+    t: TxClient,
+    fence: MessageDeletionSessionLeaseFence,
+  ): Promise<(messages: readonly { id: string; threadId: string }[]) => void> {
     const sessionTableName = getTableName({
       indexName: TABLE_HARNESS_SESSIONS,
       schemaName: getSchemaName(this.#schema),
     });
-    const row = await t.oneOrNone<{ owner_id: string | null; lease_expires_at: unknown; closed_at: unknown }>(
-      `SELECT owner_id, lease_expires_at, closed_at FROM ${sessionTableName}
+    const row = await t.oneOrNone<{
+      owner_id: string | null;
+      thread_id: string;
+      lease_expires_at: unknown;
+      closed_at: unknown;
+    }>(
+      `SELECT owner_id, thread_id, lease_expires_at, closed_at FROM ${sessionTableName}
        WHERE harness_name = $1 AND id = $2
        FOR SHARE`,
       [fence.harnessName, fence.sessionId],
     );
-    return () => {
+    return messages => {
       if (row && row.closed_at != null) throw new HarnessStorageSessionClosedError(fence.sessionId);
       const expiresAt = row?.lease_expires_at == null ? 0 : Number(row.lease_expires_at);
       if (!row || row.owner_id !== fence.ownerId || expiresAt <= Date.now()) {
         throw new HarnessStorageLeaseConflictError(fence.sessionId, row?.owner_id ?? '', expiresAt);
+      }
+      const foreign = messages.find(message => message.threadId !== row.thread_id);
+      if (foreign) {
+        throw new Error(`Message ${foreign.id} is not in the thread of the fenced session ${fence.sessionId}.`);
       }
     };
   }

@@ -77,6 +77,30 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
       messages: [expect.objectContaining({ id: fenced.prunedId })],
     });
     await expect(fenced.ownerBWrite()).resolves.toBeDefined();
+    // The fence covers only the session's own thread: a batch that names a
+    // message of another thread is refused whole.
+    const foreignId = `${unfenced.threadId}-foreign`;
+    await memory.saveMessages({
+      messages: [
+        {
+          id: foreignId,
+          threadId: unfenced.threadId,
+          resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'another thread' }] },
+          createdAt,
+        },
+      ],
+    });
+    await expect(
+      memory.deleteMessages([fenced.prunedId, foreignId], {
+        retractObservationalMemory: true,
+        sessionLeaseFence: { ...fence, ownerId: 'owner-b' },
+      }),
+    ).rejects.toThrow(/not in the thread of the fenced session/);
+    await expect(memory.listMessagesById({ messageIds: [fenced.prunedId, foreignId] })).resolves.toMatchObject({
+      messages: [expect.anything(), expect.anything()],
+    });
     // The owner holding the lease deletes as before.
     await memory.deleteMessages([fenced.prunedId], {
       retractObservationalMemory: true,

@@ -1054,7 +1054,7 @@ export class InMemoryMemory extends MemoryStorage {
       return;
     }
     // PF-5373: judged in the same synchronous section as the deletion.
-    if (options?.sessionLeaseFence) this.assertHoldsSessionLease(options.sessionLeaseFence);
+    if (options?.sessionLeaseFence) this.assertHoldsSessionLease(options.sessionLeaseFence, messageIds);
 
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
     this.withMemoryStateRollback(options?.retractObservationalMemory === true, () => {
@@ -1115,9 +1115,10 @@ export class InMemoryMemory extends MemoryStorage {
 
   /**
    * The deletion's owner must still hold an unexpired lease on the Harness
-   * session kept in this db (PF-5373). A closed session has no lease holder.
+   * session kept in this db (PF-5373), and every message it deletes must be in
+   * that session's thread. A closed session has no lease holder.
    */
-  private assertHoldsSessionLease(fence: MessageDeletionSessionLeaseFence): void {
+  private assertHoldsSessionLease(fence: MessageDeletionSessionLeaseFence, messageIds: readonly string[]): void {
     const session = this.db.harnessSessions.get(inMemoryHarnessSessionKey(fence.harnessName, fence.sessionId));
     if (session?.closedAt !== undefined) throw new HarnessStorageSessionClosedError(fence.sessionId);
     if (
@@ -1127,6 +1128,12 @@ export class InMemoryMemory extends MemoryStorage {
       session.leaseExpiresAt <= Date.now()
     ) {
       throw new HarnessStorageLeaseConflictError(fence.sessionId, session?.ownerId ?? '', session?.leaseExpiresAt ?? 0);
+    }
+    for (const messageId of messageIds) {
+      const message = this.db.messages.get(messageId);
+      if (message !== undefined && message.thread_id !== session.threadId) {
+        throw new Error(`Message ${messageId} is not in the thread of the fenced session ${fence.sessionId}.`);
+      }
     }
   }
 
