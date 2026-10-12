@@ -10,7 +10,7 @@
  * except that a rolled-back attempt reports no content, as its parts left the response.
  */
 import { ReadableStream } from 'node:stream/web';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { MockLanguageModelV2, convertArrayToReadableStream } from '../../agent/__tests__/mock-model';
 import { Agent } from '../../agent/agent';
@@ -212,6 +212,47 @@ describe('PF-5399 public step content', () => {
     const retried = (await restored.steps).at(-1)!;
     expect(retried.content).not.toContainEqual(toolStep.content[0]);
     expect(retried.content).toContainEqual(expect.objectContaining({ type: 'text', text: 'FAILED PARTIAL' }));
+  });
+
+  it('reads the answer after resuming a state saved before the loop step count, past API-error retries', async () => {
+    // A release before the count saved no `loopStepCount`. An attempt retried after an API error
+    // has a public step but no loop StepResult, so the count derived on restore must leave it out.
+    const original = MastraModelOutput.prototype.serializeState;
+    const serializeState = vi
+      .spyOn(MastraModelOutput.prototype, 'serializeState')
+      .mockImplementation(function (this: MastraModelOutput<any>) {
+        const { loopStepCount: _count, ...state } = original.call(this);
+        return state as ReturnType<typeof original>;
+      });
+    try {
+      const agent = new Agent({
+        id: 'a',
+        name: 'a',
+        instructions: 'test',
+        model: scriptedModel([
+          [toolCall('c0'), finish('tool-calls')],
+          [...text('FAILED PARTIAL'), { type: 'error', error: new Error('retry me') }, finish('error')],
+          [...text('FAILED AGAIN'), { type: 'error', error: new Error('retry me') }, finish('error')],
+          [toolCall('c1', 'apply'), finish('tool-calls')],
+          [...text('answer'), finish('stop')],
+        ]),
+        tools,
+        maxProcessorRetries: 2,
+        errorProcessors: [{ id: 'retry', processAPIError: () => ({ retry: true }) }] as any,
+      });
+      const mastra = new Mastra({ agents: { a: agent }, logger: false, storage: new InMemoryStore() });
+      const registered = mastra.getAgent('a');
+
+      const first = await registered.stream('go');
+      await first.consumeStream();
+      const resumed = await registered.approveToolCall({ runId: first.runId, toolCallId: 'c1' });
+      await resumed.consumeStream();
+
+      expect(serializeState).toHaveBeenCalled();
+      expect((await stepContents(resumed)).slice(-2)).toEqual([['tool-call:c1', 'tool-result:c1'], ['text:answer']]);
+    } finally {
+      serializeState.mockRestore();
+    }
   });
 
   it('leaves a feedback note added after a step out of that step', async () => {

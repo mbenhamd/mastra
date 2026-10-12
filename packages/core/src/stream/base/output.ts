@@ -216,6 +216,19 @@ function stepContentFromLoop(
   return stepWasRolledBack(step) ? [] : [...step.content];
 }
 
+/**
+ * How many loop StepResults restored public steps came from, for a state saved before
+ * `loopStepCount` was kept. Every public step comes from one loop step, except an attempt retried
+ * after an API error: its step is `retry` and has a tripwire only when it inherits the previous
+ * loop step's. A processor retry is also `retry` but always has its own tripwire, so a `retry`
+ * step with a tripwire is counted. Only an API-error retry right after a processor retry is
+ * overcounted, and an overcount sends a later step to the marker count, never to an earlier
+ * step's content.
+ */
+function countLoopSteps(steps: ReadonlyArray<{ finishReason?: unknown; tripwire?: unknown }>): number {
+  return steps.filter(step => step.finishReason !== 'retry' || step.tripwire !== undefined).length;
+}
+
 export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   #status: WorkflowRunStatus = 'running';
   #error: Error | undefined;
@@ -2653,9 +2666,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       rehydrateStepRequests(state.bufferedSteps, state.bufferedStepRequests),
       this.messageList,
     );
-    // A state saved before the count was kept: every loop step has a public step, so the public
-    // step count is never below it. Overcounting only sends a step to the marker count; undercounting
-    // would read the previous step's content for an attempt retried after an API error.
-    this.#loopStepCount = typeof state.loopStepCount === 'number' ? state.loopStepCount : this.#bufferedSteps.length;
+    this.#loopStepCount =
+      typeof state.loopStepCount === 'number' ? state.loopStepCount : countLoopSteps(this.#bufferedSteps);
   }
 }
