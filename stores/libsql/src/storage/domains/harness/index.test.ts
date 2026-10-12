@@ -1756,6 +1756,9 @@ describe('HarnessLibSQL active session admission', () => {
 describe('HarnessLibSQL message result evidence', () => {
   let storage: HarnessLibSQL;
   let client: Client;
+  // Result evidence is written only while its session exists (PF-5374).
+  const seedSession = (id: string, threadId: string) =>
+    storage.saveSession(sampleSession({ id, threadId }), { ownerId: 'h', ifVersion: 0 });
 
   beforeEach(async () => {
     client = createHarnessTestClient();
@@ -1764,6 +1767,7 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
+    await seedSession('session-erased', 'thread-1');
     await storage.writeMessageResultEvidence({
       harnessName: 'default',
       sessionId: 'session-erased',
@@ -1788,6 +1792,163 @@ describe('HarnessLibSQL message result evidence', () => {
     ).resolves.toMatchObject({ status: 'completed', erased: true });
   });
 
+  it('refuses late message-result writes for a deleted session (PF-5374)', async () => {
+    await seedSession('session-late', 'thread-late');
+    // Pending rows the session wrote under another thread scope survive the
+    // delete (it removes only the current scope's rows).
+    const scope = {
+      harnessName: 'default',
+      sessionId: 'session-late',
+      resourceId: 'resource-1',
+      threadId: 'thread-late-other',
+      createdAt: 1000,
+      updatedAt: 1000,
+    };
+    const accepted = {
+      state: 'accepted' as const,
+      attemptId: 'attempt-late',
+      delivery: 'idle' as const,
+      runId: 'run-late-signal',
+      acceptedAt: 1000,
+    };
+    const message = {
+      ...scope,
+      signalId: 'signal-late-message',
+      runId: 'run-late-message',
+      admissionId: 'admission-late-message',
+      admissionHash: 'hash-late-message',
+      operationKind: 'message' as const,
+      status: 'pending' as const,
+    };
+    const signal = {
+      ...scope,
+      signalId: 'signal-late-signal',
+      runId: accepted.runId,
+      admissionId: 'admission-late-signal',
+      admissionHash: 'hash-late-signal',
+      operationKind: 'signal' as const,
+      status: 'pending' as const,
+      dispatch: accepted,
+    };
+    await storage.writeMessageResultEvidence(message);
+    await storage.writeMessageResultEvidence(signal);
+    const record = await storage.loadSession({ sessionId: 'session-late' });
+    if (!record) throw new Error('expected the session');
+    await storage.deleteSession({ sessionId: record.id, ifVersion: record.version });
+    const load = (row: { signalId: string }) => storage.loadMessageResultEvidence({ ...scope, signalId: row.signalId });
+    await expect(load(message)).resolves.toMatchObject({ status: 'pending' });
+
+    // Completing a kept row with content is refused...
+    await expect(
+      storage.writeMessageResultEvidence({
+        ...message,
+        status: 'completed',
+        result: { text: 'late provider output' },
+        updatedAt: 2000,
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      storage.compareAndSwapSignalTerminal({
+        ...scope,
+        signalId: signal.signalId,
+        admissionId: signal.admissionId,
+        admissionHash: signal.admissionHash,
+        expected: accepted,
+        terminal: {
+          status: 'completed',
+          signalId: signal.signalId,
+          runId: accepted.runId,
+          result: { text: 'late provider output' },
+        },
+        updatedAt: 2000,
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      storage.compareAndSwapSignalDispatch({
+        ...scope,
+        signalId: message.signalId,
+        admissionId: message.admissionId,
+        admissionHash: message.admissionHash,
+        operationKind: 'message',
+        expected: { state: 'reserved' },
+        next: {
+          state: 'dispatching',
+          attemptId: 'attempt-late-dispatch',
+          claimExpiresAt: 10_000,
+          delivery: 'idle',
+          runId: message.runId,
+        },
+        updatedAt: 2000,
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    // ...and so is a fresh row.
+    const fresh = { ...message, threadId: 'thread-late', signalId: 'signal-late-fresh' };
+    await expect(storage.writeMessageResultEvidence(fresh)).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    const kept = await load(message);
+    expect(kept).toMatchObject({ status: 'pending' });
+    expect(kept).not.toHaveProperty('dispatch');
+    await expect(load(signal)).resolves.toMatchObject({ status: 'pending', dispatch: accepted });
+    await expect(
+      storage.loadMessageResultEvidence({ ...scope, threadId: 'thread-late', signalId: fresh.signalId }),
+    ).resolves.toBeNull();
+    const rows = await client.execute(`SELECT result FROM mastra_harness_message_results`);
+    expect(JSON.stringify(rows.rows)).not.toContain('late provider output');
+  });
+
+  it('refuses a completion when its session is deleted between the write statements (PF-5374)', async () => {
+    await seedSession('session-race', 'thread-race');
+    // A pending row under another thread scope, which the delete keeps.
+    const pending = {
+      harnessName: 'default',
+      sessionId: 'session-race',
+      resourceId: 'resource-1',
+      threadId: 'thread-race-other',
+      signalId: 'signal-race',
+      runId: 'run-race',
+      admissionId: 'admission-race',
+      admissionHash: 'hash-race',
+      operationKind: 'message' as const,
+      status: 'pending' as const,
+      createdAt: 1000,
+      updatedAt: 1000,
+    };
+    await storage.writeMessageResultEvidence(pending);
+    // The delete lands after the completion's insert attempt found the row,
+    // right before its update.
+    let deleted = false;
+    const racingClient = new Proxy(client, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop) as unknown;
+        if (prop === 'execute') {
+          return async (statement: Parameters<Client['execute']>[0]) => {
+            const sql = typeof statement === 'string' ? statement : statement.sql;
+            if (!deleted && /^\s*UPDATE\s+mastra_harness_message_results\b/i.test(sql)) {
+              deleted = true;
+              const record = await storage.loadSession({ sessionId: 'session-race' });
+              await storage.deleteSession({ sessionId: record!.id, ifVersion: record!.version });
+            }
+            return target.execute(statement);
+          };
+        }
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const racing = createHarnessStorage(racingClient);
+    await racing.init();
+
+    await expect(
+      racing.writeMessageResultEvidence({
+        ...pending,
+        status: 'completed',
+        result: { text: 'late provider output' },
+        updatedAt: 2000,
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    expect(deleted).toBe(true);
+    await expect(storage.loadMessageResultEvidence(pending)).resolves.toMatchObject({ status: 'pending' });
+  });
+
   it("erases a deleted session id's results kept under another thread scope (PF-5309)", async () => {
     await storage.saveSession(sampleSession({ id: 'session-scope', threadId: 'thread-scope-a' }), {
       ownerId: 'h',
@@ -1807,6 +1968,7 @@ describe('HarnessLibSQL message result evidence', () => {
       updatedAt: 2000,
     });
     // Another session's result in the same harness stays untouched.
+    await seedSession('session-other', 'thread-scope-b');
     await storage.writeMessageResultEvidence({
       harnessName: 'default',
       sessionId: 'session-other',
@@ -1843,6 +2005,7 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('stores retained message evidence and resolves duplicate/conflict admissions', async () => {
+    await seedSession('session-1', 'thread-1');
     await expect(
       storage.writeMessageResultEvidence({
         harnessName: 'default',
@@ -1991,6 +2154,7 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('applies exactly one of two competing unfenced terminal evidence writes', async () => {
+    await seedSession('session-terminal-cas', 'thread-terminal-cas');
     const pending = {
       harnessName: 'default',
       sessionId: 'session-terminal-cas',
@@ -2031,6 +2195,8 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('settles and reloads completed and failed admitted messages after an adapter restart', async () => {
+    await seedSession('session-message-restart-0', 'thread-message-restart-0');
+    await seedSession('session-message-restart-1', 'thread-message-restart-1');
     const terminals = [
       { status: 'completed' as const, result: { text: 'done' } },
       { status: 'failed' as const, error: { code: 'model_failed', message: 'model failed' } },
@@ -2070,6 +2236,7 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('serializes competing signal dispatch claims and migrates a legacy run row', async () => {
+    await seedSession('session-cas', 'thread-cas');
     const pending = {
       harnessName: 'default',
       sessionId: 'session-cas',
@@ -2163,6 +2330,7 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('round-trips semantic dispatch CAS and fences terminal settlement by attempt', async () => {
+    await seedSession('session-semantic-cas', 'thread-semantic-cas');
     const identity = {
       harnessName: 'default',
       sessionId: 'session-semantic-cas',
@@ -2264,6 +2432,7 @@ describe('HarnessLibSQL message result evidence', () => {
   });
 
   it('compacts terminal message evidence into tombstones', async () => {
+    await seedSession('session-1', 'thread-1');
     await storage.writeMessageResultEvidence({
       harnessName: 'default',
       sessionId: 'session-1',

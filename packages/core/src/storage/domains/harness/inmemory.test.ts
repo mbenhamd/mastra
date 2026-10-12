@@ -1235,6 +1235,8 @@ describe('InMemoryHarness admission storage contract', () => {
 
   it('reports only the durable unfenced terminal evidence writer as applied', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    // Result evidence is written only while its session exists (PF-5374).
+    await storage.saveSession(sampleSession(), { ownerId: 'h-1', ifVersion: 0 });
     const pending = {
       harnessName: 'default',
       sessionId: 'session-1',
@@ -1284,6 +1286,12 @@ describe('InMemoryHarness admission storage contract', () => {
   it('settles and reloads completed and failed admitted messages after an adapter restart', async () => {
     const db = new InMemoryDB();
     const storage = new InMemoryHarness({ db });
+    for (const index of [0, 1]) {
+      await storage.saveSession(
+        sampleSession({ id: `session-message-restart-${index}`, threadId: `thread-message-restart-${index}` }),
+        { ownerId: 'h-1', ifVersion: 0 },
+      );
+    }
     const terminals = [
       { status: 'completed' as const, result: { text: 'done' } },
       { status: 'failed' as const, error: { code: 'model_failed', message: 'model failed' } },
@@ -1323,6 +1331,7 @@ describe('InMemoryHarness admission storage contract', () => {
 
   it('atomically claims signal dispatch and migrates legacy run evidence', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(sampleSession(), { ownerId: 'h-1', ifVersion: 0 });
     const pending = {
       harnessName: 'default',
       sessionId: 'session-1',
@@ -1430,6 +1439,10 @@ describe('InMemoryHarness admission storage contract', () => {
 
   it('uses semantic dispatch CAS and fences terminal settlement by attempt', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB() });
+    await storage.saveSession(sampleSession({ id: 'session-semantic-cas', threadId: 'thread-semantic-cas' }), {
+      ownerId: 'h-1',
+      ifVersion: 0,
+    });
     const identity = {
       harnessName: 'default',
       sessionId: 'session-semantic-cas',

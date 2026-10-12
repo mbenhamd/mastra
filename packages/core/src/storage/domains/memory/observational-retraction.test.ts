@@ -1,8 +1,114 @@
 import { describe, expect, it } from 'vitest';
 
 import { InMemoryStore } from '../../mock';
+import { HarnessStorageLeaseConflictError } from '../harness';
+import type { SessionRecord } from '../harness';
 
 describe('MemoryStorage atomic observational-memory retraction', () => {
+  it('refuses a lease-fenced deletion by an owner whose Harness session was taken over (PF-5373)', async () => {
+    const storage = new InMemoryStore({ id: 'memory-lease-fenced-deletion' });
+    const memory = await storage.getStore('memory');
+    const harness = await storage.getStore('harness');
+    if (!memory || !harness) throw new Error('Expected in-memory storage domains.');
+    expect(memory.supportsSessionLeaseFencedMessageDeletion).toBe(true);
+    const createdAt = new Date('2026-01-01T00:00:00.000Z');
+    const resourceId = 'lease-fence-resource';
+
+    // Owner A held the session's lease; it lapsed and owner B took the session
+    // over and captured its source-write guard on the thread's OM record.
+    const setup = async (name: string) => {
+      const threadId = `lease-fence-thread-${name}`;
+      const sessionId = `lease-fence-session-${name}`;
+      await harness.createOrLoadActiveSession(sessionRecord(sessionId, resourceId, threadId), {
+        initialLease: { ownerId: 'owner-a', ttlMs: 1 },
+      });
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await harness.acquireSessionLease({ sessionId, ownerId: 'owner-b', ttlMs: 60_000 });
+      await memory.saveThread({
+        thread: { id: threadId, resourceId, title: 'lease fence', metadata: {}, createdAt, updatedAt: createdAt },
+      });
+      await memory.saveMessages({
+        messages: [
+          {
+            id: `${threadId}-pruned`,
+            threadId,
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'prune me' }] },
+            createdAt,
+          },
+        ],
+      });
+      const record = await memory.initializeObservationalMemory({ threadId, resourceId, scope: 'thread', config: {} });
+      const ownerBGuard = { recordId: record.id, threadId, resourceId };
+      const ownerBWrite = () =>
+        memory.saveMessages({
+          messages: [
+            {
+              id: `${threadId}-owner-b`,
+              threadId,
+              resourceId,
+              role: 'user',
+              content: { format: 2, parts: [{ type: 'text', text: 'owner b turn' }] },
+              createdAt,
+            },
+          ],
+          observationalMemorySourceWriteGuard: ownerBGuard,
+        });
+      return { threadId, sessionId, prunedId: `${threadId}-pruned`, ownerBWrite };
+    };
+
+    // Reproduction: without the fence the evicted owner's delete applies and
+    // retracts the record, and the new owner's guarded write then conflicts.
+    const unfenced = await setup('unfenced');
+    await memory.deleteMessages([unfenced.prunedId], { retractObservationalMemory: true });
+    await expect(unfenced.ownerBWrite()).rejects.toThrow(/source write guard/i);
+
+    // With the fence the evicted owner is refused and nothing changes.
+    const fenced = await setup('fenced');
+    const fence = { harnessName: 'default', sessionId: fenced.sessionId };
+    await expect(
+      memory.deleteMessages([fenced.prunedId], {
+        retractObservationalMemory: true,
+        sessionLeaseFence: { ...fence, ownerId: 'owner-a' },
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    await expect(memory.listMessagesById({ messageIds: [fenced.prunedId] })).resolves.toMatchObject({
+      messages: [expect.objectContaining({ id: fenced.prunedId })],
+    });
+    await expect(fenced.ownerBWrite()).resolves.toBeDefined();
+    // The fence covers only the session's own thread: a batch that names a
+    // message of another thread is refused whole.
+    const foreignId = `${unfenced.threadId}-foreign`;
+    await memory.saveMessages({
+      messages: [
+        {
+          id: foreignId,
+          threadId: unfenced.threadId,
+          resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'another thread' }] },
+          createdAt,
+        },
+      ],
+    });
+    await expect(
+      memory.deleteMessages([fenced.prunedId, foreignId], {
+        retractObservationalMemory: true,
+        sessionLeaseFence: { ...fence, ownerId: 'owner-b' },
+      }),
+    ).rejects.toThrow(/not in the thread of the fenced session/);
+    await expect(memory.listMessagesById({ messageIds: [fenced.prunedId, foreignId] })).resolves.toMatchObject({
+      messages: [expect.anything(), expect.anything()],
+    });
+    // The owner holding the lease deletes as before.
+    await memory.deleteMessages([fenced.prunedId], {
+      retractObservationalMemory: true,
+      sessionLeaseFence: { ...fence, ownerId: 'owner-b' },
+    });
+    await expect(memory.listMessagesById({ messageIds: [fenced.prunedId] })).resolves.toEqual({ messages: [] });
+  });
+
   it('accepts a captured source guard after reflection archives that record', async () => {
     const storage = new InMemoryStore({ id: 'memory-observational-source-guard-reflection' });
     const memory = await storage.getStore('memory');
@@ -1602,3 +1708,25 @@ describe('MemoryStorage atomic observational-memory retraction', () => {
     });
   });
 });
+
+function sessionRecord(id: string, resourceId: string, threadId: string): SessionRecord {
+  return {
+    harnessName: 'default',
+    id,
+    resourceId,
+    threadId,
+    origin: 'top-level',
+    ownsThread: false,
+    modeId: 'build',
+    modelId: 'model-1',
+    subagentModelOverrides: {},
+    permissionRules: { categories: {}, tools: {} },
+    sessionGrants: { categories: [], tools: [] },
+    tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    pendingQueue: [],
+    state: {},
+    createdAt: 1_000,
+    lastActivityAt: 1_000,
+    version: 0,
+  };
+}

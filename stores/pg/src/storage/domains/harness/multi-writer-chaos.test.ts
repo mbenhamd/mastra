@@ -236,6 +236,16 @@ describe('HarnessPG multi-writer chaos (REAL Postgres, independent pools)', () =
   describe('scenario 3: exactly-once admission evidence', () => {
     it('M independent-pool writers writing the SAME admission identity → exactly one created; the rest recognize the existing row', async () => {
       const sessionId = `admit-${randomUUID()}`;
+      // Result evidence is written only while its session exists (PF-5374).
+      await writerHarness()[0]!.saveSession(
+        createSampleSessionRecord({
+          id: sessionId,
+          harnessName: HARNESS_NS,
+          resourceId: 'r',
+          threadId: `t-${sessionId}`,
+        }),
+        { ownerId: 'evidence-owner', ifVersion: 0 },
+      );
       const signalId = `harness-message-${randomUUID().slice(0, 8)}`;
       const evidence = {
         harnessName: HARNESS_NS,
@@ -288,6 +298,16 @@ describe('HarnessPG multi-writer chaos (REAL Postgres, independent pools)', () =
 
     it('a conflicting admissionHash on the same signalId is rejected (unique identity guard), not silently overwritten', async () => {
       const sessionId = `admit2-${randomUUID()}`;
+      // Result evidence is written only while its session exists (PF-5374).
+      await writerHarness()[0]!.saveSession(
+        createSampleSessionRecord({
+          id: sessionId,
+          harnessName: HARNESS_NS,
+          resourceId: 'r',
+          threadId: `t-${sessionId}`,
+        }),
+        { ownerId: 'evidence-owner', ifVersion: 0 },
+      );
       const signalId = `harness-message-${randomUUID().slice(0, 8)}`;
       const base = {
         harnessName: HARNESS_NS,

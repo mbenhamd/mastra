@@ -312,6 +312,59 @@ describe('native session record projection', () => {
     ).resolves.toHaveLength(1);
   });
 
+  it('retires, erases and fences projection intents when a store without projections deletes the session (PF-5374)', async () => {
+    // Intents written while projection was enabled; a store without it deletes
+    // the session.
+    const db = new InMemoryDB();
+    const enabled = new InMemoryHarness({ db, sessionRecordProjection: { enabled: true, maxPendingIntents: 10 } });
+    await enabled.saveSession(sampleSession(), { ownerId: 'owner-1', ifVersion: 0 });
+    // A projection worker holds a claim when the session is deleted.
+    const [claim] = await enabled.claimSessionRecordProjectionIntents({
+      claimId: 'claim-before-delete',
+      limit: 10,
+      now: Date.now() + 1_000,
+      claimTtlMs: 60_000,
+    });
+    if (!claim) throw new Error('expected a projection intent to claim');
+
+    await new InMemoryHarness({ db }).deleteSession({ sessionId: 'session-1', ifVersion: 1 });
+
+    const intents = [...db.harnessSessionRecordProjectionIntents.values()].filter(
+      intent => intent.sessionId === 'session-1',
+    );
+    expect(intents.length).toBeGreaterThan(0);
+    // Nothing is left to claim, and no post-image survives.
+    expect(intents.every(intent => intent.status === 'dead' && intent.payload === undefined)).toBe(true);
+    // The fence closed too: the late acknowledgement resolves as fenced.
+    await expect(
+      enabled.ackSessionRecordProjection({
+        operationId: claim.operationId,
+        sessionId: claim.sessionId,
+        sessionIncarnation: claim.sessionIncarnation,
+        revision: claim.revision,
+        payloadDigest: claim.payloadDigest,
+        claimId: 'claim-before-delete',
+        acknowledgedAt: Date.now() + 2_000,
+      }),
+    ).resolves.toMatchObject({ status: 'fenced' });
+  });
+
+  it('retires and erases the projection intents of every incarnation of a deleted session (PF-5374)', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, sessionRecordProjection: { enabled: true, maxPendingIntents: 10 } });
+    await storage.saveSession(sampleSession(), { ownerId: 'owner-1', ifVersion: 0 });
+    // An intent left behind by an earlier lifetime of the same session id
+    // (a delete made before PF-5309 did not retire it).
+    const [leftover] = [...db.harnessSessionRecordProjectionIntents.values()];
+    if (!leftover) throw new Error('expected a projection intent');
+    leftover.sessionIncarnation = 'earlier-incarnation';
+
+    await storage.deleteSession({ sessionId: 'session-1', ifVersion: 1 });
+
+    expect(leftover).toMatchObject({ status: 'dead' });
+    expect(leftover.payload).toBeUndefined();
+  });
+
   it('rejects resource and thread retargeting within a projection incarnation', async () => {
     const storage = new InMemoryHarness({
       db: new InMemoryDB(),

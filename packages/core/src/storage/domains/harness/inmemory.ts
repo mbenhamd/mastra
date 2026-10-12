@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+import { inMemoryHarnessSessionKey } from '../inmemory-db';
 import type { InMemoryDB } from '../inmemory-db';
 import {
   CHANNEL_BINDING_EXTERNAL_ID_SENTINEL,
@@ -1620,7 +1621,11 @@ export class InMemoryHarness extends HarnessStorage {
       ...(record.status === 'completed' && record.erased === true ? { result: undefined } : {}),
       harnessName: resolveHarnessName(record.harnessName, this.harnessName),
     };
-    if (options.leaseOwner !== undefined) {
+    // An unfenced write still runs only while the session exists, so a late
+    // write cannot restore result content a delete erased (PF-5374).
+    if (options.leaseOwner === undefined) {
+      this.assertSessionsExist(namespacedRecord.harnessName, [namespacedRecord.sessionId]);
+    } else {
       const session = this.db.harnessSessions.get(sessionKey(namespacedRecord.harnessName, namespacedRecord.sessionId));
       if (session?.closedAt !== undefined) throw new HarnessStorageSessionClosedError(namespacedRecord.sessionId);
       if (session === undefined || session.ownerId !== options.leaseOwner.ownerId) {
@@ -2486,6 +2491,8 @@ export class InMemoryHarness extends HarnessStorage {
     input: CompareAndSwapSignalDispatchInput,
   ): Promise<CompareAndSwapSignalDispatchResult> {
     const harnessName = resolveHarnessName(input.harnessName, this.harnessName);
+    // Unfenced, the swap still runs only while the session exists (PF-5374).
+    if (input.leaseOwner === undefined) this.assertSessionsExist(harnessName, [input.sessionId]);
     const key = messageEvidenceKey(harnessName, input.sessionId, input.signalId);
     const existing = this.db.harnessMessageResultEvidence.get(key);
     if (
@@ -2536,6 +2543,8 @@ export class InMemoryHarness extends HarnessStorage {
     input: CompareAndSwapSignalTerminalInput,
   ): Promise<CompareAndSwapSignalTerminalResult> {
     const harnessName = resolveHarnessName(input.harnessName, this.harnessName);
+    // Unfenced, the swap still runs only while the session exists (PF-5374).
+    if (input.leaseOwner === undefined) this.assertSessionsExist(harnessName, [input.sessionId]);
     const key = messageEvidenceKey(harnessName, input.sessionId, input.signalId);
     const existing = this.db.harnessMessageResultEvidence.get(key);
     if (
@@ -4485,9 +4494,10 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   /**
-   * Channel and wakeup rows are written only while every session they name
-   * exists, so a late write cannot restore rows `deleteSessions` erased. The
-   * check and the write run in one synchronous section.
+   * Channel, wakeup and message-result rows are written only while every
+   * session they name exists, so a late write cannot restore rows or content
+   * `deleteSessions` erased. The check and the write run in one synchronous
+   * section.
    */
   private assertSessionsExist(namespace: string, sessionIds: readonly (string | undefined)[]): void {
     for (const sessionId of sessionIds) {
@@ -5038,7 +5048,7 @@ function keepOnlyFields(record: object, allowed: ReadonlySet<string>): void {
 }
 
 function sessionKey(harnessName: string, sessionId: string): string {
-  return `${harnessName}\u0000${sessionId}`;
+  return inMemoryHarnessSessionKey(harnessName, sessionId);
 }
 
 function projectionFenceKey(harnessName: string, sessionId: string): string {

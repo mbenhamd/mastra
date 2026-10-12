@@ -29,6 +29,7 @@ import type {
   CreateReflectionGenerationInput,
   ObservationalMemoryWriteGuard,
   ObservationalMemorySourceWriteGuard,
+  MessageDeletionSessionLeaseFence,
   ObservationalMemoryRetractionReceipt,
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
@@ -127,6 +128,13 @@ export abstract class MemoryStorage extends StorageDomain {
 
   /** Whether edit/delete retraction and guarded derived writes are atomic. */
   readonly supportsAtomicObservationalMemoryRetraction?: boolean = false;
+
+  /**
+   * Whether `deleteMessages` honors `sessionLeaseFence` (PF-5373). An adapter
+   * without it ignores the option, so a caller that needs the fence must
+   * check this first.
+   */
+  readonly supportsSessionLeaseFencedMessageDeletion?: boolean = false;
 
   /** Whether owner-protected, revisioned Working Memory updates are atomic. */
   readonly supportsRevisionedWorkingMemory?: boolean = false;
@@ -352,6 +360,13 @@ export abstract class MemoryStorage extends StorageDomain {
       managedWorkingMemoryScope?: 'thread' | 'resource';
       /** @internal Receives retractions only after the deletion commits. */
       observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+      /**
+       * @internal Delete only while this owner holds the Harness session's
+       * lease; otherwise throw `HarnessStorageLeaseConflictError` (or
+       * `HarnessStorageSessionClosedError`) and change nothing. Honored by
+       * adapters with `supportsSessionLeaseFencedMessageDeletion`.
+       */
+      sessionLeaseFence?: MessageDeletionSessionLeaseFence;
     },
   ): Promise<void> {
     throw new Error(

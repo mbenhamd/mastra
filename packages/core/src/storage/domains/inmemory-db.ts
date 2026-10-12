@@ -178,6 +178,11 @@ class WorkflowTerminalDestinationReceiptMap extends Map<string, WorkflowTerminal
   }
 }
 
+/** Key of a session in `InMemoryDB.harnessSessions`, shared by the domains that read it. */
+export function inMemoryHarnessSessionKey(harnessName: string, sessionId: string): string {
+  return `${harnessName}\u0000${sessionId}`;
+}
+
 /**
  * InMemoryDB is a thin database layer for in-memory storage.
  * It holds all the Maps that store data, similar to how a real database

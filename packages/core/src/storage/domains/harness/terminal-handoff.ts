@@ -445,6 +445,13 @@ export function harnessTerminalSeedHash(seed: JsonValue): string {
 export const HARNESS_MESSAGE_RESULT_ERASED_CODE = 'harness.message_result_erased';
 
 /**
+ * PF-5374: the message a content-free terminal error carries in place of the
+ * original one. Non-empty, so a redacted terminal result stays inside the
+ * domain `canonicalHarnessTerminalResult` validates.
+ */
+export const HARNESS_TERMINAL_ERROR_MESSAGE_NOT_RETAINED = 'The error message is not retained';
+
+/**
  * PF-5309: the content-free remainder of a deleted session's terminal result.
  * Status, run, completion time, finish reason and error code stay (replays
  * and delivery bookkeeping read them); the error message goes.
@@ -458,7 +465,12 @@ export function redactHarnessTerminalResult(result: HarnessTerminalResult): Harn
     // Tolerates a malformed stored error (null, or not an object) so a delete
     // can always erase it.
     ...(result.error !== null && typeof result.error === 'object'
-      ? { error: { code: typeof result.error.code === 'string' ? result.error.code : '', message: '' } }
+      ? {
+          error: {
+            code: typeof result.error.code === 'string' ? result.error.code : '',
+            message: HARNESS_TERMINAL_ERROR_MESSAGE_NOT_RETAINED,
+          },
+        }
       : {}),
   };
 }
@@ -487,7 +499,7 @@ export function redactStoredHarnessTerminalProjection(
  * caller's receipt and logs.
  */
 export function contentFreeHarnessTerminalReason(reason: HarnessTerminalError): HarnessTerminalError {
-  return { code: reason.code, message: '' };
+  return { code: reason.code, message: HARNESS_TERMINAL_ERROR_MESSAGE_NOT_RETAINED };
 }
 
 export function prepareHarnessTerminalAdmission(

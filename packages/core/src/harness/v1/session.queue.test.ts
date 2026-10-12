@@ -730,6 +730,20 @@ describe('Session.queue() — admission', () => {
     await session.close();
   });
 
+  it('reports a queued result write refused for a deleted session as deleted (PF-5374)', async () => {
+    const { harness, storage } = setupHarness();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    // Another process deleted the session; storage refuses the late write.
+    const record = await storage.loadSession({ sessionId: session.id });
+    await storage.deleteSession({ sessionId: session.id, ifVersion: record!.version });
+
+    await expect(
+      (
+        session as unknown as { _writeQueueSignalResultEvidence: (status: unknown) => Promise<void> }
+      )._writeQueueSignalResultEvidence({ status: 'pending', signalId: 'queue-signal-deleted', runId: 'queue-run' }),
+    ).rejects.toBeInstanceOf(HarnessSessionDeletedError);
+  });
+
   it('keeps durable duplicate queue waiters deletion-aware after close starts', async () => {
     const { harness, storage, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });

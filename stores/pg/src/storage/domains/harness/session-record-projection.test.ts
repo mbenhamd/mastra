@@ -82,6 +82,15 @@ describe('HarnessPG native session record projection', () => {
     expect(rows.length).toBeGreaterThan(0);
     // Nothing is left to claim, and no post-image survives.
     expect(rows.every(row => row.status === 'dead' && row.payload === null)).toBe(true);
+    // The retired intents' capacity is released too (PF-5374), so the pressure
+    // row matches what is still claimable.
+    const pressure = await store.db.one<{ pending_intents: string; pending_bytes: string }>(
+      `SELECT pending_intents::text AS pending_intents, pending_bytes::text AS pending_bytes
+       FROM "${schemaName}"."${TABLE_HARNESS_SESSION_PROJECTION_PRESSURE}"
+       WHERE harness_name = $1`,
+      ['default'],
+    );
+    expect(pressure).toEqual({ pending_intents: '0', pending_bytes: '0' });
     // The delete closed the projection fence too: the late acknowledgement
     // resolves as fenced instead of failing on its retired claim.
     await expect(

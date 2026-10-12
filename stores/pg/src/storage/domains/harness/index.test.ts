@@ -1648,10 +1648,15 @@ describe('HarnessPG', () => {
   it('stores message result evidence and blocks active admission behind delete fences', async () => {
     const harness = store.stores.harness;
     expect(harness).toBeDefined();
+    // Result evidence is written only while its session exists (PF-5374).
+    await harness!.saveSession(createSampleSessionRecord({ id: 'session-evidence', threadId: 'thread-evidence' }), {
+      ownerId: 'evidence-owner',
+      ifVersion: 0,
+    });
 
     const terminalEvidence = {
       harnessName: 'default',
-      sessionId: 'session-1',
+      sessionId: 'session-evidence',
       resourceId: 'resource-1',
       threadId: 'thread-1',
       signalId: 'signal-1',
@@ -1677,7 +1682,7 @@ describe('HarnessPG', () => {
 
     await expect(
       harness!.loadMessageResultEvidence({
-        sessionId: 'session-1',
+        sessionId: 'session-evidence',
         resourceId: 'resource-1',
         threadId: 'thread-1',
         signalId: 'signal-1',
@@ -1701,6 +1706,11 @@ describe('HarnessPG', () => {
 
   it('locks competing signal dispatch claims and migrates a legacy run row', async () => {
     const harness = store.stores.harness!;
+    // Result evidence is written only while its session exists (PF-5374).
+    await harness.saveSession(createSampleSessionRecord({ id: 'session-cas', threadId: 'thread-cas' }), {
+      ownerId: 'evidence-owner',
+      ifVersion: 0,
+    });
     const pending = {
       harnessName: 'default',
       sessionId: 'session-cas',
@@ -1795,6 +1805,14 @@ describe('HarnessPG', () => {
 
   it('round-trips JSONB semantic dispatch CAS and fences terminal settlement by attempt', async () => {
     const harness = store.stores.harness!;
+    // Result evidence is written only while its session exists (PF-5374).
+    await harness.saveSession(
+      createSampleSessionRecord({ id: 'session-semantic-cas', threadId: 'thread-semantic-cas' }),
+      {
+        ownerId: 'evidence-owner',
+        ifVersion: 0,
+      },
+    );
     const identity = {
       harnessName: 'default',
       sessionId: 'session-semantic-cas',
@@ -1897,6 +1915,14 @@ describe('HarnessPG', () => {
 
   it('applies exactly one of two competing unfenced terminal evidence writes', async () => {
     const harness = store.stores.harness!;
+    // Result evidence is written only while its session exists (PF-5374).
+    await harness.saveSession(
+      createSampleSessionRecord({ id: 'session-terminal-cas', threadId: 'thread-terminal-cas' }),
+      {
+        ownerId: 'evidence-owner',
+        ifVersion: 0,
+      },
+    );
     const pending = {
       harnessName: 'default',
       sessionId: 'session-terminal-cas',
@@ -1938,6 +1964,21 @@ describe('HarnessPG', () => {
 
   it('settles and reloads completed and failed admitted messages after an adapter restart', async () => {
     const harness = store.stores.harness!;
+    // Result evidence is written only while its session exists (PF-5374).
+    await harness.saveSession(
+      createSampleSessionRecord({ id: 'session-message-restart-0', threadId: 'thread-message-restart-0' }),
+      {
+        ownerId: 'evidence-owner',
+        ifVersion: 0,
+      },
+    );
+    await harness.saveSession(
+      createSampleSessionRecord({ id: 'session-message-restart-1', threadId: 'thread-message-restart-1' }),
+      {
+        ownerId: 'evidence-owner',
+        ifVersion: 0,
+      },
+    );
     const terminals = [
       { status: 'completed' as const, result: { text: 'done' } },
       { status: 'failed' as const, error: { code: 'model_failed', message: 'model failed' } },

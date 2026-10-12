@@ -76,6 +76,7 @@ import {
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionClosedError,
   HarnessStorageSessionEventReplayUnsupportedError,
+  HarnessStorageSessionNotFoundError,
   HarnessStorageVersionConflictError,
   HarnessTerminalHandoffError,
   HarnessTerminalHandoffCancelledError,
@@ -11474,6 +11475,7 @@ export class Session {
       await this._cleanupOperationEvidenceIfDeleted(status);
       return result.created ? { created: true, applied: result.applied, evidence } : result;
     } catch (err) {
+      if (err instanceof HarnessStorageSessionNotFoundError) throw this._sessionDeletedError(err);
       if (err instanceof HarnessStorageAdmissionConflictError && status.admissionId && status.admissionHash) {
         const duplicate = await this._resolveMessageAdmissionDuplicate({
           admissionId: status.admissionId,
@@ -11485,6 +11487,17 @@ export class Session {
       }
       throw err;
     }
+  }
+
+  /**
+   * A message-result write that storage refused because the session row is
+   * gone: a delete (here or in another process) won, and the late write was
+   * refused (PF-5374). Callers see the session as deleted.
+   */
+  private _sessionDeletedError(err: unknown): unknown {
+    return err instanceof HarnessStorageSessionNotFoundError
+      ? new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId)
+      : err;
   }
 
   private async _cleanupOperationEvidenceIfDeleted(status: { signalId: string }): Promise<void> {
@@ -11646,18 +11659,22 @@ export class Session {
               modeId: retainedAdmission.modeId,
               modelId: retainedAdmission.modelId,
             };
-      const write = await this._storage.compareAndSwapSignalTerminal({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId,
-        admissionId: retainedAdmission.admissionId,
-        admissionHash: retainedAdmission.admissionHash,
-        expected: retainedAdmission.dispatch,
-        terminal,
-        updatedAt: Date.now(),
-      });
+      const write = await this._storage
+        .compareAndSwapSignalTerminal({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          signalId,
+          admissionId: retainedAdmission.admissionId,
+          admissionHash: retainedAdmission.admissionHash,
+          expected: retainedAdmission.dispatch,
+          terminal,
+          updatedAt: Date.now(),
+        })
+        .catch((err: unknown) => {
+          throw this._sessionDeletedError(err);
+        });
       await this._cleanupOperationEvidenceIfDeleted({ signalId });
       // The loser adopts the durable winner by returning without rewriting or
       // projecting its stale run/result as the operation terminal.
@@ -11914,18 +11931,22 @@ export class Session {
     expected: AgentSignalDispatchState,
     next: AgentSignalDispatchState,
   ): Promise<{ applied: boolean; evidence: AgentSignalResultEvidence }> {
-    const result = await this._storage.compareAndSwapSignalDispatch({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      signalId: admission.identity.signalId,
-      admissionId: admission.admissionId,
-      admissionHash: admission.admissionHash,
-      expected,
-      next,
-      updatedAt: Date.now(),
-    });
+    const result = await this._storage
+      .compareAndSwapSignalDispatch({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: admission.identity.signalId,
+        admissionId: admission.admissionId,
+        admissionHash: admission.admissionHash,
+        expected,
+        next,
+        updatedAt: Date.now(),
+      })
+      .catch((err: unknown) => {
+        throw this._sessionDeletedError(err);
+      });
     admission.dispatch = this._signalDispatchState(result.evidence, admission.identity);
     return result;
   }
@@ -19351,15 +19372,19 @@ export class Session {
   private async _writeQueueSignalResultEvidence(status: AgentSignalResultStatus): Promise<void> {
     const now = Date.now();
     this._operationEvidenceSignalIds.add(status.signalId);
-    await this._storage.writeMessageResultEvidence({
-      ...status,
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      createdAt: now,
-      updatedAt: now,
-    });
+    await this._storage
+      .writeMessageResultEvidence({
+        ...status,
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .catch((err: unknown) => {
+        throw this._sessionDeletedError(err);
+      });
     await this._cleanupOperationEvidenceIfDeleted(status);
   }
 
