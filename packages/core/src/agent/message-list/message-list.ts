@@ -345,18 +345,23 @@ function partIdentity(part: MastraMessagePart): string {
  * was taken.
  */
 function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: RecordedParts | undefined): number {
-  if (!recorded) return -1;
+  return recordedPartIndices(parts, recorded).at(-1) ?? -1;
+}
+
+/** Indices of the parts that stand for one of `recorded`, matched in order as `lastRecordedPartIndex` matches them. */
+function recordedPartIndices(parts: MastraMessagePart[], recorded: RecordedParts | undefined): number[] {
+  if (!recorded) return [];
+  const indices: number[] = [];
   let next = 0;
-  let last = -1;
   for (let index = 0; index < parts.length && next < recorded.tokens.length; index++) {
     const part = parts[index]!;
     let match = recorded.objects.indexOf(part, next);
     if (match === -1) match = recorded.tokens.indexOf(partIdentity(part), next);
     if (match === -1) continue;
-    last = index;
+    indices.push(index);
     next = match + 1;
   }
-  return last;
+  return indices;
 }
 
 /**
@@ -365,10 +370,19 @@ function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: RecordedPar
  * a look-alike. Only then are the remaining parts matched by identity against the remaining
  * records, from the end of the message: identities can repeat (a provider that reuses simple tool
  * call ids across turns), and an iteration's own parts follow the history it was written after.
+ * Parts that stand for a `history` record take no owned record, and callers pass only the parts
+ * that can still be the iteration's (up to its end, or ahead of a rolled-back attempt), so a later
+ * look-alike cannot take a held part's record either.
  */
-function ownedPartFlags(parts: MastraMessagePart[], owned: RecordedParts | undefined): boolean[] {
+function ownedPartFlags(
+  parts: MastraMessagePart[],
+  owned: RecordedParts | undefined,
+  history: RecordedParts | undefined,
+): boolean[] {
   const flags = parts.map(() => false);
   if (!owned || owned.objects.length === 0) return flags;
+  // A part that stands for a recorded history part is history, whatever identity it shares.
+  const isHistory = new Set(recordedPartIndices(parts, history));
   const consumed = owned.objects.map(() => false);
   parts.forEach((part, index) => {
     const record = owned.objects.indexOf(part);
@@ -377,7 +391,7 @@ function ownedPartFlags(parts: MastraMessagePart[], owned: RecordedParts | undef
     flags[index] = true;
   });
   for (let index = parts.length - 1; index >= 0; index--) {
-    if (flags[index]) continue;
+    if (flags[index] || isHistory.has(index)) continue;
     const token = partIdentity(parts[index]!);
     for (let record = owned.tokens.length - 1; record >= 0; record--) {
       if (consumed[record] || owned.tokens[record] !== token) continue;
@@ -1190,7 +1204,13 @@ export class MessageList {
       // Keep only what was there before the step began; the step's own parts, the ones it wrote
       // before its input processors included, go wherever they sit.
       const start = lastRecordedPartIndex(parts, content.startParts.get(messageId)) + 1;
-      const owned = ownedPartFlags(parts, content.ownedParts?.get(messageId));
+      // Only what precedes the attempt's parts: a look-alike the attempt wrote must not take a held
+      // part's record, or the held part survives here and is written again when recarried.
+      const owned = ownedPartFlags(
+        parts.slice(0, start),
+        content.ownedParts?.get(messageId),
+        content.startParts.get(messageId),
+      );
       const kept = parts.filter((_, index) => index < start && !owned[index]);
       parts.splice(0, parts.length, ...kept);
     } else {
@@ -2391,7 +2411,11 @@ export class MessageList {
         part.type === 'tool-invocation' ? part : stampPart(part),
       );
       const start = lastRecordedPartIndex(objects, location.startParts.get(message.id)) + 1;
-      const ownedBefore = ownedPartFlags(objects, location.ownedParts?.get(message.id));
+      const ownedBefore = ownedPartFlags(
+        objects,
+        location.ownedParts?.get(message.id),
+        location.startParts.get(message.id),
+      );
       const owned = objects.map((_, index) => index >= start || ownedBefore[index]!);
       messages.set(message.id, { tokens: objects.map(partIdentity), objects, owned });
     }
@@ -2465,7 +2489,12 @@ export class MessageList {
       const stop = endParts ? lastRecordedPartIndex(messageParts, endParts) + 1 : messageParts.length;
       // The iteration's parts: those after the recorded ones, and those it wrote before its input
       // processors ran wherever they sit.
-      const owned = ownedPartFlags(messageParts, location.ownedParts?.get(message.id));
+      // Only up to the end: a later step's look-alike must not take a held part's record.
+      const owned = ownedPartFlags(
+        messageParts.slice(0, stop),
+        location.ownedParts?.get(message.id),
+        location.startParts.get(message.id),
+      );
       const stepParts = messageParts.filter((_, index) => index < stop && (index >= start || owned[index]));
       if (stepParts.length === 0) continue;
 

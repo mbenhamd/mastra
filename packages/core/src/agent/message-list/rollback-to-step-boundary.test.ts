@@ -785,6 +785,36 @@ describe('MessageList step content across input-step processors (PF-5415)', () =
     ).toEqual(['earlier result']);
   });
 
+  it('does not let a later look-alike take a cloned held part from the step', () => {
+    const { list, id } = listWith(assistant([toolCall('call_1', 'earlier result')]));
+    const location = list.openStepContent();
+    messageOf(list, id).content.parts.push(toolCall('call_1', 'carried result'));
+    const held = list.holdStepContent(location);
+    messageOf(list, id).content.parts.push(text('processor note'));
+    const rebased = list.rebaseStepContent(location, held);
+    messageOf(list, id).content.parts.push(text('answer'));
+    list.closeStepContent(rebased);
+    // Every part cloned by an output processor, then a later attempt reuses the call id.
+    messageOf(list, id).content.parts = structuredClone(messageOf(list, id).content.parts);
+    messageOf(list, id).content.parts.push(toolCall('call_1', 'later result'));
+
+    expect(
+      list
+        .stepContent(rebased)
+        .filter(part => part.type === 'tool-result')
+        .map(part => (part as { output: unknown }).output),
+    ).toEqual([{ type: 'text', value: 'carried result' }]);
+
+    // Rolling the step back removes the held part, so recarrying it cannot duplicate it.
+    expect(list.rollbackToStepBoundary(id, undefined, rebased)).toBe(true);
+    expect(
+      partsOf(list, id)?.map(
+        part =>
+          (part as { toolInvocation?: { result: unknown } }).toolInvocation?.result ?? (part as { text?: string }).text,
+      ),
+    ).toEqual(['earlier result', 'processor note']);
+  });
+
   it("keeps a held part the iteration's own when a processor replaces it with a changed copy", () => {
     const { list, id } = listWith(assistant([text('earlier step')]));
     const location = list.openStepContent();
