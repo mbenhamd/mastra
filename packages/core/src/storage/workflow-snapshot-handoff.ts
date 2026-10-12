@@ -35,6 +35,25 @@ export class WorkflowSnapshotHandoffFenceError extends TypeError {
 }
 
 /**
+ * Raised when a storage adapter finds its own handoff bookkeeping
+ * inconsistent (for example, a row locked for an update was not updated).
+ * It signals a storage defect, never invalid input; the transaction that
+ * found it is rolled back.
+ */
+export class WorkflowSnapshotHandoffInvariantError extends Error {
+  readonly code = 'WORKFLOW_SNAPSHOT_HANDOFF_INVARIANT';
+  readonly workflowName: string;
+  readonly runId: string;
+
+  constructor({ workflowName, runId, message }: { workflowName: string; runId: string; message: string }) {
+    super(`${message} for ${workflowName}/${runId}`);
+    this.name = 'WorkflowSnapshotHandoffInvariantError';
+    this.workflowName = workflowName;
+    this.runId = runId;
+  }
+}
+
+/**
  * Raised when a generation-guarded `persistWorkflowSnapshot` finds the stored
  * row missing or owned by a different execution generation — the caller's
  * execution lifetime ended (deletion-tombstone reopen), so writing its
@@ -181,16 +200,38 @@ function hasUnsafeIdentityChar(value: string): boolean {
 }
 
 /**
- * The release rule shared by every adapter: a supplied fence must match the
- * stored fence exactly (pending or completed); without a fence only a
- * completed handoff may be released.
+ * The release rule shared by every adapter, applied to the locked row:
+ * - another claim generation than the caller saw is a conflict;
+ * - a supplied fence must match the stored fence exactly;
+ * - without a fence only a completed handoff may be released.
  */
 export function isWorkflowSnapshotHandoffReleasable(
-  record: Pick<WorkflowSnapshotHandoffRecord, 'status' | 'mutationFence'>,
+  record: Pick<WorkflowSnapshotHandoffRecord, 'status' | 'mutationFence' | 'claimGeneration'>,
+  expectedClaimGeneration: number,
   mutationFence: string | undefined,
 ): boolean {
+  if (record.claimGeneration !== expectedClaimGeneration) return false;
   if (mutationFence !== undefined) return record.mutationFence === mutationFence;
   return record.status === 'completed';
+}
+
+/** Validates the release compare-and-set token. */
+export function validateWorkflowSnapshotHandoffClaimGeneration(expectedClaimGeneration: number): void {
+  if (!Number.isSafeInteger(expectedClaimGeneration) || expectedClaimGeneration < 1) {
+    throw new RangeError('Workflow snapshot handoff expectedClaimGeneration must be a positive safe integer');
+  }
+}
+
+/**
+ * Whether a claim of a released row keeps it as the retained outcome of the
+ * same claim rather than claiming the row again: a completed row claimed
+ * under its own fence answers `completed`.
+ */
+export function isWorkflowSnapshotHandoffRetainedOutcome(
+  record: Pick<WorkflowSnapshotHandoffRecord, 'status' | 'mutationFence'>,
+  mutationFence: string,
+): boolean {
+  return record.status === 'completed' && record.mutationFence === mutationFence;
 }
 
 /** Rejects handoff identity fields that cannot round-trip through UTF-8 encoding. */

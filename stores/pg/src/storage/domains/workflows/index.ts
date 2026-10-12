@@ -69,8 +69,11 @@ import {
   WorkflowSnapshotHandoffFenceError,
   WorkflowStaleSnapshotPersistError,
   isWorkflowSnapshotHandoffReleasable,
+  isWorkflowSnapshotHandoffRetainedOutcome,
+  WorkflowSnapshotHandoffInvariantError,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
+  validateWorkflowSnapshotHandoffClaimGeneration,
   validateWorkflowSnapshotHandoffFence,
   validateWorkflowSnapshotHandoffIdentity,
   validateWorkflowSnapshotHandoffLimit,
@@ -918,6 +921,12 @@ export class WorkflowsPG extends WorkflowsStorage {
       row.completed_at === null || row.completed_at === undefined
         ? undefined
         : numberValue(row.completed_at, 'completed_at');
+    const claimGeneration = numberValue(row.claim_generation, 'claim_generation');
+    if (claimGeneration < 1) throw new TypeError('Invalid workflow snapshot handoff claim_generation');
+    const releasedAt =
+      row.released_at === null || row.released_at === undefined
+        ? undefined
+        : numberValue(row.released_at, 'released_at');
     return {
       version: 1,
       workflowName: row.workflow_name,
@@ -929,6 +938,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       createdAt,
       updatedAt,
       ...(completedAt === undefined ? {} : { completedAt }),
+      claimGeneration,
+      ...(releasedAt === undefined ? {} : { releasedAt }),
     };
   }
 
@@ -951,7 +962,8 @@ export class WorkflowsPG extends WorkflowsStorage {
     runId: string,
   ): Promise<void> {
     const handoff = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
-    if (handoff) {
+    // A released row records a past claim; it no longer fences the run.
+    if (handoff && handoff.releasedAt === undefined) {
       throw new WorkflowSnapshotHandoffFenceError({
         workflowName,
         runId,
@@ -1848,6 +1860,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     // The fence error must reach callers as its own instanceof-checkable type;
     // validation TypeErrors/RangeErrors likewise keep their identity.
     if (error instanceof WorkflowSnapshotHandoffFenceError) return error;
+    if (error instanceof WorkflowSnapshotHandoffInvariantError) return error;
     if (error instanceof TypeError || error instanceof RangeError) return error;
     const details: Record<string, string> = {
       persistenceFailure: classifyPgPersistenceFailure(error, { write }),
@@ -3371,6 +3384,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       "created_at" BIGINT NOT NULL,
       "updated_at" BIGINT NOT NULL,
       "completed_at" BIGINT,
+      "claim_generation" BIGINT NOT NULL DEFAULT 1 CHECK ("claim_generation" >= 1),
+      "released_at" BIGINT CHECK ("released_at" >= 0),
       PRIMARY KEY ("workflow_name", "run_id"),
       CHECK ("version" = 1),
       CHECK ("status" IN ('pending', 'completed')),
@@ -4511,6 +4526,26 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  /**
+   * Adds the release columns to a handoff table created before them. The init
+   * catalog snapshot answers whether they exist, so a converged schema issues
+   * no ALTER; a table created by this init already has them. Without a
+   * snapshot the idempotent ALTER runs.
+   */
+  private async migrateWorkflowSnapshotHandoffRelease(): Promise<void> {
+    const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
+    if (snapshot) {
+      if (!snapshot.tables.has(TABLE_WORKFLOW_SNAPSHOT_HANDOFF)) return;
+      const columns = snapshot.columns.get(TABLE_WORKFLOW_SNAPSHOT_HANDOFF);
+      if (columns?.has('claim_generation') && columns.has('released_at')) return;
+    }
+    await this.#db.client.none(
+      `ALTER TABLE ${this.workflowSnapshotHandoffTableName()}
+         ADD COLUMN IF NOT EXISTS "claim_generation" BIGINT NOT NULL DEFAULT 1 CHECK ("claim_generation" >= 1),
+         ADD COLUMN IF NOT EXISTS "released_at" BIGINT CHECK ("released_at" >= 0)`,
+    );
+  }
+
   private async migrateWorkflowParentRevisions(): Promise<WorkflowSnapshotColumnType> {
     const initial = await this.inspectWorkflowMigrationSchema(this.#db.client, true);
     if (initial.markerTable === 'incompatible') {
@@ -4805,6 +4840,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.none(WorkflowsPG.getTerminalRecoveryAncestryTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getTerminalDestinationReceiptTableDDL(this.#schema));
     await this.#db.client.none(WorkflowsPG.getWorkflowSnapshotHandoffTableDDL(this.#schema));
+    await this.migrateWorkflowSnapshotHandoffRelease();
     const snapshotColumnType = await this.migrateWorkflowParentRevisions();
     await this.#db.client.none(WorkflowsPG.getTerminalContinuationPlanTableDDL(this.#schema));
     await this.#db.alterTable({
@@ -4877,6 +4913,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            AND NOT EXISTS (
              SELECT 1 FROM ${this.workflowSnapshotHandoffTableName()} AS handoff
              WHERE handoff.workflow_name = snapshot.workflow_name AND handoff.run_id = snapshot.run_id
+               AND handoff.released_at IS NULL
            )
            AND (snapshot.workflow_name, snapshot.run_id) NOT IN (
              SELECT * FROM unnest($3::text[], $4::text[])
@@ -4891,7 +4928,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         const removed = await this.#db.client.tx(async t => {
           const revision = await this.lockExistingWorkflowParentRevision(t, candidate.workflow_name, candidate.run_id);
           if (!revision) return false;
-          if (await this.lockWorkflowSnapshotHandoff(t, candidate.workflow_name, candidate.run_id)) return false;
+          const handoff = await this.lockWorkflowSnapshotHandoff(t, candidate.workflow_name, candidate.run_id);
+          if (handoff && handoff.releasedAt === undefined) return false;
           const result = await t.query(
             `DELETE FROM ${this.workflowSnapshotTableName()}
              WHERE workflow_name = $1 AND run_id = $2 AND "updatedAtZ" < $3`,
@@ -5368,7 +5406,10 @@ export class WorkflowsPG extends WorkflowsStorage {
           return { status: 'conflict', observedCanonical };
         }
         const existing = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
-        if (existing) {
+        if (existing?.releasedAt !== undefined && isWorkflowSnapshotHandoffRetainedOutcome(existing, mutationFence)) {
+          return { status: 'completed', record: existing };
+        }
+        if (existing && existing.releasedAt === undefined) {
           const same =
             existing.mutationFence === mutationFence &&
             existing.resourceId === resourceId &&
@@ -5386,12 +5427,42 @@ export class WorkflowsPG extends WorkflowsStorage {
         );
         const now = Number(clock.now_ms);
         if (!Number.isSafeInteger(now) || now < 0) throw new TypeError('Invalid PostgreSQL workflow handoff clock');
-        await t.none(
-          `INSERT INTO ${this.workflowSnapshotHandoffTableName()}
-         (workflow_name, run_id, version, status, resource_id, snapshot, mutation_fence, created_at, updated_at)
-         VALUES ($1, $2, 1, 'pending', $3, $4, $5, $6, $6)`,
-          [workflowName, runId, resourceId ?? null, serializedSnapshot, mutationFence, now],
-        );
+        let claimGeneration = 1;
+        if (existing) {
+          // A released row is claimed again in place, under the next generation.
+          claimGeneration = existing.claimGeneration + 1;
+          const reclaimed = await t.query(
+            `UPDATE ${this.workflowSnapshotHandoffTableName()}
+             SET status = 'pending', resource_id = $1, snapshot = $2, mutation_fence = $3,
+                 created_at = $4, updated_at = $4, completed_at = NULL,
+                 claim_generation = $5, released_at = NULL
+             WHERE workflow_name = $6 AND run_id = $7 AND claim_generation = $8 AND released_at IS NOT NULL`,
+            [
+              resourceId ?? null,
+              serializedSnapshot,
+              mutationFence,
+              now,
+              claimGeneration,
+              workflowName,
+              runId,
+              existing.claimGeneration,
+            ],
+          );
+          if ((reclaimed.rowCount ?? 0) !== 1) {
+            throw new WorkflowSnapshotHandoffInvariantError({
+              workflowName,
+              runId,
+              message: 'Workflow snapshot handoff re-claim did not update the locked released row',
+            });
+          }
+        } else {
+          await t.none(
+            `INSERT INTO ${this.workflowSnapshotHandoffTableName()}
+           (workflow_name, run_id, version, status, resource_id, snapshot, mutation_fence, created_at, updated_at)
+           VALUES ($1, $2, 1, 'pending', $3, $4, $5, $6, $6)`,
+            [workflowName, runId, resourceId ?? null, serializedSnapshot, mutationFence, now],
+          );
+        }
         return {
           status: 'created',
           record: {
@@ -5404,6 +5475,7 @@ export class WorkflowsPG extends WorkflowsStorage {
             mutationFence,
             createdAt: now,
             updatedAt: now,
+            claimGeneration,
           },
         };
       });
@@ -5440,7 +5512,9 @@ export class WorkflowsPG extends WorkflowsStorage {
             ? { status: 'completed', record: existing }
             : { status: 'conflict', record: existing };
         }
+        // A released pending claim was given up by its holder; it takes no further steps.
         const expectedMatches =
+          existing.releasedAt === undefined &&
           existing.mutationFence === mutationFence &&
           existing.resourceId === expectedResourceId &&
           workflowSnapshotHandoffSnapshotsEqual(existing.snapshot, expectedSnapshot);
@@ -5503,7 +5577,9 @@ export class WorkflowsPG extends WorkflowsStorage {
             ? { status: 'already_completed', record: existing }
             : { status: 'conflict', record: existing };
         }
+        // A released pending claim was given up by its holder; it takes no further steps.
         const expectedMatches =
+          existing.releasedAt === undefined &&
           existing.mutationFence === mutationFence &&
           existing.resourceId === expectedResourceId &&
           workflowSnapshotHandoffSnapshotsEqual(existing.snapshot, expectedSnapshot);
@@ -5539,28 +5615,47 @@ export class WorkflowsPG extends WorkflowsStorage {
   async releaseWorkflowSnapshotHandoff(
     input: ReleaseWorkflowSnapshotHandoffInput,
   ): Promise<ReleaseWorkflowSnapshotHandoffResult> {
-    const { workflowName, runId, mutationFence } = input;
+    const { workflowName, runId, expectedClaimGeneration, mutationFence, deleteRun } = input;
+    validateWorkflowSnapshotHandoffClaimGeneration(expectedClaimGeneration);
     if (mutationFence !== undefined) validateWorkflowSnapshotHandoffFence(mutationFence);
     validateWorkflowSnapshotHandoffIdentity(workflowName, runId);
     try {
       return await this.#db.client.tx(async t => {
         // Same lock order as claim, transition, complete and run deletion:
-        // parent revision first, then the handoff row.
-        await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        // parent revision first, then the handoff row, then the run snapshot.
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         const existing = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
         if (!existing) return { status: 'missing' };
-        if (!isWorkflowSnapshotHandoffReleasable(existing, mutationFence)) {
+        if (!isWorkflowSnapshotHandoffReleasable(existing, expectedClaimGeneration, mutationFence)) {
           return { status: 'conflict', record: existing };
         }
-        const result = await t.query(
-          `DELETE FROM ${this.workflowSnapshotHandoffTableName()}
-           WHERE workflow_name = $1 AND run_id = $2`,
-          [workflowName, runId],
-        );
-        if ((result.rowCount ?? 0) !== 1) {
-          throw new TypeError('Workflow snapshot handoff release did not remove the locked row');
+        let record = existing;
+        let status: 'released' | 'already_released' = 'already_released';
+        if (existing.releasedAt === undefined) {
+          const clock = await t.one<{ now_ms: string }>(
+            `SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS now_ms`,
+          );
+          const now = Number(clock.now_ms);
+          if (!Number.isSafeInteger(now) || now < 0) throw new TypeError('Invalid PostgreSQL workflow handoff clock');
+          const result = await t.query(
+            `UPDATE ${this.workflowSnapshotHandoffTableName()}
+             SET released_at = $1, updated_at = GREATEST(updated_at, $1)
+             WHERE workflow_name = $2 AND run_id = $3 AND claim_generation = $4 AND released_at IS NULL`,
+            [now, workflowName, runId, expectedClaimGeneration],
+          );
+          if ((result.rowCount ?? 0) !== 1) {
+            throw new WorkflowSnapshotHandoffInvariantError({
+              workflowName,
+              runId,
+              message: 'Workflow snapshot handoff release did not update the locked row',
+            });
+          }
+          record = { ...existing, updatedAt: Math.max(existing.updatedAt, now), releasedAt: now };
+          status = 'released';
         }
-        return { status: 'released', record: existing };
+        const runDeleted =
+          deleteRun === true && (await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision));
+        return { status, record, runDeleted };
       });
     } catch (error) {
       throw this.snapshotHandoffError('RELEASE_WORKFLOW_SNAPSHOT_HANDOFF', workflowName, runId, error);
@@ -5572,11 +5667,12 @@ export class WorkflowsPG extends WorkflowsStorage {
   ): Promise<ListWorkflowSnapshotHandoffsResult> {
     const limit = validateWorkflowSnapshotHandoffLimit(input.limit);
     const values: unknown[] = [];
-    const clauses: string[] = [];
     const add = (value: unknown): string => {
       values.push(value);
       return `$${values.length}`;
     };
+    // Released rows record past claims; recovery never lists them.
+    const clauses: string[] = ['released_at IS NULL'];
     if (input.workflowName !== undefined) clauses.push(`workflow_name = ${add(input.workflowName)}`);
     if (input.status !== undefined) clauses.push(`status = ${add(input.status)}`);
     if (input.after) {
@@ -6094,28 +6190,42 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  /**
+   * Deletes the run's canonical snapshot once the caller holds the parent
+   * revision lock and has checked that no handoff fences the run. Returns
+   * whether a snapshot was deleted.
+   */
+  private async deleteUnfencedWorkflowRun(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+    revision: WorkflowParentRevisionLock | undefined,
+  ): Promise<boolean> {
+    const snapshot = await t.oneOrNone<{ exists: boolean }>(
+      `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+       WHERE run_id = $1 AND workflow_name = $2 FOR UPDATE`,
+      [runId, workflowName],
+    );
+    if (!snapshot) return false;
+    if (!revision) {
+      throw new TypeError('Workflow snapshot is missing parent revision evidence');
+    }
+    const result = await t.query(
+      `DELETE FROM ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
+       WHERE run_id = $1 AND workflow_name = $2`,
+      [runId, workflowName],
+    );
+    if ((result.rowCount ?? 0) === 0) return false;
+    await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
+    return true;
+  }
+
   async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
     try {
       await this.#db.client.tx(async t => {
         const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
-        const snapshot = await t.oneOrNone<{ exists: boolean }>(
-          `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
-           WHERE run_id = $1 AND workflow_name = $2 FOR UPDATE`,
-          [runId, workflowName],
-        );
-        if (!snapshot) return;
-        if (!revision) {
-          throw new TypeError('Workflow snapshot is missing parent revision evidence');
-        }
-        const result = await t.query(
-          `DELETE FROM ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })}
-           WHERE run_id = $1 AND workflow_name = $2`,
-          [runId, workflowName],
-        );
-        if ((result.rowCount ?? 0) > 0) {
-          await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
-        }
+        await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision);
       });
     } catch (error) {
       if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
