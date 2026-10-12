@@ -761,6 +761,30 @@ describe('MessageList step content across input-step processors (PF-5415)', () =
     expect(texts(list.stepContent(rebased))).toEqual(['answer']);
   });
 
+  it('tells a history tool part from held tool work that reuses its call id', () => {
+    // Some providers reuse simple call ids across turns.
+    const { list, id } = listWith(assistant([toolCall('call_1', 'earlier result')]));
+    const location = list.openStepContent();
+    messageOf(list, id).content.parts.push(toolCall('call_1', 'carried result'));
+    const rebased = list.rebaseStepContent(location, list.holdStepContent(location));
+    messageOf(list, id).content.parts.push(text('answer'));
+    const toolResults = () =>
+      list
+        .stepContent(rebased)
+        .filter(part => part.type === 'tool-result')
+        .map(part => (part as { output: unknown }).output);
+
+    expect(toolResults()).toEqual([{ type: 'text', value: 'carried result' }]);
+    // An output processor hands back clones of every part: still one-to-one.
+    messageOf(list, id).content.parts = structuredClone(messageOf(list, id).content.parts);
+    expect(toolResults()).toEqual([{ type: 'text', value: 'carried result' }]);
+
+    expect(list.rollbackToStepBoundary(id, undefined, rebased)).toBe(true);
+    expect(
+      partsOf(list, id)?.map(part => (part as { toolInvocation?: { result: unknown } }).toolInvocation?.result),
+    ).toEqual(['earlier result']);
+  });
+
   it("keeps a held part the iteration's own when a processor replaces it with a changed copy", () => {
     const { list, id } = listWith(assistant([text('earlier step')]));
     const location = list.openStepContent();

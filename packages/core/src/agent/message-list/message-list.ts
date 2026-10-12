@@ -258,10 +258,10 @@ export type StepContentLocation = {
   readonly startParts: ReadonlyMap<string, RecordedParts>;
   /**
    * Parts the iteration wrote before its input-step processors ran (carried tool work, a failed
-   * fallback attempt). They are the iteration's wherever they sit, even with history a processor
-   * added after them. Set by `rebaseStepContent`.
+   * fallback attempt), by message id. They are the iteration's wherever they sit, even with history
+   * a processor added after them. Set by `rebaseStepContent`; matched by `ownedPartFlags`.
    */
-  readonly ownedParts?: RecordedParts;
+  readonly ownedParts?: ReadonlyMap<string, RecordedParts>;
   /** Each response message's parts when the iteration ended; unset while it is open. */
   endParts?: ReadonlyMap<string, RecordedParts>;
 };
@@ -359,10 +359,34 @@ function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: RecordedPar
   return last;
 }
 
-/** Whether `part` stands for one of `recorded`: the same object, or failing that the same identity. */
-function isRecordedPart(recorded: RecordedParts | undefined, part: MastraMessagePart): boolean {
-  if (!recorded || recorded.objects.length === 0) return false;
-  return recorded.objects.includes(part) || recorded.tokens.includes(partIdentity(part));
+/**
+ * Which of a message's parts stand for one of `owned`, matched one to one: each record is consumed
+ * at most once. Object references are reserved first, so a part still in the list is never taken by
+ * a look-alike. Only then are the remaining parts matched by identity against the remaining
+ * records, from the end of the message: identities can repeat (a provider that reuses simple tool
+ * call ids across turns), and an iteration's own parts follow the history it was written after.
+ */
+function ownedPartFlags(parts: MastraMessagePart[], owned: RecordedParts | undefined): boolean[] {
+  const flags = parts.map(() => false);
+  if (!owned || owned.objects.length === 0) return flags;
+  const consumed = owned.objects.map(() => false);
+  parts.forEach((part, index) => {
+    const record = owned.objects.indexOf(part);
+    if (record === -1 || consumed[record]) return;
+    consumed[record] = true;
+    flags[index] = true;
+  });
+  for (let index = parts.length - 1; index >= 0; index--) {
+    if (flags[index]) continue;
+    const token = partIdentity(parts[index]!);
+    for (let record = owned.tokens.length - 1; record >= 0; record--) {
+      if (consumed[record] || owned.tokens[record] !== token) continue;
+      consumed[record] = true;
+      flags[index] = true;
+      break;
+    }
+  }
+  return flags;
 }
 
 /**
@@ -381,6 +405,15 @@ function ownedAfterInputProcessors(
   held: RecordedParts & { readonly owned: readonly boolean[] },
 ): boolean[] {
   const owned = parts.map(() => false);
+  // Object references first, each held record at most once, so a look-alike sharing an identity
+  // (a reused tool call id) cannot take a record whose part is still in the list.
+  const reserved = new Set<number>();
+  const objectMatch = parts.map(part => {
+    const record = held.objects.indexOf(part);
+    if (record === -1 || reserved.has(record)) return -1;
+    reserved.add(record);
+    return record;
+  });
   let next = 0;
   let unmatched: number[] = [];
   // Held parts `next` up to `anchor` were replaced or removed: pair the replacements in order.
@@ -390,8 +423,18 @@ function ownedAfterInputProcessors(
   };
   for (let index = 0; index < parts.length; index++) {
     const part = parts[index]!;
-    let match = held.objects.indexOf(part, next);
-    if (match === -1) match = held.tokens.indexOf(partIdentity(part), next);
+    let match = objectMatch[index]! >= next ? objectMatch[index]! : -1;
+    if (match === -1) {
+      // By identity, among records no object claimed and before the next object-matched one.
+      const limit = objectMatch.slice(index + 1).find(record => record >= next) ?? held.objects.length;
+      const token = partIdentity(part);
+      for (let record = next; record < limit; record++) {
+        if (!reserved.has(record) && held.tokens[record] === token) {
+          match = record;
+          break;
+        }
+      }
+    }
     if (match === -1) {
       unmatched.push(index);
       continue;
@@ -1147,7 +1190,8 @@ export class MessageList {
       // Keep only what was there before the step began; the step's own parts, the ones it wrote
       // before its input processors included, go wherever they sit.
       const start = lastRecordedPartIndex(parts, content.startParts.get(messageId)) + 1;
-      const kept = parts.filter((part, index) => index < start && !isRecordedPart(content.ownedParts, part));
+      const owned = ownedPartFlags(parts, content.ownedParts?.get(messageId));
+      const kept = parts.filter((_, index) => index < start && !owned[index]);
       parts.splice(0, parts.length, ...kept);
     } else {
       // Nowhere to splice: discard the message rather than guess which parts were accepted.
@@ -2347,7 +2391,8 @@ export class MessageList {
         part.type === 'tool-invocation' ? part : stampPart(part),
       );
       const start = lastRecordedPartIndex(objects, location.startParts.get(message.id)) + 1;
-      const owned = objects.map((part, index) => index >= start || isRecordedPart(location.ownedParts, part));
+      const ownedBefore = ownedPartFlags(objects, location.ownedParts?.get(message.id));
+      const owned = objects.map((_, index) => index >= start || ownedBefore[index]!);
       messages.set(message.id, { tokens: objects.map(partIdentity), objects, owned });
     }
     return { messages };
@@ -2364,7 +2409,7 @@ export class MessageList {
    */
   public rebaseStepContent(location: StepContentLocation, held: HeldStepContent): StepContentLocation {
     const startParts = new Map<string, RecordedParts>();
-    const ownedObjects: MastraMessagePart[] = [];
+    const ownedParts = new Map<string, RecordedParts>();
     for (const message of this.response.db()) {
       const parts = (message.content.parts ?? []).map(part =>
         part.type === 'tool-invocation' ? part : stampPart(part),
@@ -2372,12 +2417,15 @@ export class MessageList {
       const before = held.messages.get(message.id);
       const owned = before?.owned.includes(true) ? ownedAfterInputProcessors(parts, before) : undefined;
       const history = owned ? parts.filter((_, index) => !owned[index]) : parts;
-      if (owned) ownedObjects.push(...parts.filter((_, index) => owned[index]));
+      if (owned?.includes(true)) {
+        const objects = parts.filter((_, index) => owned[index]);
+        ownedParts.set(message.id, { tokens: objects.map(partIdentity), objects });
+      }
       // A message the iteration started stays the iteration's.
       if (history.length === 0 && !location.startParts.has(message.id)) continue;
       startParts.set(message.id, { tokens: history.map(partIdentity), objects: history });
     }
-    return { startParts, ownedParts: { tokens: ownedObjects.map(partIdentity), objects: ownedObjects } };
+    return { startParts, ownedParts };
   }
 
   /**
@@ -2417,9 +2465,8 @@ export class MessageList {
       const stop = endParts ? lastRecordedPartIndex(messageParts, endParts) + 1 : messageParts.length;
       // The iteration's parts: those after the recorded ones, and those it wrote before its input
       // processors ran wherever they sit.
-      const stepParts = messageParts.filter(
-        (part, index) => index < stop && (index >= start || isRecordedPart(location.ownedParts, part)),
-      );
+      const owned = ownedPartFlags(messageParts, location.ownedParts?.get(message.id));
+      const stepParts = messageParts.filter((_, index) => index < stop && (index >= start || owned[index]));
       if (stepParts.length === 0) continue;
 
       const startedHere = !location.startParts.has(message.id);
