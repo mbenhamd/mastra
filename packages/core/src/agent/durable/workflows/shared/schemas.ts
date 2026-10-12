@@ -159,6 +159,7 @@ export const baseDurableAgenticInputSchema = z.object({
   modelConfig: modelConfigSchema,
   options: durableOptionsSchema,
   responseRecovery: durableResponseRecoveryStateSchema.optional(),
+  recoveryToolCeiling: z.array(z.string()).optional(),
   state: z.any(),
   messageId: z.string(),
 });
@@ -184,6 +185,7 @@ export const baseIterationStateSchema = z.object({
   modelConfig: z.any(),
   options: durableOptionsSchema,
   responseRecovery: durableResponseRecoveryStateSchema.optional(),
+  recoveryToolCeiling: z.array(z.string()).optional(),
   state: z.any(),
   messageId: z.string(),
   // JSON-safe snapshot of the caller's requestContext.entries(), carried

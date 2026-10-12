@@ -377,6 +377,11 @@ export interface DurableAgenticWorkflowInput {
   options: SerializableDurableOptions;
   /** Serialized guard; a matching live prepareStep admission is still required. */
   responseRecovery?: DurableResponseRecoveryState;
+  /**
+   * Names of the tools the latest ordinary provider request of this run
+   * advertised; a response-only recovery step never advertises more (PF-5349).
+   */
+  recoveryToolCeiling?: string[];
   /** Serializable internal state */
   state: SerializableDurableState;
   /** Message ID for the current generation */
@@ -441,6 +446,8 @@ export interface DurableLLMStepOutput {
   modelEntryId?: string;
   /** The live response-only capability was consumed, even if a later hard stop prevented provider I/O. */
   responseRecoveryConsumed?: boolean;
+  /** Tools this iteration's ordinary provider request advertised (PF-5349); absent when none was sent. */
+  recoveryToolCeiling?: string[];
   /** Latest exported model_generation span data, including content-free request totals. */
   modelSpanData?: unknown;
   /** Exported model_step span data (only set when there are tool calls) */
@@ -586,6 +593,8 @@ export interface DurableAgenticExecutionOutput {
   modelSpanData?: unknown;
   /** The live response-only capability was consumed by this iteration. */
   responseRecoveryConsumed?: boolean;
+  /** Tools this iteration's ordinary provider request advertised (PF-5349); absent when none was sent. */
+  recoveryToolCeiling?: string[];
   /** Processor retry tracking */
   processorRetryCount?: number;
   processorRetryFeedback?: string;

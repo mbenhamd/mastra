@@ -97,6 +97,12 @@ export interface LLMIterationData<Tools extends ToolSet = ToolSet, OUTPUT = unde
   terminalToolResult?: TerminalToolResult;
   /** Persisted name-only ceiling for reconstructing replacement tools after resume. */
   toolSurfaceFence?: string[];
+  /**
+   * Names of the tools the latest ordinary provider request of this run
+   * advertised. A response-only recovery step never advertises more (PF-5349);
+   * persisted so the bound survives an approval resume.
+   */
+  recoveryToolCeiling?: string[];
 }
 
 // Zod schemas for common types used in validation
@@ -180,6 +186,7 @@ export const llmIterationOutputSchema = z.object({
     })
     .optional(),
   toolSurfaceFence: z.array(z.string()).optional(),
+  recoveryToolCeiling: z.array(z.string()).optional(),
 });
 
 export const toolCallInputSchema = z.object({

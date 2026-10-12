@@ -24,6 +24,7 @@ export function mapDurableIterationToLLMInput(
     modelList: state.modelList,
     options: state.options,
     responseRecovery: state.responseRecovery,
+    recoveryToolCeiling: state.recoveryToolCeiling,
     state: state.state,
     messageId: state.messageId,
     stepIndex: state.iterationCount ?? state.stepIndex,

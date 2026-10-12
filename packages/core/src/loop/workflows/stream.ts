@@ -549,6 +549,9 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           return;
         }
 
+        // The recovery tool ceiling is loop-internal state (PF-5349), not run output.
+        const { recoveryToolCeiling: _recoveryToolCeiling, ...runResult } = executionResult.result;
+
         if (executionResult.result.terminalToolResult) {
           const terminalToolResult = materializeTerminalToolResult(executionResult.result.terminalToolResult);
           const terminalStepCount = executionResult.result.output.steps.length;
@@ -569,7 +572,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
               runId,
               from: ChunkFrom.AGENT,
               payload: {
-                ...executionResult.result,
+                ...runResult,
                 terminalToolResult,
               },
             } as ChunkType<OUTPUT>,
@@ -587,7 +590,7 @@ export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = und
           runId,
           from: ChunkFrom.AGENT,
           payload: {
-            ...executionResult.result,
+            ...runResult,
             stepResult: {
               ...executionResult.result.stepResult,
               // @ts-expect-error - runtime reason can be 'tripwire' | 'retry' from processors, but zod schema infers as string

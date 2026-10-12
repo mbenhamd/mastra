@@ -484,11 +484,13 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       // terminal answer or its step-finish here would duplicate caller-visible
       // output before the workflow has actually reached its terminal state.
       if (shouldEmitStepFinish && !typedInputData.terminalToolResult) {
+        // The recovery tool ceiling is loop-internal state (PF-5349), not step output.
+        const { recoveryToolCeiling: _recoveryToolCeiling, ...stepFinishPayload } = typedInputData;
         await outputWriter({
           type: 'step-finish',
           runId,
           from: ChunkFrom.AGENT,
-          payload: typedInputData,
+          payload: stepFinishPayload,
         });
       }
 
