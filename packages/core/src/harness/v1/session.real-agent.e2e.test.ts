@@ -5253,7 +5253,7 @@ describe('Harness v1 real-agent E2E — S23 processor retry after tool results',
   };
 
   /** A Harness whose agent reads a file, then answers the scripted `answers` in turn. */
-  function retryHarness(answers: string[][]) {
+  function retryHarness(answers: string[][], defaultOptions?: Record<string, unknown>) {
     let providerCalls = 0;
     let toolExecutions = 0;
     const readFile = createTool({
@@ -5288,6 +5288,7 @@ describe('Harness v1 real-agent E2E — S23 processor retry after tool results',
       memory: new MockMemory({ storage }),
       outputProcessors: [requireStatusLine],
       maxProcessorRetries: 2,
+      ...(defaultOptions ? { defaultOptions } : {}),
     });
     const harness = new Harness({
       agents: { default: agent } as any,
@@ -5328,6 +5329,32 @@ describe('Harness v1 real-agent E2E — S23 processor retry after tool results',
         .flatMap(message => message.content)
         .filter(part => part.type === 'text' && part.text.includes(STATUS_LINE));
       expect(persistedAnswers).toHaveLength(1);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('keeps the accepted tool call and result in history when a rejected answer follows iteration feedback', async () => {
+    // The feedback note gets the next iteration's boundary, while the rejected answer
+    // merges into the tool step's message. Rolling that message back must drop only the
+    // rejected answer, not the accepted tool step (PF-5404).
+    const { harness, providerCalls, toolExecutions } = retryHarness([[REJECTED_ANSWER], [REPAIRED_ANSWER]], {
+      onIterationComplete: async ({ iteration }: { iteration: number }) =>
+        iteration === 1 ? { feedback: 'Now answer.' } : undefined,
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u-feedback-retry', threadId: { fresh: true } });
+      const result = (await session.message({ content: 'read it' })) as any;
+
+      expect(providerCalls()).toBe(3);
+      expect(toolExecutions()).toBe(1);
+      expect(result.text).toBe(REPAIRED_ANSWER);
+
+      const persisted = (await session.listMessages()).flatMap(message => message.content);
+      expect(persisted.filter(part => part.type === 'tool_call' && part.id === 'read-1')).toHaveLength(1);
+      expect(persisted.filter(part => part.type === 'tool_result' && part.id === 'read-1')).toHaveLength(1);
+      const answers = persisted.filter(part => part.type === 'text' && part.text.startsWith(REJECTED_ANSWER));
+      expect(answers.map(part => (part as { text: string }).text)).toEqual([REPAIRED_ANSWER]);
     } finally {
       await harness.shutdown();
     }

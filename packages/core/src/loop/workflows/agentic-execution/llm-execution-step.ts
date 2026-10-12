@@ -1610,8 +1610,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           ? messageList.openStepBoundary({ acrossTrailingSignals: inputData.processorRetryFeedback !== undefined })
               .boundary
           : undefined;
-      // Where this iteration's response goes; its StepResult content is read from here.
-      const iterationContent = messageList.openStepContent();
+      // Where this iteration's response goes; its StepResult content is read from here. Input-step
+      // processors may still rewrite history, so each attempt rebases it once they have run.
+      let iterationContent = messageList.openStepContent();
 
       try {
         // Open MODEL_STEP before any step-owned processor work. The outer
@@ -1867,6 +1868,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 }
               : undefined;
 
+            // What this iteration already wrote (carried tool work, a failed fallback attempt) stays
+            // its content; whatever else the processors leave in the response is history (PF-5415).
+            const heldStepContent = messageList.holdStepContent(iterationContent);
             const processInputStepResult = await processorRunner.runProcessInputStep({
               llmRequestProcessorIds: ProcessorRunner.getLLMRequestProcessorIds(
                 getRequestInputProcessors({ inputProcessors, llmRequestInputProcessors }),
@@ -1894,6 +1898,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
               writer: inputStepWriter,
               abortSignal: options?.abortSignal,
             });
+            iterationContent = messageList.rebaseStepContent(iterationContent, heldStepContent);
             const admittedResponseRecovery =
               (processInputStepResult as Record<PropertyKey, unknown>)[AGENT_RESPONSE_RECOVERY_STEP] === true;
             if (admittedResponseRecovery) responseRecoveryStep = true;
@@ -3576,7 +3581,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         eagerCoordinator?.recarryCommittedWork(outputStream.messageId);
         // Only a response that was found and removed counts as rolled back; a rejected response
         // that stays in the conversation must keep its place when later steps are numbered.
-        if (messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary) && stepTripwireData) {
+        // The content location covers a response that merged into a message ahead of the
+        // iteration's boundary, such as the tool step's message before a feedback note (PF-5404).
+        if (
+          messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary, iterationContent) &&
+          stepTripwireData
+        ) {
           stepTripwireData.rolledBack = true;
         }
         // A processor retry throws this attempt away like the error paths do, so it gets

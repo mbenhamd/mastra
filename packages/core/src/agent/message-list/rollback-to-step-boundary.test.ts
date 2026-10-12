@@ -740,3 +740,98 @@ describe('MessageList step content location (PF-5364)', () => {
     expect(texts(list.stepContent(location))).toEqual(['Done.']);
   });
 });
+
+describe('MessageList step content across input-step processors (PF-5415)', () => {
+  const contentTypes = (content: Array<{ type: string }> | undefined) => content?.map(part => part.type);
+  const texts = (content: Array<{ type: string; text?: string }> | undefined) =>
+    content?.filter(part => part.type === 'text').map(part => part.text);
+  const messageOf = (list: MessageList, id: string) => list.get.response.db().find(message => message.id === id)!;
+
+  it('keeps carried tool work in the step when a processor appends history after it', () => {
+    const { list, id } = listWith(assistant([text('earlier step')]));
+    const location = list.openStepContent();
+    // Carried tool work is committed into the message before the input processors run.
+    messageOf(list, id).content.parts.push(toolCall('c1'));
+    const held = list.holdStepContent(location);
+    messageOf(list, id).content.parts.push(text('processor note'));
+    const rebased = list.rebaseStepContent(location, held);
+    messageOf(list, id).content.parts.push(text('answer'));
+
+    expect(contentTypes(list.stepContent(rebased))?.sort()).toEqual(['text', 'tool-call', 'tool-result']);
+    expect(texts(list.stepContent(rebased))).toEqual(['answer']);
+  });
+
+  it('tells a history tool part from held tool work that reuses its call id', () => {
+    // Some providers reuse simple call ids across turns.
+    const { list, id } = listWith(assistant([toolCall('call_1', 'earlier result')]));
+    const location = list.openStepContent();
+    messageOf(list, id).content.parts.push(toolCall('call_1', 'carried result'));
+    const rebased = list.rebaseStepContent(location, list.holdStepContent(location));
+    messageOf(list, id).content.parts.push(text('answer'));
+    const toolResults = () =>
+      list
+        .stepContent(rebased)
+        .filter(part => part.type === 'tool-result')
+        .map(part => (part as { output: unknown }).output);
+
+    expect(toolResults()).toEqual([{ type: 'text', value: 'carried result' }]);
+    // An output processor hands back clones of every part: still one-to-one.
+    messageOf(list, id).content.parts = structuredClone(messageOf(list, id).content.parts);
+    expect(toolResults()).toEqual([{ type: 'text', value: 'carried result' }]);
+
+    expect(list.rollbackToStepBoundary(id, undefined, rebased)).toBe(true);
+    expect(
+      partsOf(list, id)?.map(part => (part as { toolInvocation?: { result: unknown } }).toolInvocation?.result),
+    ).toEqual(['earlier result']);
+  });
+
+  it('does not let a later look-alike take a cloned held part from the step', () => {
+    const { list, id } = listWith(assistant([toolCall('call_1', 'earlier result')]));
+    const location = list.openStepContent();
+    messageOf(list, id).content.parts.push(toolCall('call_1', 'carried result'));
+    const held = list.holdStepContent(location);
+    messageOf(list, id).content.parts.push(text('processor note'));
+    const rebased = list.rebaseStepContent(location, held);
+    messageOf(list, id).content.parts.push(text('answer'));
+    list.closeStepContent(rebased);
+    // Every part cloned by an output processor, then a later attempt reuses the call id.
+    messageOf(list, id).content.parts = structuredClone(messageOf(list, id).content.parts);
+    messageOf(list, id).content.parts.push(toolCall('call_1', 'later result'));
+
+    expect(
+      list
+        .stepContent(rebased)
+        .filter(part => part.type === 'tool-result')
+        .map(part => (part as { output: unknown }).output),
+    ).toEqual([{ type: 'text', value: 'carried result' }]);
+
+    // Rolling the step back removes the held part, so recarrying it cannot duplicate it.
+    expect(list.rollbackToStepBoundary(id, undefined, rebased)).toBe(true);
+    expect(
+      partsOf(list, id)?.map(
+        part =>
+          (part as { toolInvocation?: { result: unknown } }).toolInvocation?.result ?? (part as { text?: string }).text,
+      ),
+    ).toEqual(['earlier result', 'processor note']);
+  });
+
+  it("keeps a held part the iteration's own when a processor replaces it with a changed copy", () => {
+    const { list, id } = listWith(assistant([text('earlier step')]));
+    const location = list.openStepContent();
+    // A failed attempt's text, still in the message when the next attempt's processors run.
+    messageOf(list, id).content.parts.push(text('partial attempt'));
+    const held = list.holdStepContent(location);
+    // A redacting processor replaces every part with a changed copy.
+    messageOf(list, id).content.parts = messageOf(list, id).content.parts.map(part =>
+      part.type === 'text' ? { ...part, text: `${part.text} [redacted]` } : part,
+    );
+    const rebased = list.rebaseStepContent(location, held);
+    messageOf(list, id).content.parts.push(text('answer'));
+
+    expect(texts(list.stepContent(rebased))).toEqual(['partial attempt [redacted]', 'answer']);
+
+    // Rejecting the step rolls back everything it wrote, the rewritten held part included.
+    expect(list.rollbackToStepBoundary(id, undefined, rebased)).toBe(true);
+    expect(partsOf(list, id)?.map(part => (part as { text?: string }).text)).toEqual(['earlier step [redacted]']);
+  });
+});

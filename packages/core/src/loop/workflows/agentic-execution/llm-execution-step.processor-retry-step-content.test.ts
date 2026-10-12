@@ -621,3 +621,66 @@ describe('PF-5364 step content after a processor retry', () => {
     expect(abortedSteps).toBe(1);
   });
 });
+
+describe('PF-5415 step content after input-step processors', () => {
+  it('does not credit a trailing assistant part an input processor rewrote to the current step', async () => {
+    // The tool step ends with narration after its call. Iteration feedback takes the next
+    // boundary, so the answer merges into the tool step's message behind that narration.
+    const { model, calls } = scriptedModel([
+      [toolCall('c1'), ...text('SECRET NARRATION'), finish('tool-calls')],
+      [...text('DONE'), finish('stop')],
+    ]);
+    const iterationTexts: string[] = [];
+    const outputStepTexts: string[] = [];
+    const agent = new Agent({
+      id: 'a',
+      name: 'a',
+      instructions: 'test',
+      model,
+      tools: { echo: echoTool() },
+      // Output processors read the step's text from where the step wrote it.
+      outputProcessors: [
+        {
+          id: 'observe',
+          processOutputStep: ({ text: stepText, messageList }: any) => {
+            outputStepTexts.push(stepText ?? '');
+            return messageList;
+          },
+        },
+      ] as any,
+      inputProcessors: [
+        {
+          id: 'redact',
+          // Returns a redacted copy: new part objects under the same message ids.
+          processInputStep: ({ stepNumber, messages }: any) => {
+            if (stepNumber !== 1) return undefined;
+            return {
+              messages: structuredClone(messages).map((message: any) => ({
+                ...message,
+                content: {
+                  ...message.content,
+                  parts: message.content.parts?.map((part: any) =>
+                    part.type === 'text' && part.text === 'SECRET NARRATION' ? { ...part, text: '[redacted]' } : part,
+                  ),
+                },
+              })),
+            };
+          },
+        },
+      ] as any,
+    });
+    const stream = await agent.stream('go', {
+      onIterationComplete: ({ iteration, text: iterationText }) => {
+        iterationTexts.push(iterationText);
+        return iteration === 1 ? { feedback: 'Now answer.' } : undefined;
+      },
+    });
+    await stream.consumeStream();
+    const steps = await stream.steps;
+
+    expect(calls()).toBe(2);
+    expect(outputStepTexts).toEqual(['SECRET NARRATION', 'DONE']);
+    expect(iterationTexts.at(-1)).toBe('DONE');
+    expect(steps.at(-1)?.text).toBe('DONE');
+  });
+});
