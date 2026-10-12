@@ -2,8 +2,24 @@
 '@mastra/core': patch
 ---
 
-A Harness message result can no longer be written for a deleted session. Storage now refuses a late result, dispatch stamp or settlement for a session that no longer exists, so a delete cannot be undone by a turn that finishes afterwards, and the session reports such a turn as deleted.
+**Fixed:** A turn that finishes after its Harness session was deleted no longer saves its result. The late result is dropped, and the caller gets `HarnessSessionDeletedError`.
 
-The error message kept on a deleted session's terminal result, and the reason kept on a grant tombstone, now read "The error message is not retained" instead of being empty, so the kept result is still a valid terminal result.
+**Fixed:** A deleted session's kept turn record now says "The error message is not retained" instead of an empty message, so it stays a valid record.
 
-Memory storage adds an optional ownership check to `deleteMessages`: with `sessionLeaseFence`, the deletion and its observational-memory retraction apply only while the caller still holds the Harness session's lease, and are refused otherwise. Check `supportsSessionLeaseFencedMessageDeletion` before relying on it. The in-memory store supports it.
+**Added:** `deleteMessages` can now refuse to run when the caller no longer owns the chat session. Pass `sessionLeaseFence`, and check `supportsSessionLeaseFencedMessageDeletion` first. If another process took the session over, the call throws `HarnessStorageLeaseConflictError` and deletes nothing.
+
+```ts
+import { HarnessStorageLeaseConflictError } from '@mastra/core/storage';
+
+const memoryStore = await storage.getStore('memory');
+if (memoryStore?.supportsSessionLeaseFencedMessageDeletion) {
+  try {
+    await memoryStore.deleteMessages(messageIds, {
+      sessionLeaseFence: { harnessName: 'default', sessionId, ownerId },
+    });
+  } catch (error) {
+    if (!(error instanceof HarnessStorageLeaseConflictError)) throw error;
+    // Another process owns the session now: nothing was deleted.
+  }
+}
+```

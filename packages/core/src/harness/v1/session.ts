@@ -19372,15 +19372,19 @@ export class Session {
   private async _writeQueueSignalResultEvidence(status: AgentSignalResultStatus): Promise<void> {
     const now = Date.now();
     this._operationEvidenceSignalIds.add(status.signalId);
-    await this._storage.writeMessageResultEvidence({
-      ...status,
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      createdAt: now,
-      updatedAt: now,
-    });
+    await this._storage
+      .writeMessageResultEvidence({
+        ...status,
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .catch((err: unknown) => {
+        throw this._sessionDeletedError(err);
+      });
     await this._cleanupOperationEvidenceIfDeleted(status);
   }
 
