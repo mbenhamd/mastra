@@ -4021,26 +4021,6 @@ export class MemoryPG extends MemoryStorage {
   }
 
   /**
-   * Memory mutations acquire locks in this order:
-   *
-   * 1. lexically sorted thread lifecycle/ownership advisory locks;
-   * 2. lexically sorted observational-memory resource advisory locks;
-   * 3. working-memory advisory locks when applicable;
-   * 4. thread/resource rows; and
-   * 5. message rows.
-   *
-   * OM rows have no single place in that row order: a guarded observer write
-   * that may stamp a not-managed record locks its OM row before its target
-   * thread/resource row, while clone rollback locks the thread row before OM
-   * rows. Only the OM-resource advisory lock (2) keeps the two apart. Any
-   * transaction that locks a thread or resource row and then an OM row must
-   * therefore hold the OM-resource advisory lock for that row's resource
-   * first; without it, it deadlocks against the observer write.
-   *
-   * The advisory key predates its broader ownership role, so it intentionally
-   * retains the `thread-clone` prefix for cross-version serialization.
-   */
-  /**
    * PF-5373: share-lock the Harness session row of a lease-fenced deletion
    * and return its judge. The deletion's owner must hold an unexpired lease
    * (by the clock leases are stamped with) on an open session; otherwise the
@@ -4067,6 +4047,27 @@ export class MemoryPG extends MemoryStorage {
     };
   }
 
+  /**
+   * Memory mutations acquire locks in this order:
+   *
+   * 0. a lease-fenced deletion's Harness session row (PF-5373);
+   * 1. lexically sorted thread lifecycle/ownership advisory locks;
+   * 2. lexically sorted observational-memory resource advisory locks;
+   * 3. working-memory advisory locks when applicable;
+   * 4. thread/resource rows; and
+   * 5. message rows.
+   *
+   * OM rows have no single place in that row order: a guarded observer write
+   * that may stamp a not-managed record locks its OM row before its target
+   * thread/resource row, while clone rollback locks the thread row before OM
+   * rows. Only the OM-resource advisory lock (2) keeps the two apart. Any
+   * transaction that locks a thread or resource row and then an OM row must
+   * therefore hold the OM-resource advisory lock for that row's resource
+   * first; without it, it deadlocks against the observer write.
+   *
+   * The advisory key predates its broader ownership role, so it intentionally
+   * retains the `thread-clone` prefix for cross-version serialization.
+   */
   private async lockThreadLifecycles(t: TxClient, threadIds: Iterable<string>): Promise<void> {
     for (const threadId of sortedUniqueStrings(threadIds)) {
       await this.lockThreadCloneLifecycle(t, threadId);

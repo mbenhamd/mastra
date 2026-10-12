@@ -1,13 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { createSignal } from '../../agent/signals';
-import type { InMemoryHarness } from '../../storage/domains/harness/inmemory';
+import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
+import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { MockAgent } from './__test-utils__/mock-agent';
 import { setupHarness } from './__test-utils__/setup';
 import {
   HarnessAdmissionConflictError,
   HarnessConfigError,
   HarnessMessageResultErasedError,
+  HarnessSessionDeletedError,
   HarnessSessionNotFoundError,
   HarnessValidationError,
 } from './errors';
@@ -1610,6 +1612,43 @@ describe('Session.signal() admissionId', () => {
     );
     await expect(settled).rejects.toBeInstanceOf(HarnessMessageResultErasedError);
   });
+
+  it.each(['compareAndSwapSignalDispatch', 'compareAndSwapSignalTerminal'] as const)(
+    'reports a signal whose session another process deleted before %s as deleted (PF-5374)',
+    async swap => {
+      // Another process deletes the session right before this one's swap, so
+      // storage refuses the swap for a session that no longer exists.
+      class DeletedBeforeSwap extends InMemoryHarness {
+        deleted = false;
+        async deleteBeforeSwap(sessionId: string): Promise<void> {
+          if (this.deleted) return;
+          this.deleted = true;
+          const record = await this.loadSession({ sessionId });
+          await this.deleteSession({ sessionId, ifVersion: record!.version });
+        }
+      }
+      const storage = new DeletedBeforeSwap({ db: new InMemoryDB() });
+      const original = storage[swap].bind(storage) as (input: { sessionId: string }) => Promise<unknown>;
+      (storage as unknown as Record<string, unknown>)[swap] = async (input: { sessionId: string }) => {
+        await storage.deleteBeforeSwap(input.sessionId);
+        return original(input);
+      };
+      const { harness } = setupHarness({ sessions: { storage } });
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+      const outcome = await session
+        .signal({ content: 'late', admissionId: `deleted-before-${swap}` })
+        .then(receipt => receipt.result)
+        .then(
+          value => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+      expect(storage.deleted).toBe(true);
+      expect(outcome).not.toHaveProperty('value');
+      expect((outcome as { error: unknown }).error).toBeInstanceOf(HarnessSessionDeletedError);
+    },
+    30_000,
+  );
 
   it('keeps an admitted suspended signal pending across restart and settles it on resume', async () => {
     const first = setupHarness();
