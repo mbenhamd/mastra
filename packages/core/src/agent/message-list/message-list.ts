@@ -251,8 +251,11 @@ type BoundaryCheckpoint = { messageId: string; prefix: BoundaryToken[] };
  * has written its last part (its tool results included).
  */
 export type StepContentLocation = {
-  /** Each response message's parts when the iteration began. */
-  readonly startParts: ReadonlyMap<string, RecordedParts>;
+  /**
+   * Each response message's parts when the iteration began, as its input-step processors left them
+   * (`rebaseStepContent`).
+   */
+  startParts: ReadonlyMap<string, RecordedParts>;
   /** Each response message's parts when the iteration ended; unset while it is open. */
   endParts?: ReadonlyMap<string, RecordedParts>;
 };
@@ -262,6 +265,39 @@ export type StepContentLocation = {
  * object itself, which a processor that rewrites a part in place keeps.
  */
 type RecordedParts = { readonly tokens: readonly string[]; readonly objects: readonly MastraMessagePart[] };
+
+/**
+ * What an iteration had written when its input-step processors started, from `holdStepContent`. Only
+ * `rebaseStepContent` reads it.
+ */
+export type HeldStepContent = { readonly owned: RecordedParts };
+
+/**
+ * A short stand-in for a part's content in its identity, so recording a step does not copy every
+ * text, reasoning or file payload in the response (PF-5415). Cached per part object and checked
+ * against the content it was computed from, so a part whose content changes in place is digested
+ * again, and a long run digests each payload once rather than once per step.
+ */
+const contentDigests = new WeakMap<MastraMessagePart, { readonly content: string; readonly digest: string }>();
+
+function contentDigest(part: MastraMessagePart, content: string): string {
+  const cached = contentDigests.get(part);
+  if (cached && cached.content === content) return cached.digest;
+  // cyrb53: a 53-bit string hash. With the length, type, provider item id and stamp beside it, two
+  // different parts collide only with equal length, equal stamp and a 53-bit hash collision.
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < content.length; i++) {
+    const code = content.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const digest = `${content.length}:${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
+  contentDigests.set(part, { content, digest });
+  return digest;
+}
 
 /** The provider's id for the output item a part came from, when the provider gives one. */
 function providerItemId(part: MastraMessagePart): string | undefined {
@@ -289,7 +325,8 @@ function partIdentity(part: MastraMessagePart): string {
   else if (part.type === 'file') content = typeof part.data === 'string' ? part.data : undefined;
   // Unary + so a Date, or a string from some storage round trip, compares as a number.
   const stamp = part.createdAt == null ? '' : String(+part.createdAt);
-  return `${part.type}\u0000${content ?? ''}\u0000${providerItemId(part) ?? ''}\u0000${stamp}`;
+  const digest = content === undefined ? '' : contentDigest(part, content);
+  return `${part.type}\u0000${digest}\u0000${providerItemId(part) ?? ''}\u0000${stamp}`;
 }
 
 /**
@@ -1002,10 +1039,13 @@ export class MessageList {
    * iteration, which opens no boundary at all, that is the whole bug: a rejected tool call
    * survives, unexecuted and still carrying its `fc_…` item id.
    *
-   * Where no boundary can be located — a first iteration, which opens none; a sealed message; or
-   * a marker `findBoundaryIndex` cannot resolve — the message is removed whole. That is not a
-   * claim that no accepted step exists, only that this cannot tell where one ends, and it is the
-   * pre-#12799 behaviour, so the fallback is never worse than the path it replaced.
+   * Where no boundary can be located — a first iteration, which opens none; a sealed message; a
+   * marker `findBoundaryIndex` cannot resolve; or a boundary opened on a later message than the one
+   * the step wrote into — the step's content location, when given, says which parts were there
+   * before the step began, and those are kept (PF-5404). Failing that too, the message is removed
+   * whole. That is not a claim that no accepted step exists, only that this cannot tell where one
+   * ends, and it is the pre-#12799 behaviour, so the fallback is never worse than the path it
+   * replaced.
    *
    * Mirrors: `content.content` and `content.toolInvocations` are re-derived below, because
    * `MessageMerger` keeps both in step with the parts as a turn streams. `content.reasoning`
@@ -1020,9 +1060,15 @@ export class MessageList {
    *
    * @param messageId - ID of the message to roll back
    * @param boundary - the marker returned by `openStepBoundary()` for the step being discarded
+   * @param content - the step's open `openStepContent()` location, used when the boundary is not in
+   *   this message: the parts recorded before the step began are kept, the rest rolled back
    * @returns true if a message was found and rolled back or removed
    */
-  public rollbackToStepBoundary(messageId: string, boundary?: MastraStepStartPart): boolean {
+  public rollbackToStepBoundary(
+    messageId: string,
+    boundary?: MastraStepStartPart,
+    content?: StepContentLocation,
+  ): boolean {
     const message = this.messages.find(m => m.id === messageId);
     if (!message) return false;
 
@@ -1032,10 +1078,18 @@ export class MessageList {
       return true;
     }
 
-    // Reference, then timestamp, then give up — see findBoundaryIndex.
-    const boundaryIndex = boundary
+    // Reference, then timestamp — see findBoundaryIndex. Then where the iteration began writing
+    // into this message, when that was recorded: the boundary goes on the last assistant message,
+    // and an iteration can write into an earlier one (a feedback note sits after the message the
+    // answer merges into), so its boundary is not in this message (PF-5404).
+    let boundaryIndex = boundary
       ? findBoundaryIndex(parts, boundary, messageId, this.#boundaryFingerprints.get(boundary))
       : -1;
+    if (boundaryIndex === -1 && content) {
+      boundaryIndex = lastRecordedPartIndex(parts, content.startParts.get(messageId)) + 1;
+      // Nothing recorded before the attempt's parts: the message is all the attempt's.
+      if (boundaryIndex === 0) boundaryIndex = -1;
+    }
 
     // Nowhere to splice: discard the message rather than guess which parts were accepted.
     if (boundaryIndex === -1) {
@@ -2220,10 +2274,48 @@ export class MessageList {
 
   /**
    * Start recording where a loop iteration writes its response. Call it after the iteration has
-   * opened its boundary (`openStepBoundary()`) and before the model streams.
+   * opened its boundary (`openStepBoundary()`) and before the model streams. When input-step
+   * processors run, bracket them with `holdStepContent` and `rebaseStepContent`.
    */
   public openStepContent(): StepContentLocation {
     return { startParts: this.#recordResponseParts() };
+  }
+
+  /**
+   * Call before the iteration's input-step processors run. Returns the parts the iteration has
+   * already written (carried tool work, a failed fallback attempt), for `rebaseStepContent`.
+   */
+  public holdStepContent(location: StepContentLocation): HeldStepContent {
+    const objects: MastraMessagePart[] = [];
+    for (const message of this.response.db()) {
+      const parts = message.content.parts ?? [];
+      const start = lastRecordedPartIndex(parts, location.startParts.get(message.id)) + 1;
+      objects.push(...parts.slice(start));
+    }
+    return { owned: { tokens: objects.map(partIdentity), objects } };
+  }
+
+  /**
+   * Call once the iteration's input-step processors have run, before the model streams. Moves the
+   * start of the iteration's content past whatever the processors left in the response, keeping
+   * the parts `holdStepContent` saw the iteration write. A processor that replaces an earlier part
+   * with a changed copy under the same message id leaves a part that matches nothing recorded at
+   * `openStepContent`; without this it would be read as the iteration's own output (PF-5415).
+   */
+  public rebaseStepContent(location: StepContentLocation, held: HeldStepContent): void {
+    const owned = held.owned;
+    const isOwned = (part: MastraMessagePart) =>
+      owned.objects.includes(part) || (owned.tokens.length > 0 && owned.tokens.includes(partIdentity(part)));
+    const startParts = new Map<string, RecordedParts>();
+    for (const message of this.response.db()) {
+      const objects = (message.content.parts ?? [])
+        .filter(part => !isOwned(part))
+        .map(part => (part.type === 'tool-invocation' ? part : stampPart(part)));
+      // A message the iteration started stays the iteration's.
+      if (objects.length === 0 && !location.startParts.has(message.id)) continue;
+      startParts.set(message.id, { tokens: objects.map(partIdentity), objects });
+    }
+    location.startParts = startParts;
   }
 
   /**
@@ -2239,11 +2331,12 @@ export class MessageList {
    * The content one loop iteration wrote: in each response message, the parts after those that
    * were there when the iteration began, up to those that were there when it ended. Parts are
    * recognised by identity rather than position, so a processor that clones, trims or rewrites
-   * earlier parts does not move the iteration's. A part a processor adds after every recorded part
-   * counts as the iteration's; a part it puts among the recorded ones (a replacement of earlier
-   * narration) stays with the earlier step, so a rewrite of history is never read as this step's
-   * answer. A message a processor re-adds under a new id is new to the list, so all of it is read
-   * as the iteration's.
+   * earlier parts does not move the iteration's. The start is taken after the input-step
+   * processors (`rebaseStepContent`), so whatever they leave in the response is history. A part an
+   * output processor adds after every recorded part counts as the iteration's; a part it puts
+   * among the recorded ones (a replacement of earlier narration) stays with the earlier step, so a
+   * rewrite of history is never read as this step's answer. A message an output processor re-adds
+   * under a new id is new to the list, so all of it is read as the iteration's.
    *
    * `modelContent(stepNumber)` instead counts `step-start` markers, which goes wrong when a
    * processor retry rolls a rejected attempt's marker back and streams the retry into a fresh
