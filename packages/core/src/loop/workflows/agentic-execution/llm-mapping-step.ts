@@ -230,7 +230,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
     } as ChunkType<OUTPUT>);
   }
 
-  return createStep({
+  const mappingStep = createStep({
     id: 'llmExecutionMappingStep',
     inputSchema: z.array(toolCallOutputSchema),
     outputSchema: llmIterationOutputSchema,
@@ -252,16 +252,21 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
         if (!Array.isArray(steps) || steps.length === 0) return;
 
         const latestStep = steps.at(-1);
-        // A rolled-back retry attempt has no parts left in the MessageList.
+        // A rolled-back retry attempt has no parts left to re-extract.
         if (!latestStep || stepWasRolledBack(latestStep)) return;
+        const refreshedContent = readStepContent(
+          rest.messageList,
+          steps,
+          steps.length - 1,
+          readScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent'),
+        );
+        // A list that no longer holds this step's parts (a durable run rebuilds it) must
+        // not wipe the content already captured. Content a processor removed on purpose
+        // is still read as empty from the step's own location.
+        if (!refreshedContent) return;
 
         steps[steps.length - 1] = new DefaultStepResult({
-          content: readStepContent(
-            rest.messageList,
-            steps,
-            steps.length - 1,
-            readScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent'),
-          ),
+          content: refreshedContent,
           finishReason: latestStep.finishReason,
           providerMetadata: latestStep.providerMetadata,
           request: latestStep.request,
@@ -968,4 +973,15 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
       return initialResult;
     },
   });
+
+  return {
+    ...mappingStep,
+    execute: async (params: Parameters<typeof mappingStep.execute>[0]) => {
+      const result = await mappingStep.execute(params);
+      // The iteration has written its tool results; what follows belongs to the next one.
+      const located = readScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent');
+      if (located) rest.messageList.closeStepContent(located.location);
+      return result;
+    },
+  };
 }

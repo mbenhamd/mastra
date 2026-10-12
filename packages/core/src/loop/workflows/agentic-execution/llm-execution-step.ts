@@ -68,6 +68,7 @@ import type {
   ChunkType,
   ExecuteStreamModelManager,
   ModelManagerModelConfig,
+  StepTripwireData,
   StreamChunkType,
   StreamTransport,
   StreamTransportRef,
@@ -119,8 +120,8 @@ import {
   boundResponseRecoveryToolSelection,
   narrowRecoveryToolCeiling,
 } from '../../shared/response-recovery-tool-choice';
-import type { LocatedStepContent } from '../../shared/step-content';
 import { readStepContent, stepWasRolledBack } from '../../shared/step-content';
+import type { LocatedStepContent } from '../../shared/step-content';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../shared/step-content-chunk-types';
 import { TERMINAL_FINISH_REASONS } from '../../shared/terminal-finish-reasons';
 import { isMastraTimeoutError } from '../../timeout';
@@ -1601,10 +1602,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // response when a tool call is followed by text, and nothing stored tells them apart.
       // Undefined on the first iteration, and on any iteration with no open assistant message to
       // append to — both roll the message back whole, which is what the rejection means there.
-      const iterationBoundary = currentIteration > 1 ? messageList.openStepBoundary().boundary : undefined;
-      // With the boundary, these say where this iteration's response will be written; read back
-      // once it has streamed (`locateStepContent`).
-      const responseMessageIdsAtIterationStart = new Set(messageList.get.response.db().map(message => message.id));
+      // A processor retry has just put its feedback signal after the accepted steps' message, so
+      // the boundary goes on that message, ahead of the signal: the retry's fresh message opens
+      // with no marker, and step content is located by counting markers (PF-5364).
+      const iterationBoundary =
+        currentIteration > 1
+          ? messageList.openStepBoundary({ acrossTrailingSignals: inputData.processorRetryFeedback !== undefined })
+              .boundary
+          : undefined;
+      // Where this iteration's response goes; its StepResult content is read from here.
+      const iterationContent = messageList.openStepContent();
 
       try {
         // Open MODEL_STEP before any step-owned processor work. The outer
@@ -1809,8 +1816,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // input-step processors.
         const previousSteps = inputData.output?.steps || [];
         const lastPreviousStep = previousSteps[previousSteps.length - 1];
-        // A processor retry rolled the rejected step's parts back off the list;
-        // there is nothing of it left to re-extract.
+        // A rolled-back retry attempt has no parts left to re-extract.
         if (lastPreviousStep && !stepWasRolledBack(lastPreviousStep)) {
           const refreshedContent = readStepContent(
             messageList,
@@ -1821,7 +1827,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Durable agents deserialize a fresh MessageList per workflow step, so
           // the re-extraction can legitimately come back empty there. Never let
           // that wipe content we already have.
-          if (refreshedContent.length > 0) {
+          if (refreshedContent && refreshedContent.length > 0) {
             previousSteps[previousSteps.length - 1] = new DefaultStepResult({
               content: refreshedContent,
               finishReason: lastPreviousStep.finishReason,
@@ -3515,24 +3521,20 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
 
       const steps = inputData.output?.steps || [];
       // The current result is pushed below, at index `steps.length`. Its content
-      // is read from where this iteration wrote its response, not by counting
-      // step-start markers: a processor retry rolls back the rejected attempt's
-      // marker and streams the retry into a fresh message with none, so a counted
-      // step number lands on the wrong parts (PF-5364). Do not slice the returned
-      // content by `messages.nonUser.length`: that value counts model messages,
-      // while this array contains content parts. Mixing those units can erase the
-      // current step's tool calls (and parallel calls in particular) from the
-      // public StepResult.
-      const currentStepContent: LocatedStepContent = {
-        stepIndex: steps.length,
-        location: messageList.locateStepContent(iterationBoundary, responseMessageIdsAtIterationStart),
-      };
+      // is what this iteration wrote, read from where it wrote it rather than by
+      // counting step-start markers (PF-5364). Do not slice the returned content
+      // by `messages.nonUser.length`: that value counts model messages, while this
+      // array contains content parts. Mixing those units can erase the current
+      // step's tool calls (and parallel calls in particular) from the public
+      // StepResult.
+      const currentStepContent: LocatedStepContent = { stepIndex: steps.length, location: iterationContent };
       writeScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent', currentStepContent);
-      const currentIterationContent = readStepContent(messageList, steps, steps.length, currentStepContent);
+      const currentIterationContent = readStepContent(messageList, steps, steps.length, currentStepContent) ?? [];
 
       // Build tripwire data if this step is being rejected
       // This includes both retry scenarios and max retries exceeded
-      const stepTripwireData = processOutputStepTripwire
+      // `rolledBack` is added below, once the rollback has actually removed the response.
+      const stepTripwireData: StepTripwireData | undefined = processOutputStepTripwire
         ? {
             reason: processOutputStepTripwire.message,
             retry: processOutputStepTripwire.options?.retry,
@@ -3572,7 +3574,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // goes back into the carry buffer for the next attempt to write again rather than
         // disappearing with the rejected response.
         eagerCoordinator?.recarryCommittedWork(outputStream.messageId);
-        messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary);
+        // Only a response that was found and removed counts as rolled back; a rejected response
+        // that stays in the conversation must keep its place when later steps are numbered.
+        if (messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary) && stepTripwireData) {
+          stepTripwireData.rolledBack = true;
+        }
         // A processor retry throws this attempt away like the error paths do, so it gets
         // the same treatment: cancel what is still running, keep what finished.
         //

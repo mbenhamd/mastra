@@ -49,7 +49,7 @@ export const STEP_TOOLS_KEY = createRunScopeKey<ToolSet>('loop:stepTools');
 export const STEP_ACTIVE_TOOLS_KEY = createRunScopeKey<string[]>('loop:stepActiveTools');
 /** Usage of the current model step, for suspension chunks emitted before its step-finish. */
 export const STEP_USAGE_KEY = createRunScopeKey<LanguageModelUsage>('loop:stepUsage');
-/** Where the latest model step wrote its response, so later reads of its content find it again. */
+/** Where the latest model step writes its response, so later reads of its content find it. */
 export const STEP_CONTENT_KEY = createRunScopeKey<LocatedStepContent>('loop:stepContent');
 export const STEP_WORKSPACE_KEY = createRunScopeKey<Workspace>('loop:stepWorkspace');
 export const TOOL_APPROVAL_VERDICTS_KEY =
