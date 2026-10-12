@@ -1440,6 +1440,26 @@ export class HarnessPG extends HarnessStorage {
     return result.rows[0] as Record<string, unknown> | undefined;
   }
 
+  /**
+   * Key-share lock the session row before a message-result row (the order
+   * deleteSessions takes them), or throw `HarnessStorageSessionNotFoundError`
+   * when the session is gone. A concurrent delete then either waits for the
+   * write and erases its row, or commits first and the write is refused, so a
+   * deleted session never regains result content from a late write (PF-5374).
+   * KEY SHARE conflicts with the delete but not with lease renewals or version
+   * writes. Returns undefined: an unfenced write judges no lease.
+   */
+  async #lockLiveSessionTx(tx: PgHarnessClient, harnessName: string, sessionId: string): Promise<undefined> {
+    const live = await tx.execute({
+      sql: `SELECT 1 FROM ${TABLE_HARNESS_SESSIONS}
+            WHERE harness_name = ? AND id = ?
+            FOR KEY SHARE`,
+      args: [harnessName, sessionId],
+    });
+    if (live.rows.length === 0) throw new HarnessStorageSessionNotFoundError(sessionId);
+    return undefined;
+  }
+
   async listRecoverableSessions(input: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
     const { now, limit } = normalizeDispatchRecoveryScanInput(input);
     await this.#ensureMessageResultsTable();
@@ -5113,10 +5133,11 @@ export class HarnessPG extends HarnessStorage {
       // A fenced write takes the session row before the evidence row, the
       // order the recovery settlement uses, and judges the owner after both.
       // A lease that expired untaken still names its owner (as `saveSession`
-      // treats it).
+      // treats it). An unfenced write still runs only while the session
+      // exists (PF-5374).
       const leaseRow =
         options.leaseOwner === undefined
-          ? undefined
+          ? await this.#lockLiveSessionTx(tx, namespacedRecord.harnessName, namespacedRecord.sessionId)
           : await this.#lockSessionLeaseRowTx(tx, namespacedRecord.harnessName, namespacedRecord.sessionId);
       const existing = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
@@ -6439,10 +6460,11 @@ export class HarnessPG extends HarnessStorage {
       // A lease-fenced stamp locks the session row before the evidence row, the
       // order recovery settlement (`compareAndSwapSignalTerminal`) and
       // `commitTerminalHandoff` use, so no other owner can take the lease (and
-      // recover the turn) until the stamp commits.
+      // recover the turn) until the stamp commits. An unfenced stamp still runs
+      // only while the session exists (PF-5374).
       const leaseRow =
         input.leaseOwner === undefined
-          ? undefined
+          ? await this.#lockLiveSessionTx(tx, harnessName, input.sessionId)
           : await this.#lockSessionLeaseRowTx(tx, harnessName, input.sessionId);
       const selected = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
@@ -6539,9 +6561,11 @@ export class HarnessPG extends HarnessStorage {
     try {
       // A recovery settlement also requires the lease. The session row is
       // locked before the evidence row, the order `commitTerminalHandoff` uses.
+      // An unfenced settlement still runs only while the session exists
+      // (PF-5374).
       const leaseRow =
         input.leaseOwner === undefined
-          ? undefined
+          ? await this.#lockLiveSessionTx(tx, harnessName, input.sessionId)
           : await this.#lockSessionLeaseRowTx(tx, harnessName, input.sessionId);
       const selected = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,

@@ -1577,6 +1577,40 @@ describe('Session.signal() admissionId', () => {
     expect((outcome as { error: unknown }).error).toBeInstanceOf(HarnessMessageResultErasedError);
   }, 30_000);
 
+  it('rejects a settlement whose durable winner a session delete erased instead of resolving it empty (PF-5374)', async () => {
+    const { harness } = setupHarness();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // The local run finished, but its terminal swap lost to a durable winner
+    // that another instance committed before deleting the session.
+    const now = Date.now();
+    const settled = (
+      session as unknown as {
+        _adoptSignalSettlement: (
+          signalId: string,
+          evidence: unknown,
+          local: { status: 'completed'; result: unknown },
+        ) => Promise<unknown>;
+      }
+    )._adoptSignalSettlement(
+      'signal-adopt-erased',
+      {
+        status: 'completed',
+        erased: true,
+        result: undefined,
+        harnessName: session.getRecord().harnessName,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        signalId: 'signal-adopt-erased',
+        runId: 'run-adopt-erased',
+        createdAt: now,
+        updatedAt: now,
+      },
+      { status: 'completed', result: { text: 'local answer' } },
+    );
+    await expect(settled).rejects.toBeInstanceOf(HarnessMessageResultErasedError);
+  });
+
   it('keeps an admitted suspended signal pending across restart and settles it on resume', async () => {
     const first = setupHarness();
     first.agent.enqueueRun({

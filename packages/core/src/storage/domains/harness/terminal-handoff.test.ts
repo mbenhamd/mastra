@@ -3,8 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { projectHarnessPublicError } from '../../../harness/v1/events';
 import { InMemoryDB } from '../inmemory-db';
 import {
+  HARNESS_TERMINAL_ERROR_MESSAGE_NOT_RETAINED,
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionClosedError,
+  HarnessStorageSessionNotFoundError,
   HarnessTerminalHandoffClaimConflictError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
@@ -12,6 +14,7 @@ import {
   HarnessTerminalHandoffValidationError,
   HarnessTerminalFinalizationPendingError,
   InMemoryHarness,
+  canonicalHarnessTerminalResult,
   harnessTerminalAdmissionId,
   harnessTerminalIntentId,
   type AgentSignalResultEvidence,
@@ -1073,8 +1076,127 @@ describe('native chat terminal handoff', () => {
     expect(JSON.stringify([...db.harnessTerminalTombstones.values()])).not.toContain('private revoke note');
   });
 
+  it('refuses late message-result writes for a deleted session (PF-5374)', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    // A pending row the session wrote under another thread scope survives the
+    // delete (the delete removes only the current scope's uncommitted rows).
+    const retained = { ...pendingEvidence(admission()), threadId: 'thread-other', signalId: 'signal-other' };
+    await storage.writeMessageResultEvidence(retained);
+    await storage.deleteSession({ harnessName: 'default', sessionId: 'session-1', ifVersion: 1 });
+    const load = (row: AgentSignalResultEvidence) =>
+      storage.loadMessageResultEvidence({
+        harnessName: row.harnessName,
+        sessionId: row.sessionId,
+        resourceId: row.resourceId,
+        threadId: row.threadId,
+        signalId: row.signalId,
+      });
+    await expect(load(retained)).resolves.toMatchObject({ status: 'pending' });
+
+    // Completing the kept row with content is refused...
+    await expect(
+      storage.writeMessageResultEvidence({
+        ...retained,
+        status: 'completed',
+        result: { text: 'late provider output' },
+        updatedAt: 3_000,
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      storage.compareAndSwapSignalTerminal({
+        harnessName: retained.harnessName,
+        sessionId: retained.sessionId,
+        resourceId: retained.resourceId,
+        threadId: retained.threadId,
+        signalId: retained.signalId,
+        admissionId: retained.admissionId!,
+        admissionHash: retained.admissionHash!,
+        operationKind: 'message',
+        expected: { state: 'reserved' },
+        terminal: {
+          status: 'completed',
+          signalId: retained.signalId,
+          runId: retained.runId!,
+          result: { text: 'late provider output' },
+        },
+        updatedAt: 3_000,
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      storage.compareAndSwapSignalDispatch({
+        harnessName: retained.harnessName,
+        sessionId: retained.sessionId,
+        resourceId: retained.resourceId,
+        threadId: retained.threadId,
+        signalId: retained.signalId,
+        admissionId: retained.admissionId!,
+        admissionHash: retained.admissionHash!,
+        operationKind: 'message',
+        expected: { state: 'reserved' },
+        next: {
+          state: 'dispatching',
+          attemptId: 'late-attempt',
+          claimExpiresAt: 10_000,
+          delivery: 'idle',
+          runId: retained.runId!,
+        },
+        updatedAt: 3_000,
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    // ...and so is a fresh row.
+    const fresh = { ...pendingEvidence(admission()), signalId: 'signal-fresh' };
+    await expect(storage.writeMessageResultEvidence(fresh)).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+
+    await expect(load(retained)).resolves.toMatchObject({ status: 'pending' });
+    await expect(load(fresh)).resolves.toBeNull();
+    expect(JSON.stringify([...db.harnessMessageResultEvidence.values()])).not.toContain('late provider output');
+  });
+
+  it("erases a failed terminal's error message and keeps the result valid (PF-5374)", async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    const error = { code: 'provider_failed', message: 'private provider error' };
+    const committed = await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: { ...pendingEvidence(input), status: 'failed', error, updatedAt: 3_000 },
+      terminalResult: { status: 'failed', runId: input.runId, completedAt: 3_000, error },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} },
+    });
+    expect(committed.status).toBe('committed');
+
+    await storage.deleteSession({ harnessName: 'default', sessionId: 'session-1', ifVersion: 1 });
+
+    const keptAdmission = await storage.loadTerminalAdmission({
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      admissionId: input.admissionId,
+      executionGrant: input.executionGrant,
+    });
+    const keptIntent = await storage.loadTerminalIntent({
+      harnessName: input.harnessName,
+      intentId: committed.intent!.id,
+    });
+    // The code stays, the message does not.
+    const redacted = { code: 'provider_failed', message: HARNESS_TERMINAL_ERROR_MESSAGE_NOT_RETAINED };
+    expect(keptAdmission?.terminalResult?.error).toEqual(redacted);
+    expect(keptIntent?.terminalResult.error).toEqual(redacted);
+    expect(
+      JSON.stringify([...db.harnessTerminalAdmissions.values(), ...db.harnessTerminalIntents.values()]),
+    ).not.toContain('private provider error');
+    // The redacted result is still a valid terminal result.
+    expect(() => canonicalHarnessTerminalResult(keptIntent!.terminalResult)).not.toThrow();
+    expect(() => canonicalHarnessTerminalResult(keptAdmission!.terminalResult!)).not.toThrow();
+  });
+
   it('round-trips the erased marker of a completed message result (PF-5309)', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
     const input = admission();
     await storage.writeMessageResultEvidence({
       ...pendingEvidence(input),

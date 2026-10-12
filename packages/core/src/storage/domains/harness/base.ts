@@ -1321,6 +1321,16 @@ export abstract class HarnessStorage extends StorageDomain {
     signalId: string;
   }): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null>;
 
+  /**
+   * Message-result writes (this, `compareAndSwapSignalDispatch` and
+   * `compareAndSwapSignalTerminal`) land only while the session exists: the
+   * adapter checks the session atomically with the write and otherwise throws
+   * `HarnessStorageSessionNotFoundError` and writes nothing. A delete either
+   * waits for an in-flight write and then erases its content, or commits first
+   * and refuses the write, so a deleted session never regains result content
+   * or a fresh result row from a late write (PF-5374). A write with
+   * `leaseOwner` is already refused for a missing session by its lease fence.
+   */
   abstract writeMessageResultEvidence(
     record: AgentSignalResultEvidence,
     options?: WriteMessageResultEvidenceOptions,

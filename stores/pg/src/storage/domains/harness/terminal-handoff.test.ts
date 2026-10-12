@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
+  HARNESS_TERMINAL_ERROR_MESSAGE_NOT_RETAINED,
+  HarnessStorageSessionNotFoundError,
   HarnessTerminalHandoffClaimConflictError,
   HarnessTerminalHandoffFencedError,
   HarnessTerminalHandoffIdentityConflictError,
@@ -14,6 +16,7 @@ import {
   TABLE_HARNESS_TERMINAL_ADMISSIONS,
   TABLE_HARNESS_TERMINAL_INTENTS,
   TABLE_HARNESS_TERMINAL_TOMBSTONES,
+  canonicalHarnessTerminalResult,
   harnessTerminalAdmissionId,
   harnessTerminalIntentId,
   type AgentSignalResultEvidence,
@@ -1530,6 +1533,178 @@ describe('HarnessPG native terminal handoff', () => {
       expect(left).toContain(committed.intent!.projection.payloadHash);
       if (mode === 'nul-error') expect(left).toContain('provider.error');
     }
+  });
+
+  it('refuses late message-result writes for a deleted session (PF-5374)', async () => {
+    const session = await createNativeSession(harness(), 'session-late-write');
+    // A pending row the session wrote under another thread scope survives the
+    // delete (the delete removes only the current scope's uncommitted rows).
+    const retained = {
+      ...pendingEvidence(admissionFor(session, 'late-write')),
+      threadId: 'thread-late-write-other',
+    };
+    await harness().writeMessageResultEvidence(retained);
+    await harness().deleteSession({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      ifVersion: session.version,
+      expectedResourceId: session.resourceId,
+      expectedThreadId: session.threadId,
+      expectedCreatedAt: session.createdAt,
+    });
+    const load = (row: AgentSignalResultEvidence) =>
+      harness().loadMessageResultEvidence({
+        harnessName: HARNESS,
+        sessionId: row.sessionId,
+        resourceId: row.resourceId,
+        threadId: row.threadId,
+        signalId: row.signalId,
+      });
+    await expect(load(retained)).resolves.toMatchObject({ status: 'pending' });
+    const swap = {
+      harnessName: HARNESS,
+      sessionId: retained.sessionId,
+      resourceId: retained.resourceId,
+      threadId: retained.threadId,
+      signalId: retained.signalId,
+      admissionId: retained.admissionId!,
+      admissionHash: retained.admissionHash!,
+      operationKind: 'message' as const,
+      expected: { state: 'reserved' as const },
+      updatedAt: Date.now(),
+    };
+
+    // Completing the kept row with content is refused...
+    await expect(
+      harness().writeMessageResultEvidence({
+        ...retained,
+        status: 'completed',
+        result: { text: 'late provider output' },
+        updatedAt: Date.now(),
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness().compareAndSwapSignalTerminal({
+        ...swap,
+        terminal: {
+          status: 'completed',
+          signalId: retained.signalId,
+          runId: retained.runId!,
+          result: { text: 'late provider output' },
+        },
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    await expect(
+      harness().compareAndSwapSignalDispatch({
+        ...swap,
+        next: {
+          state: 'dispatching',
+          attemptId: 'late-attempt',
+          claimExpiresAt: Date.now() + 60_000,
+          delivery: 'idle',
+          runId: retained.runId!,
+        },
+      }),
+    ).rejects.toBeInstanceOf(HarnessStorageSessionNotFoundError);
+    // ...and so is a fresh row.
+    const fresh = pendingEvidence(admissionFor(session, 'late-write-fresh'));
+    await expect(harness().writeMessageResultEvidence(fresh)).rejects.toBeInstanceOf(
+      HarnessStorageSessionNotFoundError,
+    );
+
+    const kept = await load(retained);
+    expect(kept).toMatchObject({ status: 'pending' });
+    expect(kept).not.toHaveProperty('dispatch');
+    await expect(load(fresh)).resolves.toBeNull();
+    const rows = await store.db.any(
+      `SELECT result, error FROM "${schemaName}"."mastra_harness_message_results" WHERE session_id = $1`,
+      [session.id],
+    );
+    expect(JSON.stringify(rows)).not.toContain('late provider output');
+  });
+
+  it("erases a failed terminal's error message and its delivery error, keeping the result valid (PF-5374)", async () => {
+    const session = await createNativeSession(harness(), 'session-failed-erase');
+    const input = admissionFor(session, 'failed-erase');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    const error = { code: 'provider_failed', message: 'private provider error' };
+    const committed = await harness().commitTerminalHandoff({
+      admission: input,
+      resultEvidence: { ...pendingEvidence(input), status: 'failed', error, updatedAt: Date.now() },
+      terminalResult: { status: 'failed', runId: input.runId, completedAt: Date.now(), error },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-failed-erase', payload: {} },
+    });
+    expect(committed.status).toBe('committed');
+    // A delivery attempt failed with its own private error.
+    const claimed = await claimFirst(harness(), 'delivery-worker-1', Date.now());
+    await harness().failTerminalIntent({
+      ...claimIdentityOf(claimed, 'delivery-worker-1'),
+      error: { code: 'delivery_failed', message: 'private delivery error' },
+      now: Date.now(),
+    });
+    const stored = async () =>
+      store.db.many<{ terminal_result_json: string; last_error_json: string | null }>(
+        `SELECT terminal_result_json, NULL AS last_error_json
+           FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_ADMISSIONS}" WHERE session_id = $1
+         UNION ALL
+         SELECT terminal_result_json, last_error_json
+           FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" WHERE session_id = $1`,
+        [session.id],
+      );
+    expect(JSON.stringify(await stored())).toContain('private delivery error');
+
+    await harness().deleteSession({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      ifVersion: session.version,
+      expectedResourceId: session.resourceId,
+      expectedThreadId: session.threadId,
+      expectedCreatedAt: session.createdAt,
+    });
+
+    const rows = await stored();
+    expect(rows).toHaveLength(2);
+    expect(JSON.stringify(rows)).not.toContain('private');
+    for (const row of rows) {
+      expect(row.last_error_json).toBeNull();
+      const result = JSON.parse(row.terminal_result_json);
+      // The code stays, the message does not, and the result stays valid.
+      expect(result.error).toEqual({ code: 'provider_failed', message: HARNESS_TERMINAL_ERROR_MESSAGE_NOT_RETAINED });
+      expect(() => canonicalHarnessTerminalResult(result)).not.toThrow();
+    }
+  });
+
+  it("deletes a session whose intent stores a literal 'null' terminal result (PF-5374)", async () => {
+    const session = await createNativeSession(harness(), 'session-null-result');
+    const input = admissionFor(session, 'null-result');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    expect((await harness().commitTerminalHandoff(commitInput(input, 'null-result'))).status).toBe('committed');
+    // Written by an unreleased build, or outside the API.
+    await store.db.none(
+      `UPDATE "${schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}"
+          SET terminal_result_json = 'null', projection_json = 'null'
+        WHERE session_id = $1`,
+      [session.id],
+    );
+
+    await expect(
+      harness().deleteSession({
+        harnessName: HARNESS,
+        sessionId: session.id,
+        ifVersion: session.version,
+        expectedResourceId: session.resourceId,
+        expectedThreadId: session.threadId,
+        expectedCreatedAt: session.createdAt,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(harness().loadSession({ harnessName: HARNESS, sessionId: session.id })).resolves.toBeNull();
+    const intents = await store.db.many<{ terminal_result_json: string; status: string }>(
+      `SELECT terminal_result_json, status FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_INTENTS}" WHERE session_id = $1`,
+      [session.id],
+    );
+    expect(intents).toEqual([{ terminal_result_json: 'null', status: 'fenced' }]);
   });
 
   it("erases a deleted session id's results kept under another thread scope (PF-5309)", async () => {

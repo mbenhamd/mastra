@@ -4653,14 +4653,19 @@ describe('Harness v1 — delete lifecycle', () => {
       override async writeMessageResultEvidence(
         record: Parameters<InMemoryHarness['writeMessageResultEvidence']>[0],
       ): Promise<{ created: boolean; applied: boolean }> {
-        if (!this.gated && record.status === 'pending') {
-          this.gated = true;
-          this.gatedSignalId = record.signalId;
-          this.start();
-          await this.gate;
-        }
+        // The reservation lands, then its acknowledgement is held until the
+        // delete runs: storage refuses a write that would land after the
+        // delete (PF-5374), so the race is on the reply, not the write.
+        const gate = !this.gated && record.status === 'pending';
         try {
-          return await super.writeMessageResultEvidence(record);
+          const written = await super.writeMessageResultEvidence(record);
+          if (gate) {
+            this.gated = true;
+            this.gatedSignalId = record.signalId;
+            this.start();
+            await this.gate;
+          }
+          return written;
         } finally {
           if (record.signalId === this.gatedSignalId) this.finish();
         }

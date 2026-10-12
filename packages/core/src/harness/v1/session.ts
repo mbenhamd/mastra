@@ -76,6 +76,7 @@ import {
   HarnessStorageLeaseConflictError,
   HarnessStorageSessionClosedError,
   HarnessStorageSessionEventReplayUnsupportedError,
+  HarnessStorageSessionNotFoundError,
   HarnessStorageVersionConflictError,
   HarnessTerminalHandoffError,
   HarnessTerminalHandoffCancelledError,
@@ -11474,6 +11475,11 @@ export class Session {
       await this._cleanupOperationEvidenceIfDeleted(status);
       return result.created ? { created: true, applied: result.applied, evidence } : result;
     } catch (err) {
+      // The session row is gone: a delete (here or in another process) won,
+      // and storage refused the late write (PF-5374).
+      if (err instanceof HarnessStorageSessionNotFoundError) {
+        throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
+      }
       if (err instanceof HarnessStorageAdmissionConflictError && status.admissionId && status.admissionHash) {
         const duplicate = await this._resolveMessageAdmissionDuplicate({
           admissionId: status.admissionId,

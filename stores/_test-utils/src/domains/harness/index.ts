@@ -1616,6 +1616,8 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
 
       it('writes retained message result evidence and resolves duplicate/conflict attempts', async () => {
         if (!harness) return;
+        // Result evidence is written only while its session exists (PF-5374).
+        await harness.saveSession(createSampleSessionRecord(), { ownerId: 'evidence-owner', ifVersion: 0 });
         await harness.writeMessageResultEvidence({
           harnessName: 'default',
           sessionId: 'session-1',
@@ -1663,6 +1665,8 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
 
       it('compacts terminal message evidence into tombstones', async () => {
         if (!harness) return;
+        // Result evidence is written only while its session exists (PF-5374).
+        await harness.saveSession(createSampleSessionRecord(), { ownerId: 'evidence-owner', ifVersion: 0 });
         await harness.writeMessageResultEvidence({
           harnessName: 'default',
           sessionId: 'session-1',
@@ -1706,6 +1710,8 @@ export function createHarnessTest({ storage }: HarnessTestOptions) {
 
       it('scopes operation evidence deletion by thread and signal when provided', async () => {
         if (!harness) return;
+        // Result evidence is written only while its session exists (PF-5374).
+        await harness.saveSession(createSampleSessionRecord(), { ownerId: 'evidence-owner', ifVersion: 0 });
         const base = {
           harnessName: 'default',
           sessionId: 'session-1',

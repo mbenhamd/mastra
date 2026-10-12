@@ -2433,6 +2433,20 @@ export interface ObservationalMemorySourceWriteSuccessor {
   successorRecordId: string;
 }
 
+/**
+ * @internal Ownership fence for an authoritative transcript deletion
+ * (PF-5373). The deletion, with its observational-memory retraction, applies
+ * only while `ownerId` holds an unexpired lease on the Harness session
+ * `(harnessName, sessionId)` kept in the same store, judged inside the
+ * deletion's own transaction. A caller that lost the session to another owner
+ * is refused before anything is deleted or retracted.
+ */
+export interface MessageDeletionSessionLeaseFence {
+  harnessName: string;
+  sessionId: string;
+  ownerId: string;
+}
+
 export interface RetractObservationalMemoryInput {
   resourceId: string;
   threadId: string;

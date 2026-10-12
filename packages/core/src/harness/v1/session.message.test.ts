@@ -958,6 +958,71 @@ describe('Session.message() — default path', () => {
     expect(receipts).toEqual(['duplicate']);
   });
 
+  it('replays the receipt, then rejects typed, when the result a waiting retry polls for is erased mid-wait (PF-5374)', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({
+      db,
+      terminalHandoff: { enabled: true },
+      sessionRecordProjection: { enabled: true },
+    });
+    const { harness } = setupHarness({
+      agents: { default: new MockAgent({ id: 'default', defaultOutput: { text: 'done' } }) },
+      sessions: {
+        storage,
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({ projectionKind: 'chat.summary', projectionId: 'response-1', payload: {} }),
+          },
+        },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const opts = {
+      content: 'once',
+      admissionId: 'erased-wait-admission',
+      executionAuthorityGrant: { key: 'usage-claim-erased-wait', generation: 1 },
+      terminalAdmissionSeed: { v: 1 },
+    } as const;
+    await session.message({ ...opts });
+    // The retry finds the turn still pending and no live run in this process
+    // (another instance runs it), so it polls the durable row.
+    const rows = [...db.harnessMessageResultEvidence.values()].filter(
+      evidence => evidence.sessionId === session.id && evidence.status === 'completed',
+    );
+    expect(rows).toHaveLength(1);
+    const row = rows[0]! as unknown as Record<string, unknown>;
+    const completed = { ...row };
+    Object.assign(row, { status: 'pending' });
+    delete row.result;
+    (session as unknown as { _completedRuns: Map<string, unknown> })._completedRuns.clear();
+    const waiter = vi.spyOn(
+      session as unknown as { _awaitDurableMessageResult: () => unknown },
+      '_awaitDurableMessageResult',
+    );
+
+    const receipts: string[] = [];
+    const retry = session.message({ ...opts, onTerminalCommit: receipt => receipts.push(receipt.status) }).then(
+      value => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.waitFor(() => expect(waiter).toHaveBeenCalled(), { timeout: 5000 });
+    // The other instance completes the turn and deletes the session: the row
+    // is completed again, with its result erased. (The retry's reservation
+    // rewrote the stored row, so it is looked up again.)
+    const live = [...db.harnessMessageResultEvidence.values()].find(
+      evidence => evidence.signalId === completed.signalId,
+    ) as unknown as Record<string, unknown>;
+    Object.assign(live, { ...completed, result: undefined, erased: true, updatedAt: Date.now() });
+
+    const outcome = await retry;
+    expect(outcome).not.toHaveProperty('value');
+    expect((outcome as { error: unknown }).error).toBeInstanceOf(HarnessMessageResultErasedError);
+    // The committed receipt still reaches the retry's observer.
+    expect(receipts).toEqual(['duplicate']);
+  }, 30_000);
+
   it('replays the receipt, then rejects typed, for a stream retry whose result a session delete erased (PF-5309)', async () => {
     const db = new InMemoryDB();
     const storage = new InMemoryHarness({

@@ -34,6 +34,9 @@ import {
   WorkingMemoryValidationError,
   assertObservationalMemoryClearExpectation,
   ObservationalMemorySourceWriteConflictError,
+  HarnessStorageLeaseConflictError,
+  HarnessStorageSessionClosedError,
+  TABLE_HARNESS_SESSIONS,
 } from '@mastra/core/storage';
 
 /**
@@ -156,6 +159,7 @@ import type {
   CreateReflectionGenerationInput,
   ObservationalMemoryWriteGuard,
   ObservationalMemorySourceWriteGuard,
+  MessageDeletionSessionLeaseFence,
   ObservationalMemoryRetractionReceipt,
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
@@ -447,6 +451,7 @@ export class MemoryPG extends MemoryStorage {
   readonly supportsObservationalMemory = true;
   readonly supportsObservationalMemorySourceWriteGuards = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
+  readonly supportsSessionLeaseFencedMessageDeletion = true;
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
   readonly supportsAtomicThreadCloneRollback = true;
@@ -2617,6 +2622,7 @@ export class MemoryPG extends MemoryStorage {
       retractObservationalMemory?: boolean;
       managedWorkingMemoryScope?: 'thread' | 'resource';
       observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+      sessionLeaseFence?: MessageDeletionSessionLeaseFence;
     },
   ): Promise<void> {
     if (!messageIds || messageIds.length === 0) {
@@ -2629,6 +2635,14 @@ export class MemoryPG extends MemoryStorage {
       const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
 
       await this.#db.client.tx(async t => {
+        // PF-5373: the Harness session row is share-locked first (before any
+        // memory row), so its lease cannot move to another owner until this
+        // deletion commits, and the lease is judged again right before the
+        // first destructive write.
+        const assertHoldsSessionLease = options?.sessionLeaseFence
+          ? await this.lockSessionLeaseFence(t, options.sessionLeaseFence)
+          : () => {};
+        assertHoldsSessionLease();
         const placeholders = messageIds.map((_, idx) => `$${idx + 1}`).join(',');
         const coordinateQuery = `SELECT
              messages.id,
@@ -2660,6 +2674,7 @@ export class MemoryPG extends MemoryStorage {
           throw new MessageMutationConflictError(messageIds[0]!);
         }
 
+        assertHoldsSessionLease();
         if (options?.retractObservationalMemory) {
           committedRetractions.push(
             ...(await this.retractObservationalMemoryForMessageRowsInTransaction(
@@ -2702,6 +2717,9 @@ export class MemoryPG extends MemoryStorage {
       });
       options?.observationalMemoryRetractions?.push(...committedRetractions);
     } catch (error) {
+      if (error instanceof HarnessStorageLeaseConflictError || error instanceof HarnessStorageSessionClosedError) {
+        throw error;
+      }
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'DELETE_MESSAGES', 'FAILED'),
@@ -4022,6 +4040,33 @@ export class MemoryPG extends MemoryStorage {
    * The advisory key predates its broader ownership role, so it intentionally
    * retains the `thread-clone` prefix for cross-version serialization.
    */
+  /**
+   * PF-5373: share-lock the Harness session row of a lease-fenced deletion
+   * and return its judge. The deletion's owner must hold an unexpired lease
+   * (by the clock leases are stamped with) on an open session; otherwise the
+   * judge throws and the transaction rolls back with nothing deleted. The
+   * share lock keeps another owner from taking the lease until commit.
+   */
+  private async lockSessionLeaseFence(t: TxClient, fence: MessageDeletionSessionLeaseFence): Promise<() => void> {
+    const sessionTableName = getTableName({
+      indexName: TABLE_HARNESS_SESSIONS,
+      schemaName: getSchemaName(this.#schema),
+    });
+    const row = await t.oneOrNone<{ owner_id: string | null; lease_expires_at: unknown; closed_at: unknown }>(
+      `SELECT owner_id, lease_expires_at, closed_at FROM ${sessionTableName}
+       WHERE harness_name = $1 AND id = $2
+       FOR SHARE`,
+      [fence.harnessName, fence.sessionId],
+    );
+    return () => {
+      if (row && row.closed_at != null) throw new HarnessStorageSessionClosedError(fence.sessionId);
+      const expiresAt = row?.lease_expires_at == null ? 0 : Number(row.lease_expires_at);
+      if (!row || row.owner_id !== fence.ownerId || expiresAt <= Date.now()) {
+        throw new HarnessStorageLeaseConflictError(fence.sessionId, row?.owner_id ?? '', expiresAt);
+      }
+    };
+  }
+
   private async lockThreadLifecycles(t: TxClient, threadIds: Iterable<string>): Promise<void> {
     for (const threadId of sortedUniqueStrings(threadIds)) {
       await this.lockThreadCloneLifecycle(t, threadId);

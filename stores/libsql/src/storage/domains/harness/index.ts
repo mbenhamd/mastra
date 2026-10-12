@@ -1733,7 +1733,8 @@ export class HarnessLibSQL extends HarnessStorage {
       sql: `INSERT INTO ${TABLE_HARNESS_MESSAGE_RESULTS}
             (id, harness_name, session_id, resource_id, thread_id, signal_id, run_id, mode_id, model_id,
              admission_id, admission_hash, operation_kind, status, dispatch, result, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE EXISTS (SELECT 1 FROM ${TABLE_HARNESS_SESSIONS} WHERE harness_name = ? AND id = ?)
             ON CONFLICT(id) DO NOTHING`,
       args: [
         id,
@@ -1758,9 +1759,12 @@ export class HarnessLibSQL extends HarnessStorage {
         messageEvidenceErrorColumn(namespacedRecord),
         namespacedRecord.createdAt,
         namespacedRecord.updatedAt,
+        namespacedRecord.harnessName,
+        namespacedRecord.sessionId,
       ],
     });
     if (inserted.rowsAffected > 0) return { created: true, applied: true };
+    await this.#assertSessionExists(namespacedRecord.harnessName, namespacedRecord.sessionId);
 
     const current = await loadCurrent();
     if (!current || !sameMessageEvidenceIdentity(current, namespacedRecord)) {
@@ -1798,7 +1802,8 @@ export class HarnessLibSQL extends HarnessStorage {
     const update = await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
             SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = ?, status = ?, dispatch = ?, result = ?, error = ?, updated_at = ?
-            WHERE id = ? AND status = 'pending' AND operation_kind IS ? AND dispatch IS ? AND run_id IS ?`,
+            WHERE id = ? AND status = 'pending' AND operation_kind IS ? AND dispatch IS ? AND run_id IS ?
+              AND EXISTS (SELECT 1 FROM ${TABLE_HARNESS_SESSIONS} WHERE harness_name = ? AND id = ?)`,
       args: [
         namespacedRecord.runId ?? null,
         updated.modeId ?? null,
@@ -1817,9 +1822,12 @@ export class HarnessLibSQL extends HarnessStorage {
         current.operationKind ?? null,
         current.dispatch === undefined ? null : JSON.stringify(current.dispatch),
         current.runId ?? null,
+        namespacedRecord.harnessName,
+        namespacedRecord.sessionId,
       ],
     });
     if (update.rowsAffected > 0) return { created: false, applied: true, evidence: updated };
+    await this.#assertSessionExists(namespacedRecord.harnessName, namespacedRecord.sessionId);
     const winner = await loadCurrent();
     if (winner && sameMessageEvidenceIdentity(winner, namespacedRecord)) {
       return { created: false, applied: false, evidence: winner };
@@ -1874,7 +1882,8 @@ export class HarnessLibSQL extends HarnessStorage {
             SET run_id = ?, operation_kind = ?, dispatch = ?, updated_at = ?
             WHERE id = ? AND status = 'pending'
               AND operation_kind IS ?
-              AND ((${expectedDispatch.sql})${legacyExpected ? ' OR (dispatch IS NULL AND run_id IS ?)' : ''})`,
+              AND ((${expectedDispatch.sql})${legacyExpected ? ' OR (dispatch IS NULL AND run_id IS ?)' : ''})
+              AND EXISTS (SELECT 1 FROM ${TABLE_HARNESS_SESSIONS} WHERE harness_name = ? AND id = ?)`,
       args: [
         input.next.state === 'reserved' ? null : input.next.runId,
         operationKind,
@@ -1884,8 +1893,11 @@ export class HarnessLibSQL extends HarnessStorage {
         current.operationKind ?? null,
         ...expectedDispatch.args,
         ...(legacyExpected ? [current.runId ?? null] : []),
+        harnessName,
+        input.sessionId,
       ],
     });
+    if (update.rowsAffected === 0) await this.#assertSessionExists(harnessName, input.sessionId);
     const winner = await this.loadMessageResultEvidence({
       harnessName,
       sessionId: input.sessionId,
@@ -1948,7 +1960,8 @@ export class HarnessLibSQL extends HarnessStorage {
             SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = 'signal', status = ?, result = ?, error = ?, updated_at = ?
             WHERE id = ? AND status = 'pending'
               AND operation_kind IS ?
-              AND ((${expectedDispatch.sql})${legacyExpected ? ' OR (dispatch IS NULL AND run_id IS ?)' : ''})`,
+              AND ((${expectedDispatch.sql})${legacyExpected ? ' OR (dispatch IS NULL AND run_id IS ?)' : ''})
+              AND EXISTS (SELECT 1 FROM ${TABLE_HARNESS_SESSIONS} WHERE harness_name = ? AND id = ?)`,
       args: [
         input.expected.runId,
         terminal.modeId ?? current.modeId ?? null,
@@ -1961,8 +1974,11 @@ export class HarnessLibSQL extends HarnessStorage {
         current.operationKind ?? null,
         ...expectedDispatch.args,
         ...(legacyExpected ? [current.runId ?? null] : []),
+        harnessName,
+        input.sessionId,
       ],
     });
+    if (update.rowsAffected === 0) await this.#assertSessionExists(harnessName, input.sessionId);
     const winner = await this.loadMessageResultEvidence({
       harnessName,
       sessionId: input.sessionId,
@@ -3425,6 +3441,21 @@ export class HarnessLibSQL extends HarnessStorage {
   // -------------------------------------------------------------------------
   // Channel inbox ledger
   // -------------------------------------------------------------------------
+
+  /**
+   * Message-result writes run only while their session exists (PF-5374): each
+   * write statement carries the session check itself (one atomic statement,
+   * so concurrent writers keep serializing on the connection), and a write
+   * that changed nothing reports a missing session as
+   * HarnessStorageSessionNotFoundError rather than as a lost race.
+   */
+  async #assertSessionExists(namespace: string, sessionId: string): Promise<void> {
+    const live = await this.#client.execute({
+      sql: `SELECT 1 FROM ${TABLE_HARNESS_SESSIONS} WHERE harness_name = ? AND id = ? LIMIT 1`,
+      args: [namespace, sessionId],
+    });
+    if (live.rows.length === 0) throw new HarnessStorageSessionNotFoundError(sessionId);
+  }
 
   /**
    * Runs a channel or wakeup ledger write while every session it names

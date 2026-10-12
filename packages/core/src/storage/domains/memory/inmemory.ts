@@ -32,6 +32,7 @@ import type {
   ObservationalMemoryWriteGuard,
   ObservationalMemorySourceWriteGuard,
   ObservationalMemorySourceWriteSuccessor,
+  MessageDeletionSessionLeaseFence,
   ObservationalMemoryRetractionReceipt,
   RetractObservationalMemoryInput,
   RetractObservationalMemoryResult,
@@ -52,6 +53,8 @@ import {
   storageMessageMatchesMetadataFilter,
   validateStorageMetadataFilter,
 } from '../../utils';
+import { HarnessStorageLeaseConflictError, HarnessStorageSessionClosedError } from '../harness/base';
+import { inMemoryHarnessSessionKey } from '../inmemory-db';
 import type { InMemoryDB } from '../inmemory-db';
 import {
   assertObservationalMemoryClearExpectation,
@@ -345,6 +348,7 @@ export class InMemoryMemory extends MemoryStorage {
   readonly supportsObservationalMemory = true;
   readonly supportsObservationalMemorySourceWriteGuards = true;
   readonly supportsAtomicObservationalMemoryRetraction = true;
+  readonly supportsSessionLeaseFencedMessageDeletion = true;
   readonly supportsRevisionedWorkingMemory = true;
   readonly supportsThreadUpdatedBeforeFilter = true;
   readonly supportsAtomicThreadCloneRollback = true;
@@ -1043,11 +1047,14 @@ export class InMemoryMemory extends MemoryStorage {
       retractObservationalMemory?: boolean;
       managedWorkingMemoryScope?: 'thread' | 'resource';
       observationalMemoryRetractions?: ObservationalMemoryRetractionReceipt[];
+      sessionLeaseFence?: MessageDeletionSessionLeaseFence;
     },
   ): Promise<void> {
     if (!messageIds || messageIds.length === 0) {
       return;
     }
+    // PF-5373: judged in the same synchronous section as the deletion.
+    if (options?.sessionLeaseFence) this.assertHoldsSessionLease(options.sessionLeaseFence);
 
     const committedRetractions: ObservationalMemoryRetractionReceipt[] = [];
     this.withMemoryStateRollback(options?.retractObservationalMemory === true, () => {
@@ -1104,6 +1111,23 @@ export class InMemoryMemory extends MemoryStorage {
       }
     });
     options?.observationalMemoryRetractions?.push(...committedRetractions);
+  }
+
+  /**
+   * The deletion's owner must still hold an unexpired lease on the Harness
+   * session kept in this db (PF-5373). A closed session has no lease holder.
+   */
+  private assertHoldsSessionLease(fence: MessageDeletionSessionLeaseFence): void {
+    const session = this.db.harnessSessions.get(inMemoryHarnessSessionKey(fence.harnessName, fence.sessionId));
+    if (session?.closedAt !== undefined) throw new HarnessStorageSessionClosedError(fence.sessionId);
+    if (
+      session === undefined ||
+      session.ownerId !== fence.ownerId ||
+      session.leaseExpiresAt === undefined ||
+      session.leaseExpiresAt <= Date.now()
+    ) {
+      throw new HarnessStorageLeaseConflictError(fence.sessionId, session?.ownerId ?? '', session?.leaseExpiresAt ?? 0);
+    }
   }
 
   async listThreads(args: StorageListThreadsInput): Promise<StorageListThreadsOutput> {
