@@ -27,7 +27,7 @@ import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../..
 import { getResponseFormat } from '../../base/schema';
 import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
 import { attachModelStreamTransport, readModelStreamTransport } from '../../types';
-import { prepareToolsAndToolChoice } from './compat';
+import { prepareToolsAndToolChoice, preparedToolKey } from './compat';
 import type { ModelSpecVersion } from './compat';
 import { AISDKV5InputStream } from './input';
 
@@ -480,6 +480,12 @@ type ExecutionProps<OUTPUT = undefined> = {
   onPreparedRequest?: (metrics: PreparedModelRequestMetrics) => void;
   /** Starts one tracing boundary immediately before each provider adapter invocation. */
   onProviderAttemptStart?: (providerAttempt: number) => void;
+  /**
+   * Receives the keys (in `tools`) of the tools the provider request advertises,
+   * after tool preparation (none for `toolChoice: 'none'`), immediately before
+   * each provider adapter invocation.
+   */
+  onProviderDispatch?: (advertisedToolKeys: string[]) => void;
   /** Closes only the failed provider-attempt boundary so a retry can open another. */
   onProviderAttemptError?: (input: { error: unknown; providerAttempt: number; aborted: boolean }) => void;
   /** Records the provider's first semantic chunk before downstream buffering. */
@@ -517,6 +523,7 @@ export function execute<OUTPUT = undefined>({
   onResult,
   onPreparedRequest,
   onProviderAttemptStart,
+  onProviderDispatch,
   onProviderAttemptError,
   onProviderFirstContent,
   onProviderChunk,
@@ -732,6 +739,11 @@ export function execute<OUTPUT = undefined>({
                 onProviderAttemptStart?.(providerAttempt);
               } catch {
                 // Tracing must never prevent the provider call.
+              }
+              try {
+                onProviderDispatch?.((toolsAndToolChoice.tools ?? []).map(tool => preparedToolKey(tool) ?? tool.name));
+              } catch {
+                // Observers must never prevent the provider call.
               }
               // Cast needed: V2 and V3 call options are structurally compatible but typed differently
               // (e.g., tool types differ: V2 uses 'provider-defined', V3 uses 'provider')

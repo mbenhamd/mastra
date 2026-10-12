@@ -69,6 +69,7 @@ const durableLLMMappingOutputSchema = z.object({
   modelEntryId: z.string().optional(),
   modelSpanData: z.any().optional(),
   responseRecoveryConsumed: z.boolean().optional(),
+  recoveryToolCeiling: z.array(z.string()).optional(),
 });
 
 /**
@@ -531,6 +532,7 @@ export function createDurableLLMMappingStep() {
         modelEntryId: llmOutput.modelEntryId,
         modelSpanData: llmOutput.modelSpanData,
         responseRecoveryConsumed: llmOutput.responseRecoveryConsumed,
+        ...(llmOutput.recoveryToolCeiling ? { recoveryToolCeiling: llmOutput.recoveryToolCeiling } : {}),
         delegationBailed,
         ...(terminalToolResult ? { terminalToolResult } : {}),
         ...(deferredStepFinishChunk ? { deferredStepFinishChunk } : {}),

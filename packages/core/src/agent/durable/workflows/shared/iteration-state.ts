@@ -105,6 +105,9 @@ export function createBaseIterationStateUpdate(input: IterationStateUpdateInput)
     modelConfig: currentState.modelConfig,
     options: currentState.options,
     responseRecovery: executionOutput.responseRecoveryConsumed ? undefined : currentState.responseRecovery,
+    // The recovery tool ceiling (PF-5349). The LLM step carries it forward on
+    // every output once set; the fallback covers outputs that end before it.
+    recoveryToolCeiling: executionOutput.recoveryToolCeiling ?? currentState.recoveryToolCeiling,
     state: executionOutput.state,
     messageId: executionOutput.messageId,
     // Carried, not recomputed: the request context is fixed for the run, and

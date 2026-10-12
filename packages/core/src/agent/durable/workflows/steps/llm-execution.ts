@@ -15,7 +15,10 @@ import { injectBackgroundTaskPrompt } from '../../../../loop/shared/inject-backg
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../../../loop/shared/merge-llm-call-headers';
 import { readToolResultFromMessageList } from '../../../../loop/shared/read-tool-result';
 import { recordTerminalErrorMessage } from '../../../../loop/shared/record-terminal-error-message';
-import { responseRecoveryToolChoice } from '../../../../loop/shared/response-recovery-tool-choice';
+import {
+  boundResponseRecoveryToolSelection,
+  narrowRecoveryToolCeiling,
+} from '../../../../loop/shared/response-recovery-tool-choice';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../../../loop/shared/step-content-chunk-types';
 import { TERMINAL_FINISH_REASONS } from '../../../../loop/shared/terminal-finish-reasons';
 import { applyToolPayloadTransformToChunk } from '../../../../loop/shared/tool-payload-transform';
@@ -117,6 +120,7 @@ const durableLLMInputSchema = z.object({
   modelList: z.array(modelListEntrySchema).optional(),
   options: durableOptionsSchema,
   responseRecovery: durableResponseRecoveryStateSchema.optional(),
+  recoveryToolCeiling: z.array(z.string()).optional(),
   state: z.any(),
   messageId: z.string(),
   // JSON-safe request context snapshot, forwarded from iteration state so the
@@ -169,6 +173,7 @@ const durableLLMOutputSchema = z.object({
   state: z.any(),
   modelEntryId: z.string().optional(),
   responseRecoveryConsumed: z.boolean().optional(),
+  recoveryToolCeiling: z.array(z.string()).optional(),
   // Step index used in this execution (for tracking)
   stepIndex: z.number().optional(),
   // Exported span data forwarded to downstream steps for trace nesting/closing
@@ -311,6 +316,10 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         throw new Error(`Durable response recovery reservation for run "${runId}" does not match step ${stepIndex}`);
       }
       let responseRecoveryAdmitted = false;
+      // PF-5349: tools advertised by the latest ordinary request of the run
+      // that reached the provider, narrowed by any later ordinary step that did
+      // not. They bound a later response-only recovery step.
+      let recoveryToolCeiling: string[] | undefined = typedInput.recoveryToolCeiling;
       const logger = mastra?.getLogger?.();
 
       // 1. Resolve runtime dependencies (tools from Mastra)
@@ -418,6 +427,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
           // when every model fails, so the predicate cannot re-grant it; the
           // run's model span data travels to finalization (PF-3243).
           ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+          ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
           modelSpanData: latestModelSpanData,
         } satisfies DurableLLMStepOutput;
       };
@@ -817,6 +827,19 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 currentModelSettings = merged.modelSettings ?? {};
                 structuredOutput = merged.structuredOutput;
                 processorSelectedTools = merged.tools as unknown as Record<string, unknown>;
+                // Narrow the recovery ceiling to the names the processors selected
+                // before the executable check or a selection fence can reject this
+                // attempt (PF-5349). Only names are read, and narrowing can only
+                // remove names, so a container that changes between reads cannot
+                // widen it.
+                if (!responseRecoveryReserved) {
+                  recoveryToolCeiling = narrowRecoveryToolCeiling(
+                    recoveryToolCeiling,
+                    merged.tools as unknown as Record<string, unknown> | undefined,
+                    currentActiveTools ?? undefined,
+                    currentToolChoice,
+                  );
+                }
                 // This must run after the untrusted selection controls above:
                 // their traps may have mutated one of the retained tools.
                 currentTools = enforceReconstructibleToolSurface(
@@ -977,6 +1000,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                       modelId: currentModel.modelId,
                     },
                     state: typedInput.state,
+                    ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                     modelSpanData: snapshotLatestModelSpanData(modelSpan),
                   } satisfies DurableLLMStepOutput;
                 }
@@ -990,6 +1014,19 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 responseRecoveryReserved
                   ? `Durable response recovery for run "${runId}" lost its live one-shot admission`
                   : `Run "${runId}" produced a response-recovery admission without a durable reservation`,
+              );
+            }
+
+            // An ordinary step narrows the recovery ceiling to what it selects as
+            // soon as the processors and fences have fixed that selection, before
+            // any download or request processor can fail; a dispatch later
+            // replaces it with what the request advertised (PF-5349).
+            if (!responseRecoveryReserved) {
+              recoveryToolCeiling = narrowRecoveryToolCeiling(
+                recoveryToolCeiling,
+                currentTools as Record<string, unknown> | undefined,
+                currentActiveTools ?? undefined,
+                currentToolChoice,
               );
             }
 
@@ -1146,6 +1183,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     },
                     state: typedInput.state,
                     ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+                    ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                     modelSpanData: snapshotLatestModelSpanData(modelSpan),
                   } satisfies DurableLLMStepOutput;
                 }
@@ -1194,12 +1232,27 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // Execution denial is keyed on the admitted recovery step, not on an
             // emptied tool list: the step keeps the schemas the previous step
             // advertised so the provider prompt cache survives (PF-5349).
+            // The step is also bounded by the tools the latest ordinary request
+            // of the run advertised, so its processors cannot offer more; with
+            // no recorded request it is tool-free (PF-5349).
             if (responseRecoveryReserved) {
-              currentToolChoice = responseRecoveryToolChoice(
-                currentToolChoice,
+              const bounded = boundResponseRecoveryToolSelection(
+                recoveryToolCeiling,
                 currentTools as Record<string, unknown> | undefined,
                 currentActiveTools ?? undefined,
-              ) as ToolChoice<ToolSet> | undefined;
+                currentToolChoice,
+              );
+              currentActiveTools = bounded.activeTools;
+              currentToolChoice = bounded.toolChoice as ToolChoice<ToolSet> | undefined;
+            } else {
+              // The last processor boundary may have narrowed the selection
+              // again; the ceiling follows it (PF-5349).
+              recoveryToolCeiling = narrowRecoveryToolCeiling(
+                recoveryToolCeiling,
+                currentTools as Record<string, unknown> | undefined,
+                currentActiveTools ?? undefined,
+                currentToolChoice,
+              );
             }
             const toolExecutionDisabled =
               responseRecoveryReserved ||
@@ -1614,6 +1667,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   onProviderAttemptStart: providerAttempt => {
                     providerAttemptCount = providerAttempt;
                     runTracingSafely(() => modelSpanTracker?.startInference?.(undefined, providerAttempt));
+                  },
+                  // A request that reaches the provider bounds a later
+                  // response-only recovery step by the tools it advertised
+                  // (PF-5349). Attempts that fail before dispatch do not.
+                  onProviderDispatch: advertisedToolKeys => {
+                    if (!responseRecoveryReserved) recoveryToolCeiling = advertisedToolKeys;
                   },
                   onProviderAttemptError: ({ error, aborted }) => {
                     const providerError = asDurableModelError(error, 'Provider attempt failed');
@@ -2329,6 +2388,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   metadata: { modelId: currentModel.modelId },
                   state: typedInput.state,
                   ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+                  ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                   modelSpanData: failedModelSpanData,
                 } satisfies DurableLLMStepOutput;
               }
@@ -2404,6 +2464,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 metadata: { modelId: currentModel.modelId },
                 state: typedInput.state,
                 ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+                ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                 modelSpanData: snapshotLatestModelSpanData(modelSpan),
               } satisfies DurableLLMStepOutput;
             }
@@ -2448,6 +2509,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   metadata: { modelId: currentModel.modelId },
                   state: typedInput.state,
                   ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+                  ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                   modelSpanData: failedModelSpanData,
                 } satisfies DurableLLMStepOutput;
               }
@@ -2487,6 +2549,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                   modelId: currentModel.modelId,
                 },
                 state: typedInput.state,
+                ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
               } satisfies DurableLLMStepOutput;
             }
 
@@ -2552,6 +2615,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     },
                     state: typedInput.state,
                     ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+                    ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                     modelSpanData: snapshotLatestModelSpanData(modelSpan),
                   } satisfies DurableLLMStepOutput;
                 }
@@ -2685,6 +2749,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     metadata: { modelId: currentModel.modelId },
                     state: typedInput.state,
                     ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+                    ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                     modelSpanData: snapshotLatestModelSpanData(modelSpan),
                   };
                 }
@@ -2791,6 +2856,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               state: typedInput.state,
               modelEntryId: modelEntry.id,
               ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+              ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
               // Persist the latest content-free generation attributes on every
               // step. Tool-call iterations need the identity for nesting, and
               // terminal iterations need the accumulated provider-request
@@ -2897,6 +2963,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                 metadata: { modelId: modelEntry.config.modelId },
                 state: typedInput.state,
                 ...(responseRecoveryAdmitted ? { responseRecoveryConsumed: true } : {}),
+                ...(recoveryToolCeiling ? { recoveryToolCeiling } : {}),
                 modelSpanData: failedModelSpanData,
               } satisfies DurableLLMStepOutput;
             }

@@ -246,6 +246,75 @@ type BoundaryToken = [type: string, identity: string | undefined];
 type BoundaryCheckpoint = { messageId: string; prefix: BoundaryToken[] };
 
 /**
+ * Where one loop iteration writes its response, for `MessageList.stepContent`. Opened by
+ * `openStepContent` when the iteration begins and closed by `closeStepContent` once the iteration
+ * has written its last part (its tool results included).
+ */
+export type StepContentLocation = {
+  /** Each response message's parts when the iteration began. */
+  readonly startParts: ReadonlyMap<string, RecordedParts>;
+  /** Each response message's parts when the iteration ended; unset while it is open. */
+  endParts?: ReadonlyMap<string, RecordedParts>;
+};
+
+/**
+ * A message's parts as recorded for `StepContentLocation`: each part's identity token, and the part
+ * object itself, which a processor that rewrites a part in place keeps.
+ */
+type RecordedParts = { readonly tokens: readonly string[]; readonly objects: readonly MastraMessagePart[] };
+
+/** The provider's id for the output item a part came from, when the provider gives one. */
+function providerItemId(part: MastraMessagePart): string | undefined {
+  const metadata = 'providerMetadata' in part ? part.providerMetadata : undefined;
+  if (!metadata) return undefined;
+  for (const providerEntry of Object.values(metadata)) {
+    const itemId = (providerEntry as { itemId?: unknown } | undefined)?.itemId;
+    if (typeof itemId === 'string') return itemId;
+  }
+  return undefined;
+}
+
+/**
+ * What identifies a part across clones. A tool call is its id, so a result filled in later is the
+ * same part. Anything else is its type, its content (text, reasoning, file data), the provider's
+ * item id and the stamp it got when it was added to the list. A clone keeps all of these, so the
+ * same answer written by two steps, or two step markers, stay distinct. Two parts can still collide
+ * only with identical content, no provider item id and stamps from the same millisecond.
+ */
+function partIdentity(part: MastraMessagePart): string {
+  if (part.type === 'tool-invocation') return `${part.type}\u0000${part.toolInvocation?.toolCallId}`;
+  let content: string | undefined;
+  if (part.type === 'text') content = part.text;
+  else if (part.type === 'reasoning') content = part.reasoning;
+  else if (part.type === 'file') content = typeof part.data === 'string' ? part.data : undefined;
+  // Unary + so a Date, or a string from some storage round trip, compares as a number.
+  const stamp = part.createdAt == null ? '' : String(+part.createdAt);
+  return `${part.type}\u0000${content ?? ''}\u0000${providerItemId(part) ?? ''}\u0000${stamp}`;
+}
+
+/**
+ * Index of the last part that stands for one of `recorded`, matched in order: the same part object
+ * (a processor rewrote it in place), or failing that the same identity (a clone). A processor may
+ * have dropped some of the recorded parts (the rest still match in order) or replaced one with a
+ * new part (it sits before a later match). Parts after the last match were written after `recorded`
+ * was taken.
+ */
+function lastRecordedPartIndex(parts: MastraMessagePart[], recorded: RecordedParts | undefined): number {
+  if (!recorded) return -1;
+  let next = 0;
+  let last = -1;
+  for (let index = 0; index < parts.length && next < recorded.tokens.length; index++) {
+    const part = parts[index]!;
+    let match = recorded.objects.indexOf(part, next);
+    if (match === -1) match = recorded.tokens.indexOf(partIdentity(part), next);
+    if (match === -1) continue;
+    last = index;
+    next = match + 1;
+  }
+  return last;
+}
+
+/**
  * Identify the parts preceding an index — what a splice at that index is actually a statement
  * about. A tool call is named by its id, text and reasoning by their own string, anything else by
  * its type alone. Each token holds that string as-is rather than building one out of it, so the
@@ -2074,10 +2143,22 @@ export class MessageList {
    * When the last part is already a `step-start` the iteration begins at *that* marker — nothing
    * has been appended after it — so it is returned rather than duplicated.
    *
+   * With `acrossTrailingSignals`, signals at the end of the list are skipped and the boundary goes on
+   * the assistant message before them. A processor retry puts its feedback signal there and streams
+   * the retry into a fresh message, which opens with no marker; without one ahead of it, counting
+   * markers cannot tell the retry's parts from the accepted step before it.
+   *
    * @returns the marker beginning this iteration, and whether it had to be appended
    */
-  public openStepBoundary(): { boundary?: MastraStepStartPart; appended: boolean } {
-    const lastMsg = this.messages[this.messages.length - 1];
+  public openStepBoundary(options?: { acrossTrailingSignals?: boolean }): {
+    boundary?: MastraStepStartPart;
+    appended: boolean;
+  } {
+    let lastIndex = this.messages.length - 1;
+    if (options?.acrossTrailingSignals) {
+      while (lastIndex >= 0 && this.messages[lastIndex]?.role === 'signal') lastIndex--;
+    }
+    const lastMsg = this.messages[lastIndex];
     if (!lastMsg || lastMsg.role !== 'assistant' || !lastMsg.content?.parts) {
       return { appended: false };
     }
@@ -2118,6 +2199,94 @@ export class MessageList {
   #rememberBoundaryFingerprint(messageId: string, parts: MastraMessagePart[], boundary: MastraStepStartPart) {
     const index = parts.indexOf(boundary);
     if (index !== -1) this.#boundaryFingerprints.set(boundary, { messageId, prefix: prefixFingerprint(parts, index) });
+  }
+
+  /**
+   * Each response message's parts as recorded for a step location. A part that reached the list
+   * unstamped (a processor pushed it onto `parts`) is stamped here first: otherwise a later clone of
+   * it, stamped when re-added, would no longer match. Tool parts are identified by call id and are
+   * left as they are, since their stamp would surface in provider options.
+   */
+  #recordResponseParts(): Map<string, RecordedParts> {
+    return new Map(
+      this.response.db().map(message => {
+        const objects = (message.content.parts ?? []).map(part =>
+          part.type === 'tool-invocation' ? part : stampPart(part),
+        );
+        return [message.id, { tokens: objects.map(partIdentity), objects }];
+      }),
+    );
+  }
+
+  /**
+   * Start recording where a loop iteration writes its response. Call it after the iteration has
+   * opened its boundary (`openStepBoundary()`) and before the model streams.
+   */
+  public openStepContent(): StepContentLocation {
+    return { startParts: this.#recordResponseParts() };
+  }
+
+  /**
+   * Fix the end of an iteration's response once it has written its last part, so later reads do
+   * not pick up what the next iteration writes (a failed partial attempt, feedback notes).
+   * Closing an already-closed location keeps its first end.
+   */
+  public closeStepContent(location: StepContentLocation): void {
+    location.endParts ??= this.#recordResponseParts();
+  }
+
+  /**
+   * The content one loop iteration wrote: in each response message, the parts after those that
+   * were there when the iteration began, up to those that were there when it ended. Parts are
+   * recognised by identity rather than position, so a processor that clones, trims or rewrites
+   * earlier parts does not move the iteration's. A part a processor adds after every recorded part
+   * counts as the iteration's; a part it puts among the recorded ones (a replacement of earlier
+   * narration) stays with the earlier step, so a rewrite of history is never read as this step's
+   * answer. A message a processor re-adds under a new id is new to the list, so all of it is read
+   * as the iteration's.
+   *
+   * `modelContent(stepNumber)` instead counts `step-start` markers, which goes wrong when a
+   * processor retry rolls a rejected attempt's marker back and streams the retry into a fresh
+   * message with none (PF-5364), when one response holds an intra-response marker (a tool call
+   * followed by text), or when a processor prunes earlier messages.
+   */
+  public stepContent(location: StepContentLocation): AIV5Type.StepResult<any>['content'] {
+    const parts: AIV5Type.UIMessage['parts'] = [];
+    for (const message of this.response.db()) {
+      const messageParts = message.content.parts ?? [];
+      const endParts = location.endParts ? location.endParts.get(message.id) : undefined;
+      // Started after the iteration ended.
+      if (location.endParts && !endParts) continue;
+
+      const start = lastRecordedPartIndex(messageParts, location.startParts.get(message.id)) + 1;
+      const stop = endParts ? lastRecordedPartIndex(messageParts, endParts) + 1 : messageParts.length;
+      if (start >= stop) continue;
+
+      const startedHere = !location.startParts.has(message.id);
+      if (startedHere && start === 0 && stop === messageParts.length) {
+        parts.push(...this.toAIV5UIMessages([message]).flatMap(uiMessage => uiMessage.parts));
+        continue;
+      }
+      // Other iterations wrote (or wrote and a processor pruned) the rest of this message. The
+      // legacy mirrors describe the whole message and would re-synthesize their parts, so only this
+      // iteration's parts are converted.
+      const {
+        toolInvocations: _toolInvocations,
+        reasoning: _reasoning,
+        content: _content,
+        experimental_attachments: _attachments,
+        ...stepMessageContent
+      } = message.content;
+      const stepMessage: MastraDBMessage = {
+        ...message,
+        content: { ...stepMessageContent, parts: messageParts.slice(start, stop) },
+      };
+      parts.push(...this.toAIV5UIMessages([stepMessage]).flatMap(uiMessage => uiMessage.parts));
+    }
+    // The next iteration may already have opened its boundary at the end of this step's message.
+    while (parts.at(-1)?.type === 'step-start') parts.pop();
+    if (parts.length === 0) return [];
+    return StepContentExtractor.convertPartsToContent(parts, 'step', this.response.aiV5.stepContent);
   }
 
   /** Sealing is not optional: a moved id whose boundary is missing folds the next response into the previous row. */

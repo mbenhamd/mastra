@@ -1264,6 +1264,11 @@ export interface StepTripwireData {
   reason: string;
   /** Whether retry was requested */
   retry?: boolean;
+  /**
+   * Whether the retry was granted and this step's response was removed from the conversation.
+   * The step stays in `steps` for history.
+   */
+  rolledBack?: boolean;
   /** Additional metadata from the tripwire */
   metadata?: unknown;
   /** ID of the processor that triggered the tripwire */

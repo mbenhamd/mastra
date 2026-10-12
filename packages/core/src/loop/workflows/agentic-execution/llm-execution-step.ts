@@ -68,6 +68,7 @@ import type {
   ChunkType,
   ExecuteStreamModelManager,
   ModelManagerModelConfig,
+  StepTripwireData,
   StreamChunkType,
   StreamTransport,
   StreamTransportRef,
@@ -99,6 +100,7 @@ import {
   MEMORY_KEY,
   RESOURCE_ID_KEY,
   STEP_ACTIVE_TOOLS_KEY,
+  STEP_CONTENT_KEY,
   STEP_MODEL_MESSAGES_KEY,
   STEP_TOOLS_KEY,
   STEP_USAGE_KEY,
@@ -114,7 +116,12 @@ import { composeStepInput } from '../../shared/compose-step-input';
 import { injectBackgroundTaskPrompt } from '../../shared/inject-background-task-prompt';
 import { buildMemoryHeaders, mergeLlmCallHeaders } from '../../shared/merge-llm-call-headers';
 import { recordTerminalErrorMessage } from '../../shared/record-terminal-error-message';
-import { responseRecoveryToolChoice } from '../../shared/response-recovery-tool-choice';
+import {
+  boundResponseRecoveryToolSelection,
+  narrowRecoveryToolCeiling,
+} from '../../shared/response-recovery-tool-choice';
+import { readStepContent, stepWasRolledBack } from '../../shared/step-content';
+import type { LocatedStepContent } from '../../shared/step-content';
 import { STEP_CONTENT_CHUNK_TYPES } from '../../shared/step-content-chunk-types';
 import { TERMINAL_FINISH_REASONS } from '../../shared/terminal-finish-reasons';
 import { isMastraTimeoutError } from '../../timeout';
@@ -1595,7 +1602,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // response when a tool call is followed by text, and nothing stored tells them apart.
       // Undefined on the first iteration, and on any iteration with no open assistant message to
       // append to — both roll the message back whole, which is what the rejection means there.
-      const iterationBoundary = currentIteration > 1 ? messageList.openStepBoundary().boundary : undefined;
+      // A processor retry has just put its feedback signal after the accepted steps' message, so
+      // the boundary goes on that message, ahead of the signal: the retry's fresh message opens
+      // with no marker, and step content is located by counting markers (PF-5364).
+      const iterationBoundary =
+        currentIteration > 1
+          ? messageList.openStepBoundary({ acrossTrailingSignals: inputData.processorRetryFeedback !== undefined })
+              .boundary
+          : undefined;
+      // Where this iteration's response goes; its StepResult content is read from here.
+      const iterationContent = messageList.openStepContent();
 
       try {
         // Open MODEL_STEP before any step-owned processor work. The outer
@@ -1636,6 +1652,28 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       const toolSurfaceFencePassthrough = persistedToolSurfaceFence
         ? { toolSurfaceFence: [...persistedToolSurfaceFence] }
         : {};
+      // PF-5349: names of the tools the latest ordinary request that reached the
+      // provider advertised. They bound a later response-only recovery step.
+      // Carried in iteration state so the bound survives a suspend/resume.
+      let recoveryToolCeiling: string[] | undefined = inputData.recoveryToolCeiling;
+      // An ordinary step narrows the ceiling to what it selects at every point
+      // its selection is settled (after processors, after the fence and the
+      // permission gate, after request processors); only a dispatch replaces
+      // it. A step that is served from a cache, or that fails before dispatch,
+      // therefore never widens it.
+      const narrowRecoveryCeilingToStep = (step: {
+        tools?: unknown;
+        activeTools?: unknown;
+        toolChoice?: unknown;
+      }): void => {
+        if (responseRecoveryStep) return;
+        recoveryToolCeiling = narrowRecoveryToolCeiling(
+          recoveryToolCeiling,
+          step.tools as Record<string, unknown> | undefined,
+          step.activeTools as string[] | undefined,
+          step.toolChoice,
+        );
+      };
       const maxErrorProcessorRetries = resolveMaxProcessorRetries({
         maxProcessorRetries,
         hasErrorProcessors: Boolean(errorProcessors?.length),
@@ -1778,13 +1816,18 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // input-step processors.
         const previousSteps = inputData.output?.steps || [];
         const lastPreviousStep = previousSteps[previousSteps.length - 1];
-        if (lastPreviousStep) {
-          // modelContent is 1-indexed, so the last completed step is `length`.
-          const refreshedContent = messageList.get.response.aiV5.modelContent(previousSteps.length);
+        // A rolled-back retry attempt has no parts left to re-extract.
+        if (lastPreviousStep && !stepWasRolledBack(lastPreviousStep)) {
+          const refreshedContent = readStepContent(
+            messageList,
+            previousSteps,
+            previousSteps.length - 1,
+            readScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent'),
+          );
           // Durable agents deserialize a fresh MessageList per workflow step, so
           // the re-extraction can legitimately come back empty there. Never let
           // that wipe content we already have.
-          if (refreshedContent.length > 0) {
+          if (refreshedContent && refreshedContent.length > 0) {
             previousSteps[previousSteps.length - 1] = new DefaultStepResult({
               content: refreshedContent,
               finishReason: lastPreviousStep.finishReason,
@@ -2011,6 +2054,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           }
         }
 
+        // Before the fence or the permission gate can reject this attempt.
+        narrowRecoveryCeilingToStep(currentStep);
+
         const toolSurfaceFence = readToolSurfaceFence(requestContext, runId);
         if (toolSurfaceFence) {
           if (currentStep.tools) {
@@ -2100,6 +2146,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             );
           }
         }
+
+        // The fence and the permission gate may have narrowed the selection.
+        narrowRecoveryCeilingToStep(currentStep);
 
         if (currentStep.tools) {
           currentStep.tools = wrapToolsWithHooks(
@@ -2200,6 +2249,8 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             inputMessages = requestStepResult.prompt;
             cachedResponse = requestStepResult.response;
           } catch (error) {
+            // A request processor may have narrowed the selection before failing.
+            narrowRecoveryCeilingToStep(currentStep);
             if (error instanceof TripWire) {
               logger?.warn('Streaming request processor tripwire triggered', {
                 reason: error.message,
@@ -2243,14 +2294,22 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Recovery owns one freshly fenced provider attempt. A cached response
           // was produced under another tool surface and cannot consume it.
           cachedResponse = undefined;
-          // Chosen after the tool-surface fence and the permission gate, from the
-          // tools this request will actually advertise (PF-5349): the step keeps
-          // their schemas and the loop denies execution below.
-          currentStep.toolChoice = responseRecoveryToolChoice(
-            currentStep.toolChoice,
+          // Bound recovery by the tools the latest ordinary request advertised
+          // (PF-5349), after the tool-surface fence and the permission gate: it
+          // keeps those schemas (the provider cache prefix) and never offers
+          // more. Without a recorded request it is tool-free. The loop denies
+          // execution of any call it emits below.
+          const bounded = boundResponseRecoveryToolSelection(
+            recoveryToolCeiling,
             currentStep.tools as Record<string, unknown> | undefined,
             currentStep.activeTools as string[] | undefined,
-          ) as typeof currentStep.toolChoice;
+            currentStep.toolChoice,
+          );
+          currentStep.activeTools = bounded.activeTools as typeof currentStep.activeTools;
+          currentStep.toolChoice = bounded.toolChoice as typeof currentStep.toolChoice;
+        } else {
+          // Request processors ran with this selection in reach.
+          narrowRecoveryCeilingToStep(currentStep);
         }
 
         // Execution denial is separate from schema exposure: the admitted
@@ -2380,6 +2439,12 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 onProviderAttemptStart: providerAttempt => {
                   providerAttemptCount = providerAttempt;
                   modelSpanTracker?.startInference?.(undefined, providerAttempt);
+                },
+                // A request that reaches the provider bounds a later response-only
+                // recovery step by the tools it advertised (PF-5349). Cache
+                // replays and attempts that fail before dispatch do not.
+                onProviderDispatch: advertisedToolKeys => {
+                  if (!responseRecoveryStep) recoveryToolCeiling = advertisedToolKeys;
                 },
                 onProviderAttemptError: ({ error, aborted }) => {
                   const tracingError = asTracingError(error, 'Provider attempt failed');
@@ -3202,6 +3267,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           processorRetryCount: nextProcessorRetryCount,
           ...(activeFallbackModelIndex > 0 ? { fallbackModelIndex: activeFallbackModelIndex } : {}),
           ...toolSurfaceFencePassthrough,
+          ...(recoveryToolCeiling === undefined ? {} : { recoveryToolCeiling }),
         };
       }
 
@@ -3454,18 +3520,21 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       }
 
       const steps = inputData.output?.steps || [];
-      // StepContentExtractor uses one-based step numbers. `steps.length` is the
-      // number of already-completed steps because the current result is pushed
-      // below, so the current iteration is `steps.length + 1`. Do not slice the
-      // returned content by `messages.nonUser.length`: that value counts model
-      // messages, while this array contains content parts. Mixing those units
-      // can erase the current step's tool calls (and parallel calls in
-      // particular) from the public StepResult.
-      const currentIterationContent = messageList.get.response.aiV5.modelContent(steps.length + 1);
+      // The current result is pushed below, at index `steps.length`. Its content
+      // is what this iteration wrote, read from where it wrote it rather than by
+      // counting step-start markers (PF-5364). Do not slice the returned content
+      // by `messages.nonUser.length`: that value counts model messages, while this
+      // array contains content parts. Mixing those units can erase the current
+      // step's tool calls (and parallel calls in particular) from the public
+      // StepResult.
+      const currentStepContent: LocatedStepContent = { stepIndex: steps.length, location: iterationContent };
+      writeScoped(scopeCtx, STEP_CONTENT_KEY, 'stepContent', currentStepContent);
+      const currentIterationContent = readStepContent(messageList, steps, steps.length, currentStepContent) ?? [];
 
       // Build tripwire data if this step is being rejected
       // This includes both retry scenarios and max retries exceeded
-      const stepTripwireData = processOutputStepTripwire
+      // `rolledBack` is added below, once the rollback has actually removed the response.
+      const stepTripwireData: StepTripwireData | undefined = processOutputStepTripwire
         ? {
             reason: processOutputStepTripwire.message,
             retry: processOutputStepTripwire.options?.retry,
@@ -3505,7 +3574,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         // goes back into the carry buffer for the next attempt to write again rather than
         // disappearing with the rejected response.
         eagerCoordinator?.recarryCommittedWork(outputStream.messageId);
-        messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary);
+        // Only a response that was found and removed counts as rolled back; a rejected response
+        // that stays in the conversation must keep its place when later steps are numbered.
+        if (messageList.rollbackToStepBoundary(outputStream.messageId, iterationBoundary) && stepTripwireData) {
+          stepTripwireData.rolledBack = true;
+        }
         // A processor retry throws this attempt away like the error paths do, so it gets
         // the same treatment: cancel what is still running, keep what finished.
         //
@@ -3603,6 +3676,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         processorRetryFeedback: retryFeedbackText,
         ...(nextFallbackModelIndex > 0 ? { fallbackModelIndex: nextFallbackModelIndex } : {}),
         ...toolSurfaceFencePassthrough,
+        ...(recoveryToolCeiling === undefined ? {} : { recoveryToolCeiling }),
       };
     },
   });

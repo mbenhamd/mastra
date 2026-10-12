@@ -652,6 +652,146 @@ describeForAllEngines(
       expect(text).not.toContain('UNEXPECTED_THIRD_CALL');
     });
 
+    it('never lets the recovery step advertise more tools than the step before it', async () => {
+      // PF-5349: a bounded response lane withdraws tools (toolChoice 'none') on
+      // the silent final step. Processors decide anew on the recovery step and
+      // would re-expose them; recovery must freeze the previous request instead.
+      let step = 0;
+      let responseOnly = false;
+      const stageTool = createTool({
+        id: 'stage_change',
+        description: 'Stage a private change',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => ({ ok: true }),
+      });
+
+      const { requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Stage the change, then answer.',
+        tools: { stage_change: stageTool },
+        maxSteps: 20,
+        recoveryMaxSteps: 1,
+        prepareStep: () => {
+          step += 1;
+          if (responseOnly) return { [AGENT_RESPONSE_RECOVERY_STEP]: true };
+          // The second request is the bounded, tool-free response lane.
+          return step === 2 ? { toolChoice: 'none' } : undefined;
+        },
+        onIterationComplete: (context: IterationCompleteContext) => {
+          if (responseOnly) return { continue: false };
+          if (context.isFinal && context.text.trim() === '') {
+            responseOnly = true;
+            return {
+              continue: true,
+              feedback: 'Report the result.',
+              [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+            };
+          }
+          return undefined;
+        },
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', sequenceIndex: 0 },
+            { toolCalls: [{ id: 'stage-1', name: 'stage_change', arguments: {} }] },
+          );
+          llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+          llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'Staged.' });
+        },
+      });
+
+      expect(requests).toHaveLength(3);
+      expect(requests[0]?.body?.tools ?? []).toHaveLength(1);
+      expect(requests[1]?.body?.tools ?? []).toHaveLength(0);
+      expect(requests[2]?.body?.tools ?? []).toHaveLength(0);
+    });
+
+    it.each([
+      ['replaces its tool map', { tools: 'stage-only' }],
+      ['narrows its active tools', { activeTools: ['stage_change'] }],
+      [
+        'forces a tool among narrowed active tools',
+        {
+          activeTools: ['stage_change'],
+          toolChoice: { type: 'tool', toolName: 'stage_change' },
+        },
+      ],
+      ['sends no tools', { activeTools: [], toolChoice: 'none' }],
+    ] as const)(
+      'never lets the recovery step offer more tools than a previous step that %s',
+      async (_label, narrowing) => {
+        // PF-5349: the previous request withdraws a private tool, and the recovery
+        // step's processors offer every tool again. Recovery must advertise only
+        // what the previous request sent, on every engine.
+        let step = 0;
+        let responseOnly = false;
+        const stageTool = createTool({
+          id: 'stage_change',
+          description: 'Stage a change',
+          inputSchema: z.object({}),
+          outputSchema: z.object({ ok: z.boolean() }),
+          execute: async () => ({ ok: true }),
+        });
+        const privateTool = createTool({
+          id: 'private_probe',
+          description: 'A private tool the response step withdraws',
+          inputSchema: z.object({}),
+          outputSchema: z.object({ ok: z.boolean() }),
+          execute: async () => ({ ok: true }),
+        });
+
+        const { requests } = await runLoopScenario({
+          engine,
+          llm: getMock(),
+          prompt: 'Stage the change, then answer.',
+          tools: { stage_change: stageTool, private_probe: privateTool },
+          maxSteps: 20,
+          recoveryMaxSteps: 1,
+          // Durable engines only accept the step's own tools back, so narrowing
+          // and re-offering both reuse the tools the step receives.
+          prepareStep: ({ tools }: { tools?: Record<string, unknown> }) => {
+            step += 1;
+            if (responseOnly) {
+              return { tools, toolChoice: 'auto', [AGENT_RESPONSE_RECOVERY_STEP]: true };
+            }
+            if (step !== 2) return undefined;
+            return 'tools' in narrowing ? { tools: { stage_change: tools?.stage_change } } : { ...narrowing };
+          },
+          onIterationComplete: (context: IterationCompleteContext) => {
+            if (responseOnly) return { continue: false };
+            if (context.isFinal && context.text.trim() === '') {
+              responseOnly = true;
+              return {
+                continue: true,
+                feedback: 'Report the result.',
+                [AGENT_RESPONSE_RECOVERY_CONTINUATION]: true,
+              };
+            }
+            return undefined;
+          },
+          fixtures: llm => {
+            llm.on(
+              { endpoint: 'chat', sequenceIndex: 0 },
+              { toolCalls: [{ id: 'stage-1', name: 'stage_change', arguments: {} }] },
+            );
+            llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { content: '' });
+            llm.on({ endpoint: 'chat', sequenceIndex: 2 }, { content: 'Staged.' });
+          },
+        });
+
+        const toolNames = (index: number) =>
+          ((requests[index]?.body?.tools ?? []) as Array<{ function?: { name?: string } }>)
+            .map(tool => tool.function?.name)
+            .sort();
+        const expected = 'toolChoice' in narrowing && narrowing.toolChoice === 'none' ? [] : ['stage_change'];
+        expect(requests).toHaveLength(3);
+        expect(toolNames(0)).toEqual(['private_probe', 'stage_change']);
+        expect(toolNames(1)).toEqual(expected);
+        expect(toolNames(2)).toEqual(expected);
+      },
+    );
+
     it('keeps the tool schemas on a response-only recovery step and refuses to execute its calls', async () => {
       // PF-5349: the recovery step must advertise exactly the tool list of the
       // step before it, so the provider's cached prompt prefix survives. Only
