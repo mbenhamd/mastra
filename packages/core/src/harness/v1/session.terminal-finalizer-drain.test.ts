@@ -748,17 +748,13 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
           });
           await expect(session.message(options)).resolves.toMatchObject({ text: 'ordinary answer' });
           expect(ended).toEqual(['complete']);
-          if (!registered) {
-            await expect(session.message(options)).resolves.toMatchObject({ text: 'ordinary answer' });
-          }
+          await expect(session.message(options)).resolves.toMatchObject({ text: 'ordinary answer' });
         } else {
           const signal = await session.signal(options);
           await expect(signal.result).resolves.toMatchObject({ text: 'ordinary answer' });
           await expect(session.lookupMessageResult(signal.id)).resolves.toMatchObject({ status: 'completed' });
-          if (!registered) {
-            const duplicate = await session.signal(options);
-            await expect(duplicate.result).resolves.toMatchObject({ text: 'ordinary answer' });
-          }
+          const duplicate = await session.signal(options);
+          await expect(duplicate.result).resolves.toMatchObject({ text: 'ordinary answer' });
         }
         expect(agent.streamCalls).toHaveLength(1);
       } finally {
@@ -955,25 +951,55 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       executionAuthorityGrant: grant,
       terminalAdmissionSeed: { v: 1 },
     });
+    const parked = ownerSession.getRecord().pendingResume!;
     await owner.harness.shutdown();
+    const response = {
+      approved: true,
+      responseId: 'approval-1',
+      itemId: parked.itemId ?? parked.toolCallId,
+      runId: parked.runId,
+      toolCallId: parked.toolCallId,
+      pendingRequestedAt: parked.requestedAt,
+    };
+    const admissionKey = { harnessName: 'default', sessionId: ownerSession.id, admissionId, executionGrant: grant };
 
     const agent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
-    const resumer = harnessProcess(db, agent, { finalizer: finalizerAt('3', calls) });
+    const unregistered = harnessProcess(db, agent, { finalizer: finalizerAt('3', calls) });
     try {
-      const session = await resumer.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
-      await expect(session.respondToToolApproval({ approved: true })).rejects.toBeInstanceOf(Error);
+      const session = await unregistered.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
+      await expect(session.respondToToolApproval(response)).rejects.toMatchObject({
+        code: 'harness.terminal_pending',
+      });
       expect(agent.resumeCalls).toHaveLength(0);
       expect(calls).toEqual([]);
-      await expect(
-        resumer.storage.loadTerminalAdmission({
-          harnessName: 'default',
-          sessionId: ownerSession.id,
-          admissionId,
-          executionGrant: grant,
-        }),
-      ).resolves.toMatchObject({ status: 'pending', finalizerVersion: '1' });
+      await expect(unregistered.storage.loadTerminalAdmission(admissionKey)).resolves.toMatchObject({
+        status: 'pending',
+        finalizerVersion: '1',
+      });
     } finally {
-      await resumer.harness.shutdown();
+      await unregistered.harness.shutdown();
+    }
+
+    // The same response resumes once a process registers the admitted version.
+    const resumeAgent = new MockAgent({ id: 'default' });
+    resumeAgent.enqueueRun({ finishReason: 'stop', text: 'resumed answer' });
+    const registered = harnessProcess(db, resumeAgent, {
+      finalizer: finalizerAt('2', calls),
+      settleOnly: [finalizerAt('1', calls)],
+    });
+    try {
+      const session = await registered.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
+      await session.respondToToolApproval(response);
+      await vi.waitFor(async () =>
+        expect(await registered.storage.loadTerminalAdmission(admissionKey)).toMatchObject({
+          status: 'committed',
+          finalizerVersion: '1',
+        }),
+      );
+      expect(resumeAgent.resumeCalls).toHaveLength(1);
+      expect(calls).toEqual([{ version: '1', finalizerVersion: '1', status: 'completed', reply: 'resumed answer' }]);
+    } finally {
+      await registered.harness.shutdown();
     }
   });
 
@@ -1020,9 +1046,15 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     }
   });
 
-  it.each([false, true])(
-    'accounts a staged resumed turn once when it is cancelled before stale-resume recovery (settlement fails: %s)',
-    async settlementFails => {
+  it.each([
+    ['stale-resume recovery', false],
+    ['stale-resume recovery', true],
+    ['an explicit abort', false],
+    ['an explicit abort', true],
+  ] as const)(
+    'accounts a staged resumed turn once when it is cancelled by %s (settlement fails: %s)',
+    async (cancellation, settlementFails) => {
+      const explicitAbort = cancellation === 'an explicit abort';
       const db = new InMemoryDB();
       const calls: FinalizeCall[] = [];
       const ownerAgent = new MockAgent({ id: 'default' });
@@ -1086,12 +1118,20 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       await expect(resumer.storage.loadSession(scope)).resolves.toMatchObject({
         tokenUsage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
       });
-      // A deliberate cancellation lands before any process recovers the turn.
-      await resumer.storage.cancelTerminalHandoff({
-        ...pending!,
-        reason: { code: 'harness.terminal_cancelled', message: 'cancelled deliberately' },
-      });
+      // A deliberate cancellation lands before any process recovers the turn,
+      // or a cold process aborts the parked turn explicitly.
+      if (!explicitAbort) {
+        await resumer.storage.cancelTerminalHandoff({
+          ...pending!,
+          reason: { code: 'harness.terminal_cancelled', message: 'cancelled deliberately' },
+        });
+      }
       await resumer.harness.shutdown().catch(() => {});
+      // The stopped resumer's lease lapses before the parked turn is due for
+      // stale-resume recovery.
+      if (explicitAbort) {
+        await resumer.storage.releaseSessionLease({ sessionId: ownerSession.id, ownerId: resumer.harness.ownerId });
+      }
 
       calls.length = 0;
       const evidenceScope = {
@@ -1100,19 +1140,25 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
         threadId: ownerSession.threadId,
         signalId: pending!.signalId,
       };
-      const adopter = await adoptAfterLeaseLapse(
-        db,
-        ownerSession.id,
-        { finalizer: finalizerAt('2', calls), settleOnly: [finalizerAt('1', calls)] },
-        process => {
-          if (!settlementFails) return;
-          // The best-effort cancelled settlement does not land before this
-          // process stops; the row stays pending with its staged output.
-          const settle = process.storage.compareAndSwapSignalTerminal.bind(process.storage);
-          process.storage.compareAndSwapSignalTerminal = async input =>
-            input.admissionId === admissionId ? { applied: false } : settle(input);
-        },
-      );
+      const registration = { finalizer: finalizerAt('2', calls), settleOnly: [finalizerAt('1', calls)] };
+      const failSettlement = (process: ReturnType<typeof harnessProcess>) => {
+        if (!settlementFails) return;
+        // The best-effort cancelled settlement does not land before this
+        // process stops; the row stays pending with its staged output.
+        const settle = process.storage.compareAndSwapSignalTerminal.bind(process.storage);
+        process.storage.compareAndSwapSignalTerminal = async input =>
+          input.admissionId === admissionId ? { applied: false } : settle(input);
+      };
+      let adopter: ReturnType<typeof harnessProcess> & { agent: MockAgent };
+      if (explicitAbort) {
+        const abortAgent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
+        adopter = { ...harnessProcess(db, abortAgent, registration), agent: abortAgent };
+        failSettlement(adopter);
+        const session = await adopter.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
+        await session.abortActiveWork();
+      } else {
+        adopter = await adoptAfterLeaseLapse(db, ownerSession.id, registration, failSettlement);
+      }
       try {
         await vi.waitFor(async () => expect((await adopter.storage.loadSession(scope))?.pendingResume).toBeUndefined());
         // Cancellation prevents delivery, never the consumed resumed usage.

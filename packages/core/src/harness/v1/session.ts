@@ -1715,12 +1715,6 @@ export class Session {
   private readonly _openRuns = new Map<string, OpenRunSpan>();
   /** Span-summary — runIds whose `run_completed` was already emitted, so duplicate terminal `agent_end` paths finalize at most once. Bounded by {@link MAX_FINALIZED_RUN_IDS}. */
   private readonly _finalizedRunIds = new Set<string>();
-  /**
-   * Span-summary — identities of runs this process never started but settled on
-   * adoption (an orphaned dispatch), consumed by the reconstructed
-   * `run_completed` so it reports the admitted mode/model, not the session's.
-   */
-  private readonly _recoveredRunIdentities = new Map<string, RunSpanIdentity>();
   /** Message result-evidence writes in flight (awaited by close before its pending check). */
   private readonly _resultEvidenceWrites = new Set<Promise<unknown>>();
   /** Orphaned-dispatch recovery in flight (one per session at a time). */
@@ -1972,6 +1966,8 @@ export class Session {
    * a second terminal agent_end.
    */
   private readonly _recoveredAgentEndRunIds = new Set<string>();
+  /** In-flight recovered completion publications, one per run. */
+  private readonly _recoveredRunPublications = new Map<string, Promise<void>>();
   /** Runs this process admitted under native terminal handoff. */
   private readonly _nativeTerminalRunIds = new Set<string>();
   /** Staging runs outside the message boundary that owns its failure observer. */
@@ -2696,12 +2692,42 @@ export class Session {
    * those (usage + identity + finishReason are still reported).
    */
   private _finalizeRunSpan(runId: string, finishReason: string, usage: TokenUsage, completedAt: number): void {
-    const recoveredIdentity = this._recoveredRunIdentities.get(runId);
-    this._recoveredRunIdentities.delete(runId);
     if (this._finalizedRunIds.has(runId)) return;
+    this._markRunFinalized(runId);
+    const { event, status, reconstructed } = this._buildRunCompletedEvent(
+      runId,
+      finishReason,
+      usage,
+      completedAt,
+      undefined,
+    );
+    this._openRuns.delete(runId);
+
+    // Emit on the turn-event choke (re-enters `_emitTurnEvent`, but `run_completed`
+    // is neither `agent_*` nor `tool_*` so it triggers no further span tracking).
+    this._emitTurnEvent(event as EmitInput);
+
+    // Slice B (durable run summary) is wired here.
+    this._persistRunSummary(event, status, reconstructed);
+  }
+
+  private _markRunFinalized(runId: string): void {
     if (this._finalizedRunIds.size >= MAX_FINALIZED_RUN_IDS) this._finalizedRunIds.clear();
     this._finalizedRunIds.add(runId);
+  }
 
+  /** Build a run's canonical `run_completed` event from its span or recovered identity. */
+  private _buildRunCompletedEvent(
+    runId: string,
+    finishReason: string,
+    usage: TokenUsage,
+    completedAt: number,
+    recoveredIdentity: RunSpanIdentity | undefined,
+  ): {
+    event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>;
+    status: RunCompletedStatus;
+    reconstructed: boolean;
+  } {
     const span = this._openRuns.get(runId);
     const reconstructed = span === undefined;
     const identity = span?.identity ?? recoveredIdentity ?? this._captureRunSpanIdentity();
@@ -2731,14 +2757,7 @@ export class Session {
       event.durationMs = Math.max(0, completedAt - span!.startedAt);
       event.toolRollup = this._materializeToolRollup(span!.rollup);
     }
-    this._openRuns.delete(runId);
-
-    // Emit on the turn-event choke (re-enters `_emitTurnEvent`, but `run_completed`
-    // is neither `agent_*` nor `tool_*` so it triggers no further span tracking).
-    this._emitTurnEvent(event as EmitInput);
-
-    // Slice B (durable run summary) is wired here.
-    this._persistRunSummary(event, status, reconstructed);
+    return { event, status, reconstructed };
   }
 
   /** Convert the in-memory rollup (Maps) into the JSON-safe {@link RunToolRollup}. */
@@ -2768,7 +2787,23 @@ export class Session {
     status: RunCompletedStatus,
     reconstructed: boolean,
   ): void {
-    const summary: HarnessRunSummary = {
+    const summary = this._buildRunSummary(event, status, reconstructed);
+    this._runSummaryPersistence = this._runSummaryPersistence
+      .then(() => this._storage.saveRunSummary({ summary }))
+      .then(
+        () => undefined,
+        err => {
+          console.error('[harness/v1] run summary persistence failed:', err);
+        },
+      );
+  }
+
+  private _buildRunSummary(
+    event: Omit<RunCompletedEvent, 'id' | 'timestamp' | 'sessionId'>,
+    status: RunCompletedStatus,
+    reconstructed: boolean,
+  ): HarnessRunSummary {
+    return {
       harnessName: this._record.harnessName,
       runId: event.runId,
       sessionId: this.id,
@@ -2790,14 +2825,6 @@ export class Session {
       ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
       ...(event.toolRollup !== undefined ? { toolRollup: event.toolRollup } : {}),
     };
-    this._runSummaryPersistence = this._runSummaryPersistence
-      .then(() => this._storage.saveRunSummary({ summary }))
-      .then(
-        () => undefined,
-        err => {
-          console.error('[harness/v1] run summary persistence failed:', err);
-        },
-      );
   }
 
   /** @internal — await all in-flight run-summary writes (tests). */
@@ -4034,37 +4061,52 @@ export class Session {
 
   /**
    * Publish a recovered turn's completion once: `agent_end` and the
-   * reconstructed `run_completed`, whose durable summary acknowledges the
-   * publication. Canonical completed evidence supplies its finish reason and
-   * usage; an interrupted turn reports aborted. An existing summary suppresses
-   * duplicate publication. A missing summary fails recovery explicitly.
+   * reconstructed `run_completed`. Canonical completed evidence supplies its
+   * finish reason and usage; an interrupted turn reports aborted. An existing
+   * summary suppresses duplicate publication. The durable run summary is
+   * written first, under the storage session fence, so nothing is emitted for
+   * a session another owner already deleted. Concurrent publications of one
+   * run share a single attempt.
    */
-  private async _publishRecoveredRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
+  private _publishRecoveredRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
     // Another storage owner's hard delete erases the completed result; this
     // retained Session may never observe that deletion locally.
     if (evidence.status === 'completed' && evidence.erased === true) {
-      throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
+      return Promise.reject(new HarnessMessageResultErasedError(this.id, evidence.signalId));
     }
     const runId = evidence.runId!;
+    const inflight = this._recoveredRunPublications.get(runId);
+    if (inflight !== undefined) return inflight;
+    const publication = this._publishRecoveredRunCompletionOnce(evidence, runId).finally(() => {
+      if (this._recoveredRunPublications.get(runId) === publication) this._recoveredRunPublications.delete(runId);
+    });
+    this._recoveredRunPublications.set(runId, publication);
+    return publication;
+  }
+
+  private async _publishRecoveredRunCompletionOnce(evidence: AgentSignalResultEvidence, runId: string): Promise<void> {
     const full = evidence.status === 'completed' ? (evidence.result as FullOutput<unknown> | undefined) : undefined;
-    const summary = { harnessName: this._record.harnessName, runId };
+    const summaryKey = { harnessName: this._record.harnessName, runId };
     let persistence: Promise<void>;
     do {
       persistence = this._runSummaryPersistence;
       await persistence;
-      if ((await this._storage.loadRunSummary(summary)) !== null) return;
+      if ((await this._storage.loadRunSummary(summaryKey)) !== null) return;
       // Another completion may have scheduled its save during the lookup.
       // Wait for that acknowledged outcome before deciding to republish.
     } while (persistence !== this._runSummaryPersistence);
     this._assertNotDeleted();
-    // The summary may be missing because another owner deleted the session
-    // while this publication waited; never emit for a deleted session.
-    const stored = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: this.id });
-    if (stored === null || stored.sessionIncarnation !== this._record.sessionIncarnation) {
-      throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
-    }
     const modeId = evidence.modeId ?? this._record.modeId;
-    this._recoveredRunIdentities.set(runId, {
+    // The original run may belong to a dead owner, so this terminal carries
+    // no span. Its summary is reconstructed from the settled outcome.
+    const finishReason =
+      full !== undefined
+        ? this._agentEndReasonForFullOutput(full)
+        : evidence.status === 'failed' && evidence.error.code !== HARNESS_RUN_INTERRUPTED_ERROR_CODE
+          ? 'error'
+          : 'aborted';
+    const usage = this._runUsage(full);
+    const { event, status, reconstructed } = this._buildRunCompletedEvent(runId, finishReason, usage, Date.now(), {
       resourceId: this.resourceId,
       threadId: this.threadId,
       agentId: this._modeAgentId(modeId),
@@ -4073,34 +4115,22 @@ export class Session {
       operationKind: 'signal',
       ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
     });
-    // The original run may belong to a dead owner, so this terminal carries
-    // no span. Its summary is reconstructed from the settled outcome.
-    // An earlier attempt on this session may have emitted it but failed to
-    // persist the summary; finalize again so persistence is retried.
-    this._finalizedRunIds.delete(runId);
-    // A repeated recovered publication must emit again (it retries the
-    // summary); only a later live terminal agent_end is suppressed.
+    const summary = this._buildRunSummary(event, status, reconstructed);
+    // Session-fenced: storage refuses the summary of a deleted session.
+    const saved = await this._storage.saveRunSummary({ summary });
+    if (saved === null) throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
+    // A concurrent owner's summary won: that owner publishes its completion.
+    if (saved.completedAt !== summary.completedAt || saved.reconstructed !== summary.reconstructed) return;
+    this._assertNotDeleted();
+    // The summary is durable; emit agent_end without finalizing again, then
+    // the matching run_completed. Only a later live terminal agent_end for
+    // this run is suppressed.
+    this._markRunFinalized(runId);
     this._recoveredAgentEndRunIds.delete(runId);
-    this._emitTurnEvent({
-      type: 'agent_end',
-      runId,
-      finishReason:
-        full !== undefined
-          ? this._agentEndReasonForFullOutput(full)
-          : evidence.status === 'failed' && evidence.error.code !== HARNESS_RUN_INTERRUPTED_ERROR_CODE
-            ? 'error'
-            : 'aborted',
-      usage: this._runUsage(full),
-    });
+    this._emitTurnEvent({ type: 'agent_end', runId, finishReason, usage });
     this._recoveredAgentEndRunIds.add(runId);
-    await this._runSummaryPersistence;
-    if ((await this._storage.loadRunSummary(summary)) === null) {
-      throw new HarnessStorageError({
-        operation: 'message_log',
-        sessionId: this.id,
-        cause: new Error(`recovered run "${runId}" completion was not acknowledged by its run summary`),
-      });
-    }
+    this._openRuns.delete(runId);
+    this._emitTurnEvent(event as EmitInput);
   }
 
   /**
@@ -4141,13 +4171,7 @@ export class Session {
     // run consumed. Persist its staged usage before any terminal evidence
     // rewrite, using the same durable per-run accounting fence.
     const staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
-    if (staged !== undefined) {
-      this._stagedTerminalRunIds.add(runId);
-      const { tokenUsageAccounted } = this._recordMessageTurnCompletion(staged as FullOutput<unknown>, {
-        persist: false,
-      });
-      if (tokenUsageAccounted) await this._persistTokenUsageOrLatch();
-    }
+    if (staged !== undefined) await this._accountStagedTerminalUsage(runId, staged as FullOutput<unknown>);
     if (admission.status !== 'pending') {
       // A cancelled admission does not settle its evidence. Keep the usage
       // fence until the canonical evidence is terminal, or a restart would
@@ -10669,7 +10693,12 @@ export class Session {
     const runId = full.runId ?? evidence.runId;
     if (runId !== undefined) {
       try {
-        await this._raceActiveTurnWaiter(this._stageCompletedTerminalOutput(runId, full), activeDeleted);
+        // The cached output exists only in this process, so a native run
+        // here is known and still fails closed on a lookup failure.
+        await this._raceActiveTurnWaiter(
+          this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true }),
+          activeDeleted,
+        );
       } catch (error) {
         throw this._terminalFailure(error, opts.onTerminalCommitError, runId);
       }
@@ -10771,13 +10800,9 @@ export class Session {
   /**
    * Stale-resume recovery terminalizes a resumed turn without delivering its
    * reply, but the resumed run may already have staged completed output and
-   * consumed tokens. Account that usage against the parked generation's
-   * durable baseline before any evidence rewrite: the persisted flush folds
-   * the advanced baseline into the still-parked pending, so a retried
-   * recovery computes a zero delta.
+   * consumed tokens. Count that usage before any evidence rewrite.
    */
   private async _accountStagedResumeUsage(pending: PendingResume, queuedItemId: string | undefined): Promise<void> {
-    // A durable fence means this run's usage is already counted.
     if (this._terminalTokenAccountedRunIds.has(pending.runId)) return;
     const admission = await this._probeResumeAdmissionByRun(pending);
     if (!admission) return;
@@ -10797,32 +10822,49 @@ export class Session {
     ) {
       return;
     }
-    const generationKey = pendingInteractionGenerationKey({
-      kind: pending.kind,
-      itemId: pending.itemId,
-      runId: pending.runId,
-      toolCallId: pending.toolCallId,
-      requestedAt: pending.requestedAt,
-    });
-    const full = stored.stagedResult as FullOutput<unknown>;
-    // A run this process already accounted keeps its armed baseline, and a
-    // queued post-run finalization already persisted its delta. Both still
-    // need the durable per-run fence below.
-    const queuedUsagePersisted =
-      queuedItemId !== undefined &&
-      this._record.queueAdmissionReceipts?.[queuedItemId]?.postRunFinalizedAt !== undefined;
-    if (!queuedUsagePersisted && this._resumeUsageBaseline?.generationKey !== generationKey) {
-      this._recordTurnCompletion(full, { persist: false, accountedCumulative: pending.accountedTokenUsage });
-      const runUsage = this._tokenUsageDeltaFromFullOutput(full);
-      if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
+    await this._accountStagedTerminalUsage(pending.runId, stored.stagedResult as FullOutput<unknown>, queuedItemId);
+  }
+
+  /**
+   * Count a staged turn's consumed usage exactly once before its pending
+   * evidence is rewritten without delivery (cancellation or interruption).
+   * A parked resumed run counts against its generation's durable baseline;
+   * other runs use the per-run message accounting. The per-run fence
+   * persists atomically with the counter and outlives the parked pending, so
+   * a later recovery of a still-pending row never counts it again. It
+   * retires once the row's canonical evidence is terminal.
+   */
+  private async _accountStagedTerminalUsage(
+    runId: string,
+    staged: FullOutput<unknown>,
+    queuedItemId?: string,
+  ): Promise<void> {
+    if (this._terminalTokenAccountedRunIds.has(runId)) return;
+    const parked = this._record.pendingResume;
+    if (parked !== undefined && parked.runId === runId) {
+      const generationKey = pendingInteractionGenerationKey({
+        kind: parked.kind,
+        itemId: parked.itemId,
+        runId: parked.runId,
+        toolCallId: parked.toolCallId,
+        requestedAt: parked.requestedAt,
+      });
+      // A run this process already accounted keeps its armed baseline, and
+      // a queued post-run finalization already persisted its delta.
+      const queuedId = queuedItemId ?? this._queuedItemIdForPendingResume(parked);
+      const queuedUsagePersisted =
+        queuedId !== undefined && this._record.queueAdmissionReceipts?.[queuedId]?.postRunFinalizedAt !== undefined;
+      if (!queuedUsagePersisted && this._resumeUsageBaseline?.generationKey !== generationKey) {
+        this._recordTurnCompletion(staged, { persist: false, accountedCumulative: parked.accountedTokenUsage });
+        const runUsage = this._tokenUsageDeltaFromFullOutput(staged);
+        if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
+      }
+      this._messageTokenAccountedRunIds.add(runId);
+    } else {
+      this._recordMessageTurnCompletion(staged, { persist: false });
     }
-    this._messageTokenAccountedRunIds.add(pending.runId);
-    // The per-run fence persists atomically with the counter and outlives
-    // the parked pending: if cancelled settlement fails and orphan recovery
-    // later commits this row, it must not add the usage again. It retires
-    // with the row's terminal canonical evidence.
-    this._stagedTerminalRunIds.add(pending.runId);
-    this._terminalTokenAccountedRunIds.add(pending.runId);
+    this._stagedTerminalRunIds.add(runId);
+    this._terminalTokenAccountedRunIds.add(runId);
     await this._persistTokenUsageOrLatch();
   }
 
@@ -10965,6 +11007,11 @@ export class Session {
           evidence.dispatch.state !== 'reserved')
       ) {
         return;
+      }
+      // Cancellation prevents delivery, never the usage a finished run
+      // consumed: count staged output before the settlement drops it.
+      if (evidence.stagedResult !== undefined) {
+        await this._accountStagedTerminalUsage(admission.runId, evidence.stagedResult as FullOutput<unknown>);
       }
       const swapped = await this._storage.compareAndSwapSignalTerminal({
         ...scope,
@@ -12584,7 +12631,9 @@ export class Session {
             cached.full.finishReason === 'suspended'
               ? this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true })
               : (async () => {
-                  await this._stageCompletedTerminalOutput(evidence.runId!, cached.full);
+                  await this._stageCompletedTerminalOutput(evidence.runId!, cached.full, {
+                    tolerateUnknownRun: true,
+                  });
                   const settled = await this._settleSignalResult(
                     evidence.signalId,
                     {
@@ -16588,7 +16637,10 @@ export class Session {
                   : undefined;
       if (resumeRefusal !== undefined) {
         this._drainTerminalObservers(pending.runId, resumeRefusal);
-        if (responseId !== undefined) {
+        // An unregistered admitted version is temporary: leave the response
+        // unadmitted so the same responseId can resume once a process
+        // registers that version.
+        if (responseId !== undefined && !(resumeRefusal instanceof HarnessTerminalFinalizationPendingError)) {
           try {
             await this._recordInboxResponsePreDispatchFailure(
               {
@@ -16610,6 +16662,9 @@ export class Session {
         }
         throw resumeRefusal;
       }
+      // A pending native admission resumes here: its completed output must
+      // stage fail-closed on every completion path.
+      if (boundAdmission?.status === 'pending') this._nativeTerminalRunIds.add(pending.runId);
     }
 
     // Mark resumed under the lease BEFORE calling the agent (idempotency
