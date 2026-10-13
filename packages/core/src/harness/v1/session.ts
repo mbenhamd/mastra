@@ -12438,6 +12438,7 @@ export class Session {
             cached.full.finishReason === 'suspended'
               ? this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true })
               : (async () => {
+                  await this._stageCompletedTerminalOutput(evidence.runId!, cached.full);
                   const settled = await this._settleSignalResult(
                     evidence.signalId,
                     {
@@ -12456,6 +12457,7 @@ export class Session {
                 })();
         } else {
           result = (async () => {
+            if (cached.err instanceof HarnessTerminalFinalizationPendingError) throw cached.err;
             const settled = await this._settleSignalResult(
               evidence.signalId,
               {
@@ -12502,6 +12504,7 @@ export class Session {
             );
           },
           async err => {
+            if (err instanceof HarnessTerminalFinalizationPendingError) throw err;
             const settled = await this._settleSignalResult(
               evidence.signalId,
               { status: 'failed', runId: evidence.runId, error: projectHarnessPublicError(err) },
@@ -12551,6 +12554,7 @@ export class Session {
             return this._awaitDurableSignalResult(evidence, opts.abortSignal, { waitIndefinitely: true });
           },
           async err => {
+            if (err instanceof HarnessTerminalFinalizationPendingError) throw err;
             const settled = await this._settleSignalResult(
               evidence.signalId,
               {
@@ -13054,6 +13058,9 @@ export class Session {
             );
           },
           async err => {
+            // Staging did not produce a terminal winner. Preserve the signal's
+            // accepted evidence for retry rather than seal a provider failure.
+            if (err instanceof HarnessTerminalFinalizationPendingError) throw err;
             const settled = await this._settleSignalResult(
               signalId,
               {
