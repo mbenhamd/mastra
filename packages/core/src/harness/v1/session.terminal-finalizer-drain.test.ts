@@ -287,6 +287,10 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       });
       const owner = harnessProcess(db, ownerAgent, { finalizer: finalizerAt('1', calls) });
       const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const completionEvents: string[] = [];
+      session.subscribe(event => {
+        if (event.type === 'agent_end' || event.type === 'run_completed') completionEvents.push(event.type);
+      });
       const commit = owner.storage.commitTerminalHandoff.bind(owner.storage);
       owner.storage.commitTerminalHandoff = async () => {
         throw new Error('terminal commit temporarily unavailable');
@@ -326,13 +330,15 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       await expect(owner.storage.loadRunSummary({ harnessName: 'default', runId: pending!.runId })).resolves.toBeNull();
       if (warmRetry) {
         owner.storage.commitTerminalHandoff = commit;
-        await expect(session.message(message)).resolves.toMatchObject({ text: 'durable answer' });
+        const replies = await Promise.all([session.message(message), session.message(message)]);
+        expect(replies).toMatchObject([{ text: 'durable answer' }, { text: 'durable answer' }]);
         await expect(owner.storage.loadTerminalAdmission(identity)).resolves.toMatchObject({ status: 'committed' });
         await expect(
           owner.storage.loadRunSummary({ harnessName: 'default', runId: pending!.runId }),
         ).resolves.toMatchObject({ status: 'completed' });
         expect(failures).toHaveLength(2);
         expect(ownerAgent.streamCalls).toHaveLength(1);
+        expect(completionEvents).toEqual(['agent_end', 'run_completed']);
         await owner.harness.shutdown();
         return;
       }
@@ -385,6 +391,55 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       }
     },
   );
+
+  it('publishes one completion when retries overlap an outstanding original summary save', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun({ finishReason: 'stop', text: 'answer' });
+    const owner = harnessProcess(db, agent, { finalizer: finalizerAt('1', []) });
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const completionEvents: string[] = [];
+    session.subscribe(event => {
+      if (event.type === 'agent_end' || event.type === 'run_completed') completionEvents.push(event.type);
+    });
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
+    let startedSave!: () => void;
+    const saveStarted = new Promise<void>(resolve => (startedSave = resolve));
+    const save = owner.storage.saveRunSummary.bind(owner.storage);
+    owner.storage.saveRunSummary = async input => {
+      startedSave();
+      await saveGate;
+      return save(input);
+    };
+    const message = { content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } };
+    try {
+      await expect(session.message(message)).resolves.toMatchObject({ text: 'answer' });
+      await saveStarted;
+      let receipts = 0;
+      let receivedBoth!: () => void;
+      const bothReceived = new Promise<void>(resolve => (receivedBoth = resolve));
+      const retry = () =>
+        session.message({
+          ...message,
+          onTerminalCommit: () => {
+            if (++receipts === 2) receivedBoth();
+          },
+        });
+      const retries = Promise.all([retry(), retry()]);
+      await bothReceived;
+      // Let both canonical receipt continuations run while the original
+      // summary write is deliberately held, without relying on a time delay.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      releaseSave();
+      await expect(retries).resolves.toMatchObject([{ text: 'answer' }, { text: 'answer' }]);
+      expect(completionEvents).toEqual(['agent_end', 'run_completed']);
+      expect(agent.streamCalls).toHaveLength(1);
+    } finally {
+      releaseSave();
+      await owner.harness.shutdown();
+    }
+  });
 
   it('leaves an orphaned turn pending when its admitted version is not registered', async () => {
     const db = new InMemoryDB();

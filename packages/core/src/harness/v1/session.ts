@@ -4022,7 +4022,14 @@ export class Session {
     const runId = evidence.runId!;
     const full = evidence.status === 'completed' ? (evidence.result as FullOutput<unknown> | undefined) : undefined;
     const summary = { harnessName: this._record.harnessName, runId };
-    if ((await this._storage.loadRunSummary(summary)) !== null) return;
+    let persistence: Promise<void>;
+    do {
+      persistence = this._runSummaryPersistence;
+      await persistence;
+      if ((await this._storage.loadRunSummary(summary)) !== null) return;
+      // Another completion may have scheduled its save during the lookup.
+      // Wait for that acknowledged outcome before deciding to republish.
+    } while (persistence !== this._runSummaryPersistence);
     const modeId = evidence.modeId ?? this._record.modeId;
     this._recoveredRunIdentities.set(runId, {
       resourceId: this.resourceId,
