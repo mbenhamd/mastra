@@ -80,6 +80,8 @@ import type {
   TransitionWorkflowSnapshotHandoffResult,
   CompleteWorkflowSnapshotHandoffInput,
   CompleteWorkflowSnapshotHandoffResult,
+  ReleaseWorkflowSnapshotHandoffInput,
+  ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
   WorkflowExecutionState,
@@ -95,8 +97,11 @@ import {
   WorkflowSnapshotHandoffFenceError,
   WorkflowStaleSnapshotPersistError,
   compareWorkflowSnapshotHandoffCursors,
+  isWorkflowSnapshotHandoffReleasable,
+  isWorkflowSnapshotHandoffRetainedOutcome,
   materializeWorkflowSnapshotHandoffSnapshot,
   pinWorkflowCasGuardValue,
+  validateWorkflowSnapshotHandoffClaimGeneration,
   validateWorkflowSnapshotHandoffFence,
   validateWorkflowSnapshotHandoffIdentity,
   validateWorkflowSnapshotHandoffLimit,
@@ -533,7 +538,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1 };
+    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1 };
   }
 
   private getWorkflowSnapshotHandoff(workflowName: string, runId: string): WorkflowSnapshotHandoffRecord | undefined {
@@ -542,7 +547,8 @@ export class WorkflowsInMemory extends WorkflowsStorage {
 
   private assertWorkflowSnapshotHandoffAvailable(workflowName: string, runId: string): void {
     const handoff = this.getWorkflowSnapshotHandoff(workflowName, runId);
-    if (handoff) {
+    // A released row records a past claim; it no longer fences the run.
+    if (handoff && handoff.releasedAt === undefined) {
       throw new WorkflowSnapshotHandoffFenceError({
         workflowName,
         runId,
@@ -1797,7 +1803,10 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     if (!canonicalMatches) {
       return { status: 'conflict', observedCanonical };
     }
-    if (existing) {
+    if (existing?.releasedAt !== undefined && isWorkflowSnapshotHandoffRetainedOutcome(existing, mutationFence)) {
+      return { status: 'completed', record: this.copyWorkflowSnapshotHandoff(existing) };
+    }
+    if (existing && existing.releasedAt === undefined) {
       const same =
         existing.mutationFence === mutationFence &&
         existing.resourceId === resourceId &&
@@ -1810,6 +1819,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         record: this.copyWorkflowSnapshotHandoff(existing),
       };
     }
+    // A released row is claimed again in place, under the next generation.
     const now = Date.now();
     const record: WorkflowSnapshotHandoffRecord = {
       version: 1,
@@ -1821,6 +1831,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       mutationFence,
       createdAt: now,
       updatedAt: now,
+      claimGeneration: existing ? existing.claimGeneration + 1 : 1,
     };
     this.db.workflowSnapshotHandoffs.set(key, record);
     return { status: 'created', record: this.copyWorkflowSnapshotHandoff(record) };
@@ -1851,7 +1862,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         ? { status: 'completed', record: this.copyWorkflowSnapshotHandoff(existing) }
         : { status: 'conflict', record: this.copyWorkflowSnapshotHandoff(existing) };
     }
+    // A released pending claim was given up by its holder; it takes no further steps.
     const expectedMatches =
+      existing.releasedAt === undefined &&
       existing.mutationFence === mutationFence &&
       existing.resourceId === expectedResourceId &&
       workflowSnapshotHandoffSnapshotsEqual(existing.snapshot, expectedSnapshot);
@@ -1895,7 +1908,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         ? { status: 'already_completed', record: this.copyWorkflowSnapshotHandoff(existing) }
         : { status: 'conflict', record: this.copyWorkflowSnapshotHandoff(existing) };
     }
+    // A released pending claim was given up by its holder; it takes no further steps.
     const expectedMatches =
+      existing.releasedAt === undefined &&
       existing.mutationFence === mutationFence &&
       existing.resourceId === expectedResourceId &&
       workflowSnapshotHandoffSnapshotsEqual(existing.snapshot, expectedSnapshot);
@@ -1913,6 +1928,38 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     return { status: 'completed', record: this.copyWorkflowSnapshotHandoff(completed) };
   }
 
+  async releaseWorkflowSnapshotHandoff(
+    input: ReleaseWorkflowSnapshotHandoffInput,
+  ): Promise<ReleaseWorkflowSnapshotHandoffResult> {
+    const { workflowName, runId, expectedClaimGeneration, mutationFence, deleteRun } = input;
+    validateWorkflowSnapshotHandoffClaimGeneration(expectedClaimGeneration);
+    if (mutationFence !== undefined) validateWorkflowSnapshotHandoffFence(mutationFence);
+    validateWorkflowSnapshotHandoffIdentity(workflowName, runId);
+    const key = this.getWorkflowKey(workflowName, runId);
+    const existing = this.db.workflowSnapshotHandoffs.get(key);
+    if (!existing) return { status: 'missing' };
+    if (!isWorkflowSnapshotHandoffReleasable(existing, expectedClaimGeneration, mutationFence)) {
+      return { status: 'conflict', record: this.copyWorkflowSnapshotHandoff(existing) };
+    }
+    let record = existing;
+    let status: 'released' | 'already_released' = 'already_released';
+    if (existing.releasedAt === undefined) {
+      const now = Date.now();
+      record = { ...existing, updatedAt: Math.max(existing.updatedAt, now), releasedAt: now };
+      this.db.workflowSnapshotHandoffs.set(key, record);
+      status = 'released';
+    }
+    // Only the call that releases the claim deletes the run: a retried release
+    // may arrive after native writes the release allowed, which must survive.
+    let runDeleted = false;
+    if (deleteRun === true && status === 'released' && this.deleteWorkflowRunRecord(workflowName, runId)) {
+      // Keep the tombstone revision, as deleteWorkflowRunById does.
+      this.bumpParentRevision(key);
+      runDeleted = true;
+    }
+    return { status, record: this.copyWorkflowSnapshotHandoff(record), runDeleted };
+  }
+
   async listWorkflowSnapshotHandoffs(
     input: ListWorkflowSnapshotHandoffsInput = {},
   ): Promise<ListWorkflowSnapshotHandoffsResult> {
@@ -1921,6 +1968,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const records = [...this.db.workflowSnapshotHandoffs.values()]
       .filter(
         record =>
+          record.releasedAt === undefined &&
           (input.workflowName === undefined || record.workflowName === input.workflowName) &&
           (input.status === undefined || record.status === input.status),
       )

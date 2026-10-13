@@ -59,6 +59,8 @@ import type {
   TransitionWorkflowSnapshotHandoffResult,
   CompleteWorkflowSnapshotHandoffInput,
   CompleteWorkflowSnapshotHandoffResult,
+  ReleaseWorkflowSnapshotHandoffInput,
+  ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
   WorkflowExecutionState,
@@ -110,6 +112,17 @@ export abstract class WorkflowsStorage extends StorageDomain {
   async completeWorkflowSnapshotHandoff(
     _input: CompleteWorkflowSnapshotHandoffInput,
   ): Promise<CompleteWorkflowSnapshotHandoffResult> {
+    return { status: 'unsupported' };
+  }
+
+  /**
+   * Releases one claim of the run's handoff, compared by `claimGeneration`:
+   * the row is kept and marked released, and no longer fences the run.
+   * Adapters implementing this advertise `releaseVersion: 1`.
+   */
+  async releaseWorkflowSnapshotHandoff(
+    _input: ReleaseWorkflowSnapshotHandoffInput,
+  ): Promise<ReleaseWorkflowSnapshotHandoffResult> {
     return { status: 'unsupported' };
   }
 
