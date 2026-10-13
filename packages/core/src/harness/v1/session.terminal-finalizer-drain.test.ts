@@ -496,119 +496,116 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     'summary publication',
     'canonical evidence load from another process',
     'summary publication from another process',
-  ])(
-    'preserves completion publication and retry cancellation after deletion at %s',
-    async deleteBoundary => {
-      const db = new InMemoryDB();
-      const agent = new MockAgent({ id: 'default' });
-      agent.enqueueRun({ finishReason: 'stop', text: 'answer' });
-      const owner = harnessProcess(db, agent, { finalizer: finalizerAt('1', []) });
-      const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-      const completionEvents: string[] = [];
-      session.subscribe(event => {
-        if (event.type === 'agent_end' || event.type === 'run_completed') completionEvents.push(event.type);
-      });
-      let releaseSave!: () => void;
-      const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
-      let startedSave!: () => void;
-      const saveStarted = new Promise<void>(resolve => (startedSave = resolve));
-      const save = owner.storage.saveRunSummary.bind(owner.storage);
-      owner.storage.saveRunSummary = async input => {
-        startedSave();
-        await saveGate;
-        return save(input);
-      };
-      const message = { content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } };
-      let releaseLoad!: () => void;
-      const loadGate = new Promise<void>(resolve => (releaseLoad = resolve));
-      let startedLoad!: () => void;
-      const loadStarted = new Promise<void>(resolve => (startedLoad = resolve));
-      let holdNextLoad = false;
-      const load = owner.storage.loadMessageResultEvidence.bind(owner.storage);
-      owner.storage.loadMessageResultEvidence = async input => {
-        if (holdNextLoad) {
-          holdNextLoad = false;
-          startedLoad();
-          await loadGate;
-        }
-        return load(input);
-      };
-      try {
-        await expect(session.message(message)).resolves.toMatchObject({ text: 'answer' });
-        await saveStarted;
-        let receipts = 0;
-        let receivedBoth!: () => void;
-        const bothReceived = new Promise<void>(resolve => (receivedBoth = resolve));
-        const retry = () =>
-          session.message({
-            ...message,
-            onTerminalCommit: () => {
-              if (deleteBoundary.startsWith('canonical evidence load')) holdNextLoad = true;
-              if (++receipts === (deleteBoundary === 'none' ? 2 : 1)) receivedBoth();
-            },
-          });
-        const retries = Promise.allSettled(deleteBoundary === 'none' ? [retry(), retry()] : [retry()]);
-        let replies: Awaited<typeof retries> | undefined;
-        void retries.then(outcomes => (replies = outcomes));
-        await bothReceived;
-        // Let both canonical receipt continuations run while the original
-        // summary write is deliberately held, without relying on a time delay.
-        await new Promise<void>(resolve => setImmediate(resolve));
-        if (deleteBoundary !== 'none') {
-          if (deleteBoundary.startsWith('canonical evidence load')) await loadStarted;
-          // Native hard-delete of a closed record must notify retained live
-          // waiters even while unrelated summary storage is unavailable. Use
-          // the real fenced save, so force-delete need not first recover/close
-          // this completed run through the deliberately held publication.
-          const record = await owner.storage.loadSession({ harnessName: 'default', sessionId: session.id });
-          await owner.storage.saveSession(
-            { ...record!, closedAt: Date.now() },
-            { harnessName: 'default', ownerId: owner.harness.ownerId, ifVersion: record!.version },
-          );
-          const externalDelete = deleteBoundary.endsWith('from another process');
-          const deleter = externalDelete ? harnessProcess(db, new MockAgent({ id: 'default' })) : owner;
-          await deleter.harness.deleteSession({ sessionId: session.id, resourceId: 'u1', force: true });
-          if (externalDelete) {
-            // The original Session receives no local deletion notification;
-            // canonical erased evidence and native session lifetime govern it.
-            releaseLoad();
-            releaseSave();
-            await deleter.harness.shutdown();
-          }
-          await vi.waitFor(() => expect(replies).toHaveLength(1), { timeout: 1_000 });
-          const expectedError =
-            deleteBoundary === 'canonical evidence load from another process'
-              ? HarnessMessageResultErasedError
-              : HarnessSessionDeletedError;
-          expect(replies![0]).toMatchObject({ status: 'rejected', reason: expect.any(expectedError) });
-          expect(completionEvents).toEqual(['agent_end', 'run_completed']);
+  ])('preserves completion publication and retry cancellation after deletion at %s', async deleteBoundary => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun({ finishReason: 'stop', text: 'answer' });
+    const owner = harnessProcess(db, agent, { finalizer: finalizerAt('1', []) });
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const completionEvents: string[] = [];
+    session.subscribe(event => {
+      if (event.type === 'agent_end' || event.type === 'run_completed') completionEvents.push(event.type);
+    });
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
+    let startedSave!: () => void;
+    const saveStarted = new Promise<void>(resolve => (startedSave = resolve));
+    const save = owner.storage.saveRunSummary.bind(owner.storage);
+    owner.storage.saveRunSummary = async input => {
+      startedSave();
+      await saveGate;
+      return save(input);
+    };
+    const message = { content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } };
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>(resolve => (releaseLoad = resolve));
+    let startedLoad!: () => void;
+    const loadStarted = new Promise<void>(resolve => (startedLoad = resolve));
+    let holdNextLoad = false;
+    const load = owner.storage.loadMessageResultEvidence.bind(owner.storage);
+    owner.storage.loadMessageResultEvidence = async input => {
+      if (holdNextLoad) {
+        holdNextLoad = false;
+        startedLoad();
+        await loadGate;
+      }
+      return load(input);
+    };
+    try {
+      await expect(session.message(message)).resolves.toMatchObject({ text: 'answer' });
+      await saveStarted;
+      let receipts = 0;
+      let receivedBoth!: () => void;
+      const bothReceived = new Promise<void>(resolve => (receivedBoth = resolve));
+      const retry = () =>
+        session.message({
+          ...message,
+          onTerminalCommit: () => {
+            if (deleteBoundary.startsWith('canonical evidence load')) holdNextLoad = true;
+            if (++receipts === (deleteBoundary === 'none' ? 2 : 1)) receivedBoth();
+          },
+        });
+      const retries = Promise.allSettled(deleteBoundary === 'none' ? [retry(), retry()] : [retry()]);
+      let replies: Awaited<typeof retries> | undefined;
+      void retries.then(outcomes => (replies = outcomes));
+      await bothReceived;
+      // Let both canonical receipt continuations run while the original
+      // summary write is deliberately held, without relying on a time delay.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (deleteBoundary !== 'none') {
+        if (deleteBoundary.startsWith('canonical evidence load')) await loadStarted;
+        // Native hard-delete of a closed record must notify retained live
+        // waiters even while unrelated summary storage is unavailable. Use
+        // the real fenced save, so force-delete need not first recover/close
+        // this completed run through the deliberately held publication.
+        const record = await owner.storage.loadSession({ harnessName: 'default', sessionId: session.id });
+        await owner.storage.saveSession(
+          { ...record!, closedAt: Date.now() },
+          { harnessName: 'default', ownerId: owner.harness.ownerId, ifVersion: record!.version },
+        );
+        const externalDelete = deleteBoundary.endsWith('from another process');
+        const deleter = externalDelete ? harnessProcess(db, new MockAgent({ id: 'default' })) : owner;
+        await deleter.harness.deleteSession({ sessionId: session.id, resourceId: 'u1', force: true });
+        if (externalDelete) {
+          // The original Session receives no local deletion notification;
+          // canonical erased evidence and native session lifetime govern it.
           releaseLoad();
           releaseSave();
-          await new Promise<void>(resolve => setImmediate(resolve));
-          await session._internalFlushRunSummaries();
-          expect(completionEvents).toEqual(['agent_end', 'run_completed']);
-          await expect(
-            owner.storage.loadRunSummary({
-              harnessName: 'default',
-              runId: agent.streamCalls[0]!.options.runId as string,
-            }),
-          ).resolves.toBeNull();
-          return;
+          await deleter.harness.shutdown();
         }
-        releaseSave();
-        await expect(retries).resolves.toMatchObject([
-          { status: 'fulfilled', value: { text: 'answer' } },
-          { status: 'fulfilled', value: { text: 'answer' } },
-        ]);
+        await vi.waitFor(() => expect(replies).toHaveLength(1), { timeout: 1_000 });
+        const expectedError =
+          deleteBoundary === 'canonical evidence load from another process'
+            ? HarnessMessageResultErasedError
+            : HarnessSessionDeletedError;
+        expect(replies![0]).toMatchObject({ status: 'rejected', reason: expect.any(expectedError) });
         expect(completionEvents).toEqual(['agent_end', 'run_completed']);
-        expect(agent.streamCalls).toHaveLength(1);
-      } finally {
         releaseLoad();
         releaseSave();
-        await owner.harness.shutdown();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        await session._internalFlushRunSummaries();
+        expect(completionEvents).toEqual(['agent_end', 'run_completed']);
+        await expect(
+          owner.storage.loadRunSummary({
+            harnessName: 'default',
+            runId: agent.streamCalls[0]!.options.runId as string,
+          }),
+        ).resolves.toBeNull();
+        return;
       }
-    },
-  );
+      releaseSave();
+      await expect(retries).resolves.toMatchObject([
+        { status: 'fulfilled', value: { text: 'answer' } },
+        { status: 'fulfilled', value: { text: 'answer' } },
+      ]);
+      expect(completionEvents).toEqual(['agent_end', 'run_completed']);
+      expect(agent.streamCalls).toHaveLength(1);
+    } finally {
+      releaseLoad();
+      releaseSave();
+      await owner.harness.shutdown();
+    }
+  });
 
   it.each([0, 2])(
     'delivers the same staged completion to an active signal with %i transient staging failures',
@@ -941,6 +938,114 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       await expect(resumer.storage.countUndeliveredTerminalIntents(countFor('1'))).resolves.toBe(0);
     } finally {
       await resumer.harness.shutdown();
+    }
+  });
+
+  it('accounts a staged resumed turn once when it is cancelled before stale-resume recovery', async () => {
+    const db = new InMemoryDB();
+    const calls: FinalizeCall[] = [];
+    const ownerAgent = new MockAgent({ id: 'default' });
+    ownerAgent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-1', toolName: 'shell', args: { cmd: 'ls' } },
+      usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+    });
+    const owner = harnessProcess(db, ownerAgent, { finalizer: finalizerAt('1', calls) });
+    const ownerSession = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await ownerSession.message({
+      content: 'needs approval',
+      admissionId,
+      executionAuthorityGrant: grant,
+      terminalAdmissionSeed: { v: 1 },
+    });
+    await owner.harness.shutdown();
+    const scope = { harnessName: 'default', sessionId: ownerSession.id };
+
+    // The resumed run finishes and stages its output, but its owner stops
+    // before the terminal commit and before any session save of its usage.
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun({
+      finishReason: 'stop',
+      text: 'resumed answer',
+      usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+      totalUsage: { inputTokens: 8, outputTokens: 5, totalTokens: 13 },
+    });
+    const resumer = harnessProcess(db, agent, {
+      finalizer: finalizerAt('2', calls),
+      settleOnly: [finalizerAt('1', calls)],
+    });
+    const resumeSession = await resumer.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
+    resumer.storage.commitTerminalHandoff = async () => {
+      throw new Error('process stopped before the resumed terminal commit');
+    };
+    let stopped = false;
+    const stage = resumer.storage.stageTerminalCompletion.bind(resumer.storage);
+    resumer.storage.stageTerminalCompletion = async input => {
+      const receipt = await stage(input);
+      stopped = true;
+      return receipt;
+    };
+    const save = resumer.storage.saveSession.bind(resumer.storage);
+    resumer.storage.saveSession = async (...args) => {
+      if (stopped) throw new Error('process stopped before saving the resumed usage');
+      return save(...args);
+    };
+    await expect(resumeSession.respondToToolApproval({ approved: true })).rejects.toMatchObject({
+      code: 'harness.terminal_pending',
+    });
+    const pending = await resumer.storage.loadTerminalAdmission({ ...scope, admissionId, executionGrant: grant });
+    await expect(
+      resumer.storage.loadMessageResultEvidence({
+        ...scope,
+        resourceId: 'u1',
+        threadId: ownerSession.threadId,
+        signalId: pending!.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'pending', stagedResult: { text: 'resumed answer' } });
+    await expect(resumer.storage.loadSession(scope)).resolves.toMatchObject({
+      tokenUsage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+    });
+    // A deliberate cancellation lands before any process recovers the turn.
+    await resumer.storage.cancelTerminalHandoff({
+      ...pending!,
+      reason: { code: 'harness.terminal_cancelled', message: 'cancelled deliberately' },
+    });
+    await resumer.harness.shutdown().catch(() => {});
+
+    calls.length = 0;
+    const adopter = await adoptAfterLeaseLapse(db, ownerSession.id, {
+      finalizer: finalizerAt('2', calls),
+      settleOnly: [finalizerAt('1', calls)],
+    });
+    try {
+      await vi.waitFor(async () => expect((await adopter.storage.loadSession(scope))?.pendingResume).toBeUndefined());
+      // Cancellation prevents delivery, never the consumed resumed usage.
+      expect(calls).toEqual([]);
+      await expect(
+        adopter.storage.loadMessageResultEvidence({
+          ...scope,
+          resourceId: 'u1',
+          threadId: ownerSession.threadId,
+          signalId: pending!.signalId,
+        }),
+      ).resolves.toMatchObject({ status: 'failed' });
+      await expect(adopter.storage.loadSession(scope)).resolves.toMatchObject({
+        tokenUsage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
+      });
+      expect(adopter.agent.resumeCalls).toHaveLength(0);
+    } finally {
+      await adopter.harness.shutdown();
+    }
+    const fresh = await adoptAfterLeaseLapse(db, ownerSession.id, {
+      finalizer: finalizerAt('2', calls),
+      settleOnly: [finalizerAt('1', calls)],
+    });
+    try {
+      await expect(fresh.storage.loadSession(scope)).resolves.toMatchObject({
+        tokenUsage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
+      });
+    } finally {
+      await fresh.harness.shutdown();
     }
   });
 

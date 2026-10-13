@@ -4008,6 +4008,10 @@ export class Session {
     });
     // A lost CAS means the dispatch changed or the lease moved: its new owner
     // settles and reports the turn.
+    if (swapped.applied) {
+      this._terminalTokenAccountedRunIds.delete(runId);
+      this._stagedTerminalRunIds.delete(runId);
+    }
     return swapped.applied;
   }
 
@@ -4019,6 +4023,11 @@ export class Session {
    * duplicate publication. A missing summary fails recovery explicitly.
    */
   private async _publishRecoveredRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
+    // Another storage owner's hard delete erases the completed result; this
+    // retained Session may never observe that deletion locally.
+    if (evidence.status === 'completed' && evidence.erased === true) {
+      throw new HarnessMessageResultErasedError(this.id, evidence.signalId);
+    }
     const runId = evidence.runId!;
     const full = evidence.status === 'completed' ? (evidence.result as FullOutput<unknown> | undefined) : undefined;
     const summary = { harnessName: this._record.harnessName, runId };
@@ -4031,6 +4040,12 @@ export class Session {
       // Wait for that acknowledged outcome before deciding to republish.
     } while (persistence !== this._runSummaryPersistence);
     this._assertNotDeleted();
+    // The summary may be missing because another owner deleted the session
+    // while this publication waited; never emit for a deleted session.
+    const stored = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: this.id });
+    if (stored === null || stored.sessionIncarnation !== this._record.sessionIncarnation) {
+      throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
+    }
     const modeId = evidence.modeId ?? this._record.modeId;
     this._recoveredRunIdentities.set(runId, {
       resourceId: this.resourceId,
@@ -4113,8 +4128,13 @@ export class Session {
       if (tokenUsageAccounted) await this._persistTokenUsageOrLatch();
     }
     if (admission.status !== 'pending') {
-      this._terminalTokenAccountedRunIds.delete(runId);
-      this._stagedTerminalRunIds.delete(runId);
+      // A cancelled admission does not settle its evidence. Keep the usage
+      // fence until the canonical evidence is terminal, or a restart would
+      // account the still-staged output again.
+      if (admission.status === 'committed') {
+        this._terminalTokenAccountedRunIds.delete(runId);
+        this._stagedTerminalRunIds.delete(runId);
+      }
       return 'unowned';
     }
     // Settle under the finalizer the turn was admitted with — the primary or a
@@ -4684,6 +4704,8 @@ export class Session {
       }
       return false;
     }
+
+    await this._accountStagedResumeUsage(recoveringPending);
 
     if (recoveringQueuedItemId !== undefined) {
       const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
@@ -8189,8 +8211,10 @@ export class Session {
         runId,
       });
       if (admission?.status === 'pending') {
-        // A process may have died after committing a prior completion but
-        // before its next session save removed that usage fence.
+        // A process may have died after settling a prior completion but
+        // before its next session save removed that usage fence. Only
+        // terminal canonical evidence retires a fence: a cancelled admission
+        // can leave its staged evidence pending for recovery.
         for (const accountedRunId of this._terminalTokenAccountedRunIds) {
           if (accountedRunId === runId) continue;
           const prior = await this._storage.loadTerminalAdmissionByRun({
@@ -8199,7 +8223,18 @@ export class Session {
             sessionIncarnation,
             runId: accountedRunId,
           });
-          if (prior !== null && prior.status !== 'pending') this._terminalTokenAccountedRunIds.delete(accountedRunId);
+          if (prior === null || prior.status === 'pending') continue;
+          if (prior.status !== 'committed') {
+            const evidence = await this._storage.loadMessageResultEvidence({
+              harnessName: this._record.harnessName,
+              sessionId: this.id,
+              resourceId: this.resourceId,
+              threadId: this.threadId,
+              signalId: prior.signalId,
+            });
+            if (evidence !== null && 'status' in evidence && evidence.status === 'pending') continue;
+          }
+          this._terminalTokenAccountedRunIds.delete(accountedRunId);
         }
         const receipt = await this._storage.stageTerminalCompletion({ identity: admission, result: full });
         if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
@@ -10693,6 +10728,53 @@ export class Session {
     const admission = await this._probeResumeAdmissionByRun(pending);
     if (!admission) return;
     await this._commitTerminalHandoff(admission, full, options);
+  }
+
+  /**
+   * Stale-resume recovery terminalizes a resumed turn without delivering its
+   * reply, but the resumed run may already have staged completed output and
+   * consumed tokens. Account that usage against the parked generation's
+   * durable baseline before any evidence rewrite: the persisted flush folds
+   * the advanced baseline into the still-parked pending, so a retried
+   * recovery computes a zero delta.
+   */
+  private async _accountStagedResumeUsage(pending: PendingResume): Promise<void> {
+    const admission = await this._probeResumeAdmissionByRun(pending);
+    if (!admission) return;
+    const stored = await this._storage.loadMessageResultEvidence({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      signalId: admission.signalId,
+    });
+    if (
+      stored === null ||
+      !('status' in stored) ||
+      stored.status !== 'pending' ||
+      stored.stagedResult === undefined ||
+      stored.runId !== pending.runId
+    ) {
+      return;
+    }
+    const generationKey = pendingInteractionGenerationKey({
+      kind: pending.kind,
+      itemId: pending.itemId,
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      requestedAt: pending.requestedAt,
+    });
+    // This process already accounted the run; its armed fence persists it.
+    if (this._resumeUsageBaseline?.generationKey === generationKey) return;
+    const full = stored.stagedResult as FullOutput<unknown>;
+    const delta = this._recordTurnCompletion(full, {
+      persist: false,
+      accountedCumulative: pending.accountedTokenUsage,
+    });
+    this._messageTokenAccountedRunIds.add(pending.runId);
+    const runUsage = this._tokenUsageDeltaFromFullOutput(full);
+    if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
+    if (delta !== undefined) await this._persistTokenUsageOrLatch();
   }
 
   /**
