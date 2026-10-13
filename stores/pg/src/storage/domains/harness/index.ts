@@ -194,6 +194,7 @@ import type {
   HarnessTerminalAckReceipt,
   HarnessTerminalAdmissionInput,
   HarnessPendingTerminalAdmissionLoadInput,
+  HarnessTerminalFinalizerCountInput,
   HarnessTerminalAdmissionLoadInput,
   HarnessTerminalAdmissionReceipt,
   HarnessTerminalCancelInput,
@@ -839,6 +840,14 @@ function harnessIndexName(schemaPrefix: string, baseName: string): string {
  * immutable external byte reference; the native operation table records
  * upload and cleanup outcomes.
  */
+function assertTerminalFinalizerCountInput(input: HarnessTerminalFinalizerCountInput): void {
+  for (const field of ['finalizerId', 'finalizerVersion'] as const) {
+    if (typeof input[field] !== 'string' || input[field].length === 0) {
+      throw new HarnessTerminalHandoffValidationError(field, 'must be a non-empty string');
+    }
+  }
+}
+
 export class HarnessPG extends HarnessStorage {
   #db: PgDB;
   #client: PgHarnessClient;
@@ -5555,6 +5564,41 @@ export class HarnessPG extends HarnessStorage {
       args: [harnessName, input.sessionId, input.sessionIncarnation, input.runId],
     });
     return result.rows[0] ? rowToHarnessTerminalAdmission(result.rows[0] as Record<string, unknown>) : null;
+  }
+
+  /**
+   * Served by the `harness_name` prefix of the existing admission indexes, so
+   * no schema change is needed: it is an operator drain read, not a hot path.
+   */
+  async countPendingTerminalAdmissions(input: HarnessTerminalFinalizerCountInput): Promise<number> {
+    this.#assertTerminalHandoffEnabled();
+    assertTerminalFinalizerCountInput(input);
+    await this.#ensureTerminalHandoffTables();
+    const harnessName = this.#resolveHarnessName(input.harnessName);
+    const result = await this.#client.execute({
+      sql: `SELECT COUNT(*) AS pending FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}
+            WHERE harness_name = ? AND status = 'pending' AND finalizer_id = ? AND finalizer_version = ?`,
+      args: [harnessName, input.finalizerId, input.finalizerVersion],
+    });
+    return Number((result.rows[0] as Record<string, unknown> | undefined)?.pending ?? 0);
+  }
+
+  /**
+   * Served by the `(harness_name, status, next_attempt_at)` claim index; an
+   * operator drain read, so it needs no schema change.
+   */
+  async countUndeliveredTerminalIntents(input: HarnessTerminalFinalizerCountInput): Promise<number> {
+    this.#assertTerminalHandoffEnabled();
+    assertTerminalFinalizerCountInput(input);
+    await this.#ensureTerminalHandoffTables();
+    const harnessName = this.#resolveHarnessName(input.harnessName);
+    const result = await this.#client.execute({
+      sql: `SELECT COUNT(*) AS undelivered FROM ${TABLE_HARNESS_TERMINAL_INTENTS}
+            WHERE harness_name = ? AND status IN ('pending', 'claimed', 'failed')
+              AND finalizer_id = ? AND finalizer_version = ?`,
+      args: [harnessName, input.finalizerId, input.finalizerVersion],
+    });
+    return Number((result.rows[0] as Record<string, unknown> | undefined)?.undelivered ?? 0);
   }
 
   async commitTerminalHandoff(input: {

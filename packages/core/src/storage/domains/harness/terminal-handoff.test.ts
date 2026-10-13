@@ -423,6 +423,93 @@ describe('native chat terminal handoff', () => {
     ).resolves.toMatchObject({ intents: [] });
   });
 
+  it('counts pending admissions and undelivered intents per finalizer id@version for the drain', async () => {
+    const storage = new InMemoryHarness({
+      db: new InMemoryDB(),
+      terminalHandoff: { enabled: true, maxAttempts: 2 },
+    });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const turn = (tag: string, finalizerVersion: string): HarnessTerminalAdmissionInput => ({
+      ...admission(),
+      admissionId: `admission-${tag}`,
+      admissionHash: `admission-hash-${tag}`,
+      signalId: `signal-${tag}`,
+      runId: `run-${tag}`,
+      executionGrant: { key: `grant-${tag}`, generation: 1 },
+      finalizerVersion,
+    });
+    const v1 = { harnessName: 'default', finalizerId: 'doxa.chat', finalizerVersion: '1' };
+    const v2 = { ...v1, finalizerVersion: '2' };
+    const delivered = turn('delivered', '1');
+    for (const input of [delivered, turn('waiting', '1'), turn('next', '2')]) {
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      await storage.admitTerminalHandoff(input);
+    }
+    await expect(storage.countPendingTerminalAdmissions(v1)).resolves.toBe(2);
+    await expect(storage.countPendingTerminalAdmissions(v2)).resolves.toBe(1);
+    await expect(storage.countPendingTerminalAdmissions({ ...v1, finalizerId: 'other' })).resolves.toBe(0);
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await storage.commitTerminalHandoff({
+      admission: delivered,
+      resultEvidence: {
+        ...pendingEvidence(delivered),
+        status: 'completed',
+        result: { text: 'done' },
+        updatedAt: 3_000,
+      },
+      terminalResult: { status: 'completed', runId: delivered.runId, completedAt: 3_000 },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-delivered', payload: {} },
+    });
+    // The committed admission leaves the admission count but its intent is
+    // still owed to a consumer: pending, claimed, then retryably failed.
+    await expect(storage.countPendingTerminalAdmissions(v1)).resolves.toBe(1);
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    await expect(storage.countUndeliveredTerminalIntents(v2)).resolves.toBe(0);
+    const claimed = (
+      await storage.claimTerminalIntents({ harnessName: 'default', consumerId: 'worker-a', limit: 1, now: 4_000 })
+    ).intents[0]!;
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const claim = {
+      harnessName: claimed.harnessName,
+      intentId: claimed.id,
+      sessionId: claimed.sessionId,
+      sessionIncarnation: claimed.sessionIncarnation,
+      revision: claimed.revision,
+      payloadHash: claimed.projection.payloadHash,
+      claimId: claimed.claimId!,
+      consumerId: 'worker-a',
+    };
+    const failed = await storage.failTerminalIntent({
+      ...claim,
+      now: 5_000,
+      error: { code: 'delivery_failed', message: 'sink unavailable' },
+    });
+    expect(failed.status).toBe('failed');
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const reclaimed = (
+      await storage.claimTerminalIntents({
+        harnessName: 'default',
+        consumerId: 'worker-a',
+        limit: 1,
+        now: failed.intent.nextAttemptAt!,
+      })
+    ).intents[0]!;
+    await storage.ackTerminalIntent({ ...claim, claimId: reclaimed.claimId!, now: failed.intent.nextAttemptAt! + 1 });
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await expect(storage.countPendingTerminalAdmissions({ ...v1, finalizerVersion: '' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffValidationError,
+    );
+    const disabled = new InMemoryHarness({ db: new InMemoryDB() });
+    await expect(disabled.countPendingTerminalAdmissions(v1)).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffUnsupportedError,
+    );
+    await expect(disabled.countUndeliveredTerminalIntents(v1)).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffUnsupportedError,
+    );
+  });
+
   it('rejects a terminal commit when pending capacity is exhausted and lets it retry after drain', async () => {
     const storage = new InMemoryHarness({
       db: new InMemoryDB(),

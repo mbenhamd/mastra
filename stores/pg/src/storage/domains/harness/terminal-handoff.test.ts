@@ -801,6 +801,53 @@ describe('HarnessPG native terminal handoff', () => {
     ).resolves.toMatchObject({ intents: [] });
   });
 
+  it('counts pending admissions and undelivered intents per finalizer id@version for the drain', async () => {
+    const session = await createNativeSession(harness(), 'session-drain-count');
+    const v1 = { harnessName: HARNESS, finalizerId: 'doxa.chat', finalizerVersion: '1' };
+    const v2 = { ...v1, finalizerVersion: '2' };
+    const settled = admissionFor(session, 'drain-settled');
+    const turns = [settled, admissionFor(session, 'drain-waiting'), { ...admissionFor(session, 'drain-next'), ...v2 }];
+    for (const input of turns) {
+      await harness().writeMessageResultEvidence(pendingEvidence(input));
+      await harness().admitTerminalHandoff(input);
+    }
+    await expect(harness().countPendingTerminalAdmissions(v1)).resolves.toBe(2);
+    await expect(harness().countPendingTerminalAdmissions(v2)).resolves.toBe(1);
+    await expect(harness().countPendingTerminalAdmissions({ ...v1, harnessName: 'other' })).resolves.toBe(0);
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await harness().commitTerminalHandoff(commitInput(settled, 'drain-settled'));
+    // The committed admission leaves the admission count; its intent is still
+    // owed to a consumer while pending, claimed or retryably failed.
+    await expect(harness().countPendingTerminalAdmissions(v1)).resolves.toBe(1);
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    await expect(harness().countUndeliveredTerminalIntents(v2)).resolves.toBe(0);
+
+    const t0 = Date.now();
+    const first = await claimFirst(harness(), 'worker-a', t0);
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const failed = await harness().failTerminalIntent({
+      ...claimIdentityOf(first, 'worker-a'),
+      error: { code: 'delivery_failed', message: 'sink unavailable' },
+      now: t0 + 10,
+    });
+    expect(failed.status).toBe('failed');
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const second = await claimFirst(harness(), 'worker-a', failed.intent.nextAttemptAt! + 1);
+    const dead = await harness().failTerminalIntent({
+      ...claimIdentityOf(second, 'worker-a'),
+      error: { code: 'delivery_failed', message: 'still down' },
+      now: failed.intent.nextAttemptAt! + 2,
+    });
+    // A dead intent is no longer deliverable; the operator handles it apart.
+    expect(dead.status).toBe('dead');
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await expect(harness().countUndeliveredTerminalIntents({ ...v1, finalizerId: '' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffValidationError,
+    );
+  });
+
   it('enforces the configured pending-intent bound across sessions', async () => {
     const bounded = terminalStore('pg-harness-terminal-capacity-store', schemaName, {
       maxPendingIntents: 1,

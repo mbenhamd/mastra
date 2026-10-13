@@ -1151,7 +1151,20 @@ export interface HarnessConfigCommon {
      * admission/result/intent transaction; the callback only sanitizes the
      * bounded product projection immediately before that commit. */
     terminalHandoff?: {
+      /** Admits every new terminal turn and settles turns admitted under it. */
       finalizer: HarnessTerminalFinalizer;
+      /**
+       * Finalizers this process may settle but never admits under — for
+       * draining turns admitted under a previous finalizer version after
+       * `finalizer` moves to a new one. A pending turn is settled by the
+       * registration matching its recorded id and version; a turn whose
+       * id@version is registered neither here nor as `finalizer` stays
+       * pending. Each entry is validated like `finalizer`, and an id@version
+       * registered twice (including one equal to `finalizer`) is rejected.
+       * Drop an entry only once `countPendingTerminalAdmissions` reports none
+       * pending for it.
+       */
+      settleOnly?: readonly HarnessTerminalFinalizer[];
     };
 
     /**

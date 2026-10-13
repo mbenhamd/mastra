@@ -277,6 +277,17 @@ export interface HarnessPendingTerminalAdmissionLoadInput {
   sessionIncarnation: string;
 }
 
+/**
+ * Select one finalizer id@version for the drain reads
+ * (`countPendingTerminalAdmissions`, `countUndeliveredTerminalIntents`) an
+ * operator checks before dropping a settle-only finalizer.
+ */
+export interface HarnessTerminalFinalizerCountInput {
+  harnessName?: string;
+  finalizerId: string;
+  finalizerVersion: string;
+}
+
 export interface HarnessTerminalIntentLoadInput {
   harnessName: string;
   intentId: string;

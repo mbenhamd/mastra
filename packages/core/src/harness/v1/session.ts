@@ -1555,6 +1555,16 @@ export interface SessionInternals {
   persistTransientStreamingEvents?: boolean;
   /** Opt-in terminal sanitizer; commit remains owned by HarnessStorage. */
   terminalFinalizer?: HarnessTerminalFinalizer;
+  /**
+   * Finalizers that settle turns admitted under their id@version but never
+   * admit new turns (`sessions.terminalHandoff.settleOnly`).
+   */
+  terminalSettleOnlyFinalizers?: readonly HarnessTerminalFinalizer[];
+}
+
+/** Lookup key for a terminal finalizer registration by its id and version. */
+export function terminalFinalizerKey(id: string, version: string): string {
+  return JSON.stringify([id, version]);
 }
 
 function normalizeSessionLogicalMessageIdentity(
@@ -1945,6 +1955,12 @@ export class Session {
   private readonly _persistTransientStreamingEvents: boolean;
   /** Registered opt-in sanitizer for the native terminal transaction. */
   private readonly _terminalFinalizer?: HarnessTerminalFinalizer;
+  /**
+   * Every finalizer that may settle a pending admission, keyed by id@version:
+   * the primary plus the settle-only registrations. Admission stamps only the
+   * primary.
+   */
+  private readonly _terminalFinalizersByIdentity = new Map<string, HarnessTerminalFinalizer>();
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
   /** Serializes terminal evidence + event projection for one admitted signal. */
@@ -2063,6 +2079,38 @@ export class Session {
       ) {
         throw new HarnessTerminalHandoffValidationError('terminalHandoff.finalizer', 'id and version are required');
       }
+      this._terminalFinalizersByIdentity.set(
+        terminalFinalizerKey(this._terminalFinalizer.id, this._terminalFinalizer.version),
+        this._terminalFinalizer,
+      );
+    }
+    for (const settleOnly of internals.terminalSettleOnlyFinalizers ?? []) {
+      if (this._terminalFinalizer === undefined) {
+        throw new HarnessTerminalHandoffValidationError(
+          'terminalHandoff.settleOnly',
+          'requires a primary terminalHandoff.finalizer',
+        );
+      }
+      if (
+        typeof settleOnly?.id !== 'string' ||
+        settleOnly.id.length === 0 ||
+        typeof settleOnly.version !== 'string' ||
+        settleOnly.version.length === 0 ||
+        typeof settleOnly.finalize !== 'function'
+      ) {
+        throw new HarnessTerminalHandoffValidationError(
+          'terminalHandoff.settleOnly',
+          'id, version, and a finalize callback are required',
+        );
+      }
+      const key = terminalFinalizerKey(settleOnly.id, settleOnly.version);
+      if (this._terminalFinalizersByIdentity.has(key)) {
+        throw new HarnessTerminalHandoffValidationError(
+          'terminalHandoff.settleOnly',
+          `terminal finalizer ${settleOnly.id}@${settleOnly.version} is registered more than once`,
+        );
+      }
+      this._terminalFinalizersByIdentity.set(key, settleOnly);
     }
     this._emitter = new EventEmitter(
       { sessionId: this.id },
@@ -4017,12 +4065,10 @@ export class Session {
     ) {
       return 'unowned';
     }
-    const finalizer = this._terminalFinalizer;
-    if (
-      finalizer === undefined ||
-      finalizer.id !== admission.finalizerId ||
-      finalizer.version !== admission.finalizerVersion
-    ) {
+    // Settle under the finalizer the turn was admitted with — the primary or a
+    // settle-only registration of a previous version.
+    const finalizer = this._terminalFinalizerFor(admission.finalizerId, admission.finalizerVersion);
+    if (finalizer === undefined) {
       console.error(
         `[harness/v1] orphaned terminal admission for run "${runId}" left pending: the admitted finalizer ${admission.finalizerId}@${admission.finalizerVersion} is not registered`,
       );
@@ -10994,6 +11040,11 @@ export class Session {
     };
   }
 
+  /** The registration that settles a turn admitted under `id@version`, if any. */
+  private _terminalFinalizerFor(id: string, version: string): HarnessTerminalFinalizer | undefined {
+    return this._terminalFinalizersByIdentity.get(terminalFinalizerKey(id, version));
+  }
+
   private async _admitTerminalHandoff(
     identity: HarnessTerminalIdentity,
     seed: JsonValue,
@@ -11339,16 +11390,19 @@ export class Session {
     if (finalizer === undefined) {
       return reportFailure(new HarnessTerminalHandoffValidationError('terminalHandoff', 'finalizer is not registered'));
     }
-    if (finalizer.id !== admission.finalizerId || finalizer.version !== admission.finalizerVersion) {
+    // Settle under the finalizer the turn was admitted with: the primary or a
+    // settle-only registration of a previous version.
+    const admittedFinalizer = this._terminalFinalizerFor(admission.finalizerId, admission.finalizerVersion);
+    if (admittedFinalizer === undefined) {
       return reportFailure(
         new Error(
-          `registered terminal finalizer ${finalizer.id}@${finalizer.version} does not match the admitted finalizer ${admission.finalizerId}@${admission.finalizerVersion}`,
+          `registered terminal finalizer ${finalizer.id}@${finalizer.version} does not match the admitted finalizer ${admission.finalizerId}@${admission.finalizerVersion}, and no settle-only finalizer is registered for it`,
         ),
       );
     }
     let projection: HarnessTerminalProjection;
     try {
-      projection = await finalizer.finalize({
+      projection = await admittedFinalizer.finalize({
         identity,
         seed: admission.seed,
         finalizerId: admission.finalizerId,

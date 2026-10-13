@@ -88,6 +88,7 @@ import type {
   HarnessTerminalAckReceipt,
   HarnessTerminalAdmissionInput,
   HarnessPendingTerminalAdmissionLoadInput,
+  HarnessTerminalFinalizerCountInput,
   HarnessTerminalAdmissionLoadInput,
   HarnessTerminalAdmissionRecord,
   HarnessTerminalAdmissionReceipt,
@@ -218,6 +219,14 @@ import type {
  * treat returned `SessionRecord`s as read-only and pass a fresh object to
  * `saveSession` for updates. This matches the pattern used by `InMemoryMemory`.
  */
+function assertTerminalFinalizerCountInput(input: HarnessTerminalFinalizerCountInput): void {
+  for (const field of ['finalizerId', 'finalizerVersion'] as const) {
+    if (typeof input[field] !== 'string' || input[field].length === 0) {
+      throw new HarnessTerminalHandoffValidationError(field, 'must be a non-empty string');
+    }
+  }
+}
+
 export class InMemoryHarness extends HarnessStorage {
   private db: InMemoryDB;
   private readonly harnessName: string;
@@ -1853,6 +1862,42 @@ export class InMemoryHarness extends HarnessStorage {
       }
     }
     return null;
+  }
+
+  async countPendingTerminalAdmissions(input: HarnessTerminalFinalizerCountInput): Promise<number> {
+    this.assertTerminalHandoffEnabled();
+    assertTerminalFinalizerCountInput(input);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    let pending = 0;
+    for (const admission of this.db.harnessTerminalAdmissions.values()) {
+      if (
+        admission.harnessName === namespace &&
+        admission.status === 'pending' &&
+        admission.finalizerId === input.finalizerId &&
+        admission.finalizerVersion === input.finalizerVersion
+      ) {
+        pending += 1;
+      }
+    }
+    return pending;
+  }
+
+  async countUndeliveredTerminalIntents(input: HarnessTerminalFinalizerCountInput): Promise<number> {
+    this.assertTerminalHandoffEnabled();
+    assertTerminalFinalizerCountInput(input);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    let undelivered = 0;
+    for (const intent of this.db.harnessTerminalIntents.values()) {
+      if (
+        intent.harnessName === namespace &&
+        (intent.status === 'pending' || intent.status === 'claimed' || intent.status === 'failed') &&
+        intent.finalizerId === input.finalizerId &&
+        intent.finalizerVersion === input.finalizerVersion
+      ) {
+        undelivered += 1;
+      }
+    }
+    return undelivered;
   }
 
   async commitTerminalHandoff(input: {

@@ -101,7 +101,7 @@ import type { HarnessSessionDeleteBlocker } from './errors';
 import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
 import { DEFAULT_PLAN_TASK_DELEGATION_TIMEOUT_MS } from './plan-task-session';
-import { Session } from './session';
+import { Session, terminalFinalizerKey } from './session';
 import type {
   AttachmentDeleteOptions,
   AttachmentRef,
@@ -180,6 +180,29 @@ const EVICTION_FLUSH_DRAIN_BUDGET_MS = 5_000;
 const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
 const DEFAULT_GOAL_MAX_TURNS = 50;
 const DEFAULT_PERMISSION_POLICY: PermissionPolicy = 'ask';
+
+/** A terminal finalizer registration needs a non-empty id and version and a finalize callback. */
+function assertTerminalFinalizerRegistration(
+  finalizer: unknown,
+  field: string,
+): asserts finalizer is import('../../storage/domains/harness').HarnessTerminalFinalizer {
+  const candidate = finalizer as Partial<import('../../storage/domains/harness').HarnessTerminalFinalizer> | null;
+  if (
+    candidate === undefined ||
+    candidate === null ||
+    typeof candidate !== 'object' ||
+    typeof candidate.id !== 'string' ||
+    candidate.id.length === 0 ||
+    typeof candidate.version !== 'string' ||
+    candidate.version.length === 0 ||
+    typeof candidate.finalize !== 'function'
+  ) {
+    throw new HarnessConfigError(
+      field,
+      'must be a terminal finalizer with a non-empty id, a non-empty version, and a finalize callback',
+    );
+  }
+}
 
 function isPendingInteractionExpiryGeneration(value: unknown): value is PendingInteractionExpiryGeneration {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -979,6 +1002,7 @@ export class Harness {
    */
   private readonly _onBeforeToolExecution: NonNullable<HarnessConfig['sessions']>['onBeforeToolExecution'];
   private readonly _terminalFinalizer?: import('../../storage/domains/harness').HarnessTerminalFinalizer;
+  private readonly _terminalSettleOnlyFinalizers?: readonly import('../../storage/domains/harness').HarnessTerminalFinalizer[];
   private readonly _closeTimeoutMs: number;
   private readonly _pendingInteractionTtlMs: number;
   /** Validated per-kind TTL overrides; kinds absent here use the default. */
@@ -1090,22 +1114,29 @@ export class Harness {
     const terminalHandoff = config.sessions?.terminalHandoff;
     if (terminalHandoff !== undefined) {
       const finalizer = terminalHandoff.finalizer;
-      if (
-        finalizer === undefined ||
-        finalizer === null ||
-        typeof finalizer !== 'object' ||
-        typeof finalizer.id !== 'string' ||
-        finalizer.id.length === 0 ||
-        typeof finalizer.version !== 'string' ||
-        finalizer.version.length === 0 ||
-        typeof finalizer.finalize !== 'function'
-      ) {
-        throw new HarnessConfigError(
-          'sessions.terminalHandoff.finalizer',
-          'must be a terminal finalizer with a non-empty id, a non-empty version, and a finalize callback',
-        );
+      assertTerminalFinalizerRegistration(finalizer, 'sessions.terminalHandoff.finalizer');
+      // Settle-only finalizers drain turns admitted under a previous finalizer
+      // version; admission always stamps the primary. Each id@version settles
+      // through exactly one registration, so a repeat is a configuration error.
+      const settleOnly = terminalHandoff.settleOnly;
+      if (settleOnly !== undefined && !Array.isArray(settleOnly)) {
+        throw new HarnessConfigError('sessions.terminalHandoff.settleOnly', 'must be an array of terminal finalizers');
+      }
+      const registered = new Set<string>([terminalFinalizerKey(finalizer.id, finalizer.version)]);
+      for (const [index, entry] of (settleOnly ?? []).entries()) {
+        const field = `sessions.terminalHandoff.settleOnly[${index}]`;
+        assertTerminalFinalizerRegistration(entry, field);
+        const key = terminalFinalizerKey(entry.id, entry.version);
+        if (registered.has(key)) {
+          throw new HarnessConfigError(
+            field,
+            `registers terminal finalizer ${entry.id}@${entry.version} more than once`,
+          );
+        }
+        registered.add(key);
       }
       this._terminalFinalizer = finalizer;
+      this._terminalSettleOnlyFinalizers = settleOnly === undefined ? undefined : [...settleOnly];
     }
     this._lockRenewMs = config.sessions?.lockRenewMs ?? DEFAULT_LEASE_RENEW_MS;
     if (!Number.isInteger(this._lockRenewMs) || this._lockRenewMs < 1 || this._lockRenewMs >= this._leaseTtlMs) {
@@ -4632,6 +4663,7 @@ export class Harness {
       eventReplaySeed: opts.eventReplaySeed,
       persistTransientStreamingEvents: this._persistTransientStreamingEvents,
       terminalFinalizer: this._terminalFinalizer,
+      terminalSettleOnlyFinalizers: this._terminalSettleOnlyFinalizers,
     });
     if (workspaceLost) session._markWorkspaceLost();
 
@@ -5004,6 +5036,7 @@ export class Harness {
         eventReplaySeed: await this._eventReplaySeedFor(storage, record),
         persistTransientStreamingEvents: this._persistTransientStreamingEvents,
         terminalFinalizer: this._terminalFinalizer,
+        terminalSettleOnlyFinalizers: this._terminalSettleOnlyFinalizers,
       });
       bridge = transientSession._subscribeInternal(event => this._emitter.forward(event));
       await transientSession._internalExpirePendingInteractionGeneration(generation, { drainQueue: false });
