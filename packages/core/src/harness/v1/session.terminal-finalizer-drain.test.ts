@@ -441,6 +441,72 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     }
   });
 
+  it('delivers the same staged completion to an active signal whose acceptance finishes during staging', async () => {
+    const db = new InMemoryDB();
+    const agent = new MockAgent({ id: 'default' });
+    let releaseRun!: () => void;
+    agent.enqueueRun({ text: 'shared answer', holdUntil: new Promise<void>(resolve => (releaseRun = resolve)) });
+    const owner = harnessProcess(db, agent, { finalizer: finalizerAt('1', []) });
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    let releaseAcceptance!: () => void;
+    const acceptanceGate = new Promise<void>(resolve => (releaseAcceptance = resolve));
+    let startedAcceptance!: () => void;
+    const acceptanceStarted = new Promise<void>(resolve => (startedAcceptance = resolve));
+    const swap = owner.storage.compareAndSwapSignalDispatch.bind(owner.storage);
+    owner.storage.compareAndSwapSignalDispatch = async input => {
+      if (input.operationKind !== 'message' && input.next.state === 'accepted') {
+        startedAcceptance();
+        await acceptanceGate;
+      }
+      return swap(input);
+    };
+    let releaseStage!: () => void;
+    const stageGate = new Promise<void>(resolve => (releaseStage = resolve));
+    let startedStage!: () => void;
+    const stageStarted = new Promise<void>(resolve => (startedStage = resolve));
+    const stage = owner.storage.stageTerminalCompletion.bind(owner.storage);
+    owner.storage.stageTerminalCompletion = async input => {
+      startedStage();
+      await stageGate;
+      return stage(input);
+    };
+    try {
+      const turn = session.message({
+        content: 'hi',
+        admissionId,
+        executionAuthorityGrant: grant,
+        terminalAdmissionSeed: { v: 1 },
+      });
+      void turn.catch(() => {});
+      await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
+      const signal = session.signal({ content: 'steer the same run', admissionId: 'signal-during-stage' });
+      void signal.catch(() => {});
+      await acceptanceStarted;
+      releaseRun();
+      await stageStarted;
+      const runId = agent.streamCalls[0]!.options.runId as string;
+      await vi.waitFor(() => expect(agent.getRunOutput(runId)).toBeUndefined());
+      releaseAcceptance();
+      const handle = await signal;
+      expect(handle).toMatchObject({ accepted: true, willInterleave: true, runId });
+      let delivered: unknown;
+      void handle.result.then(
+        full => (delivered = full),
+        error => (delivered = error),
+      );
+      expect(delivered).toBeUndefined();
+      releaseStage();
+      await expect(turn).resolves.toMatchObject({ text: 'shared answer', runId });
+      await vi.waitFor(() => expect(delivered).toMatchObject({ text: 'shared answer', runId }));
+      expect(agent.streamCalls.filter(call => call.options.runId === runId)).toHaveLength(1);
+    } finally {
+      releaseRun();
+      releaseAcceptance();
+      releaseStage();
+      await owner.harness.shutdown({ drainTimeoutMs: 1_000 }).catch(() => {});
+    }
+  });
+
   it('leaves an orphaned turn pending when its admitted version is not registered', async () => {
     const db = new InMemoryDB();
     const calls: FinalizeCall[] = [];

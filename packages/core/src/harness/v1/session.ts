@@ -8109,10 +8109,12 @@ export class Session {
    */
   private async _handleRunTerminal(runId: string, out: MastraModelOutput<unknown>): Promise<void> {
     const waiter = this._runCompletionPromises.get(runId);
-    this._runCompletionPromises.delete(runId);
+    // Share this waiter through output collection and durable staging: the
+    // runtime may already have cleared its output when another caller joins.
     const cached = this._completedRuns.get(runId);
     if (cached && !cached.ok) {
       this._runToolReceipts.delete(runId);
+      this._runCompletionPromises.delete(runId);
       if (waiter) waiter.reject(cached.err);
       return;
     }
@@ -8131,6 +8133,7 @@ export class Session {
       const runFailed = !aborted && out.status === 'failed' && out.error !== undefined && out.error === err;
       this._runToolReceipts.delete(runId);
       this._rememberCompletedRun(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
+      this._runCompletionPromises.delete(runId);
       if (waiter) waiter.reject(err);
       return;
     }
@@ -8153,6 +8156,8 @@ export class Session {
       // delivering completion or accounting usage.
       this._rememberCompletedRun(runId, full === undefined ? { ok: false, err } : { ok: true, full });
       if (waiter) waiter.reject(err);
+    } finally {
+      if (this._runCompletionPromises.get(runId) === waiter) this._runCompletionPromises.delete(runId);
     }
   }
 
