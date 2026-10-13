@@ -870,6 +870,19 @@ describe('HarnessPG native terminal handoff', () => {
       status: 'pending',
       stagedResult: output,
     });
+    // Accounting and its pending-run fence round-trip in the same native
+    // session save, with no marker mixed into the public token counters.
+    await harness().saveSession(
+      {
+        ...session,
+        tokenUsage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
+        accountedTerminalRunIds: [input.runId],
+      },
+      { ownerId: session.ownerId, ifVersion: session.version },
+    );
+    const accounted = await harness().loadSession({ harnessName: HARNESS, sessionId: session.id });
+    expect(accounted?.tokenUsage).toEqual({ promptTokens: 8, completionTokens: 5, totalTokens: 13 });
+    expect(accounted?.accountedTerminalRunIds).toEqual([input.runId]);
     // A pending rewrite of the row keeps the staged output.
     await harness().writeMessageResultEvidence(pendingEvidence(input));
     await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({ stagedResult: output });
@@ -908,6 +921,36 @@ describe('HarnessPG native terminal handoff', () => {
     await expect(harness().stageTerminalCompletion({ identity, result: output })).resolves.toEqual({
       status: 'not_pending',
     });
+    // A committed output without a run summary remains discoverable after
+    // its owner dies; a persisted summary acknowledges its publication.
+    const recoveryInput = { ...scope, now: Date.now() + 61_000, limit: 10 };
+    await expect(harness().listPendingMessageAdmissions(recoveryInput)).resolves.toMatchObject({
+      items: [{ evidence: { status: 'completed', result: output } }],
+    });
+    await expect(harness().listRecoverableSessions(recoveryInput)).resolves.toMatchObject({
+      items: [{ sessionId: session.id, pendingMessageAdmission: true }],
+    });
+    const completedAt = Date.now();
+    await harness().saveRunSummary({
+      summary: {
+        harnessName: HARNESS,
+        runId: input.runId,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        agentId: 'default',
+        modeId: 'default',
+        modelId: 'openai/gpt-4o-mini',
+        status: 'completed',
+        finishReason: 'stop',
+        reconstructed: true,
+        completedAt,
+        usage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
+        createdAt: completedAt,
+      },
+    });
+    await expect(harness().listPendingMessageAdmissions(recoveryInput)).resolves.toMatchObject({ items: [] });
+    await expect(harness().listRecoverableSessions(recoveryInput)).resolves.toMatchObject({ items: [] });
   });
 
   it('enforces the configured pending-intent bound across sessions', async () => {

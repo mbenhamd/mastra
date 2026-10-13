@@ -474,6 +474,12 @@ export interface SessionRecord {
 
   // Counters
   tokenUsage: TokenUsage;
+  /**
+   * Pending native completed runs already included in tokenUsage. Persisted
+   * with the counter so cold recovery cannot add their usage twice. Removed
+   * once the corresponding terminal commit is known.
+   */
+  accountedTerminalRunIds?: string[];
 
   // In-flight state — resumable across restarts.
   // At most one outstanding agent suspension per session (see PendingResume).

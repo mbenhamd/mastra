@@ -502,7 +502,8 @@ export class InMemoryHarness extends HarnessStorage {
   /**
    * Admitted message rows recovery must act on: pending rows other than the
    * parked resume (with their claim state at `now`), and rows it settled
-   * interrupted whose completion is unpublished (no run summary yet).
+   * interrupted, or native completed rows whose completion is unpublished
+   * (no run summary yet).
    */
   private recoverableMessageAdmissions(
     namespace: string,
@@ -525,12 +526,22 @@ export class InMemoryHarness extends HarnessStorage {
       if (evidence.status === 'pending') {
         if (!includeParkedResume && evidence.runId === record.pendingResume?.runId) continue;
         admissions.push({ evidence: cloneJson(evidence), dispatchClaim: pendingMessageDispatchClaim(evidence, now) });
-      } else if (
-        evidence.status === 'failed' &&
-        evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE &&
-        !this.db.harnessRunSummaries.has(`${namespace}::${evidence.runId}`)
-      ) {
-        admissions.push({ evidence: cloneJson(evidence), dispatchClaim: 'none' });
+      } else if (!this.db.harnessRunSummaries.has(`${namespace}::${evidence.runId}`)) {
+        const interrupted = evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE;
+        const completed =
+          this.terminalHandoff.enabled &&
+          evidence.status === 'completed' &&
+          evidence.result !== undefined &&
+          [...this.db.harnessTerminalAdmissions.values()].some(
+            admission =>
+              admission.harnessName === namespace &&
+              admission.sessionId === record.id &&
+              admission.sessionIncarnation === record.sessionIncarnation &&
+              admission.runId === evidence.runId &&
+              admission.signalId === evidence.signalId &&
+              admission.status === 'committed',
+          );
+        if (interrupted || completed) admissions.push({ evidence: cloneJson(evidence), dispatchClaim: 'none' });
       }
     }
     return admissions;

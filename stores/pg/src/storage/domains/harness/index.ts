@@ -259,9 +259,11 @@ const PG_MESSAGE_DISPATCH_CLAIM_SQL = `CASE
  * Admitted message rows (alias `m`, its session `s`) recovery must act on: a
  * pending row that is not the parked resume, or a row recovery settled
  * interrupted (one `?`: the interrupted error code) whose completion is
- * unpublished, i.e. has no run summary yet.
+ * unpublished, i.e. has no run summary yet. Native committed completed rows
+ * without a summary also remain discoverable until completion is published.
  */
-const PG_RECOVERABLE_MESSAGE_SQL = `m.operation_kind = 'message'
+function pgRecoverableMessageSql(includeCompleted: boolean): string {
+  return `m.operation_kind = 'message'
     AND m.admission_id IS NOT NULL
     AND m.admission_hash IS NOT NULL
     AND m.run_id IS NOT NULL
@@ -275,7 +277,25 @@ const PG_RECOVERABLE_MESSAGE_SQL = `m.operation_kind = 'message'
           WHERE r.harness_name = m.harness_name AND r.run_id = m.run_id
         )
       )
+      ${
+        includeCompleted
+          ? `OR (
+            m.status = 'completed' AND m.result IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS} a
+              WHERE a.harness_name = m.harness_name AND a.session_id = m.session_id
+                AND a.session_incarnation = s.session_incarnation
+                AND a.run_id = m.run_id AND a.signal_id = m.signal_id AND a.status = 'committed'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM ${TABLE_HARNESS_RUN_SUMMARIES} r
+              WHERE r.harness_name = m.harness_name AND r.run_id = m.run_id
+            )
+          )`
+          : ''
+      }
     )`;
+}
 type HarnessAttachmentOperationStatus =
   | 'pending'
   | 'uploaded'
@@ -1479,6 +1499,7 @@ export class HarnessPG extends HarnessStorage {
     const { now, limit } = normalizeDispatchRecoveryScanInput(input);
     await this.#ensureMessageResultsTable();
     await this.#ensureRunSummariesTable();
+    if (this.terminalHandoff.enabled) await this.#ensureTerminalHandoffTables();
     const cursorCondition = input.cursor !== undefined ? 'AND s.id > ?' : '';
     const args: (string | number)[] = [
       HARNESS_RUN_INTERRUPTED_ERROR_CODE,
@@ -1512,7 +1533,7 @@ export class HarnessPG extends HarnessStorage {
                            AND m.session_id = s.id
                            AND m.resource_id = s.resource_id
                            AND m.thread_id = s.thread_id
-                           AND ${PG_RECOVERABLE_MESSAGE_SQL}
+                           AND ${pgRecoverableMessageSql(this.terminalHandoff.enabled)}
                            AND ${PG_MESSAGE_DISPATCH_CLAIM_SQL} = 'live'
                        )
                      ) AS closing_claimed,
@@ -1545,7 +1566,7 @@ export class HarnessPG extends HarnessStorage {
                          AND m.session_id = s.id
                          AND m.resource_id = s.resource_id
                          AND m.thread_id = s.thread_id
-                         AND ${PG_RECOVERABLE_MESSAGE_SQL}
+                         AND ${pgRecoverableMessageSql(this.terminalHandoff.enabled)}
                          AND ${PG_MESSAGE_DISPATCH_CLAIM_SQL} <> 'live'
                      ) AS pending_message_admission
               FROM ${TABLE_HARNESS_SESSIONS} s
@@ -1582,6 +1603,7 @@ export class HarnessPG extends HarnessStorage {
     const { now, limit } = normalizeDispatchRecoveryScanInput(input);
     await this.#ensureMessageResultsTable();
     await this.#ensureRunSummariesTable();
+    if (this.terminalHandoff.enabled) await this.#ensureTerminalHandoffTables();
     const cursorCondition = input.cursor !== undefined ? 'AND m.signal_id > ?' : '';
     const args: (string | number | boolean)[] = [
       now,
@@ -1605,7 +1627,7 @@ export class HarnessPG extends HarnessStorage {
                   ? AND m.status = 'pending' AND m.operation_kind = 'message' AND m.admission_id IS NOT NULL
                   AND m.admission_hash IS NOT NULL AND m.run_id IS NOT NULL
                 )
-                OR ${PG_RECOVERABLE_MESSAGE_SQL}
+                OR ${pgRecoverableMessageSql(this.terminalHandoff.enabled)}
               )
               ${cursorCondition}
             ORDER BY m.signal_id ASC
@@ -10729,7 +10751,12 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     JSON.stringify(record.permissionRules),
     record.permissionRulesSeedHash ?? null,
     JSON.stringify(record.sessionGrants),
-    JSON.stringify(record.tokenUsage),
+    JSON.stringify({
+      ...record.tokenUsage,
+      ...(record.accountedTerminalRunIds !== undefined
+        ? { accountedTerminalRunIds: record.accountedTerminalRunIds }
+        : {}),
+    }),
     JSON.stringify(record.pendingQueue),
     record.pendingResume ? JSON.stringify(record.pendingResume) : null,
     record.currentRun ? JSON.stringify(record.currentRun) : null,
@@ -11582,6 +11609,11 @@ function rowToChannelOutboxItem(row: Record<string, unknown>): ChannelOutboxItem
 }
 
 export function rowToSession(row: Record<string, unknown>): SessionRecord {
+  const { accountedTerminalRunIds, ...tokenUsage } = parseJson(row.token_usage) ?? {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  };
   return {
     harnessName: String(row.harness_name ?? 'default'),
     id: String(row.id),
@@ -11602,7 +11634,8 @@ export function rowToSession(row: Record<string, unknown>): SessionRecord {
     permissionRulesSeedHash:
       row.permission_rules_seed_hash != null ? String(row.permission_rules_seed_hash) : undefined,
     sessionGrants: parseJson(row.session_grants) ?? { categories: [], tools: [] },
-    tokenUsage: parseJson(row.token_usage) ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    tokenUsage,
+    ...(accountedTerminalRunIds !== undefined ? { accountedTerminalRunIds } : {}),
     pendingQueue: parseJson(row.pending_queue) ?? [],
     pendingResume: parseJson(row.pending_resume) ?? undefined,
     currentRun: parseJson(row.current_run) ?? undefined,

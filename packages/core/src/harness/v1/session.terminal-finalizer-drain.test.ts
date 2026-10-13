@@ -82,11 +82,17 @@ async function orphanTurnAdmittedUnder(db: InMemoryDB, registration: TerminalReg
   return { sessionId: session.id, stop };
 }
 
-async function adoptAfterLeaseLapse(db: InMemoryDB, sessionId: string, registration: TerminalRegistration) {
+async function adoptAfterLeaseLapse(
+  db: InMemoryDB,
+  sessionId: string,
+  registration: TerminalRegistration,
+  configure?: (process: ReturnType<typeof harnessProcess>) => void,
+) {
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
   const agent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
   const adopter = harnessProcess(db, agent, registration);
+  configure?.(adopter);
   await adopter.harness.session({ sessionId, resourceId: 'u1' });
   const admission = await adopter.storage.loadTerminalAdmission({
     harnessName: 'default',
@@ -154,55 +160,153 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     }
   });
 
-  it('commits a turn whose owner died after it finished, with its reply, under the admitted version', async () => {
+  it.each(['before', 'after'] as const)(
+    'recovers the completed reply and accounts usage once when its owner dies %s the usage save',
+    async usageSaveBoundary => {
+      const db = new InMemoryDB();
+      const calls: FinalizeCall[] = [];
+      const ownerAgent = new MockAgent({ id: 'default' });
+      ownerAgent.enqueueRun({
+        finishReason: 'stop',
+        text: 'final answer',
+        usage: { inputTokens: 8, outputTokens: 5, totalTokens: 13 },
+      });
+      const owner = harnessProcess(db, ownerAgent, { finalizer: finalizerAt('1', calls) });
+      const ownerSession = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      // The run finishes, then its owner stops during the session-usage flush,
+      // before it even reaches the finalizer or terminal commit.
+      const saveSession = owner.storage.saveSession.bind(owner.storage);
+      let releaseUsageFlush!: () => void;
+      const usageFlush = new Promise<void>(resolve => (releaseUsageFlush = resolve));
+      let startedUsageFlush!: () => void;
+      const usageFlushStarted = new Promise<void>(resolve => (startedUsageFlush = resolve));
+      owner.storage.saveSession = async (record, options) => {
+        if ((record.tokenUsage?.totalTokens ?? 0) === 0) return saveSession(record, options);
+        const saved = usageSaveBoundary === 'after' ? await saveSession(record, options) : undefined;
+        startedUsageFlush();
+        await usageFlush;
+        return saved ?? saveSession(record, options);
+      };
+      const turn = ownerSession.message({
+        content: 'hi',
+        admissionId,
+        executionAuthorityGrant: grant,
+        terminalAdmissionSeed: { v: 1 },
+      });
+      void turn.catch(() => {});
+      const scope = { harnessName: 'default', sessionId: ownerSession.id, resourceId: 'u1' };
+      await usageFlushStarted;
+      await vi.waitFor(async () => {
+        const pending = await owner.storage.listPendingMessageAdmissions({
+          ...scope,
+          threadId: ownerSession.threadId,
+          now: Date.now(),
+          limit: 10,
+        });
+        expect(pending.items).toMatchObject([
+          { evidence: { status: 'pending', stagedResult: { text: 'final answer' } } },
+        ]);
+      });
+      calls.length = 0;
+
+      const adopter = await adoptAfterLeaseLapse(db, ownerSession.id, {
+        finalizer: finalizerAt('2', calls),
+        settleOnly: [finalizerAt('1', calls)],
+      });
+      try {
+        // Recovery commits the finished turn as completed with its reply — never
+        // as interrupted — through the finalizer of the version it was admitted under.
+        expect(calls).toEqual([{ version: '1', finalizerVersion: '1', status: 'completed', reply: 'final answer' }]);
+        expect(adopter.admission).toMatchObject({
+          status: 'committed',
+          finalizerVersion: '1',
+          terminalResult: { status: 'completed' },
+        });
+        const [intent] = (
+          await adopter.storage.claimTerminalIntents({ harnessName: 'default', consumerId: 'consumer', limit: 10 })
+        ).intents;
+        expect(JSON.parse(intent!.projection.payloadJson)).toEqual({
+          status: 'completed',
+          code: null,
+          reply: 'final answer',
+        });
+        await expect(
+          adopter.storage.loadMessageResultEvidence({
+            ...scope,
+            threadId: ownerSession.threadId,
+            signalId: intent!.signalId,
+          }),
+        ).resolves.toMatchObject({ status: 'completed', result: { text: 'final answer' } });
+        await expect(adopter.storage.loadSession(scope)).resolves.toMatchObject({
+          tokenUsage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
+        });
+        await expect(
+          adopter.storage.loadRunSummary({ harnessName: 'default', runId: intent!.runId }),
+        ).resolves.toMatchObject({ status: 'completed' });
+        expect(adopter.agent.streamCalls).toHaveLength(0);
+      } finally {
+        await adopter.harness.shutdown();
+        releaseUsageFlush();
+        await turn.catch(() => {});
+        await owner.harness.shutdown().catch(() => {});
+      }
+    },
+  );
+
+  it('retries completion publication after a committed recovery without recording a provisional failed summary', async () => {
     const db = new InMemoryDB();
     const calls: FinalizeCall[] = [];
     const ownerAgent = new MockAgent({ id: 'default' });
-    ownerAgent.enqueueRun({ finishReason: 'stop', text: 'final answer' });
+    ownerAgent.enqueueRun({
+      finishReason: 'stop',
+      text: 'durable answer',
+      usage: { inputTokens: 8, outputTokens: 5, totalTokens: 13 },
+    });
     const owner = harnessProcess(db, ownerAgent, { finalizer: finalizerAt('1', calls) });
-    const ownerSession = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    // The run finishes, then its owner stops during the session-usage flush,
-    // before it even reaches the finalizer or terminal commit.
-    const saveSession = owner.storage.saveSession.bind(owner.storage);
-    let releaseUsageFlush!: () => void;
-    const usageFlush = new Promise<void>(resolve => (releaseUsageFlush = resolve));
-    owner.storage.saveSession = async (record, options) => {
-      if ((record.tokenUsage?.totalTokens ?? 0) > 0) await usageFlush;
-      return saveSession(record, options);
+    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    owner.storage.commitTerminalHandoff = async () => {
+      throw new Error('terminal commit temporarily unavailable');
     };
-    const turn = ownerSession.message({
-      content: 'hi',
-      admissionId,
-      executionAuthorityGrant: grant,
-      terminalAdmissionSeed: { v: 1 },
-    });
-    void turn.catch(() => {});
-    const scope = { harnessName: 'default', sessionId: ownerSession.id, resourceId: 'u1' };
-    await vi.waitFor(async () => {
-      const pending = await owner.storage.listPendingMessageAdmissions({
-        ...scope,
-        threadId: ownerSession.threadId,
-        now: Date.now(),
-        limit: 10,
-      });
-      expect(pending.items).toMatchObject([
-        { evidence: { status: 'pending', stagedResult: { text: 'final answer' } } },
-      ]);
-    });
+    await expect(
+      session.message({ content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } }),
+    ).rejects.toMatchObject({ code: 'harness.terminal_pending' });
+    await owner.harness.shutdown();
+    const identity = { harnessName: 'default', sessionId: session.id, admissionId, executionGrant: grant };
+    const pending = await owner.storage.loadTerminalAdmission(identity);
+    expect(pending).toMatchObject({ status: 'pending' });
+    await expect(owner.storage.loadRunSummary({ harnessName: 'default', runId: pending!.runId })).resolves.toBeNull();
     calls.length = 0;
-
-    const adopter = await adoptAfterLeaseLapse(db, ownerSession.id, {
-      finalizer: finalizerAt('2', calls),
-      settleOnly: [finalizerAt('1', calls)],
-    });
+    const registration = { finalizer: finalizerAt('2', calls), settleOnly: [finalizerAt('1', calls)] };
+    let failedAdopter: ReturnType<typeof harnessProcess> | undefined;
+    let adopter: Awaited<ReturnType<typeof adoptAfterLeaseLapse>> | undefined;
     try {
-      // Recovery commits the finished turn as completed with its reply — never
-      // as interrupted — through the finalizer of the version it was admitted under.
-      expect(calls).toEqual([{ version: '1', finalizerVersion: '1', status: 'completed', reply: 'final answer' }]);
-      expect(adopter.admission).toMatchObject({
+      await expect(
+        adoptAfterLeaseLapse(db, session.id, registration, process => {
+          failedAdopter = process;
+          process.storage.saveRunSummary = async () => {
+            throw new Error('completion publication temporarily unavailable');
+          };
+        }),
+      ).rejects.toThrow();
+      await expect(failedAdopter!.storage.loadTerminalAdmission(identity)).resolves.toMatchObject({
         status: 'committed',
-        finalizerVersion: '1',
-        terminalResult: { status: 'completed' },
+      });
+      await expect(
+        failedAdopter!.storage.loadRunSummary({ harnessName: 'default', runId: pending!.runId }),
+      ).resolves.toBeNull();
+      await failedAdopter!.harness.shutdown().catch(() => {});
+
+      // The next process discovers the committed output with no summary and
+      // publishes completion without executing or finalizing the run again.
+      adopter = await adoptAfterLeaseLapse(db, session.id, registration);
+      expect(calls).toEqual([{ version: '1', finalizerVersion: '1', status: 'completed', reply: 'durable answer' }]);
+      await expect(
+        adopter.storage.loadRunSummary({ harnessName: 'default', runId: pending!.runId }),
+      ).resolves.toMatchObject({ status: 'completed' });
+      await expect(
+        adopter.storage.loadSession({ harnessName: 'default', sessionId: session.id }),
+      ).resolves.toMatchObject({
+        tokenUsage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
       });
       const [intent] = (
         await adopter.storage.claimTerminalIntents({ harnessName: 'default', consumerId: 'consumer', limit: 10 })
@@ -210,21 +314,12 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       expect(JSON.parse(intent!.projection.payloadJson)).toEqual({
         status: 'completed',
         code: null,
-        reply: 'final answer',
+        reply: 'durable answer',
       });
-      await expect(
-        adopter.storage.loadMessageResultEvidence({
-          ...scope,
-          threadId: ownerSession.threadId,
-          signalId: intent!.signalId,
-        }),
-      ).resolves.toMatchObject({ status: 'completed', result: { text: 'final answer' } });
       expect(adopter.agent.streamCalls).toHaveLength(0);
     } finally {
-      await adopter.harness.shutdown();
-      releaseUsageFlush();
-      await turn.catch(() => {});
-      await owner.harness.shutdown().catch(() => {});
+      await adopter?.harness.shutdown();
+      await failedAdopter?.harness.shutdown().catch(() => {});
     }
   });
 
@@ -278,9 +373,24 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     resumer.storage.commitTerminalHandoff = async () => {
       throw new Error('process stopped before the resumed terminal commit');
     };
+    const stage = resumer.storage.stageTerminalCompletion.bind(resumer.storage);
+    let stagingFailed = false;
+    resumer.storage.stageTerminalCompletion = async input => {
+      if (!stagingFailed) {
+        stagingFailed = true;
+        throw new Error('completed output staging temporarily unavailable');
+      }
+      return stage(input);
+    };
     await expect(resumeSession.respondToToolApproval({ approved: true })).rejects.toMatchObject({
       code: 'harness.terminal_pending',
     });
+    // Retrying uses the cached output, restages it before finalization, and
+    // never executes the provider twice.
+    await expect(resumeSession.respondToToolApproval({ approved: true })).rejects.toMatchObject({
+      code: 'harness.terminal_pending',
+    });
+    expect(agent.resumeCalls).toHaveLength(1);
     await resumer.harness.shutdown();
     calls.length = 0;
     const adopter = await adoptAfterLeaseLapse(db, ownerSession.id, {

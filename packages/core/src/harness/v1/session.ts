@@ -1962,6 +1962,9 @@ export class Session {
    */
   private readonly _terminalFinalizersByIdentity = new Map<string, HarnessTerminalFinalizer>();
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
+  /** Pending native completions whose usage has joined the durable session counter. */
+  private readonly _terminalTokenAccountedRunIds = new Set<string>();
+  private readonly _stagedTerminalRunIds = new Set<string>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
   /** Serializes terminal evidence + event projection for one admitted signal. */
   private readonly _signalResultSettlements = new Map<string, Promise<AgentSignalResultEvidence | undefined>>();
@@ -2053,6 +2056,9 @@ export class Session {
         completionTokens,
         totalTokens,
       };
+    }
+    for (const runId of internals.record.accountedTerminalRunIds ?? []) {
+      this._terminalTokenAccountedRunIds.add(runId);
     }
     if (this._record.closedAt !== undefined) {
       this._state = 'closed';
@@ -3859,7 +3865,10 @@ export class Session {
       });
       for (const admission of page.items) {
         const { evidence } = admission;
-        if (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE) {
+        if (
+          evidence.status === 'completed' ||
+          (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE)
+        ) {
           unpublished.push(evidence);
           continue;
         }
@@ -4006,7 +4015,12 @@ export class Session {
    */
   private async _publishRecoveredRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
     const runId = evidence.runId!;
-    const full = evidence.status === 'pending' ? (evidence.stagedResult as FullOutput<unknown> | undefined) : undefined;
+    const full =
+      evidence.status === 'completed'
+        ? (evidence.result as FullOutput<unknown> | undefined)
+        : evidence.status === 'pending'
+          ? (evidence.stagedResult as FullOutput<unknown> | undefined)
+          : undefined;
     const summary = { harnessName: this._record.harnessName, runId };
     if ((await this._storage.loadRunSummary(summary)) !== null) return;
     const modeId = evidence.modeId ?? this._record.modeId;
@@ -4101,6 +4115,13 @@ export class Session {
     // committed as completed with that output; only a run cut off mid-flight
     // is interrupted.
     const staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
+    if (staged !== undefined) {
+      this._stagedTerminalRunIds.add(runId);
+      const { tokenUsageAccounted } = this._recordMessageTurnCompletion(staged as FullOutput<unknown>, {
+        persist: false,
+      });
+      if (tokenUsageAccounted) await this._persistTokenUsageOrLatch();
+    }
     const stagedFinishReason =
       staged !== undefined ? (staged as { finishReason?: unknown } | null)?.finishReason : undefined;
     const terminalResult: HarnessTerminalResult =
@@ -4157,6 +4178,8 @@ export class Session {
       recovery: { expectedDispatch: evidence.dispatch ?? null, leaseOwner },
     });
     if (receipt.status === 'committed') {
+      this._terminalTokenAccountedRunIds.delete(runId);
+      this._stagedTerminalRunIds.delete(runId);
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
@@ -5118,13 +5141,19 @@ export class Session {
     opts: { persist?: boolean } = {},
   ): { tokenUsageDelta?: TokenUsage; tokenUsageAccounted: boolean } {
     this._captureTurnRunId(full);
-    if (full.runId && this._messageTokenAccountedRunIds.has(full.runId)) {
+    if (
+      full.runId &&
+      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalTokenAccountedRunIds.has(full.runId))
+    ) {
       return { tokenUsageAccounted: true };
     }
     const tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
     this._applyTokenUsageDelta(tokenUsageDelta);
     if (tokenUsageDelta !== undefined) {
       if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
+      if (full.runId && this._stagedTerminalRunIds.has(full.runId)) {
+        this._terminalTokenAccountedRunIds.add(full.runId);
+      }
       if (opts.persist !== false) this._schedulePersistTokenUsage();
       return { tokenUsageDelta, tokenUsageAccounted: true };
     }
@@ -8120,7 +8149,20 @@ export class Session {
         runId,
       });
       if (admission?.status === 'pending') {
-        await this._storage.stageTerminalCompletion({ identity: admission, result: full });
+        // A process may have died after committing a prior completion but
+        // before its next session save removed that usage fence.
+        for (const accountedRunId of this._terminalTokenAccountedRunIds) {
+          if (accountedRunId === runId) continue;
+          const prior = await this._storage.loadTerminalAdmissionByRun({
+            harnessName: this._record.harnessName,
+            sessionId: this.id,
+            sessionIncarnation,
+            runId: accountedRunId,
+          });
+          if (prior !== null && prior.status !== 'pending') this._terminalTokenAccountedRunIds.delete(accountedRunId);
+        }
+        const receipt = await this._storage.stageTerminalCompletion({ identity: admission, result: full });
+        if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
       }
     } catch (error) {
       throw this._terminalFailure(error, undefined, runId);
@@ -9695,13 +9737,14 @@ export class Session {
                 signalId: signal.signal.id,
                 error: projectHarnessPublicError(failure),
               });
+            } else {
+              this._emitTurnEvent({
+                type: 'agent_end',
+                finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
+                runId: signal.runId,
+                usage: this._runUsage(),
+              });
             }
-            this._emitTurnEvent({
-              type: 'agent_end',
-              finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
-              runId: signal.runId,
-              usage: this._runUsage(),
-            });
           }
           // The caller owns the visible stream; swallow drain-side errors.
         })
@@ -9844,13 +9887,14 @@ export class Session {
             signalId: signal.signal.id,
             error: projectHarnessPublicError(failure),
           });
+        } else {
+          this._emitTurnEvent({
+            type: 'agent_end',
+            finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
+            runId: signal.runId,
+            usage: this._runUsage(),
+          });
         }
-        this._emitTurnEvent({
-          type: 'agent_end',
-          finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',
-          runId: signal.runId,
-          usage: this._runUsage(),
-        });
       }
       // §13.3f.1 — `message()` is a public §4.2b boundary; its promise
       // rejection must not leak raw provider/driver/SQL/path text. Redact a raw
@@ -10890,6 +10934,7 @@ export class Session {
     const completingQueuedItemId = pendingQueuedItemId;
     await this._withActiveDeletedWaiter(async activeTurnWaiter => {
       try {
+        await this._stageCompletedTerminalOutput(pending.runId, full);
         await this._finalizeResumedTurnOutcome(pending, full, {
           responseId,
           pendingQueuedItemId,
@@ -11343,6 +11388,8 @@ export class Session {
         admission,
         ...(intent !== null ? { intent } : {}),
       };
+      this._terminalTokenAccountedRunIds.delete(identity.runId);
+      this._stagedTerminalRunIds.delete(identity.runId);
       try {
         options.onReceipt?.(receipt);
       } catch {
@@ -11508,6 +11555,10 @@ export class Session {
     }
     if (receipt.status === 'fenced') {
       return reportFailure(new HarnessTerminalHandoffFencedError(identity.sessionId));
+    }
+    if (receipt.status === 'committed' || receipt.status === 'duplicate') {
+      this._terminalTokenAccountedRunIds.delete(identity.runId);
+      this._stagedTerminalRunIds.delete(identity.runId);
     }
     try {
       options.onReceipt?.(receipt);
@@ -20255,6 +20306,8 @@ export class Session {
           // construction and post-save assignment are not lost — we re-overlay
           // from the live counter below.
           tokenUsage: { ...tokenUsageForSave },
+          accountedTerminalRunIds:
+            this._terminalTokenAccountedRunIds.size > 0 ? [...this._terminalTokenAccountedRunIds] : undefined,
           lastActivityAt: Date.now(),
         };
         // Resume-usage fence: while armed, any write that persists the bumped
