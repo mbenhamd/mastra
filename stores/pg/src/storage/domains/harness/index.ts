@@ -5223,6 +5223,11 @@ export class HarnessPG extends HarnessStorage {
         }
         const updated = {
           ...namespacedRecord,
+          ...(namespacedRecord.status === 'pending' &&
+          current.status === 'pending' &&
+          current.stagedResult !== undefined
+            ? { stagedResult: current.stagedResult }
+            : {}),
           modeId: namespacedRecord.modeId ?? current.modeId,
           modelId: namespacedRecord.modelId ?? current.modelId,
           operationKind: namespacedRecord.operationKind ?? current.operationKind,

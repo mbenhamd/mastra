@@ -884,7 +884,10 @@ describe('HarnessPG native terminal handoff', () => {
     expect(accounted?.tokenUsage).toEqual({ promptTokens: 8, completionTokens: 5, totalTokens: 13 });
     expect(accounted?.accountedTerminalRunIds).toEqual([input.runId]);
     // A pending rewrite of the row keeps the staged output.
-    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await expect(harness().writeMessageResultEvidence(pendingEvidence(input))).resolves.toMatchObject({
+      applied: true,
+      evidence: { status: 'pending', stagedResult: output },
+    });
     await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({ stagedResult: output });
 
     // Recovery may not interrupt a turn whose finished output is staged.

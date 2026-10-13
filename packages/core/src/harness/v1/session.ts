@@ -4030,6 +4030,7 @@ export class Session {
       // Another completion may have scheduled its save during the lookup.
       // Wait for that acknowledged outcome before deciding to republish.
     } while (persistence !== this._runSummaryPersistence);
+    this._assertNotDeleted();
     const modeId = evidence.modeId ?? this._record.modeId;
     this._recoveredRunIdentities.set(runId, {
       resourceId: this.resourceId,
@@ -4095,10 +4096,25 @@ export class Session {
     });
     if (
       admission === null ||
-      admission.status !== 'pending' ||
       admission.admissionId !== evidence.admissionId ||
       admission.signalId !== evidence.signalId
     ) {
+      return 'unowned';
+    }
+    // Cancellation prevents delivery, but cannot erase tokens the finished
+    // run consumed. Persist its staged usage before any terminal evidence
+    // rewrite, using the same durable per-run accounting fence.
+    const staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
+    if (staged !== undefined) {
+      this._stagedTerminalRunIds.add(runId);
+      const { tokenUsageAccounted } = this._recordMessageTurnCompletion(staged as FullOutput<unknown>, {
+        persist: false,
+      });
+      if (tokenUsageAccounted) await this._persistTokenUsageOrLatch();
+    }
+    if (admission.status !== 'pending') {
+      this._terminalTokenAccountedRunIds.delete(runId);
+      this._stagedTerminalRunIds.delete(runId);
       return 'unowned';
     }
     // Settle under the finalizer the turn was admitted with — the primary or a
@@ -4126,14 +4142,6 @@ export class Session {
     // A run that finished and staged its output before its owner died is
     // committed as completed with that output; only a run cut off mid-flight
     // is interrupted.
-    const staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
-    if (staged !== undefined) {
-      this._stagedTerminalRunIds.add(runId);
-      const { tokenUsageAccounted } = this._recordMessageTurnCompletion(staged as FullOutput<unknown>, {
-        persist: false,
-      });
-      if (tokenUsageAccounted) await this._persistTokenUsageOrLatch();
-    }
     const stagedFinishReason =
       staged !== undefined ? (staged as { finishReason?: unknown } | null)?.finishReason : undefined;
     const terminalResult: HarnessTerminalResult =
@@ -8166,6 +8174,7 @@ export class Session {
     const sessionIncarnation = this._record.sessionIncarnation;
     if (
       !this._storage.supportsTerminalCompletionStaging ||
+      this._terminalFinalizersByIdentity.size === 0 ||
       sessionIncarnation === undefined ||
       this._agentEndReasonForFullOutput(full) !== 'complete' ||
       full.finishReason === 'abort'
@@ -10990,7 +10999,7 @@ export class Session {
     const completingQueuedItemId = pendingQueuedItemId;
     await this._withActiveDeletedWaiter(async activeTurnWaiter => {
       try {
-        await this._stageCompletedTerminalOutput(pending.runId, full);
+        await this._raceActiveTurnWaiter(this._stageCompletedTerminalOutput(pending.runId, full), activeTurnWaiter);
         await this._finalizeResumedTurnOutcome(pending, full, {
           responseId,
           pendingQueuedItemId,
@@ -16920,7 +16929,10 @@ export class Session {
     // accepted".
     const completingQueuedItemId = full.finishReason !== 'suspended' ? pendingQueuedItemId : undefined;
     try {
-      await this._stageCompletedTerminalOutput(pending.runId, full);
+      await this._raceActiveTurnWaiter(
+        this._stageCompletedTerminalOutput(pending.runId, full),
+        activeTurnWaiter.promise,
+      );
       await this._finalizeResumedTurnOutcome(pending, full, {
         responseId,
         pendingQueuedItemId,
