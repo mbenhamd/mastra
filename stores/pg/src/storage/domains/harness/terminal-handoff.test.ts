@@ -848,6 +848,51 @@ describe('HarnessPG native terminal handoff', () => {
     );
   });
 
+  it('drops staged output when a cancelled turn settles its pending row', async () => {
+    const session = await createNativeSession(harness(), 'session-staged-cancel');
+    const input = admissionFor(session, 'staged-cancel');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    await harness().stageTerminalCompletion({ identity: input, result: { text: 'cancelled reply' } });
+    await harness().cancelTerminalHandoff({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      sessionIncarnation: session.sessionIncarnation!,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      executionGrant: input.executionGrant,
+      reason: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      cancelledAt: Date.now(),
+    });
+    const scope = {
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      signalId: input.signalId,
+    };
+    const settled = await harness().compareAndSwapSignalTerminal({
+      ...scope,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      operationKind: 'message',
+      expected: { state: 'reserved' },
+      leaseOwner: { ownerId: session.ownerId! },
+      terminal: {
+        status: 'failed',
+        signalId: input.signalId,
+        runId: input.runId,
+        error: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      },
+      updatedAt: Date.now(),
+    });
+    expect(settled).toMatchObject({ applied: true, evidence: { status: 'failed' } });
+    expect(settled.evidence).not.toHaveProperty('stagedResult');
+    const stored = await harness().loadMessageResultEvidence(scope);
+    expect(stored).toMatchObject({ status: 'failed' });
+    expect(stored).not.toHaveProperty('stagedResult');
+  });
+
   it('stages a completed output on the pending row so recovery commits it as completed, never interrupted', async () => {
     const session = await createNativeSession(harness(), 'session-staged');
     const input = admissionFor(session, 'staged');

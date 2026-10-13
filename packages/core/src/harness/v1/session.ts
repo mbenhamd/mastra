@@ -1965,6 +1965,15 @@ export class Session {
   /** Pending native completions whose usage has joined the durable session counter. */
   private readonly _terminalTokenAccountedRunIds = new Set<string>();
   private readonly _stagedTerminalRunIds = new Set<string>();
+  /**
+   * Runs whose terminal agent_end this Session already emitted through
+   * recovered publication. A live owner finishing the same run afterwards
+   * (resume bookkeeping, or a retry that joined the live run) must not emit
+   * a second terminal agent_end.
+   */
+  private readonly _recoveredAgentEndRunIds = new Set<string>();
+  /** Runs this process admitted under native terminal handoff. */
+  private readonly _nativeTerminalRunIds = new Set<string>();
   /** Staging runs outside the message boundary that owns its failure observer. */
   private readonly _terminalStagingFailuresAwaitingObserver = new WeakSet<HarnessTerminalHandoffError>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
@@ -2519,6 +2528,14 @@ export class Session {
    * back to its `queue()` item.
    */
   private _emitTurnEvent(event: EmitInput): HarnessEvent {
+    if (
+      event.type === 'agent_end' &&
+      event.runId !== undefined &&
+      event.finishReason !== 'suspended' &&
+      this._recoveredAgentEndRunIds.delete(event.runId)
+    ) {
+      return event as HarnessEvent;
+    }
     // Span-summary: enrich `tool_end` with durationMs + accumulate the run's
     // tool rollup BEFORE emit, so the live subscriber and the durable row carry
     // the same value. Returns the (possibly enriched) event to emit.
@@ -4061,6 +4078,9 @@ export class Session {
     // An earlier attempt on this session may have emitted it but failed to
     // persist the summary; finalize again so persistence is retried.
     this._finalizedRunIds.delete(runId);
+    // A repeated recovered publication must emit again (it retries the
+    // summary); only a later live terminal agent_end is suppressed.
+    this._recoveredAgentEndRunIds.delete(runId);
     this._emitTurnEvent({
       type: 'agent_end',
       runId,
@@ -4072,6 +4092,7 @@ export class Session {
             : 'aborted',
       usage: this._runUsage(full),
     });
+    this._recoveredAgentEndRunIds.add(runId);
     await this._runSummaryPersistence;
     if ((await this._storage.loadRunSummary(summary)) === null) {
       throw new HarnessStorageError({
@@ -4705,7 +4726,7 @@ export class Session {
       return false;
     }
 
-    await this._accountStagedResumeUsage(recoveringPending);
+    await this._accountStagedResumeUsage(recoveringPending, recoveringQueuedItemId);
 
     if (recoveringQueuedItemId !== undefined) {
       const settledReceipt = this._record.queueAdmissionReceipts?.[recoveringQueuedItemId] ?? failedQueueReceipt;
@@ -7951,7 +7972,7 @@ export class Session {
     const cached = this._completedRuns.get(runId);
     if (cached) {
       return cached.ok
-        ? this._stageCompletedTerminalOutput(runId, cached.full).then(() => cached.full)
+        ? this._stageCompletedTerminalOutput(runId, cached.full, { tolerateUnknownRun: true }).then(() => cached.full)
         : Promise.reject(cached.err);
     }
     // Multiple callers can await the same run (e.g. `message()` followed by
@@ -8176,7 +8197,7 @@ export class Session {
         this._emitAbortedToolEnds();
       }
       full = this._materializeHarnessRunOutput(runId, rawFull);
-      await this._stageCompletedTerminalOutput(runId, full);
+      await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true });
       this._rememberCompletedRun(runId, { ok: true, full });
       if (waiter) waiter.resolve(full);
     } catch (err) {
@@ -8191,8 +8212,19 @@ export class Session {
     }
   }
 
-  /** Make native completed output durable before resolving the run's waiter. */
-  private async _stageCompletedTerminalOutput(runId: string, full: FullOutput<unknown>): Promise<void> {
+  /**
+   * Make native completed output durable before resolving the run's waiter.
+   * `tolerateUnknownRun` is for generic completion paths that see every run:
+   * when the admission lookup fails for a run this process did not admit
+   * natively, the run is treated as an ordinary turn instead of failing its
+   * completion. Native resume, duplicate and signal paths stage again and
+   * fail closed.
+   */
+  private async _stageCompletedTerminalOutput(
+    runId: string,
+    full: FullOutput<unknown>,
+    opts: { tolerateUnknownRun?: boolean } = {},
+  ): Promise<void> {
     const sessionIncarnation = this._record.sessionIncarnation;
     if (
       !this._storage.supportsTerminalCompletionStaging ||
@@ -8204,12 +8236,18 @@ export class Session {
       return;
     }
     try {
-      const admission = await this._storage.loadTerminalAdmissionByRun({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        sessionIncarnation,
-        runId,
-      });
+      let admission: HarnessTerminalAdmissionRecord | null;
+      try {
+        admission = await this._storage.loadTerminalAdmissionByRun({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          sessionIncarnation,
+          runId,
+        });
+      } catch (error) {
+        if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
+        throw error;
+      }
       if (admission?.status === 'pending') {
         // A process may have died after settling a prior completion but
         // before its next session save removed that usage fence. Only
@@ -10738,7 +10776,9 @@ export class Session {
    * the advanced baseline into the still-parked pending, so a retried
    * recovery computes a zero delta.
    */
-  private async _accountStagedResumeUsage(pending: PendingResume): Promise<void> {
+  private async _accountStagedResumeUsage(pending: PendingResume, queuedItemId: string | undefined): Promise<void> {
+    // A durable fence means this run's usage is already counted.
+    if (this._terminalTokenAccountedRunIds.has(pending.runId)) return;
     const admission = await this._probeResumeAdmissionByRun(pending);
     if (!admission) return;
     const stored = await this._storage.loadMessageResultEvidence({
@@ -10764,17 +10804,26 @@ export class Session {
       toolCallId: pending.toolCallId,
       requestedAt: pending.requestedAt,
     });
-    // This process already accounted the run; its armed fence persists it.
-    if (this._resumeUsageBaseline?.generationKey === generationKey) return;
     const full = stored.stagedResult as FullOutput<unknown>;
-    const delta = this._recordTurnCompletion(full, {
-      persist: false,
-      accountedCumulative: pending.accountedTokenUsage,
-    });
+    // A run this process already accounted keeps its armed baseline, and a
+    // queued post-run finalization already persisted its delta. Both still
+    // need the durable per-run fence below.
+    const queuedUsagePersisted =
+      queuedItemId !== undefined &&
+      this._record.queueAdmissionReceipts?.[queuedItemId]?.postRunFinalizedAt !== undefined;
+    if (!queuedUsagePersisted && this._resumeUsageBaseline?.generationKey !== generationKey) {
+      this._recordTurnCompletion(full, { persist: false, accountedCumulative: pending.accountedTokenUsage });
+      const runUsage = this._tokenUsageDeltaFromFullOutput(full);
+      if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
+    }
     this._messageTokenAccountedRunIds.add(pending.runId);
-    const runUsage = this._tokenUsageDeltaFromFullOutput(full);
-    if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
-    if (delta !== undefined) await this._persistTokenUsageOrLatch();
+    // The per-run fence persists atomically with the counter and outlives
+    // the parked pending: if cancelled settlement fails and orphan recovery
+    // later commits this row, it must not add the usage again. It retires
+    // with the row's terminal canonical evidence.
+    this._stagedTerminalRunIds.add(pending.runId);
+    this._terminalTokenAccountedRunIds.add(pending.runId);
+    await this._persistTokenUsageOrLatch();
   }
 
   /**
@@ -11362,6 +11411,7 @@ export class Session {
         ),
       );
     }
+    this._nativeTerminalRunIds.add(identity.runId);
   }
 
   /**
@@ -11537,6 +11587,7 @@ export class Session {
       };
       this._terminalTokenAccountedRunIds.delete(identity.runId);
       this._stagedTerminalRunIds.delete(identity.runId);
+      this._nativeTerminalRunIds.delete(identity.runId);
       try {
         options.onReceipt?.(receipt);
       } catch {
@@ -11706,6 +11757,7 @@ export class Session {
     if (receipt.status === 'committed' || receipt.status === 'duplicate') {
       this._terminalTokenAccountedRunIds.delete(identity.runId);
       this._stagedTerminalRunIds.delete(identity.runId);
+      this._nativeTerminalRunIds.delete(identity.runId);
     }
     try {
       options.onReceipt?.(receipt);
@@ -16521,7 +16573,19 @@ export class Session {
               ? new HarnessTerminalHandoffFencedError(this.id)
               : boundAdmission.status === 'pending' && this._terminalFinalizer === undefined
                 ? new HarnessTerminalHandoffValidationError('terminalHandoff', 'finalizer is not registered')
-                : undefined;
+                : boundAdmission.status === 'pending' &&
+                    this._terminalFinalizerFor(boundAdmission.finalizerId, boundAdmission.finalizerVersion) ===
+                      undefined
+                  ? // The turn stays pending for a process that registers its
+                    // admitted version; resuming here would run the provider
+                    // for output this process cannot settle.
+                    new HarnessTerminalFinalizationPendingError(
+                      Date.now() + 1_000,
+                      new Error(
+                        `admitted finalizer ${boundAdmission.finalizerId}@${boundAdmission.finalizerVersion} is not registered`,
+                      ),
+                    )
+                  : undefined;
       if (resumeRefusal !== undefined) {
         this._drainTerminalObservers(pending.runId, resumeRefusal);
         if (responseId !== undefined) {

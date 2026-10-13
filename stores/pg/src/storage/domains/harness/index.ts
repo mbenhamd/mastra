@@ -6806,8 +6806,10 @@ export class HarnessPG extends HarnessStorage {
           current.operationKind ?? null,
         ],
       });
+      // The UPDATE replaced the pending staged output; never return it.
+      const { stagedResult: _stagedResult, ...settledFrom } = current as typeof current & { stagedResult?: unknown };
       const evidence: AgentSignalResultEvidence = {
-        ...current,
+        ...settledFrom,
         ...terminal,
         operationKind,
         runId,

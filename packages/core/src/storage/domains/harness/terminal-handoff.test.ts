@@ -568,6 +568,48 @@ describe('native chat terminal handoff', () => {
     });
   });
 
+  it('drops staged output when a cancelled turn settles its pending row', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 60_000 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    await storage.stageTerminalCompletion({ identity: input, result: { text: 'cancelled reply' } });
+    await storage.cancelTerminalHandoff({
+      ...input,
+      reason: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      cancelledAt: 2_500,
+    });
+    const scope = {
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      resourceId: input.resourceId,
+      threadId: input.threadId,
+      signalId: input.signalId,
+    };
+    const settled = await storage.compareAndSwapSignalTerminal({
+      ...scope,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      operationKind: 'message',
+      expected: { state: 'reserved' },
+      leaseOwner: { ownerId: 'owner-1' },
+      terminal: {
+        status: 'failed',
+        signalId: input.signalId,
+        runId: input.runId,
+        error: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      },
+      updatedAt: 3_000,
+    });
+    expect(settled).toMatchObject({ applied: true, evidence: { status: 'failed' } });
+    expect(settled.evidence).not.toHaveProperty('stagedResult');
+    const stored = await storage.loadMessageResultEvidence(scope);
+    expect(stored).toMatchObject({ status: 'failed' });
+    expect(stored).not.toHaveProperty('stagedResult');
+  });
+
   it('rejects a terminal commit when pending capacity is exhausted and lets it retry after drain', async () => {
     const storage = new InMemoryHarness({
       db: new InMemoryDB(),

@@ -2704,8 +2704,10 @@ export class InMemoryHarness extends HarnessStorage {
     ) {
       return { applied: false, evidence: cloneJson(existing) };
     }
+    // A settled row never retains pending staged output.
+    const { stagedResult: _stagedResult, ...settledFrom } = existing as typeof existing & { stagedResult?: unknown };
     const terminal: AgentSignalResultEvidence = {
-      ...existing,
+      ...settledFrom,
       ...cloneJson(input.terminal),
       harnessName,
       sessionId: input.sessionId,

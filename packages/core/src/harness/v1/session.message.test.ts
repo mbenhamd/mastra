@@ -2380,6 +2380,8 @@ describe('Session.message() — default path', () => {
     // A redeployed finalizer with a different version must not commit its
     // output under the admitted identity — the rejection is a retryable
     // pending failure so a corrected registration can still settle the grant.
+    // It is refused before the provider resumes, so no output is produced
+    // that this process could not settle.
     const storage2 = new InMemoryHarness({
       db,
       terminalHandoff: { enabled: true },
@@ -2409,7 +2411,7 @@ describe('Session.message() — default path', () => {
       await expect(session2.respondToToolApproval({ approved: true })).rejects.toMatchObject({
         name: 'HarnessTerminalHandoffError:harness.terminal_pending',
       });
-      expect(agent2.resumeCalls).toHaveLength(1);
+      expect(agent2.resumeCalls).toHaveLength(0);
       expect(v2FinalizeCalls).toBe(0);
       const admission = await storage2.loadTerminalAdmission({
         harnessName: 'default',
