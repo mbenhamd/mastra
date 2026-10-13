@@ -205,6 +205,14 @@ const WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID = createStorageErrorId(
   'WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA',
   'MISSING_COLUMNS',
 );
+/**
+ * The missing-release-columns error stops every handoff-fenced write. Write
+ * paths re-throw it unwrapped so its id stays visible to callers and alerts
+ * instead of hiding as the cause of a generic `*_FAILED` storage error.
+ */
+function isWorkflowSnapshotHandoffSchemaError(error: unknown): error is MastraError {
+  return error instanceof MastraError && error.id === WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID;
+}
 const TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH = 'mastra_workflow_parent_revision_migration_epoch';
 const WORKFLOW_PARENT_REVISION_MIGRATION = 'workflow-parent-revision-v1';
 const WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH = 1;
@@ -493,7 +501,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         return publicResult as T;
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', operation.toUpperCase(), 'FAILED'),
@@ -733,7 +742,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         return result;
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'PERSIST_WORKFLOW_STEP_UPDATE', 'FAILED'),
@@ -1900,6 +1910,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     { write }: { write: boolean } = { write: true },
   ): never {
     if (error instanceof TypeError || error instanceof RangeError) throw error;
+    if (isWorkflowSnapshotHandoffSchemaError(error)) throw error;
     throw new MastraError(
       {
         id: createStorageErrorId('PG', operation, 'FAILED'),
@@ -1926,7 +1937,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     // validation TypeErrors/RangeErrors likewise keep their identity.
     if (error instanceof WorkflowSnapshotHandoffFenceError) return error;
     if (error instanceof WorkflowSnapshotHandoffInvariantError) return error;
-    if (error instanceof MastraError && error.id === WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID) return error;
+    if (isWorkflowSnapshotHandoffSchemaError(error)) return error;
     if (error instanceof TypeError || error instanceof RangeError) return error;
     const details: Record<string, string> = {
       persistenceFailure: classifyPgPersistenceFailure(error, { write }),
@@ -5125,7 +5136,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         };
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'BIND_WORKFLOW_NESTED_RUN_OWNERSHIP', 'FAILED'),
@@ -5880,7 +5892,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         return snapshot.context;
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'UPDATE_WORKFLOW_RESULTS', 'FAILED'),
@@ -6013,7 +6026,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         return updatedSnapshot;
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'UPDATE_WORKFLOW_STATE', 'FAILED'),
@@ -6104,7 +6118,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
       if (error instanceof WorkflowStaleSnapshotPersistError) throw error;
       throw new MastraError(
         {
@@ -6302,7 +6317,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision);
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError) throw error;
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'DELETE_WORKFLOW_RUN_BY_ID', 'FAILED'),

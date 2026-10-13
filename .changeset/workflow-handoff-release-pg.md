@@ -20,10 +20,15 @@ await workflows.releaseWorkflowSnapshotHandoff({
 - **Upgrading with init disabled.** If you manage the schema yourself (`disableInit` or `MASTRA_DISABLE_STORAGE_INIT=true`), run this idempotent statement before deploying, with your schema in place of `public`:
 
   ```sql
+  SET lock_timeout = '5s';
   ALTER TABLE "public"."mastra_workflow_snapshot_handoffs"
     ADD COLUMN IF NOT EXISTS "claim_generation" BIGINT NOT NULL DEFAULT 1 CHECK ("claim_generation" >= 1),
     ADD COLUMN IF NOT EXISTS "released_at" BIGINT CHECK ("released_at" >= 0);
   ```
+
+  - **How to run it.** Use `psql -X -v ON_ERROR_STOP=1 -f <file>`, as the table's owner or migration role, against the database's direct endpoint, not a transaction pooler.
+  - **Lock timeout.** The `ALTER` briefly takes an exclusive lock on the table. `lock_timeout` makes it fail fast instead of queueing behind long transactions; if it times out, run it again.
+  - **Order.** It is safe to apply before upgrading: the previous version's inserts don't name the new columns, so they take the defaults (generation 1, not released).
 
   `WorkflowsPG.getWorkflowSnapshotHandoffReleaseDDL(schemaName)` returns the same statement for a given schema.
   - Until you run it, every handoff operation, every native write or deletion that checks the handoff, and retention all fail with an error naming the missing columns. Nothing is written.

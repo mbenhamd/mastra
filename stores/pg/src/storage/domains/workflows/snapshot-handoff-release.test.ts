@@ -474,6 +474,45 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
     ).resolves.toMatchObject({ status: 'released' });
   }, 60000);
 
+  it('surfaces the missing-columns error id at the top level of native writes', async () => {
+    const schemaName = `handoff_release_alert_${randomUUID().replace(/-/g, '')}`;
+    schemasToDrop.push(schemaName);
+    await adminPool.query(`CREATE SCHEMA "${schemaName}"`);
+    const managed = new PostgresStore({ id: `handoff-alert-managed-${schemaName}`, connectionString, schemaName });
+    storesToClose.push(managed);
+    await managed.init();
+    const runId = randomUUID();
+    const run = { workflowName: 'alert', runId };
+    await (await managed.getStore('workflows'))!.persistWorkflowSnapshot({
+      ...run,
+      snapshot: snapshot(runId, 'running'),
+    });
+    await adminPool.query(
+      `ALTER TABLE "${schemaName}".mastra_workflow_snapshot_handoffs DROP COLUMN claim_generation, DROP COLUMN released_at`,
+    );
+    const external = new PostgresStore({
+      id: `handoff-alert-external-${schemaName}`,
+      connectionString,
+      schemaName,
+      disableInit: true,
+    });
+    storesToClose.push(external);
+    const externalWorkflows = (await external.getStore('workflows'))!;
+    const schemaError = {
+      id: 'MASTRA_STORAGE_PG_WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_MISSING_COLUMNS',
+      details: { missingColumns: 'claim_generation,released_at' },
+    };
+
+    await expect(
+      externalWorkflows.persistWorkflowSnapshot({ ...run, snapshot: snapshot(runId, 'running', { step: 2 }) }),
+    ).rejects.toMatchObject(schemaError);
+    await expect(
+      externalWorkflows.updateWorkflowState({ ...run, opts: { status: 'suspended' } }),
+    ).rejects.toMatchObject(schemaError);
+    await expect(externalWorkflows.deleteWorkflowRunById(run)).rejects.toMatchObject(schemaError);
+    await expect(externalWorkflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
+  }, 60000);
+
   it('fails closed when an older init created the table without the columns after this init saw it absent', async () => {
     const schemaName = `handoff_release_race_${randomUUID().replace(/-/g, '')}`;
     schemasToDrop.push(schemaName);
