@@ -126,8 +126,9 @@ describe('synchronous end-of-turn observation', () => {
       } else {
         await expect(completion).resolves.toBe(nextMessageList);
       }
-      if (boundary === 'MessageList replacement' && failurePolicy === 'continue') {
-        // Separate input/output processors share state, but input can retain an ended turn.
+      if (boundary === 'MessageList replacement') {
+        // Separate input/output processors share state, and input retains the ended turn
+        // whether its observation resolved or rejected.
         const outputProcessor = new ObservationalMemoryProcessor(om, memory);
         await outputProcessor.processOutputResult({
           messageList: nextMessageList,
