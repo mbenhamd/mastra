@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { OmModelExecutionError } from '../error';
 import { ObservationalMemory } from '../observational-memory';
 import { ObservationalMemoryProcessor } from '../processor';
+import type { MemoryContextProvider } from '../processor';
 
 describe('synchronous end-of-turn observation', () => {
   it.each([
@@ -49,7 +50,7 @@ describe('synchronous end-of-turn observation', () => {
         },
       });
       const messageList = new MessageList({ threadId, resourceId });
-      const processor = new ObservationalMemoryProcessor(om, {
+      const memory: MemoryContextProvider = {
         getContext: async () => ({
           systemMessage: undefined,
           messages: [],
@@ -61,7 +62,8 @@ describe('synchronous end-of-turn observation', () => {
         persistMessages: async messages => {
           await storage.saveMessages({ messages });
         },
-      });
+      };
+      const processor = new ObservationalMemoryProcessor(om, memory);
       const requestContext = new RequestContext();
       requestContext.set('MastraMemory', { thread: { id: threadId }, resourceId });
       const state: Record<string, unknown> = {};
@@ -123,6 +125,22 @@ describe('synchronous end-of-turn observation', () => {
         await expect(completion).resolves.toHaveProperty('record');
       } else {
         await expect(completion).resolves.toBe(nextMessageList);
+      }
+      if (boundary === 'MessageList replacement' && failurePolicy === 'continue') {
+        // Separate input/output processors share state, but input can retain an ended turn.
+        const outputProcessor = new ObservationalMemoryProcessor(om, memory);
+        await outputProcessor.processOutputResult({
+          messageList: nextMessageList,
+          messages: [],
+          requestContext,
+          state,
+          abort: reason => {
+            throw new Error(reason);
+          },
+          result: { text: '', usage: { inputTokens: 0, outputTokens: 0 }, finishReason: 'stop', steps: [] },
+        });
+        const followingMessageList = new MessageList({ threadId, resourceId });
+        await expect(inputStep(followingMessageList, state, 0)).resolves.toBe(followingMessageList);
       }
       if (failurePolicy === 'abort' || boundary === 'turn end') {
         expect(doStream).toHaveBeenCalledOnce();
