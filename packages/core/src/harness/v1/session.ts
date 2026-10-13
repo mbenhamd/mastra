@@ -4291,6 +4291,25 @@ export class Session {
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
+    if (receipt.status === 'cancelled' && staged === undefined) {
+      // Cancellation won during finalization; output staged meanwhile is
+      // final now and must be counted before the fallback settlement.
+      const current = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: evidence.signalId,
+      });
+      if (
+        current !== null &&
+        'status' in current &&
+        current.status === 'pending' &&
+        current.stagedResult !== undefined
+      ) {
+        await this._accountStagedTerminalUsage(runId, current.stagedResult as FullOutput<unknown>);
+      }
+    }
     return receipt.status === 'cancelled' ? 'unowned' : 'skipped';
   }
 
@@ -10883,7 +10902,15 @@ export class Session {
       const queuedId = queuedItemId ?? this._queuedItemIdForPendingResume(parked);
       const queuedUsagePersisted =
         queuedId !== undefined && this._record.queueAdmissionReceipts?.[queuedId]?.postRunFinalizedAt !== undefined;
-      if (!queuedUsagePersisted && this._resumeUsageBaseline?.generationKey !== generationKey) {
+      // Resumed finalization and this path share one once-only marker.
+      const cached = this._completedRuns.get(runId);
+      const finalizationAccounted = cached?.ok === true && cached.resumeAccountingKey === generationKey;
+      if (cached?.ok === true) cached.resumeAccountingKey = generationKey;
+      if (
+        !queuedUsagePersisted &&
+        !finalizationAccounted &&
+        this._resumeUsageBaseline?.generationKey !== generationKey
+      ) {
         this._recordTurnCompletion(staged, { persist: false, accountedCumulative: parked.accountedTokenUsage });
         const runUsage = this._tokenUsageDeltaFromFullOutput(staged);
         if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
