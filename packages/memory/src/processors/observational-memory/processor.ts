@@ -26,7 +26,7 @@ import type { TokenCounterModelContext } from './token-counter';
  * The turn is stashed in the request-local processor-state map as a live `ObservationTurn`.
  * Processor state is deliberately excluded from workflow snapshots, but a caller can still hand
  * this code a serialized projection. Calling `.end()` on that projection would throw a synchronous
- * TypeError the surrounding `.catch()` could not trap. Only treat a value with a callable `end()`
+ * TypeError before a fresh turn can be created. Only treat a value with a callable `end()`
  * as a turn, so OM falls through to creating a fresh one.
  */
 function asLiveTurn(value: unknown): ObservationTurn | undefined {
@@ -281,7 +281,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
       if (activeTurn && activeTurn.messageList !== messageList) {
         // Durable runs may deserialize a fresh MessageList between loop iterations. End the
         // old turn first so any messages tracked on that list are flushed before OM moves on.
-        await activeTurn.end().catch(() => {});
+        await activeTurn.end();
         if (this.turn === activeTurn) {
           this.turn = undefined;
         }
@@ -302,7 +302,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
       if (!this.turn || !state.__omTurn) {
         // End previous turn if state was reset mid-flow
         if (this.turn && !state.__omTurn) {
-          await this.turn.end().catch(() => {});
+          await this.turn.end();
         }
         this.turn = this.engine.beginTurn({
           threadId,

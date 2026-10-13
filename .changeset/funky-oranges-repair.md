@@ -2,4 +2,4 @@
 '@mastra/memory': patch
 ---
 
-Fixed synchronous end-of-turn observation so configured abort failures propagate after chat messages are persisted (PF-5507).
+Fixed `ObservationTurn.end()` and turn rollover so observer model errors reach the caller under the default `abort` failure policy. With `continue`, observer model errors still resolve. Chat messages are saved before observation.
