@@ -267,9 +267,21 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     owner.storage.commitTerminalHandoff = async () => {
       throw new Error('terminal commit temporarily unavailable');
     };
-    await expect(
-      session.message({ content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } }),
-    ).rejects.toMatchObject({ code: 'harness.terminal_pending' });
+    const stage = owner.storage.stageTerminalCompletion.bind(owner.storage);
+    let stagingFailed = false;
+    owner.storage.stageTerminalCompletion = async input => {
+      if (!stagingFailed) {
+        stagingFailed = true;
+        throw new Error('completed output staging temporarily unavailable');
+      }
+      return stage(input);
+    };
+    const message = { content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } };
+    await expect(session.message(message)).rejects.toMatchObject({ code: 'harness.terminal_pending' });
+    // A transient staging failure preserves the already-produced output for
+    // retry. Retrying stages it before the usage save and never re-runs it.
+    await expect(session.message(message)).rejects.toMatchObject({ code: 'harness.terminal_pending' });
+    expect(ownerAgent.streamCalls).toHaveLength(1);
     await owner.harness.shutdown();
     const identity = { harnessName: 'default', sessionId: session.id, admissionId, executionGrant: grant };
     const pending = await owner.storage.loadTerminalAdmission(identity);

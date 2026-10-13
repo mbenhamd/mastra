@@ -7900,7 +7900,9 @@ export class Session {
     // if another waiter arrived first.
     const cached = this._completedRuns.get(runId);
     if (cached) {
-      return cached.ok ? Promise.resolve(cached.full) : Promise.reject(cached.err);
+      return cached.ok
+        ? this._stageCompletedTerminalOutput(runId, cached.full).then(() => cached.full)
+        : Promise.reject(cached.err);
     }
     // Multiple callers can await the same run (e.g. `message()` followed by
     // an active-delivery `signal()` that drains into the same run). Memoize
@@ -8113,19 +8115,23 @@ export class Session {
       return;
     }
     this._abortedTerminalRunIds.delete(runId);
+    let full: FullOutput<unknown> | undefined;
     try {
       // Close dangling tools while their receipt state can still be attached to
       // this run's output. Suspended tools remain parked for their real terminal.
       if (rawFull.finishReason !== 'suspended' && this._currentRunId === runId) {
         this._emitAbortedToolEnds();
       }
-      const full = this._materializeHarnessRunOutput(runId, rawFull);
+      full = this._materializeHarnessRunOutput(runId, rawFull);
       await this._stageCompletedTerminalOutput(runId, full);
       this._rememberCompletedRun(runId, { ok: true, full });
       if (waiter) waiter.resolve(full);
     } catch (err) {
       this._runToolReceipts.delete(runId);
-      this._rememberCompletedRun(runId, { ok: false, err });
+      // A staging failure is pending settlement of concrete output. Keep that
+      // output available to a same-admission retry, which must stage it before
+      // delivering completion or accounting usage.
+      this._rememberCompletedRun(runId, full === undefined ? { ok: false, err } : { ok: true, full });
       if (waiter) waiter.reject(err);
     }
   }
@@ -10536,6 +10542,10 @@ export class Session {
     opts: MessageOptions,
     activeDeleted?: Promise<never>,
   ): Promise<void> {
+    const runId = full.runId ?? evidence.runId;
+    if (runId !== undefined) {
+      await this._raceActiveTurnWaiter(this._stageCompletedTerminalOutput(runId, full), activeDeleted);
+    }
     if (full.finishReason === 'suspended') {
       // A cached suspension is a replay of an earlier generation — a resumed
       // run may already have parked a *newer* pendingResume (different tool
