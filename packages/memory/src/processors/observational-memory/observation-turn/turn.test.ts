@@ -10,7 +10,7 @@ import { ObservationalMemory } from '../observational-memory';
 import { ObservationalMemoryProcessor } from '../processor';
 import type { MemoryContextProvider } from '../processor';
 
-describe('synchronous end-of-turn observation', () => {
+describe('observation failure policy at native turn boundaries', () => {
   it.each([
     ['abort', 'turn end'],
     ['continue', 'turn end'],
@@ -156,4 +156,50 @@ describe('synchronous end-of-turn observation', () => {
       expect(await storage.getObservationalMemory(threadId, resourceId)).toMatchObject({ activeObservations: '' });
     },
   );
+
+  it('rejects a non-model storage failure at turn end under the continue policy', async () => {
+    const storage = new InMemoryMemory({ db: new InMemoryDB() });
+    const threadId = 'observer-storage-failure';
+    const resourceId = 'observer-resource';
+    const createdAt = new Date('2026-10-13T00:00:00Z');
+    await storage.saveThread({
+      thread: { id: threadId, resourceId, title: 'Observer storage failure', createdAt, updatedAt: createdAt },
+    });
+    const doStream = vi.fn();
+    const om = new ObservationalMemory({
+      storage,
+      scope: 'thread',
+      observation: {
+        model: new MockLanguageModelV2({ doStream }),
+        messageTokens: 1,
+        bufferTokens: false,
+        maxRetries: 0,
+        failurePolicy: 'continue',
+      },
+    });
+    const messageList = new MessageList({ threadId, resourceId });
+    messageList.add(
+      {
+        id: 'user-message',
+        threadId,
+        resourceId,
+        role: 'user',
+        createdAt,
+        content: { format: 2, parts: [{ type: 'text', text: 'Remember this important conversational detail.' }] },
+      },
+      'input',
+    );
+    const turn = om.beginTurn({ threadId, resourceId, messageList });
+    await turn.start();
+    const storageFailure = new Error('Observational memory storage unavailable');
+    const read = vi.spyOn(storage, 'getObservationalMemory').mockRejectedValue(storageFailure);
+
+    await expect(turn.end()).rejects.toBe(storageFailure);
+
+    read.mockRestore();
+    expect(turn.ended).toBe(true);
+    expect(doStream).not.toHaveBeenCalled();
+    const persisted = await storage.listMessages({ threadId, resourceId, perPage: false });
+    expect(persisted.messages.map(message => message.id)).toEqual(['user-message']);
+  });
 });

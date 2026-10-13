@@ -226,6 +226,11 @@ export class ObservationTurn {
    * a background buffer operation is kicked off so that observations are computed
    * proactively while the agent is idle, rather than waiting for the next turn.
    * The returned record does not wait for that background buffering pass to finish.
+   *
+   * Rejects when synchronous end-of-turn observation fails under the configured failure policy
+   * (any failure under `abort`; non-model failures such as storage or cancellation under `continue`).
+   * Unsaved messages are persisted first. The turn stays sealed after a rejection, so do not call
+   * `end()` again; start a new turn instead.
    */
   async end(messageList: MessageList = this.messageList): Promise<TurnResult> {
     if (this._ended) throw new Error('Turn already ended');
