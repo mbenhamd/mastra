@@ -3,7 +3,6 @@ import type { MemoryRunState } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
 import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import { ObservationalMemorySourceWriteConflictError } from '@mastra/core/storage';
 import type { ObservationalMemoryRecord, ObservationalMemorySourceWriteGuard } from '@mastra/core/storage';
 
 import { omDebug } from '../debug';
@@ -253,25 +252,20 @@ export class ObservationTurn {
       // threshold and advances the cursor, and the await keeps the record
       // consistent before the next turn starts (the cost lands only on the
       // rare threshold-crossing turn).
-      try {
-        const observeResult = await this.om.observe({
-          threadId: this.threadId,
-          resourceId: this.resourceId,
-          messages: messageList.get.all.db(),
-          agent: this.agent,
-          requestContext: this.requestContext,
-          writer: this.writer,
-          observabilityContext: this.observabilityContext,
-          sourceWriteGuard: this._sourceWriteGuard,
-        });
-        if (observeResult.observed) {
-          omDebug(
-            `[OM:turn.end] synchronous end-of-turn observation ran (gen=${observeResult.record.generationCount})`,
-          );
-        }
-      } catch (err) {
-        if (err instanceof ObservationalMemorySourceWriteConflictError) throw err;
-        omDebug(`[OM:turn.end] end-of-turn observation failed: ${err instanceof Error ? err.message : String(err)}`);
+      // observe() applies the configured failure policy. Preserve rejected work
+      // so abort-mode model failures and fatal storage failures reach the caller.
+      const observeResult = await this.om.observe({
+        threadId: this.threadId,
+        resourceId: this.resourceId,
+        messages: messageList.get.all.db(),
+        agent: this.agent,
+        requestContext: this.requestContext,
+        writer: this.writer,
+        observabilityContext: this.observabilityContext,
+        sourceWriteGuard: this._sourceWriteGuard,
+      });
+      if (observeResult.observed) {
+        omDebug(`[OM:turn.end] synchronous end-of-turn observation ran (gen=${observeResult.record.generationCount})`);
       }
     }
     if (asyncObservationEnabled && bufferOnIdle) {
