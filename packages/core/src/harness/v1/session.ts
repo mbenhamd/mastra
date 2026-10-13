@@ -4117,10 +4117,21 @@ export class Session {
     });
     const summary = this._buildRunSummary(event, status, reconstructed);
     // Session-fenced: storage refuses the summary of a deleted session.
-    const saved = await this._storage.saveRunSummary({ summary });
+    let saved: HarnessRunSummary | null;
+    try {
+      saved = await this._storage.saveRunSummary({ summary });
+    } catch (error) {
+      // A lost acknowledgement must not suppress publication of a summary
+      // that did commit: later recovery treats the summary as published.
+      saved = await this._storage.loadRunSummary(summaryKey);
+      if (saved === null) throw error;
+    }
     if (saved === null) throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
     // A concurrent owner's summary won: that owner publishes its completion.
     if (saved.completedAt !== summary.completedAt || saved.reconstructed !== summary.reconstructed) return;
+    // A live owner (or an earlier attempt here) already emitted this run's
+    // completion; only its summary was missing.
+    if (this._finalizedRunIds.has(runId)) return;
     this._assertNotDeleted();
     // The summary is durable; emit agent_end without finalizing again, then
     // the matching run_completed. Only a later live terminal agent_end for
@@ -4170,7 +4181,19 @@ export class Session {
     // Cancellation prevents delivery, but cannot erase tokens the finished
     // run consumed. Persist its staged usage before any terminal evidence
     // rewrite, using the same durable per-run accounting fence.
-    const staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
+    let staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
+    if (staged === undefined && admission.status !== 'pending') {
+      // The scan may predate staging; staging needs a pending admission, so
+      // the evidence read after observing it settled is final.
+      const current = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: evidence.signalId,
+      });
+      if (current !== null && 'status' in current && current.status === 'pending') staged = current.stagedResult;
+    }
     if (staged !== undefined) await this._accountStagedTerminalUsage(runId, staged as FullOutput<unknown>);
     if (admission.status !== 'pending') {
       // A cancelled admission does not settle its evidence. Keep the usage
@@ -10803,7 +10826,6 @@ export class Session {
    * consumed tokens. Count that usage before any evidence rewrite.
    */
   private async _accountStagedResumeUsage(pending: PendingResume, queuedItemId: string | undefined): Promise<void> {
-    if (this._terminalTokenAccountedRunIds.has(pending.runId)) return;
     const admission = await this._probeResumeAdmissionByRun(pending);
     if (!admission) return;
     const stored = await this._storage.loadMessageResultEvidence({
@@ -10839,7 +10861,14 @@ export class Session {
     staged: FullOutput<unknown>,
     queuedItemId?: string,
   ): Promise<void> {
-    if (this._terminalTokenAccountedRunIds.has(runId)) return;
+    if (this._terminalTokenAccountedRunIds.has(runId)) {
+      // Counted here before, but that save may have failed: settlement may
+      // drop the staged output only once the fence and counter are durable.
+      if (!this._record.accountedTerminalRunIds?.includes(runId) || !this._recordTokenUsageMatchesLive()) {
+        await this._persistTokenUsageOrLatch();
+      }
+      return;
+    }
     const parked = this._record.pendingResume;
     if (parked !== undefined && parked.runId === runId) {
       const generationKey = pendingInteractionGenerationKey({
