@@ -116,8 +116,9 @@ export abstract class WorkflowsStorage extends StorageDomain {
   }
 
   /**
-   * Removes the run's handoff row so the run is no longer fenced. Adapters
-   * implementing this advertise `releaseVersion: 1`.
+   * Releases one claim of the run's handoff, compared by `claimGeneration`:
+   * the row is kept and marked released, and no longer fences the run.
+   * Adapters implementing this advertise `releaseVersion: 1`.
    */
   async releaseWorkflowSnapshotHandoff(
     _input: ReleaseWorkflowSnapshotHandoffInput,

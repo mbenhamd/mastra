@@ -1208,6 +1208,72 @@ describe('importExecutionClosure', () => {
     expect(thread).toBeDefined();
   });
 
+  it('never restores a released handoff over later state or into a deleted run', async () => {
+    const src = await store('released-src');
+    const dst = await store('released-dst');
+    const { runId } = await seedClosure(src.s, src.schemaName, 'rel1');
+    const workflows = src.s.stores.workflows!;
+    const run = { workflowName: 'test-workflow', runId };
+    const canonical = (await workflows.loadWorkflowSnapshot(run))!;
+    const claimTime = { ...canonical, value: { phase: 'claim-time' } };
+    await workflows.claimWorkflowSnapshotHandoff({
+      ...run,
+      expectedCanonical: { kind: 'present', snapshot: canonical },
+      snapshot: claimTime,
+      mutationFence: 'closure-owner',
+    });
+    await workflows.completeWorkflowSnapshotHandoff({
+      ...run,
+      expectedSnapshot: claimTime,
+      snapshot: { ...claimTime, value: { phase: 'delivered' } },
+      mutationFence: 'closure-owner',
+    });
+    await expect(
+      workflows.releaseWorkflowSnapshotHandoff({ ...run, expectedClaimGeneration: 1 }),
+    ).resolves.toMatchObject({ status: 'released' });
+    // Native state moves on after the release.
+    await workflows.persistWorkflowSnapshot({ ...run, snapshot: { ...canonical, value: { phase: 'after-release' } } });
+
+    const exported = await src.s.exportExecutionClosure({ harnessName: HARNESS, sessionId: 'rel1' });
+    expect(exported.rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF] ?? []).toEqual([]);
+    await expect(dst.s.importExecutionClosure(exported)).resolves.toMatchObject({ status: 'imported' });
+    await expect(dst.s.stores.workflows!.loadWorkflowSnapshot(run)).resolves.toMatchObject({
+      value: { phase: 'after-release' },
+    });
+
+    // Deleted together with its release: an export carries nothing that recreates it.
+    const deletedSrc = await store('deleted-src');
+    const deletedDst = await store('deleted-dst');
+    const seeded = await seedClosure(deletedSrc.s, deletedSrc.schemaName, 'rel2');
+    const deletedRun = { workflowName: 'test-workflow', runId: seeded.runId };
+    const deletedWorkflows = deletedSrc.s.stores.workflows!;
+    const deletedCanonical = (await deletedWorkflows.loadWorkflowSnapshot(deletedRun))!;
+    await deletedWorkflows.claimWorkflowSnapshotHandoff({
+      ...deletedRun,
+      expectedCanonical: { kind: 'present', snapshot: deletedCanonical },
+      snapshot: deletedCanonical,
+      mutationFence: 'closure-owner',
+    });
+    await deletedWorkflows.completeWorkflowSnapshotHandoff({
+      ...deletedRun,
+      expectedSnapshot: deletedCanonical,
+      snapshot: deletedCanonical,
+      mutationFence: 'closure-owner',
+    });
+    await expect(
+      deletedWorkflows.releaseWorkflowSnapshotHandoff({ ...deletedRun, expectedClaimGeneration: 1, deleteRun: true }),
+    ).resolves.toMatchObject({ status: 'released', runDeleted: true });
+
+    const deletedExport = await exportExecutionClosure(
+      deletedSrc.s.db,
+      { harnessName: HARNESS, sessionId: 'rel2' },
+      { schemaName: deletedSrc.schemaName },
+    );
+    expect(deletedExport.rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF] ?? []).toEqual([]);
+    await importExecutionClosure(deletedDst.s.db, deletedExport, { schemaName: deletedDst.schemaName });
+    await expect(deletedDst.s.stores.workflows!.loadWorkflowSnapshot(deletedRun)).resolves.toBeNull();
+  });
+
   it('carries a pre-admission grant revocation to the destination, where it still fences admission', async () => {
     const terminalStore = async (name: string) => {
       const schemaName = `import_${name}_${randomUUID().slice(0, 8)}`.replaceAll('-', '_');

@@ -301,9 +301,11 @@ export const EXECUTION_CLOSURE_TABLES: Partial<Record<ExecutionClosureTableName,
   // run ids it cannot attribute to a single workflow.
   [TABLE_WORKFLOW_SNAPSHOT]: { role: 'state', scope: [], runPairScope: runPair },
   // The snapshot handoff is the run's live mutation fence — canonical
-  // snapshot writes reject while ANY handoff row exists, so restoring one
-  // would make the imported run permanently unwritable. The exporter keeps it
-  // as evidence; the importer materializes its snapshot as canonical state.
+  // snapshot writes reject while an unreleased handoff row exists, so
+  // restoring one would make the imported run permanently unwritable. The
+  // exporter keeps unreleased rows as evidence; the importer materializes
+  // their snapshot as canonical state. A released row (`released_at` set)
+  // records a past claim only and is neither exported nor materialized.
   [TABLE_WORKFLOW_SNAPSHOT_HANDOFF]: { role: 'authority', scope: [], runPairScope: runPair },
   // The terminalization row holds the run's terminal record AND live claim
   // fields; the owner/token/lease clear on import so the new incarnation

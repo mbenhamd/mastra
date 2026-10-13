@@ -652,6 +652,21 @@ async function readClosureTable(
 }
 
 /** Read the rows of a run-pair-scoped workflow table for exact (workflow, run) pairs. */
+/**
+ * A released snapshot-handoff row only records a past claim: the run's
+ * canonical snapshot (or its deletion) has moved on since, so the row neither
+ * proves the run nor supplies its state. Released rows are dropped wherever
+ * the closure reads handoff rows; rows from a store without the release
+ * columns have no `released_at` and stay live.
+ */
+function withoutReleasedHandoffs(
+  table: ExecutionClosureTableName,
+  rows: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  if (table !== TABLE_WORKFLOW_SNAPSHOT_HANDOFF) return rows;
+  return rows.filter(row => row.released_at === null || row.released_at === undefined);
+}
+
 async function readRunPairTable(
   t: TxClient,
   table: ExecutionClosureTableName,
@@ -678,10 +693,11 @@ async function readRunPairTable(
     })
     .join(' OR ');
   conditions.push(`(${ors})`);
-  return t.manyOrNone<Record<string, unknown>>(
+  const rows = await t.manyOrNone<Record<string, unknown>>(
     `SELECT * FROM ${tableSql(table, schemaName)} WHERE ${conditions.join(' AND ')}`,
     args,
   );
+  return withoutReleasedHandoffs(table, rows);
 }
 
 /**
@@ -709,10 +725,11 @@ async function readRunPairCandidates(
     conditions.push(`"harness_name" = ${push(harnessName)}`);
   }
   conditions.push(`${quoteIdent(pairScope.runIdColumn)} = ANY(${push([...runIds])}::text[])`);
-  return t.manyOrNone<Record<string, unknown>>(
+  const rows = await t.manyOrNone<Record<string, unknown>>(
     `SELECT * FROM ${tableSql(table, schemaName)} WHERE ${conditions.join(' AND ')}`,
     args,
   );
+  return withoutReleasedHandoffs(table, rows);
 }
 
 /** Parent (workflow, run) references carried by terminal lineage rows. */
@@ -1725,8 +1742,13 @@ export async function importExecutionClosure(
     // --- Workflow snapshot handoffs are imported as evidence only: their
     // snapshot is materialized as canonical state and the fence row itself is
     // never restored, so the destination run stays writable.
+    // A released row (from any exporter) is never materialized: the run's
+    // later canonical state, or its deletion, supersedes it.
     const handoffPairs = new Map<string, Record<string, unknown>>();
-    for (const row of rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF] ?? []) {
+    for (const row of withoutReleasedHandoffs(
+      TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
+      rows[TABLE_WORKFLOW_SNAPSHOT_HANDOFF] ?? [],
+    )) {
       const pair = pairKeyOf(row.workflow_name, row.run_id);
       if (pair) handoffPairs.set(pair, row);
     }

@@ -108,8 +108,10 @@ export interface WorkflowSnapshotHandoffRecord {
   claimGeneration: number;
   /**
    * When the handoff was released. A released row no longer fences the run:
-   * deletion, retention and native writes proceed. The row stays as a record
-   * of the claim until the run is claimed again.
+   * deletion, retention and native writes proceed. The row stays as the
+   * record of that claim until the run is claimed again under another fence
+   * (which replaces it) or the row is removed by the operator. Storage never
+   * removes released rows itself.
    */
   releasedAt?: number;
 }
@@ -132,7 +134,13 @@ export type WorkflowSnapshotHandoffCanonicalState =
  * - a completed row with the same `mutationFence` answers `completed` and
  *   stays released (the claim's outcome is kept for later retries of it);
  * - otherwise the row is claimed again: it becomes pending with this input,
- *   its `claimGeneration` increases by one, and it answers `created`.
+ *   its `claimGeneration` increases by one, and it answers `created`. A claim
+ *   under another fence therefore replaces the kept record of a released
+ *   completed claim; only the latest fence's outcome is kept.
+ *
+ * Transition and completion compare the fence and the expected snapshot, not
+ * the generation: a holder whose fence is reused by a later claim of the same
+ * run (a deterministic per-run fence) acts on that later claim.
  */
 export interface ClaimWorkflowSnapshotHandoffInput {
   workflowName: string;
@@ -197,9 +205,12 @@ export type CompleteWorkflowSnapshotHandoffResult =
  * - a completed handoff may be released without a fence, but a supplied fence
  *   must match it exactly.
  *
- * With `deleteRun: true` the run's canonical snapshot is deleted in the same
- * transaction, as `deleteWorkflowRunById` would, so no new claim can fence the
- * run between the release and the deletion.
+ * With `deleteRun: true` the call that releases the claim also deletes the
+ * run's canonical snapshot in the same transaction, as `deleteWorkflowRunById`
+ * would, so no new claim can fence the run in between. A repeated release
+ * (`already_released`) never deletes: native writes made after the first
+ * release must survive a late retry. Use `deleteWorkflowRunById` to delete a
+ * run whose claim was released earlier.
  */
 export interface ReleaseWorkflowSnapshotHandoffInput {
   workflowName: string;
@@ -212,7 +223,7 @@ export interface ReleaseWorkflowSnapshotHandoffInput {
 /**
  * - `released`: this call marked the claim released; `record` is the released row.
  * - `already_released`: the same claim was released before (a retried
- *   release); nothing changed except the run deletion when `deleteRun` is set.
+ *   release); nothing changed.
  * - In both, `runDeleted` is true only when this call deleted the run's
  *   canonical snapshot.
  * - `missing`: the run has no handoff row at all.

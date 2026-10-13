@@ -1949,8 +1949,10 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       this.db.workflowSnapshotHandoffs.set(key, record);
       status = 'released';
     }
+    // Only the call that releases the claim deletes the run: a retried release
+    // may arrive after native writes the release allowed, which must survive.
     let runDeleted = false;
-    if (deleteRun === true && this.deleteWorkflowRunRecord(workflowName, runId)) {
+    if (deleteRun === true && status === 'released' && this.deleteWorkflowRunRecord(workflowName, runId)) {
       // Keep the tombstone revision, as deleteWorkflowRunById does.
       this.bumpParentRevision(key);
       runDeleted = true;

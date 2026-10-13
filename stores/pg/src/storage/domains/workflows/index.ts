@@ -198,6 +198,13 @@ const TABLE_WORKFLOW_TERMINAL_DESTINATION_RECEIPTS = 'mastra_workflow_terminal_d
 const TABLE_WORKFLOW_TERMINAL_CONTINUATION_PLANS = 'mastra_workflow_terminal_continuation_plans_v2';
 const TABLE_WORKFLOW_PARENT_REVISIONS = 'mastra_workflow_parent_revisions';
 const TABLE_WORKFLOW_SCHEMA_MIGRATIONS = 'mastra_workflow_schema_migrations';
+/** Handoff release columns an externally managed schema must provide (see getWorkflowSnapshotHandoffReleaseDDL). */
+const WORKFLOW_SNAPSHOT_HANDOFF_RELEASE_COLUMNS = ['claim_generation', 'released_at'] as const;
+const WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID = createStorageErrorId(
+  'PG',
+  'WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA',
+  'MISSING_COLUMNS',
+);
 const TABLE_WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH = 'mastra_workflow_parent_revision_migration_epoch';
 const WORKFLOW_PARENT_REVISION_MIGRATION = 'workflow-parent-revision-v1';
 const WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH = 1;
@@ -374,6 +381,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   #skipDefaultIndexes?: boolean;
   #indexes?: CreateIndexOptions[];
   #initializedWorkflowSnapshotColumnType?: WorkflowSnapshotColumnType;
+  #workflowSnapshotHandoffReleaseColumnsVerified = false;
 
   /** Tables managed by this domain */
   static readonly MANAGED_TABLES = [
@@ -943,11 +951,68 @@ export class WorkflowsPG extends WorkflowsStorage {
     };
   }
 
+  /**
+   * The idempotent DDL that adds the handoff release columns to a table
+   * created before them. `init()` runs it when needed; an externally managed
+   * schema (`disableInit` / `MASTRA_DISABLE_STORAGE_INIT`) must run it before
+   * deploying a store that reports `releaseVersion: 1`.
+   */
+  static getWorkflowSnapshotHandoffReleaseDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `ALTER TABLE ${tableName}
+  ADD COLUMN IF NOT EXISTS "claim_generation" BIGINT NOT NULL DEFAULT 1 CHECK ("claim_generation" >= 1),
+  ADD COLUMN IF NOT EXISTS "released_at" BIGINT CHECK ("released_at" >= 0);`;
+  }
+
+  /**
+   * With init disabled nothing adds the release columns, and an older
+   * version's concurrent init can create the table without them after this
+   * init saw it absent. Until the columns are known to exist, every handoff
+   * read first checks the live catalog for them, on the caller's own
+   * connection. A miss fails closed with the columns and the DDL to run, and
+   * is not cached, so the store recovers once the migration has run.
+   */
+  private async assertWorkflowSnapshotHandoffReleaseColumns(client: Pick<DbClient, 'manyOrNone'>): Promise<void> {
+    if (this.#workflowSnapshotHandoffReleaseColumnsVerified) return;
+    const rows = await client.manyOrNone<{ column_name: string }>(
+      `SELECT attribute_row.attname AS column_name
+         FROM pg_catalog.pg_class AS relation_row
+         JOIN pg_catalog.pg_namespace AS namespace_row
+           ON namespace_row.oid = relation_row.relnamespace
+         JOIN pg_catalog.pg_attribute AS attribute_row
+           ON attribute_row.attrelid = relation_row.oid
+        WHERE namespace_row.nspname = $1
+          AND relation_row.relname = $2
+          AND relation_row.relkind IN ('r', 'p')
+          AND attribute_row.attnum > 0
+          AND NOT attribute_row.attisdropped
+          AND attribute_row.attname = ANY($3::text[])`,
+      [this.#schema || 'public', TABLE_WORKFLOW_SNAPSHOT_HANDOFF, [...WORKFLOW_SNAPSHOT_HANDOFF_RELEASE_COLUMNS]],
+    );
+    const present = new Set(rows.map(row => row.column_name));
+    const missing = WORKFLOW_SNAPSHOT_HANDOFF_RELEASE_COLUMNS.filter(column => !present.has(column));
+    if (missing.length === 0) {
+      this.#workflowSnapshotHandoffReleaseColumnsVerified = true;
+      return;
+    }
+    throw new MastraError({
+      id: WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID,
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.USER,
+      text: `PostgreSQL external schema table ${this.workflowSnapshotHandoffTableName()} is missing required columns: ${missing.join(', ')}. Run: ${WorkflowsPG.getWorkflowSnapshotHandoffReleaseDDL(this.#schema)}`,
+      details: { tableName: TABLE_WORKFLOW_SNAPSHOT_HANDOFF, missingColumns: missing.join(',') },
+    });
+  }
+
   private async lockWorkflowSnapshotHandoff(
     t: TxClient,
     workflowName: string,
     runId: string,
   ): Promise<WorkflowSnapshotHandoffRecord | undefined> {
+    await this.assertWorkflowSnapshotHandoffReleaseColumns(t);
     const row = await t.oneOrNone<Record<string, unknown>>(
       `SELECT * FROM ${this.workflowSnapshotHandoffTableName()}
        WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
@@ -1861,6 +1926,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     // validation TypeErrors/RangeErrors likewise keep their identity.
     if (error instanceof WorkflowSnapshotHandoffFenceError) return error;
     if (error instanceof WorkflowSnapshotHandoffInvariantError) return error;
+    if (error instanceof MastraError && error.id === WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID) return error;
     if (error instanceof TypeError || error instanceof RangeError) return error;
     const details: Record<string, string> = {
       persistenceFailure: classifyPgPersistenceFailure(error, { write }),
@@ -4535,15 +4601,17 @@ export class WorkflowsPG extends WorkflowsStorage {
   private async migrateWorkflowSnapshotHandoffRelease(): Promise<void> {
     const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
     if (snapshot) {
+      // Created by this init with the columns, unless an older version's
+      // concurrent init won the CREATE: the first handoff read verifies.
       if (!snapshot.tables.has(TABLE_WORKFLOW_SNAPSHOT_HANDOFF)) return;
       const columns = snapshot.columns.get(TABLE_WORKFLOW_SNAPSHOT_HANDOFF);
-      if (columns?.has('claim_generation') && columns.has('released_at')) return;
+      if (columns?.has('claim_generation') && columns.has('released_at')) {
+        this.#workflowSnapshotHandoffReleaseColumnsVerified = true;
+        return;
+      }
     }
-    await this.#db.client.none(
-      `ALTER TABLE ${this.workflowSnapshotHandoffTableName()}
-         ADD COLUMN IF NOT EXISTS "claim_generation" BIGINT NOT NULL DEFAULT 1 CHECK ("claim_generation" >= 1),
-         ADD COLUMN IF NOT EXISTS "released_at" BIGINT CHECK ("released_at" >= 0)`,
-    );
+    await this.#db.client.none(WorkflowsPG.getWorkflowSnapshotHandoffReleaseDDL(this.#schema));
+    this.#workflowSnapshotHandoffReleaseColumnsVerified = true;
   }
 
   private async migrateWorkflowParentRevisions(): Promise<WorkflowSnapshotColumnType> {
@@ -4902,6 +4970,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     // table drained while unattempted candidates remain.
     const skippedNames: string[] = [];
     const skippedRuns: string[] = [];
+    await this.assertWorkflowSnapshotHandoffReleaseColumns(this.#db.client);
     while (deleted < limit) {
       if (options?.signal?.aborted) return { deleted, truncated: true };
       const candidates = await this.#db.client.manyOrNone<{ workflow_name: string; run_id: string }>(
@@ -5653,8 +5722,12 @@ export class WorkflowsPG extends WorkflowsStorage {
           record = { ...existing, updatedAt: Math.max(existing.updatedAt, now), releasedAt: now };
           status = 'released';
         }
+        // Only the call that releases the claim deletes the run: a retried
+        // release may arrive after native writes the release allowed.
         const runDeleted =
-          deleteRun === true && (await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision));
+          deleteRun === true &&
+          status === 'released' &&
+          (await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision));
         return { status, record, runDeleted };
       });
     } catch (error) {
@@ -5688,6 +5761,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     values.push(limit + 1);
     let decoded: WorkflowSnapshotHandoffRecord[];
     try {
+      await this.assertWorkflowSnapshotHandoffReleaseColumns(this.#db.client);
       const rows = await this.#db.client.any<Record<string, unknown>>(
         `SELECT * FROM ${this.workflowSnapshotHandoffTableName()}
          ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}

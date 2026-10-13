@@ -819,6 +819,8 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     created_at: { type: 'bigint' },
     updated_at: { type: 'bigint' },
     completed_at: { type: 'bigint', nullable: true },
+    claim_generation: { type: 'bigint' },
+    released_at: { type: 'bigint', nullable: true },
   },
   [TABLE_SCORERS]: SCORERS_SCHEMA,
   [TABLE_THREADS]: {

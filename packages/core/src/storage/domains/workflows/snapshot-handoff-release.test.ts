@@ -18,6 +18,9 @@ const snapshot = (runId: string, status: WorkflowRunState['status'], value: unkn
     timestamp: Date.now(),
   }) as WorkflowRunState;
 
+const isRunState = (value: unknown): value is WorkflowRunState =>
+  typeof value === 'object' && value !== null && 'runId' in value && 'status' in value;
+
 async function claimedRun(workflowName: string, runId: string, mutationFence = 'owner-fence') {
   const store = new InMemoryStore();
   const workflows = (await store.getStore('workflows'))!;
@@ -31,7 +34,7 @@ async function claimedRun(workflowName: string, runId: string, mutationFence = '
       ...owner,
       mutationFence: fence,
       expectedCanonical: { kind: 'present', snapshot: canonical },
-      snapshot: value === pending.value ? pending : snapshot(runId, 'waiting', value),
+      snapshot: value === pending.value ? pending : isRunState(value) ? value : snapshot(runId, 'waiting', value),
     });
   await expect(claim(mutationFence, pending.value)).resolves.toMatchObject({
     status: 'created',
@@ -170,11 +173,13 @@ describe('workflow snapshot handoff release', () => {
     const { workflows, target, claim, complete } = await claimedRun('release-stale', 'run-1');
     await complete();
     await workflows.releaseWorkflowSnapshotHandoff({ ...target, expectedClaimGeneration: 1 });
-    const reclaimed = await claim('second-owner', { phase: 'second' });
+    const second = snapshot(target.runId, 'waiting', { phase: 'second' });
+    const reclaimed = await claim('second-owner', second);
     expect(reclaimed).toMatchObject({ status: 'created', record: { claimGeneration: 2 } });
-    await expect(
-      complete('second-owner', snapshot(target.runId, 'waiting', { phase: 'second' })),
-    ).resolves.toMatchObject({ status: 'completed', record: { claimGeneration: 2 } });
+    await expect(complete('second-owner', second)).resolves.toMatchObject({
+      status: 'completed',
+      record: { claimGeneration: 2 },
+    });
 
     await expect(
       workflows.releaseWorkflowSnapshotHandoff({ ...target, expectedClaimGeneration: 1 }),
@@ -185,7 +190,7 @@ describe('workflow snapshot handoff release', () => {
     ).resolves.toMatchObject({ status: 'released' });
   });
 
-  it('deletes the run in the same step when asked, and a retry reports nothing left to delete', async () => {
+  it('deletes the run in the same step when asked, and a late retry never deletes later writes', async () => {
     const { workflows, target, complete } = await claimedRun('release-delete', 'run-1');
     await complete();
     const release = { ...target, expectedClaimGeneration: 1, deleteRun: true };
@@ -195,9 +200,33 @@ describe('workflow snapshot handoff release', () => {
       runDeleted: true,
     });
     await expect(workflows.loadWorkflowSnapshot(target)).resolves.toBeNull();
+    // The release lets native writes through; a delayed retry must not delete them.
+    await workflows.persistWorkflowSnapshot({
+      ...target,
+      snapshot: snapshot(target.runId, 'success', { phase: 'after-release' }),
+    });
     await expect(workflows.releaseWorkflowSnapshotHandoff(release)).resolves.toMatchObject({
       status: 'already_released',
       runDeleted: false,
+    });
+    await expect(workflows.loadWorkflowSnapshot(target)).resolves.toMatchObject({
+      value: { phase: 'after-release' },
+    });
+  });
+
+  it('replaces the kept record of a released completed claim when another fence claims the run', async () => {
+    const { workflows, owner, target, claim, complete } = await claimedRun('release-overwrite', 'run-1');
+    await complete();
+    await workflows.releaseWorkflowSnapshotHandoff({ ...target, expectedClaimGeneration: 1 });
+
+    await expect(claim('second-owner', { phase: 'second' })).resolves.toMatchObject({
+      status: 'created',
+      record: { claimGeneration: 2, status: 'pending', mutationFence: 'second-owner' },
+    });
+    // Only the latest fence's outcome is kept: the first owner's retry now meets the new claim.
+    await expect(claim(owner.mutationFence, { phase: 'retried' })).resolves.toMatchObject({
+      status: 'conflict',
+      record: { claimGeneration: 2, mutationFence: 'second-owner' },
     });
   });
 

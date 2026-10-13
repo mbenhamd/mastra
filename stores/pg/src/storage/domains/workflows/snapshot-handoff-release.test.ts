@@ -81,11 +81,17 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
       [workflowName, runId],
     );
 
-  const parentRevisionWaiters = async (): Promise<number> => {
+  /** Backends waiting, directly or behind another waiter, on the blocker's lock. */
+  const waitersBehind = async (blockerPid: number): Promise<number> => {
     const { rows } = await adminPool.query<{ waiters: number }>(
-      `SELECT count(*)::int AS waiters FROM pg_stat_activity
-       WHERE datname = current_database() AND wait_event_type = 'Lock'
-         AND query ILIKE '%mastra_workflow_parent_revisions%'`,
+      `WITH RECURSIVE chain(pid) AS (
+         SELECT $1::int
+         UNION
+         SELECT activity.pid FROM pg_stat_activity AS activity
+         JOIN chain ON chain.pid = ANY(pg_blocking_pids(activity.pid))
+       )
+       SELECT count(*)::int - 1 AS waiters FROM chain`,
+      [blockerPid],
     );
     return rows[0]!.waiters;
   };
@@ -93,8 +99,9 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
   /**
    * Runs `first` and `second` against one run in a forced order: a blocking
    * transaction holds the run's parent revision row, `first` is queued behind
-   * it before `second` starts, and PostgreSQL grants the row lock to waiters
-   * in queue order once the blocker commits.
+   * it before `second` starts (counted through the blocker's own lock chain,
+   * so other sessions on the database cannot skew it), and PostgreSQL grants
+   * the row lock to waiters in queue order once the blocker commits.
    */
   async function inForcedOrder<A, B>(
     target: { workflowName: string; runId: string },
@@ -104,6 +111,8 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
     const blocker = new Client({ connectionString });
     await blocker.connect();
     try {
+      const { rows: backend } = await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const blockerPid = backend[0]!.pid;
       await blocker.query('BEGIN');
       await blocker.query(
         `SELECT generation FROM mastra_workflow_parent_revisions
@@ -112,7 +121,7 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
       );
       const waitFor = async (count: number) => {
         const deadline = Date.now() + 10_000;
-        while ((await parentRevisionWaiters()) < count) {
+        while ((await waitersBehind(blockerPid)) < count) {
           if (Date.now() > deadline) throw new Error(`Timed out waiting for ${count} lock waiters`);
           await new Promise(resolve => setTimeout(resolve, 20));
         }
@@ -278,7 +287,7 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
     ).resolves.toMatchObject({ status: 'released' });
   });
 
-  it('deletes the run in the same transaction when asked, and a retry reports nothing left to delete', async () => {
+  it('deletes the run in the same transaction when asked, and a late retry never deletes later writes', async () => {
     const { target, complete } = await claimedRun('release-delete');
     await complete();
     const release = { ...target, expectedClaimGeneration: 1, deleteRun: true };
@@ -288,10 +297,32 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
       runDeleted: true,
     });
     await expect(workflows.loadWorkflowSnapshot(target)).resolves.toBeNull();
+    // The release lets native writes through; a delayed retry must not delete them.
+    await workflows.persistWorkflowSnapshot({
+      ...target,
+      snapshot: snapshot(target.runId, 'success', { phase: 'after-release' }),
+    });
     await expect(workflows.releaseWorkflowSnapshotHandoff(release)).resolves.toMatchObject({
       status: 'already_released',
       runDeleted: false,
     });
+    await expect(workflows.loadWorkflowSnapshot(target)).resolves.toMatchObject({
+      value: { phase: 'after-release' },
+    });
+  });
+
+  it('replaces the kept record of a released completed claim when another fence claims the run', async () => {
+    const { owner, target, claim, complete } = await claimedRun('release-overwrite');
+    await complete();
+    await workflows.releaseWorkflowSnapshotHandoff({ ...target, expectedClaimGeneration: 1 });
+
+    await expect(claim('second-owner', snapshot(target.runId, 'waiting', { phase: 'second' }))).resolves.toMatchObject({
+      status: 'created',
+      record: { claimGeneration: 2, status: 'pending', mutationFence: 'second-owner' },
+    });
+    await expect(
+      claim(owner.mutationFence, snapshot(target.runId, 'waiting', { phase: 'retried' })),
+    ).resolves.toMatchObject({ status: 'conflict', record: { claimGeneration: 2, mutationFence: 'second-owner' } });
   });
 
   it('lets retention prune a released run', async () => {
@@ -378,6 +409,89 @@ describe('workflow snapshot handoff release in PostgreSQL', () => {
       ]);
     });
   });
+
+  it('fails closed naming the missing release columns when init is disabled, and recovers after the documented DDL', async () => {
+    const schemaName = `handoff_release_external_${randomUUID().replace(/-/g, '')}`;
+    schemasToDrop.push(schemaName);
+    await adminPool.query(`CREATE SCHEMA "${schemaName}"`);
+    const managed = new PostgresStore({ id: `handoff-managed-${schemaName}`, connectionString, schemaName });
+    storesToClose.push(managed);
+    await managed.init();
+    const managedWorkflows = (await managed.getStore('workflows'))!;
+    const runId = randomUUID();
+    const canonical = snapshot(runId, 'success', { native: true });
+    await managedWorkflows.persistWorkflowSnapshot({ workflowName: 'external', runId, snapshot: canonical });
+    await managedWorkflows.claimWorkflowSnapshotHandoff({
+      workflowName: 'external',
+      runId,
+      expectedCanonical: { kind: 'present', snapshot: canonical },
+      snapshot: snapshot(runId, 'waiting'),
+      mutationFence: 'external-owner',
+    });
+    // An externally managed schema that has not run the release migration yet.
+    await adminPool.query(
+      `ALTER TABLE "${schemaName}".mastra_workflow_snapshot_handoffs DROP COLUMN claim_generation, DROP COLUMN released_at`,
+    );
+
+    const external = new PostgresStore({
+      id: `handoff-external-${schemaName}`,
+      connectionString,
+      schemaName,
+      disableInit: true,
+    });
+    storesToClose.push(external);
+    const externalWorkflows = (await external.getStore('workflows'))!;
+    const missing = /is missing required columns: claim_generation, released_at\. Run: ALTER TABLE/;
+    await expect(externalWorkflows.listWorkflowSnapshotHandoffs({ workflowName: 'external' })).rejects.toThrow(missing);
+    await expect(
+      externalWorkflows.persistWorkflowSnapshot({
+        workflowName: 'external',
+        runId,
+        snapshot: snapshot(runId, 'failed'),
+      }),
+    ).rejects.toThrow(missing);
+    await expect(
+      externalWorkflows.releaseWorkflowSnapshotHandoff({
+        workflowName: 'external',
+        runId,
+        expectedClaimGeneration: 1,
+        mutationFence: 'external-owner',
+      }),
+    ).rejects.toThrow(missing);
+
+    await adminPool.query(WorkflowsPG.getWorkflowSnapshotHandoffReleaseDDL(schemaName));
+    await adminPool.query(WorkflowsPG.getWorkflowSnapshotHandoffReleaseDDL(schemaName));
+    await expect(externalWorkflows.listWorkflowSnapshotHandoffs({ workflowName: 'external' })).resolves.toMatchObject({
+      records: [{ runId, status: 'pending', claimGeneration: 1 }],
+    });
+    await expect(
+      externalWorkflows.releaseWorkflowSnapshotHandoff({
+        workflowName: 'external',
+        runId,
+        expectedClaimGeneration: 1,
+        mutationFence: 'external-owner',
+      }),
+    ).resolves.toMatchObject({ status: 'released' });
+  }, 60000);
+
+  it('fails closed when an older init created the table without the columns after this init saw it absent', async () => {
+    const schemaName = `handoff_release_race_${randomUUID().replace(/-/g, '')}`;
+    schemasToDrop.push(schemaName);
+    await adminPool.query(`CREATE SCHEMA "${schemaName}"`);
+    const managed = new PostgresStore({ id: `handoff-race-${schemaName}`, connectionString, schemaName });
+    storesToClose.push(managed);
+    await managed.init();
+    // Stands in for an older version's concurrent init winning the CREATE.
+    await adminPool.query(
+      `ALTER TABLE "${schemaName}".mastra_workflow_snapshot_handoffs DROP COLUMN claim_generation, DROP COLUMN released_at`,
+    );
+    const managedWorkflows = (await managed.getStore('workflows'))!;
+    await expect(managedWorkflows.listWorkflowSnapshotHandoffs()).rejects.toThrow(
+      /is missing required columns: claim_generation, released_at/,
+    );
+    await adminPool.query(WorkflowsPG.getWorkflowSnapshotHandoffReleaseDDL(schemaName));
+    await expect(managedWorkflows.listWorkflowSnapshotHandoffs()).resolves.toEqual({ records: [], hasMore: false });
+  }, 60000);
 
   it('adds the release columns to a handoff table created before them, once', async () => {
     const schemaName = `handoff_release_migration_${randomUUID().replace(/-/g, '')}`;
