@@ -801,6 +801,206 @@ describe('HarnessPG native terminal handoff', () => {
     ).resolves.toMatchObject({ intents: [] });
   });
 
+  it('counts pending admissions and undelivered intents per finalizer id@version for the drain', async () => {
+    const session = await createNativeSession(harness(), 'session-drain-count');
+    const v1 = { harnessName: HARNESS, finalizerId: 'doxa.chat', finalizerVersion: '1' };
+    const v2 = { ...v1, finalizerVersion: '2' };
+    const settled = admissionFor(session, 'drain-settled');
+    const turns = [settled, admissionFor(session, 'drain-waiting'), { ...admissionFor(session, 'drain-next'), ...v2 }];
+    for (const input of turns) {
+      await harness().writeMessageResultEvidence(pendingEvidence(input));
+      await harness().admitTerminalHandoff(input);
+    }
+    await expect(harness().countPendingTerminalAdmissions(v1)).resolves.toBe(2);
+    await expect(harness().countPendingTerminalAdmissions(v2)).resolves.toBe(1);
+    await expect(harness().countPendingTerminalAdmissions({ ...v1, harnessName: 'other' })).resolves.toBe(0);
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await harness().commitTerminalHandoff(commitInput(settled, 'drain-settled'));
+    // The committed admission leaves the admission count; its intent is still
+    // owed to a consumer while pending, claimed or retryably failed.
+    await expect(harness().countPendingTerminalAdmissions(v1)).resolves.toBe(1);
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    await expect(harness().countUndeliveredTerminalIntents(v2)).resolves.toBe(0);
+
+    const t0 = Date.now();
+    const first = await claimFirst(harness(), 'worker-a', t0);
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const failed = await harness().failTerminalIntent({
+      ...claimIdentityOf(first, 'worker-a'),
+      error: { code: 'delivery_failed', message: 'sink unavailable' },
+      now: t0 + 10,
+    });
+    expect(failed.status).toBe('failed');
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const second = await claimFirst(harness(), 'worker-a', failed.intent.nextAttemptAt! + 1);
+    const dead = await harness().failTerminalIntent({
+      ...claimIdentityOf(second, 'worker-a'),
+      error: { code: 'delivery_failed', message: 'still down' },
+      now: failed.intent.nextAttemptAt! + 2,
+    });
+    // A dead intent is no longer deliverable; the operator handles it apart.
+    expect(dead.status).toBe('dead');
+    await expect(harness().countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await expect(harness().countUndeliveredTerminalIntents({ ...v1, finalizerId: '' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffValidationError,
+    );
+  });
+
+  it('drops staged output when a cancelled turn settles its pending row', async () => {
+    const session = await createNativeSession(harness(), 'session-staged-cancel');
+    const input = admissionFor(session, 'staged-cancel');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    await harness().stageTerminalCompletion({ identity: input, result: { text: 'cancelled reply' } });
+    await harness().cancelTerminalHandoff({
+      harnessName: HARNESS,
+      sessionId: session.id,
+      sessionIncarnation: session.sessionIncarnation!,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      executionGrant: input.executionGrant,
+      reason: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      cancelledAt: Date.now(),
+    });
+    const scope = {
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      signalId: input.signalId,
+    };
+    const settled = await harness().compareAndSwapSignalTerminal({
+      ...scope,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      operationKind: 'message',
+      expected: { state: 'reserved' },
+      leaseOwner: { ownerId: session.ownerId! },
+      terminal: {
+        status: 'failed',
+        signalId: input.signalId,
+        runId: input.runId,
+        error: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      },
+      updatedAt: Date.now(),
+    });
+    expect(settled).toMatchObject({ applied: true, evidence: { status: 'failed' } });
+    expect(settled.evidence).not.toHaveProperty('stagedResult');
+    const stored = await harness().loadMessageResultEvidence(scope);
+    expect(stored).toMatchObject({ status: 'failed' });
+    expect(stored).not.toHaveProperty('stagedResult');
+  });
+
+  it('stages a completed output on the pending row so recovery commits it as completed, never interrupted', async () => {
+    const session = await createNativeSession(harness(), 'session-staged');
+    const input = admissionFor(session, 'staged');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    expect(harness().supportsTerminalCompletionStaging).toBe(true);
+    const output = { text: 'final answer', finishReason: 'stop' };
+    const identity = { ...input, executionGrant: input.executionGrant };
+    await expect(harness().stageTerminalCompletion({ identity, result: output })).resolves.toEqual({
+      status: 'staged',
+    });
+    const scope = {
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      signalId: input.signalId,
+    };
+    await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'pending',
+      stagedResult: output,
+    });
+    // Accounting and its pending-run fence round-trip in the same native
+    // session save, with no marker mixed into the public token counters.
+    await harness().saveSession(
+      {
+        ...session,
+        tokenUsage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
+        accountedTerminalRunIds: [input.runId],
+      },
+      { ownerId: session.ownerId, ifVersion: session.version },
+    );
+    const accounted = await harness().loadSession({ harnessName: HARNESS, sessionId: session.id });
+    expect(accounted?.tokenUsage).toEqual({ promptTokens: 8, completionTokens: 5, totalTokens: 13 });
+    expect(accounted?.accountedTerminalRunIds).toEqual([input.runId]);
+    // A pending rewrite of the row keeps the staged output.
+    await expect(harness().writeMessageResultEvidence(pendingEvidence(input))).resolves.toMatchObject({
+      applied: true,
+      evidence: { status: 'pending', stagedResult: output },
+    });
+    await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({ stagedResult: output });
+
+    // Recovery may not interrupt a turn whose finished output is staged.
+    const interrupted = commitInput(input, 'staged');
+    await expect(
+      harness().commitTerminalHandoff({
+        ...interrupted,
+        resultEvidence: {
+          ...pendingEvidence(input),
+          status: 'failed',
+          error: { code: 'harness.run_interrupted', message: 'interrupted' },
+        },
+        terminalResult: {
+          status: 'aborted',
+          runId: input.runId,
+          completedAt: Date.now(),
+          error: { code: 'harness.run_interrupted', message: 'interrupted' },
+        },
+        recovery: { expectedDispatch: null, leaseOwner: { ownerId: `owner-${session.id}` } },
+      }),
+    ).resolves.toMatchObject({ status: 'conflict' });
+
+    // It commits as completed with the staged output.
+    const committed = await harness().commitTerminalHandoff({
+      ...interrupted,
+      resultEvidence: { ...interrupted.resultEvidence, result: output },
+      recovery: { expectedDispatch: null, leaseOwner: { ownerId: `owner-${session.id}` } },
+    });
+    expect(committed.status).toBe('committed');
+    await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'completed',
+      result: output,
+    });
+    await expect(harness().stageTerminalCompletion({ identity, result: output })).resolves.toEqual({
+      status: 'not_pending',
+    });
+    // A committed output without a run summary remains discoverable after
+    // its owner dies; a persisted summary acknowledges its publication.
+    const recoveryInput = { ...scope, now: Date.now() + 61_000, limit: 10 };
+    await expect(harness().listPendingMessageAdmissions(recoveryInput)).resolves.toMatchObject({
+      items: [{ evidence: { status: 'completed', result: output } }],
+    });
+    await expect(harness().listRecoverableSessions(recoveryInput)).resolves.toMatchObject({
+      items: [{ sessionId: session.id, pendingMessageAdmission: true }],
+    });
+    const completedAt = Date.now();
+    await harness().saveRunSummary({
+      summary: {
+        harnessName: HARNESS,
+        runId: input.runId,
+        sessionId: session.id,
+        resourceId: session.resourceId,
+        threadId: session.threadId,
+        agentId: 'default',
+        modeId: 'default',
+        modelId: 'openai/gpt-4o-mini',
+        status: 'completed',
+        finishReason: 'stop',
+        reconstructed: true,
+        completedAt,
+        usage: { promptTokens: 8, completionTokens: 5, totalTokens: 13 },
+        createdAt: completedAt,
+      },
+    });
+    await expect(harness().listPendingMessageAdmissions(recoveryInput)).resolves.toMatchObject({ items: [] });
+    await expect(harness().listRecoverableSessions(recoveryInput)).resolves.toMatchObject({ items: [] });
+  });
+
   it('enforces the configured pending-intent bound across sessions', async () => {
     const bounded = terminalStore('pg-harness-terminal-capacity-store', schemaName, {
       maxPendingIntents: 1,

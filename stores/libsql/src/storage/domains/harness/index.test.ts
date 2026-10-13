@@ -38,6 +38,7 @@ import {
   HarnessStorageVersionConflictError,
   HarnessStorageWakeupClaimConflictError,
   HarnessStorageWakeupTransitionError,
+  HarnessTerminalHandoffUnsupportedError,
 } from '@mastra/core/storage';
 import type {
   ChannelActionReceipt,
@@ -1749,6 +1750,23 @@ describe('HarnessLibSQL active session admission', () => {
 
         await expect(fence.assertActive()).rejects.toBeInstanceOf(HarnessStorageThreadDeleteFenceConflictError);
       },
+    );
+  });
+});
+
+describe('HarnessLibSQL terminal finalizer drain reads', () => {
+  // LibSQL has no native terminal handoff, so it holds no terminal admissions
+  // or intents; the drain reads must say so rather than report an empty drain.
+  it('reports the pending-admission and undelivered-intent counts as unsupported', async () => {
+    const storage = createHarnessStorage(createHarnessTestClient());
+    await storage.init();
+    expect(storage.supportsTerminalHandoff).toBe(false);
+    const finalizer = { harnessName: 'default', finalizerId: 'doxa.chat', finalizerVersion: '1' };
+    await expect(storage.countPendingTerminalAdmissions(finalizer)).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffUnsupportedError,
+    );
+    await expect(storage.countUndeliveredTerminalIntents(finalizer)).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffUnsupportedError,
     );
   });
 });

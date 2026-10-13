@@ -88,6 +88,9 @@ import type {
   HarnessTerminalAckReceipt,
   HarnessTerminalAdmissionInput,
   HarnessPendingTerminalAdmissionLoadInput,
+  HarnessTerminalFinalizerCountInput,
+  HarnessTerminalCompletionStageInput,
+  HarnessTerminalCompletionStageReceipt,
   HarnessTerminalAdmissionLoadInput,
   HarnessTerminalAdmissionRecord,
   HarnessTerminalAdmissionReceipt,
@@ -218,6 +221,14 @@ import type {
  * treat returned `SessionRecord`s as read-only and pass a fresh object to
  * `saveSession` for updates. This matches the pattern used by `InMemoryMemory`.
  */
+function assertTerminalFinalizerCountInput(input: HarnessTerminalFinalizerCountInput): void {
+  for (const field of ['finalizerId', 'finalizerVersion'] as const) {
+    if (typeof input[field] !== 'string' || input[field].length === 0) {
+      throw new HarnessTerminalHandoffValidationError(field, 'must be a non-empty string');
+    }
+  }
+}
+
 export class InMemoryHarness extends HarnessStorage {
   private db: InMemoryDB;
   private readonly harnessName: string;
@@ -240,6 +251,10 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   override get supportsTerminalHandoff(): boolean {
+    return this.terminalHandoff.enabled;
+  }
+
+  override get supportsTerminalCompletionStaging(): boolean {
     return this.terminalHandoff.enabled;
   }
 
@@ -487,7 +502,8 @@ export class InMemoryHarness extends HarnessStorage {
   /**
    * Admitted message rows recovery must act on: pending rows other than the
    * parked resume (with their claim state at `now`), and rows it settled
-   * interrupted whose completion is unpublished (no run summary yet).
+   * interrupted, or native completed rows whose completion is unpublished
+   * (no run summary yet).
    */
   private recoverableMessageAdmissions(
     namespace: string,
@@ -510,12 +526,22 @@ export class InMemoryHarness extends HarnessStorage {
       if (evidence.status === 'pending') {
         if (!includeParkedResume && evidence.runId === record.pendingResume?.runId) continue;
         admissions.push({ evidence: cloneJson(evidence), dispatchClaim: pendingMessageDispatchClaim(evidence, now) });
-      } else if (
-        evidence.status === 'failed' &&
-        evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE &&
-        !this.db.harnessRunSummaries.has(`${namespace}::${evidence.runId}`)
-      ) {
-        admissions.push({ evidence: cloneJson(evidence), dispatchClaim: 'none' });
+      } else if (!this.db.harnessRunSummaries.has(`${namespace}::${evidence.runId}`)) {
+        const interrupted = evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE;
+        const completed =
+          this.terminalHandoff.enabled &&
+          evidence.status === 'completed' &&
+          evidence.result !== undefined &&
+          [...this.db.harnessTerminalAdmissions.values()].some(
+            admission =>
+              admission.harnessName === namespace &&
+              admission.sessionId === record.id &&
+              admission.sessionIncarnation === record.sessionIncarnation &&
+              admission.runId === evidence.runId &&
+              admission.signalId === evidence.signalId &&
+              admission.status === 'committed',
+          );
+        if (interrupted || completed) admissions.push({ evidence: cloneJson(evidence), dispatchClaim: 'none' });
       }
     }
     return admissions;
@@ -1695,6 +1721,10 @@ export class InMemoryHarness extends HarnessStorage {
       ...(namespacedRecord.dispatch === undefined && existing?.dispatch !== undefined
         ? { dispatch: existing.dispatch }
         : {}),
+      // A pending rewrite keeps a staged completed output.
+      ...(namespacedRecord.status === 'pending' && existing?.status === 'pending' && existing.stagedResult !== undefined
+        ? { stagedResult: existing.stagedResult }
+        : {}),
       ...(namespacedRecord.operationKind === undefined && existing?.operationKind !== undefined
         ? { operationKind: existing.operationKind }
         : {}),
@@ -1855,6 +1885,82 @@ export class InMemoryHarness extends HarnessStorage {
     return null;
   }
 
+  async countPendingTerminalAdmissions(input: HarnessTerminalFinalizerCountInput): Promise<number> {
+    this.assertTerminalHandoffEnabled();
+    assertTerminalFinalizerCountInput(input);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    let pending = 0;
+    for (const admission of this.db.harnessTerminalAdmissions.values()) {
+      if (
+        admission.harnessName === namespace &&
+        admission.status === 'pending' &&
+        admission.finalizerId === input.finalizerId &&
+        admission.finalizerVersion === input.finalizerVersion
+      ) {
+        pending += 1;
+      }
+    }
+    return pending;
+  }
+
+  async stageTerminalCompletion(
+    input: HarnessTerminalCompletionStageInput,
+  ): Promise<HarnessTerminalCompletionStageReceipt> {
+    this.assertTerminalHandoffEnabled();
+    const namespace = resolveHarnessName(input.identity.harnessName, this.harnessName);
+    const identity = { ...input.identity, harnessName: namespace };
+    validateHarnessTerminalIdentity(identity);
+    // Clone before reading any row, so an uncloneable output fails without a write.
+    const stagedResult = cloneJson(input.result);
+    const admission = this.db.harnessTerminalAdmissions.get(harnessTerminalAdmissionId(identity));
+    if (admission === undefined) throw new HarnessTerminalHandoffFencedError(identity.sessionId);
+    if (
+      admission.admissionId !== identity.admissionId ||
+      admission.admissionHash !== identity.admissionHash ||
+      admission.signalId !== identity.signalId ||
+      admission.runId !== identity.runId ||
+      admission.sessionIncarnation !== identity.sessionIncarnation ||
+      admission.resourceId !== identity.resourceId ||
+      admission.threadId !== identity.threadId
+    ) {
+      throw new HarnessTerminalHandoffIdentityConflictError(identity.executionGrant.key);
+    }
+    const key = messageEvidenceKey(namespace, identity.sessionId, identity.signalId);
+    const evidence = this.db.harnessMessageResultEvidence.get(key);
+    if (admission.status !== 'pending' || evidence === undefined || evidence.status !== 'pending') {
+      return { status: 'not_pending' };
+    }
+    if (
+      evidence.admissionId !== identity.admissionId ||
+      evidence.admissionHash !== identity.admissionHash ||
+      evidence.runId !== identity.runId ||
+      evidence.resourceId !== identity.resourceId ||
+      evidence.threadId !== identity.threadId
+    ) {
+      throw new HarnessTerminalHandoffIdentityConflictError(identity.executionGrant.key);
+    }
+    this.db.harnessMessageResultEvidence.set(key, { ...evidence, stagedResult, updatedAt: Date.now() });
+    return { status: 'staged' };
+  }
+
+  async countUndeliveredTerminalIntents(input: HarnessTerminalFinalizerCountInput): Promise<number> {
+    this.assertTerminalHandoffEnabled();
+    assertTerminalFinalizerCountInput(input);
+    const namespace = resolveHarnessName(input.harnessName, this.harnessName);
+    let undelivered = 0;
+    for (const intent of this.db.harnessTerminalIntents.values()) {
+      if (
+        intent.harnessName === namespace &&
+        (intent.status === 'pending' || intent.status === 'claimed' || intent.status === 'failed') &&
+        intent.finalizerId === input.finalizerId &&
+        intent.finalizerVersion === input.finalizerVersion
+      ) {
+        undelivered += 1;
+      }
+    }
+    return undelivered;
+  }
+
   async commitTerminalHandoff(input: {
     admission: HarnessTerminalAdmissionInput;
     resultEvidence: AgentSignalResultEvidence;
@@ -1947,6 +2053,9 @@ export class InMemoryHarness extends HarnessStorage {
     if (
       input.recovery !== undefined &&
       (currentEvidence.status !== 'pending' ||
+        // A staged completed output is never interrupted: recovery commits it
+        // as completed on its next pass.
+        (resultEvidence.status !== 'completed' && currentEvidence.stagedResult !== undefined) ||
         !sameSignalDispatch(currentEvidence.dispatch, input.recovery.expectedDispatch ?? undefined) ||
         !this.holdsSessionLease(namespace, stored.sessionId, input.recovery.leaseOwner))
     ) {
@@ -2595,8 +2704,10 @@ export class InMemoryHarness extends HarnessStorage {
     ) {
       return { applied: false, evidence: cloneJson(existing) };
     }
+    // A settled row never retains pending staged output.
+    const { stagedResult: _stagedResult, ...settledFrom } = existing as typeof existing & { stagedResult?: unknown };
     const terminal: AgentSignalResultEvidence = {
-      ...existing,
+      ...settledFrom,
       ...cloneJson(input.terminal),
       harnessName,
       sessionId: input.sessionId,

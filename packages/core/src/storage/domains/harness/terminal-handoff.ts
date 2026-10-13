@@ -277,6 +277,37 @@ export interface HarnessPendingTerminalAdmissionLoadInput {
   sessionIncarnation: string;
 }
 
+/**
+ * Stage a native terminal turn's completed output on its pending
+ * message-result row before the terminal commit, so a process that dies
+ * between the run finishing and the commit leaves the reply durable.
+ */
+export interface HarnessTerminalCompletionStageInput {
+  identity: HarnessTerminalIdentity;
+  /** The run's full output, stored as the completed evidence result would be. */
+  result: unknown;
+}
+
+export interface HarnessTerminalCompletionStageReceipt {
+  /**
+   * `staged`: the output is durable on the pending row. `not_pending`: the
+   * admission or its evidence is no longer pending (committed, cancelled,
+   * fenced or interrupted), so nothing was written.
+   */
+  status: 'staged' | 'not_pending';
+}
+
+/**
+ * Select one finalizer id@version for the drain reads
+ * (`countPendingTerminalAdmissions`, `countUndeliveredTerminalIntents`) an
+ * operator checks before dropping a settle-only finalizer.
+ */
+export interface HarnessTerminalFinalizerCountInput {
+  harnessName?: string;
+  finalizerId: string;
+  finalizerVersion: string;
+}
+
 export interface HarnessTerminalIntentLoadInput {
   harnessName: string;
   intentId: string;

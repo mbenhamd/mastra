@@ -474,6 +474,12 @@ export interface SessionRecord {
 
   // Counters
   tokenUsage: TokenUsage;
+  /**
+   * Pending native completed runs already included in tokenUsage. Persisted
+   * with the counter so cold recovery cannot add their usage twice. Removed
+   * once the corresponding terminal commit is known.
+   */
+  accountedTerminalRunIds?: string[];
 
   // In-flight state — resumable across restarts.
   // At most one outstanding agent suspension per session (see PendingResume).
@@ -1010,7 +1016,18 @@ export type AgentSignalDispatchState =
     };
 
 export type AgentSignalResultStatus = (
-  | { status: 'pending'; signalId: string; runId?: string }
+  | {
+      status: 'pending';
+      signalId: string;
+      runId?: string;
+      /**
+       * The completed output of a native terminal turn, staged by
+       * `stageTerminalCompletion` before its terminal commit. A pending row
+       * that carries it finished its run: recovery commits it as completed
+       * with this output instead of interrupting it.
+       */
+      stagedResult?: unknown;
+    }
   | {
       status: 'completed';
       signalId: string;

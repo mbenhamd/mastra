@@ -10,6 +10,9 @@ import {
   type HarnessTerminalAdmissionInput,
   type HarnessTerminalAdmissionLoadInput,
   type HarnessPendingTerminalAdmissionLoadInput,
+  type HarnessTerminalFinalizerCountInput,
+  type HarnessTerminalCompletionStageInput,
+  type HarnessTerminalCompletionStageReceipt,
   type HarnessTerminalAdmissionRecord,
   type HarnessTerminalAdmissionReceipt,
   type HarnessTerminalCancelInput,
@@ -904,6 +907,11 @@ export abstract class HarnessStorage extends StorageDomain {
     return false;
   }
 
+  /** Native adapters override this after implementing `stageTerminalCompletion`. */
+  get supportsTerminalCompletionStaging(): boolean {
+    return false;
+  }
+
   /** Native adapters override this after implementing `revokeTerminalGrant`. */
   get supportsTerminalGrantRevocation(): boolean {
     return false;
@@ -1027,7 +1035,8 @@ export abstract class HarnessStorage extends StorageDomain {
    * a finalizer id and version the recovering process does not register is
    * left pending (only that finalizer may settle it), so its session is listed
    * again each time its lease lapses until a process registering that exact
-   * finalizer version recovers it.
+   * finalizer version — as its primary or a settle-only finalizer — recovers
+   * it.
    */
   async listRecoverableSessions(_opts: ListRecoverableSessionsInput): Promise<ListRecoverableSessionsResult> {
     throw new HarnessStorageDispatchRecoveryUnsupportedError();
@@ -1401,6 +1410,46 @@ export abstract class HarnessStorage extends StorageDomain {
   async loadTerminalAdmissionByRun(
     _input: HarnessPendingTerminalAdmissionLoadInput,
   ): Promise<HarnessTerminalAdmissionRecord | null> {
+    throw new HarnessTerminalHandoffUnsupportedError();
+  }
+
+  /**
+   * Durably record a native terminal turn's completed output on its pending
+   * message-result row (as `stagedResult`) before the terminal commit runs.
+   * Written only while both the terminal admission and the evidence row are
+   * still pending; the row stays pending. Orphan recovery then commits the
+   * turn as completed with this output, and an interrupting commit with a
+   * recovery precondition is refused while a staged output is present. The
+   * terminal commit and a session delete clear it.
+   */
+  async stageTerminalCompletion(
+    _input: HarnessTerminalCompletionStageInput,
+  ): Promise<HarnessTerminalCompletionStageReceipt> {
+    throw new HarnessTerminalHandoffUnsupportedError();
+  }
+
+  /**
+   * Count this harness's terminal admissions still `pending` under exactly the
+   * given finalizer id and version. A pending admission is settled only by a
+   * process registering that finalizer (as its primary or a settle-only
+   * finalizer), so a zero count is the evidence that a previous finalizer
+   * version has drained and its settle-only registration can be dropped.
+   * Adapters without native terminal handoff report it unsupported.
+   */
+  async countPendingTerminalAdmissions(_input: HarnessTerminalFinalizerCountInput): Promise<number> {
+    throw new HarnessTerminalHandoffUnsupportedError();
+  }
+
+  /**
+   * Count this harness's terminal intents committed under exactly the given
+   * finalizer id and version that are not yet delivered: `pending`, `claimed`
+   * or `failed` (a retryable failure). `acked`, `dead` and `fenced` intents are
+   * excluded. A consumer still has to accept these intents' projection, so a
+   * finalizer version is drained only when this count and
+   * `countPendingTerminalAdmissions` are both zero. Adapters without native
+   * terminal handoff report it unsupported.
+   */
+  async countUndeliveredTerminalIntents(_input: HarnessTerminalFinalizerCountInput): Promise<number> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }
 

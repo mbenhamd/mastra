@@ -423,6 +423,193 @@ describe('native chat terminal handoff', () => {
     ).resolves.toMatchObject({ intents: [] });
   });
 
+  it('counts pending admissions and undelivered intents per finalizer id@version for the drain', async () => {
+    const storage = new InMemoryHarness({
+      db: new InMemoryDB(),
+      terminalHandoff: { enabled: true, maxAttempts: 2 },
+    });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const turn = (tag: string, finalizerVersion: string): HarnessTerminalAdmissionInput => ({
+      ...admission(),
+      admissionId: `admission-${tag}`,
+      admissionHash: `admission-hash-${tag}`,
+      signalId: `signal-${tag}`,
+      runId: `run-${tag}`,
+      executionGrant: { key: `grant-${tag}`, generation: 1 },
+      finalizerVersion,
+    });
+    const v1 = { harnessName: 'default', finalizerId: 'doxa.chat', finalizerVersion: '1' };
+    const v2 = { ...v1, finalizerVersion: '2' };
+    const delivered = turn('delivered', '1');
+    for (const input of [delivered, turn('waiting', '1'), turn('next', '2')]) {
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      await storage.admitTerminalHandoff(input);
+    }
+    await expect(storage.countPendingTerminalAdmissions(v1)).resolves.toBe(2);
+    await expect(storage.countPendingTerminalAdmissions(v2)).resolves.toBe(1);
+    await expect(storage.countPendingTerminalAdmissions({ ...v1, finalizerId: 'other' })).resolves.toBe(0);
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await storage.commitTerminalHandoff({
+      admission: delivered,
+      resultEvidence: {
+        ...pendingEvidence(delivered),
+        status: 'completed',
+        result: { text: 'done' },
+        updatedAt: 3_000,
+      },
+      terminalResult: { status: 'completed', runId: delivered.runId, completedAt: 3_000 },
+      projection: { projectionKind: 'chat.summary', projectionId: 'summary-delivered', payload: {} },
+    });
+    // The committed admission leaves the admission count but its intent is
+    // still owed to a consumer: pending, claimed, then retryably failed.
+    await expect(storage.countPendingTerminalAdmissions(v1)).resolves.toBe(1);
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    await expect(storage.countUndeliveredTerminalIntents(v2)).resolves.toBe(0);
+    const claimed = (
+      await storage.claimTerminalIntents({ harnessName: 'default', consumerId: 'worker-a', limit: 1, now: 4_000 })
+    ).intents[0]!;
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const claim = {
+      harnessName: claimed.harnessName,
+      intentId: claimed.id,
+      sessionId: claimed.sessionId,
+      sessionIncarnation: claimed.sessionIncarnation,
+      revision: claimed.revision,
+      payloadHash: claimed.projection.payloadHash,
+      claimId: claimed.claimId!,
+      consumerId: 'worker-a',
+    };
+    const failed = await storage.failTerminalIntent({
+      ...claim,
+      now: 5_000,
+      error: { code: 'delivery_failed', message: 'sink unavailable' },
+    });
+    expect(failed.status).toBe('failed');
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(1);
+    const reclaimed = (
+      await storage.claimTerminalIntents({
+        harnessName: 'default',
+        consumerId: 'worker-a',
+        limit: 1,
+        now: failed.intent.nextAttemptAt!,
+      })
+    ).intents[0]!;
+    await storage.ackTerminalIntent({ ...claim, claimId: reclaimed.claimId!, now: failed.intent.nextAttemptAt! + 1 });
+    await expect(storage.countUndeliveredTerminalIntents(v1)).resolves.toBe(0);
+
+    await expect(storage.countPendingTerminalAdmissions({ ...v1, finalizerVersion: '' })).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffValidationError,
+    );
+    const disabled = new InMemoryHarness({ db: new InMemoryDB() });
+    await expect(disabled.countPendingTerminalAdmissions(v1)).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffUnsupportedError,
+    );
+    await expect(disabled.countUndeliveredTerminalIntents(v1)).rejects.toBeInstanceOf(
+      HarnessTerminalHandoffUnsupportedError,
+    );
+  });
+
+  it('stages a completed output on the pending row so recovery commits it as completed, never interrupted', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 60_000 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    expect(storage.supportsTerminalCompletionStaging).toBe(true);
+    const output = { text: 'final answer', finishReason: 'stop' };
+    await expect(storage.stageTerminalCompletion({ identity: input, result: output })).resolves.toEqual({
+      status: 'staged',
+    });
+    const scope = {
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      resourceId: input.resourceId,
+      threadId: input.threadId,
+      signalId: input.signalId,
+    };
+    await expect(storage.loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'pending',
+      stagedResult: output,
+    });
+    // A pending rewrite of the row keeps the staged output.
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await expect(storage.loadMessageResultEvidence(scope)).resolves.toMatchObject({ stagedResult: output });
+
+    const recovery = { expectedDispatch: null, leaseOwner: { ownerId: 'owner-1' } };
+    const interruption = { code: 'harness.run_interrupted', message: 'interrupted' };
+    const projection = { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} };
+    // Recovery may not interrupt a turn whose finished output is staged.
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'failed', error: interruption },
+        terminalResult: { status: 'aborted', runId: input.runId, completedAt: 3_000, error: interruption },
+        projection,
+        recovery,
+      }),
+    ).resolves.toMatchObject({ status: 'conflict' });
+    // It commits as completed with the staged output.
+    const committed = await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: { ...pendingEvidence(input), status: 'completed', result: output, updatedAt: 3_000 },
+      terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+      projection,
+      recovery,
+    });
+    expect(committed.status).toBe('committed');
+    await expect(storage.loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'completed',
+      result: output,
+    });
+    await expect(storage.stageTerminalCompletion({ identity: input, result: output })).resolves.toEqual({
+      status: 'not_pending',
+    });
+  });
+
+  it('drops staged output when a cancelled turn settles its pending row', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 60_000 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    await storage.stageTerminalCompletion({ identity: input, result: { text: 'cancelled reply' } });
+    await storage.cancelTerminalHandoff({
+      ...input,
+      reason: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      cancelledAt: 2_500,
+    });
+    const scope = {
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      resourceId: input.resourceId,
+      threadId: input.threadId,
+      signalId: input.signalId,
+    };
+    const settled = await storage.compareAndSwapSignalTerminal({
+      ...scope,
+      admissionId: input.admissionId,
+      admissionHash: input.admissionHash,
+      operationKind: 'message',
+      expected: { state: 'reserved' },
+      leaseOwner: { ownerId: 'owner-1' },
+      terminal: {
+        status: 'failed',
+        signalId: input.signalId,
+        runId: input.runId,
+        error: { code: 'harness.terminal_cancelled', message: 'cancelled' },
+      },
+      updatedAt: 3_000,
+    });
+    expect(settled).toMatchObject({ applied: true, evidence: { status: 'failed' } });
+    expect(settled.evidence).not.toHaveProperty('stagedResult');
+    const stored = await storage.loadMessageResultEvidence(scope);
+    expect(stored).toMatchObject({ status: 'failed' });
+    expect(stored).not.toHaveProperty('stagedResult');
+  });
+
   it('rejects a terminal commit when pending capacity is exhausted and lets it retry after drain', async () => {
     const storage = new InMemoryHarness({
       db: new InMemoryDB(),
