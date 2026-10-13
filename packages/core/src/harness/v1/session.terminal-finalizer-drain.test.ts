@@ -13,7 +13,7 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { MockAgent } from './__test-utils__/mock-agent';
-import { HarnessConfigError, HarnessSessionDeletedError } from './errors';
+import { HarnessConfigError, HarnessMessageResultErasedError, HarnessSessionDeletedError } from './errors';
 import { Harness } from './harness';
 
 const LEASE_AND_DISPATCH_CLAIM_LAPSED_MS = 31_000;
@@ -173,7 +173,29 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       usageSaveBoundary: 'after',
       cancelled: true,
     },
-  ])('recovers the canonical terminal outcome after its owner dies $name', async ({ usageSaveBoundary, cancelled }) => {
+    {
+      name: 'before usage save with cancellation evidence still unsettled',
+      usageSaveBoundary: 'before',
+      cancelled: true,
+      delayedEvidence: true,
+    },
+    {
+      name: 'after usage save with cancellation evidence still unsettled',
+      usageSaveBoundary: 'after',
+      cancelled: true,
+      delayedEvidence: true,
+    },
+    {
+      name: 'before usage save with an unknown version cancelled after recovery',
+      usageSaveBoundary: 'before',
+      cancelled: true,
+      delayedEvidence: true,
+      cancelAfterAdoption: true,
+    },
+  ])('recovers the canonical terminal outcome after its owner dies $name', async row => {
+    const { usageSaveBoundary, cancelled } = row;
+    const delayedEvidence = 'delayedEvidence' in row && row.delayedEvidence;
+    const cancelAfterAdoption = 'cancelAfterAdoption' in row && row.cancelAfterAdoption;
     const db = new InMemoryDB();
     const calls: FinalizeCall[] = [];
     const ownerAgent = new MockAgent({ id: 'default' });
@@ -220,18 +242,82 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     });
     calls.length = 0;
     const pending = await owner.storage.loadTerminalAdmission({ ...scope, admissionId, executionGrant: grant });
-    if (cancelled) {
+    if (cancelled && !cancelAfterAdoption) {
       await owner.storage.cancelTerminalHandoff({
         ...pending!,
         reason: { code: 'harness.terminal_cancelled', message: 'cancelled deliberately' },
       });
     }
 
-    const adopter = await adoptAfterLeaseLapse(db, ownerSession.id, {
-      finalizer: finalizerAt('2', calls),
-      settleOnly: [finalizerAt('1', calls)],
-    });
+    const adopter = await adoptAfterLeaseLapse(
+      db,
+      ownerSession.id,
+      {
+        finalizer: finalizerAt('2', calls),
+        settleOnly: cancelAfterAdoption ? [] : [finalizerAt('1', calls)],
+      },
+      process => {
+        if (!delayedEvidence) return;
+        const settle = process.storage.compareAndSwapSignalTerminal.bind(process.storage);
+        process.storage.compareAndSwapSignalTerminal = async input =>
+          input.admissionId === admissionId ? { applied: false } : settle(input);
+      },
+    );
     try {
+      if (delayedEvidence) {
+        if (cancelAfterAdoption) {
+          expect(adopter.admission).toMatchObject({ status: 'pending' });
+          await adopter.storage.cancelTerminalHandoff({
+            ...pending!,
+            reason: { code: 'harness.terminal_cancelled', message: 'cancelled after unknown-version recovery' },
+          });
+        }
+        const session = await adopter.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
+        adopter.agent.enqueueRun({
+          finishReason: 'stop',
+          text: 'next answer',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        });
+        await session.message({
+          content: 'next',
+          admissionId: 'next-turn',
+          executionAuthorityGrant: { key: 'usage-claim-next', generation: 1 },
+          terminalAdmissionSeed: { v: 2 },
+        });
+        await expect(
+          adopter.storage.loadMessageResultEvidence({
+            ...scope,
+            threadId: ownerSession.threadId,
+            signalId: pending!.signalId,
+          }),
+        ).resolves.toMatchObject({ status: 'pending', stagedResult: { text: 'final answer' } });
+        // A session save after a different run must retain the old run's
+        // accounting fence until its canonical evidence actually settles.
+        await session.setState({ checkpoint: true });
+        await expect(adopter.storage.loadSession(scope)).resolves.toMatchObject({
+          tokenUsage: { promptTokens: 9, completionTokens: 6, totalTokens: 15 },
+        });
+        const fresh = await adoptAfterLeaseLapse(db, ownerSession.id, {
+          finalizer: finalizerAt('2', calls),
+          settleOnly: [finalizerAt('1', calls)],
+        });
+        try {
+          await expect(fresh.storage.loadSession(scope)).resolves.toMatchObject({
+            tokenUsage: { promptTokens: 9, completionTokens: 6, totalTokens: 15 },
+          });
+          await expect(
+            fresh.storage.loadMessageResultEvidence({
+              ...scope,
+              threadId: ownerSession.threadId,
+              signalId: pending!.signalId,
+            }),
+          ).resolves.toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
+          expect(fresh.agent.streamCalls).toHaveLength(0);
+        } finally {
+          await fresh.harness.shutdown();
+        }
+        return;
+      }
       if (cancelled) {
         expect(adopter.admission).toMatchObject({ status: 'cancelled' });
         expect(calls).toEqual([]);
@@ -404,7 +490,13 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     },
   );
 
-  it.each(['none', 'canonical evidence load', 'summary publication'])(
+  it.each([
+    'none',
+    'canonical evidence load',
+    'summary publication',
+    'canonical evidence load from another process',
+    'summary publication from another process',
+  ])(
     'preserves completion publication and retry cancellation after deletion at %s',
     async deleteBoundary => {
       const db = new InMemoryDB();
@@ -451,7 +543,7 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
           session.message({
             ...message,
             onTerminalCommit: () => {
-              if (deleteBoundary === 'canonical evidence load') holdNextLoad = true;
+              if (deleteBoundary.startsWith('canonical evidence load')) holdNextLoad = true;
               if (++receipts === (deleteBoundary === 'none' ? 2 : 1)) receivedBoth();
             },
           });
@@ -463,7 +555,7 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
         // summary write is deliberately held, without relying on a time delay.
         await new Promise<void>(resolve => setImmediate(resolve));
         if (deleteBoundary !== 'none') {
-          if (deleteBoundary === 'canonical evidence load') await loadStarted;
+          if (deleteBoundary.startsWith('canonical evidence load')) await loadStarted;
           // Native hard-delete of a closed record must notify retained live
           // waiters even while unrelated summary storage is unavailable. Use
           // the real fenced save, so force-delete need not first recover/close
@@ -473,9 +565,22 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
             { ...record!, closedAt: Date.now() },
             { harnessName: 'default', ownerId: owner.harness.ownerId, ifVersion: record!.version },
           );
-          await owner.harness.deleteSession({ sessionId: session.id, resourceId: 'u1', force: true });
+          const externalDelete = deleteBoundary.endsWith('from another process');
+          const deleter = externalDelete ? harnessProcess(db, new MockAgent({ id: 'default' })) : owner;
+          await deleter.harness.deleteSession({ sessionId: session.id, resourceId: 'u1', force: true });
+          if (externalDelete) {
+            // The original Session receives no local deletion notification;
+            // canonical erased evidence and native session lifetime govern it.
+            releaseLoad();
+            releaseSave();
+            await deleter.harness.shutdown();
+          }
           await vi.waitFor(() => expect(replies).toHaveLength(1), { timeout: 1_000 });
-          expect(replies![0]).toMatchObject({ status: 'rejected', reason: expect.any(HarnessSessionDeletedError) });
+          const expectedError =
+            deleteBoundary === 'canonical evidence load from another process'
+              ? HarnessMessageResultErasedError
+              : HarnessSessionDeletedError;
+          expect(replies![0]).toMatchObject({ status: 'rejected', reason: expect.any(expectedError) });
           expect(completionEvents).toEqual(['agent_end', 'run_completed']);
           releaseLoad();
           releaseSave();
