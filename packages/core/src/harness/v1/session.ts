@@ -1965,6 +1965,8 @@ export class Session {
   /** Pending native completions whose usage has joined the durable session counter. */
   private readonly _terminalTokenAccountedRunIds = new Set<string>();
   private readonly _stagedTerminalRunIds = new Set<string>();
+  /** Staging runs outside the message boundary that owns its failure observer. */
+  private readonly _terminalStagingFailuresAwaitingObserver = new WeakSet<HarnessTerminalHandoffError>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
   /** Serializes terminal evidence + event projection for one admitted signal. */
   private readonly _signalResultSettlements = new Map<string, Promise<AgentSignalResultEvidence | undefined>>();
@@ -3882,12 +3884,7 @@ export class Session {
       cursor = page.nextCursor;
     } while (cursor !== undefined);
     for (const evidence of orphaned) {
-      if (await this._interruptOrphanedMessageDispatch(evidence)) {
-        unpublished.push(evidence);
-        continue;
-      }
-      // The settlement did not commit (a fresh claim, a moved lease, or a
-      // finalizer this process cannot run). A turn still pending blocks.
+      const settled = await this._interruptOrphanedMessageDispatch(evidence);
       const latest = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -3895,6 +3892,14 @@ export class Session {
         threadId: this.threadId,
         signalId: evidence.signalId,
       });
+      if (settled && latest !== null && 'status' in latest && latest.status !== 'pending') {
+        // Cancellation may have won over a staged output. Publish the settled
+        // canonical result, never the pending snapshot recovery started with.
+        unpublished.push(latest);
+        continue;
+      }
+      // The settlement did not commit (a fresh claim, a moved lease, or a
+      // finalizer this process cannot run). A turn still pending blocks.
       if (latest === null || !('status' in latest) || latest.status !== 'pending') continue;
       const claim = latest.dispatch;
       if (claim?.state === 'dispatching' && claim.claimExpiresAt > Date.now()) {
@@ -4009,18 +4014,13 @@ export class Session {
   /**
    * Publish a recovered turn's completion once: `agent_end` and the
    * reconstructed `run_completed`, whose durable summary acknowledges the
-   * publication. A staged output supplies its completed finish reason and
-   * usage; an unfinished turn reports aborted. An existing summary suppresses
+   * publication. Canonical completed evidence supplies its finish reason and
+   * usage; an interrupted turn reports aborted. An existing summary suppresses
    * duplicate publication. A missing summary fails recovery explicitly.
    */
   private async _publishRecoveredRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
     const runId = evidence.runId!;
-    const full =
-      evidence.status === 'completed'
-        ? (evidence.result as FullOutput<unknown> | undefined)
-        : evidence.status === 'pending'
-          ? (evidence.stagedResult as FullOutput<unknown> | undefined)
-          : undefined;
+    const full = evidence.status === 'completed' ? (evidence.result as FullOutput<unknown> | undefined) : undefined;
     const summary = { harnessName: this._record.harnessName, runId };
     if ((await this._storage.loadRunSummary(summary)) !== null) return;
     const modeId = evidence.modeId ?? this._record.modeId;
@@ -4033,15 +4033,20 @@ export class Session {
       operationKind: 'signal',
       ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
     });
-    // The run's start was emitted by the dead owner, so this terminal carries
-    // no span. Its summary is reconstructed from the recovered outcome.
+    // The original run may belong to a dead owner, so this terminal carries
+    // no span. Its summary is reconstructed from the settled outcome.
     // An earlier attempt on this session may have emitted it but failed to
     // persist the summary; finalize again so persistence is retried.
     this._finalizedRunIds.delete(runId);
     this._emitTurnEvent({
       type: 'agent_end',
       runId,
-      finishReason: full === undefined ? 'aborted' : this._agentEndReasonForFullOutput(full),
+      finishReason:
+        full !== undefined
+          ? this._agentEndReasonForFullOutput(full)
+          : evidence.status === 'failed' && evidence.error.code !== HARNESS_RUN_INTERRUPTED_ERROR_CODE
+            ? 'error'
+            : 'aborted',
       usage: this._runUsage(full),
     });
     await this._runSummaryPersistence;
@@ -4864,8 +4869,16 @@ export class Session {
     onFailure?: (error: HarnessTerminalHandoffError) => void,
     runId?: string,
   ): HarnessTerminalHandoffError {
-    if (err instanceof HarnessTerminalHandoffError) return err;
-    const pending = new HarnessTerminalFinalizationPendingError(Date.now() + 1_000, err);
+    if (
+      err instanceof HarnessTerminalHandoffError &&
+      (onFailure === undefined || !this._terminalStagingFailuresAwaitingObserver.delete(err))
+    ) {
+      return err;
+    }
+    const pending =
+      err instanceof HarnessTerminalHandoffError
+        ? err
+        : new HarnessTerminalFinalizationPendingError(Date.now() + 1_000, err);
     try {
       onFailure?.(pending);
     } catch {
@@ -8171,7 +8184,9 @@ export class Session {
         if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
       }
     } catch (error) {
-      throw this._terminalFailure(error, undefined, runId);
+      const pending = this._terminalFailure(error, undefined, runId);
+      this._terminalStagingFailuresAwaitingObserver.add(pending);
+      throw pending;
     }
   }
 
@@ -10466,7 +10481,7 @@ export class Session {
       evidence.admissionHash,
       opts.executionAuthorityGrant,
     );
-    await this._raceActiveTurnWaiter(
+    const receipt = await this._raceActiveTurnWaiter(
       this._commitTerminalHandoff(identity, full, {
         modeId: this._messageDuplicateModeId(evidence, opts),
         modelId: this._messageDuplicateModelId(evidence, opts),
@@ -10475,6 +10490,18 @@ export class Session {
       }),
       activeDeleted,
     );
+    if (receipt?.status === 'committed' || receipt?.status === 'duplicate') {
+      const settled = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: evidence.signalId,
+      });
+      if (settled !== null && 'status' in settled && settled.status !== 'pending') {
+        await this._publishRecoveredRunCompletion(settled);
+      }
+    }
     return true;
   }
 
@@ -10544,7 +10571,11 @@ export class Session {
   ): Promise<void> {
     const runId = full.runId ?? evidence.runId;
     if (runId !== undefined) {
-      await this._raceActiveTurnWaiter(this._stageCompletedTerminalOutput(runId, full), activeDeleted);
+      try {
+        await this._raceActiveTurnWaiter(this._stageCompletedTerminalOutput(runId, full), activeDeleted);
+      } catch (error) {
+        throw this._terminalFailure(error, opts.onTerminalCommitError, runId);
+      }
     }
     if (full.finishReason === 'suspended') {
       // A cached suspension is a replay of an earlier generation — a resumed
