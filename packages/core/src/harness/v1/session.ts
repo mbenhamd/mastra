@@ -3663,7 +3663,10 @@ export class Session {
    * leases are stamped with). Interruption settles it
    * `failed{harness.run_interrupted}` — through the native terminal commit
    * (with an aborted terminal intent) when a pending terminal admission owns
-   * it, otherwise through the dispatch CAS. A turn that died before its
+   * it, otherwise through the dispatch CAS. A native terminal turn whose run
+   * finished and staged its output (`stageTerminalCompletion`) before its
+   * owner died is not interrupted: it commits as completed with that output,
+   * so its reply is kept. A turn that died before its
    * terminal admission was written has no admission to commit against, so it
    * gets no intent; one whose admitted finalizer id and version this process
    * does not register is left pending. Both settlements are fenced on the
@@ -3671,11 +3674,11 @@ export class Session {
    * owner stamps meanwhile is never overwritten. Provider work is never re-run; a
    * retry must be a new admission.
    *
-   * Completion is published after settlement: `agent_end` (aborted) and the
-   * reconstructed `run_completed` (interrupted), acknowledged by its durable
-   * run summary. A settled turn without a summary is published again on the
-   * next recovery, so a settlement whose acknowledgement was lost is never
-   * left unreported. A run whose completion was already published keeps it.
+   * Completion is published after settlement: `agent_end` and reconstructed
+   * `run_completed`, acknowledged by the durable run summary. Staged output
+   * reports completed; an unfinished run reports aborted/interrupted. An
+   * interrupted turn without a summary is published again on the next
+   * recovery. A run whose completion was already published keeps it.
    *
    * Returns what blocks a close: another process's live claim, or a turn whose
    * settlement did not commit.
@@ -3892,7 +3895,7 @@ export class Session {
       }
     }
     for (const evidence of unpublished) {
-      await this._publishInterruptedRunCompletion(evidence);
+      await this._publishRecoveredRunCompletion(evidence);
     }
     // This recovery replaces the recheck it ran for, but a recheck scheduled
     // while it ran is for a turn it may not have seen: keep the earliest.
@@ -3966,7 +3969,7 @@ export class Session {
     // The adapter judges the lease when the settlement commits.
     const leaseOwner = { ownerId: this._harness.ownerId };
     const terminal = await this._commitInterruptedTerminalHandoff(evidence, runId, error, leaseOwner);
-    if (terminal === 'committed') return true;
+    if (terminal === 'completed' || terminal === 'committed') return true;
     if (terminal === 'skipped') return false;
     const swapped = await this._storage.compareAndSwapSignalTerminal({
       harnessName: this._record.harnessName,
@@ -3995,14 +3998,15 @@ export class Session {
   }
 
   /**
-   * Publish an interrupted turn's completion once: `agent_end` (aborted) and
-   * the reconstructed `run_completed`, whose durable run summary is the
-   * acknowledgement. Nothing is emitted when a summary already exists — that
-   * run already reported its terminal. A summary that fails to persist fails
-   * recovery, so the next recovery publishes again.
+   * Publish a recovered turn's completion once: `agent_end` and the
+   * reconstructed `run_completed`, whose durable summary acknowledges the
+   * publication. A staged output supplies its completed finish reason and
+   * usage; an unfinished turn reports aborted. An existing summary suppresses
+   * duplicate publication. A missing summary fails recovery explicitly.
    */
-  private async _publishInterruptedRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
+  private async _publishRecoveredRunCompletion(evidence: AgentSignalResultEvidence): Promise<void> {
     const runId = evidence.runId!;
+    const full = evidence.status === 'pending' ? (evidence.stagedResult as FullOutput<unknown> | undefined) : undefined;
     const summary = { harnessName: this._record.harnessName, runId };
     if ((await this._storage.loadRunSummary(summary)) !== null) return;
     const modeId = evidence.modeId ?? this._record.modeId;
@@ -4016,18 +4020,22 @@ export class Session {
       ...(this._record.parentSessionId !== undefined ? { parentSessionId: this._record.parentSessionId } : {}),
     });
     // The run's start was emitted by the dead owner, so this terminal carries
-    // no span: `run_completed` is `interrupted` + `reconstructed`, and any
-    // persisted assistant draft for the run is terminalized as interrupted.
+    // no span. Its summary is reconstructed from the recovered outcome.
     // An earlier attempt on this session may have emitted it but failed to
     // persist the summary; finalize again so persistence is retried.
     this._finalizedRunIds.delete(runId);
-    this._emitTurnEvent({ type: 'agent_end', runId, finishReason: 'aborted', usage: this._runUsage() });
+    this._emitTurnEvent({
+      type: 'agent_end',
+      runId,
+      finishReason: full === undefined ? 'aborted' : this._agentEndReasonForFullOutput(full),
+      usage: this._runUsage(full),
+    });
     await this._runSummaryPersistence;
     if ((await this._storage.loadRunSummary(summary)) === null) {
       throw new HarnessStorageError({
         operation: 'message_log',
         sessionId: this.id,
-        cause: new Error(`interrupted run "${runId}" completion was not acknowledged by its run summary`),
+        cause: new Error(`recovered run "${runId}" completion was not acknowledged by its run summary`),
       });
     }
   }
@@ -4036,7 +4044,9 @@ export class Session {
    * Settle an orphaned dispatch owned by a pending native terminal admission:
    * the finalizer projects the interrupted outcome (it receives no output) and
    * storage commits failed evidence, the aborted terminal result, and its
-   * delivery intent in one transaction — only while the evidence still shows
+   * delivery intent in one transaction. A run that staged its completed output
+   * is committed as `completed` with that output instead (`'completed'`).
+   * Either commit lands only while the evidence still shows
    * the dispatch recovery observed and this process holds the lease.
    * `unowned` means no pending admission owns the dispatch (or it was
    * cancelled meanwhile), so the evidence CAS settles it; `skipped` leaves it
@@ -4048,7 +4058,7 @@ export class Session {
     runId: string,
     error: { code: string; message: string },
     leaseOwner: { ownerId: string },
-  ): Promise<'committed' | 'unowned' | 'skipped'> {
+  ): Promise<'committed' | 'completed' | 'unowned' | 'skipped'> {
     const sessionIncarnation = this._record.sessionIncarnation;
     if (!this._storage.supportsTerminalHandoff || sessionIncarnation === undefined) return 'unowned';
     const admission = await this._storage.loadTerminalAdmissionByRun({
@@ -4087,19 +4097,33 @@ export class Session {
       executionGrant: { ...admission.executionGrant },
     };
     const now = Date.now();
-    const terminalResult: HarnessTerminalResult = {
-      status: 'aborted',
-      runId,
-      completedAt: now,
-      error: boundHarnessTerminalError(error),
-    };
+    // A run that finished and staged its output before its owner died is
+    // committed as completed with that output; only a run cut off mid-flight
+    // is interrupted.
+    const staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
+    const stagedFinishReason =
+      staged !== undefined ? (staged as { finishReason?: unknown } | null)?.finishReason : undefined;
+    const terminalResult: HarnessTerminalResult =
+      staged !== undefined
+        ? {
+            status: 'completed',
+            runId,
+            ...(typeof stagedFinishReason === 'string' ? { finishReason: stagedFinishReason } : {}),
+            completedAt: now,
+          }
+        : {
+            status: 'aborted',
+            runId,
+            completedAt: now,
+            error: boundHarnessTerminalError(error),
+          };
     const projection = await finalizer.finalize({
       identity,
       seed: admission.seed,
       finalizerId: admission.finalizerId,
       finalizerVersion: admission.finalizerVersion,
       result: terminalResult,
-      fullOutput: undefined,
+      fullOutput: staged,
     });
     const receipt = await this._storage.commitTerminalHandoff({
       admission: {
@@ -4110,10 +4134,11 @@ export class Session {
         createdAt: admission.createdAt,
       },
       resultEvidence: {
-        status: 'failed',
+        ...(staged !== undefined
+          ? { status: 'completed' as const, result: staged }
+          : { status: 'failed' as const, error }),
         signalId: identity.signalId,
         runId,
-        error,
         ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
         ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
         operationKind: 'message',
@@ -4133,7 +4158,7 @@ export class Session {
     });
     if (receipt.status === 'committed') {
       this._drainTerminalObservers(runId, receipt);
-      return 'committed';
+      return staged !== undefined ? 'completed' : 'committed';
     }
     return receipt.status === 'cancelled' ? 'unowned' : 'skipped';
   }
@@ -4431,12 +4456,9 @@ export class Session {
       return false;
     }
 
-    // A committed terminal admission means the resumed run's outcome already
-    // sealed — the crash was in the post-commit bookkeeping (the
-    // pendingResume-clearing flush), not the provider run. Recover the durable
-    // winner and finish the remaining bookkeeping instead of failing the
-    // interaction as abandoned. The stale-failure transition below only runs
-    // when no sealed winner exists.
+    // A committed admission or staged completed output means the provider run
+    // finished before its owner died. Recover it and finish settlement and
+    // bookkeeping instead of failing the interaction as abandoned.
     const recoveryIncarnation = this._record.sessionIncarnation;
     if (
       this._storage.supportsTerminalHandoff &&
@@ -4452,7 +4474,7 @@ export class Session {
         runId: expected.runId,
         sessionIncarnation: recoveryIncarnation,
       });
-      if (boundAdmission?.status === 'committed') {
+      if (boundAdmission?.status === 'committed' || boundAdmission?.status === 'pending') {
         const stored = await this._storage.loadMessageResultEvidence({
           harnessName: this._record.harnessName,
           sessionId: this.id,
@@ -4464,14 +4486,14 @@ export class Session {
         if (
           stored !== null &&
           'status' in stored &&
-          stored.status === 'completed' &&
-          stored.result !== undefined &&
+          ((stored.status === 'completed' && stored.result !== undefined) ||
+            (stored.status === 'pending' && stored.stagedResult !== undefined)) &&
           parked !== undefined &&
           parked.runId === expected.runId &&
           parked.toolCallId === expected.toolCallId &&
           parked.resumedAt === expected.resumedAt
         ) {
-          const full = stored.result as FullOutput<unknown>;
+          const full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
           // Repopulate the local run cache so the per-generation usage marker
           // still dedupes a concurrent settlement retry.
           this._rememberCompletedRun(parked.runId, { ok: true, full });
@@ -8069,12 +8091,39 @@ export class Session {
         this._emitAbortedToolEnds();
       }
       const full = this._materializeHarnessRunOutput(runId, rawFull);
+      await this._stageCompletedTerminalOutput(runId, full);
       this._rememberCompletedRun(runId, { ok: true, full });
       if (waiter) waiter.resolve(full);
     } catch (err) {
       this._runToolReceipts.delete(runId);
       this._rememberCompletedRun(runId, { ok: false, err });
       if (waiter) waiter.reject(err);
+    }
+  }
+
+  /** Make native completed output durable before resolving the run's waiter. */
+  private async _stageCompletedTerminalOutput(runId: string, full: FullOutput<unknown>): Promise<void> {
+    const sessionIncarnation = this._record.sessionIncarnation;
+    if (
+      !this._storage.supportsTerminalCompletionStaging ||
+      sessionIncarnation === undefined ||
+      this._agentEndReasonForFullOutput(full) !== 'complete' ||
+      full.finishReason === 'abort'
+    ) {
+      return;
+    }
+    try {
+      const admission = await this._storage.loadTerminalAdmissionByRun({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        sessionIncarnation,
+        runId,
+      });
+      if (admission?.status === 'pending') {
+        await this._storage.stageTerminalCompletion({ identity: admission, result: full });
+      }
+    } catch (error) {
+      throw this._terminalFailure(error, undefined, runId);
     }
   }
 
@@ -10800,9 +10849,9 @@ export class Session {
     let full: FullOutput<unknown>;
     if (cached !== undefined && cached.ok && cached.full.finishReason !== 'suspended') {
       full = cached.full;
-    } else if (admission.status === 'committed') {
-      // A restart emptied the local run cache — the committed admission's
-      // canonical evidence still carries the authoritative terminal output, so
+    } else {
+      // A restart emptied the local run cache — canonical evidence still
+      // carries the committed or staged completed output, so
       // recover it instead of reporting the resume as abandoned. The cached
       // entry is repopulated so the per-generation usage marker still dedupes
       // a second retry.
@@ -10813,13 +10862,18 @@ export class Session {
         threadId: this.threadId,
         signalId: admission.signalId,
       });
-      if (!stored || !('status' in stored) || stored.status !== 'completed' || stored.result === undefined) {
+      if (
+        !stored ||
+        !('status' in stored) ||
+        !(
+          (stored.status === 'completed' && stored.result !== undefined) ||
+          (stored.status === 'pending' && stored.stagedResult !== undefined)
+        )
+      ) {
         return undefined;
       }
-      full = stored.result as FullOutput<unknown>;
+      full = (stored.status === 'completed' ? stored.result : stored.stagedResult) as FullOutput<unknown>;
       this._rememberCompletedRun(pending.runId, { ok: true, full });
-    } else {
-      return undefined;
     }
 
     const { expectedKind, responseMode, responseId } = options;
@@ -16752,6 +16806,7 @@ export class Session {
     // accepted".
     const completingQueuedItemId = full.finishReason !== 'suspended' ? pendingQueuedItemId : undefined;
     try {
+      await this._stageCompletedTerminalOutput(pending.runId, full);
       await this._finalizeResumedTurnOutcome(pending, full, {
         responseId,
         pendingQueuedItemId,

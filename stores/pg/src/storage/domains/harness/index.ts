@@ -195,6 +195,8 @@ import type {
   HarnessTerminalAdmissionInput,
   HarnessPendingTerminalAdmissionLoadInput,
   HarnessTerminalFinalizerCountInput,
+  HarnessTerminalCompletionStageInput,
+  HarnessTerminalCompletionStageReceipt,
   HarnessTerminalAdmissionLoadInput,
   HarnessTerminalAdmissionReceipt,
   HarnessTerminalCancelInput,
@@ -920,6 +922,10 @@ export class HarnessPG extends HarnessStorage {
   }
 
   override get supportsTerminalHandoff(): boolean {
+    return this.terminalHandoff.enabled;
+  }
+
+  override get supportsTerminalCompletionStaging(): boolean {
     return this.terminalHandoff.enabled;
   }
 
@@ -5203,7 +5209,8 @@ export class HarnessPG extends HarnessStorage {
         };
         const update = await tx.execute({
           sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
-                SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = ?, status = ?, dispatch = ?, result = ?, error = ?, updated_at = ?
+                SET run_id = ?, mode_id = ?, model_id = ?, operation_kind = ?, status = ?, dispatch = ?,
+                    result = CASE WHEN ? = 'pending' THEN result ELSE CAST(? AS jsonb) END, error = ?, updated_at = ?
                 WHERE id = ? AND status = 'pending'
                   AND operation_kind IS NOT DISTINCT FROM ?
                   AND dispatch IS NOT DISTINCT FROM CAST(? AS jsonb)
@@ -5215,6 +5222,8 @@ export class HarnessPG extends HarnessStorage {
             updated.operationKind ?? null,
             namespacedRecord.status,
             updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
+            // A pending rewrite keeps a staged terminal completion.
+            namespacedRecord.status,
             'result' in namespacedRecord &&
             namespacedRecord.result !== undefined &&
             !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
@@ -5580,7 +5589,83 @@ export class HarnessPG extends HarnessStorage {
             WHERE harness_name = ? AND status = 'pending' AND finalizer_id = ? AND finalizer_version = ?`,
       args: [harnessName, input.finalizerId, input.finalizerVersion],
     });
-    return Number((result.rows[0] as Record<string, unknown> | undefined)?.pending ?? 0);
+    const count = Number(result.rows[0]?.pending);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new HarnessTerminalHandoffValidationError('pendingCount', 'database did not return a valid drain count');
+    }
+    return count;
+  }
+
+  /**
+   * Stores the output in the pending row's existing `result` column (status
+   * stays `pending`), so no schema change is needed.
+   */
+  async stageTerminalCompletion(
+    input: HarnessTerminalCompletionStageInput,
+  ): Promise<HarnessTerminalCompletionStageReceipt> {
+    this.#assertTerminalHandoffEnabled();
+    await this.#ensureMessageResultsTable();
+    await this.#ensureTerminalHandoffTables();
+    const harnessName = this.#resolveHarnessName(input.identity.harnessName);
+    const identity = { ...input.identity, harnessName };
+    validateHarnessTerminalIdentity(identity);
+    const stagedResult = JSON.stringify(input.result);
+    if (stagedResult === undefined) {
+      throw new HarnessTerminalHandoffValidationError('result', 'must be JSON-serializable');
+    }
+    const admissionId = harnessTerminalAdmissionId(identity);
+    const evidenceId = messageEvidenceId({ harnessName, sessionId: identity.sessionId, signalId: identity.signalId });
+    const tx = await this.#client.transaction('write');
+    try {
+      // The commit's lock order: grant -> admission -> canonical evidence.
+      await this.#lockTerminalGrant(tx, harnessName, identity.executionGrant);
+      const admissionRow = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+        args: [admissionId],
+      });
+      if (!admissionRow.rows[0]) throw new HarnessTerminalHandoffFencedError(identity.sessionId);
+      const admission = rowToHarnessTerminalAdmission(admissionRow.rows[0] as Record<string, unknown>);
+      if (
+        admission.admissionId !== identity.admissionId ||
+        admission.admissionHash !== identity.admissionHash ||
+        admission.signalId !== identity.signalId ||
+        admission.runId !== identity.runId ||
+        admission.sessionIncarnation !== identity.sessionIncarnation ||
+        admission.resourceId !== identity.resourceId ||
+        admission.threadId !== identity.threadId
+      ) {
+        throw new HarnessTerminalHandoffIdentityConflictError(identity.executionGrant.key);
+      }
+      const evidenceRow = await tx.execute({
+        sql: `SELECT * FROM ${TABLE_HARNESS_MESSAGE_RESULTS} WHERE id = ? LIMIT 1 FOR UPDATE`,
+        args: [evidenceId],
+      });
+      const evidence = evidenceRow.rows[0]
+        ? rowToMessageResultEvidence(evidenceRow.rows[0] as Record<string, unknown>)
+        : undefined;
+      if (admission.status !== 'pending' || evidence === undefined || evidence.status !== 'pending') {
+        await tx.commit();
+        return { status: 'not_pending' };
+      }
+      if (
+        evidence.admissionId !== identity.admissionId ||
+        evidence.admissionHash !== identity.admissionHash ||
+        evidence.runId !== identity.runId ||
+        evidence.resourceId !== identity.resourceId ||
+        evidence.threadId !== identity.threadId
+      ) {
+        throw new HarnessTerminalHandoffIdentityConflictError(identity.executionGrant.key);
+      }
+      await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS} SET result = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
+        args: [stagedResult, Date.now(), evidenceId],
+      });
+      await tx.commit();
+      return { status: 'staged' };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
+    }
   }
 
   /**
@@ -5598,7 +5683,14 @@ export class HarnessPG extends HarnessStorage {
               AND finalizer_id = ? AND finalizer_version = ?`,
       args: [harnessName, input.finalizerId, input.finalizerVersion],
     });
-    return Number((result.rows[0] as Record<string, unknown> | undefined)?.undelivered ?? 0);
+    const count = Number(result.rows[0]?.undelivered);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new HarnessTerminalHandoffValidationError(
+        'undeliveredCount',
+        'database did not return a valid drain count',
+      );
+    }
+    return count;
   }
 
   async commitTerminalHandoff(input: {
@@ -5737,6 +5829,9 @@ export class HarnessPG extends HarnessStorage {
       if (input.recovery !== undefined) {
         if (
           currentEvidence.status !== 'pending' ||
+          // A staged completed output is never interrupted: recovery commits
+          // it as completed on its next pass.
+          (resultEvidence.status !== 'completed' && currentEvidence.stagedResult !== undefined) ||
           !sameSignalDispatch(currentEvidence.dispatch, input.recovery.expectedDispatch ?? undefined) ||
           !rowHoldsSessionLease(session.rows[0] as Record<string, unknown> | undefined, input.recovery.leaseOwner)
         ) {
@@ -12355,7 +12450,8 @@ function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalRe
       error: parseJson(row.error) ?? { code: 'harness.message_failed', message: 'Message failed' },
     };
   }
-  return { ...base, status: 'pending' };
+  // A pending row's result is a staged terminal completion.
+  return { ...base, status: 'pending', ...(row.result == null ? {} : { stagedResult: parseJson(row.result) }) };
 }
 
 function rowToHarnessTerminalAdmission(row: Record<string, unknown>): HarnessTerminalAdmissionRecord {

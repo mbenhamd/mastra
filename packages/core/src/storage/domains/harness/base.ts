@@ -11,6 +11,8 @@ import {
   type HarnessTerminalAdmissionLoadInput,
   type HarnessPendingTerminalAdmissionLoadInput,
   type HarnessTerminalFinalizerCountInput,
+  type HarnessTerminalCompletionStageInput,
+  type HarnessTerminalCompletionStageReceipt,
   type HarnessTerminalAdmissionRecord,
   type HarnessTerminalAdmissionReceipt,
   type HarnessTerminalCancelInput,
@@ -905,6 +907,11 @@ export abstract class HarnessStorage extends StorageDomain {
     return false;
   }
 
+  /** Native adapters override this after implementing `stageTerminalCompletion`. */
+  get supportsTerminalCompletionStaging(): boolean {
+    return false;
+  }
+
   /** Native adapters override this after implementing `revokeTerminalGrant`. */
   get supportsTerminalGrantRevocation(): boolean {
     return false;
@@ -1403,6 +1410,21 @@ export abstract class HarnessStorage extends StorageDomain {
   async loadTerminalAdmissionByRun(
     _input: HarnessPendingTerminalAdmissionLoadInput,
   ): Promise<HarnessTerminalAdmissionRecord | null> {
+    throw new HarnessTerminalHandoffUnsupportedError();
+  }
+
+  /**
+   * Durably record a native terminal turn's completed output on its pending
+   * message-result row (as `stagedResult`) before the terminal commit runs.
+   * Written only while both the terminal admission and the evidence row are
+   * still pending; the row stays pending. Orphan recovery then commits the
+   * turn as completed with this output, and an interrupting commit with a
+   * recovery precondition is refused while a staged output is present. The
+   * terminal commit and a session delete clear it.
+   */
+  async stageTerminalCompletion(
+    _input: HarnessTerminalCompletionStageInput,
+  ): Promise<HarnessTerminalCompletionStageReceipt> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }
 

@@ -1010,7 +1010,18 @@ export type AgentSignalDispatchState =
     };
 
 export type AgentSignalResultStatus = (
-  | { status: 'pending'; signalId: string; runId?: string }
+  | {
+      status: 'pending';
+      signalId: string;
+      runId?: string;
+      /**
+       * The completed output of a native terminal turn, staged by
+       * `stageTerminalCompletion` before its terminal commit. A pending row
+       * that carries it finished its run: recovery commits it as completed
+       * with this output instead of interrupting it.
+       */
+      stagedResult?: unknown;
+    }
   | {
       status: 'completed';
       signalId: string;

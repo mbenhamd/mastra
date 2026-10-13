@@ -848,6 +848,68 @@ describe('HarnessPG native terminal handoff', () => {
     );
   });
 
+  it('stages a completed output on the pending row so recovery commits it as completed, never interrupted', async () => {
+    const session = await createNativeSession(harness(), 'session-staged');
+    const input = admissionFor(session, 'staged');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    expect(harness().supportsTerminalCompletionStaging).toBe(true);
+    const output = { text: 'final answer', finishReason: 'stop' };
+    const identity = { ...input, executionGrant: input.executionGrant };
+    await expect(harness().stageTerminalCompletion({ identity, result: output })).resolves.toEqual({
+      status: 'staged',
+    });
+    const scope = {
+      harnessName: HARNESS,
+      sessionId: session.id,
+      resourceId: session.resourceId,
+      threadId: session.threadId,
+      signalId: input.signalId,
+    };
+    await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'pending',
+      stagedResult: output,
+    });
+    // A pending rewrite of the row keeps the staged output.
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({ stagedResult: output });
+
+    // Recovery may not interrupt a turn whose finished output is staged.
+    const interrupted = commitInput(input, 'staged');
+    await expect(
+      harness().commitTerminalHandoff({
+        ...interrupted,
+        resultEvidence: {
+          ...pendingEvidence(input),
+          status: 'failed',
+          error: { code: 'harness.run_interrupted', message: 'interrupted' },
+        },
+        terminalResult: {
+          status: 'aborted',
+          runId: input.runId,
+          completedAt: Date.now(),
+          error: { code: 'harness.run_interrupted', message: 'interrupted' },
+        },
+        recovery: { expectedDispatch: null, leaseOwner: { ownerId: `owner-${session.id}` } },
+      }),
+    ).resolves.toMatchObject({ status: 'conflict' });
+
+    // It commits as completed with the staged output.
+    const committed = await harness().commitTerminalHandoff({
+      ...interrupted,
+      resultEvidence: { ...interrupted.resultEvidence, result: output },
+      recovery: { expectedDispatch: null, leaseOwner: { ownerId: `owner-${session.id}` } },
+    });
+    expect(committed.status).toBe('committed');
+    await expect(harness().loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'completed',
+      result: output,
+    });
+    await expect(harness().stageTerminalCompletion({ identity, result: output })).resolves.toEqual({
+      status: 'not_pending',
+    });
+  });
+
   it('enforces the configured pending-intent bound across sessions', async () => {
     const bounded = terminalStore('pg-harness-terminal-capacity-store', schemaName, {
       maxPendingIntents: 1,

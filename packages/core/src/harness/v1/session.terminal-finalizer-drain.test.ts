@@ -154,6 +154,80 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     }
   });
 
+  it('commits a turn whose owner died after it finished, with its reply, under the admitted version', async () => {
+    const db = new InMemoryDB();
+    const calls: FinalizeCall[] = [];
+    const ownerAgent = new MockAgent({ id: 'default' });
+    ownerAgent.enqueueRun({ finishReason: 'stop', text: 'final answer' });
+    const owner = harnessProcess(db, ownerAgent, { finalizer: finalizerAt('1', calls) });
+    const ownerSession = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // The run finishes, then its owner stops during the session-usage flush,
+    // before it even reaches the finalizer or terminal commit.
+    const saveSession = owner.storage.saveSession.bind(owner.storage);
+    let releaseUsageFlush!: () => void;
+    const usageFlush = new Promise<void>(resolve => (releaseUsageFlush = resolve));
+    owner.storage.saveSession = async (record, options) => {
+      if ((record.tokenUsage?.totalTokens ?? 0) > 0) await usageFlush;
+      return saveSession(record, options);
+    };
+    const turn = ownerSession.message({
+      content: 'hi',
+      admissionId,
+      executionAuthorityGrant: grant,
+      terminalAdmissionSeed: { v: 1 },
+    });
+    void turn.catch(() => {});
+    const scope = { harnessName: 'default', sessionId: ownerSession.id, resourceId: 'u1' };
+    await vi.waitFor(async () => {
+      const pending = await owner.storage.listPendingMessageAdmissions({
+        ...scope,
+        threadId: ownerSession.threadId,
+        now: Date.now(),
+        limit: 10,
+      });
+      expect(pending.items).toMatchObject([
+        { evidence: { status: 'pending', stagedResult: { text: 'final answer' } } },
+      ]);
+    });
+    calls.length = 0;
+
+    const adopter = await adoptAfterLeaseLapse(db, ownerSession.id, {
+      finalizer: finalizerAt('2', calls),
+      settleOnly: [finalizerAt('1', calls)],
+    });
+    try {
+      // Recovery commits the finished turn as completed with its reply — never
+      // as interrupted — through the finalizer of the version it was admitted under.
+      expect(calls).toEqual([{ version: '1', finalizerVersion: '1', status: 'completed', reply: 'final answer' }]);
+      expect(adopter.admission).toMatchObject({
+        status: 'committed',
+        finalizerVersion: '1',
+        terminalResult: { status: 'completed' },
+      });
+      const [intent] = (
+        await adopter.storage.claimTerminalIntents({ harnessName: 'default', consumerId: 'consumer', limit: 10 })
+      ).intents;
+      expect(JSON.parse(intent!.projection.payloadJson)).toEqual({
+        status: 'completed',
+        code: null,
+        reply: 'final answer',
+      });
+      await expect(
+        adopter.storage.loadMessageResultEvidence({
+          ...scope,
+          threadId: ownerSession.threadId,
+          signalId: intent!.signalId,
+        }),
+      ).resolves.toMatchObject({ status: 'completed', result: { text: 'final answer' } });
+      expect(adopter.agent.streamCalls).toHaveLength(0);
+    } finally {
+      await adopter.harness.shutdown();
+      releaseUsageFlush();
+      await turn.catch(() => {});
+      await owner.harness.shutdown().catch(() => {});
+    }
+  });
+
   it('leaves an orphaned turn pending when its admitted version is not registered', async () => {
     const db = new InMemoryDB();
     const calls: FinalizeCall[] = [];
@@ -200,14 +274,26 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
       finalizer: finalizerAt('2', calls),
       settleOnly: [finalizerAt('1', calls)],
     });
+    const resumeSession = await resumer.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
+    resumer.storage.commitTerminalHandoff = async () => {
+      throw new Error('process stopped before the resumed terminal commit');
+    };
+    await expect(resumeSession.respondToToolApproval({ approved: true })).rejects.toMatchObject({
+      code: 'harness.terminal_pending',
+    });
+    await resumer.harness.shutdown();
+    calls.length = 0;
+    const adopter = await adoptAfterLeaseLapse(db, ownerSession.id, {
+      finalizer: finalizerAt('2', calls),
+      settleOnly: [finalizerAt('1', calls)],
+    });
     try {
-      const session = await resumer.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
-      await session.respondToToolApproval({ approved: true });
+      const session = await adopter.harness.session({ sessionId: ownerSession.id, resourceId: 'u1' });
       // The previous owner is gone; the reply produced on resume reaches the
       // admitted version's finalizer and its committed intent.
       expect(calls).toEqual([{ version: '1', finalizerVersion: '1', status: 'completed', reply: 'resumed answer' }]);
       const [intent] = (
-        await resumer.storage.claimTerminalIntents({ harnessName: 'default', consumerId: 'consumer', limit: 10 })
+        await adopter.storage.claimTerminalIntents({ harnessName: 'default', consumerId: 'consumer', limit: 10 })
       ).intents;
       expect(intent).toMatchObject({ finalizerVersion: '1', projection: { projectionKind: 'chat.summary.v1' } });
       expect(JSON.parse(intent!.projection.payloadJson)).toEqual({
@@ -216,7 +302,7 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
         reply: 'resumed answer',
       });
       await expect(
-        resumer.storage.loadTerminalAdmission({
+        adopter.storage.loadTerminalAdmission({
           harnessName: 'default',
           sessionId: ownerSession.id,
           admissionId,
@@ -224,8 +310,9 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
         }),
       ).resolves.toMatchObject({ status: 'committed', finalizerVersion: '1' });
 
-      // A new turn on the resuming process is admitted under the primary @2.
-      agent.enqueueRun({ finishReason: 'stop', text: 'next answer' });
+      expect(adopter.agent.resumeCalls).toHaveLength(0);
+      // A new turn on the recovering process is admitted under the primary @2.
+      adopter.agent.enqueueRun({ finishReason: 'stop', text: 'next answer' });
       await session.message({
         content: 'next',
         admissionId: 'next-turn',
@@ -233,7 +320,7 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
         terminalAdmissionSeed: { v: 2 },
       });
       await expect(
-        resumer.storage.loadTerminalAdmission({
+        adopter.storage.loadTerminalAdmission({
           harnessName: 'default',
           sessionId: ownerSession.id,
           admissionId: 'next-turn',
@@ -241,7 +328,7 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
         }),
       ).resolves.toMatchObject({ status: 'committed', finalizerVersion: '2' });
     } finally {
-      await resumer.harness.shutdown();
+      await adopter.harness.shutdown();
     }
   });
 

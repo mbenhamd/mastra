@@ -89,6 +89,8 @@ import type {
   HarnessTerminalAdmissionInput,
   HarnessPendingTerminalAdmissionLoadInput,
   HarnessTerminalFinalizerCountInput,
+  HarnessTerminalCompletionStageInput,
+  HarnessTerminalCompletionStageReceipt,
   HarnessTerminalAdmissionLoadInput,
   HarnessTerminalAdmissionRecord,
   HarnessTerminalAdmissionReceipt,
@@ -249,6 +251,10 @@ export class InMemoryHarness extends HarnessStorage {
   }
 
   override get supportsTerminalHandoff(): boolean {
+    return this.terminalHandoff.enabled;
+  }
+
+  override get supportsTerminalCompletionStaging(): boolean {
     return this.terminalHandoff.enabled;
   }
 
@@ -1704,6 +1710,10 @@ export class InMemoryHarness extends HarnessStorage {
       ...(namespacedRecord.dispatch === undefined && existing?.dispatch !== undefined
         ? { dispatch: existing.dispatch }
         : {}),
+      // A pending rewrite keeps a staged completed output.
+      ...(namespacedRecord.status === 'pending' && existing?.status === 'pending' && existing.stagedResult !== undefined
+        ? { stagedResult: existing.stagedResult }
+        : {}),
       ...(namespacedRecord.operationKind === undefined && existing?.operationKind !== undefined
         ? { operationKind: existing.operationKind }
         : {}),
@@ -1882,6 +1892,46 @@ export class InMemoryHarness extends HarnessStorage {
     return pending;
   }
 
+  async stageTerminalCompletion(
+    input: HarnessTerminalCompletionStageInput,
+  ): Promise<HarnessTerminalCompletionStageReceipt> {
+    this.assertTerminalHandoffEnabled();
+    const namespace = resolveHarnessName(input.identity.harnessName, this.harnessName);
+    const identity = { ...input.identity, harnessName: namespace };
+    validateHarnessTerminalIdentity(identity);
+    // Clone before reading any row, so an uncloneable output fails without a write.
+    const stagedResult = cloneJson(input.result);
+    const admission = this.db.harnessTerminalAdmissions.get(harnessTerminalAdmissionId(identity));
+    if (admission === undefined) throw new HarnessTerminalHandoffFencedError(identity.sessionId);
+    if (
+      admission.admissionId !== identity.admissionId ||
+      admission.admissionHash !== identity.admissionHash ||
+      admission.signalId !== identity.signalId ||
+      admission.runId !== identity.runId ||
+      admission.sessionIncarnation !== identity.sessionIncarnation ||
+      admission.resourceId !== identity.resourceId ||
+      admission.threadId !== identity.threadId
+    ) {
+      throw new HarnessTerminalHandoffIdentityConflictError(identity.executionGrant.key);
+    }
+    const key = messageEvidenceKey(namespace, identity.sessionId, identity.signalId);
+    const evidence = this.db.harnessMessageResultEvidence.get(key);
+    if (admission.status !== 'pending' || evidence === undefined || evidence.status !== 'pending') {
+      return { status: 'not_pending' };
+    }
+    if (
+      evidence.admissionId !== identity.admissionId ||
+      evidence.admissionHash !== identity.admissionHash ||
+      evidence.runId !== identity.runId ||
+      evidence.resourceId !== identity.resourceId ||
+      evidence.threadId !== identity.threadId
+    ) {
+      throw new HarnessTerminalHandoffIdentityConflictError(identity.executionGrant.key);
+    }
+    this.db.harnessMessageResultEvidence.set(key, { ...evidence, stagedResult, updatedAt: Date.now() });
+    return { status: 'staged' };
+  }
+
   async countUndeliveredTerminalIntents(input: HarnessTerminalFinalizerCountInput): Promise<number> {
     this.assertTerminalHandoffEnabled();
     assertTerminalFinalizerCountInput(input);
@@ -1992,6 +2042,9 @@ export class InMemoryHarness extends HarnessStorage {
     if (
       input.recovery !== undefined &&
       (currentEvidence.status !== 'pending' ||
+        // A staged completed output is never interrupted: recovery commits it
+        // as completed on its next pass.
+        (resultEvidence.status !== 'completed' && currentEvidence.stagedResult !== undefined) ||
         !sameSignalDispatch(currentEvidence.dispatch, input.recovery.expectedDispatch ?? undefined) ||
         !this.holdsSessionLease(namespace, stored.sessionId, input.recovery.leaseOwner))
     ) {

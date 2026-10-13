@@ -1161,8 +1161,8 @@ export interface HarnessConfigCommon {
        * id@version is registered neither here nor as `finalizer` stays
        * pending. Each entry is validated like `finalizer`, and an id@version
        * registered twice (including one equal to `finalizer`) is rejected.
-       * Drop an entry only once `countPendingTerminalAdmissions` reports none
-       * pending for it.
+       * Drop an entry only once `countPendingTerminalAdmissions` and
+       * `countUndeliveredTerminalIntents` both report zero for it.
        */
       settleOnly?: readonly HarnessTerminalFinalizer[];
     };

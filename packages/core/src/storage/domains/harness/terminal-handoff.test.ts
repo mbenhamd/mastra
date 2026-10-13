@@ -510,6 +510,64 @@ describe('native chat terminal handoff', () => {
     );
   });
 
+  it('stages a completed output on the pending row so recovery commits it as completed, never interrupted', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 60_000 });
+    const input = admission();
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await storage.admitTerminalHandoff(input);
+    expect(storage.supportsTerminalCompletionStaging).toBe(true);
+    const output = { text: 'final answer', finishReason: 'stop' };
+    await expect(storage.stageTerminalCompletion({ identity: input, result: output })).resolves.toEqual({
+      status: 'staged',
+    });
+    const scope = {
+      harnessName: input.harnessName,
+      sessionId: input.sessionId,
+      resourceId: input.resourceId,
+      threadId: input.threadId,
+      signalId: input.signalId,
+    };
+    await expect(storage.loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'pending',
+      stagedResult: output,
+    });
+    // A pending rewrite of the row keeps the staged output.
+    await storage.writeMessageResultEvidence(pendingEvidence(input));
+    await expect(storage.loadMessageResultEvidence(scope)).resolves.toMatchObject({ stagedResult: output });
+
+    const recovery = { expectedDispatch: null, leaseOwner: { ownerId: 'owner-1' } };
+    const interruption = { code: 'harness.run_interrupted', message: 'interrupted' };
+    const projection = { projectionKind: 'chat.summary', projectionId: 'summary-1', payload: {} };
+    // Recovery may not interrupt a turn whose finished output is staged.
+    await expect(
+      storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'failed', error: interruption },
+        terminalResult: { status: 'aborted', runId: input.runId, completedAt: 3_000, error: interruption },
+        projection,
+        recovery,
+      }),
+    ).resolves.toMatchObject({ status: 'conflict' });
+    // It commits as completed with the staged output.
+    const committed = await storage.commitTerminalHandoff({
+      admission: input,
+      resultEvidence: { ...pendingEvidence(input), status: 'completed', result: output, updatedAt: 3_000 },
+      terminalResult: { status: 'completed', runId: input.runId, completedAt: 3_000 },
+      projection,
+      recovery,
+    });
+    expect(committed.status).toBe('committed');
+    await expect(storage.loadMessageResultEvidence(scope)).resolves.toMatchObject({
+      status: 'completed',
+      result: output,
+    });
+    await expect(storage.stageTerminalCompletion({ identity: input, result: output })).resolves.toEqual({
+      status: 'not_pending',
+    });
+  });
+
   it('rejects a terminal commit when pending capacity is exhausted and lets it retry after drain', async () => {
     const storage = new InMemoryHarness({
       db: new InMemoryDB(),
