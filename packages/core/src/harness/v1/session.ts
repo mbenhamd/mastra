@@ -10503,15 +10503,18 @@ export class Session {
       activeDeleted,
     );
     if (receipt?.status === 'committed' || receipt?.status === 'duplicate') {
-      const settled = await this._storage.loadMessageResultEvidence({
-        harnessName: this._record.harnessName,
-        sessionId: this.id,
-        resourceId: this.resourceId,
-        threadId: this.threadId,
-        signalId: evidence.signalId,
-      });
+      const settled = await this._raceActiveTurnWaiter(
+        this._storage.loadMessageResultEvidence({
+          harnessName: this._record.harnessName,
+          sessionId: this.id,
+          resourceId: this.resourceId,
+          threadId: this.threadId,
+          signalId: evidence.signalId,
+        }),
+        activeDeleted,
+      );
       if (settled !== null && 'status' in settled && settled.status !== 'pending') {
-        await this._publishRecoveredRunCompletion(settled);
+        await this._raceActiveTurnWaiter(this._publishRecoveredRunCompletion(settled), activeDeleted);
       }
     }
     return true;

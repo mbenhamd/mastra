@@ -13,7 +13,7 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { MockAgent } from './__test-utils__/mock-agent';
-import { HarnessConfigError } from './errors';
+import { HarnessConfigError, HarnessSessionDeletedError } from './errors';
 import { Harness } from './harness';
 
 const LEASE_AND_DISPATCH_CLAIM_LAPSED_MS = 31_000;
@@ -392,54 +392,94 @@ describe('Harness terminal handoff — settle-only finalizers', () => {
     },
   );
 
-  it('publishes one completion when retries overlap an outstanding original summary save', async () => {
-    const db = new InMemoryDB();
-    const agent = new MockAgent({ id: 'default' });
-    agent.enqueueRun({ finishReason: 'stop', text: 'answer' });
-    const owner = harnessProcess(db, agent, { finalizer: finalizerAt('1', []) });
-    const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const completionEvents: string[] = [];
-    session.subscribe(event => {
-      if (event.type === 'agent_end' || event.type === 'run_completed') completionEvents.push(event.type);
-    });
-    let releaseSave!: () => void;
-    const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
-    let startedSave!: () => void;
-    const saveStarted = new Promise<void>(resolve => (startedSave = resolve));
-    const save = owner.storage.saveRunSummary.bind(owner.storage);
-    owner.storage.saveRunSummary = async input => {
-      startedSave();
-      await saveGate;
-      return save(input);
-    };
-    const message = { content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } };
-    try {
-      await expect(session.message(message)).resolves.toMatchObject({ text: 'answer' });
-      await saveStarted;
-      let receipts = 0;
-      let receivedBoth!: () => void;
-      const bothReceived = new Promise<void>(resolve => (receivedBoth = resolve));
-      const retry = () =>
-        session.message({
-          ...message,
-          onTerminalCommit: () => {
-            if (++receipts === 2) receivedBoth();
-          },
-        });
-      const retries = Promise.all([retry(), retry()]);
-      await bothReceived;
-      // Let both canonical receipt continuations run while the original
-      // summary write is deliberately held, without relying on a time delay.
-      await new Promise<void>(resolve => setImmediate(resolve));
-      releaseSave();
-      await expect(retries).resolves.toMatchObject([{ text: 'answer' }, { text: 'answer' }]);
-      expect(completionEvents).toEqual(['agent_end', 'run_completed']);
-      expect(agent.streamCalls).toHaveLength(1);
-    } finally {
-      releaseSave();
-      await owner.harness.shutdown();
-    }
-  });
+  it.each(['none', 'canonical evidence load', 'summary publication'])(
+    'preserves completion publication and retry cancellation after deletion at %s',
+    async deleteBoundary => {
+      const db = new InMemoryDB();
+      const agent = new MockAgent({ id: 'default' });
+      agent.enqueueRun({ finishReason: 'stop', text: 'answer' });
+      const owner = harnessProcess(db, agent, { finalizer: finalizerAt('1', []) });
+      const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const completionEvents: string[] = [];
+      session.subscribe(event => {
+        if (event.type === 'agent_end' || event.type === 'run_completed') completionEvents.push(event.type);
+      });
+      let releaseSave!: () => void;
+      const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
+      let startedSave!: () => void;
+      const saveStarted = new Promise<void>(resolve => (startedSave = resolve));
+      const save = owner.storage.saveRunSummary.bind(owner.storage);
+      owner.storage.saveRunSummary = async input => {
+        startedSave();
+        await saveGate;
+        return save(input);
+      };
+      const message = { content: 'hi', admissionId, executionAuthorityGrant: grant, terminalAdmissionSeed: { v: 1 } };
+      let releaseLoad!: () => void;
+      const loadGate = new Promise<void>(resolve => (releaseLoad = resolve));
+      let startedLoad!: () => void;
+      const loadStarted = new Promise<void>(resolve => (startedLoad = resolve));
+      let holdNextLoad = false;
+      const load = owner.storage.loadMessageResultEvidence.bind(owner.storage);
+      owner.storage.loadMessageResultEvidence = async input => {
+        if (holdNextLoad) {
+          holdNextLoad = false;
+          startedLoad();
+          await loadGate;
+        }
+        return load(input);
+      };
+      try {
+        await expect(session.message(message)).resolves.toMatchObject({ text: 'answer' });
+        await saveStarted;
+        let receipts = 0;
+        let receivedBoth!: () => void;
+        const bothReceived = new Promise<void>(resolve => (receivedBoth = resolve));
+        const retry = () =>
+          session.message({
+            ...message,
+            onTerminalCommit: () => {
+              if (deleteBoundary === 'canonical evidence load') holdNextLoad = true;
+              if (++receipts === (deleteBoundary === 'none' ? 2 : 1)) receivedBoth();
+            },
+          });
+        const retries = Promise.allSettled(deleteBoundary === 'none' ? [retry(), retry()] : [retry()]);
+        let replies: Awaited<typeof retries> | undefined;
+        void retries.then(outcomes => (replies = outcomes));
+        await bothReceived;
+        // Let both canonical receipt continuations run while the original
+        // summary write is deliberately held, without relying on a time delay.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        if (deleteBoundary !== 'none') {
+          if (deleteBoundary === 'canonical evidence load') await loadStarted;
+          // Native hard-delete of a closed record must notify retained live
+          // waiters even while unrelated summary storage is unavailable. Use
+          // the real fenced save, so force-delete need not first recover/close
+          // this completed run through the deliberately held publication.
+          const record = await owner.storage.loadSession({ harnessName: 'default', sessionId: session.id });
+          await owner.storage.saveSession(
+            { ...record!, closedAt: Date.now() },
+            { harnessName: 'default', ownerId: owner.harness.ownerId, ifVersion: record!.version },
+          );
+          await owner.harness.deleteSession({ sessionId: session.id, resourceId: 'u1', force: true });
+          await vi.waitFor(() => expect(replies).toHaveLength(1), { timeout: 1_000 });
+          expect(replies![0]).toMatchObject({ status: 'rejected', reason: expect.any(HarnessSessionDeletedError) });
+          return;
+        }
+        releaseSave();
+        await expect(retries).resolves.toMatchObject([
+          { status: 'fulfilled', value: { text: 'answer' } },
+          { status: 'fulfilled', value: { text: 'answer' } },
+        ]);
+        expect(completionEvents).toEqual(['agent_end', 'run_completed']);
+        expect(agent.streamCalls).toHaveLength(1);
+      } finally {
+        releaseLoad();
+        releaseSave();
+        await owner.harness.shutdown();
+      }
+    },
+  );
 
   it.each([0, 2])(
     'delivers the same staged completion to an active signal with %i transient staging failures',
