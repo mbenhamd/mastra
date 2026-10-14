@@ -743,6 +743,8 @@ function pruneInboxResponseReceipts(
 
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
+/** Backoff before the one retry of a failed provider-result stage. */
+const PROVIDER_RESULT_STAGE_RETRY_MS = 100;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
 const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
 const MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS = 1_000;
@@ -1970,6 +1972,12 @@ export class Session {
   private readonly _recoveredRunPublications = new Map<string, Promise<void>>();
   /** Runs this process admitted under native terminal handoff. */
   private readonly _nativeTerminalRunIds = new Set<string>();
+  /**
+   * Pending terminal admissions known to this process, by run id, so staging a
+   * run's output is one storage transaction. Storage re-validates identity and
+   * status under its locks, so a stale entry only yields `not_pending`.
+   */
+  private readonly _terminalStagingAdmissions = new Map<string, HarnessTerminalAdmissionRecord>();
   /** Staging runs outside the message boundary that owns its failure observer. */
   private readonly _terminalStagingFailuresAwaitingObserver = new WeakSet<HarnessTerminalHandoffError>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
@@ -4055,6 +4063,7 @@ export class Session {
     if (swapped.applied) {
       this._terminalTokenAccountedRunIds.delete(runId);
       this._stagedTerminalRunIds.delete(runId);
+      this._terminalStagingAdmissions.delete(runId);
     }
     return swapped.applied;
   }
@@ -4202,6 +4211,7 @@ export class Session {
       if (admission.status === 'committed') {
         this._terminalTokenAccountedRunIds.delete(runId);
         this._stagedTerminalRunIds.delete(runId);
+        this._terminalStagingAdmissions.delete(runId);
       }
       return 'unowned';
     }
@@ -4288,6 +4298,7 @@ export class Session {
     if (receipt.status === 'committed') {
       this._terminalTokenAccountedRunIds.delete(runId);
       this._stagedTerminalRunIds.delete(runId);
+      this._terminalStagingAdmissions.delete(runId);
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
@@ -8089,6 +8100,19 @@ export class Session {
       waiter?.reject(err);
       return;
     }
+    // Stage the provider's completed output as soon as the run has it, before
+    // memory persistence, onFinish, delivery or usage accounting can treat
+    // the run as complete: a process death after this point recovers the
+    // reply. The completed output re-stages over it below.
+    // Test doubles may hand back a bare output without the listener API.
+    const providerResultObserved = out._onProviderResult?.(providerResult =>
+      this._stageProviderResult(runId, providerResult),
+    );
+    if (providerResultObserved === false) {
+      console.debug(
+        `[harness/v1] run "${runId}" finished before its provider result could be staged early; only its completed output is staged`,
+      );
+    }
     try {
       if (typeof out._waitUntilFinished === 'function') {
         await out._waitUntilFinished();
@@ -8279,6 +8303,61 @@ export class Session {
   }
 
   /**
+   * Stage the provider result (the run's output before output result
+   * processors and onFinish) for recovery. Fails closed: a stage that still
+   * fails after one retry, and whose commit is not found durable, rejects, and
+   * the run then fails before any output result processor (memory) can hold a
+   * reply that recovery could not find. Receipt state is read, not consumed.
+   */
+  private async _stageProviderResult(runId: string, providerResult: FullOutput<unknown>): Promise<void> {
+    const receiptState = this._runToolReceipts.get(runId);
+    const full = materializeHarnessTerminalText(
+      withHarnessSubagentToolReceipts(providerResult, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
+    );
+    let failure: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, PROVIDER_RESULT_STAGE_RETRY_MS));
+      try {
+        await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true, provisional: true });
+        return;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    // A lost acknowledgement: the write committed, so the reply is recoverable.
+    if (await this._providerResultStagedDurably(runId)) return;
+    console.error(`[harness/v1] could not stage the provider result of run "${runId}"; failing the run`, failure);
+    throw failure;
+  }
+
+  private async _providerResultStagedDurably(runId: string): Promise<boolean> {
+    const admission = this._terminalStagingAdmissions.get(runId);
+    if (admission === undefined) return false;
+    try {
+      const evidence = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: admission.signalId,
+      });
+      if (
+        evidence === null ||
+        !('status' in evidence) ||
+        evidence.status !== 'pending' ||
+        evidence.runId !== runId ||
+        evidence.stagedResult === undefined
+      ) {
+        return false;
+      }
+      this._stagedTerminalRunIds.add(runId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Make native completed output durable before resolving the run's waiter.
    * `tolerateUnknownRun` is for generic completion paths that see every run:
    * when the admission lookup fails for a run this process did not admit
@@ -8289,7 +8368,7 @@ export class Session {
   private async _stageCompletedTerminalOutput(
     runId: string,
     full: FullOutput<unknown>,
-    opts: { tolerateUnknownRun?: boolean } = {},
+    opts: { tolerateUnknownRun?: boolean; provisional?: boolean } = {},
   ): Promise<void> {
     const sessionIncarnation = this._record.sessionIncarnation;
     if (
@@ -8302,24 +8381,32 @@ export class Session {
       return;
     }
     try {
+      const cached = this._terminalStagingAdmissions.get(runId);
       let admission: HarnessTerminalAdmissionRecord | null;
-      try {
-        admission = await this._storage.loadTerminalAdmissionByRun({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          sessionIncarnation,
-          runId,
-        });
-      } catch (error) {
-        if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
-        throw error;
+      if (cached !== undefined && cached.sessionIncarnation === sessionIncarnation) {
+        admission = cached;
+      } else {
+        try {
+          admission = await this._storage.loadTerminalAdmissionByRun({
+            harnessName: this._record.harnessName,
+            sessionId: this.id,
+            sessionIncarnation,
+            runId,
+          });
+        } catch (error) {
+          if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
+          throw error;
+        }
+        if (admission?.status === 'pending') this._terminalStagingAdmissions.set(runId, admission);
       }
       if (admission?.status === 'pending') {
         // A process may have died after settling a prior completion but
         // before its next session save removed that usage fence. Only
         // terminal canonical evidence retires a fence: a cancelled admission
-        // can leave its staged evidence pending for recovery.
-        for (const accountedRunId of this._terminalTokenAccountedRunIds) {
+        // can leave its staged evidence pending for recovery. A run already
+        // staged here (its provider result) has run this sweep.
+        const fencesToSweep = this._stagedTerminalRunIds.has(runId) ? [] : this._terminalTokenAccountedRunIds;
+        for (const accountedRunId of fencesToSweep) {
           if (accountedRunId === runId) continue;
           const prior = await this._storage.loadTerminalAdmissionByRun({
             harnessName: this._record.harnessName,
@@ -8342,8 +8429,12 @@ export class Session {
         }
         const receipt = await this._storage.stageTerminalCompletion({ identity: admission, result: full });
         if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
+        else this._terminalStagingAdmissions.delete(runId);
       }
     } catch (error) {
+      // A provisional stage has no observer of its own; the completed-output
+      // staging that follows reports its failure.
+      if (opts.provisional === true) throw error;
       const pending = this._terminalFailure(error, undefined, runId);
       this._terminalStagingFailuresAwaitingObserver.add(pending);
       throw pending;
@@ -11515,6 +11606,7 @@ export class Session {
       );
     }
     this._nativeTerminalRunIds.add(identity.runId);
+    this._terminalStagingAdmissions.set(identity.runId, receipt.admission);
   }
 
   /**
@@ -11690,6 +11782,7 @@ export class Session {
       };
       this._terminalTokenAccountedRunIds.delete(identity.runId);
       this._stagedTerminalRunIds.delete(identity.runId);
+      this._terminalStagingAdmissions.delete(identity.runId);
       this._nativeTerminalRunIds.delete(identity.runId);
       try {
         options.onReceipt?.(receipt);
@@ -11860,6 +11953,7 @@ export class Session {
     if (receipt.status === 'committed' || receipt.status === 'duplicate') {
       this._terminalTokenAccountedRunIds.delete(identity.runId);
       this._stagedTerminalRunIds.delete(identity.runId);
+      this._terminalStagingAdmissions.delete(identity.runId);
       this._nativeTerminalRunIds.delete(identity.runId);
     }
     try {
@@ -16720,7 +16814,10 @@ export class Session {
       }
       // A pending native admission resumes here: its completed output must
       // stage fail-closed on every completion path.
-      if (boundAdmission?.status === 'pending') this._nativeTerminalRunIds.add(pending.runId);
+      if (boundAdmission?.status === 'pending') {
+        this._nativeTerminalRunIds.add(pending.runId);
+        this._terminalStagingAdmissions.set(pending.runId, boundAdmission);
+      }
     }
 
     // Mark resumed under the lease BEFORE calling the agent (idempotency

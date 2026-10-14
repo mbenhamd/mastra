@@ -334,6 +334,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   #loopStepCount = 0;
   #tripwire: StepTripwireData | undefined = undefined;
   #wasSuspended = false;
+  /** Awaited at the run's final `finish`, before output result processors and `onFinish` (see `_onProviderResult`). */
+  #providerResultListeners: Array<(result: FullOutput<OUTPUT>) => Promise<void>> = [];
+  #providerResultObserved = false;
   #terminalToolResult: TerminalToolResult | undefined;
   #transportRef: MastraModelOutputOptions<OUTPUT>['transportRef'] | undefined;
   #transportClosed = false;
@@ -1342,6 +1345,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     'response',
                   );
                 }
+
+                // The provider's final output is known here. Its listeners finish
+                // before output result processors run: those persist the turn
+                // (memory), and nothing may hold the reply durably before the
+                // listeners have staged it for recovery.
+                await self.#publishProviderResult({
+                  response,
+                  providerMetadata: finalProviderMetadata,
+                  terminalToolResult: terminalCommit?.data,
+                });
 
                 if (self.processorRunner && !self.#options.isLLMExecutionStep) {
                   // Run output processors when NOT in LLM execution step context
@@ -2382,6 +2395,86 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   /** @internal  */
   _getBaseStream() {
     return this.#baseStream;
+  }
+
+  /**
+   * @internal Register a listener for the run's provider result: a
+   * `FullOutput`-shaped snapshot of the final output as the provider finished
+   * it, awaited at the final `finish` chunk before output result processors
+   * (memory persistence), `onFinish`, and the finish chunk's delivery. It fires
+   * at most once, only for a run that is still successful at that point. A
+   * listener that rejects fails the run before any output result processor
+   * runs, so nothing persists a reply the listener could not secure. The
+   * snapshot is a
+   * detached JSON copy: it has no structured `object` and carries the text
+   * before output result processors.
+   * Returns `false` when the run's finish already started, so the caller must
+   * rely on the completed output instead.
+   */
+  _onProviderResult(listener: (result: FullOutput<OUTPUT>) => Promise<void>): boolean {
+    if (this.#providerResultObserved || this.#streamFinished) return false;
+    this.#providerResultListeners.push(listener);
+    return true;
+  }
+
+  async #publishProviderResult(input: {
+    response: LLMStepResult<OUTPUT>['response'];
+    providerMetadata: ProviderMetadata | undefined;
+    terminalToolResult: TerminalToolResult | undefined;
+  }): Promise<void> {
+    if (this.#providerResultObserved) return;
+    this.#providerResultObserved = true;
+    const listeners = this.#providerResultListeners;
+    this.#providerResultListeners = [];
+    if (listeners.length === 0 || this.#status !== 'success') return;
+    const steps = [...this.#bufferedSteps];
+    const snapshot = {
+      // Same derivation as getFullOutput(): rejected steps carry no text.
+      text: steps.map(step => step.text || '').join(''),
+      usage: { ...this.#usageCount },
+      steps,
+      finishReason: this.#finishReason,
+      warnings: [...this.#warnings],
+      providerMetadata: input.providerMetadata,
+      request: this.#request || {},
+      reasoning: Object.values(this.#bufferedReasoningDetails || {}),
+      reasoningText:
+        this.#bufferedReasoning.length > 0
+          ? this.#bufferedReasoning.map(reasoningPart => reasoningPart.payload.text).join('')
+          : undefined,
+      toolCalls: [...this.#toolCalls],
+      toolResults: [...this.#toolResults],
+      sources: [...this.#bufferedSources],
+      files: [...this.#bufferedFiles],
+      response: input.response,
+      totalUsage: this.#getTotalUsage(),
+      object: undefined as OUTPUT,
+      usedFallbackValue: this.#usedFallbackValue,
+      error: undefined,
+      tripwire: this.#tripwire,
+      traceId: this.traceId,
+      spanId: this.spanId,
+      runId: this.runId,
+      suspendPayload: undefined,
+      resumeSchema: undefined,
+      messages: [],
+      rememberedMessages: [],
+      ...(input.terminalToolResult !== undefined ? { terminalToolResult: input.terminalToolResult } : {}),
+    } satisfies FullOutput<OUTPUT>;
+    // Output result processors later mutate the step and message objects in
+    // place. Detach the snapshot, in the JSON form storage persists anyway.
+    const result = JSON.parse(JSON.stringify(snapshot)) as FullOutput<OUTPUT>;
+    // Every listener starts before the first await, so each reads its own
+    // state at the provider finish too. The first rejection fails the run.
+    const settled = await Promise.allSettled(listeners.map(async listener => listener(result)));
+    const rejected = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+    if (rejected !== undefined) {
+      this.logger?.error?.('Provider result listener failed; failing the run', {
+        error: rejected.reason,
+        runId: this.runId,
+      });
+      throw rejected.reason;
+    }
   }
 
   /** @internal */
