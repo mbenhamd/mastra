@@ -7,7 +7,7 @@
  *
  *   PF5620_LIVE=1 PF5620_LIVE_OUT=/tmp/pf5620.jsonl \
  *     <load the two AZURE_LUNA_* names> npx vitest run --project e2e:packages/core \
- *     src/harness/v1/session.subagent-answer-stream.live.e2e.test.ts
+ *     src/harness/v1/session.subagent-answer-stream.live.test.ts
  *
  * A real Harness runs a real child Agent that calls research tools over
  * several steps and then answers through `report_subagent_outcome`. The
@@ -313,7 +313,8 @@ describe.skipIf(!LIVE)('PF-5620 live streamed subagent answers (Azure gpt-6-luna
         const answerText = directAnswer(tool, result, 'tc-live-spawn');
         const accepted = acceptedReportSummary(events, deltas[0]?.event.subagentSessionId);
         const answer = { text: answerText ?? accepted?.summary ?? '' };
-        const end = endOf(events, 'tc-live-spawn')!;
+        const end = endOf(events, 'tc-live-spawn');
+        const firstDelta = deltas[0];
         const reportToolStart = events.find(
           entry =>
             entry.event.type === 'subagent_tool_start' &&
@@ -333,19 +334,27 @@ describe.skipIf(!LIVE)('PF-5620 live streamed subagent answers (Azure gpt-6-luna
           hasNewline: answer.text.includes('\n'),
           hasQuote: answer.text.includes('"'),
           hasNonAscii: /[^\u0000-\u007f]/.test(answer.text),
-          totalMs: Math.round(end.at - startedAt),
+          totalMs: end === undefined ? null : Math.round(end.at - startedAt),
           firstDeltaAfterReportInputMs:
-            reportInputStart === undefined ? null : Math.round(deltas[0]!.at - reportInputStart),
-          firstDeltaBeforeEndMs: Math.round(end.at - deltas[0]!.at),
+            reportInputStart === undefined || firstDelta === undefined
+              ? null
+              : Math.round(firstDelta.at - reportInputStart),
+          firstDeltaBeforeEndMs:
+            end === undefined || firstDelta === undefined ? null : Math.round(end.at - firstDelta.at),
           firstDeltaBeforeReportToolStartMs:
-            reportToolStart === undefined ? null : Math.round(reportToolStart.at - deltas[0]!.at),
+            reportToolStart === undefined || firstDelta === undefined
+              ? null
+              : Math.round(reportToolStart.at - firstDelta.at),
           reportCalls: new Set(deltas.map(entry => entry.event.innerToolCallId)).size,
           directAnswerVerified: answerText !== undefined,
         });
 
+        // The record above is written first, so a run without deltas or an end
+        // event still leaves its timing evidence before these assertions fail.
+        expect(end).toBeDefined();
         expect(toolSteps).toBeGreaterThanOrEqual(2);
         expect(deltas.length).toBeGreaterThanOrEqual(5);
-        expect(deltas.every(entry => entry.at < end.at)).toBe(true);
+        expect(deltas.every(entry => entry.at < end!.at)).toBe(true);
         expect(accepted).toBeDefined();
         expect(lastReportText(deltas)).toBe(accepted!.summary);
         if (answerText !== undefined) expect(lastReportText(deltas)).toBe(answerText);
