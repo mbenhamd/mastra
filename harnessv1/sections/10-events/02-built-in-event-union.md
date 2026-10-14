@@ -217,6 +217,23 @@ type SubagentEvent =
       depth: number;
     }
   | {
+      // The decoded `summary` characters of the child's streaming
+      // `report_subagent_outcome` input (its answer), in order. The deltas of
+      // `innerToolCallId` form a prefix of the final direct answer's text, and
+      // equal it when the report completes as a direct answer. Streaming stops
+      // early with no input deltas, a display transform or suppression of the
+      // report input, the direct-answer byte bound, or a second top-level
+      // `summary` key. `subagent_end` stays authoritative.
+      type: 'subagent_answer_delta';
+      toolCallId: string;
+      subagentSessionId: string;
+      agentType: string;
+      innerToolCallId: string;
+      delta: string;
+      parentId?: string;
+      depth: number;
+    }
+  | {
       type: 'subagent_tool_start';
       toolCallId: string;
       subagentSessionId: string;

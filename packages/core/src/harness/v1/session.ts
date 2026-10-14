@@ -1555,7 +1555,7 @@ export interface SessionInternals {
   eventReplaySeed?: { epoch: string; nextSequence: number };
   /**
    * §10.5: when false, transient streaming deltas (`text_delta`,
-   * `reasoning_delta`, `subagent_text_delta`, `subagent_reasoning_delta`) are NOT persisted to the durable session-event log
+   * `reasoning_delta`, `subagent_text_delta`, `subagent_reasoning_delta`, `subagent_answer_delta`) are NOT persisted to the durable session-event log
    * (live subscribers still receive them). Defaults to true.
    */
   persistTransientStreamingEvents?: boolean;
@@ -3079,6 +3079,7 @@ export class Session {
     this._currentTurnSourceWriteGuard = undefined;
     this._activeTools.clear();
     this._toolInputBuffers.clear();
+    this._subagentAnswerDecoders.clear();
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
     // spanning multiple parent turns still renders.
@@ -3115,6 +3116,7 @@ export class Session {
       this._currentTraceId = undefined;
       this._activeTools.clear();
       this._toolInputBuffers.clear();
+      this._subagentAnswerDecoders.clear();
     }
     this._notifyMaybeIdle();
   }
@@ -22367,6 +22369,18 @@ export class Session {
     const childDepth = child.subagentDepth;
     const innerToolNames = new Map<string, string>();
     child._subagentParentToolCallId = parentToolCallId;
+    // PF-5620: stream the child's answer (its report `summary`) like the spawn tool does.
+    child._subagentAnswerDeltaListener = (delta, reportToolCallId) => {
+      this._emitSubagentEvent({
+        type: 'subagent_answer_delta',
+        toolCallId: parentToolCallId,
+        subagentSessionId: child.id,
+        agentType,
+        innerToolCallId: reportToolCallId,
+        delta,
+        depth: childDepth,
+      });
+    };
     const unsubProgress = child.subscribe(event => {
       this._internalUpdateSubagentProgress(progressKey, event);
       switch (event.type) {
@@ -22523,6 +22537,7 @@ export class Session {
       outcome = 'failed';
       publicError = projectHarnessPublicError(error);
     } finally {
+      child._subagentAnswerDeltaListener = undefined;
       unsubProgress();
       this._activeSubagents.delete(`delegate:${child.id}`);
       child._subagentTracingContext = undefined;

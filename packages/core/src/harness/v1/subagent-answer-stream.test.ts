@@ -71,6 +71,12 @@ describe('SubagentReportSummaryDecoder', () => {
     expect(decode(['{"summary":42}'])).toEqual([]);
   });
 
+  it('stops at a second top-level summary key, whose value JSON.parse would keep instead', () => {
+    const report = '{"summary":"first","outcome":"completed","summary":"second"}';
+    expect((JSON.parse(report) as { summary: string }).summary).toBe('second');
+    expect(decode(['{"summary":"fir', 'st","outcome":"completed","summ', 'ary":"second"}']).join('')).toBe('first');
+  });
+
   it('stops for good once the summary exceeds the byte limit of a direct answer', () => {
     // 'é' is 2 UTF-8 bytes: 3 fit within 6 bytes, the 4th does not.
     const deltas = decode(['{"summary":"éé', 'é', 'é', 'éé"}'], 6);

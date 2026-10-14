@@ -763,10 +763,16 @@ export interface SubagentReasoningDeltaEvent extends HarnessEventBase {
  * A subagent answers through the `summary` of its framework-owned
  * `report_subagent_outcome` call, which the provider streams as tool input.
  * Each delta carries only decoded `summary` characters of that call, in order.
- * When the spawn ends with a direct answer, the deltas of the reporting call
- * (`innerToolCallId`) concatenate to exactly that answer's text. Interim
- * prose stays in `subagent_text_delta`. `subagent_end` is authoritative: a
- * report that fails verification streams deltas but yields no direct answer.
+ * The deltas of the reporting call (`innerToolCallId`) form a prefix of the
+ * final direct answer's text, and equal it when the report completes as a
+ * direct answer. Streaming stops early, leaving a strict prefix that may be
+ * empty, when the provider sends no input deltas, when a display policy
+ * transforms or suppresses a chunk of the report input, or past the
+ * direct-answer byte bound. It also stops at a second top-level `summary`
+ * key; `JSON.parse` keeps that later value, so the streamed first value is
+ * then not a prefix of it. Interim prose stays in `subagent_text_delta`.
+ * `subagent_end` is authoritative: a report that fails verification may
+ * stream deltas but yields no direct answer.
  */
 export interface SubagentAnswerDeltaEvent extends HarnessEventBase {
   type: 'subagent_answer_delta';

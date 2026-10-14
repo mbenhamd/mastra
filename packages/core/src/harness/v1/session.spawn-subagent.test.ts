@@ -1035,7 +1035,7 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
   const REPORT_CALL_ID = 'report-subagent-outcome-1';
 
   /** The child's streamed report input, split at awkward boundaries. */
-  function streamedReport(summary: string, chunkSize: number) {
+  function streamedReport(summary: string, chunkSize: number, metadata?: unknown) {
     const input = JSON.stringify({
       kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
       outcome: 'completed',
@@ -1046,6 +1046,7 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
     for (let i = 0; i < input.length; i += chunkSize) {
       deltas.push({
         type: 'tool-call-delta',
+        ...(metadata === undefined ? {} : { metadata }),
         payload: {
           toolCallId: REPORT_CALL_ID,
           toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
@@ -1107,6 +1108,29 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
       expect(events.some(event => event.type === 'subagent_text_delta')).toBe(true);
       const endIndex = events.findIndex(event => event.type === 'subagent_end');
       expect(events.findLastIndex(event => event.type === 'subagent_answer_delta')).toBeLessThan(endIndex);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it.each([
+    ['suppresses', { suppress: true }],
+    ['transforms', { transformed: '[redacted]' }],
+  ])('streams no answer when a display policy %s the report input', async (_label, displayState) => {
+    const summary = 'An answer whose report input the display policy owns.';
+    const metadata = { mastra: { toolPayloadTransform: { display: { 'input-delta': displayState } } } };
+    const { harness, childAgent } = setup({ chunks: streamedReport(summary, 6, metadata) });
+    childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-policy'));
+
+      expect(events.some(event => event.type === 'subagent_end')).toBe(true);
+      expect(events.filter(event => event.type === 'subagent_answer_delta')).toEqual([]);
     } finally {
       await harness.shutdown();
     }

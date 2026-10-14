@@ -987,7 +987,7 @@ export class Harness {
   private readonly _pendingInteractionExpirySessionsInFlight = new Map<string, Promise<void>>();
   private readonly _maxQueueDepth: number;
   private readonly _queueBackpressure: HarnessQueueBackpressurePolicy;
-  /** §10.5: when false, skip persisting transient streaming deltas (text_delta / reasoning_delta / subagent_text_delta / subagent_reasoning_delta). */
+  /** §10.5: when false, skip persisting transient streaming deltas (text_delta / reasoning_delta / subagent_text_delta / subagent_reasoning_delta / subagent_answer_delta). */
   private readonly _persistTransientStreamingEvents: boolean;
   /**
    * Optional per-queued-item pre-drain hook (`sessions.onBeforeQueuedTurn`).

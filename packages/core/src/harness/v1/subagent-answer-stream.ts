@@ -11,8 +11,9 @@
  * arrives, so no delta ends in half a code point.
  *
  * Only a key of the top-level object counts: keys of nested objects and string
- * values that merely contain the text "summary" are skipped. Only the first
- * top-level `summary` is streamed. Emission stops for good once the decoded
+ * values that merely contain the text "summary" are skipped. Emission stops
+ * for good at a second top-level `summary` key (`JSON.parse` keeps the last
+ * duplicate, which was not streamed), and once the decoded
  * summary would exceed `maxBytes` UTF-8 bytes (such a summary is never a
  * direct answer), or once the input stops being a JSON object.
  */
@@ -44,7 +45,8 @@ export class SubagentReportSummaryDecoder {
   #expectKey = false;
   /** At depth 1, whether the next value belongs to the `summary` key. */
   #summaryValueNext = false;
-  #summaryStreamed = false;
+  /** Whether a top-level `summary` key was already seen. */
+  #summaryKeySeen = false;
   /** What the current string is: a top-level key, the summary, or other. */
   #stringRole: 'key' | 'summary' | 'other' = 'other';
   #key = '';
@@ -152,11 +154,19 @@ export class SubagentReportSummaryDecoder {
     this.#stringRole = 'other';
     if (role === 'key') {
       this.#expectKey = false;
-      this.#summaryValueNext = this.#key === 'summary' && !this.#summaryStreamed;
+      if (this.#key === 'summary') {
+        // JSON.parse keeps the last duplicate, but the first one may already be
+        // streamed: stop rather than stream a value that will not be final.
+        if (this.#summaryKeySeen) {
+          this.#state = 'done';
+          return '';
+        }
+        this.#summaryKeySeen = true;
+        this.#summaryValueNext = true;
+      }
       return '';
     }
     if (role === 'summary') {
-      this.#summaryStreamed = true;
       // A lone high surrogate at the end decodes to itself, as in JSON.parse.
       const held = this.#heldHighSurrogate;
       this.#heldHighSurrogate = '';

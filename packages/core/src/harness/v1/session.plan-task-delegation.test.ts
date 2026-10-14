@@ -2991,3 +2991,66 @@ describe('cancelSubagent (§SA1)', () => {
     await harness.shutdown();
   });
 });
+
+describe('task delegation — streamed answer (PF-5620)', () => {
+  it('streams the delegated child report summary as answer deltas equal to its final text', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const summary = 'Delegated finding: "two" sources\nagree — étude 🧪.';
+    const input = JSON.stringify({
+      kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
+      outcome: 'completed',
+      summary,
+      evidence: [{ kind: 'analysis', description: 'Verified by the delegated test fixture' }],
+    });
+    const deltas = [];
+    for (let i = 0; i < input.length; i += 6) {
+      deltas.push({
+        type: 'tool-call-delta',
+        payload: {
+          toolCallId: 'report-call-1',
+          toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+          argsTextDelta: input.slice(i, i + 6),
+        },
+      });
+    }
+    childAgent.enqueueRun({
+      text: 'checking sources',
+      finishReason: 'tool-calls',
+      terminalToolResult: outcomeTerminalResult('completed', summary),
+      chunks: [
+        { type: 'text-delta', payload: { id: 'child-message', text: 'checking sources' } },
+        {
+          type: 'tool-call-input-streaming-start',
+          payload: { toolCallId: 'report-call-1', toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID },
+        },
+        ...deltas,
+      ],
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const events: any[] = [];
+    parent.subscribe(event => events.push(event));
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+    const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'audit paper' } as any, toolCtx)) as any;
+    const delegated = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+
+    await poll(async () => (await planRow(parent, task.taskId))?.status === 'completed');
+    const answerDeltas = events.filter(event => event.type === 'subagent_answer_delta');
+    const end = events.find(event => event.type === 'subagent_end');
+    expect(answerDeltas.length).toBeGreaterThan(3);
+    expect(answerDeltas.map(event => event.delta).join('')).toBe(end.output.text);
+    expect(end.output.text).toBe(summary);
+    expect(answerDeltas[0]).toMatchObject({
+      toolCallId: 'tc-deleg',
+      subagentSessionId: delegated.subagentSessionId,
+      agentType: 'worker',
+      innerToolCallId: 'report-call-1',
+      depth: 1,
+    });
+    close();
+    await harness.shutdown();
+  });
+});
