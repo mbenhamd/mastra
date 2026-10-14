@@ -6,7 +6,7 @@
  * Responses route), so fork CI stays offline. Example:
  *
  *   PF5620_LIVE=1 PF5620_LIVE_OUT=/tmp/pf5620.jsonl \
- *     <load the two AZURE_LUNA_* names> npx vitest run --project e2e:packages/core \
+ *     <load the two AZURE_LUNA_* names> npx vitest run \
  *     src/harness/v1/session.subagent-answer-stream.live.test.ts
  *
  * A real Harness runs a real child Agent that calls research tools over
@@ -62,10 +62,12 @@ vi.mock('./subagent-outcome-tool', async importOriginal => {
   };
 });
 
-const LIVE =
-  process.env.PF5620_LIVE === '1' &&
-  Boolean(process.env.AZURE_LUNA_RESOURCE_NAME) &&
-  Boolean(process.env.AZURE_LUNA_API_KEY);
+/** The live scenarios call a paid provider, so they run only on an explicit opt-in. */
+function liveEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.PF5620_LIVE === '1' && Boolean(env.AZURE_LUNA_RESOURCE_NAME) && Boolean(env.AZURE_LUNA_API_KEY);
+}
+
+const LIVE = liveEnabled(process.env);
 const MODEL_ID = 'azure-openai-luna/gpt-6-luna';
 const LIVE_TIMEOUT_MS = 600_000;
 
@@ -283,6 +285,18 @@ function record(scenario: string, data: Record<string, unknown>) {
   const out = process.env.PF5620_LIVE_OUT;
   if (out) appendFileSync(out, `${JSON.stringify({ scenario, at: new Date().toISOString(), ...data })}\n`);
 }
+
+describe('PF-5620 live suite opt-in', () => {
+  it('stays off unless PF5620_LIVE=1 and both Luna credentials are set', () => {
+    const credentials = { AZURE_LUNA_RESOURCE_NAME: 'resource', AZURE_LUNA_API_KEY: 'key' };
+    expect(liveEnabled({})).toBe(false);
+    expect(liveEnabled(credentials)).toBe(false);
+    expect(liveEnabled({ ...credentials, PF5620_LIVE: 'true' })).toBe(false);
+    expect(liveEnabled({ PF5620_LIVE: '1', AZURE_LUNA_RESOURCE_NAME: 'resource' })).toBe(false);
+    expect(liveEnabled({ PF5620_LIVE: '1', AZURE_LUNA_API_KEY: 'key' })).toBe(false);
+    expect(liveEnabled({ ...credentials, PF5620_LIVE: '1' })).toBe(true);
+  });
+});
 
 describe.skipIf(!LIVE)('PF-5620 live streamed subagent answers (Azure gpt-6-luna)', () => {
   it(
