@@ -141,6 +141,7 @@ import {
   getTransformedToolPayload,
   hasTransformedToolPayload,
   normalizeToolPayloadTransformPolicy,
+  toolPayloadTransformPolicyPassesThrough,
 } from '../../tools/payload-transform';
 import type { ToolPayloadTransformPolicy } from '../../tools/types';
 import type { Workspace } from '../../workspace';
@@ -8658,8 +8659,9 @@ export class Session {
    * streaming `report_subagent_outcome` input to its spawning bridge. Only the
    * raw provider input is decoded, and only when no display policy applies to
    * the tool's input in any phase: a call whose chunk shows a display
-   * transform or suppression, or whose run has a display payload policy at all
-   * (agent or Mastra level), never streams.
+   * transform or suppression, or whose run has a display payload policy that
+   * doesn't declare the report tool in `passThroughToolNames` (agent or Mastra
+   * level), never streams.
    */
   private _streamSubagentAnswer(
     toolCallId: string,
@@ -8694,8 +8696,12 @@ export class Session {
    * per-call policy), then the agent's own policy, then Mastra's. The built-in
    * report tool carries no tool-level transform. The defaults are resolved
    * with the turn's own request context, as the run resolves them, and
-   * normalized the way the agent normalizes them. Unknown means yes: no turn
-   * context, asynchronous defaults and an unreadable default fail closed.
+   * normalized the way the agent normalizes them. A resolved policy that lists
+   * the report tool in `passThroughToolNames` never transforms its payloads
+   * (the transform layer enforces it), so it doesn't apply. Unknown means yes:
+   * no turn context, asynchronous defaults and an unreadable default fail
+   * closed, and a legacy projection can't declare pass-through. A tool-level
+   * transform would still surface on the chunk, which the caller checks.
    */
   private _subagentAnswerDisplayPolicyMayApply(): boolean {
     const agent = this._threadSubscriptionAgent;
@@ -8725,7 +8731,11 @@ export class Session {
       defaultPolicy ??
       agent.getToolPayloadTransform() ??
       normalizeToolPayloadTransformPolicy(agent.getMastraInstance()?.getToolPayloadTransform?.());
-    return Boolean(policy?.transformToolPayload && (!policy.targets || policy.targets.includes('display')));
+    return Boolean(
+      policy?.transformToolPayload &&
+      (!policy.targets || policy.targets.includes('display')) &&
+      !toolPayloadTransformPolicyPassesThrough(policy, HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID),
+    );
   }
 
   /**

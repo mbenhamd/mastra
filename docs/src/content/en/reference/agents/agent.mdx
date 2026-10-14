@@ -1009,7 +1009,7 @@ SystemMessage types: string | string[] | CoreSystemMessage | CoreSystemMessage[]
     type: 'ToolPayloadTransformPolicy',
     isOptional: true,
     description:
-      'Shared policy for transforming tool payloads before display streams or user-visible transcript messages receive them. Use per-tool `transform` on `createTool()` for tool-local rules.',
+      'Shared policy for transforming tool payloads before display streams or user-visible transcript messages receive them. List tools in `passThroughToolNames` to exempt them: the policy never calls `transformToolPayload` for those tools, so their payloads pass through unchanged. Use per-tool `transform` on `createTool()` for tool-local rules.',
   },
   {
     name: 'workflows',

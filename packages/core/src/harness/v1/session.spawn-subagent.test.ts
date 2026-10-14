@@ -17,7 +17,9 @@
 import { describe, expect, it } from 'vitest';
 
 import { Agent } from '../../agent';
+import { Mastra } from '../../mastra';
 import { RequestContext } from '../../request-context';
+import { InMemoryStore } from '../../storage';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { buildFakeOutput } from './__test-utils__/fake-output';
@@ -116,13 +118,25 @@ function setup(opts?: {
   allowInline?: boolean;
   inheritRequestContextAppKeys?: string[];
   childAgentConfig?: Record<string, unknown>;
+  /** A Mastra-level tool payload transform policy; the agents then live on a caller-built Mastra. */
+  mastraTransform?: Record<string, unknown>;
 }) {
   const parentAgent = new FakeAgent('parent-agent');
   const childAgent = new FakeAgent('child-agent', opts?.childAgentConfig);
   if (opts?.chunks) childAgent.chunks = opts.chunks;
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
+  const agents = { 'parent-agent': parentAgent, 'child-agent': childAgent } as any;
   const harness = new Harness({
-    agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+    ...(opts?.mastraTransform === undefined
+      ? { agents }
+      : {
+          mastra: new Mastra({
+            agents,
+            storage: new InMemoryStore(),
+            logger: false,
+            transform: opts.mastraTransform as any,
+          }),
+        }),
     modes: [
       { id: 'default', agentId: 'parent-agent' },
       { id: 'explore-mode', agentId: 'child-agent' },
@@ -1231,6 +1245,89 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
     } finally {
       await harness.shutdown();
     }
+  });
+
+  /** A display policy that redacts every complete tool input it's asked to transform. */
+  function redactingDisplayPolicy(passThroughToolNames?: readonly string[]) {
+    return {
+      targets: ['display'],
+      transformToolPayload: ({ phase }: { phase: string }) =>
+        phase === 'input-available' ? { redacted: true } : undefined,
+      ...(passThroughToolNames === undefined ? {} : { passThroughToolNames }),
+    };
+  }
+
+  async function answerDeltasFor(
+    childAgentConfig: Record<string, unknown>,
+    summary: string,
+    mastraTransform?: Record<string, unknown>,
+  ) {
+    const { harness, childAgent } = setup({ chunks: streamedReport(summary, 6), childAgentConfig, mastraTransform });
+    childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-pass-through'));
+
+      expect(events.some(event => event.type === 'subagent_end')).toBe(true);
+      return (events.filter(event => event.type === 'subagent_answer_delta') as any[]).map(event => event.delta);
+    } finally {
+      await harness.shutdown();
+    }
+  }
+
+  it.each([
+    ['the agent policy', { transform: redactingDisplayPolicy([HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID]) }],
+    [
+      'the default options policy',
+      { defaultOptions: { transform: redactingDisplayPolicy([HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID]) } },
+    ],
+  ])('streams the answer when %s passes the report tool through', async (_label, childAgentConfig) => {
+    const summary = 'An answer the display policy declares it never transforms.';
+
+    const deltas = await answerDeltasFor(childAgentConfig, summary);
+
+    expect(deltas.join('')).toBe(summary);
+  });
+
+  it.each([
+    ['declares no pass-through', redactingDisplayPolicy()],
+    ['passes only another tool through', redactingDisplayPolicy(['run_python'])],
+    [
+      'names the report tool in a string, not a list',
+      { ...redactingDisplayPolicy(), passThroughToolNames: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID },
+    ],
+  ])('streams no answer when the display policy %s', async (_label, transform) => {
+    const deltas = await answerDeltasFor({ transform }, 'An answer the display policy may redact.');
+
+    expect(deltas).toEqual([]);
+  });
+
+  it.each([
+    ['streams the answer', [HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID], true],
+    ['streams nothing', undefined, false],
+  ] as const)(
+    '%s when only the Mastra-level display policy governs the report tool',
+    async (_label, passThroughToolNames, streams) => {
+      const summary = 'An answer only the Mastra-level display policy governs.';
+      const deltas = await answerDeltasFor({}, summary, redactingDisplayPolicy(passThroughToolNames));
+
+      expect(deltas.join('')).toBe(streams ? summary : '');
+    },
+  );
+
+  it('streams no answer when asynchronous default options declare report-tool pass-through', async () => {
+    const deltas = await answerDeltasFor(
+      {
+        defaultOptions: async () => ({ transform: redactingDisplayPolicy([HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID]) }),
+      },
+      'An answer whose asynchronous defaults are unknown when the input streams.',
+    );
+
+    expect(deltas).toEqual([]);
   });
 
   it('stops streaming the answer once the spawn is aborted', async () => {

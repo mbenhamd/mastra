@@ -247,6 +247,13 @@ export type ToolPayloadTransformPolicy = {
   transformToolPayload?: ToolPayloadTransformFunction;
   targets?: ToolPayloadTransformTarget[];
   /**
+   * Tools whose payloads this policy never transforms. For a tool named here,
+   * `transformToolPayload` is not called at all, in any phase or for any
+   * target, and the payload passes through unchanged (a tool-level
+   * `transform` on that tool still applies). Matching is by exact tool name.
+   */
+  passThroughToolNames?: readonly string[];
+  /**
    * Explicitly permits direct terminal-tool delivery when this policy is
    * display-only. Transcript transforms and policies without this opt-in keep
    * the ordinary model continuation path.
