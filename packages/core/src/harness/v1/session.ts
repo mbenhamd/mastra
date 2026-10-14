@@ -142,6 +142,7 @@ import {
   hasTransformedToolPayload,
   normalizeToolPayloadTransformPolicy,
 } from '../../tools/payload-transform';
+import type { ToolPayloadTransformPolicy } from '../../tools/types';
 import type { Workspace } from '../../workspace';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
@@ -8688,14 +8689,32 @@ export class Session {
 
   /**
    * Whether a display payload policy may govern the report tool's input for
-   * this child's runs, in the merge order the agent applies (agent, then
-   * Mastra; the Harness passes no per-call policy). The built-in report tool
-   * carries no tool-level transform. Unknown means yes.
+   * this child's runs, in the merge order the agent applies: the run options'
+   * `transform` (the agent's `defaultOptions`, as the Harness passes no
+   * per-call policy), then the agent's own policy, then Mastra's. The built-in
+   * report tool carries no tool-level transform. Unknown means yes: dynamic
+   * default options (resolved per request) and an unreadable default fail
+   * closed.
    */
   private _subagentAnswerDisplayPolicyMayApply(): boolean {
     const agent = this._threadSubscriptionAgent;
     if (agent === undefined) return true;
+    let defaults: unknown;
+    try {
+      defaults = agent.getDefaultOptions();
+    } catch {
+      return true;
+    }
+    if (defaults instanceof Promise) {
+      defaults.catch(() => undefined);
+      return true;
+    }
+    const defaultPolicy =
+      defaults !== null && typeof defaults === 'object'
+        ? (defaults as { transform?: ToolPayloadTransformPolicy }).transform
+        : undefined;
     const policy =
+      defaultPolicy ??
       agent.getToolPayloadTransform() ??
       normalizeToolPayloadTransformPolicy(agent.getMastraInstance()?.getToolPayloadTransform?.());
     return Boolean(policy?.transformToolPayload && (!policy.targets || policy.targets.includes('display')));

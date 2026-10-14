@@ -1165,6 +1165,49 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
     }
   });
 
+  it.each([
+    [
+      'static default options',
+      {
+        transform: {
+          targets: ['display'],
+          transformToolPayload: ({ phase }: { phase: string }) =>
+            phase === 'input-available' ? { redacted: true } : undefined,
+        },
+      },
+    ],
+    [
+      'dynamic default options',
+      async () => ({
+        transform: {
+          targets: ['display'],
+          transformToolPayload: ({ phase }: { phase: string }) =>
+            phase === 'input-available' ? { redacted: true } : undefined,
+        },
+      }),
+    ],
+  ])('streams no answer when the child agent sets a display policy through %s', async (_label, defaultOptions) => {
+    const summary = 'An answer whose complete input the default display policy redacts.';
+    const { harness, childAgent } = setup({
+      chunks: streamedReport(summary, 6),
+      childAgentConfig: { defaultOptions },
+    });
+    childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-default-policy'));
+
+      expect(events.some(event => event.type === 'subagent_end')).toBe(true);
+      expect(events.filter(event => event.type === 'subagent_answer_delta')).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('stops streaming the answer once the spawn is aborted', async () => {
     const summary = 'A long answer that must not keep streaming after the user stopped the turn.';
     const { harness, childAgent } = setup({ chunks: streamedReport(summary, 5) });
