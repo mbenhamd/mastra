@@ -137,7 +137,11 @@ import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
-import { getTransformedToolPayload, hasTransformedToolPayload } from '../../tools/payload-transform';
+import {
+  getTransformedToolPayload,
+  hasTransformedToolPayload,
+  normalizeToolPayloadTransformPolicy,
+} from '../../tools/payload-transform';
 import type { Workspace } from '../../workspace';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
@@ -8651,8 +8655,10 @@ export class Session {
   /**
    * PF-5620: forward the decoded `summary` characters of this child's
    * streaming `report_subagent_outcome` input to its spawning bridge. Only the
-   * raw provider input is decoded, and only while no display policy transforms
-   * or suppresses that input; otherwise streaming stops for the call.
+   * raw provider input is decoded, and only when no display policy applies to
+   * the tool's input in any phase: a call whose chunk shows a display
+   * transform or suppression, or whose run has a display payload policy at all
+   * (agent or Mastra level), never streams.
    */
   private _streamSubagentAnswer(
     toolCallId: string,
@@ -8669,11 +8675,30 @@ export class Session {
       return;
     }
     if (decoder === undefined) {
+      if (this._subagentAnswerDisplayPolicyMayApply()) {
+        this._subagentAnswerDecoders.set(toolCallId, null);
+        return;
+      }
       decoder = new SubagentReportSummaryDecoder(MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES);
       this._subagentAnswerDecoders.set(toolCallId, decoder);
     }
     const delta = decoder.push(argsTextDelta);
     if (delta.length > 0) listener(delta, toolCallId);
+  }
+
+  /**
+   * Whether a display payload policy may govern the report tool's input for
+   * this child's runs, in the merge order the agent applies (agent, then
+   * Mastra; the Harness passes no per-call policy). The built-in report tool
+   * carries no tool-level transform. Unknown means yes.
+   */
+  private _subagentAnswerDisplayPolicyMayApply(): boolean {
+    const agent = this._threadSubscriptionAgent;
+    if (agent === undefined) return true;
+    const policy =
+      agent.getToolPayloadTransform() ??
+      normalizeToolPayloadTransformPolicy(agent.getMastraInstance()?.getToolPayloadTransform?.());
+    return Boolean(policy?.transformToolPayload && (!policy.targets || policy.targets.includes('display')));
   }
 
   /**

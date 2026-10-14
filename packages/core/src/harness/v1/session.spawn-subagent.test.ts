@@ -83,8 +83,8 @@ class FakeAgent extends Agent<any, any, any> {
     terminalToolResult: outcomeTerminalResult(),
   };
 
-  constructor(name: string) {
-    super({ id: name, name, instructions: 'fake', model: 'openai/gpt-4o-mini' as any });
+  constructor(name: string, config: Record<string, unknown> = {}) {
+    super({ id: name, name, instructions: 'fake', model: 'openai/gpt-4o-mini' as any, ...config });
   }
 
   async stream(_messages: any, options?: any): Promise<any> {
@@ -115,9 +115,10 @@ function setup(opts?: {
   chunks?: any[];
   allowInline?: boolean;
   inheritRequestContextAppKeys?: string[];
+  childAgentConfig?: Record<string, unknown>;
 }) {
   const parentAgent = new FakeAgent('parent-agent');
-  const childAgent = new FakeAgent('child-agent');
+  const childAgent = new FakeAgent('child-agent', opts?.childAgentConfig);
   if (opts?.chunks) childAgent.chunks = opts.chunks;
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
   const harness = new Harness({
@@ -1128,6 +1129,34 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
       const tool = createSpawnSubagentTool(parent)!;
 
       await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-policy'));
+
+      expect(events.some(event => event.type === 'subagent_end')).toBe(true);
+      expect(events.filter(event => event.type === 'subagent_answer_delta')).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('streams no answer when the child agent has a display policy for the input only once it is available', async () => {
+    const summary = 'An answer whose complete input the display policy redacts.';
+    const { harness, childAgent } = setup({
+      chunks: streamedReport(summary, 6),
+      childAgentConfig: {
+        transform: {
+          targets: ['display'],
+          transformToolPayload: ({ phase }: { phase: string }) =>
+            phase === 'input-available' ? { redacted: true } : undefined,
+        },
+      },
+    });
+    childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-input-policy'));
 
       expect(events.some(event => event.type === 'subagent_end')).toBe(true);
       expect(events.filter(event => event.type === 'subagent_answer_delta')).toEqual([]);
