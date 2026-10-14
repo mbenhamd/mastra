@@ -1086,7 +1086,7 @@ The harness emits events through registered listeners. The following table lists
 | `om_thread_title_updated` | Observational Memory updated the thread title. |
 | `subagent_start` | A subagent started processing. |
 | `subagent_text_delta` | A subagent emitted a text delta. |
-| `subagent_answer_delta` | A subagent streamed part of its answer: the decoded `summary` of its `report_subagent_outcome` call, in order. The deltas of one `innerToolCallId` form a prefix of the final direct answer, and equal it when the report completes as one. If the input holds a second top-level `summary` key, streaming stops and the streamed text isn't a prefix of the final value. |
+| `subagent_answer_delta` | A subagent streamed part of its answer: the decoded `summary` of its `report_subagent_outcome` call, in order. The deltas of one `innerToolCallId` form a prefix of the final direct answer. They equal it only when streaming runs to completion: it stops early at the byte bound or when a display policy applies to the report's input. If the input holds a second top-level `summary` key, streaming stops and the streamed text isn't a prefix of the final value. `subagent_end` stays authoritative. |
 | `subagent_tool_start` | A subagent started a tool call. |
 | `subagent_tool_end` | A subagent finished a tool call. |
 | `subagent_end` | A subagent finished processing. |
