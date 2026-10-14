@@ -758,6 +758,34 @@ export interface SubagentReasoningDeltaEvent extends HarnessEventBase {
   depth: number;
 }
 
+/**
+ * A streamed slice of a subagent's answer, attributed to the parent (PF-5620).
+ * A subagent answers through the `summary` of its framework-owned
+ * `report_subagent_outcome` call, which the provider streams as tool input.
+ * Each delta carries only decoded `summary` characters of that call, in order.
+ * The deltas of the reporting call (`innerToolCallId`) form a prefix of the
+ * final direct answer's text, and equal it when the report completes as a
+ * direct answer. Streaming stops early, leaving a strict prefix that may be
+ * empty, when the provider sends no input deltas, when a display policy
+ * transforms or suppresses a chunk of the report input, or past the
+ * direct-answer byte bound. It also stops at a second top-level `summary`
+ * key; `JSON.parse` keeps that later value, so the streamed first value is
+ * then not a prefix of it. Interim prose stays in `subagent_text_delta`.
+ * `subagent_end` is authoritative: a report that fails verification may
+ * stream deltas but yields no direct answer.
+ */
+export interface SubagentAnswerDeltaEvent extends HarnessEventBase {
+  type: 'subagent_answer_delta';
+  toolCallId: string;
+  subagentSessionId: string;
+  agentType: string;
+  /** The child's `report_subagent_outcome` call these characters belong to. */
+  innerToolCallId: string;
+  delta: string;
+  parentId?: string;
+  depth: number;
+}
+
 export interface SubagentToolStartEvent extends HarnessEventBase {
   type: 'subagent_tool_start';
   toolCallId: string;
@@ -905,6 +933,7 @@ export type HarnessEvent =
   | SubagentStartEvent
   | SubagentTextDeltaEvent
   | SubagentReasoningDeltaEvent
+  | SubagentAnswerDeltaEvent
   | SubagentToolStartEvent
   | SubagentToolEndEvent
   | SubagentEndEvent

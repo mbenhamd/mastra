@@ -137,7 +137,12 @@ import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
-import { getTransformedToolPayload, hasTransformedToolPayload } from '../../tools/payload-transform';
+import {
+  getTransformedToolPayload,
+  hasTransformedToolPayload,
+  normalizeToolPayloadTransformPolicy,
+} from '../../tools/payload-transform';
+import type { ToolPayloadTransformPolicy } from '../../tools/types';
 import type { Workspace } from '../../workspace';
 
 // §5.1 stable-hash canonicalization (centralized in ./canonical-json). Admission hashing here
@@ -210,6 +215,7 @@ import type {
   RunToolRollup,
   SubagentEndEvent,
   SubagentReasoningDeltaEvent,
+  SubagentAnswerDeltaEvent,
   SubagentStartEvent,
   SubagentTextDeltaEvent,
   SubagentToolEndEvent,
@@ -253,6 +259,7 @@ import {
   validateCallerRequestContext,
 } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
+import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
@@ -263,6 +270,7 @@ import type {
 } from './terminal-subagent-result';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+  MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES,
   materializeHarnessTerminalText,
   parseHarnessSubagentOutcomeReport,
   parseHarnessSubagentTerminalResult,
@@ -1552,7 +1560,7 @@ export interface SessionInternals {
   eventReplaySeed?: { epoch: string; nextSequence: number };
   /**
    * §10.5: when false, transient streaming deltas (`text_delta`,
-   * `reasoning_delta`, `subagent_text_delta`, `subagent_reasoning_delta`) are NOT persisted to the durable session-event log
+   * `reasoning_delta`, `subagent_text_delta`, `subagent_reasoning_delta`, `subagent_answer_delta`) are NOT persisted to the durable session-event log
    * (live subscribers still receive them). Defaults to true.
    */
   persistTransientStreamingEvents?: boolean;
@@ -2356,6 +2364,7 @@ export class Session {
       !this._persistTransientStreamingEvents &&
       (event.type === 'text_delta' ||
         event.type === 'subagent_text_delta' ||
+        event.type === 'subagent_answer_delta' ||
         event.type === 'reasoning_delta' ||
         event.type === 'subagent_reasoning_delta')
     ) {
@@ -2859,6 +2868,7 @@ export class Session {
       | Omit<SubagentStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentTextDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentReasoningDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
+      | Omit<SubagentAnswerDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>,
@@ -3074,6 +3084,7 @@ export class Session {
     this._currentTurnSourceWriteGuard = undefined;
     this._activeTools.clear();
     this._toolInputBuffers.clear();
+    this._subagentAnswerDecoders.clear();
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
     // spanning multiple parent turns still renders.
@@ -3110,6 +3121,7 @@ export class Session {
       this._currentTraceId = undefined;
       this._activeTools.clear();
       this._toolInputBuffers.clear();
+      this._subagentAnswerDecoders.clear();
     }
     this._notifyMaybeIdle();
   }
@@ -6878,6 +6890,15 @@ export class Session {
   _subagentParentToolCallId?: string;
 
   /**
+   * @internal — PF-5620: set by the spawning bridge on a subagent child.
+   * Receives the decoded `summary` characters of the child's streaming
+   * `report_subagent_outcome` input, per report call.
+   */
+  _subagentAnswerDeltaListener?: (delta: string, reportToolCallId: string) => void;
+  /** Per report call: its summary decoder, or `null` once streaming stopped. */
+  private readonly _subagentAnswerDecoders = new Map<string, SubagentReportSummaryDecoder | null>();
+
+  /**
    * @internal — tracing context a spawned/delegated child's runs attach to, so
    * subagent spans join the parent trace and inherit its span metadata
    * (`subagent-tracing.ts`). Set by the spawning parent before the child's turn
@@ -8633,6 +8654,81 @@ export class Session {
   }
 
   /**
+   * PF-5620: forward the decoded `summary` characters of this child's
+   * streaming `report_subagent_outcome` input to its spawning bridge. Only the
+   * raw provider input is decoded, and only when no display policy applies to
+   * the tool's input in any phase: a call whose chunk shows a display
+   * transform or suppression, or whose run has a display payload policy at all
+   * (agent or Mastra level), never streams.
+   */
+  private _streamSubagentAnswer(
+    toolCallId: string,
+    toolName: string,
+    argsTextDelta: unknown,
+    displayedDelta: unknown,
+  ): void {
+    const listener = this._subagentAnswerDeltaListener;
+    if (listener === undefined || toolName !== HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID) return;
+    let decoder = this._subagentAnswerDecoders.get(toolCallId);
+    if (decoder === null) return;
+    if (typeof argsTextDelta !== 'string' || displayedDelta !== argsTextDelta) {
+      this._subagentAnswerDecoders.set(toolCallId, null);
+      return;
+    }
+    if (decoder === undefined) {
+      if (this._subagentAnswerDisplayPolicyMayApply()) {
+        this._subagentAnswerDecoders.set(toolCallId, null);
+        return;
+      }
+      decoder = new SubagentReportSummaryDecoder(MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES);
+      this._subagentAnswerDecoders.set(toolCallId, decoder);
+    }
+    const delta = decoder.push(argsTextDelta);
+    if (delta.length > 0) listener(delta, toolCallId);
+  }
+
+  /**
+   * Whether a display payload policy may govern the report tool's input for
+   * this child's runs, in the merge order the agent applies: the run options'
+   * `transform` (the agent's `defaultOptions`, as the Harness passes no
+   * per-call policy), then the agent's own policy, then Mastra's. The built-in
+   * report tool carries no tool-level transform. The defaults are resolved
+   * with the turn's own request context, as the run resolves them, and
+   * normalized the way the agent normalizes them. Unknown means yes: no turn
+   * context, asynchronous defaults and an unreadable default fail closed.
+   */
+  private _subagentAnswerDisplayPolicyMayApply(): boolean {
+    const agent = this._threadSubscriptionAgent;
+    const requestContext = this._currentAgentRequestContext;
+    if (agent === undefined || requestContext === undefined) return true;
+    let defaults: unknown;
+    try {
+      defaults = agent.getDefaultOptions({ requestContext });
+    } catch {
+      return true;
+    }
+    if (defaults instanceof Promise) {
+      defaults.catch(() => undefined);
+      return true;
+    }
+    const defaultOptions =
+      defaults !== null && typeof defaults === 'object'
+        ? (defaults as {
+            transform?: ToolPayloadTransformPolicy;
+            toolPayloadProjection?: Parameters<typeof normalizeToolPayloadTransformPolicy>[0];
+          })
+        : undefined;
+    const defaultPolicy = normalizeToolPayloadTransformPolicy(
+      defaultOptions?.transform ?? defaultOptions?.toolPayloadProjection,
+    );
+    const policy =
+      defaultPolicy ??
+      agent.getToolPayloadTransform() ??
+      normalizeToolPayloadTransformPolicy(agent.getMastraInstance()?.getToolPayloadTransform?.());
+    return Boolean(policy?.transformToolPayload && (!policy.targets || policy.targets.includes('display')));
+  }
+
+  /**
    * Translate a single fullStream chunk into the matching harness event(s).
    * Extracted from `_drainStreamToEvents` so the long-lived subscription
    * drain is the single consumer of chunks.
@@ -8760,6 +8856,7 @@ export class Session {
         const prev = this._toolInputBuffers.get(payload.toolCallId);
         const toolName = prev?.toolName ?? payload.toolName ?? '';
         const displayedDelta = harnessDisplayToolPayload(chunk.metadata, 'input-delta', payload.argsTextDelta);
+        this._streamSubagentAnswer(payload.toolCallId, toolName, payload.argsTextDelta, displayedDelta);
         this._toolInputBuffers.set(payload.toolCallId, {
           toolName,
           text: (prev?.text ?? '') + (typeof displayedDelta === 'string' ? displayedDelta : ''),
@@ -8769,6 +8866,7 @@ export class Session {
       case 'tool-call-input-streaming-end': {
         const payload = chunk.payload as { toolCallId: string };
         this._toolInputBuffers.delete(payload.toolCallId);
+        this._subagentAnswerDecoders.delete(payload.toolCallId);
         return;
       }
       case 'tool-call': {
@@ -8780,6 +8878,7 @@ export class Session {
           startedAt: Date.now(),
         });
         this._toolInputBuffers.delete(payload.toolCallId);
+        this._subagentAnswerDecoders.delete(payload.toolCallId);
         if (runId !== undefined) {
           // §10.2: project `input` to its JSON-safe replay shape AT EMIT so the
           // live subscriber and the durable/replayed row carry the identical
@@ -22322,6 +22421,18 @@ export class Session {
     const childDepth = child.subagentDepth;
     const innerToolNames = new Map<string, string>();
     child._subagentParentToolCallId = parentToolCallId;
+    // PF-5620: stream the child's answer (its report `summary`) like the spawn tool does.
+    child._subagentAnswerDeltaListener = (delta, reportToolCallId) => {
+      this._emitSubagentEvent({
+        type: 'subagent_answer_delta',
+        toolCallId: parentToolCallId,
+        subagentSessionId: child.id,
+        agentType,
+        innerToolCallId: reportToolCallId,
+        delta,
+        depth: childDepth,
+      });
+    };
     const unsubProgress = child.subscribe(event => {
       this._internalUpdateSubagentProgress(progressKey, event);
       switch (event.type) {
@@ -22478,6 +22589,7 @@ export class Session {
       outcome = 'failed';
       publicError = projectHarnessPublicError(error);
     } finally {
+      child._subagentAnswerDeltaListener = undefined;
       unsubProgress();
       this._activeSubagents.delete(`delegate:${child.id}`);
       child._subagentTracingContext = undefined;
