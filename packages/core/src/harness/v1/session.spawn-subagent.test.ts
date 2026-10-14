@@ -1137,6 +1137,36 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
     }
   });
 
+  it('streams the answer when the child agent display policy declares the report tool pass-through', async () => {
+    const summary = 'An answer the display policy leaves untouched, streamed as it is written.';
+    const { harness, childAgent } = setup({
+      chunks: streamedReport(summary, 6),
+      childAgentConfig: {
+        transform: {
+          targets: ['display'],
+          passThroughToolNames: ['report_subagent_outcome'],
+          transformToolPayload: ({ phase }: { phase: string }) =>
+            phase === 'input-available' ? { redacted: true } : undefined,
+        },
+      },
+    });
+    childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-pass-through'));
+
+      const deltas = events.filter(event => event.type === 'subagent_answer_delta');
+      expect(deltas.length).toBeGreaterThan(1);
+      expect(deltas.map(event => (event as { delta: string }).delta).join('')).toBe(summary);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('streams no answer when the child agent has a display policy for the input only once it is available', async () => {
     const summary = 'An answer whose complete input the display policy redacts.';
     const { harness, childAgent } = setup({

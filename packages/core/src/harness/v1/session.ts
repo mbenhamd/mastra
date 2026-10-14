@@ -140,6 +140,7 @@ import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
 import {
   getTransformedToolPayload,
   hasTransformedToolPayload,
+  isPolicyAppliedToTool,
   normalizeToolPayloadTransformPolicy,
 } from '../../tools/payload-transform';
 import type { ToolPayloadTransformPolicy } from '../../tools/types';
@@ -8695,7 +8696,8 @@ export class Session {
    * report tool carries no tool-level transform. The defaults are resolved
    * with the turn's own request context, as the run resolves them, and
    * normalized the way the agent normalizes them. Unknown means yes: no turn
-   * context, asynchronous defaults and an unreadable default fail closed.
+   * context, asynchronous defaults and an unreadable default fail closed. A
+   * policy whose `passThroughToolNames` lists the report tool does not apply.
    */
   private _subagentAnswerDisplayPolicyMayApply(): boolean {
     const agent = this._threadSubscriptionAgent;
@@ -8725,7 +8727,10 @@ export class Session {
       defaultPolicy ??
       agent.getToolPayloadTransform() ??
       normalizeToolPayloadTransformPolicy(agent.getMastraInstance()?.getToolPayloadTransform?.());
-    return Boolean(policy?.transformToolPayload && (!policy.targets || policy.targets.includes('display')));
+    // A policy that declares the report tool pass-through never transforms
+    // its payloads (`isPolicyAppliedToTool` is the same rule the transform
+    // itself applies), so its summary may stream.
+    return isPolicyAppliedToTool(policy, 'display', HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID);
   }
 
   /**

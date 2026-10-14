@@ -252,6 +252,14 @@ export type ToolPayloadTransformPolicy = {
    * the ordinary model continuation path.
    */
   terminalToolResultPolicy?: 'pass-through';
+  /**
+   * Tools whose payloads this policy never transforms: their phases bypass
+   * `transformToolPayload` for every target, so the declaration is enforced,
+   * not just trusted. A Harness child may stream its `report_subagent_outcome`
+   * summary as `subagent_answer_delta` only when the report tool is listed
+   * here (or no input display policy applies at all).
+   */
+  passThroughToolNames?: readonly string[];
 };
 
 /**

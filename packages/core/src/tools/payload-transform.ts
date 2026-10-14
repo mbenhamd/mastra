@@ -86,8 +86,21 @@ function isPolicyConfiguredForTarget(
   return Boolean(policy?.transformToolPayload && (!policy.targets || policy.targets.includes(target)));
 }
 
-function isTransformConfigured(source: ToolPayloadTransformSource | undefined, target: ToolPayloadTransformTarget) {
-  return Boolean(isPolicyConfiguredForTarget(source?.policy, target) || source?.toolTransform?.[target]);
+/** Whether the policy transforms this tool's payloads for the target (`passThroughToolNames` exempts a tool). */
+export function isPolicyAppliedToTool(
+  policy: ToolPayloadTransformPolicy | undefined,
+  target: ToolPayloadTransformTarget,
+  toolName: string,
+) {
+  return isPolicyConfiguredForTarget(policy, target) && !policy?.passThroughToolNames?.includes(toolName);
+}
+
+function isTransformConfigured(
+  source: ToolPayloadTransformSource | undefined,
+  target: ToolPayloadTransformTarget,
+  toolName: string,
+) {
+  return Boolean(isPolicyAppliedToTool(source?.policy, target, toolName) || source?.toolTransform?.[target]);
 }
 
 function getToolTransformer(
@@ -109,13 +122,15 @@ async function transformOneTarget(
   source: ToolPayloadTransformSource | undefined,
   logger?: IMastraLogger,
 ): Promise<TransformedToolPayloadState | undefined> {
-  const configured = isTransformConfigured(source, context.target);
+  const configured = isTransformConfigured(source, context.target, context.toolName);
   if (!configured) {
     return undefined;
   }
 
   const transformers = [
-    isPolicyConfiguredForTarget(source?.policy, context.target) ? source?.policy?.transformToolPayload : undefined,
+    isPolicyAppliedToTool(source?.policy, context.target, context.toolName)
+      ? source?.policy?.transformToolPayload
+      : undefined,
     getToolTransformer(source, context.target, context.phase),
   ].filter(Boolean) as ToolPayloadTransformFunction[];
 

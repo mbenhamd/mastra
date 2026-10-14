@@ -182,4 +182,32 @@ describe('tool payload transform', () => {
     });
     expect(logger.warn).toHaveBeenCalled();
   });
+  it('never transforms a tool the policy declares pass-through, for any target or phase', async () => {
+    const transformToolPayload = vi.fn(() => ({ redacted: true }));
+    const source = {
+      policy: {
+        targets: ['display', 'transcript'] as const,
+        passThroughToolNames: ['report_subagent_outcome'],
+        transformToolPayload,
+      },
+    };
+    for (const phase of ['input-delta', 'input-available', 'output-available'] as const) {
+      const passThrough = await transformToolPayloadForTargets(
+        { phase, toolName: 'report_subagent_outcome', toolCallId: 'r1', input: { summary: 's' } } as never,
+        source as never,
+      );
+      expect(passThrough).toBeUndefined();
+      const other = await transformToolPayloadForTargets(
+        { phase, toolName: 'search_trials', toolCallId: 's1', input: { q: 'x' } } as never,
+        source as never,
+      );
+      expect(other?.display?.[phase]).toEqual({ transformed: { redacted: true } });
+    }
+    expect(transformToolPayload).toHaveBeenCalledTimes(6);
+    expect(
+      transformToolPayload.mock.calls.every(
+        ([context]) => (context as { toolName: string }).toolName === 'search_trials',
+      ),
+    ).toBe(true);
+  });
 });
