@@ -131,6 +131,18 @@ type DelayedPromises<OUTPUT = undefined> = {
 };
 
 /**
+ * @internal Rejection a provider-result listener uses when the run's turn was
+ * cancelled while the listener ran: the run then ends cancelled, not failed.
+ * Any other rejection, including a driver's own AbortError, fails the run.
+ */
+export class ProviderResultCancelledError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'ProviderResultCancelledError';
+  }
+}
+
+/**
  * The complete output returned by `getFullOutput()`.
  */
 export type FullOutput<OUTPUT = undefined> = {
@@ -1358,8 +1370,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     terminalToolResult: terminalCommit?.data,
                   });
                 } catch (error) {
-                  // A listener reports a turn cancelled meanwhile as an AbortError.
-                  if (error instanceof Error && error.name === 'AbortError') providerResultCancelled = true;
+                  // Only a listener's explicit cancellation ends the run cancelled.
+                  if (error instanceof ProviderResultCancelledError) providerResultCancelled = true;
                   throw error;
                 }
 
@@ -2420,7 +2432,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * at most once, only for a run that is still successful at that point. A
    * listener that rejects fails the run before any output result processor
    * runs, so nothing persists a reply the listener could not secure; one that
-   * rejects with an `AbortError` ends the run cancelled. The snapshot has no
+   * rejects with a `ProviderResultCancelledError` ends the run cancelled. The snapshot has no
    * structured `object` and carries the text before output result processors.
    * Returns `false` when the run's finish already started, so the caller must
    * rely on the completed output instead.
@@ -2475,8 +2487,6 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       rememberedMessages: [],
       ...(input.terminalToolResult !== undefined ? { terminalToolResult: input.terminalToolResult } : {}),
     } satisfies FullOutput<OUTPUT>;
-    // Output result processors later mutate the step and message objects in
-    // place. Detach the snapshot, in the JSON form storage persists anyway.
     // Output result processors mutate the step objects only after every
     // listener settled; storage serializes what it persists.
     const result: FullOutput<OUTPUT> = snapshot;
