@@ -8089,6 +8089,12 @@ export class Session {
       waiter?.reject(err);
       return;
     }
+    // Stage the provider's completed output as soon as the run has it, before
+    // memory persistence, onFinish, delivery or usage accounting can treat
+    // the run as complete: a process death after this point recovers the
+    // reply. The completed output re-stages over it below.
+    // Test doubles may hand back a bare output without the listener API.
+    out._onProviderResult?.(providerResult => this._stageProviderResult(runId, providerResult));
     try {
       if (typeof out._waitUntilFinished === 'function') {
         await out._waitUntilFinished();
@@ -8279,6 +8285,24 @@ export class Session {
   }
 
   /**
+   * Stage the provider result (the run's output before output result
+   * processors and onFinish) for recovery. Best effort: on failure the run
+   * goes on, and the completed-output staging in `_handleRunTerminal` still
+   * runs and fails closed. Receipt state is read, not consumed.
+   */
+  private async _stageProviderResult(runId: string, providerResult: FullOutput<unknown>): Promise<void> {
+    const receiptState = this._runToolReceipts.get(runId);
+    const full = materializeHarnessTerminalText(
+      withHarnessSubagentToolReceipts(providerResult, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
+    );
+    try {
+      await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true, provisional: true });
+    } catch (error) {
+      console.error(`[harness/v1] could not stage the provider result of run "${runId}" before completion`, error);
+    }
+  }
+
+  /**
    * Make native completed output durable before resolving the run's waiter.
    * `tolerateUnknownRun` is for generic completion paths that see every run:
    * when the admission lookup fails for a run this process did not admit
@@ -8289,7 +8313,7 @@ export class Session {
   private async _stageCompletedTerminalOutput(
     runId: string,
     full: FullOutput<unknown>,
-    opts: { tolerateUnknownRun?: boolean } = {},
+    opts: { tolerateUnknownRun?: boolean; provisional?: boolean } = {},
   ): Promise<void> {
     const sessionIncarnation = this._record.sessionIncarnation;
     if (
@@ -8344,6 +8368,9 @@ export class Session {
         if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
       }
     } catch (error) {
+      // A provisional stage has no observer of its own; the completed-output
+      // staging that follows reports its failure.
+      if (opts.provisional === true) throw error;
       const pending = this._terminalFailure(error, undefined, runId);
       this._terminalStagingFailuresAwaitingObserver.add(pending);
       throw pending;
