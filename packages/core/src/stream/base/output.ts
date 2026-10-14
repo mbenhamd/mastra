@@ -1230,6 +1230,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               let terminalPromiseResolution: Pick<PromiseResults<OUTPUT>, 'text' | 'finishReason'> | undefined;
               const terminalProcessorChunks: ChunkType<OUTPUT>[] = [];
               let terminalDeliveryFailed = false;
+              let providerResultCancelled = false;
               let terminalFailureReason: 'error' | 'other' = 'error';
               // The onFinish writer runs after terminal commit, before the final finish chunk.
               // Unlike the processor writer below, it must not buffer chunks for that commit.
@@ -1350,11 +1351,17 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 // before output result processors run: those persist the turn
                 // (memory), and nothing may hold the reply durably before the
                 // listeners have staged it for recovery.
-                await self.#publishProviderResult({
-                  response,
-                  providerMetadata: finalProviderMetadata,
-                  terminalToolResult: terminalCommit?.data,
-                });
+                try {
+                  await self.#publishProviderResult({
+                    response,
+                    providerMetadata: finalProviderMetadata,
+                    terminalToolResult: terminalCommit?.data,
+                  });
+                } catch (error) {
+                  // A listener reports a turn cancelled meanwhile as an AbortError.
+                  if (error instanceof Error && error.name === 'AbortError') providerResultCancelled = true;
+                  throw error;
+                }
 
                 if (self.processorRunner && !self.#options.isLLMExecutionStep) {
                   // Run output processors when NOT in LLM execution step context
@@ -1587,7 +1594,15 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 stagedTerminalStepFinishChunk = undefined;
                 stagedTerminalStepResult = undefined;
                 self.#terminalToolResult = undefined;
-                if (error instanceof TripWire) {
+                if (providerResultCancelled) {
+                  terminalFailureReason = 'other';
+                  self.#status = 'canceled';
+                  self.#finishReason = 'aborted';
+                  self.resolvePromises({
+                    finishReason: 'aborted',
+                    text: '',
+                  });
+                } else if (error instanceof TripWire) {
                   terminalFailureReason = 'other';
                   self.#tripwire = {
                     reason: error.message,
@@ -2404,10 +2419,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * (memory persistence), `onFinish`, and the finish chunk's delivery. It fires
    * at most once, only for a run that is still successful at that point. A
    * listener that rejects fails the run before any output result processor
-   * runs, so nothing persists a reply the listener could not secure. The
-   * snapshot is a
-   * detached JSON copy: it has no structured `object` and carries the text
-   * before output result processors.
+   * runs, so nothing persists a reply the listener could not secure; one that
+   * rejects with an `AbortError` ends the run cancelled. The snapshot has no
+   * structured `object` and carries the text before output result processors.
    * Returns `false` when the run's finish already started, so the caller must
    * rely on the completed output instead.
    */
@@ -2463,9 +2477,10 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     } satisfies FullOutput<OUTPUT>;
     // Output result processors later mutate the step and message objects in
     // place. Detach the snapshot, in the JSON form storage persists anyway.
-    const result = JSON.parse(JSON.stringify(snapshot)) as FullOutput<OUTPUT>;
-    // Every listener starts before the first await, so each reads its own
-    // state at the provider finish too. The first rejection fails the run.
+    // Output result processors mutate the step objects only after every
+    // listener settled; storage serializes what it persists.
+    const result: FullOutput<OUTPUT> = snapshot;
+    // The first rejection fails the run.
     const settled = await Promise.allSettled(listeners.map(async listener => listener(result)));
     const rejected = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
     if (rejected !== undefined) {
