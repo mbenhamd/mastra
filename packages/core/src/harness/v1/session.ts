@@ -8094,7 +8094,14 @@ export class Session {
     // the run as complete: a process death after this point recovers the
     // reply. The completed output re-stages over it below.
     // Test doubles may hand back a bare output without the listener API.
-    out._onProviderResult?.(providerResult => this._stageProviderResult(runId, providerResult));
+    const providerResultObserved = out._onProviderResult?.(providerResult =>
+      this._stageProviderResult(runId, providerResult),
+    );
+    if (providerResultObserved === false) {
+      console.debug(
+        `[harness/v1] run "${runId}" finished before its provider result could be staged early; only its completed output is staged`,
+      );
+    }
     try {
       if (typeof out._waitUntilFinished === 'function') {
         await out._waitUntilFinished();

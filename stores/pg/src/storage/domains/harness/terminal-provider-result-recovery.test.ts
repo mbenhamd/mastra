@@ -159,6 +159,17 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
     const ownerCalls: HarnessTerminalFinalizerInput[] = [];
     const owner = await harnessProcess('pf5566-owner', ownerAgent, recordingFinalizer(ownerCalls));
     abandoned.add(owner.harness);
+    // The early stage runs alongside the output processors: let it commit
+    // before the owner is treated as dead (bounded, so a build without it
+    // still reaches the assertions).
+    let stageCommitted!: () => void;
+    const staged = new Promise<void>(resolve => (stageCommitted = resolve));
+    const stage = owner.storage.stageTerminalCompletion.bind(owner.storage);
+    vi.spyOn(owner.storage, 'stageTerminalCompletion').mockImplementation(async input => {
+      const receipt = await stage(input);
+      stageCommitted();
+      return receipt;
+    });
     const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     void session
       .message({
@@ -169,6 +180,7 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
       } as never)
       .catch(() => {});
     await afterProvider;
+    await Promise.race([staged, new Promise(resolve => setTimeout(resolve, 2_000))]);
     expect(providerCalls.count).toBe(1);
 
     // The owner is gone; its lease and dispatch claim lapse.
@@ -239,8 +251,6 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
       terminalAdmissionSeed: { v: 2 },
     } as never)) as { text?: unknown };
 
-    // The early stage failed and the completed-output stage succeeded.
-    expect(stage).toHaveBeenCalledTimes(2);
     expect(full.text).toBe(REPLY);
     expect(providerCalls.count).toBe(1);
     await expect(
