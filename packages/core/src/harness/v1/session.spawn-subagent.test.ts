@@ -17,7 +17,9 @@
 import { describe, expect, it } from 'vitest';
 
 import { Agent } from '../../agent';
+import { Mastra } from '../../mastra';
 import { RequestContext } from '../../request-context';
+import { InMemoryStore } from '../../storage';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { buildFakeOutput } from './__test-utils__/fake-output';
@@ -116,13 +118,25 @@ function setup(opts?: {
   allowInline?: boolean;
   inheritRequestContextAppKeys?: string[];
   childAgentConfig?: Record<string, unknown>;
+  /** A Mastra-level tool payload transform policy; the agents then live on a caller-built Mastra. */
+  mastraTransform?: Record<string, unknown>;
 }) {
   const parentAgent = new FakeAgent('parent-agent');
   const childAgent = new FakeAgent('child-agent', opts?.childAgentConfig);
   if (opts?.chunks) childAgent.chunks = opts.chunks;
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
+  const agents = { 'parent-agent': parentAgent, 'child-agent': childAgent } as any;
   const harness = new Harness({
-    agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+    ...(opts?.mastraTransform === undefined
+      ? { agents }
+      : {
+          mastra: new Mastra({
+            agents,
+            storage: new InMemoryStore(),
+            logger: false,
+            transform: opts.mastraTransform as any,
+          }),
+        }),
     modes: [
       { id: 'default', agentId: 'parent-agent' },
       { id: 'explore-mode', agentId: 'child-agent' },
@@ -1243,8 +1257,12 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
     };
   }
 
-  async function answerDeltasFor(childAgentConfig: Record<string, unknown>, summary: string) {
-    const { harness, childAgent } = setup({ chunks: streamedReport(summary, 6), childAgentConfig });
+  async function answerDeltasFor(
+    childAgentConfig: Record<string, unknown>,
+    summary: string,
+    mastraTransform?: Record<string, unknown>,
+  ) {
+    const { harness, childAgent } = setup({ chunks: streamedReport(summary, 6), childAgentConfig, mastraTransform });
     childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     try {
@@ -1287,6 +1305,19 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
 
     expect(deltas).toEqual([]);
   });
+
+  it.each([
+    ['streams the answer', [HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID], true],
+    ['streams nothing', undefined, false],
+  ] as const)(
+    '%s when only the Mastra-level display policy governs the report tool',
+    async (_label, passThroughToolNames, streams) => {
+      const summary = 'An answer only the Mastra-level display policy governs.';
+      const deltas = await answerDeltasFor({}, summary, redactingDisplayPolicy(passThroughToolNames));
+
+      expect(deltas.join('')).toBe(streams ? summary : '');
+    },
+  );
 
   it('streams no answer when asynchronous default options declare report-tool pass-through', async () => {
     const deltas = await answerDeltasFor(

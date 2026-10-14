@@ -90,6 +90,23 @@ describe('tool payload transform', () => {
     expect(transformToolPayload).toHaveBeenCalledTimes(2);
   });
 
+  it("still applies a pass-through tool's own transform without calling the policy", async () => {
+    const transformToolPayload = vi.fn(() => ({ redacted: 'by policy' }));
+    const toolInput = vi.fn(() => ({ redacted: 'by tool' }));
+
+    const transform = await transformToolPayloadForTargets(
+      { phase: 'input-available', toolName: 'reportOutcome', toolCallId: 'call-1', input: { summary: 'raw' } },
+      {
+        policy: { transformToolPayload, passThroughToolNames: ['reportOutcome'] },
+        toolTransform: { display: { input: toolInput } },
+      },
+    );
+
+    expect(transform).toEqual({ display: { 'input-available': { transformed: { redacted: 'by tool' } } } });
+    expect(toolInput).toHaveBeenCalledTimes(1);
+    expect(transformToolPayload).not.toHaveBeenCalled();
+  });
+
   it('stores target and phase specific transforms on chunk metadata', async () => {
     const transform = await transformToolPayloadForTargets(
       {
