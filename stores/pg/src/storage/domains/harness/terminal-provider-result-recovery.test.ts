@@ -301,7 +301,7 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
     expect(adopterCalls.map(call => (call.fullOutput as { text?: unknown }).text)).toEqual([REPLY]);
   });
 
-  it('completes a live turn normally when staging its provider result fails', async () => {
+  it('completes a live turn when its provider-result stage succeeds on the retry', async () => {
     const providerCalls = { count: 0 };
     const agent = new Agent({
       id: 'default',
@@ -335,5 +335,55 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
       }),
     ).resolves.toMatchObject({ status: 'committed', terminalResult: { status: 'completed' } });
     expect(calls.map(call => (call.fullOutput as { text?: unknown }).text)).toEqual([REPLY]);
+  });
+
+  it('fails a live turn before memory persists when its provider result cannot be staged', async () => {
+    const memoryWrites: string[] = [];
+    const memory: Processor = {
+      id: 'memory',
+      processOutputResult: async ({ messageList }) => {
+        memoryWrites.push('reply');
+        return messageList;
+      },
+    };
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'reply',
+      model: answeringModel({ count: 0 }) as never,
+      outputProcessors: [memory],
+    });
+    const calls: HarnessTerminalFinalizerInput[] = [];
+    const live = await harnessProcess('pf5566-unstaged', agent, recordingFinalizer(calls));
+    vi.spyOn(live.storage, 'stageTerminalCompletion').mockRejectedValue(new Error('storage unavailable'));
+    const session = await live.harness.session({ resourceId: 'u4', threadId: { fresh: true } });
+    const unstagedGrant = { key: 'pf5566-unstaged-grant', generation: 1 };
+
+    const outcome = await session
+      .message({
+        content: 'hi',
+        admissionId: 'pf5566-unstaged-turn',
+        executionAuthorityGrant: unstagedGrant,
+        terminalAdmissionSeed: { v: 2 },
+      } as never)
+      .then(
+        full => ({ full }),
+        error => ({ error }),
+      );
+    // The run fails through the existing failed-terminal route.
+
+    // No memory holds a reply that recovery could not find; the turn is a
+    // visible failure, never a silent completion or loss.
+    expect(memoryWrites).toEqual([]);
+    expect(outcome).toMatchObject({ full: { finishReason: 'error', error: { message: 'storage unavailable' } } });
+    await expect(
+      live.storage.loadTerminalAdmission({
+        harnessName: 'default',
+        sessionId: session.id,
+        admissionId: 'pf5566-unstaged-turn',
+        executionGrant: unstagedGrant,
+      }),
+    ).resolves.toMatchObject({ status: 'committed', terminalResult: { status: 'failed' } });
+    expect(calls.map(call => call.result.status)).toEqual(['failed']);
   });
 });

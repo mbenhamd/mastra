@@ -2402,8 +2402,10 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * `FullOutput`-shaped snapshot of the final output as the provider finished
    * it, awaited at the final `finish` chunk before output result processors
    * (memory persistence), `onFinish`, and the finish chunk's delivery. It fires
-   * at most once, only for a run that is still successful at that point, and a
-   * listener failure is logged without failing the run. The snapshot is a
+   * at most once, only for a run that is still successful at that point. A
+   * listener that rejects fails the run before any output result processor
+   * runs, so nothing persists a reply the listener could not secure. The
+   * snapshot is a
    * detached JSON copy: it has no structured `object` and carries the text
    * before output result processors.
    * Returns `false` when the run's finish already started, so the caller must
@@ -2461,23 +2463,18 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     } satisfies FullOutput<OUTPUT>;
     // Output result processors later mutate the step and message objects in
     // place. Detach the snapshot, in the JSON form storage persists anyway.
-    let result: FullOutput<OUTPUT>;
-    try {
-      result = JSON.parse(JSON.stringify(snapshot)) as FullOutput<OUTPUT>;
-    } catch (error) {
-      this.logger?.error?.('Provider result is not serializable', { error, runId: this.runId });
-      return;
-    }
+    const result = JSON.parse(JSON.stringify(snapshot)) as FullOutput<OUTPUT>;
     // Every listener starts before the first await, so each reads its own
-    // state at the provider finish too.
-    const settled = listeners.map(async listener => {
-      try {
-        await listener(result);
-      } catch (error) {
-        this.logger?.error?.('Provider result listener failed', { error, runId: this.runId });
-      }
-    });
-    await Promise.all(settled);
+    // state at the provider finish too. The first rejection fails the run.
+    const settled = await Promise.allSettled(listeners.map(async listener => listener(result)));
+    const rejected = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+    if (rejected !== undefined) {
+      this.logger?.error?.('Provider result listener failed; failing the run', {
+        error: rejected.reason,
+        runId: this.runId,
+      });
+      throw rejected.reason;
+    }
   }
 
   /** @internal */

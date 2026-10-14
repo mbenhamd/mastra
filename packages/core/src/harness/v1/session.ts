@@ -743,6 +743,8 @@ function pruneInboxResponseReceipts(
 
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
+/** Backoff before the one retry of a failed provider-result stage. */
+const PROVIDER_RESULT_STAGE_RETRY_MS = 100;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
 const MESSAGE_ADMISSION_DURABLE_WAIT_INTERVAL_MS = 100;
 const MESSAGE_ADMISSION_DURABLE_WAIT_EXTENDED_INTERVAL_MS = 1_000;
@@ -8302,19 +8304,56 @@ export class Session {
 
   /**
    * Stage the provider result (the run's output before output result
-   * processors and onFinish) for recovery. Best effort: on failure the run
-   * goes on, and the completed-output staging in `_handleRunTerminal` still
-   * runs and fails closed. Receipt state is read, not consumed.
+   * processors and onFinish) for recovery. Fails closed: a stage that still
+   * fails after one retry, and whose commit is not found durable, rejects, and
+   * the run then fails before any output result processor (memory) can hold a
+   * reply that recovery could not find. Receipt state is read, not consumed.
    */
   private async _stageProviderResult(runId: string, providerResult: FullOutput<unknown>): Promise<void> {
     const receiptState = this._runToolReceipts.get(runId);
     const full = materializeHarnessTerminalText(
       withHarnessSubagentToolReceipts(providerResult, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
     );
+    let failure: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, PROVIDER_RESULT_STAGE_RETRY_MS));
+      try {
+        await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true, provisional: true });
+        return;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    // A lost acknowledgement: the write committed, so the reply is recoverable.
+    if (await this._providerResultStagedDurably(runId)) return;
+    console.error(`[harness/v1] could not stage the provider result of run "${runId}"; failing the run`, failure);
+    throw failure;
+  }
+
+  private async _providerResultStagedDurably(runId: string): Promise<boolean> {
+    const admission = this._terminalStagingAdmissions.get(runId);
+    if (admission === undefined) return false;
     try {
-      await this._stageCompletedTerminalOutput(runId, full, { tolerateUnknownRun: true, provisional: true });
-    } catch (error) {
-      console.error(`[harness/v1] could not stage the provider result of run "${runId}" before completion`, error);
+      const evidence = await this._storage.loadMessageResultEvidence({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: admission.signalId,
+      });
+      if (
+        evidence === null ||
+        !('status' in evidence) ||
+        evidence.status !== 'pending' ||
+        evidence.runId !== runId ||
+        evidence.stagedResult === undefined
+      ) {
+        return false;
+      }
+      this._stagedTerminalRunIds.add(runId);
+      return true;
+    } catch {
+      return false;
     }
   }
 
