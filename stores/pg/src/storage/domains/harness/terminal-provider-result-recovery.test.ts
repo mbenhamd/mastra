@@ -509,4 +509,55 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
 
     expect(full).toMatchObject({ text: REPLY, finishReason: 'stop' });
   });
+
+  it('fails the turn when the only staged row holds a different result', async () => {
+    const memoryWrites: string[] = [];
+    const memory: Processor = {
+      id: 'memory',
+      processOutputResult: async ({ messageList }) => {
+        memoryWrites.push('reply');
+        return messageList;
+      },
+    };
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'reply',
+      model: answeringModel({ count: 0 }) as never,
+      outputProcessors: [memory],
+    });
+    const calls: HarnessTerminalFinalizerInput[] = [];
+    const live = await harnessProcess('pf5566-other-row', agent, recordingFinalizer(calls));
+    const stage = live.storage.stageTerminalCompletion.bind(live.storage);
+    vi.spyOn(live.storage, 'stageTerminalCompletion').mockImplementation(async input => {
+      // Each attempt leaves some other result staged and reports a failure.
+      await stage({ ...input, result: { ...(input.result as object), text: 'another answer' } });
+      throw new Error('connection reset after commit');
+    });
+    const session = await live.harness.session({ resourceId: 'u8', threadId: { fresh: true } });
+    const otherGrant = { key: 'pf5566-other-row-grant', generation: 1 };
+
+    const outcome = await session
+      .message({
+        content: 'hi',
+        admissionId: 'pf5566-other-row-turn',
+        executionAuthorityGrant: otherGrant,
+        terminalAdmissionSeed: { v: 2 },
+      } as never)
+      .then(
+        full => ({ full }),
+        error => ({ error }),
+      );
+
+    expect(memoryWrites).toEqual([]);
+    expect(outcome).toMatchObject({ full: { finishReason: 'error' } });
+    await expect(
+      live.storage.loadTerminalAdmission({
+        harnessName: 'default',
+        sessionId: session.id,
+        admissionId: 'pf5566-other-row-turn',
+        executionGrant: otherGrant,
+      }),
+    ).resolves.toMatchObject({ status: 'committed', terminalResult: { status: 'failed' } });
+  });
 });

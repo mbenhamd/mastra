@@ -133,6 +133,7 @@ import type {
   SessionSummary,
 } from '../../storage/domains/harness';
 import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
+import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
 import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
@@ -8343,9 +8344,9 @@ export class Session {
     if (await this._providerResultStagedDurably(runId, full)) return;
     if (turnAbort?.signal.aborted === true) {
       // The turn was cancelled meanwhile: the run ends cancelled, not failed.
-      const cancelled = new Error(`run "${runId}" was aborted while staging its provider result`, { cause: failure });
-      cancelled.name = 'AbortError';
-      throw cancelled;
+      throw new ProviderResultCancelledError(`run "${runId}" was aborted while staging its provider result`, {
+        cause: failure,
+      });
     }
     console.error(`[harness/v1] could not stage the provider result of run "${runId}"; failing the run`, failure);
     throw failure;
