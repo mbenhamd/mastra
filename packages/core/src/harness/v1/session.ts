@@ -8104,10 +8104,13 @@ export class Session {
     // memory persistence, onFinish, delivery or usage accounting can treat
     // the run as complete: a process death after this point recovers the
     // reply. The completed output re-stages over it below.
-    // Test doubles may hand back a bare output without the listener API.
-    const providerResultObserved = out._onProviderResult?.(providerResult =>
-      this._stageProviderResult(runId, providerResult),
-    );
+    // Only a session that can stage terminal output registers: other runs
+    // never pay for, or fail on, a snapshot. Test doubles may hand back a
+    // bare output without the listener API.
+    const turnAbort = this._currentTurnAbortController;
+    const providerResultObserved = this._canStageTerminalCompletion()
+      ? out._onProviderResult?.(providerResult => this._stageProviderResult(runId, providerResult, turnAbort))
+      : undefined;
     if (providerResultObserved === false) {
       console.debug(
         `[harness/v1] run "${runId}" finished before its provider result could be staged early; only its completed output is staged`,
@@ -8309,7 +8312,19 @@ export class Session {
    * the run then fails before any output result processor (memory) can hold a
    * reply that recovery could not find. Receipt state is read, not consumed.
    */
-  private async _stageProviderResult(runId: string, providerResult: FullOutput<unknown>): Promise<void> {
+  private _canStageTerminalCompletion(): boolean {
+    return (
+      this._storage.supportsTerminalCompletionStaging === true &&
+      this._terminalFinalizersByIdentity.size > 0 &&
+      this._record.sessionIncarnation !== undefined
+    );
+  }
+
+  private async _stageProviderResult(
+    runId: string,
+    providerResult: FullOutput<unknown>,
+    turnAbort: AbortController | undefined,
+  ): Promise<void> {
     const receiptState = this._runToolReceipts.get(runId);
     const full = materializeHarnessTerminalText(
       withHarnessSubagentToolReceipts(providerResult, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
@@ -8325,12 +8340,19 @@ export class Session {
       }
     }
     // A lost acknowledgement: the write committed, so the reply is recoverable.
-    if (await this._providerResultStagedDurably(runId)) return;
+    if (await this._providerResultStagedDurably(runId, full)) return;
+    if (turnAbort?.signal.aborted === true) {
+      // The turn was cancelled meanwhile: the run ends cancelled, not failed.
+      const cancelled = new Error(`run "${runId}" was aborted while staging its provider result`, { cause: failure });
+      cancelled.name = 'AbortError';
+      throw cancelled;
+    }
     console.error(`[harness/v1] could not stage the provider result of run "${runId}"; failing the run`, failure);
     throw failure;
   }
 
-  private async _providerResultStagedDurably(runId: string): Promise<boolean> {
+  /** Whether this exact provider result is durably staged for the run. */
+  private async _providerResultStagedDurably(runId: string, full: FullOutput<unknown>): Promise<boolean> {
     const admission = this._terminalStagingAdmissions.get(runId);
     if (admission === undefined) return false;
     try {
@@ -8347,6 +8369,18 @@ export class Session {
         evidence.status !== 'pending' ||
         evidence.runId !== runId ||
         evidence.stagedResult === undefined
+      ) {
+        return false;
+      }
+      const staged = evidence.stagedResult as Partial<FullOutput<unknown>>;
+      const usageCounters = (usage: unknown) => {
+        const u = (usage ?? {}) as Record<string, unknown>;
+        return [u.inputTokens, u.outputTokens, u.totalTokens, u.reasoningTokens, u.cachedInputTokens];
+      };
+      if (
+        staged.text !== full.text ||
+        staged.finishReason !== full.finishReason ||
+        JSON.stringify(usageCounters(staged.totalUsage)) !== JSON.stringify(usageCounters(full.totalUsage))
       ) {
         return false;
       }

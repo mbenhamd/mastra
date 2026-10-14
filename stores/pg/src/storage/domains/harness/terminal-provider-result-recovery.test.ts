@@ -36,7 +36,7 @@ const grant = { key: 'pf5566-grant', generation: 1 };
 const admissionId = 'pf5566-turn';
 
 /** A provider that answers once with REPLY and USAGE. */
-function answeringModel(calls: { count: number }) {
+function answeringModel(calls: { count: number }, finishExtras: Record<string, unknown> = {}) {
   return {
     specificationVersion: 'v2' as const,
     provider: 'pf5566',
@@ -53,7 +53,7 @@ function answeringModel(calls: { count: number }) {
         { type: 'text-start', id: 'text-1' },
         { type: 'text-delta', id: 'text-1', delta: REPLY },
         { type: 'text-end', id: 'text-1' },
-        { type: 'finish', finishReason: 'stop', usage: USAGE },
+        { type: 'finish', finishReason: 'stop', usage: USAGE, ...finishExtras },
       ];
       return {
         stream: new ReadableStream({
@@ -385,5 +385,128 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
       }),
     ).resolves.toMatchObject({ status: 'committed', terminalResult: { status: 'failed' } });
     expect(calls.map(call => call.result.status)).toEqual(['failed']);
+  });
+
+  it('counts a stage whose acknowledgement was lost, and completes the turn', async () => {
+    const memoryWrites: string[] = [];
+    const memory: Processor = {
+      id: 'memory',
+      processOutputResult: async ({ messageList }) => {
+        memoryWrites.push('reply');
+        return messageList;
+      },
+    };
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'reply',
+      model: answeringModel({ count: 0 }) as never,
+      outputProcessors: [memory],
+    });
+    const calls: HarnessTerminalFinalizerInput[] = [];
+    const live = await harnessProcess('pf5566-lost-ack', agent, recordingFinalizer(calls));
+    const stage = live.storage.stageTerminalCompletion.bind(live.storage);
+    let lostAcks = 0;
+    vi.spyOn(live.storage, 'stageTerminalCompletion').mockImplementation(async input => {
+      const receipt = await stage(input);
+      // Both early attempts commit, and both acknowledgements are lost.
+      if (lostAcks < 2) {
+        lostAcks += 1;
+        throw new Error('connection reset after commit');
+      }
+      return receipt;
+    });
+    const session = await live.harness.session({ resourceId: 'u5', threadId: { fresh: true } });
+    const lostAckGrant = { key: 'pf5566-lost-ack-grant', generation: 1 };
+
+    const full = (await session.message({
+      content: 'hi',
+      admissionId: 'pf5566-lost-ack-turn',
+      executionAuthorityGrant: lostAckGrant,
+      terminalAdmissionSeed: { v: 2 },
+    } as never)) as { text?: unknown };
+
+    expect(full.text).toBe(REPLY);
+    expect(memoryWrites).toEqual(['reply']);
+    await expect(
+      live.storage.loadTerminalAdmission({
+        harnessName: 'default',
+        sessionId: session.id,
+        admissionId: 'pf5566-lost-ack-turn',
+        executionGrant: lostAckGrant,
+      }),
+    ).resolves.toMatchObject({ status: 'committed', terminalResult: { status: 'completed' } });
+  });
+
+  it('never settles a turn aborted while its stage is retried as failed', async () => {
+    const memoryWrites: string[] = [];
+    const memory: Processor = {
+      id: 'memory',
+      processOutputResult: async ({ messageList }) => {
+        memoryWrites.push('reply');
+        return messageList;
+      },
+    };
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'reply',
+      model: answeringModel({ count: 0 }) as never,
+      outputProcessors: [memory],
+    });
+    const calls: HarnessTerminalFinalizerInput[] = [];
+    const live = await harnessProcess('pf5566-abort-retry', agent, recordingFinalizer(calls));
+    const session = await live.harness.session({ resourceId: 'u6', threadId: { fresh: true } });
+    const stage = vi.spyOn(live.storage, 'stageTerminalCompletion').mockImplementation(async () => {
+      // The user stops the turn while the failed attempt backs off.
+      session.abort();
+      throw new Error('storage unavailable');
+    });
+    const turn = {
+      content: 'hi',
+      admissionId: 'pf5566-abort-turn',
+      executionAuthorityGrant: { key: 'pf5566-abort-grant', generation: 1 },
+      terminalAdmissionSeed: { v: 2 },
+    };
+    await expect(session.message(turn as never)).rejects.toThrow();
+    // Let the run end, then settle the turn through a same-admission retry.
+    await new Promise(resolve => setTimeout(resolve, 500));
+    stage.mockRestore();
+    await session.message(turn as never).catch(() => {});
+
+    expect(memoryWrites).toEqual([]);
+    const admission = await live.storage.loadTerminalAdmission({
+      harnessName: 'default',
+      sessionId: session.id,
+      admissionId: 'pf5566-abort-turn',
+      executionGrant: turn.executionAuthorityGrant,
+    });
+    expect(admission).toMatchObject({ status: 'committed', terminalResult: { status: 'aborted' } });
+    expect(calls.map(call => call.result.status)).toEqual(['aborted']);
+  });
+
+  it('completes an ordinary run whose provider metadata cannot be serialized', async () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'reply',
+      model: answeringModel({ count: 0 }, { providerMetadata: { pf5566: { requestBytes: 12n } } }) as never,
+    });
+    const store = storeFor('pf5566-ordinary');
+    await store.init();
+    // A session without a terminal finalizer never stages its output.
+    const harness = new Harness({
+      agents: { default: agent } as never,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage: store.stores.harness! },
+    });
+    harnesses.push(harness);
+    const session = await harness.session({ resourceId: 'u7', threadId: { fresh: true } });
+
+    const full = (await session.message({ content: 'hi' } as never)) as { text?: unknown; finishReason?: unknown };
+
+    expect(full).toMatchObject({ text: REPLY, finishReason: 'stop' });
   });
 });
