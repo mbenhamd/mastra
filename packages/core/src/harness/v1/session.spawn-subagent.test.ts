@@ -1177,6 +1177,31 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
       },
     ],
     [
+      'synchronous dynamic default options that read the request context',
+      ({ requestContext }: { requestContext: { get(key: string): unknown } }) =>
+        // Only the turn's real context carries the Harness slot: resolved with
+        // an empty context, these defaults would report no policy.
+        requestContext.get('harness') !== undefined
+          ? {
+              transform: {
+                targets: ['display'],
+                transformToolPayload: ({ phase }: { phase: string }) =>
+                  phase === 'input-available' ? { redacted: true } : undefined,
+              },
+            }
+          : {},
+    ],
+    [
+      'legacy projection default options',
+      {
+        toolPayloadProjection: {
+          targets: ['display'],
+          projectToolPayload: ({ phase }: { phase: string }) =>
+            phase === 'input-available' ? { redacted: true } : undefined,
+        },
+      },
+    ],
+    [
       'dynamic default options',
       async () => ({
         transform: {

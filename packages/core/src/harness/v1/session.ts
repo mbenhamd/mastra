@@ -8692,16 +8692,18 @@ export class Session {
    * this child's runs, in the merge order the agent applies: the run options'
    * `transform` (the agent's `defaultOptions`, as the Harness passes no
    * per-call policy), then the agent's own policy, then Mastra's. The built-in
-   * report tool carries no tool-level transform. Unknown means yes: dynamic
-   * default options (resolved per request) and an unreadable default fail
-   * closed.
+   * report tool carries no tool-level transform. The defaults are resolved
+   * with the turn's own request context, as the run resolves them, and
+   * normalized the way the agent normalizes them. Unknown means yes: no turn
+   * context, asynchronous defaults and an unreadable default fail closed.
    */
   private _subagentAnswerDisplayPolicyMayApply(): boolean {
     const agent = this._threadSubscriptionAgent;
-    if (agent === undefined) return true;
+    const requestContext = this._currentAgentRequestContext;
+    if (agent === undefined || requestContext === undefined) return true;
     let defaults: unknown;
     try {
-      defaults = agent.getDefaultOptions();
+      defaults = agent.getDefaultOptions({ requestContext });
     } catch {
       return true;
     }
@@ -8709,10 +8711,16 @@ export class Session {
       defaults.catch(() => undefined);
       return true;
     }
-    const defaultPolicy =
+    const defaultOptions =
       defaults !== null && typeof defaults === 'object'
-        ? (defaults as { transform?: ToolPayloadTransformPolicy }).transform
+        ? (defaults as {
+            transform?: ToolPayloadTransformPolicy;
+            toolPayloadProjection?: Parameters<typeof normalizeToolPayloadTransformPolicy>[0];
+          })
         : undefined;
+    const defaultPolicy = normalizeToolPayloadTransformPolicy(
+      defaultOptions?.transform ?? defaultOptions?.toolPayloadProjection,
+    );
     const policy =
       defaultPolicy ??
       agent.getToolPayloadTransform() ??
