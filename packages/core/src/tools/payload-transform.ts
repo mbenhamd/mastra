@@ -23,6 +23,11 @@ export type ToolPayloadTransformSource = {
   toolTransform?: ToolPayloadTransform;
 };
 
+/**
+ * Legacy `toolPayloadProjection` policies can't declare `passThroughToolNames`:
+ * normalization keeps only the projection function and its targets, so a
+ * legacy policy applies to every tool.
+ */
 type LegacyToolPayloadProjectionPolicy = {
   projectToolPayload?: ToolPayloadTransformFunction;
   targets?: ToolPayloadTransformTarget[];
@@ -79,15 +84,35 @@ const PHASE_TO_TOOL_TRANSFORMER: Record<ToolPayloadTransformPhase, keyof NonNull
     resume: 'resume',
   };
 
+/**
+ * Whether the policy declares that it never transforms this tool's payloads.
+ * Only a real array counts: any other value declares nothing.
+ */
+export function toolPayloadTransformPolicyPassesThrough(
+  policy: ToolPayloadTransformPolicy | undefined,
+  toolName: string,
+): boolean {
+  const names: unknown = policy?.passThroughToolNames;
+  return Array.isArray(names) && names.includes(toolName);
+}
+
 function isPolicyConfiguredForTarget(
   policy: ToolPayloadTransformPolicy | undefined,
   target: ToolPayloadTransformTarget,
+  toolName: string,
 ) {
-  return Boolean(policy?.transformToolPayload && (!policy.targets || policy.targets.includes(target)));
+  return Boolean(
+    policy?.transformToolPayload &&
+    (!policy.targets || policy.targets.includes(target)) &&
+    !toolPayloadTransformPolicyPassesThrough(policy, toolName),
+  );
 }
 
-function isTransformConfigured(source: ToolPayloadTransformSource | undefined, target: ToolPayloadTransformTarget) {
-  return Boolean(isPolicyConfiguredForTarget(source?.policy, target) || source?.toolTransform?.[target]);
+function isTransformConfigured(source: ToolPayloadTransformSource | undefined, context: ToolPayloadTransformContext) {
+  return Boolean(
+    isPolicyConfiguredForTarget(source?.policy, context.target, context.toolName) ||
+    source?.toolTransform?.[context.target],
+  );
 }
 
 function getToolTransformer(
@@ -109,13 +134,15 @@ async function transformOneTarget(
   source: ToolPayloadTransformSource | undefined,
   logger?: IMastraLogger,
 ): Promise<TransformedToolPayloadState | undefined> {
-  const configured = isTransformConfigured(source, context.target);
+  const configured = isTransformConfigured(source, context);
   if (!configured) {
     return undefined;
   }
 
   const transformers = [
-    isPolicyConfiguredForTarget(source?.policy, context.target) ? source?.policy?.transformToolPayload : undefined,
+    isPolicyConfiguredForTarget(source?.policy, context.target, context.toolName)
+      ? source?.policy?.transformToolPayload
+      : undefined,
     getToolTransformer(source, context.target, context.phase),
   ].filter(Boolean) as ToolPayloadTransformFunction[];
 

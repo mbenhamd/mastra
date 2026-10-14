@@ -49,6 +49,47 @@ describe('tool payload transform', () => {
     expect(transform).toBeUndefined();
   });
 
+  it('never calls the policy for a pass-through tool and leaves its payloads unchanged', async () => {
+    const transformToolPayload = vi.fn(() => ({ redacted: true }));
+    const policy = { transformToolPayload, passThroughToolNames: ['reportOutcome'] };
+    const phases = [
+      'input-delta',
+      'input-available',
+      'output-available',
+      'error',
+      'approval',
+      'suspend',
+      'resume',
+    ] as const;
+
+    for (const phase of phases) {
+      const transform = await transformToolPayloadForTargets(
+        {
+          phase,
+          toolName: 'reportOutcome',
+          toolCallId: `call-${phase}`,
+          input: { summary: 'raw summary' },
+          inputTextDelta: '{"summary":"raw',
+          output: { ok: true },
+          error: new Error('raw error'),
+        },
+        { policy },
+      );
+      expect(transform).toBeUndefined();
+    }
+    expect(transformToolPayload).not.toHaveBeenCalled();
+
+    const otherTool = await transformToolPayloadForTargets(
+      { phase: 'input-available', toolName: 'runPython', toolCallId: 'call-other', input: { code: 'raw' } },
+      { policy },
+    );
+    expect(otherTool).toEqual({
+      display: { 'input-available': { transformed: { redacted: true } } },
+      transcript: { 'input-available': { transformed: { redacted: true } } },
+    });
+    expect(transformToolPayload).toHaveBeenCalledTimes(2);
+  });
+
   it('stores target and phase specific transforms on chunk metadata', async () => {
     const transform = await transformToolPayloadForTargets(
       {

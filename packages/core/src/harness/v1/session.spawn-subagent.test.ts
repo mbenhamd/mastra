@@ -1233,6 +1233,72 @@ describe('spawn_subagent — streamed answer (PF-5620)', () => {
     }
   });
 
+  /** A display policy that redacts every complete tool input it's asked to transform. */
+  function redactingDisplayPolicy(passThroughToolNames?: readonly string[]) {
+    return {
+      targets: ['display'],
+      transformToolPayload: ({ phase }: { phase: string }) =>
+        phase === 'input-available' ? { redacted: true } : undefined,
+      ...(passThroughToolNames === undefined ? {} : { passThroughToolNames }),
+    };
+  }
+
+  async function answerDeltasFor(childAgentConfig: Record<string, unknown>, summary: string) {
+    const { harness, childAgent } = setup({ chunks: streamedReport(summary, 6), childAgentConfig });
+    childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-pass-through'));
+
+      expect(events.some(event => event.type === 'subagent_end')).toBe(true);
+      return (events.filter(event => event.type === 'subagent_answer_delta') as any[]).map(event => event.delta);
+    } finally {
+      await harness.shutdown();
+    }
+  }
+
+  it.each([
+    ['the agent policy', { transform: redactingDisplayPolicy([HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID]) }],
+    [
+      'the default options policy',
+      { defaultOptions: { transform: redactingDisplayPolicy([HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID]) } },
+    ],
+  ])('streams the answer when %s passes the report tool through', async (_label, childAgentConfig) => {
+    const summary = 'An answer the display policy declares it never transforms.';
+
+    const deltas = await answerDeltasFor(childAgentConfig, summary);
+
+    expect(deltas.join('')).toBe(summary);
+  });
+
+  it.each([
+    ['declares no pass-through', redactingDisplayPolicy()],
+    ['passes only another tool through', redactingDisplayPolicy(['run_python'])],
+    [
+      'names the report tool in a string, not a list',
+      { ...redactingDisplayPolicy(), passThroughToolNames: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID },
+    ],
+  ])('streams no answer when the display policy %s', async (_label, transform) => {
+    const deltas = await answerDeltasFor({ transform }, 'An answer the display policy may redact.');
+
+    expect(deltas).toEqual([]);
+  });
+
+  it('streams no answer when asynchronous default options declare report-tool pass-through', async () => {
+    const deltas = await answerDeltasFor(
+      {
+        defaultOptions: async () => ({ transform: redactingDisplayPolicy([HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID]) }),
+      },
+      'An answer whose asynchronous defaults are unknown when the input streams.',
+    );
+
+    expect(deltas).toEqual([]);
+  });
+
   it('stops streaming the answer once the spawn is aborted', async () => {
     const summary = 'A long answer that must not keep streaming after the user stopped the turn.';
     const { harness, childAgent } = setup({ chunks: streamedReport(summary, 5) });
