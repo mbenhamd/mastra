@@ -1030,3 +1030,112 @@ describe('spawn_subagent — inline suspension is an error, not a completion (§
     }
   });
 });
+
+describe('spawn_subagent — streamed answer (PF-5620)', () => {
+  const REPORT_CALL_ID = 'report-subagent-outcome-1';
+
+  /** The child's streamed report input, split at awkward boundaries. */
+  function streamedReport(summary: string, chunkSize: number) {
+    const input = JSON.stringify({
+      kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
+      outcome: 'completed',
+      evidence: [{ kind: 'analysis', description: 'The "summary" of the evidence.' }],
+      summary,
+    });
+    const deltas: any[] = [];
+    for (let i = 0; i < input.length; i += chunkSize) {
+      deltas.push({
+        type: 'tool-call-delta',
+        payload: {
+          toolCallId: REPORT_CALL_ID,
+          toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+          argsTextDelta: input.slice(i, i + chunkSize),
+        },
+      });
+    }
+    return [
+      { type: 'text-start', payload: { id: 'interim' } },
+      { type: 'text-delta', payload: { id: 'interim', text: "I'll search the literature first." } },
+      {
+        type: 'tool-call-input-streaming-start',
+        payload: { toolCallId: REPORT_CALL_ID, toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID },
+      },
+      ...deltas,
+      { type: 'tool-call-input-streaming-end', payload: { toolCallId: REPORT_CALL_ID } },
+    ];
+  }
+
+  it('streams the report summary as answer deltas whose concatenation is the terminal direct answer', async () => {
+    const summary = 'Three trials found "no effect".\nSee C:\\data — étude 🧪 done.';
+    const { harness, childAgent } = setup({ chunks: streamedReport(summary, 7) });
+    childAgent.fullOutput = {
+      ...childAgent.fullOutput,
+      text: "I'll search the literature first.",
+      terminalToolResult: outcomeTerminalResult(summary),
+    };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const tool = createSpawnSubagentTool(parent)!;
+
+      const result = await tool.execute!({ agentType: 'explore', task: 'review the trials' }, execCtx('tc-answer'));
+      const answer = await tool.terminalResult!.project!(result as any, {
+        toolName: SPAWN_SUBAGENT_TOOL_ID,
+        toolCallId: 'tc-answer',
+        args: { delivery: 'final' },
+        batchSize: 1,
+        batchIndex: 0,
+        runId: 'run-1',
+        abortSignal: new AbortController().signal,
+      });
+
+      const answerDeltas = events.filter(event => event.type === 'subagent_answer_delta') as any[];
+      expect(answerDeltas.length).toBeGreaterThan(3);
+      expect(answerDeltas.map(event => event.delta).join('')).toBe((answer as { text: string }).text);
+      expect((answer as { text: string }).text).toBe(summary);
+      for (const event of answerDeltas) {
+        expect(event).toMatchObject({
+          toolCallId: 'tc-answer',
+          agentType: 'explore',
+          innerToolCallId: REPORT_CALL_ID,
+          depth: 1,
+          parentId: parent.id,
+        });
+      }
+      // Interim prose stays a text delta, and every answer delta precedes the end.
+      expect(events.some(event => event.type === 'subagent_text_delta')).toBe(true);
+      const endIndex = events.findIndex(event => event.type === 'subagent_end');
+      expect(events.findLastIndex(event => event.type === 'subagent_answer_delta')).toBeLessThan(endIndex);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('stops streaming the answer once the spawn is aborted', async () => {
+    const summary = 'A long answer that must not keep streaming after the user stopped the turn.';
+    const { harness, childAgent } = setup({ chunks: streamedReport(summary, 5) });
+    childAgent.fullOutput = { ...childAgent.fullOutput, terminalToolResult: outcomeTerminalResult(summary) };
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    try {
+      const controller = new AbortController();
+      const deltas: string[] = [];
+      parent.subscribe(event => {
+        if (event.type !== 'subagent_answer_delta') return;
+        deltas.push(event.delta);
+        controller.abort();
+      });
+      const tool = createSpawnSubagentTool(parent)!;
+
+      await tool.execute!(
+        { agentType: 'explore', task: 'review the trials' },
+        { ...execCtx('tc-aborted'), abortSignal: controller.signal },
+      );
+
+      expect(deltas).toHaveLength(1);
+      expect(summary.startsWith(deltas[0]!)).toBe(true);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});

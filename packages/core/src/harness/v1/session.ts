@@ -210,6 +210,7 @@ import type {
   RunToolRollup,
   SubagentEndEvent,
   SubagentReasoningDeltaEvent,
+  SubagentAnswerDeltaEvent,
   SubagentStartEvent,
   SubagentTextDeltaEvent,
   SubagentToolEndEvent,
@@ -253,6 +254,7 @@ import {
   validateCallerRequestContext,
 } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
+import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
@@ -263,6 +265,7 @@ import type {
 } from './terminal-subagent-result';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+  MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES,
   materializeHarnessTerminalText,
   parseHarnessSubagentOutcomeReport,
   parseHarnessSubagentTerminalResult,
@@ -2356,6 +2359,7 @@ export class Session {
       !this._persistTransientStreamingEvents &&
       (event.type === 'text_delta' ||
         event.type === 'subagent_text_delta' ||
+        event.type === 'subagent_answer_delta' ||
         event.type === 'reasoning_delta' ||
         event.type === 'subagent_reasoning_delta')
     ) {
@@ -2859,6 +2863,7 @@ export class Session {
       | Omit<SubagentStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentTextDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentReasoningDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
+      | Omit<SubagentAnswerDeltaEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolStartEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentToolEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>
       | Omit<SubagentEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>,
@@ -6878,6 +6883,15 @@ export class Session {
   _subagentParentToolCallId?: string;
 
   /**
+   * @internal — PF-5620: set by the spawning bridge on a subagent child.
+   * Receives the decoded `summary` characters of the child's streaming
+   * `report_subagent_outcome` input, per report call.
+   */
+  _subagentAnswerDeltaListener?: (delta: string, reportToolCallId: string) => void;
+  /** Per report call: its summary decoder, or `null` once streaming stopped. */
+  private readonly _subagentAnswerDecoders = new Map<string, SubagentReportSummaryDecoder | null>();
+
+  /**
    * @internal — tracing context a spawned/delegated child's runs attach to, so
    * subagent spans join the parent trace and inherit its span metadata
    * (`subagent-tracing.ts`). Set by the spawning parent before the child's turn
@@ -8633,6 +8647,34 @@ export class Session {
   }
 
   /**
+   * PF-5620: forward the decoded `summary` characters of this child's
+   * streaming `report_subagent_outcome` input to its spawning bridge. Only the
+   * raw provider input is decoded, and only while no display policy transforms
+   * or suppresses that input; otherwise streaming stops for the call.
+   */
+  private _streamSubagentAnswer(
+    toolCallId: string,
+    toolName: string,
+    argsTextDelta: unknown,
+    displayedDelta: unknown,
+  ): void {
+    const listener = this._subagentAnswerDeltaListener;
+    if (listener === undefined || toolName !== HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID) return;
+    let decoder = this._subagentAnswerDecoders.get(toolCallId);
+    if (decoder === null) return;
+    if (typeof argsTextDelta !== 'string' || displayedDelta !== argsTextDelta) {
+      this._subagentAnswerDecoders.set(toolCallId, null);
+      return;
+    }
+    if (decoder === undefined) {
+      decoder = new SubagentReportSummaryDecoder(MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES);
+      this._subagentAnswerDecoders.set(toolCallId, decoder);
+    }
+    const delta = decoder.push(argsTextDelta);
+    if (delta.length > 0) listener(delta, toolCallId);
+  }
+
+  /**
    * Translate a single fullStream chunk into the matching harness event(s).
    * Extracted from `_drainStreamToEvents` so the long-lived subscription
    * drain is the single consumer of chunks.
@@ -8760,6 +8802,7 @@ export class Session {
         const prev = this._toolInputBuffers.get(payload.toolCallId);
         const toolName = prev?.toolName ?? payload.toolName ?? '';
         const displayedDelta = harnessDisplayToolPayload(chunk.metadata, 'input-delta', payload.argsTextDelta);
+        this._streamSubagentAnswer(payload.toolCallId, toolName, payload.argsTextDelta, displayedDelta);
         this._toolInputBuffers.set(payload.toolCallId, {
           toolName,
           text: (prev?.text ?? '') + (typeof displayedDelta === 'string' ? displayedDelta : ''),
@@ -8769,6 +8812,7 @@ export class Session {
       case 'tool-call-input-streaming-end': {
         const payload = chunk.payload as { toolCallId: string };
         this._toolInputBuffers.delete(payload.toolCallId);
+        this._subagentAnswerDecoders.delete(payload.toolCallId);
         return;
       }
       case 'tool-call': {
@@ -8780,6 +8824,7 @@ export class Session {
           startedAt: Date.now(),
         });
         this._toolInputBuffers.delete(payload.toolCallId);
+        this._subagentAnswerDecoders.delete(payload.toolCallId);
         if (runId !== undefined) {
           // §10.2: project `input` to its JSON-safe replay shape AT EMIT so the
           // live subscriber and the durable/replayed row carry the identical

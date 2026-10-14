@@ -322,6 +322,23 @@ export function createSpawnSubagentTool(parent: Session) {
           }
         });
 
+        // PF-5620: the child's answer is the `summary` of its streaming
+        // `report_subagent_outcome` input. Forward its decoded characters as
+        // `subagent_answer_delta` until this spawn settles or is aborted.
+        let answerStreamOpen = true;
+        child._subagentAnswerDeltaListener = (delta, reportToolCallId) => {
+          if (!answerStreamOpen || ctx.abortSignal?.aborted === true) return;
+          parent._emitSubagentEvent({
+            type: 'subagent_answer_delta',
+            toolCallId,
+            subagentSessionId: child.id,
+            agentType,
+            innerToolCallId: reportToolCallId,
+            delta,
+            depth: childDepth,
+          });
+        };
+
         // Track the active subagent so `getDisplayState()` renders it.
 
         const activeMap = (parent as any)._activeSubagents as Map<
@@ -430,6 +447,8 @@ export function createSpawnSubagentTool(parent: Session) {
           isError = true;
           publicError = projectHarnessPublicError(err);
         } finally {
+          answerStreamOpen = false;
+          child._subagentAnswerDeltaListener = undefined;
           unsub();
           activeMap.delete(toolCallId);
           // Auto-close the subagent-tool child per §5.6, but never join a
