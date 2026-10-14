@@ -159,17 +159,6 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
     const ownerCalls: HarnessTerminalFinalizerInput[] = [];
     const owner = await harnessProcess('pf5566-owner', ownerAgent, recordingFinalizer(ownerCalls));
     abandoned.add(owner.harness);
-    // The early stage runs alongside the output processors: let it commit
-    // before the owner is treated as dead (bounded, so a build without it
-    // still reaches the assertions).
-    let stageCommitted!: () => void;
-    const staged = new Promise<void>(resolve => (stageCommitted = resolve));
-    const stage = owner.storage.stageTerminalCompletion.bind(owner.storage);
-    vi.spyOn(owner.storage, 'stageTerminalCompletion').mockImplementation(async input => {
-      const receipt = await stage(input);
-      stageCommitted();
-      return receipt;
-    });
     const session = await owner.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     void session
       .message({
@@ -180,7 +169,6 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
       } as never)
       .catch(() => {});
     await afterProvider;
-    await Promise.race([staged, new Promise(resolve => setTimeout(resolve, 2_000))]);
     expect(providerCalls.count).toBe(1);
 
     // The owner is gone; its lease and dispatch claim lapse.
@@ -226,6 +214,91 @@ describe('PF-5566 provider result recovery (PostgreSQL)', () => {
       signalId: admission!.signalId,
     });
     expect(evidence).toMatchObject({ status: 'completed', result: { text: REPLY } });
+  });
+
+  it('stages the provider result before a result processor persists the turn, so a crash after that write still recovers the reply', async () => {
+    let reachedAfterWrite!: () => void;
+    const afterWrite = new Promise<void>(resolve => (reachedAfterWrite = resolve));
+    let sessionId = '';
+    const observer = storeFor('pf5566-memory-writer');
+    await observer.init();
+    const memoryWrites: Array<{ stagedReply: unknown }> = [];
+    // Models memory persistence on its own connection: it durably records
+    // what the store held when it wrote, then the process dies.
+    const persistingMemory: Processor = {
+      id: 'persisting-memory',
+      processOutputResult: async () => {
+        const admission = await observer.stores.harness!.loadTerminalAdmission({
+          harnessName: 'default',
+          sessionId,
+          admissionId: 'pf5566-memory-turn',
+          executionGrant: { key: 'pf5566-memory-grant', generation: 1 },
+        });
+        const evidence = (await observer.stores.harness!.loadMessageResultEvidence({
+          harnessName: 'default',
+          sessionId,
+          resourceId: 'u3',
+          threadId: admission!.threadId,
+          signalId: admission!.signalId,
+        })) as { stagedResult?: { text?: unknown } } | null;
+        memoryWrites.push({ stagedReply: evidence?.stagedResult?.text });
+        reachedAfterWrite();
+        return await new Promise<never>(() => {});
+      },
+    };
+    const ownerAgent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'reply',
+      model: answeringModel({ count: 0 }) as never,
+      outputProcessors: [persistingMemory],
+    });
+    const owner = await harnessProcess('pf5566-memory-owner', ownerAgent, recordingFinalizer([]));
+    abandoned.add(owner.harness);
+    // A remote database: the staging transaction takes far longer than the
+    // processor's own write. The stage must still be durable first.
+    const stage = owner.storage.stageTerminalCompletion.bind(owner.storage);
+    vi.spyOn(owner.storage, 'stageTerminalCompletion').mockImplementation(async input => {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      return await stage(input);
+    });
+    const session = await owner.harness.session({ resourceId: 'u3', threadId: { fresh: true } });
+    sessionId = session.id;
+    void session
+      .message({
+        content: 'hi',
+        admissionId: 'pf5566-memory-turn',
+        executionAuthorityGrant: { key: 'pf5566-memory-grant', generation: 1 },
+        terminalAdmissionSeed: { v: 2 },
+      } as never)
+      .catch(() => {});
+    await afterWrite;
+    // The reply was durable for recovery before the processor's write.
+    expect(memoryWrites).toEqual([{ stagedReply: REPLY }]);
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+    const adopterCalls: HarnessTerminalFinalizerInput[] = [];
+    const adopter = await harnessProcess(
+      'pf5566-memory-adopter',
+      new Agent({
+        id: 'default',
+        name: 'default',
+        instructions: 'reply',
+        model: answeringModel({ count: 0 }) as never,
+      }),
+      recordingFinalizer(adopterCalls),
+    );
+    await adopter.harness.session({ sessionId: session.id, resourceId: 'u3' });
+    await expect(
+      adopter.storage.loadTerminalAdmission({
+        harnessName: 'default',
+        sessionId: session.id,
+        admissionId: 'pf5566-memory-turn',
+        executionGrant: { key: 'pf5566-memory-grant', generation: 1 },
+      }),
+    ).resolves.toMatchObject({ status: 'committed', terminalResult: { status: 'completed' } });
+    expect(adopterCalls.map(call => (call.fullOutput as { text?: unknown }).text)).toEqual([REPLY]);
   });
 
   it('completes a live turn normally when staging its provider result fails', async () => {

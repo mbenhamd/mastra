@@ -1346,18 +1346,15 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   );
                 }
 
-                // The provider's final output is known here, before output result
-                // processors (memory persistence), onFinish and the finish chunk.
-                // Its snapshot is taken synchronously; the listeners run alongside
-                // the output result processors and are awaited before anything
-                // resolves or delivers the run's completion.
-                const providerResultPublished = self.#publishProviderResult({
+                // The provider's final output is known here. Its listeners finish
+                // before output result processors run: those persist the turn
+                // (memory), and nothing may hold the reply durably before the
+                // listeners have staged it for recovery.
+                await self.#publishProviderResult({
                   response,
                   providerMetadata: finalProviderMetadata,
                   terminalToolResult: terminalCommit?.data,
                 });
-                const runsOutputResultProcessors = !!self.processorRunner && !self.#options.isLLMExecutionStep;
-                if (!runsOutputResultProcessors) await providerResultPublished;
 
                 if (self.processorRunner && !self.#options.isLLMExecutionStep) {
                   // Run output processors when NOT in LLM execution step context
@@ -1423,18 +1420,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                     );
                   }
 
-                  try {
-                    self.messageList = await self.processorRunner.runOutputProcessors(
-                      self.messageList,
-                      resolveObservabilityContext(options),
-                      self.#options.requestContext,
-                      0,
-                      outputResultWriter,
-                      outputResult,
-                    );
-                  } finally {
-                    await providerResultPublished;
-                  }
+                  self.messageList = await self.processorRunner.runOutputProcessors(
+                    self.messageList,
+                    resolveObservabilityContext(options),
+                    self.#options.requestContext,
+                    0,
+                    outputResultWriter,
+                    outputResult,
+                  );
 
                   // Get text from the final assistant turn. That turn can span more
                   // than one response message when the loop forced a continuation,
@@ -2407,15 +2400,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   /**
    * @internal Register a listener for the run's provider result: a
    * `FullOutput`-shaped snapshot of the final output as the provider finished
-   * it, taken at the final `finish` chunk before output result processors
-   * (memory persistence) run, and awaited before `onFinish` and the finish
-   * chunk's delivery. It fires
+   * it, awaited at the final `finish` chunk before output result processors
+   * (memory persistence), `onFinish`, and the finish chunk's delivery. It fires
    * at most once, only for a run that is still successful at that point, and a
-   * listener failure is logged without failing the run. Listeners run
-   * alongside the output result processors and are awaited before the run's
-   * completion resolves or is delivered. The snapshot is a detached JSON copy:
-   * it has no structured `object` and carries the text before output result
-   * processors.
+   * listener failure is logged without failing the run. The snapshot is a
+   * detached JSON copy: it has no structured `object` and carries the text
+   * before output result processors.
    * Returns `false` when the run's finish already started, so the caller must
    * rely on the completed output instead.
    */
@@ -2469,9 +2459,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       rememberedMessages: [],
       ...(input.terminalToolResult !== undefined ? { terminalToolResult: input.terminalToolResult } : {}),
     } satisfies FullOutput<OUTPUT>;
-    // Output result processors run alongside the listeners and mutate the step
-    // and message objects in place. Detach the snapshot first, in the JSON form
-    // storage persists anyway.
+    // Output result processors later mutate the step and message objects in
+    // place. Detach the snapshot, in the JSON form storage persists anyway.
     let result: FullOutput<OUTPUT>;
     try {
       result = JSON.parse(JSON.stringify(snapshot)) as FullOutput<OUTPUT>;

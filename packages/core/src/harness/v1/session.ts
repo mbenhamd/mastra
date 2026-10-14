@@ -1970,6 +1970,12 @@ export class Session {
   private readonly _recoveredRunPublications = new Map<string, Promise<void>>();
   /** Runs this process admitted under native terminal handoff. */
   private readonly _nativeTerminalRunIds = new Set<string>();
+  /**
+   * Pending terminal admissions known to this process, by run id, so staging a
+   * run's output is one storage transaction. Storage re-validates identity and
+   * status under its locks, so a stale entry only yields `not_pending`.
+   */
+  private readonly _terminalStagingAdmissions = new Map<string, HarnessTerminalAdmissionRecord>();
   /** Staging runs outside the message boundary that owns its failure observer. */
   private readonly _terminalStagingFailuresAwaitingObserver = new WeakSet<HarnessTerminalHandoffError>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
@@ -4055,6 +4061,7 @@ export class Session {
     if (swapped.applied) {
       this._terminalTokenAccountedRunIds.delete(runId);
       this._stagedTerminalRunIds.delete(runId);
+      this._terminalStagingAdmissions.delete(runId);
     }
     return swapped.applied;
   }
@@ -4202,6 +4209,7 @@ export class Session {
       if (admission.status === 'committed') {
         this._terminalTokenAccountedRunIds.delete(runId);
         this._stagedTerminalRunIds.delete(runId);
+        this._terminalStagingAdmissions.delete(runId);
       }
       return 'unowned';
     }
@@ -4288,6 +4296,7 @@ export class Session {
     if (receipt.status === 'committed') {
       this._terminalTokenAccountedRunIds.delete(runId);
       this._stagedTerminalRunIds.delete(runId);
+      this._terminalStagingAdmissions.delete(runId);
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
@@ -8333,24 +8342,32 @@ export class Session {
       return;
     }
     try {
+      const cached = this._terminalStagingAdmissions.get(runId);
       let admission: HarnessTerminalAdmissionRecord | null;
-      try {
-        admission = await this._storage.loadTerminalAdmissionByRun({
-          harnessName: this._record.harnessName,
-          sessionId: this.id,
-          sessionIncarnation,
-          runId,
-        });
-      } catch (error) {
-        if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
-        throw error;
+      if (cached !== undefined && cached.sessionIncarnation === sessionIncarnation) {
+        admission = cached;
+      } else {
+        try {
+          admission = await this._storage.loadTerminalAdmissionByRun({
+            harnessName: this._record.harnessName,
+            sessionId: this.id,
+            sessionIncarnation,
+            runId,
+          });
+        } catch (error) {
+          if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
+          throw error;
+        }
+        if (admission?.status === 'pending') this._terminalStagingAdmissions.set(runId, admission);
       }
       if (admission?.status === 'pending') {
         // A process may have died after settling a prior completion but
         // before its next session save removed that usage fence. Only
         // terminal canonical evidence retires a fence: a cancelled admission
-        // can leave its staged evidence pending for recovery.
-        for (const accountedRunId of this._terminalTokenAccountedRunIds) {
+        // can leave its staged evidence pending for recovery. A run already
+        // staged here (its provider result) has run this sweep.
+        const fencesToSweep = this._stagedTerminalRunIds.has(runId) ? [] : this._terminalTokenAccountedRunIds;
+        for (const accountedRunId of fencesToSweep) {
           if (accountedRunId === runId) continue;
           const prior = await this._storage.loadTerminalAdmissionByRun({
             harnessName: this._record.harnessName,
@@ -8373,6 +8390,7 @@ export class Session {
         }
         const receipt = await this._storage.stageTerminalCompletion({ identity: admission, result: full });
         if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
+        else this._terminalStagingAdmissions.delete(runId);
       }
     } catch (error) {
       // A provisional stage has no observer of its own; the completed-output
@@ -11549,6 +11567,7 @@ export class Session {
       );
     }
     this._nativeTerminalRunIds.add(identity.runId);
+    this._terminalStagingAdmissions.set(identity.runId, receipt.admission);
   }
 
   /**
@@ -11724,6 +11743,7 @@ export class Session {
       };
       this._terminalTokenAccountedRunIds.delete(identity.runId);
       this._stagedTerminalRunIds.delete(identity.runId);
+      this._terminalStagingAdmissions.delete(identity.runId);
       this._nativeTerminalRunIds.delete(identity.runId);
       try {
         options.onReceipt?.(receipt);
@@ -11894,6 +11914,7 @@ export class Session {
     if (receipt.status === 'committed' || receipt.status === 'duplicate') {
       this._terminalTokenAccountedRunIds.delete(identity.runId);
       this._stagedTerminalRunIds.delete(identity.runId);
+      this._terminalStagingAdmissions.delete(identity.runId);
       this._nativeTerminalRunIds.delete(identity.runId);
     }
     try {
@@ -16754,7 +16775,10 @@ export class Session {
       }
       // A pending native admission resumes here: its completed output must
       // stage fail-closed on every completion path.
-      if (boundAdmission?.status === 'pending') this._nativeTerminalRunIds.add(pending.runId);
+      if (boundAdmission?.status === 'pending') {
+        this._nativeTerminalRunIds.add(pending.runId);
+        this._terminalStagingAdmissions.set(pending.runId, boundAdmission);
+      }
     }
 
     // Mark resumed under the lease BEFORE calling the agent (idempotency
