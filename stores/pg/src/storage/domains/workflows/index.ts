@@ -4760,7 +4760,15 @@ export class WorkflowsPG extends WorkflowsStorage {
     const columns = getSchemaSnapshot(this.#db.client, this.#schema)?.columns.get(TABLE_WORKFLOW_PARENT_REVISIONS);
     if (!columns?.has(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN)) {
       await this.#db.client.none(WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(this.#schema));
+      // Record the column with its type: the migration shape check reads both
+      // from the init snapshot on the next init.
       this.#db.noteColumnAdded(TABLE_WORKFLOW_PARENT_REVISIONS, WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN);
+      const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
+      if (snapshot) {
+        const types = snapshot.columnTypes.get(TABLE_WORKFLOW_PARENT_REVISIONS) ?? new Map<string, string>();
+        types.set(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN, 'bigint');
+        snapshot.columnTypes.set(TABLE_WORKFLOW_PARENT_REVISIONS, types);
+      }
     }
     this.#workflowParentRevisionHandoffHwmColumnVerified = true;
   }
