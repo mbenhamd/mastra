@@ -2436,6 +2436,54 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  /**
+   * Whether any recursively linked child (through parent effects or recovery
+   * ancestry) lacks a completed terminal journal. Missing journals count as
+   * pending, so cleanup of the ancestor fails closed.
+   */
+  private async hasPendingTerminalDependents(t: TxClient, workflowName: string, runId: string): Promise<boolean> {
+    const dependencyState = await t.one<{ pending: boolean }>(
+      `WITH RECURSIVE descendants(workflow_name, run_id) AS (
+           SELECT child.workflow_name, child.run_id
+           FROM (
+             SELECT effect.workflow_name, effect.run_id
+             FROM ${this.terminalEffectTableName()} AS effect
+             WHERE effect.effect_kind = 'parent-workflow-step-end'
+               AND effect.parent_workflow_name = $1 AND effect.parent_run_id = $2
+             UNION
+             SELECT ancestry.workflow_name, ancestry.run_id
+             FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
+             WHERE ancestry.immediate_parent_workflow_name = $1
+               AND ancestry.immediate_parent_run_id = $2
+           ) AS child
+           UNION
+           SELECT child.workflow_name, child.run_id
+           FROM descendants AS parent
+           CROSS JOIN LATERAL (
+             SELECT effect.workflow_name, effect.run_id
+             FROM ${this.terminalEffectTableName()} AS effect
+             WHERE effect.effect_kind = 'parent-workflow-step-end'
+               AND effect.parent_workflow_name = parent.workflow_name
+               AND effect.parent_run_id = parent.run_id
+             UNION
+             SELECT ancestry.workflow_name, ancestry.run_id
+             FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
+             WHERE ancestry.immediate_parent_workflow_name = parent.workflow_name
+               AND ancestry.immediate_parent_run_id = parent.run_id
+           ) AS child
+         )
+         SELECT EXISTS (
+           SELECT 1
+           FROM descendants AS child
+           LEFT JOIN ${this.terminalizationTableName()} AS journal
+             ON journal.workflow_name = child.workflow_name AND journal.run_id = child.run_id
+           WHERE journal.phase IS DISTINCT FROM 'complete'
+         ) AS pending`,
+      [workflowName, runId],
+    );
+    return dependencyState.pending;
+  }
+
   async deleteCompletedWorkflowTerminalizations(
     input: DeleteCompletedWorkflowTerminalizationsInput,
   ): Promise<DeleteCompletedWorkflowTerminalizationsResult> {
@@ -2462,46 +2510,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         // ancestry edge exists before a child journal/effect and closes the
         // crash window where parent recovery evidence could otherwise be
         // deleted while a nested child is only partially admitted.
-        const dependencyState = await t.one<{ pending: boolean }>(
-          `WITH RECURSIVE descendants(workflow_name, run_id) AS (
-             SELECT child.workflow_name, child.run_id
-             FROM (
-               SELECT effect.workflow_name, effect.run_id
-               FROM ${this.terminalEffectTableName()} AS effect
-               WHERE effect.effect_kind = 'parent-workflow-step-end'
-                 AND effect.parent_workflow_name = $1 AND effect.parent_run_id = $2
-               UNION
-               SELECT ancestry.workflow_name, ancestry.run_id
-               FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
-               WHERE ancestry.immediate_parent_workflow_name = $1
-                 AND ancestry.immediate_parent_run_id = $2
-             ) AS child
-             UNION
-             SELECT child.workflow_name, child.run_id
-             FROM descendants AS parent
-             CROSS JOIN LATERAL (
-               SELECT effect.workflow_name, effect.run_id
-               FROM ${this.terminalEffectTableName()} AS effect
-               WHERE effect.effect_kind = 'parent-workflow-step-end'
-                 AND effect.parent_workflow_name = parent.workflow_name
-                 AND effect.parent_run_id = parent.run_id
-               UNION
-               SELECT ancestry.workflow_name, ancestry.run_id
-               FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
-               WHERE ancestry.immediate_parent_workflow_name = parent.workflow_name
-                 AND ancestry.immediate_parent_run_id = parent.run_id
-             ) AS child
-           )
-           SELECT EXISTS (
-             SELECT 1
-             FROM descendants AS child
-             LEFT JOIN ${this.terminalizationTableName()} AS journal
-               ON journal.workflow_name = child.workflow_name AND journal.run_id = child.run_id
-             WHERE journal.phase IS DISTINCT FROM 'complete'
-           ) AS pending`,
-          [operation.workflowName, operation.runId],
-        );
-        if (dependencyState.pending) return { status: 'deleted', count: 0 };
+        const pending = await this.hasPendingTerminalDependents(t, operation.workflowName, operation.runId);
+        if (pending) return { status: 'deleted', count: 0 };
 
         const revision = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
         if (!revision) {
@@ -5990,6 +6000,9 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (journal && journal.phase !== 'complete' && journal.owner_id !== null && journal.lease_live) {
           return { status: 'active' };
         }
+        // A nested child that has not completed its terminal journal still
+        // needs this run's parent state; erase children first.
+        if (await this.hasPendingTerminalDependents(t, workflowName, runId)) return { status: 'active' };
 
         // Leaves first and the journal last, as completed-journal cleanup does.
         let terminalRows = 0;

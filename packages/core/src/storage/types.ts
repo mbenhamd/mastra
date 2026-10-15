@@ -290,8 +290,10 @@ export interface DeleteWorkflowRunClosureInput {
  * - `fenced`: the handoff is pending and unreleased; its owner is still
  *   writing the run. Retry after the handoff completes or is released.
  * - `active`: the snapshot status is not settled (`success`, `failed`,
- *   `canceled`, `tripwire`, `bailed`, `skipped`), or a terminalization owner
- *   still holds a live lease on the journal. Retry later.
+ *   `canceled`, `tripwire`, `bailed`, `skipped`), a terminalization owner
+ *   still holds a live lease on the journal, or a nested child run (linked
+ *   by a parent effect or recovery ancestry) has not completed its terminal
+ *   journal. Retry later; erase child runs first.
  * - `deleted`: the closure is gone; `removed` counts what this call deleted.
  * - `unsupported`: the adapter does not implement `closureDeleteVersion: 1`.
  */

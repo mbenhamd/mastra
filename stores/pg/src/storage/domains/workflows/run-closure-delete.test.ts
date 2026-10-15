@@ -199,6 +199,16 @@ describe('WorkflowsPG run closure delete', () => {
       mastra_workflow_terminal_destination_receipts_v2: 1,
       mastra_workflow_terminal_recovery_ancestries: 1,
     });
+    // The settled parent still owes the child's unfinished terminal journal its state.
+    const parentSnapshot = (await workflows.loadWorkflowSnapshot(parent))!;
+    await workflows.persistWorkflowSnapshot({
+      ...parent,
+      resourceId: resource,
+      snapshot: { ...parentSnapshot, status: 'failed' },
+    });
+    await expect(workflows.deleteWorkflowRunClosure({ ...parent, expectedResourceId: resource })).resolves.toEqual({
+      status: 'active',
+    });
     const revisionBefore = Number((await parentRevision(run))!.generation);
 
     await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toEqual({
@@ -213,6 +223,10 @@ describe('WorkflowsPG run closure delete', () => {
     await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toEqual({
       status: 'missing',
     });
+    // With the child erased, the parent's closure goes too.
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...parent, expectedResourceId: resource }),
+    ).resolves.toMatchObject({ status: 'deleted' });
   });
 
   it('finds and erases a delivered handoff whose snapshot was already deleted', async () => {

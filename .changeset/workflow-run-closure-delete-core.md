@@ -27,7 +27,7 @@ do {
   - `missing`: nothing is stored for the run (an idempotent no-op);
   - `resource_mismatch`: the snapshot, handoff or terminal snapshot records another resource, or none;
   - `fenced`: the handoff is pending and unreleased (a completed handoff does not fence erasure, released or not);
-  - `active`: the snapshot status is not settled (`success`, `failed`, `canceled`, `tripwire`, `bailed`, `skipped`), or a terminalization owner holds a live lease;
+  - `active`: the snapshot status is not settled (`success`, `failed`, `canceled`, `tripwire`, `bailed`, `skipped`), a terminalization owner holds a live lease, or a nested child run has not completed its terminal journal (erase child runs first);
   - `deleted`, with `removed: { snapshot, handoff, terminalRows }`;
   - `unsupported`, from adapters without the capability.
 - **Listing.** `listWorkflowRunClosuresByResource` pages runs by `(workflowName, runId)` in code-point order and returns each run once, with flags for which rows matched: `snapshot`, `terminalSnapshot`, and `handoff: { status, released }`. Released handoffs are included, so it finds a delivered handoff whose snapshot was already deleted. `limit` is required (1 to 100).

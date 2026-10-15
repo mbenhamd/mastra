@@ -2056,6 +2056,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     ) {
       return { status: 'active' };
     }
+    // A nested child that has not completed its terminal journal still needs
+    // this run's parent state; erase children first.
+    if (this.hasPendingTerminalDependents(workflowName, runId)) return { status: 'active' };
 
     // Leaves first and the journal last, as completed-journal cleanup does.
     for (const planKey of planKeys) this.db.workflowTerminalContinuationPlans.delete(planKey);
