@@ -77,6 +77,9 @@ import {
   validateWorkflowSnapshotHandoffFence,
   validateWorkflowSnapshotHandoffIdentity,
   validateWorkflowSnapshotHandoffLimit,
+  validateWorkflowRunClosureIdentity,
+  validateWorkflowRunClosureListInput,
+  isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
 } from '@mastra/core/storage';
@@ -149,6 +152,11 @@ import type {
   ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
+  DeleteWorkflowRunClosureInput,
+  DeleteWorkflowRunClosureResult,
+  ListWorkflowRunClosuresByResourceInput,
+  ListWorkflowRunClosuresByResourceResult,
+  WorkflowRunClosureEntry,
   WorkflowTerminalRecoveryAncestryRecord,
   TABLE_NAMES,
   PruneOptions,
@@ -310,6 +318,14 @@ function workflowSnapshotCreatedAtIndexName(schemaPrefix: string): string {
   return truncateIdentifierWithHash(`${schemaPrefix}${WORKFLOW_SNAPSHOT_CREATEDAT_INDEX}`.toLowerCase());
 }
 
+/** Base name (before any schema prefix) of the `("resourceId", workflow_name, run_id)` snapshot index. */
+const WORKFLOW_SNAPSHOT_RESOURCE_INDEX = 'mastra_workflow_snapshot_resource_run_idx';
+
+/** Schema-prefixed name of the resource snapshot index, normalized like the createdAt index. */
+function workflowSnapshotResourceIndexName(schemaPrefix: string): string {
+  return truncateIdentifierWithHash(`${schemaPrefix}${WORKFLOW_SNAPSHOT_RESOURCE_INDEX}`.toLowerCase());
+}
+
 /** Base name (before any schema prefix) of the expression index backing the status filter. */
 const WORKFLOW_SNAPSHOT_STATUS_INDEX = 'mastra_workflow_snapshot_name_status_createdat_idx';
 
@@ -447,7 +463,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1 };
+    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1, closureDeleteVersion: 1 };
   }
 
   private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
@@ -3343,6 +3359,23 @@ export class WorkflowsPG extends WorkflowsStorage {
         table: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
         columns: ['status', 'updated_at', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
       },
+      // Resource indexes back listWorkflowRunClosuresByResource's keyset scan
+      // and any resource-scoped lookup of a run's closure rows.
+      {
+        name: workflowSnapshotResourceIndexName(schemaPrefix),
+        table: TABLE_WORKFLOW_SNAPSHOT,
+        columns: ['resourceId', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
+      },
+      {
+        name: 'mastra_workflow_snapshot_handoffs_resource_idx',
+        table: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
+        columns: ['resource_id', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
+      },
+      {
+        name: 'mastra_workflow_terminal_snapshots_v2_resource_idx',
+        table: TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
+        columns: ['resource_id', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
+      },
     ];
   }
 
@@ -5796,6 +5829,172 @@ export class WorkflowsPG extends WorkflowsStorage {
       ...(hasMore && last
         ? { nextCursor: { updatedAt: last.updatedAt, workflowName: last.workflowName, runId: last.runId } }
         : {}),
+    };
+  }
+
+  async deleteWorkflowRunClosure(input: DeleteWorkflowRunClosureInput): Promise<DeleteWorkflowRunClosureResult> {
+    const { workflowName, runId, expectedResourceId } = input;
+    validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    const identity = [workflowName, runId];
+    try {
+      return await this.#db.client.tx(async t => {
+        // The terminal journal's advisory lock first, so journal writers (which
+        // take it before their row locks) never interleave. Then the usual
+        // order: parent revision, handoff row, run snapshot.
+        await t.none(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [JSON.stringify(identity)]);
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        const handoff = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
+        const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
+        const snapshot = await t.oneOrNone<{ resource_id: string | null; status: string | null }>(
+          `SELECT "resourceId" AS resource_id,
+                  ${this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot')} AS status
+           FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const journal = await t.oneOrNone<{ phase: string; owner_id: string | null; lease_live: boolean }>(
+          `SELECT phase, owner_id,
+                  COALESCE(lease_expires_at > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint, FALSE)
+                    AS lease_live
+           FROM ${this.terminalizationTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const terminalSnapshot = await t.oneOrNone<{ resource_id: string | null }>(
+          `SELECT resource_id FROM ${this.terminalSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const dependents = await t.one<{ count: string }>(
+          `SELECT (
+             (SELECT count(*) FROM ${this.terminalContinuationPlanTableName()} WHERE workflow_name = $1 AND run_id = $2)
+             + (SELECT count(*) FROM ${this.terminalDestinationReceiptTableName()} WHERE workflow_name = $1 AND run_id = $2)
+             + (SELECT count(*) FROM ${this.terminalEffectTableName()} WHERE workflow_name = $1 AND run_id = $2)
+             + (SELECT count(*) FROM ${this.terminalRecoveryAncestryTableName()} WHERE workflow_name = $1 AND run_id = $2)
+           )::text AS count`,
+          identity,
+        );
+        const hasTerminalRows = journal !== null || terminalSnapshot !== null || Number(dependents.count) > 0;
+        if (!snapshot && !handoff && !hasTerminalRows) return { status: 'missing' };
+
+        const owners = [
+          snapshot?.resource_id,
+          handoff ? (handoff.resourceId ?? null) : undefined,
+          terminalSnapshot?.resource_id,
+        ].filter(owner => owner !== undefined);
+        if (owners.length === 0 || owners.some(owner => owner !== expectedResourceId)) {
+          return { status: 'resource_mismatch' };
+        }
+        if (handoff && handoff.status === 'pending' && handoff.releasedAt === undefined) return { status: 'fenced' };
+        if (snapshot && !isSettledWorkflowRunStatus(snapshot.status)) return { status: 'active' };
+        if (journal && journal.phase !== 'complete' && journal.owner_id !== null && journal.lease_live) {
+          return { status: 'active' };
+        }
+
+        // Leaves first and the journal last, as completed-journal cleanup does.
+        let terminalRows = 0;
+        for (const table of [
+          this.terminalContinuationPlanTableName(),
+          this.terminalDestinationReceiptTableName(),
+          this.terminalEffectTableName(),
+          this.terminalSnapshotTableName(),
+          this.terminalRecoveryAncestryTableName(),
+          this.terminalizationTableName(),
+        ]) {
+          const result = await t.query(`DELETE FROM ${table} WHERE workflow_name = $1 AND run_id = $2`, identity);
+          terminalRows += result.rowCount ?? 0;
+        }
+        const handoffDeleted = await t.query(
+          `DELETE FROM ${this.workflowSnapshotHandoffTableName()} WHERE workflow_name = $1 AND run_id = $2`,
+          identity,
+        );
+        // Deletes the snapshot and bumps the kept parent revision, the
+        // content-free run-id reuse fence, exactly as deleteWorkflowRunById.
+        const snapshotDeleted = await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision);
+        return {
+          status: 'deleted',
+          removed: { snapshot: snapshotDeleted, handoff: (handoffDeleted.rowCount ?? 0) > 0, terminalRows },
+        };
+      });
+    } catch (error) {
+      throw this.snapshotHandoffError('DELETE_WORKFLOW_RUN_CLOSURE', workflowName, runId, error);
+    }
+  }
+
+  async listWorkflowRunClosuresByResource(
+    input: ListWorkflowRunClosuresByResourceInput,
+  ): Promise<ListWorkflowRunClosuresByResourceResult> {
+    const limit = validateWorkflowRunClosureListInput(input);
+    const { resourceId, after } = input;
+    const values: unknown[] = [resourceId];
+    let keyset = '';
+    if (after) {
+      values.push(after.workflowName, after.runId);
+      keyset = `AND (workflow_name COLLATE "C", run_id COLLATE "C") > ($2, $3)`;
+    }
+    values.push(limit + 1);
+    const limitParam = `$${values.length}`;
+    // Each branch is an index-ordered keyset scan; the page's first limit + 1
+    // runs are always within each branch's first limit + 1 rows.
+    const branch = (table: string, resourceColumn: string, columns: string) =>
+      `(SELECT workflow_name, run_id, ${columns} FROM ${table}
+        WHERE ${resourceColumn} = $1 ${keyset}
+        ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
+        LIMIT ${limitParam})`;
+    let rows: Array<{
+      workflow_name: string;
+      run_id: string;
+      snapshot: boolean;
+      terminal_snapshot: boolean;
+      handoff_status: string | null;
+      handoff_released: boolean | null;
+    }>;
+    try {
+      await this.assertWorkflowSnapshotHandoffReleaseColumns(this.#db.client);
+      rows = await this.#db.client.any(
+        `SELECT workflow_name, run_id,
+                bool_or(snapshot) AS snapshot,
+                bool_or(terminal_snapshot) AS terminal_snapshot,
+                max(handoff_status) AS handoff_status,
+                bool_or(handoff_released) AS handoff_released
+         FROM (
+           ${branch(this.workflowSnapshotTableName(), '"resourceId"', 'TRUE AS snapshot, FALSE AS terminal_snapshot, NULL::text AS handoff_status, NULL::boolean AS handoff_released')}
+           UNION ALL
+           ${branch(this.terminalSnapshotTableName(), 'resource_id', 'FALSE, TRUE, NULL::text, NULL::boolean')}
+           UNION ALL
+           ${branch(this.workflowSnapshotHandoffTableName(), 'resource_id', 'FALSE, FALSE, status, released_at IS NOT NULL')}
+         ) AS matches
+         GROUP BY workflow_name, run_id
+         ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
+         LIMIT ${limitParam}`,
+        values,
+      );
+    } catch (error) {
+      throw this.snapshotHandoffError('LIST_WORKFLOW_RUN_CLOSURES_BY_RESOURCE', undefined, undefined, error, {
+        write: false,
+      });
+    }
+    const closures = rows.slice(0, limit).map((row): WorkflowRunClosureEntry => {
+      if (row.handoff_status !== null && row.handoff_status !== 'pending' && row.handoff_status !== 'completed') {
+        throw new TypeError('Invalid workflow snapshot handoff status');
+      }
+      return {
+        workflowName: row.workflow_name,
+        runId: row.run_id,
+        snapshot: row.snapshot,
+        terminalSnapshot: row.terminal_snapshot,
+        ...(row.handoff_status === null
+          ? {}
+          : { handoff: { status: row.handoff_status, released: row.handoff_released === true } }),
+      };
+    });
+    const hasMore = rows.length > limit;
+    const last = closures.at(-1);
+    return {
+      status: 'listed',
+      closures,
+      hasMore,
+      ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
     };
   }
 

@@ -84,6 +84,11 @@ import type {
   ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
+  DeleteWorkflowRunClosureInput,
+  DeleteWorkflowRunClosureResult,
+  ListWorkflowRunClosuresByResourceInput,
+  ListWorkflowRunClosuresByResourceResult,
+  WorkflowRunClosureEntry,
   WorkflowExecutionState,
   UpdateWorkflowResultsResult,
 } from '../../types';
@@ -107,6 +112,10 @@ import {
   validateWorkflowSnapshotHandoffLimit,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
+  compareWorkflowRunClosureCursors,
+  isSettledWorkflowRunStatus,
+  validateWorkflowRunClosureIdentity,
+  validateWorkflowRunClosureListInput,
 } from '../../workflow-snapshot-handoff';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
@@ -538,7 +547,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1 };
+    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1, closureDeleteVersion: 1 };
   }
 
   private getWorkflowSnapshotHandoff(workflowName: string, runId: string): WorkflowSnapshotHandoffRecord | undefined {
@@ -1983,6 +1992,117 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       ...(hasMore && last
         ? { nextCursor: { updatedAt: last.updatedAt, workflowName: last.workflowName, runId: last.runId } }
         : {}),
+    };
+  }
+
+  async deleteWorkflowRunClosure(input: DeleteWorkflowRunClosureInput): Promise<DeleteWorkflowRunClosureResult> {
+    const { workflowName, runId, expectedResourceId } = input;
+    validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    const key = this.getWorkflowKey(workflowName, runId);
+    const belongsToRun = (record: { workflowName: string; runId: string }) =>
+      record.workflowName === workflowName && record.runId === runId;
+    // Everything below runs synchronously, so no other call interleaves
+    // between the checks and the deletes.
+    const run = this.db.workflows.get(key);
+    const handoff = this.db.workflowSnapshotHandoffs.get(key);
+    const journal = this.db.workflowTerminalizations.get(key);
+    const terminalSnapshot = this.db.workflowTerminalSnapshots.get(key);
+    const effectKeys = [...this.db.workflowTerminalEffects]
+      .filter(([, effect]) => belongsToRun(effect))
+      .map(([k]) => k);
+    const receiptKeys = [...this.db.workflowTerminalDestinationReceipts]
+      .filter(([, receipt]) => belongsToRun(receipt))
+      .map(([k]) => k);
+    const planKeys = [...this.db.workflowTerminalContinuationPlans]
+      .filter(([, plan]) => belongsToRun(plan))
+      .map(([k]) => k);
+    const hasAncestry = this.db.workflowTerminalRecoveryAncestries.has(key);
+    const terminalRows =
+      (journal ? 1 : 0) +
+      (terminalSnapshot ? 1 : 0) +
+      (hasAncestry ? 1 : 0) +
+      effectKeys.length +
+      receiptKeys.length +
+      planKeys.length;
+    if (!run && !handoff && terminalRows === 0) return { status: 'missing' };
+
+    const owners = [run, handoff, terminalSnapshot].filter(row => row !== undefined);
+    if (owners.length === 0 || owners.some(row => row.resourceId !== expectedResourceId)) {
+      return { status: 'resource_mismatch' };
+    }
+    if (handoff && handoff.status === 'pending' && handoff.releasedAt === undefined) return { status: 'fenced' };
+    if (run) {
+      const snapshot = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
+      if (!isSettledWorkflowRunStatus(snapshot?.status)) return { status: 'active' };
+    }
+    if (
+      journal &&
+      journal.phase !== 'complete' &&
+      journal.ownerId !== undefined &&
+      (journal.leaseExpiresAt ?? 0) > Date.now()
+    ) {
+      return { status: 'active' };
+    }
+
+    // Leaves first and the journal last, as completed-journal cleanup does.
+    for (const planKey of planKeys) this.db.workflowTerminalContinuationPlans.delete(planKey);
+    for (const receiptKey of receiptKeys) this.db.workflowTerminalDestinationReceipts.delete(receiptKey);
+    for (const effectKey of effectKeys) this.db.workflowTerminalEffects.delete(effectKey);
+    this.db.workflowTerminalSnapshots.delete(key);
+    this.db.workflowTerminalRecoveryAncestries.delete(key);
+    this.db.workflowTerminalizations.delete(key);
+    this.db.workflowSnapshotHandoffs.delete(key);
+    const snapshotDeleted = this.db.workflows.delete(key);
+    // Keep the parent revision as the content-free run-id reuse fence and
+    // bump it, as deleteWorkflowRunById does, so a recreated run cannot make
+    // an older parent context current again.
+    if (snapshotDeleted) this.bumpParentRevision(key);
+    return {
+      status: 'deleted',
+      removed: { snapshot: snapshotDeleted, handoff: handoff !== undefined, terminalRows },
+    };
+  }
+
+  async listWorkflowRunClosuresByResource(
+    input: ListWorkflowRunClosuresByResourceInput,
+  ): Promise<ListWorkflowRunClosuresByResourceResult> {
+    const limit = validateWorkflowRunClosureListInput(input);
+    const { resourceId, after } = input;
+    const entries = new Map<string, WorkflowRunClosureEntry>();
+    const entryFor = (workflowName: string, runId: string): WorkflowRunClosureEntry => {
+      const key = this.getWorkflowKey(workflowName, runId);
+      let entry = entries.get(key);
+      if (!entry) {
+        entry = { workflowName, runId, snapshot: false, terminalSnapshot: false };
+        entries.set(key, entry);
+      }
+      return entry;
+    };
+    for (const run of this.db.workflows.values()) {
+      if (run.resourceId === resourceId) entryFor(run.workflow_name, run.run_id).snapshot = true;
+    }
+    for (const record of this.db.workflowTerminalSnapshots.values()) {
+      if (record.resourceId === resourceId) entryFor(record.workflowName, record.runId).terminalSnapshot = true;
+    }
+    for (const record of this.db.workflowSnapshotHandoffs.values()) {
+      if (record.resourceId === resourceId) {
+        entryFor(record.workflowName, record.runId).handoff = {
+          status: record.status,
+          released: record.releasedAt !== undefined,
+        };
+      }
+    }
+    const ordered = [...entries.values()]
+      .sort(compareWorkflowRunClosureCursors)
+      .filter(entry => !after || compareWorkflowRunClosureCursors(entry, after) > 0);
+    const closures = ordered.slice(0, limit);
+    const hasMore = ordered.length > limit;
+    const last = closures.at(-1);
+    return {
+      status: 'listed',
+      closures,
+      hasMore,
+      ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
     };
   }
 

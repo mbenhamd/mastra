@@ -276,3 +276,62 @@ export function validateWorkflowSnapshotHandoffLimit(limit: number | undefined):
   }
   return resolved;
 }
+
+/** Snapshot statuses after which a run takes no further native steps. */
+export const SETTLED_WORKFLOW_RUN_STATUSES = [
+  'success',
+  'failed',
+  'canceled',
+  'tripwire',
+  'bailed',
+  'skipped',
+] as const;
+
+export function isSettledWorkflowRunStatus(status: unknown): boolean {
+  return (SETTLED_WORKFLOW_RUN_STATUSES as readonly unknown[]).includes(status);
+}
+
+/** Validates a closure erasure's identity and resource before any read. */
+export function validateWorkflowRunClosureIdentity(workflowName: string, runId: string, resourceId: string): void {
+  if (typeof workflowName !== 'string' || workflowName.length === 0) {
+    throw new TypeError('Workflow run closure workflowName must be a non-empty string');
+  }
+  if (typeof runId !== 'string' || runId.length === 0) {
+    throw new TypeError('Workflow run closure runId must be a non-empty string');
+  }
+  if (typeof resourceId !== 'string' || resourceId.length === 0) {
+    throw new TypeError('Workflow run closure resourceId must be a non-empty string');
+  }
+  validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
+}
+
+/** Validates a closure listing and returns its limit. */
+export function validateWorkflowRunClosureListInput(input: {
+  resourceId: string;
+  after?: { workflowName: string; runId: string };
+  limit: number;
+}): number {
+  const { resourceId, after, limit } = input;
+  if (typeof resourceId !== 'string' || resourceId.length === 0) {
+    throw new TypeError('Workflow run closure resourceId must be a non-empty string');
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new RangeError('Workflow run closure limit must be between 1 and 100');
+  }
+  if (after !== undefined && (typeof after.workflowName !== 'string' || typeof after.runId !== 'string')) {
+    throw new TypeError('Workflow run closure cursor must carry workflowName and runId strings');
+  }
+  validateWorkflowSnapshotHandoffIdentity(after?.workflowName ?? '', after?.runId ?? '', resourceId);
+  return limit;
+}
+
+/** Orders closure cursors by code point, matching PostgreSQL's `COLLATE "C"` keyset. */
+export function compareWorkflowRunClosureCursors(
+  left: { workflowName: string; runId: string },
+  right: { workflowName: string; runId: string },
+): number {
+  return (
+    compareWorkflowSnapshotHandoffText(left.workflowName, right.workflowName) ||
+    compareWorkflowSnapshotHandoffText(left.runId, right.runId)
+  );
+}
