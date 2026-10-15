@@ -61,7 +61,10 @@ Returns: `Promise<DeleteWorkflowRunClosureResult>`. The checks run in this order
 - `deleted`: the closure is gone. `removed` reports `{ snapshot, handoff, terminalRows }`.
 - `unsupported`: the store doesn't implement closure erasure.
 
-The run's content-free parent revision is kept as the run-id reuse fence. If the same run id is used again later, its next handoff claim starts above the erased claims. A delayed `releaseWorkflowSnapshotHandoff` from the erased run then answers `conflict` and changes nothing. A delayed terminal recovery-ancestry write for the erased run answers `missing_run` and writes nothing.
+The run's content-free parent revision is kept as the run-id reuse fence, with the erased run's terminal status cleared so a reused run id can run again. Late writers from the erased run change nothing:
+
+- A delayed `releaseWorkflowSnapshotHandoff` answers `missing` while the run has no handoff. Once the same run id is used again, its next handoff claim starts above the erased claims, so the delayed release answers `conflict`.
+- A delayed terminal recovery-ancestry write answers `missing_run` until the run id is used again.
 
 ## `listWorkflowRunClosuresByResource(input)`
 

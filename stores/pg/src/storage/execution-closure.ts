@@ -1434,14 +1434,16 @@ function applyImportTransforms(
 /**
  * Reject payload values the destination's readers would refuse later, so a
  * successful import never leaves a run unusable. The handoff claim
- * high-water mark must be absent or a positive safe integer.
+ * high-water mark must be absent or a positive integer below
+ * `Number.MAX_SAFE_INTEGER`.
  */
 function assertClosureRowInvariants(tableName: ExecutionClosureTableName, applied: Record<string, unknown>): void {
   if (tableName !== 'mastra_workflow_parent_revisions') return;
   const hwm = applied.handoff_claim_generation_hwm;
   if (hwm === undefined || hwm === null) return;
   const value = typeof hwm === 'string' && /^[0-9]+$/.test(hwm) ? Number(hwm) : hwm;
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+  // The next handoff claim is hwm + 1, which must stay a safe integer.
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value >= Number.MAX_SAFE_INTEGER) {
     throw closureError(
       'IMPORT_EXECUTION_CLOSURE',
       'INVALID_ROW_VALUE',

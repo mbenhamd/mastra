@@ -1052,7 +1052,10 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
     if (!row || row.hwm === null) return 0;
     const hwm = typeof row.hwm === 'string' ? Number(row.hwm) : row.hwm;
-    if (!Number.isSafeInteger(hwm) || hwm < 1) throw new TypeError('Invalid workflow handoff claim high-water mark');
+    // The next claim is hwm + 1, which must stay a safe integer.
+    if (!Number.isSafeInteger(hwm) || hwm < 1 || hwm >= Number.MAX_SAFE_INTEGER) {
+      throw new TypeError('Invalid workflow handoff claim high-water mark');
+    }
     return hwm;
   }
 
@@ -6064,6 +6067,16 @@ export class WorkflowsPG extends WorkflowsStorage {
         // Deletes the snapshot and bumps the kept parent revision, the
         // content-free run-id reuse fence, exactly as deleteWorkflowRunById.
         const snapshotDeleted = await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision);
+        // The erased lifetime's terminal latch must not carry over: a reused
+        // run id starts running again. The generation still moves forward.
+        await t.none(
+          `UPDATE ${this.workflowParentRevisionTableName()}
+           SET terminal_status = NULL,
+               generation = generation + $3,
+               updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+           WHERE workflow_name = $1 AND run_id = $2 AND terminal_status IS NOT NULL`,
+          [workflowName, runId, snapshotDeleted ? 0 : 1],
+        );
         return {
           status: 'deleted',
           removed: { snapshot: snapshotDeleted, handoff: (handoffDeleted.rowCount ?? 0) > 0, terminalRows },

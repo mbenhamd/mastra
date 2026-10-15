@@ -31,6 +31,7 @@ do {
   - `deleted`, with `removed: { snapshot, handoff, terminalRows }`;
   - `unsupported`, from adapters without the capability.
 - **Listing.** `listWorkflowRunClosuresByResource` pages runs by `(workflowName, runId)` in code-point order and returns each run once, with flags for which rows matched: `snapshot`, `terminalSnapshot`, and `handoff: { status, released }`. Released handoffs are included, so it finds a delivered handoff whose snapshot was already deleted. `limit` is required (1 to 100).
-- **Late writers.** A delayed release or recovery-ancestry write from an erased run answers `conflict` or `missing_run` and writes nothing.
+- **Late writers.** A delayed `releaseWorkflowSnapshotHandoff` from an erased run answers `missing` while the run has no handoff, and `conflict` once a new claim of a reused run id holds the row; either way nothing changes. A delayed recovery-ancestry write for an erased run answers `missing_run` and writes nothing.
+- **Run-id reuse.** The erased run's terminal status is cleared, so a reused run id starts running again.
 - **Docs.** See the new *Workflow run closure* storage reference page.
 - **Capability.** Adapters that implement both report `closureDeleteVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. The in-memory store supports it; the base class answers `unsupported` for both methods and never an empty page.

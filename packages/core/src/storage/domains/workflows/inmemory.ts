@@ -2090,6 +2090,16 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // bump it, as deleteWorkflowRunById does, so a recreated run cannot make
     // an older parent context current again.
     if (snapshotDeleted) this.bumpParentRevision(key);
+    // The erased lifetime's terminal latch must not carry over: a reused run
+    // id starts running again. The generation still moves forward.
+    const kept = this.db.workflowTerminalParentRevisions.get(key);
+    if (kept && kept.terminalStatus !== null) {
+      this.db.workflowTerminalParentRevisions.set(key, {
+        ...kept,
+        generation: snapshotDeleted ? kept.generation : kept.generation + 1,
+        terminalStatus: null,
+      });
+    }
     return {
       status: 'deleted',
       removed: { snapshot: snapshotDeleted, handoff: handoff !== undefined, terminalRows },

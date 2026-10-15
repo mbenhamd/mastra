@@ -326,7 +326,13 @@ describe('WorkflowsInMemory run closure delete', () => {
       status: 'deleted',
     });
 
-    // The same run id runs again and is delivered again.
+    // The same run id runs again (starting as running) and is delivered again.
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'running' },
+    });
+    await expect(workflows.getWorkflowRunTerminalStatus(run)).resolves.toEqual({ status: 'nonterminal' });
     await workflows.persistWorkflowSnapshot({
       ...run,
       resourceId: RESOURCE,
