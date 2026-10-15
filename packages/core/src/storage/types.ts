@@ -272,6 +272,12 @@ export interface ListWorkflowSnapshotHandoffsResult {
  * `expectedResourceId` must match every row that records a resource: the
  * snapshot, the handoff and the terminal snapshot. Rows without any of those
  * cannot be attributed and answer `resource_mismatch`.
+ *
+ * Like an operator removing a released handoff row, erasure drops the run's
+ * handoff claim history: a later claim of the same run id starts again at
+ * `claimGeneration` 1. Do not reuse an erased run's id while a release from
+ * its erased lifetime could still arrive; such a release would match the new
+ * claim's generation.
  */
 export interface DeleteWorkflowRunClosureInput {
   workflowName: string;

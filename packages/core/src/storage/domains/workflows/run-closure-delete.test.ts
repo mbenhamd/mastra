@@ -263,6 +263,37 @@ describe('WorkflowsInMemory run closure delete', () => {
     expect(closureRows(db, leasedRun)).toMatchObject({ snapshot: true, journal: true, effects: 1 });
   });
 
+  it('rechecks a run that a snapshot status getter replaced while being read', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-reentrant' };
+    let armed = false;
+    let replaced = false;
+    // An inherited accessor survives the store's clone of the snapshot.
+    const statusGetter = {
+      get status() {
+        if (armed && !replaced) {
+          replaced = true;
+          void workflows.persistWorkflowSnapshot({
+            ...run,
+            resourceId: 'workspace-2:user-1',
+            snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'running' },
+          });
+        }
+        return 'success';
+      },
+    };
+    const { status: _ownStatus, ...fields } = createEmptyWorkflowSnapshot(run.runId);
+    const settled = Object.assign(Object.create(statusGetter), fields) as WorkflowRunState;
+    await workflows.persistWorkflowSnapshot({ ...run, resourceId: RESOURCE, snapshot: settled });
+    armed = true;
+
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toEqual({
+      status: 'resource_mismatch',
+    });
+    expect(replaced).toBe(true);
+    expect(closureRows(db, run)).toMatchObject({ snapshot: true });
+  });
+
   it('answers missing for a run storage never held', async () => {
     const { workflows } = setup();
     await expect(

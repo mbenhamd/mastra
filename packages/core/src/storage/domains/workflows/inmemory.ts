@@ -2001,9 +2001,19 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const key = this.getWorkflowKey(workflowName, runId);
     const belongsToRun = (record: { workflowName: string; runId: string }) =>
       record.workflowName === workflowName && record.runId === runId;
-    // Everything below runs synchronously, so no other call interleaves
-    // between the checks and the deletes.
-    const run = this.db.workflows.get(key);
+    // Reading the stored snapshot's status can invoke a caller getter that
+    // reenters these maps. Read it first and restart if the run changed; from
+    // the captures below to the last delete no caller code runs, so no other
+    // call interleaves between the checks and the deletes.
+    let run: StorageWorkflowRun | undefined;
+    let runStatus: unknown;
+    for (let attempt = 1; ; attempt++) {
+      run = this.db.workflows.get(key);
+      const snapshot = run ? (typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot) : undefined;
+      runStatus = snapshot?.status;
+      if (this.db.workflows.get(key) === run) break;
+      throwIfWorkflowReentrantAttemptsExhausted(attempt);
+    }
     const handoff = this.db.workflowSnapshotHandoffs.get(key);
     const journal = this.db.workflowTerminalizations.get(key);
     const terminalSnapshot = this.db.workflowTerminalSnapshots.get(key);
@@ -2031,10 +2041,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       return { status: 'resource_mismatch' };
     }
     if (handoff && handoff.status === 'pending' && handoff.releasedAt === undefined) return { status: 'fenced' };
-    if (run) {
-      const snapshot = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
-      if (!isSettledWorkflowRunStatus(snapshot?.status)) return { status: 'active' };
-    }
+    if (run && !isSettledWorkflowRunStatus(runStatus)) return { status: 'active' };
     if (
       journal &&
       journal.phase !== 'complete' &&

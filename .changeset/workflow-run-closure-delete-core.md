@@ -21,6 +21,7 @@ do {
 ```
 
 - **What is deleted.** In one atomic step: the handoff row (released or not), the run snapshot, and every terminal row whatever the journal phase (journal, effects, terminal snapshot, destination receipts, continuation plans, recovery ancestry).
+- **Run ids.** Erasure drops the handoff's claim history, as removing a released handoff row by hand does: a later claim of the same run id starts again at `claimGeneration` 1. Don't reuse an erased run's id while a release from its erased lifetime could still arrive.
 - **What is kept.** The content-free parent revision stays as the run-id reuse fence and is bumped, as `deleteWorkflowRunById` does.
 - **Results**, checked in this order, and nothing changes unless the result is `deleted`:
   - `missing`: nothing is stored for the run (an idempotent no-op);
