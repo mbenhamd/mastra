@@ -2256,6 +2256,26 @@ describe('importExecutionClosure', () => {
     expect((await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName })).status).toBe('imported');
   });
 
+  it('refuses to import a handoff claim high-water mark the destination could not read', async () => {
+    const src = await store('hwm-bad-src');
+    const dst = await store('hwm-bad-dst');
+    const { runId } = await seedClosure(src.s, src.schemaName, 'hwm2');
+    // The source column has no range check, so an out-of-range value can be exported.
+    await src.s.db.none(
+      `UPDATE "${src.schemaName}"."mastra_workflow_parent_revisions" SET handoff_claim_generation_hwm = 0
+       WHERE workflow_name = 'test-workflow' AND run_id = $1`,
+      [runId],
+    );
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'hwm2' },
+      { schemaName: src.schemaName },
+    );
+    await expect(importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName })).rejects.toThrow(
+      /invalid handoff_claim_generation_hwm/,
+    );
+  });
+
   it('converges when a destination worker only renewed the imported session lease', async () => {
     const src = await store('lease-src');
     const dst = await store('lease-dst');

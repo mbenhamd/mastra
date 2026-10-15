@@ -106,7 +106,7 @@ async function settledTerminalizedRun(workflows: WorkflowsInMemory, run: Run) {
       consumerId: 'closure-test',
     }),
   ).resolves.toMatchObject({ status: 'reserved' });
-  return { parent, fence };
+  return { parent, fence, ancestry };
 }
 
 function parentEffect(parent: Run, parentStepId: string) {
@@ -165,7 +165,7 @@ describe('WorkflowsInMemory run closure delete', () => {
   it('erases a released delivery with its snapshot and every terminal row, keeping the parent revision', async () => {
     const { db, workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-deleted' };
-    const { parent, fence } = await settledTerminalizedRun(workflows, run);
+    const { parent, fence, ancestry } = await settledTerminalizedRun(workflows, run);
     await expect(workflows.releaseWorkflowTerminalization(fence)).resolves.toMatchObject({ status: 'released' });
     await deliveredHandoff(workflows, run, { release: true });
     expect(closureRows(db, run)).toMatchObject({
@@ -193,6 +193,11 @@ describe('WorkflowsInMemory run closure delete', () => {
     const result = await workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE });
 
     expect(result).toEqual({ status: 'deleted', removed: { snapshot: true, handoff: true, terminalRows: 5 } });
+    expect(closureRows(db, run)).toEqual(NOTHING);
+    // A recovery-ancestry write queued behind the delete cannot recreate a terminal row.
+    await expect(workflows.persistWorkflowTerminalRecoveryAncestry({ ...run, ancestry })).resolves.toEqual({
+      status: 'missing_run',
+    });
     expect(closureRows(db, run)).toEqual(NOTHING);
     expect(db.workflowTerminalParentRevisions.get(revisionKey)!.generation).toBeGreaterThan(revisionBefore);
     // The parent run is another closure and stays.
@@ -351,6 +356,41 @@ describe('WorkflowsInMemory run closure delete', () => {
       workflows.releaseWorkflowSnapshotHandoff({ ...run, expectedClaimGeneration: 1, deleteRun: true }),
     ).resolves.toMatchObject({ status: 'conflict', record: { claimGeneration: 2 } });
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ result: { second: true } });
+  });
+
+  it('erases runs stored under empty names and reads a listing input only once', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: '', runId: '' };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'success' },
+    });
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'research',
+      runId: 'run-other',
+      resourceId: 'workspace-2:user-1',
+      snapshot: { ...createEmptyWorkflowSnapshot('run-other'), status: 'success' },
+    });
+
+    // A getter that answers differently on a second read must not move the query.
+    let reads = 0;
+    const input = {
+      get resourceId() {
+        reads++;
+        return reads === 1 ? RESOURCE : 'workspace-2:user-1';
+      },
+      limit: 10,
+    };
+    await expect(workflows.listWorkflowRunClosuresByResource(input)).resolves.toMatchObject({
+      closures: [{ ...run, snapshot: true }],
+    });
+    expect(reads).toBe(1);
+
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+    expect(closureRows(db, run)).toEqual(NOTHING);
   });
 
   it('answers missing for a run storage never held', async () => {

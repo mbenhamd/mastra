@@ -115,7 +115,7 @@ import {
   compareWorkflowRunClosureCursors,
   isSettledWorkflowRunStatus,
   validateWorkflowRunClosureIdentity,
-  validateWorkflowRunClosureListInput,
+  captureWorkflowRunClosureListInput,
 } from '../../workflow-snapshot-handoff';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
@@ -866,6 +866,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       return sameWorkflowTerminalRecoveryAncestry(existing, desired)
         ? { status: 'already_persisted', record: copyWorkflowTerminalRecoveryAncestryRecord(existing) }
         : { status: 'ancestry_conflict' };
+    }
+    // A run whose kept parent revision outlived its snapshot was deleted or
+    // had its closure erased; a late writer must not recreate terminal rows
+    // for it. A child that has never been persisted has no revision yet.
+    if (this.db.workflowTerminalParentRevisions.has(key) && !this.db.workflows.has(key)) {
+      return { status: 'missing_run' };
     }
     for (const frame of desired.ancestry) {
       const parentKey = this.getWorkflowKey(frame.parentWorkflowName, frame.parentRunId);
@@ -2093,8 +2099,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   async listWorkflowRunClosuresByResource(
     input: ListWorkflowRunClosuresByResourceInput,
   ): Promise<ListWorkflowRunClosuresByResourceResult> {
-    const limit = validateWorkflowRunClosureListInput(input);
-    const { resourceId, after } = input;
+    const { resourceId, after, limit } = captureWorkflowRunClosureListInput(input);
     const entries = new Map<string, WorkflowRunClosureEntry>();
     const entryFor = (workflowName: string, runId: string): WorkflowRunClosureEntry => {
       const key = this.getWorkflowKey(workflowName, runId);

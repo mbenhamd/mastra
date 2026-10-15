@@ -1,5 +1,5 @@
 ---
-'@mastra/core': patch
+'@mastra/core': minor
 ---
 
 Added `deleteWorkflowRunClosure` and `listWorkflowRunClosuresByResource` to workflow storage, so an application can erase everything storage keeps for a user's settled workflow runs. Before this, a released handoff kept its snapshot copy and delivered payload forever, and terminal rows had no delete path outside completed-journal cleanup.
@@ -31,4 +31,6 @@ do {
   - `deleted`, with `removed: { snapshot, handoff, terminalRows }`;
   - `unsupported`, from adapters without the capability.
 - **Listing.** `listWorkflowRunClosuresByResource` pages runs by `(workflowName, runId)` in code-point order and returns each run once, with flags for which rows matched: `snapshot`, `terminalSnapshot`, and `handoff: { status, released }`. Released handoffs are included, so it finds a delivered handoff whose snapshot was already deleted. `limit` is required (1 to 100).
+- **Late writers.** A delayed release or recovery-ancestry write from an erased run answers `conflict` or `missing_run` and writes nothing.
+- **Docs.** See the new *Workflow run closure* storage reference page.
 - **Capability.** Adapters that implement both report `closureDeleteVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. The in-memory store supports it; the base class answers `unsupported` for both methods and never an empty page.

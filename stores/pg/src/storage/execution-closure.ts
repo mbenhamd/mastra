@@ -1431,6 +1431,26 @@ function applyImportTransforms(
   return applied;
 }
 
+/**
+ * Reject payload values the destination's readers would refuse later, so a
+ * successful import never leaves a run unusable. The handoff claim
+ * high-water mark must be absent or a positive safe integer.
+ */
+function assertClosureRowInvariants(tableName: ExecutionClosureTableName, applied: Record<string, unknown>): void {
+  if (tableName !== 'mastra_workflow_parent_revisions') return;
+  const hwm = applied.handoff_claim_generation_hwm;
+  if (hwm === undefined || hwm === null) return;
+  const value = typeof hwm === 'string' && /^[0-9]+$/.test(hwm) ? Number(hwm) : hwm;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw closureError(
+      'IMPORT_EXECUTION_CLOSURE',
+      'INVALID_ROW_VALUE',
+      `Execution closure row for ${tableName} carries an invalid handoff_claim_generation_hwm`,
+      { tableName, column: 'handoff_claim_generation_hwm' },
+    );
+  }
+}
+
 /** Reject payload row keys outside the table's registered schema. */
 function assertClosureRowColumns(tableName: ExecutionClosureTableName, applied: Record<string, unknown>): string[] {
   const allowed = allowedColumnsFor(tableName);
@@ -1487,6 +1507,7 @@ async function insertClosureRow(
   options?: { verifyConflict?: boolean },
 ): Promise<'inserted' | 'skipped'> {
   const columns = assertClosureRowColumns(tableName, applied);
+  assertClosureRowInvariants(tableName, applied);
   const result = await t.query(
     `INSERT INTO ${tableSql(tableName, schemaName)} (${columns.map(quoteIdent).join(', ')})
      VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})

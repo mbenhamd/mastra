@@ -138,7 +138,7 @@ describe('WorkflowsPG run closure delete', () => {
         consumerId: 'closure-test',
       }),
     ).resolves.toMatchObject({ status: 'reserved' });
-    return { parent, fence };
+    return { parent, fence, ancestry };
   }
 
   /** Claims, completes and optionally releases a product handoff over the run's current snapshot. */
@@ -187,7 +187,7 @@ describe('WorkflowsPG run closure delete', () => {
 
   it('erases a released delivery with its snapshot and every terminal row, keeping the parent revision', async () => {
     const run = newRun();
-    const { parent, fence } = await settledTerminalizedRun(run);
+    const { parent, fence, ancestry } = await settledTerminalizedRun(run);
     await expect(workflows.releaseWorkflowTerminalization(fence)).resolves.toMatchObject({ status: 'released' });
     await deliveredHandoff(run, { release: true });
     expect(await closureRows(run)).toMatchObject({
@@ -217,6 +217,10 @@ describe('WorkflowsPG run closure delete', () => {
     });
 
     expect(await closureRows(run)).toEqual(noRows);
+    // A recovery-ancestry write queued behind the delete cannot recreate a terminal row.
+    await expect(workflows.persistWorkflowTerminalRecoveryAncestry({ ...run, ancestry })).resolves.toEqual({
+      status: 'missing_run',
+    });
     // The content-free run-id reuse fence stays, bumped like a run deletion.
     expect(Number((await parentRevision(run))!.generation)).toBeGreaterThan(revisionBefore);
     await expect(workflows.loadWorkflowSnapshot(parent)).resolves.not.toBeNull();

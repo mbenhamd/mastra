@@ -293,11 +293,13 @@ export function isSettledWorkflowRunStatus(status: unknown): boolean {
 
 /** Validates a closure erasure's identity and resource before any read. */
 export function validateWorkflowRunClosureIdentity(workflowName: string, runId: string, resourceId: string): void {
-  if (typeof workflowName !== 'string' || workflowName.length === 0) {
-    throw new TypeError('Workflow run closure workflowName must be a non-empty string');
+  // Empty names are allowed: persistWorkflowSnapshot stores them, so their
+  // closures must stay erasable.
+  if (typeof workflowName !== 'string') {
+    throw new TypeError('Workflow run closure workflowName must be a string');
   }
-  if (typeof runId !== 'string' || runId.length === 0) {
-    throw new TypeError('Workflow run closure runId must be a non-empty string');
+  if (typeof runId !== 'string') {
+    throw new TypeError('Workflow run closure runId must be a string');
   }
   if (typeof resourceId !== 'string' || resourceId.length === 0) {
     throw new TypeError('Workflow run closure resourceId must be a non-empty string');
@@ -305,24 +307,37 @@ export function validateWorkflowRunClosureIdentity(workflowName: string, runId: 
   validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
 }
 
-/** Validates a closure listing and returns its limit. */
-export function validateWorkflowRunClosureListInput(input: {
+/**
+ * Reads a closure listing's input exactly once and validates that copy, so
+ * accessor-backed inputs cannot hand the query a different value than the
+ * one validated. Adapters use only the returned copy.
+ */
+export function captureWorkflowRunClosureListInput(input: {
   resourceId: string;
   after?: { workflowName: string; runId: string };
   limit: number;
-}): number {
-  const { resourceId, after, limit } = input;
+}): { resourceId: string; after?: { workflowName: string; runId: string }; limit: number } {
+  const resourceId: unknown = input.resourceId;
+  const limit: unknown = input.limit;
+  const rawAfter: unknown = input.after;
+  let after: { workflowName: string; runId: string } | undefined;
+  if (rawAfter !== undefined) {
+    const cursor = rawAfter as { workflowName: unknown; runId: unknown };
+    const workflowName = cursor.workflowName;
+    const runId = cursor.runId;
+    if (typeof workflowName !== 'string' || typeof runId !== 'string') {
+      throw new TypeError('Workflow run closure cursor must carry workflowName and runId strings');
+    }
+    after = { workflowName, runId };
+  }
   if (typeof resourceId !== 'string' || resourceId.length === 0) {
     throw new TypeError('Workflow run closure resourceId must be a non-empty string');
   }
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+  if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
     throw new RangeError('Workflow run closure limit must be between 1 and 100');
   }
-  if (after !== undefined && (typeof after.workflowName !== 'string' || typeof after.runId !== 'string')) {
-    throw new TypeError('Workflow run closure cursor must carry workflowName and runId strings');
-  }
   validateWorkflowSnapshotHandoffIdentity(after?.workflowName ?? '', after?.runId ?? '', resourceId);
-  return limit;
+  return Object.freeze({ resourceId, limit, ...(after ? { after: Object.freeze(after) } : {}) });
 }
 
 /** Orders closure cursors by code point, matching PostgreSQL's `COLLATE "C"` keyset. */

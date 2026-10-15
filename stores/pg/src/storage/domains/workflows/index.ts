@@ -78,7 +78,7 @@ import {
   validateWorkflowSnapshotHandoffIdentity,
   validateWorkflowSnapshotHandoffLimit,
   validateWorkflowRunClosureIdentity,
-  validateWorkflowRunClosureListInput,
+  captureWorkflowRunClosureListInput,
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
@@ -2083,6 +2083,19 @@ export class WorkflowsPG extends WorkflowsStorage {
           return sameWorkflowTerminalRecoveryAncestry(existing, desired)
             ? { status: 'already_persisted', record: copyWorkflowTerminalRecoveryAncestryRecord(existing) }
             : { status: 'ancestry_conflict' };
+        }
+        // A run whose kept parent revision outlived its snapshot was deleted or
+        // had its closure erased; a writer queued behind that delete on the
+        // advisory lock must not recreate terminal rows for it. A child that
+        // has never been persisted has no revision row yet.
+        const childRevision = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
+        if (childRevision) {
+          const childSnapshot = await t.oneOrNone<{ exists: boolean }>(
+            `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [operation.workflowName, operation.runId],
+          );
+          if (!childSnapshot) return { status: 'missing_run' };
         }
         for (const frame of desired.ancestry) {
           let parentRevision: WorkflowParentRevisionLock | undefined;
@@ -4580,6 +4593,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       ['epoch'],
       WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH_CHECKS,
     );
+    const hasHandoffHwmColumn =
+      snapshot.columns.get(TABLE_WORKFLOW_PARENT_REVISIONS)?.has(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN) ?? false;
     noteRelation(
       TABLE_WORKFLOW_PARENT_REVISIONS,
       {
@@ -4588,6 +4603,9 @@ export class WorkflowsPG extends WorkflowsStorage {
         generation: { type: 'bigint', notNull: true },
         terminal_status: { type: 'text', notNull: false },
         updated_at: { type: 'bigint', notNull: true },
+        ...(hasHandoffHwmColumn
+          ? { [WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN]: { type: 'bigint', notNull: false } }
+          : {}),
       },
       ['workflow_name', 'run_id'],
       [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
@@ -4742,6 +4760,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     const columns = getSchemaSnapshot(this.#db.client, this.#schema)?.columns.get(TABLE_WORKFLOW_PARENT_REVISIONS);
     if (!columns?.has(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN)) {
       await this.#db.client.none(WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(this.#schema));
+      this.#db.noteColumnAdded(TABLE_WORKFLOW_PARENT_REVISIONS, WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN);
     }
     this.#workflowParentRevisionHandoffHwmColumnVerified = true;
   }
@@ -6050,8 +6069,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   async listWorkflowRunClosuresByResource(
     input: ListWorkflowRunClosuresByResourceInput,
   ): Promise<ListWorkflowRunClosuresByResourceResult> {
-    const limit = validateWorkflowRunClosureListInput(input);
-    const { resourceId, after } = input;
+    const { resourceId, after, limit } = captureWorkflowRunClosureListInput(input);
     const values: unknown[] = [resourceId];
     let keyset = '';
     if (after) {
@@ -6078,7 +6096,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     try {
       await this.assertWorkflowSnapshotHandoffReleaseColumns(this.#db.client);
       rows = await this.#db.client.any(
-        `SELECT workflow_name, run_id,
+        `SELECT workflow_name COLLATE "C" AS workflow_name, run_id COLLATE "C" AS run_id,
                 bool_or(snapshot) AS snapshot,
                 bool_or(terminal_snapshot) AS terminal_snapshot,
                 max(handoff_status) AS handoff_status,
@@ -6090,7 +6108,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            UNION ALL
            ${branch(this.workflowSnapshotHandoffTableName(), 'resource_id', 'FALSE, FALSE, status, released_at IS NOT NULL')}
          ) AS matches
-         GROUP BY workflow_name, run_id
+         GROUP BY workflow_name COLLATE "C", run_id COLLATE "C"
          ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
          LIMIT ${limitParam}`,
         values,
