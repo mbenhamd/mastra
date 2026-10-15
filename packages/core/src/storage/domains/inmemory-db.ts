@@ -81,6 +81,11 @@ import type { WorkspaceVersion } from './workspaces';
 export interface WorkflowTerminalParentRevisionState {
   generation: number;
   terminalStatus: 'success' | 'failed' | 'canceled' | 'tripwire' | 'bailed' | 'skipped' | null;
+  /**
+   * The highest handoff claim generation an erased closure of the run held.
+   * A later claim of the erased run starts above it.
+   */
+  handoffClaimGenerationHwm?: number;
 }
 
 class WorkflowTerminalDestinationReceiptMap extends Map<string, WorkflowTerminalDestinationReceiptRecord> {

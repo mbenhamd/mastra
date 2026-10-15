@@ -850,6 +850,7 @@ const sidebars = {
         { type: 'doc', id: 'storage/execution-closure', label: 'Execution Closure' },
         { type: 'doc', id: 'storage/retention', label: 'Retention (prune)' },
         { type: 'doc', id: 'storage/turso', label: 'Turso Storage' },
+        { type: 'doc', id: 'storage/workflow-run-closure', label: 'Workflow Run Closure' },
       ],
     },
     {

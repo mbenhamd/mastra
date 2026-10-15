@@ -203,7 +203,14 @@ const WORKFLOW_TERMINAL_TABLE_COLUMNS: Record<string, readonly string[]> = {
     'immediate_parent_run_id',
     'created_at',
   ],
-  mastra_workflow_parent_revisions: ['workflow_name', 'run_id', 'generation', 'terminal_status', 'updated_at'],
+  mastra_workflow_parent_revisions: [
+    'workflow_name',
+    'run_id',
+    'generation',
+    'terminal_status',
+    'updated_at',
+    'handoff_claim_generation_hwm',
+  ],
 };
 
 /**
@@ -393,8 +400,14 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
     'destination_applied_at',
     'quarantined_at',
   ]),
-  // The parent revision generation/terminal marker moves forward on commit.
-  mastra_workflow_parent_revisions: new Set(['generation', 'terminal_status', 'updated_at']),
+  // The parent revision generation/terminal marker moves forward on commit,
+  // and a closure erasure raises the handoff claim high-water mark.
+  mastra_workflow_parent_revisions: new Set([
+    'generation',
+    'terminal_status',
+    'updated_at',
+    'handoff_claim_generation_hwm',
+  ]),
   // A resumed session touches its thread and mutable session-scoped state.
   [TABLE_THREADS]: new Set(['title', 'metadata', 'updatedAt', 'updatedAtZ']),
   [TABLE_THREAD_STATE]: new Set(['value', 'updatedAt', 'updatedAtZ']),
@@ -1365,7 +1378,7 @@ const WORKFLOW_TERMINAL_BIGINT_COLUMNS: Record<string, ReadonlySet<string>> = {
   mastra_workflow_terminal_continuation_plans_v2: new Set(['created_at']),
   mastra_workflow_terminal_snapshots_v2: new Set(['created_at']),
   mastra_workflow_terminal_recovery_ancestries: new Set(['created_at']),
-  mastra_workflow_parent_revisions: new Set(['generation', 'updated_at']),
+  mastra_workflow_parent_revisions: new Set(['generation', 'updated_at', 'handoff_claim_generation_hwm']),
 };
 
 /** Columns stripped of live authority before a row is applied. */
@@ -1416,6 +1429,28 @@ function applyImportTransforms(
     }
   }
   return applied;
+}
+
+/**
+ * Reject payload values the destination's readers would refuse later, so a
+ * successful import never leaves a run unusable. The handoff claim
+ * high-water mark must be absent or a positive integer below
+ * `Number.MAX_SAFE_INTEGER`.
+ */
+function assertClosureRowInvariants(tableName: ExecutionClosureTableName, applied: Record<string, unknown>): void {
+  if (tableName !== 'mastra_workflow_parent_revisions') return;
+  const hwm = applied.handoff_claim_generation_hwm;
+  if (hwm === undefined || hwm === null) return;
+  const value = typeof hwm === 'string' && /^[0-9]+$/.test(hwm) ? Number(hwm) : hwm;
+  // The next handoff claim is hwm + 1, which must stay a safe integer.
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value >= Number.MAX_SAFE_INTEGER) {
+    throw closureError(
+      'IMPORT_EXECUTION_CLOSURE',
+      'INVALID_ROW_VALUE',
+      `Execution closure row for ${tableName} carries an invalid handoff_claim_generation_hwm`,
+      { tableName, column: 'handoff_claim_generation_hwm' },
+    );
+  }
 }
 
 /** Reject payload row keys outside the table's registered schema. */
@@ -1474,6 +1509,7 @@ async function insertClosureRow(
   options?: { verifyConflict?: boolean },
 ): Promise<'inserted' | 'skipped'> {
   const columns = assertClosureRowColumns(tableName, applied);
+  assertClosureRowInvariants(tableName, applied);
   const result = await t.query(
     `INSERT INTO ${tableSql(tableName, schemaName)} (${columns.map(quoteIdent).join(', ')})
      VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})
@@ -1506,9 +1542,13 @@ async function insertClosureRow(
     // generation regressed below the imported value is not a valid successor —
     // it is a foreign row that happens to share the registered lifecycle
     // columns, and it must fail closed rather than be adopted.
+    // The handoff claim high-water mark is monotonic the same way: a stored
+    // row below the imported mark has not seen the source's erased claims,
+    // and adopting it would let a reused run id restart below them.
     if (
       tableName === 'mastra_workflow_parent_revisions' &&
-      Number(stored[0]!.generation) < Number(applied.generation)
+      (Number(stored[0]!.generation) < Number(applied.generation) ||
+        Number(stored[0]!.handoff_claim_generation_hwm ?? 0) < Number(applied.handoff_claim_generation_hwm ?? 0))
     ) {
       throw closureError(
         'IMPORT_EXECUTION_CLOSURE',
