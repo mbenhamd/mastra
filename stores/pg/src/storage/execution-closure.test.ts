@@ -2228,6 +2228,34 @@ describe('importExecutionClosure', () => {
     expect(converged.status).toBe('imported');
   });
 
+  it('fails a retry when the destination handoff claim high-water mark is below the imported one', async () => {
+    const src = await store('hwm-src');
+    const dst = await store('hwm-dst');
+    const { runId } = await seedClosure(src.s, src.schemaName, 'hwm1');
+    const setHwm = (schemaName: string, db: typeof src.s.db, hwm: number) =>
+      db.none(
+        `UPDATE "${schemaName}"."mastra_workflow_parent_revisions" SET handoff_claim_generation_hwm = $2
+         WHERE workflow_name = 'test-workflow' AND run_id = $1`,
+        [runId, hwm],
+      );
+    await setHwm(src.schemaName, src.s.db, 5);
+    const exported = await exportExecutionClosure(
+      src.s.db,
+      { harnessName: HARNESS, sessionId: 'hwm1' },
+      { schemaName: src.schemaName },
+    );
+    expect((await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName })).status).toBe('imported');
+
+    // A destination row that has not seen the source's erased claims would
+    // let a reused run id restart below them.
+    await setHwm(dst.schemaName, dst.s.db, 1);
+    await expect(importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName })).rejects.toThrow(
+      /conflicts with a different destination row/i,
+    );
+    await setHwm(dst.schemaName, dst.s.db, 7);
+    expect((await importExecutionClosure(dst.s.db, exported, { schemaName: dst.schemaName })).status).toBe('imported');
+  });
+
   it('converges when a destination worker only renewed the imported session lease', async () => {
     const src = await store('lease-src');
     const dst = await store('lease-dst');

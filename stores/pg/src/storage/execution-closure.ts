@@ -1519,9 +1519,13 @@ async function insertClosureRow(
     // generation regressed below the imported value is not a valid successor —
     // it is a foreign row that happens to share the registered lifecycle
     // columns, and it must fail closed rather than be adopted.
+    // The handoff claim high-water mark is monotonic the same way: a stored
+    // row below the imported mark has not seen the source's erased claims,
+    // and adopting it would let a reused run id restart below them.
     if (
       tableName === 'mastra_workflow_parent_revisions' &&
-      Number(stored[0]!.generation) < Number(applied.generation)
+      (Number(stored[0]!.generation) < Number(applied.generation) ||
+        Number(stored[0]!.handoff_claim_generation_hwm ?? 0) < Number(applied.handoff_claim_generation_hwm ?? 0))
     ) {
       throw closureError(
         'IMPORT_EXECUTION_CLOSURE',
