@@ -1,0 +1,84 @@
+---
+title: 'Reference: Workflow run closure | Storage'
+description: 'Find and erase everything storage keeps for a settled workflow run, by resource, on the in-memory and PostgreSQL workflow stores.'
+packages:
+  - '@mastra/core'
+  - '@mastra/pg'
+---
+
+# Workflow run closure
+
+A workflow run's closure is every row workflow storage keeps for one `(workflowName, runId)` pair:
+
+- its snapshot;
+- its snapshot handoff, released or not;
+- its terminal rows: journal, effects, terminal snapshot, destination receipts, continuation plans and recovery ancestry.
+
+`deleteWorkflowRunClosure` erases one settled run's closure in a single atomic step. `listWorkflowRunClosuresByResource` finds the runs to erase for a resource. Together they let an application erase a user's workflow data, for example for account deletion.
+
+## Usage
+
+```typescript
+const workflows = await storage.getStore('workflows')
+
+if (workflows?.getWorkflowSnapshotHandoffCapabilities().closureDeleteVersion !== 1) {
+  throw new Error('This store cannot erase workflow run closures')
+}
+
+let after
+do {
+  const page = await workflows.listWorkflowRunClosuresByResource({ resourceId, after, limit: 100 })
+  if (page.status !== 'listed') throw new Error('Closure listing is unsupported')
+
+  for (const { workflowName, runId } of page.closures) {
+    const result = await workflows.deleteWorkflowRunClosure({
+      workflowName,
+      runId,
+      expectedResourceId: resourceId,
+    })
+    // 'deleted' and 'missing' are done. Retry 'fenced' and 'active' later.
+    // 'resource_mismatch' is a refusal.
+  }
+  after = page.nextCursor
+} while (after)
+```
+
+## `deleteWorkflowRunClosure(input)`
+
+Erases one run's closure.
+
+Input: `{ workflowName, runId, expectedResourceId }`.
+
+Returns: `Promise<DeleteWorkflowRunClosureResult>`. The checks run in this order, and nothing changes unless the result is `deleted`:
+
+- `missing`: storage holds no row for the run. Repeating a delete answers `missing`.
+- `resource_mismatch`: the snapshot, handoff or terminal snapshot records another resource, or none at all.
+- `fenced`: the handoff is pending and not released, so its owner is still writing the run. A completed handoff doesn't block erasure, released or not.
+- `active`: one of these holds, and you can retry later:
+  - the snapshot status isn't settled (`success`, `failed`, `canceled`, `tripwire`, `bailed` or `skipped`);
+  - a terminalization owner holds a live lease on the journal;
+  - a nested child run hasn't completed its terminal journal. Erase child runs before their parents.
+- `deleted`: the closure is gone. `removed` reports `{ snapshot, handoff, terminalRows }`.
+- `unsupported`: the store doesn't implement closure erasure.
+
+The run's content-free parent revision is kept as the run-id reuse fence, with the erased run's terminal status cleared so a reused run id can run again. Late writers from the erased run change nothing:
+
+- A delayed `releaseWorkflowSnapshotHandoff` answers `missing` while the run has no handoff. Once the same run id is used again, its next handoff claim starts above the erased claims, so the delayed release answers `conflict`.
+- A delayed terminal recovery-ancestry write answers `missing_run` until the run id is used again.
+
+## `listWorkflowRunClosuresByResource(input)`
+
+Pages the runs that hold rows recorded under a resource.
+
+Input: `{ resourceId, after?, limit }`. `limit` is required and between 1 and 100. `after` is the `nextCursor` of the previous page.
+
+Returns: `Promise<ListWorkflowRunClosuresByResourceResult>`:
+
+- `{ status: 'listed', closures, hasMore, nextCursor? }`: each entry is `{ workflowName, runId, snapshot, terminalSnapshot, handoff? }`. The flags say which rows matched the resource, and `handoff` is `{ status, released }`. Released handoffs are included, so a delivered handoff whose snapshot was already deleted is still found. Runs are ordered by `(workflowName, runId)` in code-point order.
+- `{ status: 'unsupported' }`: the store can't list closures. It never answers an empty page instead.
+
+## Availability
+
+The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
+
+On PostgreSQL, the listing uses resource indexes on the snapshot, handoff and terminal snapshot tables, and the reuse fence uses the `handoff_claim_generation_hwm` column of `mastra_workflow_parent_revisions`. `init()` creates them. With an externally managed schema (`disableInit`), apply the statements from `exportSchemas()` before deploying. The `@mastra/pg` changelog lists them.

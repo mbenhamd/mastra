@@ -121,6 +121,11 @@ export interface WorkflowSnapshotHandoffCapabilities {
   recoveryVersion?: 1;
   /** Fenced handoff release (`releaseWorkflowSnapshotHandoff`), which lifts the run's deletion fence. */
   releaseVersion?: 1;
+  /**
+   * Run closure erasure: `deleteWorkflowRunClosure` and
+   * `listWorkflowRunClosuresByResource`, backed by resource indexes.
+   */
+  closureDeleteVersion?: 1;
 }
 
 /** The canonical native snapshot state a handoff claim must compare under the parent lock. */
@@ -256,6 +261,91 @@ export interface ListWorkflowSnapshotHandoffsResult {
   hasMore: boolean;
   nextCursor?: WorkflowSnapshotHandoffCursor;
 }
+
+/**
+ * Erases everything storage keeps for one settled run, as one atomic step:
+ * its snapshot handoff row (released or not), its canonical snapshot, and
+ * every terminal row (journal, effects, terminal snapshot, destination
+ * receipts, continuation plans, recovery ancestry), whatever the journal
+ * phase. The content-free parent revision is kept as the run-id reuse fence.
+ *
+ * `expectedResourceId` must match every row that records a resource: the
+ * snapshot, the handoff and the terminal snapshot. Rows without any of those
+ * cannot be attributed and answer `resource_mismatch`.
+ *
+ * Erasure keeps the deleted handoff's claim generation as a content-free
+ * high-water mark on the parent revision; a later claim of the same run id
+ * starts above it, so a release from the erased lifetime answers `conflict`.
+ */
+export interface DeleteWorkflowRunClosureInput {
+  workflowName: string;
+  runId: string;
+  expectedResourceId: string;
+}
+
+/**
+ * Checked in this order, and nothing changes unless the result is `deleted`:
+ * - `missing`: storage holds no row for the run (an idempotent no-op).
+ * - `resource_mismatch`: a row records another resource, or none at all.
+ * - `fenced`: the handoff is pending and unreleased; its owner is still
+ *   writing the run. Retry after the handoff completes or is released.
+ * - `active`: the snapshot status is not settled (`success`, `failed`,
+ *   `canceled`, `tripwire`, `bailed`, `skipped`), a terminalization owner
+ *   still holds a live lease on the journal, or a nested child run (linked
+ *   by a parent effect or recovery ancestry) has not completed its terminal
+ *   journal. Retry later; erase child runs first.
+ * - `deleted`: the closure is gone; `removed` counts what this call deleted.
+ * - `unsupported`: the adapter does not implement `closureDeleteVersion: 1`.
+ */
+export type DeleteWorkflowRunClosureResult =
+  | {
+      status: 'deleted';
+      removed: { snapshot: boolean; handoff: boolean; terminalRows: number };
+    }
+  | { status: 'missing' | 'resource_mismatch' | 'fenced' | 'active' | 'unsupported' };
+
+/** Keyset position in `listWorkflowRunClosuresByResource`, ordered by code point. */
+export interface WorkflowRunClosureCursor {
+  workflowName: string;
+  runId: string;
+}
+
+export interface ListWorkflowRunClosuresByResourceInput {
+  resourceId: string;
+  after?: WorkflowRunClosureCursor;
+  /** Between 1 and 100. */
+  limit: number;
+}
+
+/**
+ * One run that holds rows recorded under the resource. A run appears once
+ * however many of its rows match; each flag says which of them did.
+ */
+export interface WorkflowRunClosureEntry {
+  workflowName: string;
+  runId: string;
+  /** The canonical snapshot records this resource. */
+  snapshot: boolean;
+  /** The retained terminal snapshot records this resource. */
+  terminalSnapshot: boolean;
+  /** The handoff row records this resource; released rows are included. */
+  handoff?: { status: WorkflowSnapshotHandoffStatus; released: boolean };
+}
+
+/**
+ * Lists every run with a snapshot, handoff (released or not) or terminal
+ * snapshot recorded under the resource, including a handoff whose snapshot
+ * was already deleted. `unsupported` means the adapter cannot enumerate
+ * closures; it never answers an empty page in that case.
+ */
+export type ListWorkflowRunClosuresByResourceResult =
+  | {
+      status: 'listed';
+      closures: WorkflowRunClosureEntry[];
+      hasMore: boolean;
+      nextCursor?: WorkflowRunClosureCursor;
+    }
+  | { status: 'unsupported' };
 
 /**
  * Compact workflow execution state used by lifecycle authority checks.

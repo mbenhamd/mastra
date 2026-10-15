@@ -63,6 +63,10 @@ import type {
   ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
+  DeleteWorkflowRunClosureInput,
+  DeleteWorkflowRunClosureResult,
+  ListWorkflowRunClosuresByResourceInput,
+  ListWorkflowRunClosuresByResourceResult,
   WorkflowExecutionState,
 } from '../../types';
 import { StorageDomain } from '../base';
@@ -130,6 +134,22 @@ export abstract class WorkflowsStorage extends StorageDomain {
     _input: ListWorkflowSnapshotHandoffsInput = {},
   ): Promise<ListWorkflowSnapshotHandoffsResult> {
     return { records: [], hasMore: false };
+  }
+
+  /**
+   * Erases a settled run's handoff, snapshot and terminal rows atomically,
+   * keeping the parent revision. Adapters implementing this advertise
+   * `closureDeleteVersion: 1`.
+   */
+  async deleteWorkflowRunClosure(_input: DeleteWorkflowRunClosureInput): Promise<DeleteWorkflowRunClosureResult> {
+    return { status: 'unsupported' };
+  }
+
+  /** Pages the runs holding rows under a resource, released handoffs included. */
+  async listWorkflowRunClosuresByResource(
+    _input: ListWorkflowRunClosuresByResourceInput,
+  ): Promise<ListWorkflowRunClosuresByResourceResult> {
+    return { status: 'unsupported' };
   }
 
   async admitWorkflowResume(_input: AdmitWorkflowResumeInput): Promise<AdmitWorkflowResumeResult> {

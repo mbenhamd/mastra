@@ -77,6 +77,9 @@ import {
   validateWorkflowSnapshotHandoffFence,
   validateWorkflowSnapshotHandoffIdentity,
   validateWorkflowSnapshotHandoffLimit,
+  validateWorkflowRunClosureIdentity,
+  captureWorkflowRunClosureListInput,
+  isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
 } from '@mastra/core/storage';
@@ -149,6 +152,11 @@ import type {
   ReleaseWorkflowSnapshotHandoffResult,
   ListWorkflowSnapshotHandoffsInput,
   ListWorkflowSnapshotHandoffsResult,
+  DeleteWorkflowRunClosureInput,
+  DeleteWorkflowRunClosureResult,
+  ListWorkflowRunClosuresByResourceInput,
+  ListWorkflowRunClosuresByResourceResult,
+  WorkflowRunClosureEntry,
   WorkflowTerminalRecoveryAncestryRecord,
   TABLE_NAMES,
   PruneOptions,
@@ -200,6 +208,8 @@ const TABLE_WORKFLOW_PARENT_REVISIONS = 'mastra_workflow_parent_revisions';
 const TABLE_WORKFLOW_SCHEMA_MIGRATIONS = 'mastra_workflow_schema_migrations';
 /** Handoff release columns an externally managed schema must provide (see getWorkflowSnapshotHandoffReleaseDDL). */
 const WORKFLOW_SNAPSHOT_HANDOFF_RELEASE_COLUMNS = ['claim_generation', 'released_at'] as const;
+/** Parent-revision column keeping an erased closure's highest handoff claim generation. */
+const WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN = 'handoff_claim_generation_hwm';
 const WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID = createStorageErrorId(
   'PG',
   'WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA',
@@ -310,6 +320,14 @@ function workflowSnapshotCreatedAtIndexName(schemaPrefix: string): string {
   return truncateIdentifierWithHash(`${schemaPrefix}${WORKFLOW_SNAPSHOT_CREATEDAT_INDEX}`.toLowerCase());
 }
 
+/** Base name (before any schema prefix) of the `("resourceId", workflow_name, run_id)` snapshot index. */
+const WORKFLOW_SNAPSHOT_RESOURCE_INDEX = 'mastra_workflow_snapshot_resource_run_idx';
+
+/** Schema-prefixed name of the resource snapshot index, normalized like the createdAt index. */
+function workflowSnapshotResourceIndexName(schemaPrefix: string): string {
+  return truncateIdentifierWithHash(`${schemaPrefix}${WORKFLOW_SNAPSHOT_RESOURCE_INDEX}`.toLowerCase());
+}
+
 /** Base name (before any schema prefix) of the expression index backing the status filter. */
 const WORKFLOW_SNAPSHOT_STATUS_INDEX = 'mastra_workflow_snapshot_name_status_createdat_idx';
 
@@ -390,6 +408,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   #indexes?: CreateIndexOptions[];
   #initializedWorkflowSnapshotColumnType?: WorkflowSnapshotColumnType;
   #workflowSnapshotHandoffReleaseColumnsVerified = false;
+  #workflowParentRevisionHandoffHwmColumnVerified = false;
 
   /** Tables managed by this domain */
   static readonly MANAGED_TABLES = [
@@ -447,7 +466,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1 };
+    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1, closureDeleteVersion: 1 };
   }
 
   private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
@@ -967,6 +986,79 @@ export class WorkflowsPG extends WorkflowsStorage {
    * schema (`disableInit` / `MASTRA_DISABLE_STORAGE_INIT`) must run it before
    * deploying a store that reports `releaseVersion: 1`.
    */
+  /**
+   * The idempotent DDL that adds the handoff claim high-water column to the
+   * parent revision table. `init()` runs it; an externally managed schema
+   * must run it before deploying a store that reports `closureDeleteVersion: 1`.
+   */
+  static getWorkflowParentRevisionHandoffHwmDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISIONS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `ALTER TABLE ${tableName}
+  ADD COLUMN IF NOT EXISTS "${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}" BIGINT;`;
+  }
+
+  /**
+   * Handoff claims and closure erasure read and write the high-water column.
+   * Until it is known to exist, they check the live catalog on the caller's
+   * connection and fail closed with the DDL to run; a miss is not cached.
+   */
+  private async assertWorkflowParentRevisionHandoffHwmColumn(client: Pick<DbClient, 'oneOrNone'>): Promise<void> {
+    if (this.#workflowParentRevisionHandoffHwmColumnVerified) return;
+    const row = await client.oneOrNone<{ present: boolean }>(
+      `SELECT TRUE AS present
+         FROM pg_catalog.pg_class AS relation_row
+         JOIN pg_catalog.pg_namespace AS namespace_row
+           ON namespace_row.oid = relation_row.relnamespace
+         JOIN pg_catalog.pg_attribute AS attribute_row
+           ON attribute_row.attrelid = relation_row.oid
+        WHERE namespace_row.nspname = $1
+          AND relation_row.relname = $2
+          AND relation_row.relkind IN ('r', 'p')
+          AND attribute_row.attnum > 0
+          AND NOT attribute_row.attisdropped
+          AND attribute_row.attname = $3`,
+      [this.#schema || 'public', TABLE_WORKFLOW_PARENT_REVISIONS, WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN],
+    );
+    if (row) {
+      this.#workflowParentRevisionHandoffHwmColumnVerified = true;
+      return;
+    }
+    throw new MastraError({
+      id: WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID,
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.USER,
+      text: `PostgreSQL external schema table ${this.workflowParentRevisionTableName()} is missing required columns: ${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}. Run: ${WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(this.#schema)}`,
+      details: {
+        tableName: TABLE_WORKFLOW_PARENT_REVISIONS,
+        missingColumns: WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN,
+      },
+    });
+  }
+
+  /** The erased-closure claim high-water mark of a run whose revision row this transaction holds. */
+  private async readWorkflowParentRevisionHandoffHwm(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+  ): Promise<number> {
+    await this.assertWorkflowParentRevisionHandoffHwmColumn(t);
+    const row = await t.oneOrNone<{ hwm: string | number | null }>(
+      `SELECT "${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}" AS hwm FROM ${this.workflowParentRevisionTableName()}
+       WHERE workflow_name = $1 AND run_id = $2`,
+      [workflowName, runId],
+    );
+    if (!row || row.hwm === null) return 0;
+    const hwm = typeof row.hwm === 'string' ? Number(row.hwm) : row.hwm;
+    // The next claim is hwm + 1, which must stay a safe integer.
+    if (!Number.isSafeInteger(hwm) || hwm < 1 || hwm >= Number.MAX_SAFE_INTEGER) {
+      throw new TypeError('Invalid workflow handoff claim high-water mark');
+    }
+    return hwm;
+  }
+
   static getWorkflowSnapshotHandoffReleaseDDL(schemaName?: string): string {
     const tableName = getTableName({
       indexName: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
@@ -1995,6 +2087,19 @@ export class WorkflowsPG extends WorkflowsStorage {
             ? { status: 'already_persisted', record: copyWorkflowTerminalRecoveryAncestryRecord(existing) }
             : { status: 'ancestry_conflict' };
         }
+        // A run whose kept parent revision outlived its snapshot was deleted or
+        // had its closure erased; a writer queued behind that delete on the
+        // advisory lock must not recreate terminal rows for it. A child that
+        // has never been persisted has no revision row yet.
+        const childRevision = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
+        if (childRevision) {
+          const childSnapshot = await t.oneOrNone<{ exists: boolean }>(
+            `SELECT TRUE AS exists FROM ${this.workflowSnapshotTableName()}
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [operation.workflowName, operation.runId],
+          );
+          if (!childSnapshot) return { status: 'missing_run' };
+        }
         for (const frame of desired.ancestry) {
           let parentRevision: WorkflowParentRevisionLock | undefined;
           try {
@@ -2347,6 +2452,54 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  /**
+   * Whether any recursively linked child (through parent effects or recovery
+   * ancestry) lacks a completed terminal journal. Missing journals count as
+   * pending, so cleanup of the ancestor fails closed.
+   */
+  private async hasPendingTerminalDependents(t: TxClient, workflowName: string, runId: string): Promise<boolean> {
+    const dependencyState = await t.one<{ pending: boolean }>(
+      `WITH RECURSIVE descendants(workflow_name, run_id) AS (
+           SELECT child.workflow_name, child.run_id
+           FROM (
+             SELECT effect.workflow_name, effect.run_id
+             FROM ${this.terminalEffectTableName()} AS effect
+             WHERE effect.effect_kind = 'parent-workflow-step-end'
+               AND effect.parent_workflow_name = $1 AND effect.parent_run_id = $2
+             UNION
+             SELECT ancestry.workflow_name, ancestry.run_id
+             FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
+             WHERE ancestry.immediate_parent_workflow_name = $1
+               AND ancestry.immediate_parent_run_id = $2
+           ) AS child
+           UNION
+           SELECT child.workflow_name, child.run_id
+           FROM descendants AS parent
+           CROSS JOIN LATERAL (
+             SELECT effect.workflow_name, effect.run_id
+             FROM ${this.terminalEffectTableName()} AS effect
+             WHERE effect.effect_kind = 'parent-workflow-step-end'
+               AND effect.parent_workflow_name = parent.workflow_name
+               AND effect.parent_run_id = parent.run_id
+             UNION
+             SELECT ancestry.workflow_name, ancestry.run_id
+             FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
+             WHERE ancestry.immediate_parent_workflow_name = parent.workflow_name
+               AND ancestry.immediate_parent_run_id = parent.run_id
+           ) AS child
+         )
+         SELECT EXISTS (
+           SELECT 1
+           FROM descendants AS child
+           LEFT JOIN ${this.terminalizationTableName()} AS journal
+             ON journal.workflow_name = child.workflow_name AND journal.run_id = child.run_id
+           WHERE journal.phase IS DISTINCT FROM 'complete'
+         ) AS pending`,
+      [workflowName, runId],
+    );
+    return dependencyState.pending;
+  }
+
   async deleteCompletedWorkflowTerminalizations(
     input: DeleteCompletedWorkflowTerminalizationsInput,
   ): Promise<DeleteCompletedWorkflowTerminalizationsResult> {
@@ -2373,46 +2526,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         // ancestry edge exists before a child journal/effect and closes the
         // crash window where parent recovery evidence could otherwise be
         // deleted while a nested child is only partially admitted.
-        const dependencyState = await t.one<{ pending: boolean }>(
-          `WITH RECURSIVE descendants(workflow_name, run_id) AS (
-             SELECT child.workflow_name, child.run_id
-             FROM (
-               SELECT effect.workflow_name, effect.run_id
-               FROM ${this.terminalEffectTableName()} AS effect
-               WHERE effect.effect_kind = 'parent-workflow-step-end'
-                 AND effect.parent_workflow_name = $1 AND effect.parent_run_id = $2
-               UNION
-               SELECT ancestry.workflow_name, ancestry.run_id
-               FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
-               WHERE ancestry.immediate_parent_workflow_name = $1
-                 AND ancestry.immediate_parent_run_id = $2
-             ) AS child
-             UNION
-             SELECT child.workflow_name, child.run_id
-             FROM descendants AS parent
-             CROSS JOIN LATERAL (
-               SELECT effect.workflow_name, effect.run_id
-               FROM ${this.terminalEffectTableName()} AS effect
-               WHERE effect.effect_kind = 'parent-workflow-step-end'
-                 AND effect.parent_workflow_name = parent.workflow_name
-                 AND effect.parent_run_id = parent.run_id
-               UNION
-               SELECT ancestry.workflow_name, ancestry.run_id
-               FROM ${this.terminalRecoveryAncestryTableName()} AS ancestry
-               WHERE ancestry.immediate_parent_workflow_name = parent.workflow_name
-                 AND ancestry.immediate_parent_run_id = parent.run_id
-             ) AS child
-           )
-           SELECT EXISTS (
-             SELECT 1
-             FROM descendants AS child
-             LEFT JOIN ${this.terminalizationTableName()} AS journal
-               ON journal.workflow_name = child.workflow_name AND journal.run_id = child.run_id
-             WHERE journal.phase IS DISTINCT FROM 'complete'
-           ) AS pending`,
-          [operation.workflowName, operation.runId],
-        );
-        if (dependencyState.pending) return { status: 'deleted', count: 0 };
+        const pending = await this.hasPendingTerminalDependents(t, operation.workflowName, operation.runId);
+        if (pending) return { status: 'deleted', count: 0 };
 
         const revision = await this.lockExistingWorkflowParentRevision(t, operation.workflowName, operation.runId);
         if (!revision) {
@@ -3343,6 +3458,23 @@ export class WorkflowsPG extends WorkflowsStorage {
         table: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
         columns: ['status', 'updated_at', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
       },
+      // Resource indexes back listWorkflowRunClosuresByResource's keyset scan
+      // and any resource-scoped lookup of a run's closure rows.
+      {
+        name: workflowSnapshotResourceIndexName(schemaPrefix),
+        table: TABLE_WORKFLOW_SNAPSHOT,
+        columns: ['resourceId', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
+      },
+      {
+        name: 'mastra_workflow_snapshot_handoffs_resource_idx',
+        table: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
+        columns: ['resource_id', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
+      },
+      {
+        name: 'mastra_workflow_terminal_snapshots_v2_resource_idx',
+        table: TABLE_WORKFLOW_TERMINAL_SNAPSHOTS,
+        columns: ['resource_id', 'workflow_name COLLATE "C" ASC', 'run_id COLLATE "C" ASC'],
+      },
     ];
   }
 
@@ -3373,6 +3505,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     statements.push(WorkflowsPG.getWorkflowSnapshotHandoffTableDDL(schemaName));
     statements.push(WorkflowsPG.getWorkflowSchemaMigrationTableDDL(schemaName));
     statements.push(WorkflowsPG.getWorkflowParentRevisionExportDDL(schemaName));
+    statements.push(WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalContinuationPlanTableDDL(schemaName));
     for (const idx of WorkflowsPG.getDefaultIndexDefs(schemaPrefix)) {
       statements.push(generateIndexSQL(idx, schemaName));
@@ -3935,13 +4068,18 @@ export class WorkflowsPG extends WorkflowsStorage {
       WHERE check_row.conrelid = revision_oid
         AND check_row.contype = 'c';
 
-      IF revision_columns = '{
+      IF (revision_columns - '${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}') = '{
            "workflow_name": {"type": "text", "not_null": true, "has_default": false},
            "run_id": {"type": "text", "not_null": true, "has_default": false},
            "generation": {"type": "bigint", "not_null": true, "has_default": false},
            "terminal_status": {"type": "text", "not_null": false, "has_default": false},
            "updated_at": {"type": "bigint", "not_null": true, "has_default": false}
          }'::jsonb
+         AND COALESCE(
+           revision_columns -> '${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}'
+             = '{"type": "bigint", "not_null": false, "has_default": false}'::jsonb,
+           TRUE
+         )
          AND revision_primary_key = ARRAY['workflow_name', 'run_id']::text[]
          AND revision_primary_key_immediate
          AND revision_checks = ARRAY[
@@ -4139,17 +4277,23 @@ export class WorkflowsPG extends WorkflowsStorage {
     ) {
       parentRevisions = 'legacy';
     } else if (
-      matches(
-        revision,
-        {
-          workflow_name: { type: 'text', notNull: true },
-          run_id: { type: 'text', notNull: true },
-          generation: { type: 'bigint', notNull: true },
-          terminal_status: { type: 'text', notNull: false },
-          updated_at: { type: 'bigint', notNull: true },
-        },
-        ['workflow_name', 'run_id'],
-        [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
+      [false, true].some(withHandoffHwm =>
+        matches(
+          revision,
+          {
+            workflow_name: { type: 'text', notNull: true },
+            run_id: { type: 'text', notNull: true },
+            generation: { type: 'bigint', notNull: true },
+            terminal_status: { type: 'text', notNull: false },
+            updated_at: { type: 'bigint', notNull: true },
+            // Added by a later additive migration; current either way.
+            ...(withHandoffHwm
+              ? { [WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN]: { type: 'bigint', notNull: false } }
+              : {}),
+          },
+          ['workflow_name', 'run_id'],
+          [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
+        ),
       )
     ) {
       parentRevisions = 'current';
@@ -4452,6 +4596,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       ['epoch'],
       WORKFLOW_PARENT_REVISION_MIGRATION_EPOCH_CHECKS,
     );
+    const hasHandoffHwmColumn =
+      snapshot.columns.get(TABLE_WORKFLOW_PARENT_REVISIONS)?.has(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN) ?? false;
     noteRelation(
       TABLE_WORKFLOW_PARENT_REVISIONS,
       {
@@ -4460,6 +4606,9 @@ export class WorkflowsPG extends WorkflowsStorage {
         generation: { type: 'bigint', notNull: true },
         terminal_status: { type: 'text', notNull: false },
         updated_at: { type: 'bigint', notNull: true },
+        ...(hasHandoffHwmColumn
+          ? { [WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN]: { type: 'bigint', notNull: false } }
+          : {}),
       },
       ['workflow_name', 'run_id'],
       [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
@@ -4609,6 +4758,24 @@ export class WorkflowsPG extends WorkflowsStorage {
    * no ALTER; a table created by this init already has them. Without a
    * snapshot the idempotent ALTER runs.
    */
+  /** Adds the handoff claim high-water column unless the init catalog snapshot already has it. */
+  private async migrateWorkflowParentRevisionHandoffHwm(): Promise<void> {
+    const columns = getSchemaSnapshot(this.#db.client, this.#schema)?.columns.get(TABLE_WORKFLOW_PARENT_REVISIONS);
+    if (!columns?.has(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN)) {
+      await this.#db.client.none(WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(this.#schema));
+      // Record the column with its type: the migration shape check reads both
+      // from the init snapshot on the next init.
+      this.#db.noteColumnAdded(TABLE_WORKFLOW_PARENT_REVISIONS, WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN);
+      const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
+      if (snapshot) {
+        const types = snapshot.columnTypes.get(TABLE_WORKFLOW_PARENT_REVISIONS) ?? new Map<string, string>();
+        types.set(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN, 'bigint');
+        snapshot.columnTypes.set(TABLE_WORKFLOW_PARENT_REVISIONS, types);
+      }
+    }
+    this.#workflowParentRevisionHandoffHwmColumnVerified = true;
+  }
+
   private async migrateWorkflowSnapshotHandoffRelease(): Promise<void> {
     const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
     if (snapshot) {
@@ -4921,6 +5088,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.none(WorkflowsPG.getWorkflowSnapshotHandoffTableDDL(this.#schema));
     await this.migrateWorkflowSnapshotHandoffRelease();
     const snapshotColumnType = await this.migrateWorkflowParentRevisions();
+    await this.migrateWorkflowParentRevisionHandoffHwm();
     await this.#db.client.none(WorkflowsPG.getTerminalContinuationPlanTableDDL(this.#schema));
     await this.#db.alterTable({
       tableName: TABLE_WORKFLOW_SNAPSHOT,
@@ -5537,11 +5705,16 @@ export class WorkflowsPG extends WorkflowsStorage {
             });
           }
         } else {
+          // A run whose closure was erased starts above the erased claims, so
+          // a release from the erased lifetime cannot match this claim. The
+          // parent revision row locked above holds the mark.
+          claimGeneration = (await this.readWorkflowParentRevisionHandoffHwm(t, workflowName, runId)) + 1;
           await t.none(
             `INSERT INTO ${this.workflowSnapshotHandoffTableName()}
-           (workflow_name, run_id, version, status, resource_id, snapshot, mutation_fence, created_at, updated_at)
-           VALUES ($1, $2, 1, 'pending', $3, $4, $5, $6, $6)`,
-            [workflowName, runId, resourceId ?? null, serializedSnapshot, mutationFence, now],
+           (workflow_name, run_id, version, status, resource_id, snapshot, mutation_fence, created_at, updated_at,
+            claim_generation)
+           VALUES ($1, $2, 1, 'pending', $3, $4, $5, $6, $6, $7)`,
+            [workflowName, runId, resourceId ?? null, serializedSnapshot, mutationFence, now, claimGeneration],
           );
         }
         return {
@@ -5796,6 +5969,197 @@ export class WorkflowsPG extends WorkflowsStorage {
       ...(hasMore && last
         ? { nextCursor: { updatedAt: last.updatedAt, workflowName: last.workflowName, runId: last.runId } }
         : {}),
+    };
+  }
+
+  async deleteWorkflowRunClosure(input: DeleteWorkflowRunClosureInput): Promise<DeleteWorkflowRunClosureResult> {
+    const { workflowName, runId, expectedResourceId } = input;
+    validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    const identity = [workflowName, runId];
+    try {
+      return await this.#db.client.tx(async t => {
+        // The terminal journal's advisory lock first, so journal writers (which
+        // take it before their row locks) never interleave. Then the usual
+        // order: parent revision, handoff row, run snapshot.
+        await t.none(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [JSON.stringify(identity)]);
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        const handoff = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
+        const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
+        const snapshot = await t.oneOrNone<{ resource_id: string | null; status: string | null }>(
+          `SELECT "resourceId" AS resource_id,
+                  ${this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot')} AS status
+           FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const journal = await t.oneOrNone<{ phase: string; owner_id: string | null; lease_live: boolean }>(
+          `SELECT phase, owner_id,
+                  COALESCE(lease_expires_at > floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint, FALSE)
+                    AS lease_live
+           FROM ${this.terminalizationTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const terminalSnapshot = await t.oneOrNone<{ resource_id: string | null }>(
+          `SELECT resource_id FROM ${this.terminalSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const dependents = await t.one<{ count: string }>(
+          `SELECT (
+             (SELECT count(*) FROM ${this.terminalContinuationPlanTableName()} WHERE workflow_name = $1 AND run_id = $2)
+             + (SELECT count(*) FROM ${this.terminalDestinationReceiptTableName()} WHERE workflow_name = $1 AND run_id = $2)
+             + (SELECT count(*) FROM ${this.terminalEffectTableName()} WHERE workflow_name = $1 AND run_id = $2)
+             + (SELECT count(*) FROM ${this.terminalRecoveryAncestryTableName()} WHERE workflow_name = $1 AND run_id = $2)
+           )::text AS count`,
+          identity,
+        );
+        const hasTerminalRows = journal !== null || terminalSnapshot !== null || Number(dependents.count) > 0;
+        if (!snapshot && !handoff && !hasTerminalRows) return { status: 'missing' };
+
+        const owners = [
+          snapshot?.resource_id,
+          handoff ? (handoff.resourceId ?? null) : undefined,
+          terminalSnapshot?.resource_id,
+        ].filter(owner => owner !== undefined);
+        if (owners.length === 0 || owners.some(owner => owner !== expectedResourceId)) {
+          return { status: 'resource_mismatch' };
+        }
+        if (handoff && handoff.status === 'pending' && handoff.releasedAt === undefined) return { status: 'fenced' };
+        if (snapshot && !isSettledWorkflowRunStatus(snapshot.status)) return { status: 'active' };
+        if (journal && journal.phase !== 'complete' && journal.owner_id !== null && journal.lease_live) {
+          return { status: 'active' };
+        }
+        // A nested child that has not completed its terminal journal still
+        // needs this run's parent state; erase children first.
+        if (await this.hasPendingTerminalDependents(t, workflowName, runId)) return { status: 'active' };
+
+        // Leaves first and the journal last, as completed-journal cleanup does.
+        let terminalRows = 0;
+        for (const table of [
+          this.terminalContinuationPlanTableName(),
+          this.terminalDestinationReceiptTableName(),
+          this.terminalEffectTableName(),
+          this.terminalSnapshotTableName(),
+          this.terminalRecoveryAncestryTableName(),
+          this.terminalizationTableName(),
+        ]) {
+          const result = await t.query(`DELETE FROM ${table} WHERE workflow_name = $1 AND run_id = $2`, identity);
+          terminalRows += result.rowCount ?? 0;
+        }
+        if (handoff) {
+          // Keep the erased claim history's high-water mark on the kept
+          // revision row (locked above), so a later claim starts above it.
+          if (!revision) throw new TypeError('Workflow snapshot handoff is missing parent revision evidence');
+          await this.assertWorkflowParentRevisionHandoffHwmColumn(t);
+          await t.none(
+            `UPDATE ${this.workflowParentRevisionTableName()}
+             SET "${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}" =
+                   GREATEST(COALESCE("${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}", 0), $3)
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [workflowName, runId, handoff.claimGeneration],
+          );
+        }
+        const handoffDeleted = await t.query(
+          `DELETE FROM ${this.workflowSnapshotHandoffTableName()} WHERE workflow_name = $1 AND run_id = $2`,
+          identity,
+        );
+        // Deletes the snapshot and bumps the kept parent revision, the
+        // content-free run-id reuse fence, exactly as deleteWorkflowRunById.
+        const snapshotDeleted = await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision);
+        // The erased lifetime's terminal latch must not carry over: a reused
+        // run id starts running again. The generation still moves forward.
+        await t.none(
+          `UPDATE ${this.workflowParentRevisionTableName()}
+           SET terminal_status = NULL,
+               generation = generation + $3,
+               updated_at = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+           WHERE workflow_name = $1 AND run_id = $2 AND terminal_status IS NOT NULL`,
+          [workflowName, runId, snapshotDeleted ? 0 : 1],
+        );
+        return {
+          status: 'deleted',
+          removed: { snapshot: snapshotDeleted, handoff: (handoffDeleted.rowCount ?? 0) > 0, terminalRows },
+        };
+      });
+    } catch (error) {
+      throw this.snapshotHandoffError('DELETE_WORKFLOW_RUN_CLOSURE', workflowName, runId, error);
+    }
+  }
+
+  async listWorkflowRunClosuresByResource(
+    input: ListWorkflowRunClosuresByResourceInput,
+  ): Promise<ListWorkflowRunClosuresByResourceResult> {
+    const { resourceId, after, limit } = captureWorkflowRunClosureListInput(input);
+    const values: unknown[] = [resourceId];
+    let keyset = '';
+    if (after) {
+      values.push(after.workflowName, after.runId);
+      keyset = `AND (workflow_name COLLATE "C", run_id COLLATE "C") > ($2, $3)`;
+    }
+    values.push(limit + 1);
+    const limitParam = `$${values.length}`;
+    // Each branch is an index-ordered keyset scan; the page's first limit + 1
+    // runs are always within each branch's first limit + 1 rows.
+    const branch = (table: string, resourceColumn: string, columns: string) =>
+      `(SELECT workflow_name, run_id, ${columns} FROM ${table}
+        WHERE ${resourceColumn} = $1 ${keyset}
+        ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
+        LIMIT ${limitParam})`;
+    let rows: Array<{
+      workflow_name: string;
+      run_id: string;
+      snapshot: boolean;
+      terminal_snapshot: boolean;
+      handoff_status: string | null;
+      handoff_released: boolean | null;
+    }>;
+    try {
+      await this.assertWorkflowSnapshotHandoffReleaseColumns(this.#db.client);
+      rows = await this.#db.client.any(
+        `SELECT workflow_name COLLATE "C" AS workflow_name, run_id COLLATE "C" AS run_id,
+                bool_or(snapshot) AS snapshot,
+                bool_or(terminal_snapshot) AS terminal_snapshot,
+                max(handoff_status) AS handoff_status,
+                bool_or(handoff_released) AS handoff_released
+         FROM (
+           ${branch(this.workflowSnapshotTableName(), '"resourceId"', 'TRUE AS snapshot, FALSE AS terminal_snapshot, NULL::text AS handoff_status, NULL::boolean AS handoff_released')}
+           UNION ALL
+           ${branch(this.terminalSnapshotTableName(), 'resource_id', 'FALSE, TRUE, NULL::text, NULL::boolean')}
+           UNION ALL
+           ${branch(this.workflowSnapshotHandoffTableName(), 'resource_id', 'FALSE, FALSE, status, released_at IS NOT NULL')}
+         ) AS matches
+         GROUP BY workflow_name COLLATE "C", run_id COLLATE "C"
+         ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
+         LIMIT ${limitParam}`,
+        values,
+      );
+    } catch (error) {
+      throw this.snapshotHandoffError('LIST_WORKFLOW_RUN_CLOSURES_BY_RESOURCE', undefined, undefined, error, {
+        write: false,
+      });
+    }
+    const closures = rows.slice(0, limit).map((row): WorkflowRunClosureEntry => {
+      if (row.handoff_status !== null && row.handoff_status !== 'pending' && row.handoff_status !== 'completed') {
+        throw new TypeError('Invalid workflow snapshot handoff status');
+      }
+      return {
+        workflowName: row.workflow_name,
+        runId: row.run_id,
+        snapshot: row.snapshot,
+        terminalSnapshot: row.terminal_snapshot,
+        ...(row.handoff_status === null
+          ? {}
+          : { handoff: { status: row.handoff_status, released: row.handoff_released === true } }),
+      };
+    });
+    const hasMore = rows.length > limit;
+    const last = closures.at(-1);
+    return {
+      status: 'listed',
+      closures,
+      hasMore,
+      ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
     };
   }
 
