@@ -294,6 +294,51 @@ describe('WorkflowsInMemory run closure delete', () => {
     expect(closureRows(db, run)).toMatchObject({ snapshot: true });
   });
 
+  it('starts a reused run id above the erased claims, so a stale release cannot delete the new run', async () => {
+    const { workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-reused' };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'success' },
+    });
+    await deliveredHandoff(workflows, run, { release: true });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+
+    // The same run id runs again and is delivered again.
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'success', result: { second: true } },
+    });
+    const canonical = (await workflows.loadWorkflowSnapshot(run))!;
+    const owner = { ...run, resourceId: RESOURCE, mutationFence: 'second-fence' };
+    const pending = { ...canonical, value: { phase: 'claimed-again' } } as WorkflowRunState;
+    await expect(
+      workflows.claimWorkflowSnapshotHandoff({
+        ...owner,
+        expectedCanonical: { kind: 'present', resourceId: RESOURCE, snapshot: canonical },
+        snapshot: pending,
+      }),
+    ).resolves.toMatchObject({ status: 'created', record: { claimGeneration: 2 } });
+    await expect(
+      workflows.completeWorkflowSnapshotHandoff({
+        ...owner,
+        expectedResourceId: RESOURCE,
+        expectedSnapshot: pending,
+        snapshot: canonical,
+      }),
+    ).resolves.toMatchObject({ status: 'completed' });
+
+    // A delayed release from the erased lifetime names generation 1.
+    await expect(
+      workflows.releaseWorkflowSnapshotHandoff({ ...run, expectedClaimGeneration: 1, deleteRun: true }),
+    ).resolves.toMatchObject({ status: 'conflict', record: { claimGeneration: 2 } });
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ result: { second: true } });
+  });
+
   it('answers missing for a run storage never held', async () => {
     const { workflows } = setup();
     await expect(

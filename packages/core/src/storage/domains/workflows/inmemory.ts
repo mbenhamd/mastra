@@ -1024,6 +1024,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const snapshot = this.db.workflows.get(key)?.snapshot;
     const status = snapshot && typeof snapshot !== 'string' ? snapshot.status : undefined;
     this.db.workflowTerminalParentRevisions.set(key, {
+      ...existing,
       generation,
       terminalStatus: existing?.terminalStatus ?? (isTerminalParentStatus(status) ? status : null),
     });
@@ -1040,6 +1041,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const generation = (existing?.generation ?? 0) + 1;
     if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
     this.db.workflowTerminalParentRevisions.set(key, {
+      ...existing,
       generation,
       terminalStatus,
     });
@@ -1840,7 +1842,11 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       mutationFence,
       createdAt: now,
       updatedAt: now,
-      claimGeneration: existing ? existing.claimGeneration + 1 : 1,
+      // A run whose closure was erased starts above the erased claims, so a
+      // release from the erased lifetime cannot match this claim.
+      claimGeneration: existing
+        ? existing.claimGeneration + 1
+        : (this.db.workflowTerminalParentRevisions.get(key)?.handoffClaimGenerationHwm ?? 0) + 1,
     };
     this.db.workflowSnapshotHandoffs.set(key, record);
     return { status: 'created', record: this.copyWorkflowSnapshotHandoff(record) };
@@ -2060,6 +2066,17 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     this.db.workflowTerminalizations.delete(key);
     this.db.workflowSnapshotHandoffs.delete(key);
     const snapshotDeleted = this.db.workflows.delete(key);
+    if (handoff) {
+      // Keep the erased claim history's high-water mark on the kept revision.
+      const revision = this.db.workflowTerminalParentRevisions.get(key) ?? {
+        generation: 1,
+        terminalStatus: null,
+      };
+      this.db.workflowTerminalParentRevisions.set(key, {
+        ...revision,
+        handoffClaimGenerationHwm: Math.max(revision.handoffClaimGenerationHwm ?? 0, handoff.claimGeneration),
+      });
+    }
     // Keep the parent revision as the content-free run-id reuse fence and
     // bump it, as deleteWorkflowRunById does, so a recreated run cannot make
     // an older parent context current again.

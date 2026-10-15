@@ -270,6 +270,52 @@ describe('WorkflowsPG run closure delete', () => {
     });
   });
 
+  it('starts a reused run id above the erased claims, so a stale release cannot delete the new run', async () => {
+    const run = newRun();
+    await settledRun(run);
+    await deliveredHandoff(run, { release: true });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+
+    // The same run id runs again and is delivered again.
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: resource,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'success', result: { second: true } },
+    });
+    const canonical = (await workflows.loadWorkflowSnapshot(run))!;
+    const owner = { ...run, resourceId: resource, mutationFence: `second-${randomUUID()}` };
+    const pending = { ...canonical, value: { phase: 'claimed-again' } } as WorkflowRunState;
+    await expect(
+      workflows.claimWorkflowSnapshotHandoff({
+        ...owner,
+        expectedCanonical: { kind: 'present', resourceId: resource, snapshot: canonical },
+        snapshot: pending,
+      }),
+    ).resolves.toMatchObject({ status: 'created', record: { claimGeneration: 2 } });
+    await expect(
+      workflows.completeWorkflowSnapshotHandoff({
+        ...owner,
+        expectedResourceId: resource,
+        expectedSnapshot: pending,
+        snapshot: canonical,
+      }),
+    ).resolves.toMatchObject({ status: 'completed' });
+
+    // A delayed release from the erased lifetime names generation 1.
+    await expect(
+      workflows.releaseWorkflowSnapshotHandoff({ ...run, expectedClaimGeneration: 1, deleteRun: true }),
+    ).resolves.toMatchObject({ status: 'conflict', record: { claimGeneration: 2 } });
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ result: { second: true } });
+    const stored = await store.db.one<{ claim_generation: string; released: boolean }>(
+      `SELECT claim_generation::text, released_at IS NOT NULL AS released
+       FROM mastra_workflow_snapshot_handoffs WHERE workflow_name = $1 AND run_id = $2`,
+      [run.workflowName, run.runId],
+    );
+    expect(stored).toEqual({ claim_generation: '2', released: false });
+  });
+
   it('answers missing for a run storage never held', async () => {
     await expect(workflows.deleteWorkflowRunClosure({ ...newRun(), expectedResourceId: resource })).resolves.toEqual({
       status: 'missing',

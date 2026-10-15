@@ -208,6 +208,8 @@ const TABLE_WORKFLOW_PARENT_REVISIONS = 'mastra_workflow_parent_revisions';
 const TABLE_WORKFLOW_SCHEMA_MIGRATIONS = 'mastra_workflow_schema_migrations';
 /** Handoff release columns an externally managed schema must provide (see getWorkflowSnapshotHandoffReleaseDDL). */
 const WORKFLOW_SNAPSHOT_HANDOFF_RELEASE_COLUMNS = ['claim_generation', 'released_at'] as const;
+/** Parent-revision column keeping an erased closure's highest handoff claim generation. */
+const WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN = 'handoff_claim_generation_hwm';
 const WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID = createStorageErrorId(
   'PG',
   'WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA',
@@ -406,6 +408,7 @@ export class WorkflowsPG extends WorkflowsStorage {
   #indexes?: CreateIndexOptions[];
   #initializedWorkflowSnapshotColumnType?: WorkflowSnapshotColumnType;
   #workflowSnapshotHandoffReleaseColumnsVerified = false;
+  #workflowParentRevisionHandoffHwmColumnVerified = false;
 
   /** Tables managed by this domain */
   static readonly MANAGED_TABLES = [
@@ -983,6 +986,76 @@ export class WorkflowsPG extends WorkflowsStorage {
    * schema (`disableInit` / `MASTRA_DISABLE_STORAGE_INIT`) must run it before
    * deploying a store that reports `releaseVersion: 1`.
    */
+  /**
+   * The idempotent DDL that adds the handoff claim high-water column to the
+   * parent revision table. `init()` runs it; an externally managed schema
+   * must run it before deploying a store that reports `closureDeleteVersion: 1`.
+   */
+  static getWorkflowParentRevisionHandoffHwmDDL(schemaName?: string): string {
+    const tableName = getTableName({
+      indexName: TABLE_WORKFLOW_PARENT_REVISIONS,
+      schemaName: getSchemaName(schemaName),
+    });
+    return `ALTER TABLE ${tableName}
+  ADD COLUMN IF NOT EXISTS "${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}" BIGINT;`;
+  }
+
+  /**
+   * Handoff claims and closure erasure read and write the high-water column.
+   * Until it is known to exist, they check the live catalog on the caller's
+   * connection and fail closed with the DDL to run; a miss is not cached.
+   */
+  private async assertWorkflowParentRevisionHandoffHwmColumn(client: Pick<DbClient, 'oneOrNone'>): Promise<void> {
+    if (this.#workflowParentRevisionHandoffHwmColumnVerified) return;
+    const row = await client.oneOrNone<{ present: boolean }>(
+      `SELECT TRUE AS present
+         FROM pg_catalog.pg_class AS relation_row
+         JOIN pg_catalog.pg_namespace AS namespace_row
+           ON namespace_row.oid = relation_row.relnamespace
+         JOIN pg_catalog.pg_attribute AS attribute_row
+           ON attribute_row.attrelid = relation_row.oid
+        WHERE namespace_row.nspname = $1
+          AND relation_row.relname = $2
+          AND relation_row.relkind IN ('r', 'p')
+          AND attribute_row.attnum > 0
+          AND NOT attribute_row.attisdropped
+          AND attribute_row.attname = $3`,
+      [this.#schema || 'public', TABLE_WORKFLOW_PARENT_REVISIONS, WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN],
+    );
+    if (row) {
+      this.#workflowParentRevisionHandoffHwmColumnVerified = true;
+      return;
+    }
+    throw new MastraError({
+      id: WORKFLOW_SNAPSHOT_HANDOFF_SCHEMA_ERROR_ID,
+      domain: ErrorDomain.STORAGE,
+      category: ErrorCategory.USER,
+      text: `PostgreSQL external schema table ${this.workflowParentRevisionTableName()} is missing required columns: ${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}. Run: ${WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(this.#schema)}`,
+      details: {
+        tableName: TABLE_WORKFLOW_PARENT_REVISIONS,
+        missingColumns: WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN,
+      },
+    });
+  }
+
+  /** The erased-closure claim high-water mark of a run whose revision row this transaction holds. */
+  private async readWorkflowParentRevisionHandoffHwm(
+    t: TxClient,
+    workflowName: string,
+    runId: string,
+  ): Promise<number> {
+    await this.assertWorkflowParentRevisionHandoffHwmColumn(t);
+    const row = await t.oneOrNone<{ hwm: string | number | null }>(
+      `SELECT "${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}" AS hwm FROM ${this.workflowParentRevisionTableName()}
+       WHERE workflow_name = $1 AND run_id = $2`,
+      [workflowName, runId],
+    );
+    if (!row || row.hwm === null) return 0;
+    const hwm = typeof row.hwm === 'string' ? Number(row.hwm) : row.hwm;
+    if (!Number.isSafeInteger(hwm) || hwm < 1) throw new TypeError('Invalid workflow handoff claim high-water mark');
+    return hwm;
+  }
+
   static getWorkflowSnapshotHandoffReleaseDDL(schemaName?: string): string {
     const tableName = getTableName({
       indexName: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
@@ -3406,6 +3479,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     statements.push(WorkflowsPG.getWorkflowSnapshotHandoffTableDDL(schemaName));
     statements.push(WorkflowsPG.getWorkflowSchemaMigrationTableDDL(schemaName));
     statements.push(WorkflowsPG.getWorkflowParentRevisionExportDDL(schemaName));
+    statements.push(WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(schemaName));
     statements.push(WorkflowsPG.getTerminalContinuationPlanTableDDL(schemaName));
     for (const idx of WorkflowsPG.getDefaultIndexDefs(schemaPrefix)) {
       statements.push(generateIndexSQL(idx, schemaName));
@@ -3968,13 +4042,18 @@ export class WorkflowsPG extends WorkflowsStorage {
       WHERE check_row.conrelid = revision_oid
         AND check_row.contype = 'c';
 
-      IF revision_columns = '{
+      IF (revision_columns - '${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}') = '{
            "workflow_name": {"type": "text", "not_null": true, "has_default": false},
            "run_id": {"type": "text", "not_null": true, "has_default": false},
            "generation": {"type": "bigint", "not_null": true, "has_default": false},
            "terminal_status": {"type": "text", "not_null": false, "has_default": false},
            "updated_at": {"type": "bigint", "not_null": true, "has_default": false}
          }'::jsonb
+         AND COALESCE(
+           revision_columns -> '${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}'
+             = '{"type": "bigint", "not_null": false, "has_default": false}'::jsonb,
+           TRUE
+         )
          AND revision_primary_key = ARRAY['workflow_name', 'run_id']::text[]
          AND revision_primary_key_immediate
          AND revision_checks = ARRAY[
@@ -4172,17 +4251,23 @@ export class WorkflowsPG extends WorkflowsStorage {
     ) {
       parentRevisions = 'legacy';
     } else if (
-      matches(
-        revision,
-        {
-          workflow_name: { type: 'text', notNull: true },
-          run_id: { type: 'text', notNull: true },
-          generation: { type: 'bigint', notNull: true },
-          terminal_status: { type: 'text', notNull: false },
-          updated_at: { type: 'bigint', notNull: true },
-        },
-        ['workflow_name', 'run_id'],
-        [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
+      [false, true].some(withHandoffHwm =>
+        matches(
+          revision,
+          {
+            workflow_name: { type: 'text', notNull: true },
+            run_id: { type: 'text', notNull: true },
+            generation: { type: 'bigint', notNull: true },
+            terminal_status: { type: 'text', notNull: false },
+            updated_at: { type: 'bigint', notNull: true },
+            // Added by a later additive migration; current either way.
+            ...(withHandoffHwm
+              ? { [WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN]: { type: 'bigint', notNull: false } }
+              : {}),
+          },
+          ['workflow_name', 'run_id'],
+          [...WORKFLOW_PARENT_REVISION_BASE_CHECKS, WORKFLOW_PARENT_REVISION_TERMINAL_STATUS_CHECK],
+        ),
       )
     ) {
       parentRevisions = 'current';
@@ -4642,6 +4727,15 @@ export class WorkflowsPG extends WorkflowsStorage {
    * no ALTER; a table created by this init already has them. Without a
    * snapshot the idempotent ALTER runs.
    */
+  /** Adds the handoff claim high-water column unless the init catalog snapshot already has it. */
+  private async migrateWorkflowParentRevisionHandoffHwm(): Promise<void> {
+    const columns = getSchemaSnapshot(this.#db.client, this.#schema)?.columns.get(TABLE_WORKFLOW_PARENT_REVISIONS);
+    if (!columns?.has(WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN)) {
+      await this.#db.client.none(WorkflowsPG.getWorkflowParentRevisionHandoffHwmDDL(this.#schema));
+    }
+    this.#workflowParentRevisionHandoffHwmColumnVerified = true;
+  }
+
   private async migrateWorkflowSnapshotHandoffRelease(): Promise<void> {
     const snapshot = getSchemaSnapshot(this.#db.client, this.#schema);
     if (snapshot) {
@@ -4954,6 +5048,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     await this.#db.client.none(WorkflowsPG.getWorkflowSnapshotHandoffTableDDL(this.#schema));
     await this.migrateWorkflowSnapshotHandoffRelease();
     const snapshotColumnType = await this.migrateWorkflowParentRevisions();
+    await this.migrateWorkflowParentRevisionHandoffHwm();
     await this.#db.client.none(WorkflowsPG.getTerminalContinuationPlanTableDDL(this.#schema));
     await this.#db.alterTable({
       tableName: TABLE_WORKFLOW_SNAPSHOT,
@@ -5570,11 +5665,16 @@ export class WorkflowsPG extends WorkflowsStorage {
             });
           }
         } else {
+          // A run whose closure was erased starts above the erased claims, so
+          // a release from the erased lifetime cannot match this claim. The
+          // parent revision row locked above holds the mark.
+          claimGeneration = (await this.readWorkflowParentRevisionHandoffHwm(t, workflowName, runId)) + 1;
           await t.none(
             `INSERT INTO ${this.workflowSnapshotHandoffTableName()}
-           (workflow_name, run_id, version, status, resource_id, snapshot, mutation_fence, created_at, updated_at)
-           VALUES ($1, $2, 1, 'pending', $3, $4, $5, $6, $6)`,
-            [workflowName, runId, resourceId ?? null, serializedSnapshot, mutationFence, now],
+           (workflow_name, run_id, version, status, resource_id, snapshot, mutation_fence, created_at, updated_at,
+            claim_generation)
+           VALUES ($1, $2, 1, 'pending', $3, $4, $5, $6, $6, $7)`,
+            [workflowName, runId, resourceId ?? null, serializedSnapshot, mutationFence, now, claimGeneration],
           );
         }
         return {
@@ -5903,6 +6003,19 @@ export class WorkflowsPG extends WorkflowsStorage {
         ]) {
           const result = await t.query(`DELETE FROM ${table} WHERE workflow_name = $1 AND run_id = $2`, identity);
           terminalRows += result.rowCount ?? 0;
+        }
+        if (handoff) {
+          // Keep the erased claim history's high-water mark on the kept
+          // revision row (locked above), so a later claim starts above it.
+          if (!revision) throw new TypeError('Workflow snapshot handoff is missing parent revision evidence');
+          await this.assertWorkflowParentRevisionHandoffHwmColumn(t);
+          await t.none(
+            `UPDATE ${this.workflowParentRevisionTableName()}
+             SET "${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}" =
+                   GREATEST(COALESCE("${WORKFLOW_PARENT_REVISION_HANDOFF_HWM_COLUMN}", 0), $3)
+             WHERE workflow_name = $1 AND run_id = $2`,
+            [workflowName, runId, handoff.claimGeneration],
+          );
         }
         const handoffDeleted = await t.query(
           `DELETE FROM ${this.workflowSnapshotHandoffTableName()} WHERE workflow_name = $1 AND run_id = $2`,

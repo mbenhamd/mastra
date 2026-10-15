@@ -273,11 +273,9 @@ export interface ListWorkflowSnapshotHandoffsResult {
  * snapshot, the handoff and the terminal snapshot. Rows without any of those
  * cannot be attributed and answer `resource_mismatch`.
  *
- * Like an operator removing a released handoff row, erasure drops the run's
- * handoff claim history: a later claim of the same run id starts again at
- * `claimGeneration` 1. Do not reuse an erased run's id while a release from
- * its erased lifetime could still arrive; such a release would match the new
- * claim's generation.
+ * Erasure keeps the deleted handoff's claim generation as a content-free
+ * high-water mark on the parent revision; a later claim of the same run id
+ * starts above it, so a release from the erased lifetime answers `conflict`.
  */
 export interface DeleteWorkflowRunClosureInput {
   workflowName: string;

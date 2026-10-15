@@ -203,7 +203,14 @@ const WORKFLOW_TERMINAL_TABLE_COLUMNS: Record<string, readonly string[]> = {
     'immediate_parent_run_id',
     'created_at',
   ],
-  mastra_workflow_parent_revisions: ['workflow_name', 'run_id', 'generation', 'terminal_status', 'updated_at'],
+  mastra_workflow_parent_revisions: [
+    'workflow_name',
+    'run_id',
+    'generation',
+    'terminal_status',
+    'updated_at',
+    'handoff_claim_generation_hwm',
+  ],
 };
 
 /**
@@ -393,8 +400,14 @@ const ADVANCEABLE_COLUMNS: Partial<Record<ExecutionClosureTableName, ReadonlySet
     'destination_applied_at',
     'quarantined_at',
   ]),
-  // The parent revision generation/terminal marker moves forward on commit.
-  mastra_workflow_parent_revisions: new Set(['generation', 'terminal_status', 'updated_at']),
+  // The parent revision generation/terminal marker moves forward on commit,
+  // and a closure erasure raises the handoff claim high-water mark.
+  mastra_workflow_parent_revisions: new Set([
+    'generation',
+    'terminal_status',
+    'updated_at',
+    'handoff_claim_generation_hwm',
+  ]),
   // A resumed session touches its thread and mutable session-scoped state.
   [TABLE_THREADS]: new Set(['title', 'metadata', 'updatedAt', 'updatedAtZ']),
   [TABLE_THREAD_STATE]: new Set(['value', 'updatedAt', 'updatedAtZ']),
@@ -1365,7 +1378,7 @@ const WORKFLOW_TERMINAL_BIGINT_COLUMNS: Record<string, ReadonlySet<string>> = {
   mastra_workflow_terminal_continuation_plans_v2: new Set(['created_at']),
   mastra_workflow_terminal_snapshots_v2: new Set(['created_at']),
   mastra_workflow_terminal_recovery_ancestries: new Set(['created_at']),
-  mastra_workflow_parent_revisions: new Set(['generation', 'updated_at']),
+  mastra_workflow_parent_revisions: new Set(['generation', 'updated_at', 'handoff_claim_generation_hwm']),
 };
 
 /** Columns stripped of live authority before a row is applied. */
