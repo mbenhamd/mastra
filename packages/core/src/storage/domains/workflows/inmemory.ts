@@ -86,6 +86,8 @@ import type {
   ListWorkflowSnapshotHandoffsResult,
   DeleteWorkflowRunClosureInput,
   DeleteWorkflowRunClosureResult,
+  CancelWorkflowRunForErasureInput,
+  CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
   WorkflowRunClosureEntry,
@@ -547,7 +549,13 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1, closureDeleteVersion: 1 };
+    return {
+      handoffVersion: 1,
+      recoveryVersion: 1,
+      releaseVersion: 1,
+      closureDeleteVersion: 1,
+      closureCancelVersion: 1,
+    };
   }
 
   private getWorkflowSnapshotHandoff(workflowName: string, runId: string): WorkflowSnapshotHandoffRecord | undefined {
@@ -2104,6 +2112,47 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       status: 'deleted',
       removed: { snapshot: snapshotDeleted, handoff: handoff !== undefined, terminalRows },
     };
+  }
+
+  async cancelWorkflowRunForErasure(
+    input: CancelWorkflowRunForErasureInput,
+  ): Promise<CancelWorkflowRunForErasureResult> {
+    const { workflowName, runId, expectedResourceId } = input;
+    validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    const key = this.getWorkflowKey(workflowName, runId);
+    // As in deleteWorkflowRunClosure: read the stored status first and restart
+    // if a reentrant getter changed the run. From the captures below to the
+    // write no caller code runs, so no other call interleaves.
+    let run: StorageWorkflowRun | undefined;
+    let runStatus: unknown;
+    for (let attempt = 1; ; attempt++) {
+      run = this.db.workflows.get(key);
+      const snapshot = run ? (typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot) : undefined;
+      runStatus = snapshot?.status;
+      if (this.db.workflows.get(key) === run) break;
+      throwIfWorkflowReentrantAttemptsExhausted(attempt);
+    }
+    if (!run) return { status: 'missing' };
+    const handoff = this.db.workflowSnapshotHandoffs.get(key);
+    const terminalSnapshot = this.db.workflowTerminalSnapshots.get(key);
+    const owners = [run, handoff, terminalSnapshot].filter(row => row !== undefined);
+    if (owners.some(row => row.resourceId !== expectedResourceId)) return { status: 'resource_mismatch' };
+    // The fence persistWorkflowSnapshot enforces: any unreleased handoff.
+    if (handoff && handoff.releasedAt === undefined) return { status: 'fenced' };
+    if (this.db.workflowTerminalizations.has(key)) return { status: 'journaled' };
+    if (this.hasPendingTerminalDependents(workflowName, runId)) return { status: 'active' };
+    if (isSettledWorkflowRunStatus(runStatus)) return { status: 'settled' };
+    // A latched terminal status the snapshot does not show yet: its
+    // settlement is in flight.
+    if (this.db.workflowTerminalParentRevisions.get(key)?.terminalStatus) return { status: 'active' };
+
+    this.setWorkflowRunRecord(workflowName, runId, {
+      ...run,
+      snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'canceled' },
+      updatedAt: new Date(),
+    });
+    this.bumpParentRevision(key);
+    return { status: 'cancelled' };
   }
 
   async listWorkflowRunClosuresByResource(
