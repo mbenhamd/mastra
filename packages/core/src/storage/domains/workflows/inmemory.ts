@@ -337,6 +337,7 @@ function plainErasureSnapshot<T>(value: T): T {
     level && level !== Object.prototype;
     level = Object.getPrototypeOf(level)
   ) {
+    // Every inherited enumerable key, symbols included.
     const inherited = Object.getOwnPropertyDescriptors(level);
     for (const name of Reflect.ownKeys(inherited)) {
       const descriptor = (inherited as Record<PropertyKey, PropertyDescriptor>)[name]!;
@@ -354,7 +355,14 @@ function plainErasureSnapshot<T>(value: T): T {
     Object.defineProperty(fields, name, { value: field, writable: true, enumerable, configurable: true });
   }
   Object.defineProperty(fields, 'status', { value: status, writable: true, enumerable: true, configurable: true });
-  return cloneRunData(fields) as T;
+  const plain = cloneRunData(fields) as Record<PropertyKey, unknown>;
+  // Symbol-keyed fields are copied too, whatever cloneRunData does with them.
+  for (const key of Object.getOwnPropertySymbols(fields)) {
+    if (Object.prototype.hasOwnProperty.call(plain, key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(fields, key)!;
+    Object.defineProperty(plain, key, { ...descriptor, value: cloneRunData(descriptor.value) });
+  }
+  return plain as T;
 }
 
 // JSON.stringify serializes an enumerable getter's return value as a fresh

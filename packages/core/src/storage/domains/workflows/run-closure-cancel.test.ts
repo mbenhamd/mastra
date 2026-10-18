@@ -850,6 +850,10 @@ describe('WorkflowsInMemory erasure cancel', () => {
     const stored = record.snapshot as WorkflowRunState & Record<string, unknown>;
     Object.defineProperty(stored, 'audit', { value: { by: 'engine' }, enumerable: false, writable: true });
     Object.defineProperty(stored, '__proto__', { value: { kept: true }, enumerable: true, writable: true });
+    // An enumerable symbol field the snapshot inherits.
+    const marker = Symbol.for('test.snapshot.marker');
+    const withInherited = Object.create({ [marker]: 'inherited' }, Object.getOwnPropertyDescriptors(stored));
+    db.workflows.set(key, { ...record, snapshot: withInherited });
 
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const after = db.workflows.get(key)!.snapshot as Record<string, unknown>;
@@ -859,6 +863,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
     });
     expect(Object.getOwnPropertyDescriptor(after, '__proto__')?.value).toEqual({ kept: true });
     expect(Object.getPrototypeOf(after)).toBe(Object.prototype);
+    expect((after as Record<symbol, unknown>)[marker]).toBe('inherited');
   });
 
   it('never runs a stored error accessor on the stored error during a refused cancel', async () => {
