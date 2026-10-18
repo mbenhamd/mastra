@@ -664,22 +664,26 @@ describe('WorkflowsInMemory erasure cancel', () => {
     const { workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-built-ins' };
     const finishedAt = new Date('2026-10-18T00:00:00.000Z');
+    const sourceUrl = new URL('https://example.invalid/report');
     await workflows.persistWorkflowSnapshot({
       ...run,
       resourceId: RESOURCE,
       snapshot: {
         ...createEmptyWorkflowSnapshot(run.runId),
         status: 'success',
-        result: { finishedAt, counts: new Map([['papers', 3]]), failure: new Error('kept') },
+        result: { finishedAt, counts: new Map([['papers', 3]]), failure: new Error('kept'), sourceUrl },
       },
     });
 
+    const before = (await workflows.loadWorkflowSnapshot(run))!;
+    expect((before.result as { sourceUrl: URL }).sourceUrl.href).toBe(sourceUrl.href);
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const stored = (await workflows.loadWorkflowSnapshot(run))!;
-    const result = stored.result as { finishedAt: Date; counts: Map<string, number>; failure: Error };
+    const result = stored.result as { finishedAt: Date; counts: Map<string, number>; failure: Error; sourceUrl: URL };
     expect(result.finishedAt).toEqual(finishedAt);
     expect(result.counts.get('papers')).toBe(3);
     expect(result.failure.message).toBe('kept');
+    expect(result.sourceUrl.href).toBe(sourceUrl.href);
   });
 
   it('finishes the erasure of a run reopened and then settled with another status', async () => {

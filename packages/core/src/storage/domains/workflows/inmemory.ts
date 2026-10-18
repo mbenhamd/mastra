@@ -212,6 +212,7 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   if (value === null || typeof value !== 'object') return value;
   const known = seen.get(value);
   if (known !== undefined) return known;
+  if (value instanceof URL) return new URL(value.href);
   // Built-ins keep their payload in internal slots a prototype shell would
   // lose: copy them whole (their accessors live on the built-in prototypes).
   if (
@@ -280,6 +281,7 @@ function plainErasureValue(value: unknown, seen: Map<object, unknown>): unknown 
   if (known !== undefined) return known;
   if (value instanceof Date) return new Date(value.getTime());
   if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof URL) return new URL(value.href);
   if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return structuredClone(value);
   if (value instanceof Map) {
     const map = new Map<unknown, unknown>();
