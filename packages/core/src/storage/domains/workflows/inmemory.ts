@@ -213,21 +213,28 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   const known = seen.get(value);
   if (known !== undefined) return known;
   // Built-ins keep their payload in internal slots a prototype shell would
-  // lose: copy them whole (their accessors live on the built-in prototypes).
-  if (
-    value instanceof Date ||
-    value instanceof Map ||
-    value instanceof Set ||
-    value instanceof RegExp ||
-    value instanceof ArrayBuffer ||
-    ArrayBuffer.isView(value)
-  ) {
-    let copy: unknown;
-    try {
-      copy = structuredClone(value);
-    } catch {
-      copy = value;
-    }
+  // lose: copy them as built-ins (their accessors live on the built-in
+  // prototypes). Collections are copied entry by entry, so their entries are
+  // detached too.
+  if (value instanceof Map) {
+    const map = new Map<unknown, unknown>();
+    seen.set(value, map);
+    for (const [key, entry] of value) map.set(detachedErasureCopy(key, seen), detachedErasureCopy(entry, seen));
+    return map;
+  }
+  if (value instanceof Set) {
+    const set = new Set<unknown>();
+    seen.set(value, set);
+    for (const entry of value) set.add(detachedErasureCopy(entry, seen));
+    return set;
+  }
+  if (value instanceof URL) {
+    const url = new URL(value.href);
+    seen.set(value, url);
+    return url;
+  }
+  if (value instanceof Date || value instanceof RegExp || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    const copy = structuredClone(value);
     seen.set(value, copy);
     return copy;
   }
@@ -280,6 +287,7 @@ function plainErasureValue(value: unknown, seen: Map<object, unknown>): unknown 
   if (known !== undefined) return known;
   if (value instanceof Date) return new Date(value.getTime());
   if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof URL) return new URL(value.href);
   if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return structuredClone(value);
   if (value instanceof Map) {
     const map = new Map<unknown, unknown>();

@@ -670,16 +670,33 @@ describe('WorkflowsInMemory erasure cancel', () => {
       snapshot: {
         ...createEmptyWorkflowSnapshot(run.runId),
         status: 'success',
-        result: { finishedAt, counts: new Map([['papers', 3]]), failure: new Error('kept') },
+        result: {
+          finishedAt,
+          counts: new Map([['papers', 3]]),
+          failure: new Error('kept'),
+          failures: new Map([['first', new Error('first kept')]]),
+          tags: new Set([new Error('tag kept')]),
+          source: new URL('https://example.org/paper'),
+        },
       },
     });
 
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const stored = (await workflows.loadWorkflowSnapshot(run))!;
-    const result = stored.result as { finishedAt: Date; counts: Map<string, number>; failure: Error };
+    const result = stored.result as {
+      finishedAt: Date;
+      counts: Map<string, number>;
+      failure: Error;
+      failures: Map<string, Error>;
+      tags: Set<Error>;
+      source: URL;
+    };
     expect(result.finishedAt).toEqual(finishedAt);
     expect(result.counts.get('papers')).toBe(3);
     expect(result.failure.message).toBe('kept');
+    expect(result.failures.get('first')?.message).toBe('first kept');
+    expect([...result.tags][0]?.message).toBe('tag kept');
+    expect(result.source.href).toBe('https://example.org/paper');
   });
 
   it('finishes the erasure of a run reopened and then settled with another status', async () => {
