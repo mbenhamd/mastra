@@ -203,6 +203,21 @@ export function cloneRunData<T>(value: T): T {
   return deepCloneForRun(value, new Map()) as T;
 }
 
+function cloneErasureCancelledSnapshot(
+  snapshot: WorkflowRunState,
+  status: WorkflowRunState['status'],
+): WorkflowRunState {
+  // Status evaluation can introduce enumerable accessors after the first
+  // clone. Resolve those on a detached receiver before publishing the row,
+  // retaining the exact checked status even if an accessor mutates it.
+  const statusDescriptor = { configurable: true, enumerable: true, writable: true, value: status };
+  const detached = Object.create(Object.getPrototypeOf(snapshot), {
+    ...Object.getOwnPropertyDescriptors(snapshot),
+    status: statusDescriptor,
+  }) as WorkflowRunState;
+  return Object.defineProperty(cloneRunData(detached), 'status', statusDescriptor);
+}
+
 // JSON.stringify serializes an enumerable getter's return value as a fresh
 // projection, not a reference. When the getter returns an object that was
 // already cloned — a sibling serialized earlier in enumeration order that the
@@ -878,7 +893,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // A run whose kept parent revision outlived its snapshot was deleted or
     // had its closure erased; a late writer must not recreate terminal rows
     // for it. A child that has never been persisted has no revision yet.
-    if (this.db.workflowTerminalParentRevisions.has(key) && !this.db.workflows.has(key)) {
+    const childRun = this.db.workflows.get(key);
+    const childGeneration = this.db.workflowTerminalParentRevisions.get(key)?.generation;
+    if (childGeneration !== undefined && !childRun) {
       return { status: 'missing_run' };
     }
     // What each parent looked like when checked: re-verified right before the
@@ -932,6 +949,8 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         return { status: 'ancestry_conflict' };
       }
     }
+    const storedRecord = copyWorkflowTerminalRecoveryAncestryRecord(desired);
+    const returnedRecord = copyWorkflowTerminalRecoveryAncestryRecord(desired);
     for (const checked of checkedParents) {
       const revision = this.db.workflowTerminalParentRevisions.get(checked.key);
       if (
@@ -942,8 +961,16 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
       }
     }
-    this.db.workflowTerminalRecoveryAncestries.set(key, copyWorkflowTerminalRecoveryAncestryRecord(desired));
-    return { status: 'persisted', record: copyWorkflowTerminalRecoveryAncestryRecord(desired) };
+    // A parent getter can erase and reuse the child identity too. Do not
+    // attach this old admission to a different lifetime under the same key.
+    if (
+      this.db.workflows.get(key) !== childRun ||
+      this.db.workflowTerminalParentRevisions.get(key)?.generation !== childGeneration
+    ) {
+      return { status: 'missing_run' };
+    }
+    this.db.workflowTerminalRecoveryAncestries.set(key, storedRecord);
+    return { status: 'persisted', record: returnedRecord };
   }
 
   async getWorkflowTerminalRecoveryAncestry(
@@ -2558,10 +2585,23 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // Clone before the final source check so no caller code runs between
       // the check and the map write; restart if a reentrant write changed the
       // source row so the CAS merge never overwrites a newer record.
-      const storedSnapshot = cloneRunData(working);
+      let storedSnapshot = cloneRunData(working);
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      // Preparing the result can invoke a retained context getter. Finish it
+      // on a detached receiver before the final freshness check and map write.
+      const returnedContext = revision?.erasureCancelled
+        ? cloneRunData(cloneRunData(storedSnapshot).context)
+        : undefined;
+      const snapshotStatus = revision?.erasureCancelled ? storedSnapshot.status : undefined;
+      if (revision?.erasureCancelled && snapshotStatus === revision.terminalStatus) {
+        storedSnapshot = cloneErasureCancelledSnapshot(storedSnapshot, snapshotStatus);
+      }
       if (this.db.workflows.get(key) !== run) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
 
       this.setWorkflowRunRecord(workflowName, runId, {
@@ -2570,7 +2610,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       });
       this.bumpParentRevision(key);
 
-      return cloneRunData(storedSnapshot.context);
+      return revision?.erasureCancelled ? returnedContext! : cloneRunData(storedSnapshot.context);
     }
   }
 
@@ -2725,7 +2765,10 @@ export class WorkflowsInMemory extends WorkflowsStorage {
             : typeof existing.snapshot === 'string'
               ? (JSON.parse(existing.snapshot) as WorkflowRunState)
               : existing.snapshot;
-        if (storedSnapshot?.executionGeneration !== expectedExecutionGeneration) {
+        const guardedSnapshot = this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled
+          ? cloneRunData(storedSnapshot)
+          : storedSnapshot;
+        if (guardedSnapshot?.executionGeneration !== expectedExecutionGeneration) {
           throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
         }
       }
@@ -2736,12 +2779,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       const revision = this.db.workflowTerminalParentRevisions.get(key);
       const snapshotStatus = revision?.erasureCancelled ? clonedSnapshot?.status : undefined;
       if (revision?.erasureCancelled && snapshotStatus === revision.terminalStatus) {
-        // Keep other descriptors and the prototype, but store the checked
-        // status as data even when its accessor was non-configurable.
-        clonedSnapshot = Object.create(Object.getPrototypeOf(clonedSnapshot), {
-          ...Object.getOwnPropertyDescriptors(clonedSnapshot),
-          status: { configurable: true, enumerable: true, writable: true, value: snapshotStatus },
-        });
+        clonedSnapshot = cloneErasureCancelledSnapshot(clonedSnapshot, snapshotStatus);
       }
       if (this.db.workflows.get(key) !== existing) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
