@@ -2800,13 +2800,18 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     workflowName: string;
     runId: string;
   }): Promise<WorkflowExecutionState | null> {
-    const stored = this.db.workflows.get(this.getWorkflowKey(workflowName, runId));
+    const key = this.getWorkflowKey(workflowName, runId);
+    const stored = this.db.workflows.get(key);
     if (!stored) return null;
 
-    // In-memory workflow rows already hold the snapshot object. Read only the
-    // authority fields so lifecycle checks do not clone the full state.
-    const snapshot = typeof stored.snapshot === 'string' ? JSON.parse(stored.snapshot) : stored.snapshot;
-    if (!snapshot) return null;
+    const storedSnapshot = typeof stored.snapshot === 'string' ? JSON.parse(stored.snapshot) : stored.snapshot;
+    if (!storedSnapshot) return null;
+    // Ordinary lifecycle reads avoid cloning the full state. For an erased
+    // lifetime, retained authority getters must receive a clone so they cannot
+    // mutate the live canceled snapshot.
+    const snapshot = this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled
+      ? cloneRunData(storedSnapshot)
+      : storedSnapshot;
     return {
       status: snapshot.status,
       ...(snapshot.executionGeneration === undefined ? {} : { executionGeneration: snapshot.executionGeneration }),

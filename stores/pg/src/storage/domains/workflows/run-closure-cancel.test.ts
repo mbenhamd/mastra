@@ -121,6 +121,71 @@ describe('WorkflowsPG erasure cancel', () => {
     });
     await persist(run, 'running');
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
+
+    // Pause the cancel before its first snapshot read, then let the first
+    // public persist commit. Revision evidence must come from that lifetime.
+    const racing = newRun();
+    const pool = new Pool({ connectionString, max: 1 });
+    const cancelClients = new WeakSet<object>();
+    let reachedSnapshotRead!: () => void;
+    let resumeSnapshotRead!: () => void;
+    const snapshotRead = new Promise<void>(resolve => (reachedSnapshotRead = resolve));
+    const resume = new Promise<void>(resolve => (resumeSnapshotRead = resolve));
+    let paused = false;
+    pool.on('connect', client => {
+      const query = client.query;
+      client.query = function (this: typeof client, ...args: unknown[]) {
+        const text = typeof args[0] === 'string' ? args[0] : '';
+        const values = Array.isArray(args[1]) ? args[1] : [];
+        if (
+          text.includes('pg_advisory_xact_lock') &&
+          values[0] === JSON.stringify([racing.workflowName, racing.runId])
+        ) {
+          cancelClients.add(client);
+        }
+        if (
+          !paused &&
+          cancelClients.has(client) &&
+          text.trimStart().startsWith('SELECT') &&
+          text.includes('mastra_workflow_snapshot') &&
+          !text.includes('mastra_workflow_snapshot_handoff') &&
+          values[0] === racing.workflowName &&
+          values[1] === racing.runId
+        ) {
+          paused = true;
+          reachedSnapshotRead();
+          return resume.then(() => Reflect.apply(query, this, args));
+        }
+        return Reflect.apply(query, this, args);
+      } as typeof client.query;
+    });
+    const racingStore = new PostgresStore({ id: `workflow-erasure-create-${randomUUID()}`, pool });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await racingStore.init();
+      const racingWorkflows = (await racingStore.getStore('workflows'))!;
+      const cancellation = racingWorkflows.cancelWorkflowRunForErasure({ ...racing, expectedResourceId: resource });
+      pending = Promise.allSettled([cancellation]);
+      await Promise.race([
+        snapshotRead,
+        cancellation.then(() => {
+          throw new Error('Cancellation settled before its snapshot read');
+        }),
+      ]);
+      await persist(racing, 'running');
+      resumeSnapshotRead();
+      await expect(cancellation).resolves.toEqual({ status: 'cancelled' });
+      await expect(workflows.loadWorkflowSnapshot(racing)).resolves.toMatchObject({ status: 'canceled' });
+      await expect(parentRevision(racing)).resolves.toMatchObject({ generation: '2', terminal_status: 'canceled' });
+      await expect(
+        workflows.deleteWorkflowRunClosure({ ...racing, expectedResourceId: resource }),
+      ).resolves.toMatchObject({ status: 'deleted' });
+    } finally {
+      resumeSnapshotRead();
+      await pending;
+      await racingStore.close();
+      await pool.end();
+    }
   });
 
   it('rolls back late snapshot and state writes after the cancel, so the closure delete still erases the run', async () => {
@@ -158,7 +223,14 @@ describe('WorkflowsPG erasure cancel', () => {
   });
 
   it('answers missing, resource_mismatch, fenced and settled without changes', async () => {
-    await expect(cancel(newRun())).resolves.toEqual({ status: 'missing' });
+    const missing = newRun();
+    await expect(cancel(missing)).resolves.toEqual({ status: 'missing' });
+    await expect(
+      store.db.any(`SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+        missing.workflowName,
+        missing.runId,
+      ]),
+    ).resolves.toEqual([]);
 
     const running = newRun();
     await persist(running, 'running');
@@ -189,6 +261,31 @@ describe('WorkflowsPG erasure cancel', () => {
       status: 'failed',
       result: { draft: `${settled.runId} draft` },
     });
+
+    const orphan = newRun();
+    await persist(orphan, 'running');
+    await store.db.none(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+      orphan.workflowName,
+      orphan.runId,
+    ]);
+    try {
+      await expect(cancel(orphan, `workspace-${randomUUID()}:user-1`)).resolves.toEqual({
+        status: 'resource_mismatch',
+      });
+      await expect(cancel(orphan)).rejects.toThrow('Workflow snapshot is missing parent revision evidence');
+      await expect(workflows.loadWorkflowSnapshot(orphan)).resolves.toMatchObject({ status: 'running' });
+      await expect(
+        store.db.any(
+          `SELECT generation FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`,
+          [orphan.workflowName, orphan.runId],
+        ),
+      ).resolves.toEqual([]);
+    } finally {
+      await store.db.none(`DELETE FROM mastra_workflow_snapshot WHERE workflow_name = $1 AND run_id = $2`, [
+        orphan.workflowName,
+        orphan.runId,
+      ]);
+    }
   });
 
   describe('under contention on the run lock', () => {

@@ -222,12 +222,21 @@ describe('WorkflowsInMemory erasure cancel', () => {
     // The checked status must remain data even when a non-configurable,
     // non-enumerable accessor would return a different status on its next read.
     let statusReads = 0;
+    const executionStateReader: Partial<WorkflowRunState> = {
+      get cancelRequest() {
+        this.status = 'running';
+        return undefined;
+      },
+    };
     const changingStatusSnapshot = Object.defineProperty(
-      Object.assign(Object.create(Object.prototype), snapshot),
+      Object.assign(Object.create(executionStateReader), snapshot),
       'status',
       { get: () => (statusReads++ === 0 ? 'canceled' : 'running') },
     );
     await workflows.persistWorkflowSnapshot({ ...run, snapshot: changingStatusSnapshot });
+    expect((await workflows.loadWorkflowSnapshot(run))?.status).toBe('canceled');
+    // A retained authority getter must not receive the live canceled snapshot.
+    await expect(workflows.getWorkflowExecutionState(run)).resolves.toMatchObject({ status: 'canceled' });
     expect((await workflows.loadWorkflowSnapshot(run))?.status).toBe('canceled');
     await expect(cancel(workflows, run, nextResource)).resolves.toEqual({ status: 'settled' });
     await expect(

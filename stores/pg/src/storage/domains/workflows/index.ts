@@ -6110,6 +6110,14 @@ export class WorkflowsPG extends WorkflowsStorage {
         // journal row. A journal or a nested child admitted after these checks
         // waits for this transaction.
         await t.none(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [JSON.stringify(identity)]);
+        // First snapshot creation does not take the advisory lock. Linearize
+        // missing here, before reading revision evidence, without adding a lock.
+        const snapshotExists = await t.oneOrNone<{ present: boolean }>(
+          `SELECT TRUE AS present FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2`,
+          identity,
+        );
+        if (!snapshotExists) return { status: 'missing' };
         const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         const handoff = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
         const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
