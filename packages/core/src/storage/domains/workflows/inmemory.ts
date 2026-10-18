@@ -237,12 +237,6 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   return copy;
 }
 
-/**
- * A run selected for erasure is stored and checked as plain data. Its
- * accessors are read once, on a detached copy, and kept as data values, so no
- * caller accessor runs inside a fenced check-then-write, and a later read sees
- * the value that was checked.
- */
 /** Reads a field once on a detached copy; an accessor that throws yields `undefined`. */
 function readErasureField(owner: object, name: string): unknown {
   try {
