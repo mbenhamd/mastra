@@ -1051,16 +1051,26 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   private bumpParentRevision(key: string): void {
-    const existing = this.db.workflowTerminalParentRevisions.get(key);
-    const generation = (existing?.generation ?? 0) + 1;
-    if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
-    const snapshot = this.db.workflows.get(key)?.snapshot;
-    const status = snapshot && typeof snapshot !== 'string' ? snapshot.status : undefined;
-    this.db.workflowTerminalParentRevisions.set(key, {
-      ...existing,
-      generation,
-      terminalStatus: existing?.terminalStatus ?? (isTerminalParentStatus(status) ? status : null),
-    });
+    for (let attempt = 1; ; attempt++) {
+      const run = this.db.workflows.get(key);
+      const snapshot = run?.snapshot;
+      const status = snapshot && typeof snapshot !== 'string' ? snapshot.status : undefined;
+      if (this.db.workflows.get(key) !== run) {
+        throwIfWorkflowReentrantAttemptsExhausted(attempt);
+        continue;
+      }
+      // A status getter can cancel or replace this row. Advance the latest
+      // revision only after the status and row lifetime have been checked.
+      const existing = this.db.workflowTerminalParentRevisions.get(key);
+      const generation = (existing?.generation ?? 0) + 1;
+      if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
+      this.db.workflowTerminalParentRevisions.set(key, {
+        ...existing,
+        generation,
+        terminalStatus: existing?.terminalStatus ?? (isTerminalParentStatus(status) ? status : null),
+      });
+      return;
+    }
   }
 
   private latchParentTerminalStatus(key: string, terminalStatus: TerminalParentStatus): void {

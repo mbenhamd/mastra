@@ -154,13 +154,32 @@ describe('WorkflowsInMemory erasure cancel', () => {
     const key = JSON.stringify([run.workflowName, run.runId]);
     const before = db.workflowTerminalParentRevisions.get(key);
 
-    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'cancelled' });
+    // An ordinary snapshot's inherited status getter can cancel the run while
+    // its parent revision is being advanced. The outer write must retain that fence.
+    const { status: _initialStatus, ...initialSnapshot } = (await workflows.loadWorkflowSnapshot(run))!;
+    let cancelling = false;
+    let reentrantCancellation: ReturnType<typeof cancel> | undefined;
+    const cancellingStatusReader = {
+      get status() {
+        if (!cancelling) {
+          cancelling = true;
+          reentrantCancellation = cancel(workflows, run);
+        }
+        return 'running';
+      },
+    };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      snapshot: Object.assign(Object.create(cancellingStatusReader), initialSnapshot),
+    });
+    await expect(reentrantCancellation).resolves.toEqual({ status: 'cancelled' });
     const after = db.workflowTerminalParentRevisions.get(key);
-    expect(after?.generation).toBe((before?.generation ?? 0) + 1);
-    expect(after?.terminalStatus).toBe('canceled');
 
     // A queued engine write after the cancel cannot reopen the erased run.
     await expect(persist(workflows, run, 'running')).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    expect(after?.generation).toBe((before?.generation ?? 0) + 2);
+    expect(after?.terminalStatus).toBe('canceled');
+    expect(after?.erasureCancelled).toBe(true);
     for (const status of ['running', 'suspended'] as const) {
       await expect(workflows.updateWorkflowState({ ...run, opts: { status } })).rejects.toBeInstanceOf(
         WorkflowStaleSnapshotPersistError,
