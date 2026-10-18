@@ -2722,9 +2722,17 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // Cloning the caller snapshot and reading an inherited status getter
       // can reenter this map; restart if either changed the row so a persisted
       // snapshot never silently overwrites a newer record.
-      const clonedSnapshot = cloneRunData(snapshot);
+      let clonedSnapshot = cloneRunData(snapshot);
       const revision = this.db.workflowTerminalParentRevisions.get(key);
       const snapshotStatus = revision?.erasureCancelled ? clonedSnapshot?.status : undefined;
+      if (revision?.erasureCancelled && snapshotStatus === revision.terminalStatus) {
+        // Keep other descriptors and the prototype, but store the checked
+        // status as data even when its accessor was non-configurable.
+        clonedSnapshot = Object.create(Object.getPrototypeOf(clonedSnapshot), {
+          ...Object.getOwnPropertyDescriptors(clonedSnapshot),
+          status: { configurable: true, enumerable: true, writable: true, value: snapshotStatus },
+        });
+      }
       if (this.db.workflows.get(key) !== existing) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;

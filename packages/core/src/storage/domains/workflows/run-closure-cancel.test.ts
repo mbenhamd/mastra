@@ -199,6 +199,18 @@ describe('WorkflowsInMemory erasure cancel', () => {
     await reentrantWrite;
     expect(reentered).toBe(true);
     expect(db.workflows.get(key)?.resourceId).toBe(nextResource);
+
+    // The checked status must remain data even when a non-configurable,
+    // non-enumerable accessor would return a different status on its next read.
+    let statusReads = 0;
+    const changingStatusSnapshot = Object.defineProperty(
+      Object.assign(Object.create(Object.prototype), snapshot),
+      'status',
+      { get: () => (statusReads++ === 0 ? 'canceled' : 'running') },
+    );
+    await workflows.persistWorkflowSnapshot({ ...run, snapshot: changingStatusSnapshot });
+    expect((await workflows.loadWorkflowSnapshot(run))?.status).toBe('canceled');
+    await expect(cancel(workflows, run, nextResource)).resolves.toEqual({ status: 'settled' });
     await expect(
       workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: nextResource }),
     ).resolves.toMatchObject({
