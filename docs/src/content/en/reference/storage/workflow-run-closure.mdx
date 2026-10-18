@@ -72,7 +72,7 @@ Settles a run that will never settle on its own, so its closure can be erased. F
 
 Input: `{ workflowName, runId, expectedResourceId }`.
 
-Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write happen in one atomic step, under the same locks as `deleteWorkflowRunClosure`. A journal or nested child can't appear between a check and the write. The checks run in this order, and nothing changes unless the result is `cancelled`:
+Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write happen in one atomic step, under the same locks as `deleteWorkflowRunClosure`. A journal or nested child can't appear between a check and the write. The checks run in this order. Snapshot content changes only when the result is `cancelled`:
 
 - `missing`: storage holds no snapshot for the run.
 - `resource_mismatch`: the snapshot, handoff or terminal snapshot records another resource, or the snapshot records none.
@@ -84,6 +84,8 @@ Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write 
 - `unsupported`: the store doesn't implement the erasure cancel.
 
 A nested child admitted after the cancel finds its parent terminal and is refused.
+
+In the in-memory store, both `cancelled` and `settled` protect the selected run from later `persistWorkflowSnapshot` or `updateWorkflowState` calls whose status disagrees with its retained terminal latch. Those calls throw `WorkflowStaleSnapshotPersistError`. Writes matching that latch remain valid, and an already settled run keeps its snapshot content. Closure deletion clears this protection before the same run ID is used again. Runs not selected for erasure keep their existing write behavior.
 
 ## `listWorkflowRunClosuresByResource(input)`
 

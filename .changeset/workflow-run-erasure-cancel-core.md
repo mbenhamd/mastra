@@ -12,7 +12,7 @@ if (workflows.getWorkflowSnapshotHandoffCapabilities().closureCancelVersion === 
 ```
 
 - **Atomic.** Every check and the write happen in one step. An application that reads the journal and the run's nested children first and then calls `persistWorkflowSnapshot` could overwrite a parent while a child's terminal journal goes live. This call refuses that case.
-- **Results**, checked in this order, and nothing changes unless the result is `cancelled`:
+- **Results**, checked in this order. Snapshot content changes only when the result is `cancelled`:
   - `missing`: no snapshot is stored for the run;
   - `resource_mismatch`: the snapshot, handoff or terminal snapshot records another resource, or the snapshot records none;
   - `fenced`: an unreleased handoff fences the run's snapshot writes, as for `persistWorkflowSnapshot`;
@@ -22,4 +22,4 @@ if (workflows.getWorkflowSnapshotHandoffCapabilities().closureCancelVersion === 
   - `cancelled`;
   - `unsupported`, from adapters without the capability.
 - **Capability.** Adapters report `closureCancelVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. The in-memory store supports it, and the base class answers `unsupported`.
-- **In-memory cancellation fence.** The cancel latches `canceled` on the run's parent revision. A later `persistWorkflowSnapshot` or `updateWorkflowState` with a different status for that canceled lifetime throws `WorkflowStaleSnapshotPersistError`, so a queued engine write cannot reopen the run. Matching `canceled` snapshot and state updates remain valid. Closure deletion clears this fence so the same run ID can be used again. A recovery ancestry admission re-checks each parent right before it commits, so a parent cancelled while its graph is read refuses the child.
+- **In-memory erasure fence.** Both `cancelled` and `settled` protect the selected run from late writes that would reopen it. A later `persistWorkflowSnapshot` or `updateWorkflowState` whose status disagrees with the retained terminal latch throws `WorkflowStaleSnapshotPersistError`. Writes matching that latch remain valid, and an already settled run keeps its snapshot content. Closure deletion clears this fence so the same run ID can be used again. Runs not selected for erasure keep their existing write behavior. A recovery ancestry admission re-checks each parent right before it commits, so a parent cancelled while its graph is read refuses the child.

@@ -2198,7 +2198,13 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     if (handoff && handoff.releasedAt === undefined) return { status: 'fenced' };
     if (this.db.workflowTerminalizations.has(key)) return { status: 'journaled' };
     if (this.hasPendingTerminalDependents(workflowName, runId)) return { status: 'active' };
-    if (isSettledWorkflowRunStatus(runStatus)) return { status: 'settled' };
+    if (isSettledWorkflowRunStatus(runStatus)) {
+      // Erasure also selects already-settled runs. Keep their payload, but
+      // refuse queued writes that would reopen them before closure deletion.
+      const latched = this.db.workflowTerminalParentRevisions.get(key);
+      if (latched) this.db.workflowTerminalParentRevisions.set(key, { ...latched, erasureCancelled: true });
+      return { status: 'settled' };
+    }
     // A latched terminal status the snapshot does not show yet: its
     // settlement is in flight.
     if (this.db.workflowTerminalParentRevisions.get(key)?.terminalStatus) return { status: 'active' };

@@ -107,7 +107,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
     await expect(workflows.loadWorkflowSnapshot(child)).resolves.toMatchObject({ status: 'running' });
   });
 
-  it('answers missing, resource_mismatch, fenced and settled without changes', async () => {
+  it('preserves refused snapshots and fences an already settled run for erasure', async () => {
     const { workflows } = setup();
     await expect(cancel(workflows, { workflowName: 'research', runId: 'never-stored' })).resolves.toEqual({
       status: 'missing',
@@ -140,6 +140,22 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'failed',
       result: { draft: `${settled.runId} draft` },
     });
+    await expect(workflows.updateWorkflowState({ ...settled, opts: { status: 'running' } })).rejects.toBeInstanceOf(
+      WorkflowStaleSnapshotPersistError,
+    );
+    await expect(persist(workflows, settled, 'running')).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    await expect(workflows.updateWorkflowState({ ...settled, opts: { status: 'failed' } })).resolves.toMatchObject({
+      status: 'failed',
+      result: { draft: `${settled.runId} draft` },
+    });
+    await expect(cancel(workflows, settled)).resolves.toEqual({ status: 'settled' });
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...settled, expectedResourceId: RESOURCE }),
+    ).resolves.toMatchObject({
+      status: 'deleted',
+    });
+    await persist(workflows, settled, 'running');
+    await expect(workflows.loadWorkflowSnapshot(settled)).resolves.toMatchObject({ status: 'running' });
   });
 
   it('moves the parent revision and latches canceled, so later snapshot and state writes are refused', async () => {
