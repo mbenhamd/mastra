@@ -337,7 +337,9 @@ function plainErasureSnapshot<T>(value: T): T {
     level && level !== Object.prototype;
     level = Object.getPrototypeOf(level)
   ) {
-    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(level))) {
+    const inherited = Object.getOwnPropertyDescriptors(level);
+    for (const name of Reflect.ownKeys(inherited)) {
+      const descriptor = (inherited as Record<PropertyKey, PropertyDescriptor>)[name]!;
       if (descriptor.enumerable && !names.has(name)) names.set(name, true);
     }
   }

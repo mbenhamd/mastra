@@ -664,6 +664,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
     const { workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-built-ins' };
     const finishedAt = new Date('2026-10-18T00:00:00.000Z');
+    const inheritedNote = Symbol('inherited-note');
     const snapshot: WorkflowRunState = {
       ...createEmptyWorkflowSnapshot(run.runId),
       status: 'success',
@@ -679,6 +680,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
         usage: { reasoning: undefined },
       },
     };
+    Object.setPrototypeOf(snapshot, { [inheritedNote]: 'kept inherited symbol' });
     Object.defineProperty(snapshot, 'retainedNote', {
       value: 'kept non-enumerable',
       writable: true,
@@ -694,6 +696,8 @@ describe('WorkflowsInMemory erasure cancel', () => {
     await workflows.persistWorkflowSnapshot({ ...run, resourceId: RESOURCE, snapshot });
 
     const before = (await workflows.loadWorkflowSnapshot(run))!;
+    expect(Object.hasOwn(before, inheritedNote)).toBe(false);
+    expect(Reflect.get(before, inheritedNote)).toBe('kept inherited symbol');
     expect((before.result as { source: URL }).source.href).toBe('https://example.org/paper');
     expect(Object.getOwnPropertyDescriptor(before, 'retainedNote')).toMatchObject({
       value: 'kept non-enumerable',
@@ -702,6 +706,10 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(Object.getOwnPropertyDescriptor(before, '__proto__')?.value).toEqual({ note: 'kept as data' });
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const stored = (await workflows.loadWorkflowSnapshot(run))!;
+    expect.soft(Object.getOwnPropertyDescriptor(stored, inheritedNote)).toMatchObject({
+      value: 'kept inherited symbol',
+      enumerable: true,
+    });
     expect.soft(Object.getOwnPropertyDescriptor(stored, 'retainedNote')).toMatchObject({
       value: 'kept non-enumerable',
       enumerable: false,
