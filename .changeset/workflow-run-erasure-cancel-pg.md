@@ -6,7 +6,7 @@ Added `cancelWorkflowRunForErasure` to the PostgreSQL workflow store. It follows
 
 ```ts
 const result = await workflows.cancelWorkflowRunForErasure({ workflowName, runId, expectedResourceId });
-if (result.status === 'cancelled') {
+if (result.status === 'cancelled' || result.status === 'settled') {
   await workflows.deleteWorkflowRunClosure({ workflowName, runId, expectedResourceId });
 }
 ```

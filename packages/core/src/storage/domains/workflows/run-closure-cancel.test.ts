@@ -684,6 +684,8 @@ describe('WorkflowsInMemory erasure cancel', () => {
       },
     });
 
+    const before = (await workflows.loadWorkflowSnapshot(run))!;
+    expect((before.result as { source: URL }).source.href).toBe('https://example.org/paper');
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const stored = (await workflows.loadWorkflowSnapshot(run))!;
     const result = stored.result as {
