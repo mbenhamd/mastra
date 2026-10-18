@@ -678,6 +678,8 @@ describe('WorkflowsInMemory erasure cancel', () => {
           tags: new Set([new Error('tag kept')]),
           source: new URL('https://example.org/paper'),
           bytes: Buffer.from('payload'),
+          headers: undefined,
+          usage: { reasoning: undefined },
         },
       },
     });
@@ -700,6 +702,22 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect([...result.tags][0]?.message).toBe('tag kept');
     expect(result.source.href).toBe('https://example.org/paper');
     expect(Buffer.isBuffer(result.bytes) && result.bytes.toString('base64')).toBe('cGF5bG9hZA==');
+    expect(Object.keys(result)).toContain('headers');
+    expect(Object.keys((result as unknown as { usage: object }).usage)).toEqual(['reasoning']);
+
+    // A permitted same-status write keeps a fresh native error's stack.
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(run.runId),
+        status: 'success',
+        result: { failure: new Error('fresh') },
+      },
+    });
+    const rewritten = (await workflows.loadWorkflowSnapshot(run))!.result as { failure: Error };
+    expect(rewritten.failure.message).toBe('fresh');
+    expect(typeof rewritten.failure.stack).toBe('string');
   });
 
   it('finishes the erasure of a run reopened and then settled with another status', async () => {

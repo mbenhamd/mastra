@@ -212,37 +212,20 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   if (value === null || typeof value !== 'object') return value;
   const known = seen.get(value);
   if (known !== undefined) return known;
-  // Built-ins keep their payload in internal slots a prototype shell would
-  // lose: copy them as built-ins (their accessors live on the built-in
-  // prototypes). Collections are copied entry by entry, so their entries are
-  // detached too.
-  if (value instanceof Map) {
-    const map = new Map<unknown, unknown>();
-    seen.set(value, map);
-    for (const [key, entry] of value) map.set(detachedErasureCopy(key, seen), detachedErasureCopy(entry, seen));
-    return map;
-  }
-  if (value instanceof Set) {
-    const set = new Set<unknown>();
-    seen.set(value, set);
-    for (const entry of value) set.add(detachedErasureCopy(entry, seen));
-    return set;
-  }
-  if (value instanceof URL) {
-    const url = new URL(value.href);
-    seen.set(value, url);
-    return url;
-  }
-  if (ArrayBuffer.isView(value)) {
-    // Binary data (a Buffer included) keeps its own type, as cloneRunData keeps it.
-    const copy = cloneRunData(value);
-    seen.set(value, copy);
-    return copy;
-  }
-  if (value instanceof Date || value instanceof RegExp || value instanceof ArrayBuffer) {
-    const copy = structuredClone(value);
-    seen.set(value, copy);
-    return copy;
+  // Built-ins keep their payload in internal slots (a native error's stack
+  // included) that a prototype shell would lose: keep them by reference, and
+  // let cloneRunData copy them as an ordinary persist does.
+  if (
+    value instanceof Date ||
+    value instanceof RegExp ||
+    value instanceof Map ||
+    value instanceof Set ||
+    value instanceof URL ||
+    value instanceof Error ||
+    value instanceof ArrayBuffer ||
+    ArrayBuffer.isView(value)
+  ) {
+    return value;
   }
   const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
   seen.set(value, copy);
@@ -261,82 +244,27 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
  * the value that was checked.
  */
 /** Reads a field once on a detached copy; an accessor that throws yields `undefined`. */
-function readErasureField(owner: object, name: string | number): unknown {
+function readErasureField(owner: object, name: string): unknown {
   try {
-    return (owner as Record<string | number, unknown>)[name];
+    return (owner as Record<string, unknown>)[name];
   } catch {
     return undefined;
   }
 }
 
-/** The own and inherited enumerable field names of a detached copy, and an error's own fields. */
-function erasureFieldNames(value: object): string[] {
-  const names = new Set<string>();
-  if (value instanceof Error) for (const name of Object.getOwnPropertyNames(value)) names.add(name);
-  for (let level: object | null = value; level && level !== Object.prototype; level = Object.getPrototypeOf(level)) {
-    if (level === Error.prototype) break;
-    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(level))) {
-      if (descriptor.enumerable) names.add(name);
-    }
-  }
-  return [...names];
-}
-
 /**
- * Plain data from a detached copy: every accessor is read once (on the copy)
- * and kept as a data value; built-ins keep their payload; functions are dropped.
+ * A run selected for erasure is stored and checked as plain data. Its
+ * top-level fields, own or inherited, are read once on a detached copy with
+ * `status` first and pinned, so no caller accessor runs inside a fenced
+ * check-then-write and a later read sees the value that was checked. The
+ * fields are then copied with cloneRunData, so every payload keeps what an
+ * ordinary persist keeps (binary data, dates, maps, errors with their stack,
+ * fields set to `undefined`).
  */
-function plainErasureValue(value: unknown, seen: Map<object, unknown>): unknown {
-  if (typeof value === 'function') return undefined;
-  if (value === null || typeof value !== 'object') return value;
-  const known = seen.get(value);
-  if (known !== undefined) return known;
-  if (value instanceof Date) return new Date(value.getTime());
-  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-  if (value instanceof URL) return new URL(value.href);
-  if (ArrayBuffer.isView(value)) return cloneRunData(value);
-  if (value instanceof ArrayBuffer) return structuredClone(value);
-  if (value instanceof Map) {
-    const map = new Map<unknown, unknown>();
-    seen.set(value, map);
-    for (const [key, entry] of value) map.set(plainErasureValue(key, seen), plainErasureValue(entry, seen));
-    return map;
-  }
-  if (value instanceof Set) {
-    const set = new Set<unknown>();
-    seen.set(value, set);
-    for (const entry of value) set.add(plainErasureValue(entry, seen));
-    return set;
-  }
-  if (Array.isArray(value)) {
-    const array: unknown[] = [];
-    seen.set(value, array);
-    for (let index = 0; index < value.length; index++) {
-      array.push(plainErasureValue(readErasureField(value, index), seen));
-    }
-    return array;
-  }
-  // An error keeps its prototype (its methods); everything else is a plain object.
-  const out: Record<string, unknown> = Object.create(
-    value instanceof Error ? Object.getPrototypeOf(value) : Object.prototype,
-  );
-  seen.set(value, out);
-  for (const name of erasureFieldNames(value)) {
-    const field = plainErasureValue(readErasureField(value, name), seen);
-    if (field === undefined) continue;
-    const enumerable = Object.getOwnPropertyDescriptor(value, name)?.enumerable ?? true;
-    Object.defineProperty(out, name, { value: field, writable: true, enumerable, configurable: true });
-  }
-  return out;
-}
-
 function plainErasureSnapshot<T>(value: T): T {
   const copy = detachedErasureCopy(value);
-  const seen = new Map<object, unknown>();
-  if (copy === null || typeof copy !== 'object' || Array.isArray(copy)) return plainErasureValue(copy, seen) as T;
+  if (copy === null || typeof copy !== 'object' || Array.isArray(copy)) return cloneRunData(copy) as T;
   const record = copy as Record<string, unknown>;
-  // `status` first, pinned as data on the copy, so no later accessor can
-  // change the value that is checked and stored.
   const status = readErasureField(record, 'status');
   try {
     Object.defineProperty(record, 'status', { value: status, writable: true, enumerable: true, configurable: true });
@@ -344,15 +272,23 @@ function plainErasureSnapshot<T>(value: T): T {
     // A non-configurable own accessor stays; `status` below is still the value read.
   }
   // Then each other top-level field once, including one an earlier accessor
-  // introduced.
+  // introduced; an accessor that throws leaves its field out.
   const fields: Record<string, unknown> = {};
-  for (const name of erasureFieldNames(record)) {
-    if (name === 'status') continue;
-    const field = plainErasureValue(readErasureField(record, name), seen);
-    if (field !== undefined) fields[name] = field;
+  const names = new Set<string>();
+  for (let level: object | null = record; level && level !== Object.prototype; level = Object.getPrototypeOf(level)) {
+    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(level))) {
+      if (descriptor.enumerable && name !== 'status') names.add(name);
+    }
   }
-  if (status !== undefined) fields.status = status;
-  return fields as T;
+  for (const name of names) {
+    try {
+      fields[name] = record[name];
+    } catch {
+      // Left out.
+    }
+  }
+  fields.status = status;
+  return cloneRunData(fields) as T;
 }
 
 // JSON.stringify serializes an enumerable getter's return value as a fresh

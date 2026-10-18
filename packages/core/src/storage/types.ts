@@ -318,6 +318,15 @@ export type DeleteWorkflowRunClosureResult =
  * the closure. Every check and the write happen in one atomic step, under the
  * same locks as `deleteWorkflowRunClosure`, so no journal or nested child can
  * appear between them.
+ *
+ * Caller contract: the store has no executor lease or liveness check. A
+ * `running` run with no journal, no unreleased handoff and no pending nested
+ * dependent is cancelled even if an executor in another process is still
+ * running it; that executor's next generation-guarded persist then fails as
+ * stale and its work is discarded. `active` means a settlement or a nested
+ * dependent is in flight, not that an executor is running. Call this only for
+ * runs that will never settle on their own: their owner is gone and no
+ * executor can be admitted for them.
  */
 export interface CancelWorkflowRunForErasureInput {
   workflowName: string;

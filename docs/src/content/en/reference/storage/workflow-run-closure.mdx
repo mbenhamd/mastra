@@ -85,6 +85,12 @@ Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write 
 
 A nested child admitted after the cancel finds its parent terminal and is refused.
 
+:::warning
+
+The store has no executor lease or liveness check. A `running` run with no journal, no unreleased handoff and no pending nested child is cancelled even if an executor in another process is still running it. That executor's next generation-guarded persist then fails as stale, and its work is discarded. `active` means a settlement or a nested child is in flight; it doesn't mean an executor is running. Call `cancelWorkflowRunForErasure` only for runs that will never settle on their own: their owner is gone and no executor can be admitted for them.
+
+:::
+
 In the in-memory store, both `cancelled` and `settled` protect the selected run from writes that would reopen it, and the run is stored as plain data from then on:
 
 - `persistWorkflowSnapshot`, `updateWorkflowState`, `updateWorkflowResults`, `bindWorkflowNestedRunOwnership`, and resume admission, rollback and finalization throw `WorkflowStaleSnapshotPersistError` when the new status disagrees with the run's terminal status. Writes with the same status still succeed.
