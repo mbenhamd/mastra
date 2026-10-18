@@ -302,23 +302,29 @@ function plainErasureSnapshot<T>(value: T): T {
   } catch {
     // A non-configurable own accessor stays; `status` below is still the value read.
   }
-  // Then each other top-level field once, including one an earlier accessor
-  // introduced; an accessor that throws leaves its field out.
+  // Then each other top-level field once, including non-enumerable own data
+  // and fields introduced by the status accessor. A throwing accessor is omitted.
   const fields: Record<string, unknown> = {};
-  const names = new Set<string>();
+  const names = new Map<string, boolean>();
   for (let level: object | null = record; level && level !== Object.prototype; level = Object.getPrototypeOf(level)) {
     for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(level))) {
-      if (descriptor.enumerable && name !== 'status') names.add(name);
+      if (
+        name !== 'status' &&
+        (descriptor.enumerable || (level === record && 'value' in descriptor)) &&
+        !names.has(name)
+      ) {
+        names.set(name, descriptor.enumerable ?? false);
+      }
     }
   }
-  for (const name of names) {
+  for (const [name, enumerable] of names) {
     try {
-      fields[name] = record[name];
+      Object.defineProperty(fields, name, { value: record[name], writable: true, enumerable, configurable: true });
     } catch {
       // Left out.
     }
   }
-  fields.status = status;
+  Object.defineProperty(fields, 'status', { value: status, writable: true, enumerable: true, configurable: true });
   return cloneRunData(fields) as T;
 }
 

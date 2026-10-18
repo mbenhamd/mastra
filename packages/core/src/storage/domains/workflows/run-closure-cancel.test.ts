@@ -664,30 +664,49 @@ describe('WorkflowsInMemory erasure cancel', () => {
     const { workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-built-ins' };
     const finishedAt = new Date('2026-10-18T00:00:00.000Z');
-    await workflows.persistWorkflowSnapshot({
-      ...run,
-      resourceId: RESOURCE,
-      snapshot: {
-        ...createEmptyWorkflowSnapshot(run.runId),
-        status: 'success',
-        result: {
-          finishedAt,
-          counts: new Map([['papers', 3]]),
-          failure: new Error('kept'),
-          failures: new Map([['first', new Error('first kept')]]),
-          tags: new Set([new Error('tag kept')]),
-          source: new URL('https://example.org/paper'),
-          bytes: Buffer.from('payload'),
-          headers: undefined,
-          usage: { reasoning: undefined },
-        },
+    const snapshot: WorkflowRunState = {
+      ...createEmptyWorkflowSnapshot(run.runId),
+      status: 'success',
+      result: {
+        finishedAt,
+        counts: new Map([['papers', 3]]),
+        failure: new Error('kept'),
+        failures: new Map([['first', new Error('first kept')]]),
+        tags: new Set([new Error('tag kept')]),
+        source: new URL('https://example.org/paper'),
+        bytes: Buffer.from('payload'),
+        headers: undefined,
+        usage: { reasoning: undefined },
       },
+    };
+    Object.defineProperty(snapshot, 'retainedNote', {
+      value: 'kept non-enumerable',
+      writable: true,
+      enumerable: false,
+      configurable: true,
     });
+    Object.defineProperty(snapshot, '__proto__', {
+      value: { note: 'kept as data' },
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    await workflows.persistWorkflowSnapshot({ ...run, resourceId: RESOURCE, snapshot });
 
     const before = (await workflows.loadWorkflowSnapshot(run))!;
     expect((before.result as { source: URL }).source.href).toBe('https://example.org/paper');
+    expect(Object.getOwnPropertyDescriptor(before, 'retainedNote')).toMatchObject({
+      value: 'kept non-enumerable',
+      enumerable: false,
+    });
+    expect(Object.getOwnPropertyDescriptor(before, '__proto__')?.value).toEqual({ note: 'kept as data' });
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const stored = (await workflows.loadWorkflowSnapshot(run))!;
+    expect.soft(Object.getOwnPropertyDescriptor(stored, 'retainedNote')).toMatchObject({
+      value: 'kept non-enumerable',
+      enumerable: false,
+    });
+    expect.soft(Object.getOwnPropertyDescriptor(stored, '__proto__')?.value).toEqual({ note: 'kept as data' });
     const result = stored.result as {
       finishedAt: Date;
       counts: Map<string, number>;
