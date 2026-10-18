@@ -546,4 +546,61 @@ describe('WorkflowsInMemory erasure cancel', () => {
     await persist(workflows, run, 'running');
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
   });
+
+  it('refuses a resume finalization that would reopen a settled run selected for erasure', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-resume-finalize' };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(run.runId),
+        status: 'suspended',
+        executionGeneration: 'gen-1',
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+      } as WorkflowRunState,
+    });
+    const fence = {
+      ...run,
+      resumeOperationHash: `sha256:${'0'.repeat(64)}` as `sha256:${string}`,
+      executionGeneration: 'gen-1',
+      lifecycleResumeAttempt: 0,
+      lifecycleStepStates: {},
+    };
+    await expect(
+      workflows.admitWorkflowResume({
+        ...fence,
+        nextLifecycleResumeAttempt: 1,
+        operationReplayContext: { version: 1, steps: [] },
+      }),
+    ).resolves.toMatchObject({ status: 'admitted' });
+    // A state update settles the run while its resume checkpoint is retained.
+    await workflows.updateWorkflowState({ ...run, opts: { status: 'failed' } });
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+
+    await expect(
+      workflows.finalizeWorkflowResume({
+        ...fence,
+        lifecycleResumeAttempt: 1,
+        shouldPersistSnapshot: true,
+        snapshot: {
+          ...createEmptyWorkflowSnapshot(run.runId),
+          status: 'running',
+          executionGeneration: 'gen-1',
+          lifecycleResumeAttempt: 1,
+          lifecycleStepStates: {},
+        } as WorkflowRunState,
+        receiptKey: 'receipt-1',
+        result: { status: 'success', result: {} } as never,
+      }),
+    ).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'failed' });
+    expect(db.workflowTerminalParentRevisions.get(JSON.stringify([run.workflowName, run.runId]))).toMatchObject({
+      terminalStatus: 'failed',
+    });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
 });

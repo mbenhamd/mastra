@@ -668,9 +668,17 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // an inherited getter — capture it before the check as well.
       const storedSnapshot = updatedSnapshot ? cloneRunData(updatedSnapshot) : undefined;
       const storedResourceId = storedSnapshot?.resourceId;
+      // The erasure fence: a resume admission, rollback, finalization or step
+      // update that would give a cancelled or settled-selected run another
+      // status is refused before anything is written.
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      const fencedStatus = revision?.erasureCancelled && storedSnapshot ? storedSnapshot.status : undefined;
       if (this.db.workflows.get(key) !== existing) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      if (revision?.erasureCancelled && storedSnapshot && fencedStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
       if (storedSnapshot && existing) {
         this.setWorkflowRunRecord(workflowName, runId, {
