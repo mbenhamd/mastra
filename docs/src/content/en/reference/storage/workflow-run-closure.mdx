@@ -85,7 +85,15 @@ Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write 
 
 A nested child admitted after the cancel finds its parent terminal and is refused.
 
-In the in-memory store, both `cancelled` and `settled` protect the selected run from later `persistWorkflowSnapshot`, `updateWorkflowState`, `bindWorkflowNestedRunOwnership` or resume mutation (admission, rollback, finalization, step update) calls whose status disagrees with its retained terminal latch. Those calls throw `WorkflowStaleSnapshotPersistError`. Writes matching that latch remain valid, and an already settled run keeps its snapshot content. Closure deletion clears this protection before the same run ID is used again. Runs not selected for erasure keep their existing write behavior.
+In the in-memory store, both `cancelled` and `settled` protect the selected run from writes that would reopen it, and the run is stored as plain data from then on:
+
+- `persistWorkflowSnapshot`, `updateWorkflowState`, `updateWorkflowResults`, `bindWorkflowNestedRunOwnership`, and resume admission, rollback and finalization throw `WorkflowStaleSnapshotPersistError` when the new status disagrees with the run's terminal status. Writes with the same status still succeed.
+- `persistWorkflowStepUpdate` doesn't throw. It returns `{ status: 'finalized', disposition }`, as it does for any terminal run.
+- An already settled run keeps its snapshot content.
+- Closure deletion removes this protection before the same run ID is used again.
+- Runs not selected for erasure keep their existing write behavior.
+
+The in-memory store also lets an ordinary write reopen a settled run, which the PostgreSQL store refuses. The erasure cancel treats such a reopened run, with no journal and no pending nested child, as unsettled and cancels it.
 
 ## `listWorkflowRunClosuresByResource(input)`
 

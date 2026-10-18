@@ -299,8 +299,9 @@ describe('WorkflowsInMemory erasure cancel', () => {
     });
     expect((await workflows.loadWorkflowSnapshot(run))?.status).toBe('canceled');
 
-    // Result merging and preparing its return value must both use detached
-    // receivers, and a conflicting result write must leave the row canceled.
+    // The selected run is stored as plain data: the accessor that would
+    // reopen it during result merging is read once, at persist, so the
+    // merged result keeps the row canceled.
     const { context: _context, ...resultFields } = canceled;
     const context = createEmptyWorkflowSnapshot(run.runId).context;
     const contextReader: Partial<WorkflowRunState> = {
@@ -319,9 +320,9 @@ describe('WorkflowsInMemory erasure cancel', () => {
       result: { status: 'success', output: 'done' } as const,
       requestContext: {},
     };
-    await expect(workflows.updateWorkflowResults(resultUpdate)).rejects.toBeInstanceOf(
-      WorkflowStaleSnapshotPersistError,
-    );
+    await expect(workflows.updateWorkflowResults(resultUpdate)).resolves.toEqual({
+      step: { status: 'success', output: 'done' },
+    });
     expect((await workflows.loadWorkflowSnapshot(run))?.status).toBe('canceled');
 
     let firstContextReceiver: object | undefined;
@@ -598,6 +599,61 @@ describe('WorkflowsInMemory erasure cancel', () => {
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'failed' });
     expect(db.workflowTerminalParentRevisions.get(JSON.stringify([run.workflowName, run.runId]))).toMatchObject({
       terminalStatus: 'failed',
+    });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
+
+  it('never wedges erasure on a stateful status accessor: the checked status is the stored one', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-stateful-status' };
+    await persist(workflows, run, 'failed');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const { status: _status, ...rest } = record.snapshot as WorkflowRunState;
+    // Answers `failed` once, then `running` on every later read.
+    let reads = 0;
+    const flipping = {
+      get status() {
+        return reads++ === 0 ? 'failed' : 'running';
+      },
+    };
+    db.workflows.set(key, { ...record, snapshot: Object.assign(Object.create(flipping), rest) });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'failed' });
+    // A queued write whose status flips after its first read stays refused or stored as checked.
+    let writeReads = 0;
+    const flippingWrite = {
+      get status() {
+        return writeReads++ === 0 ? 'failed' : 'running';
+      },
+    };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: Object.assign(Object.create(flippingWrite), rest),
+    });
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'failed' });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
+
+  it('cancels a run an ordinary write reopened after it settled, so erasure cannot wedge', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-reopened' };
+    await persist(workflows, run, 'success');
+    // This store lets an ordinary write reopen a settled run; its latch stays.
+    await workflows.updateWorkflowState({ ...run, opts: { status: 'running' } });
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    expect(db.workflowTerminalParentRevisions.get(key)?.terminalStatus).toBe('success');
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'cancelled' });
+    expect(db.workflowTerminalParentRevisions.get(key)).toMatchObject({
+      terminalStatus: 'canceled',
+      erasureCancelled: true,
     });
     await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
       status: 'deleted',

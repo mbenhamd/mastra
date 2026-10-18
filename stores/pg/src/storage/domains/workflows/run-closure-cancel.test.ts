@@ -206,6 +206,18 @@ describe('WorkflowsPG erasure cancel', () => {
     });
   });
 
+  it('refuses an ordinary reopen of a settled run, so the erasure cancel and closure delete still finish', async () => {
+    const run = newRun();
+    await persist(run, 'success');
+    // The parent revision latched `success`: a reopening write is rolled back.
+    await expect(persist(run, 'running')).rejects.toThrow();
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'success' });
+    await expect(cancel(run)).resolves.toEqual({ status: 'settled' });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
+
   it('refuses a parent a nested child still needs, and the child whose journal is claimed, without changes', async () => {
     const parent = newRun();
     await persist(parent, 'running');

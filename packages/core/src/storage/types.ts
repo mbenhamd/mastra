@@ -340,7 +340,9 @@ export interface CancelWorkflowRunForErasureInput {
  * - `active`: a nested child run (linked by a parent effect or recovery
  *   ancestry, whatever its resource) has not completed its terminal journal,
  *   or a terminal status is latched on the run's parent revision that its
- *   snapshot does not show yet. Retry later.
+ *   snapshot does not show yet. Retry later. (The in-memory store, which lets
+ *   an ordinary write reopen a settled run, cancels such a reopened run when
+ *   no journal or pending child remains.)
  * - `settled`: the snapshot status is already settled; nothing to overwrite
  *   (its later writes are refused as for `cancelled`).
  * - `cancelled`: the snapshot is now an empty `canceled` snapshot, and the
