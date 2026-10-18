@@ -889,4 +889,30 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(failure.message).toBe('stored');
     expect(receiver).not.toBe(failure);
   });
+
+  it('keeps references a settled payload shares through symbol-keyed fields', async () => {
+    const { workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-symbol-shared' };
+    const pick = Symbol.for('test.payload.pick');
+    const item = { id: 'paper-1' };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(run.runId),
+        status: 'success',
+        result: { [pick]: item, scores: new Map([[item, 3]]) },
+      },
+    });
+    const before = (await workflows.loadWorkflowSnapshot(run))!.result as Record<PropertyKey, unknown> & {
+      scores: Map<unknown, number>;
+    };
+    expect(before.scores.get(before[pick])).toBe(3);
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const result = (await workflows.loadWorkflowSnapshot(run))!.result as Record<PropertyKey, unknown> & {
+      scores: Map<unknown, number>;
+    };
+    expect(result.scores.get(result[pick])).toBe(3);
+  });
 });

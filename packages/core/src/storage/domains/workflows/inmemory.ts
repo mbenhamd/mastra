@@ -276,7 +276,9 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
   seen.set(value, copy);
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  for (const descriptor of Object.values(descriptors)) {
+  // Every own key, symbols included, through the same memo.
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = (descriptors as Record<PropertyKey, PropertyDescriptor>)[key]!;
     if ('value' in descriptor) descriptor.value = detachedErasureCopy(descriptor.value, seen);
   }
   Object.defineProperties(copy, descriptors);
@@ -355,12 +357,14 @@ function plainErasureSnapshot<T>(value: T): T {
     Object.defineProperty(fields, name, { value: field, writable: true, enumerable, configurable: true });
   }
   Object.defineProperty(fields, 'status', { value: status, writable: true, enumerable: true, configurable: true });
-  const plain = cloneRunData(fields) as Record<PropertyKey, unknown>;
-  // Symbol-keyed fields are copied too, whatever cloneRunData does with them.
+  // One clone memo for the whole snapshot, so references shared between
+  // fields (symbol-keyed ones included) stay shared.
+  const memo = new Map<object, unknown>();
+  const plain = deepCloneForRun(fields, memo) as Record<PropertyKey, unknown>;
   for (const key of Object.getOwnPropertySymbols(fields)) {
     if (Object.prototype.hasOwnProperty.call(plain, key)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(fields, key)!;
-    Object.defineProperty(plain, key, { ...descriptor, value: cloneRunData(descriptor.value) });
+    Object.defineProperty(plain, key, { ...descriptor, value: deepCloneForRun(descriptor.value, memo) });
   }
   return plain as T;
 }
