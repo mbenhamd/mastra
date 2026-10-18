@@ -2185,7 +2185,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     for (let attempt = 1; ; attempt++) {
       run = this.db.workflows.get(key);
       const snapshot = run ? (typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot) : undefined;
-      runStatus = snapshot?.status;
+      // Read the status on a detached receiver: an accessor then mutates the
+      // copy, never the stored row, so a refusal leaves the run unchanged.
+      runStatus =
+        snapshot && typeof snapshot === 'object'
+          ? Object.create(Object.getPrototypeOf(snapshot), Object.getOwnPropertyDescriptors(snapshot)).status
+          : undefined;
       if (this.db.workflows.get(key) === run) break;
       throwIfWorkflowReentrantAttemptsExhausted(attempt);
     }
@@ -2307,10 +2312,24 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       if (ownership.status === 'already_bound') {
         return { status: 'already_bound', stepResults: cloneRunData(ownership.snapshot.context) };
       }
-      const storedSnapshot = cloneRunData(ownership.snapshot);
+      let storedSnapshot = cloneRunData(ownership.snapshot);
+      // The erasure fence updateWorkflowResults applies: finish reading the
+      // result on a detached receiver, and refuse a status that disagrees
+      // with an erasure cancel's latch before anything is written.
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      const returnedContext = revision?.erasureCancelled
+        ? cloneRunData(cloneRunData(storedSnapshot).context)
+        : undefined;
+      const snapshotStatus = revision?.erasureCancelled ? storedSnapshot.status : undefined;
+      if (revision?.erasureCancelled && snapshotStatus === revision.terminalStatus) {
+        storedSnapshot = cloneErasureCancelledSnapshot(storedSnapshot, snapshotStatus);
+      }
       if (this.db.workflows.get(key) !== run) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName: operation.workflowName, runId: operation.runId });
       }
       this.setWorkflowRunRecord(operation.workflowName, operation.runId, {
         ...run,
@@ -2320,7 +2339,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       this.bumpParentRevision(key);
       return {
         status: 'bound',
-        stepResults: cloneRunData(storedSnapshot.context),
+        stepResults: revision?.erasureCancelled ? returnedContext! : cloneRunData(storedSnapshot.context),
       };
     }
   }

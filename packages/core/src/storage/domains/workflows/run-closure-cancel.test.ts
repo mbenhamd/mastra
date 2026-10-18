@@ -430,4 +430,66 @@ describe('WorkflowsInMemory erasure cancel', () => {
     // A fresh request can bind the replacement lifetime.
     await expect(admit()).resolves.toMatchObject({ status: 'persisted' });
   });
+
+  it('reads the status on a detached copy, so a refused cancel changes nothing', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-status-accessor' };
+    await persist(workflows, run, 'running');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const { status: _status, ...rest } = record.snapshot as WorkflowRunState;
+    // An inherited status accessor that rewrites its receiver when read.
+    const accessor = {
+      get status() {
+        Object.defineProperty(this, 'status', {
+          value: 'success',
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+        return 'running';
+      },
+    };
+    const stored = Object.assign(Object.create(accessor), rest);
+    db.workflows.set(key, { ...record, snapshot: stored });
+    const revisionBefore = structuredClone(db.workflowTerminalParentRevisions.get(key));
+
+    await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
+    expect(db.workflows.get(key)?.snapshot).toBe(stored);
+    expect(Object.getOwnPropertyDescriptor(stored, 'status')).toBeUndefined();
+    expect(db.workflowTerminalParentRevisions.get(key)).toEqual(revisionBefore);
+  });
+
+  it('refuses a nested ownership bind that would reopen a cancelled run through a context accessor', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-bind-accessor' };
+    await persist(workflows, run, 'suspended');
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'cancelled' });
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const { context, ...rest } = record.snapshot as WorkflowRunState;
+    // The stored canceled snapshot's context is read through an accessor
+    // that reopens its receiver as running.
+    const accessor = {
+      get context() {
+        (this as { status: string }).status = 'running';
+        return context;
+      },
+    };
+    db.workflows.set(key, { ...record, snapshot: Object.assign(Object.create(accessor), rest) });
+
+    await expect(
+      workflows.bindWorkflowNestedRunOwnership({
+        ...run,
+        stepId: 'nested',
+        nestedRunId: 'run-bind-accessor-child',
+        result: { status: 'running', payload: {} },
+        requestContext: {},
+      }),
+    ).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    expect(db.workflowTerminalParentRevisions.get(key)).toMatchObject({ terminalStatus: 'canceled' });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
 });
