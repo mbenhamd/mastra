@@ -1217,13 +1217,10 @@ export class ObservabilityInMemory extends ObservabilityStorage {
     const traceIds = new Set<string>(args.traceIds);
     for (const traceId of args.traceIds) {
       const traceEntry = this.db.traces.get(traceId);
-      if (!traceEntry) {
-        this.db.traces.delete(traceId);
-        continue;
-      }
-      // Tenant scope applies per row, matching the SQL adapters'
-      // DELETE ... WHERE "traceId" IN (...) AND "organizationId" = ... —
-      // spans outside the scope survive and keep the trace alive.
+      if (!traceEntry) continue;
+
+      // Tenant scope applies per span, like the row-level deletes in SQL adapters,
+      // so spans from other tenants in the same trace are kept.
       let removedAny = false;
       for (const [spanId, span] of Object.entries(traceEntry.spans)) {
         if (!this.matchesDeleteScope(span, args)) continue;
@@ -1231,16 +1228,21 @@ export class ObservabilityInMemory extends ObservabilityStorage {
         this.db.branchCursorIds.delete(this.createBranchCursorKey(traceId, spanId));
         removedAny = true;
       }
+      // A trace with no span inside the delete scope is left exactly as it was.
       if (!removedAny) continue;
-      if (Object.keys(traceEntry.spans).length === 0) {
-        this.db.traceCursorIds.delete(traceId);
+
+      const remainingSpans = Object.values(traceEntry.spans);
+      if (remainingSpans.length === 0) {
         this.db.traces.delete(traceId);
+        this.db.traceCursorIds.delete(traceId);
         continue;
       }
-      // The previous root span may have been deleted; re-anchor to a remaining
-      // root before recomputing derived trace properties.
-      if (traceEntry.rootSpan && traceEntry.spans[traceEntry.rootSpan.spanId] === undefined) {
-        traceEntry.rootSpan = Object.values(traceEntry.spans).find(span => span.parentSpanId == null) ?? null;
+
+      if (traceEntry.rootSpan && !traceEntry.spans[traceEntry.rootSpan.spanId]) {
+        traceEntry.rootSpan = remainingSpans.find(span => span.parentSpanId == null) ?? null;
+      }
+      if (!traceEntry.rootSpan) {
+        this.db.traceCursorIds.delete(traceId);
       }
       this.recomputeTraceProperties(traceEntry);
     }
@@ -1363,6 +1365,7 @@ export class ObservabilityInMemory extends ObservabilityStorage {
     if (filters.threadId !== undefined && m.threadId !== filters.threadId) return false;
     if (filters.requestId !== undefined && m.requestId !== filters.requestId) return false;
     if (filters.experimentId !== undefined && m.experimentId !== filters.experimentId) return false;
+    if (Array.isArray(filters.experimentIds) && !filters.experimentIds.includes(m.experimentId)) return false;
     if (filters.serviceName !== undefined && m.serviceName !== filters.serviceName) return false;
     if (filters.environment !== undefined && m.environment !== filters.environment) return false;
     const metricExecutionSource = m.executionSource ?? m.source ?? null;

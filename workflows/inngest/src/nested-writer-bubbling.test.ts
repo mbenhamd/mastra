@@ -24,12 +24,12 @@ describe('nested workflow writer bubbling', () => {
       realtimeHandlers.set(`${channel}:${topics[0]}`, onMessage);
       return { close: vi.fn() };
     });
-    const parentPubsub = new InngestPubSub(inngest, 'parent', realtimeSubscribe as any);
+    const parentPubsub = new InngestPubSub(inngest, 'parent', undefined, realtimeSubscribe as any);
     const parentEvents: Event[] = [];
     await parentPubsub.subscribe('workflow.events.v2.parent-run', event => {
       parentEvents.push(event);
     });
-    const childPubsub = new InngestPubSub(inngest, 'child', realtimeSubscribe as any);
+    const childPubsub = new InngestPubSub(inngest, 'child', undefined, realtimeSubscribe as any);
     const childEvents: Event[] = [];
     let childSubscription: Promise<void> | undefined;
     vi.spyOn(inngest.realtime, 'publish').mockImplementation(async (topicRef: any, data: any) => {

@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  assertCompleteModelResponse,
   computeDelay,
   isTransientLLMError,
   ObservationalMemoryOperationTimeoutError,
+  OmIncompleteResponseError,
   RETRY_CONFIG,
   withRetry,
 } from '../retry';
@@ -293,5 +295,24 @@ describe('withRetry', () => {
 
     await rejection;
     expect(fn).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('assertCompleteModelResponse', () => {
+  it.each(['other', 'unknown'])('throws a transient error for finishReason %s', finishReason => {
+    let thrown: unknown;
+    try {
+      assertCompleteModelResponse({ finishReason, text: 'partial' }, 'OM observer');
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(OmIncompleteResponseError);
+    expect(thrown).toMatchObject({ name: 'OmIncompleteResponseError', finishReason });
+    expect(isTransientLLMError(thrown)).toBe(true);
+  });
+
+  it.each(['stop', 'length'])('returns the output for finishReason %s', finishReason => {
+    const output = { finishReason, text: 'done' };
+    expect(assertCompleteModelResponse(output, 'OM observer')).toBe(output);
   });
 });

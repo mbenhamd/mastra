@@ -14,6 +14,8 @@ export const TRANSIENT_EXECUTION_SYMBOL = Symbol('transient_execution');
 // Unlike TRANSIENT_EXECUTION_SYMBOL, this does not force an inherited nested
 // run ID to be transient.
 export const PROCESSOR_EXECUTION_SYMBOL = Symbol('processor_execution');
+// Abort reason used when workflow code explicitly cancels a run.
+export const WORKFLOW_CANCELLED_SYMBOL = Symbol('workflow_cancelled');
 
 // Symbol used to identify results from nested workflow execution.
 //

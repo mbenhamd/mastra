@@ -19,6 +19,7 @@ import {
   isWorkflowCancelRequestAbort,
   workflowCancelRequestFor,
 } from './cancel-request';
+import { WORKFLOW_CANCELLED_SYMBOL } from './constants';
 import type { ExecutionGraph } from './execution-engine';
 import { ExecutionEngine } from './execution-engine';
 import type {
@@ -53,6 +54,7 @@ import type {
   EntryExecutionResult,
   ExecutionContext,
   MutableContext,
+  NestedWorkflowParent,
   OutputWriter,
   RestartExecutionParams,
   SerializedStepFlowEntry,
@@ -65,6 +67,7 @@ import type {
   TimeTravelExecutionParams,
   WorkflowCancelRequestV1,
   WorkflowRunStatus,
+  WorkflowStateTracingContext,
 } from './types';
 // Used by the per-type execute methods (executeAgent/executeTool/executeMapping)
 // to build a runnable step from a declarative entry.
@@ -908,6 +911,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     lifecycleResumeAttempt: number;
     lifecycleStepStates: Record<string, { stepCallId: string; stepAttempt: number }>;
     resumeOperationHash?: `sha256:${string}`;
+    parentWorkflow?: NestedWorkflowParent;
     resourceId?: string;
     disableScorers?: boolean;
     graph: ExecutionGraph;
@@ -1156,12 +1160,70 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     // leaves that outcome standing. Other aborts keep their existing effect —
     // Run.cancel() commits `canceled` durably first, and a step's own abort()
     // stays local as before.
+    //
+    // Upstream #24684: only an explicit cancellation is terminal. Run.cancel(), a step's own
+    // abort() and every fork-admitted lineage cancellation abort with
+    // WORKFLOW_CANCELLED_SYMBOL; a durable cancel request aborts with its
+    // WorkflowCancelRequestedError. Any other abort of the run controller is an executor
+    // interruption (shutdown, ownership handoff) and leaves a restart-compatible `waiting`
+    // snapshot instead of committing `canceled`.
+    // A cancel request whose cancellation Run.cancel() already committed durably also counts as
+    // a run cancellation (it relabels like Run.cancel(); see markDurableCancelCommitted).
     const isRunCancelAbort = () =>
-      params.abortController.signal.aborted && !isWorkflowCancelRequestAbort(params.abortController.signal);
+      params.abortController.signal.aborted &&
+      (params.abortController.signal.reason === WORKFLOW_CANCELLED_SYMBOL ||
+        (params.abortController.signal.reason instanceof WorkflowCancelRequestedError &&
+          !isWorkflowCancelRequestAbort(params.abortController.signal)));
+    const isExecutorAbort = () =>
+      params.abortController.signal.aborted &&
+      params.abortController.signal.reason !== WORKFLOW_CANCELLED_SYMBOL &&
+      !(params.abortController.signal.reason instanceof WorkflowCancelRequestedError);
+    // The `waiting` write is the same lineage-fenced step write: a rejected write
+    // (another owner or a terminal transition won) returns the durable outcome.
+    const commitExecutorAbortedExecution = async (executionContext: ExecutionContext): Promise<TOutput> => {
+      const waitingWrite = await this.persistStepUpdate({
+        workflowId,
+        runId,
+        resourceId,
+        stepResults,
+        serializedStepGraph: params.serializedStepGraph,
+        executionContext,
+        workflowStatus: 'waiting',
+        requestContext: currentRequestContext,
+        phase: 'executor-aborted',
+      });
+      const rejected = await this.resolveRejectedTerminalWrite(
+        waitingWrite,
+        { workflowId, runId, executionGeneration, lifecycleResumeAttempt },
+        false,
+        { pubsub: params.pubsub, includeState: params.outputOptions?.includeState },
+      );
+      if (rejected) {
+        workflowSpan?.end({ attributes: { status: rejected.status } });
+        this.clearLastPersistedStatus(runId);
+        return { ...rejected, runId } as unknown as TOutput;
+      }
+
+      workflowSpan?.end({ attributes: { status: 'waiting' } });
+
+      const formattedResult = await this.fmtReturnValue<any>(
+        params.pubsub,
+        stepResults,
+        { status: 'waiting', payload: undefined, startedAt: Date.now() },
+        undefined,
+        stepExecutionPath,
+      );
+
+      return {
+        ...formattedResult,
+        runId,
+        ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+      } as any;
+    };
 
     for (let i = startIdx; i < steps.length; i++) {
       if (params.abortController.signal.aborted) {
-        return await commitCanceledExecution(
+        return await (isExecutorAbort() ? commitExecutorAbortedExecution : commitCanceledExecution)(
           lastExecutionContext || {
             workflowId,
             runId,
@@ -1193,6 +1255,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         lifecycleResumeAttempt,
         lifecycleStepStates,
         resumeOperationHash: params.resumeOperationHash,
+        parentWorkflow: params.parentWorkflow,
         executionPath: [i],
         stepExecutionPath,
         activeStepsPath: {},
@@ -1306,6 +1369,26 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         return await commitCanceledExecution(executionContext, settledStatus);
       }
 
+      // Upstream #24684: an executor interruption (not an explicit cancellation) that a step
+      // observed returns a restart-compatible waiting result instead of a terminal one.
+      if (lastOutput.result.status === 'waiting' && isExecutorAbort()) {
+        workflowSpan?.end({ attributes: { status: 'waiting' } });
+
+        const formattedResult = await this.fmtReturnValue<any>(
+          params.pubsub,
+          stepResults,
+          lastOutput.result,
+          undefined,
+          stepExecutionPath,
+        );
+
+        return {
+          ...formattedResult,
+          runId,
+          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+        } as any;
+      }
+
       // if step result is not success, stop and return
       if (lastOutput.result.status !== 'success') {
         if (lastOutput.result.status === 'bailed') {
@@ -1326,14 +1409,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         // never stored, and the resumed span's exported children would inherit it and
         // land as orphans. Undefined when nothing in the chain is exportable, which
         // correctly makes those children trace roots instead.
-        const persistTracingContext =
-          result.status === 'suspended' && workflowSpan
-            ? {
-                traceId: workflowSpan.traceId,
-                spanId: resolveExportedSpanId(workflowSpan),
-                parentSpanId: workflowSpan.getParentSpanId(),
-              }
-            : {};
+        let persistTracingContext: WorkflowStateTracingContext = {};
+        if (result.status === 'suspended') {
+          if (this.options.resumeTracingContext) {
+            persistTracingContext = this.options.resumeTracingContext;
+          } else if (workflowSpan) {
+            persistTracingContext = {
+              traceId: workflowSpan.traceId,
+              spanId: resolveExportedSpanId(workflowSpan),
+              parentSpanId: workflowSpan.getParentSpanId(),
+            };
+          }
+        }
 
         let terminalWrite: PersistWorkflowStepUpdateResult | void = undefined;
         if (!executionContext.transientExecution) {

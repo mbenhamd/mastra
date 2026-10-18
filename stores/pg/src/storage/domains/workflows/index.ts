@@ -5,7 +5,9 @@ import {
   normalizePerPage,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
+  TABLE_WORKFLOW_RUN_OWNERS,
   TABLE_SCHEMAS,
+  RUN_FENCING_TABLE_SCHEMAS,
   matchesExpectedWorkflowState,
   STALE_EXECUTION_RESULT,
   WorkflowsStorage,
@@ -82,6 +84,8 @@ import {
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
+  isRunFenceConflictError,
+  resolveRunFence,
 } from '@mastra/core/storage';
 import type {
   AdvanceWorkflowTerminalizationInput,
@@ -130,6 +134,12 @@ import type {
   RollbackWorkflowResumeInput,
   RollbackWorkflowResumeResult,
   UpdateWorkflowResultsResult,
+  ClaimRunOwnershipInput,
+  ClaimRunOwnershipResult,
+  RenewRunOwnershipInput,
+  RenewRunOwnershipResult,
+  RunFence,
+  RunOwnershipRecord,
   UpdateWorkflowStateOptions,
   StorageListWorkflowRunsInput,
   WorkflowRun,
@@ -185,6 +195,8 @@ import { PgDB, resolvePgConfig, generateIndexSQL, generateTableSQL } from '../..
 import type { PgDomainConfig } from '../../db';
 import { buildConstraintName, truncateIdentifierWithHash } from '../../db/constraint-utils';
 import { classifyPgPersistenceFailure } from '../../db/pg-errors';
+import { assertRunFence, DB_NOW_MS } from '../../db/run-fencing';
+import type { Queryable } from '../../db/run-fencing';
 import { PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN, sanitizeJsonForPg, toPgJson } from '../../db/sanitize-json';
 import { getSchemaSnapshot } from '../../db/schema-snapshot';
 import type { SchemaCheckConstraint } from '../../db/schema-snapshot';
@@ -328,6 +340,27 @@ function workflowSnapshotResourceIndexName(schemaPrefix: string): string {
   return truncateIdentifierWithHash(`${schemaPrefix}${WORKFLOW_SNAPSHOT_RESOURCE_INDEX}`.toLowerCase());
 }
 
+interface RunOwnerRow {
+  /** BIGINT columns come back as strings. */
+  generation: string | number;
+  ownerId: string;
+  leaseExpiresAt: string | number | null;
+  nowMs: string | number;
+}
+
+const RUN_OWNER_COLUMNS = `generation, "ownerId", "leaseExpiresAt", ${DB_NOW_MS} AS "nowMs"`;
+
+function toRunOwnershipRecord(runId: string, row: RunOwnerRow): RunOwnershipRecord {
+  const leaseExpiresAt = row.leaseExpiresAt === null ? null : Number(row.leaseExpiresAt);
+  return {
+    runId,
+    generation: Number(row.generation),
+    ownerId: row.ownerId,
+    leaseExpiresAt: leaseExpiresAt === null ? null : new Date(leaseExpiresAt),
+    live: leaseExpiresAt !== null && leaseExpiresAt > Number(row.nowMs),
+  };
+}
+
 /** Base name (before any schema prefix) of the expression index backing the status filter. */
 const WORKFLOW_SNAPSHOT_STATUS_INDEX = 'mastra_workflow_snapshot_name_status_createdat_idx';
 
@@ -351,10 +384,14 @@ export function workflowSnapshotStatusIndexName(schemaName?: string): string {
 /**
  * Expression index on `(workflow_name, snapshot->>'status', "createdAt" DESC)` so
  * listWorkflowRuns() status filters can use an index instead of scanning every snapshot.
+ *
+ * `concurrently` is set by init, which may build the index on a large existing table while
+ * other processes keep writing to it. The exported DDL stays plain because migration
+ * tooling often wraps statements in a transaction, where CONCURRENTLY is rejected.
  */
-function workflowSnapshotStatusIndexSQL(indexName: string, schemaName?: string): string {
+function workflowSnapshotStatusIndexSQL(indexName: string, schemaName?: string, concurrently = false): string {
   const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(schemaName) });
-  return `CREATE INDEX IF NOT EXISTS "${indexName}" ON ${tableName} (workflow_name, (snapshot ->> 'status'), "createdAt" DESC)`;
+  return `CREATE INDEX ${concurrently ? 'CONCURRENTLY ' : ''}IF NOT EXISTS "${indexName}" ON ${tableName} (workflow_name, (snapshot ->> 'status'), "createdAt" DESC)`;
 }
 
 /** Base name (before any schema prefix) of the expression index backing the threadId filter. */
@@ -395,10 +432,11 @@ export const WORKFLOW_SNAPSHOT_THREAD_ID_EXPR = `COALESCE(jsonb_path_query_first
 /**
  * Expression index on the snapshot-embedded thread id so listWorkflowRuns() threadId filters
  * (Agent.listSuspendedRuns) can use an index instead of detoasting every snapshot.
+ * See {@link workflowSnapshotStatusIndexSQL} for `concurrently`.
  */
-function workflowSnapshotThreadIdIndexSQL(indexName: string, schemaName?: string): string {
+function workflowSnapshotThreadIdIndexSQL(indexName: string, schemaName?: string, concurrently = false): string {
   const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(schemaName) });
-  return `CREATE INDEX IF NOT EXISTS "${indexName}" ON ${tableName} ((${WORKFLOW_SNAPSHOT_THREAD_ID_EXPR}))`;
+  return `CREATE INDEX ${concurrently ? 'CONCURRENTLY ' : ''}IF NOT EXISTS "${indexName}" ON ${tableName} ((${WORKFLOW_SNAPSHOT_THREAD_ID_EXPR}))`;
 }
 
 export class WorkflowsPG extends WorkflowsStorage {
@@ -428,9 +466,14 @@ export class WorkflowsPG extends WorkflowsStorage {
    * Workflow run snapshots accumulate as runs execute. Anchored on the
    * timezone-aware `updatedAtZ` mirror column (last activity) so suspended or
    * long-running runs are not pruned by start age.
+   *
+   * Run ownership rows are anchored on `updatedAt` (epoch ms), which every
+   * claim, renewal and release refreshes, so a live execution's row is never
+   * older than its renew interval.
    */
   static override readonly retentionTables: RetentionTablesDescriptor = {
     workflowSnapshot: { table: TABLE_WORKFLOW_SNAPSHOT, column: 'updatedAtZ', indexed: true },
+    runOwnership: { table: TABLE_WORKFLOW_RUN_OWNERS, column: 'updatedAt', indexed: true, anchorType: 'epoch-ms' },
   };
 
   constructor(config: PgDomainConfig) {
@@ -3511,6 +3554,16 @@ export class WorkflowsPG extends WorkflowsStorage {
       statements.push(generateIndexSQL(idx, schemaName));
     }
 
+    // The status and threadId expression indexes are emitted above by
+    // getWorkflowSnapshotStatusIndexExportDDL() behind the jsonb column-type guard.
+    statements.push(
+      generateTableSQL({
+        tableName: TABLE_WORKFLOW_RUN_OWNERS as TABLE_NAMES,
+        schema: RUN_FENCING_TABLE_SCHEMAS[TABLE_WORKFLOW_RUN_OWNERS],
+        schemaName,
+        includeAllConstraints: true,
+      }),
+    );
     return statements;
   }
 
@@ -5043,7 +5096,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     if (snapshotType !== 'jsonb') return;
     if (!hasStatusIndex) {
       try {
-        await this.#db.createIndexFromStatement(indexName, workflowSnapshotStatusIndexSQL(indexName, this.#schema));
+        await this.#db.createIndexFromStatement(indexName, workflowSnapshotStatusIndexSQL(indexName, this.#schema, true));
       } catch (error) {
         if (this.#db.isExternalSchemaMode()) throw error;
         this.logger?.warn?.(`Failed to create index ${indexName}:`, error);
@@ -5057,7 +5110,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     try {
       await this.#db.createIndexFromStatement(
         threadIdIndexName,
-        workflowSnapshotThreadIdIndexSQL(threadIdIndexName, this.#schema),
+        workflowSnapshotThreadIdIndexSQL(threadIdIndexName, this.#schema, true),
       );
     } catch (error) {
       this.logger?.warn?.(`Failed to create index ${threadIdIndexName}:`, error);
@@ -5094,6 +5147,10 @@ export class WorkflowsPG extends WorkflowsStorage {
       tableName: TABLE_WORKFLOW_SNAPSHOT,
       schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT],
       ifNotExists: ['resourceId'],
+    });
+    await this.#db.createTable({
+      tableName: TABLE_WORKFLOW_RUN_OWNERS as TABLE_NAMES,
+      schema: RUN_FENCING_TABLE_SCHEMAS[TABLE_WORKFLOW_RUN_OWNERS],
     });
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
@@ -5200,13 +5257,13 @@ export class WorkflowsPG extends WorkflowsStorage {
     return { deleted, truncated: false };
   }
 
-  /** Delete workflow run snapshots older than the `workflowSnapshot` policy's `maxAge`, batched. */
+  /** Delete workflow run snapshots and run ownership rows older than their policy's `maxAge`, batched. */
   async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
     await this.ensureRetentionIndexes(policies);
     const targets = resolveTargets({
       policies,
       descriptor: WorkflowsPG.retentionTables,
-      order: ['workflowSnapshot'],
+      order: ['workflowSnapshot', 'runOwnership'],
     });
     // A batch cut short by cancellation or the skipped-candidate bound did not
     // evaluate every eligible row: the sweep is resumable, not drained, so the
@@ -5217,7 +5274,12 @@ export class WorkflowsPG extends WorkflowsStorage {
       domain: 'workflows',
       targets,
       options,
-      deleteBatch: async (_target, cutoff, limit) => {
+      deleteBatch: async (target, cutoff, limit) => {
+        // Run ownership rows carry no handoff or revision fence: prune them with
+        // the generic batched delete. Snapshots go through the fenced batch.
+        if (target.table !== TABLE_WORKFLOW_SNAPSHOT) {
+          return this.#db.pruneBatch({ tableName: target.table, column: target.column, cutoff, limit });
+        }
         const batch = await this.pruneWorkflowSnapshotsBatch(cutoff, limit, options);
         truncated ||= batch.truncated;
         return batch.deleted;
@@ -5250,7 +5312,7 @@ export class WorkflowsPG extends WorkflowsStorage {
 
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.client.none(
-      `TRUNCATE TABLE ${this.terminalContinuationPlanTableName()}, ${this.terminalDestinationReceiptTableName()}, ${this.terminalEffectTableName()}, ${this.terminalSnapshotTableName()}, ${this.terminalRecoveryAncestryTableName()}, ${this.terminalizationTableName()}, ${this.workflowSnapshotHandoffTableName()}, ${this.workflowSnapshotTableName()}, ${this.workflowParentRevisionTableName()} CASCADE`,
+      `TRUNCATE TABLE ${this.terminalContinuationPlanTableName()}, ${this.terminalDestinationReceiptTableName()}, ${this.terminalEffectTableName()}, ${this.terminalSnapshotTableName()}, ${this.terminalRecoveryAncestryTableName()}, ${this.terminalizationTableName()}, ${this.workflowSnapshotHandoffTableName()}, ${this.workflowSnapshotTableName()}, ${this.workflowParentRevisionTableName()}, ${this.#runOwnersTable()} CASCADE`,
     );
   }
 
@@ -6163,6 +6225,123 @@ export class WorkflowsPG extends WorkflowsStorage {
     };
   }
 
+  // Ownership reads and writes always go to the primary client: a replica's
+  // stale view of a lease would let a claim or a fenced write act on old data.
+
+  supportsRunFencing(): boolean {
+    return true;
+  }
+
+  #runOwnersTable(): string {
+    return getTableName({ indexName: TABLE_WORKFLOW_RUN_OWNERS, schemaName: getSchemaName(this.#schema) });
+  }
+
+  async #readRunOwner(q: Queryable, runId: string): Promise<RunOwnershipRecord | null> {
+    const row = await q.oneOrNone<RunOwnerRow>(
+      `SELECT ${RUN_OWNER_COLUMNS} FROM ${this.#runOwnersTable()} WHERE "runId" = $1`,
+      [runId],
+    );
+    return row ? toRunOwnershipRecord(runId, row) : null;
+  }
+
+  #ownershipError(operation: string, runId: string, error: unknown): MastraError {
+    return new MastraError(
+      {
+        id: createStorageErrorId('PG', operation, 'FAILED'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.THIRD_PARTY,
+        details: { runId },
+      },
+      error,
+    );
+  }
+
+  async claimRunOwnership({
+    runId,
+    ownerId,
+    leaseMs,
+    force,
+    expectedGeneration,
+  }: ClaimRunOwnershipInput): Promise<ClaimRunOwnershipResult> {
+    const table = this.#runOwnersTable();
+    try {
+      return await this.#db.client.tx(async t => {
+        const existing = await t.oneOrNone(`SELECT 1 FROM ${table} WHERE "runId" = $1 FOR UPDATE`, [runId]);
+        if (!existing) {
+          if (expectedGeneration !== undefined && expectedGeneration !== 0) {
+            return { acquired: false, record: null };
+          }
+          // A first claim seeds its generation from the database clock, so a run
+          // whose ownership row was pruned starts above every generation it had.
+          const inserted = await t.oneOrNone<RunOwnerRow>(
+            `INSERT INTO ${table} ("runId", generation, "ownerId", "leaseExpiresAt", "updatedAt")
+             VALUES ($1, GREATEST(1, ${DB_NOW_MS}), $2, ${DB_NOW_MS} + $3, ${DB_NOW_MS})
+             ON CONFLICT ("runId") DO NOTHING
+             RETURNING ${RUN_OWNER_COLUMNS}`,
+            [runId, ownerId, leaseMs],
+          );
+          if (inserted) return { acquired: true, record: toRunOwnershipRecord(runId, inserted) };
+          // A concurrent first claim inserted the row; the update below claims against it.
+        }
+        // The lease check runs in this statement, after the row lock is held, so
+        // it reads the database clock at the moment the claim actually happens.
+        const claimed = await t.oneOrNone<RunOwnerRow>(
+          `UPDATE ${table}
+           SET generation = generation + 1, "ownerId" = $2, "leaseExpiresAt" = ${DB_NOW_MS} + $3,
+               "updatedAt" = ${DB_NOW_MS}
+           WHERE "runId" = $1
+             AND ($4::bigint IS NULL OR generation = $4)
+             AND ($5::boolean OR "leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= ${DB_NOW_MS})
+           RETURNING ${RUN_OWNER_COLUMNS}`,
+          [runId, ownerId, leaseMs, expectedGeneration ?? null, force === true],
+        );
+        if (claimed) return { acquired: true, record: toRunOwnershipRecord(runId, claimed) };
+        return { acquired: false, record: await this.#readRunOwner(t, runId) };
+      });
+    } catch (error) {
+      throw this.#ownershipError('CLAIM_RUN_OWNERSHIP', runId, error);
+    }
+  }
+
+  async renewRunOwnership({ leaseMs, ...fence }: RenewRunOwnershipInput): Promise<RenewRunOwnershipResult> {
+    try {
+      const renewed = await this.#db.client.oneOrNone<RunOwnerRow>(
+        `UPDATE ${this.#runOwnersTable()}
+         SET "leaseExpiresAt" = ${DB_NOW_MS} + $4, "updatedAt" = ${DB_NOW_MS}
+         WHERE "runId" = $1 AND generation = $2 AND "ownerId" = $3 AND "leaseExpiresAt" IS NOT NULL
+         RETURNING ${RUN_OWNER_COLUMNS}`,
+        [fence.runId, fence.generation, fence.ownerId, leaseMs],
+      );
+      if (renewed) return { renewed: true, record: toRunOwnershipRecord(fence.runId, renewed) };
+      return { renewed: false, record: await this.#readRunOwner(this.#db.client, fence.runId) };
+    } catch (error) {
+      throw this.#ownershipError('RENEW_RUN_OWNERSHIP', fence.runId, error);
+    }
+  }
+
+  async releaseRunOwnership(fence: RunFence): Promise<boolean> {
+    try {
+      const released = await this.#db.client.oneOrNone(
+        `UPDATE ${this.#runOwnersTable()}
+         SET "leaseExpiresAt" = NULL, "updatedAt" = ${DB_NOW_MS}
+         WHERE "runId" = $1 AND generation = $2 AND "ownerId" = $3
+         RETURNING "runId"`,
+        [fence.runId, fence.generation, fence.ownerId],
+      );
+      return released !== null;
+    } catch (error) {
+      throw this.#ownershipError('RELEASE_RUN_OWNERSHIP', fence.runId, error);
+    }
+  }
+
+  async getRunOwnership({ runId }: { runId: string }): Promise<RunOwnershipRecord | null> {
+    try {
+      return await this.#readRunOwner(this.#db.client, runId);
+    } catch (error) {
+      throw this.#ownershipError('GET_RUN_OWNERSHIP', runId, error);
+    }
+  }
+
   async updateWorkflowResults({
     workflowName,
     runId,
@@ -6170,6 +6349,8 @@ export class WorkflowsPG extends WorkflowsStorage {
     result,
     requestContext,
     executionGeneration,
+    state,
+    fence: explicitFence,
   }: {
     workflowName: string;
     runId: string;
@@ -6177,10 +6358,14 @@ export class WorkflowsPG extends WorkflowsStorage {
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
     executionGeneration?: string;
+    state?: Record<string, any>;
+    fence?: RunFence;
   }): Promise<UpdateWorkflowResultsResult> {
+    const fence = resolveRunFence(this, explicitFence, runId);
     try {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
+        if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, 'updateWorkflowResults');
         const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
@@ -6195,50 +6380,37 @@ export class WorkflowsPG extends WorkflowsStorage {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
 
-        let snapshot: WorkflowRunState;
         if (!existingSnapshotResult) {
-          // Create new snapshot if none exists
-          snapshot = {
-            context: {},
-            activePaths: [],
-            timestamp: Date.now(),
-            suspendedPaths: {},
-            activeStepsPath: {},
-            resumeLabels: {},
-            serializedStepGraph: [],
-            status: 'pending',
-            value: {},
-            waitingPaths: {},
-            runId: runId,
-            requestContext: {},
-          } as WorkflowRunState;
-        } else {
-          // Parse existing snapshot
-          const existingSnapshot = existingSnapshotResult.snapshot;
-          snapshot = typeof existingSnapshot === 'string' ? JSON.parse(existingSnapshot) : existingSnapshot;
+          // No run record to merge into: roll back the provisional revision the
+          // upsert lock created so a step result never leaves revision evidence
+          // for a run that has no snapshot.
+          await this.deleteProvisionalWorkflowParentRevision(t, workflowName, runId, revision.created);
+          return {};
         }
+
+        const existingSnapshot = existingSnapshotResult.snapshot;
+        const snapshot: WorkflowRunState =
+          typeof existingSnapshot === 'string' ? JSON.parse(existingSnapshot) : existingSnapshot;
 
         // Compare-and-set guard before any merge: a delayed result write from
         // a deleted execution lifetime must not merge into the snapshot a
         // reopened lifetime installed under the same runId (PF-4385 tombstone
         // reopen). An existing row owned by another generation resolves to the
         // stale sentinel so the caller stops instead of advancing with an
-        // inline result; a missing row keeps the `{}` missing-record fallback —
-        // a lineage-carrying write never resurrects a deleted run, but runs
-        // that opted out of snapshot persistence legitimately write without a
-        // row. Mirrors the updateWorkflowState guard below.
+        // inline result. A missing row resolves to `{}` above without writing:
+        // a step result never creates a run record. Mirrors the
+        // updateWorkflowState guard below.
         if (
           !matchesExpectedWorkflowState(snapshot, {
             expectedExecutionGeneration: executionGeneration,
           })
         ) {
-          await this.deleteProvisionalWorkflowParentRevision(t, workflowName, runId, revision.created);
-          return existingSnapshotResult ? STALE_EXECUTION_RESULT : {};
+          return STALE_EXECUTION_RESULT;
         }
 
         // Merge the new step result using element-wise array merging
         // (critical for concurrent foreach iteration results)
-        mergeWorkflowStepResult({ snapshot, stepId, result, requestContext });
+        mergeWorkflowStepResult({ snapshot, stepId, result, requestContext, state });
 
         // Upsert the snapshot within the same transaction
         const now = new Date();
@@ -6256,7 +6428,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         return snapshot.context;
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+      if (
+        error instanceof WorkflowSnapshotHandoffFenceError ||
+        isWorkflowSnapshotHandoffSchemaError(error) ||
+        isRunFenceConflictError(error)
+      )
         throw error;
       throw new MastraError(
         {
@@ -6278,10 +6454,12 @@ export class WorkflowsPG extends WorkflowsStorage {
     workflowName,
     runId,
     opts,
+    fence: explicitFence,
   }: {
     workflowName: string;
     runId: string;
     opts: UpdateWorkflowStateOptions;
+    fence?: RunFence;
   }): Promise<WorkflowRunState | undefined> {
     // Capture the CAS guards and state options before awaiting: `opts` is
     // caller-owned, so reading it inside the transaction would let a caller
@@ -6317,9 +6495,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         value: 'value' in descriptor ? descriptor.value : descriptor.get?.call(opts),
       });
     }
+    const fence = resolveRunFence(this, explicitFence, runId);
     try {
       // Use a transaction with row-level locking to ensure atomicity
       return await this.#db.client.tx(async t => {
+        if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, 'updateWorkflowState');
         const tableName = getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) });
         const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
@@ -6390,7 +6570,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         return updatedSnapshot;
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+      if (
+        error instanceof WorkflowSnapshotHandoffFenceError ||
+        isWorkflowSnapshotHandoffSchemaError(error) ||
+        isRunFenceConflictError(error)
+      )
         throw error;
       throw new MastraError(
         {
@@ -6416,6 +6600,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     createdAt,
     updatedAt,
     expectedExecutionGeneration,
+    fence: explicitFence,
   }: {
     workflowName: string;
     runId: string;
@@ -6424,6 +6609,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     createdAt?: Date;
     updatedAt?: Date;
     expectedExecutionGeneration?: string;
+    fence?: RunFence;
   }): Promise<void> {
     validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
     try {
@@ -6431,6 +6617,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       const createdAtValue = createdAt ? createdAt : now;
       const updatedAtValue = updatedAt ? updatedAt : now;
       await this.#db.client.tx(async t => {
+        const fence = resolveRunFence(this, explicitFence, runId);
+        if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, 'persistWorkflowSnapshot');
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
         const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
@@ -6482,7 +6670,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+      if (
+        error instanceof WorkflowSnapshotHandoffFenceError ||
+        isWorkflowSnapshotHandoffSchemaError(error) ||
+        isRunFenceConflictError(error)
+      )
         throw error;
       if (error instanceof WorkflowStaleSnapshotPersistError) throw error;
       throw new MastraError(
@@ -6673,15 +6865,29 @@ export class WorkflowsPG extends WorkflowsStorage {
     return true;
   }
 
-  async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
+  async deleteWorkflowRunById({
+    runId,
+    workflowName,
+    fence: explicitFence,
+  }: {
+    runId: string;
+    workflowName: string;
+    fence?: RunFence;
+  }): Promise<void> {
     try {
       await this.#db.client.tx(async t => {
+        const fence = resolveRunFence(this, explicitFence, runId);
+        if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, 'deleteWorkflowRunById');
         const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
         await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision);
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+      if (
+        error instanceof WorkflowSnapshotHandoffFenceError ||
+        isWorkflowSnapshotHandoffSchemaError(error) ||
+        isRunFenceConflictError(error)
+      )
         throw error;
       throw new MastraError(
         {

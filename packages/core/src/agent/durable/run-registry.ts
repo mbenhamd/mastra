@@ -1,6 +1,7 @@
 import { TTLCache } from '@isaacs/ttlcache';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { Mastra } from '../../mastra';
+import { unwrapMastraTracingProxy } from '../../observability/context';
 import type { CoreTool } from '../../tools/types';
 import type { MessageList } from '../message-list';
 import type { SaveQueueManager } from '../save-queue';
@@ -47,9 +48,13 @@ export const globalRunRegistry = new TTLCache<string, RunRegistryEntry>({
   noDisposeOnSet: true,
 });
 
-/** Resolve a runtime entry, including one pinned for an active workflow segment. */
+/**
+ * Resolve a runtime entry, including one pinned for an active workflow segment.
+ * A missing key is checked with `has()` first: with `updateAgeOnGet`, `get()` on a
+ * missing runId schedules an expiration for a key that has no value.
+ */
 export function getGlobalRunRegistryEntry(runId: string): RunRegistryEntry | undefined {
-  return pinnedRunRegistry.get(runId)?.entry ?? globalRunRegistry.get(runId);
+  return pinnedRunRegistry.get(runId)?.entry ?? (globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined);
 }
 
 /** Keep an active workflow segment immune to TTL/capacity eviction. */
@@ -59,7 +64,7 @@ export function pinGlobalRunRegistryEntry(runId: string): RunRegistryEntry | und
     pinned.count += 1;
     return pinned.entry;
   }
-  const entry = globalRunRegistry.get(runId);
+  const entry = globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined;
   if (entry) pinnedRunRegistry.set(runId, { entry, count: 1 });
   return entry;
 }
@@ -89,6 +94,53 @@ export function clearGlobalRunRegistry(): void {
   pinnedRunRegistry.clear();
   globalRunRegistry.clear();
   for (const entry of pinnedOnlyEntries) entry.cleanup?.();
+}
+
+/**
+ * Read a run's registry entry as seen from a workflow step running under `mastra`.
+ *
+ * Entries are keyed only by runId, so when another Mastra instance in this
+ * process reuses the runId, a still-running workflow from the earlier run
+ * would otherwise read (and write its transcript into) the new run's entry.
+ * An entry owned by a different Mastra instance is treated as absent. An
+ * ownerless entry (a placeholder or rehydrated entry) is claimed by the first
+ * scoped reader, so a later instance reusing the runId cannot adopt it.
+ *
+ * Fork (PF): this is the cross-instance owner check only. Same-instance run-ID
+ * reuse is fenced separately by the per-execution `runtimeBindingId`
+ * ({@link getBoundRunRegistryEntry}); steps that carry a binding must use that.
+ */
+export function getRunRegistryEntry(runId: string, mastra: Mastra | undefined): RunRegistryEntry | undefined {
+  const entry = getGlobalRunRegistryEntry(runId);
+  if (!entry || !mastra) return entry;
+  if (!entry.mastra) {
+    entry.mastra = mastra;
+    return entry;
+  }
+  return unwrapMastraTracingProxy(entry.mastra) === unwrapMastraTracingProxy(mastra) ? entry : undefined;
+}
+
+/**
+ * Publish an entry for `runId`, owned by `mastra`, unless the slot holds
+ * another Mastra instance's live run (cached or pinned by an active segment).
+ * Returns whether the entry was stored.
+ */
+export function setRunRegistryEntry(runId: string, entry: RunRegistryEntry, mastra: Mastra | undefined): boolean {
+  const current = getGlobalRunRegistryEntry(runId);
+  if (current?.mastra && mastra && unwrapMastraTracingProxy(current.mastra) !== unwrapMastraTracingProxy(mastra))
+    return false;
+  // Fork (PF): never swap the entry an active segment pinned for a different
+  // execution binding; the pin would keep serving the old entry anyway.
+  const pinned = pinnedRunRegistry.get(runId);
+  if (pinned && pinned.entry !== entry && pinned.entry.runtimeBindingId !== entry.runtimeBindingId) return false;
+  if (mastra) entry.mastra ??= mastra;
+  globalRunRegistry.set(runId, entry);
+  return true;
+}
+
+/** Remove `runId`'s entry only if it belongs to `mastra` (or has no owner). */
+export function deleteRunRegistryEntry(runId: string, mastra: Mastra | undefined): void {
+  if (getRunRegistryEntry(runId, mastra) && globalRunRegistry.has(runId)) globalRunRegistry.delete(runId);
 }
 
 /** runId -> number of in-flight operations holding the entry alive. */
@@ -158,23 +210,42 @@ export function __resetRunRegistryActivityForTests(): void {
   }
 }
 
-/**
- * Collect the in-flight durable workflow executions owned by `mastra` so graceful
- * shutdown can await them. Pinned segments are included: an active segment may have
- * been evicted from the TTL cache while it is still running.
- */
-export function getActiveDurableAgentWorkflowExecutions(mastra: Mastra): Promise<unknown>[] {
-  // `globalRunRegistry` is a TTLCache, and — as the `dispose` handler above already
-  // documents — it can surface an `undefined` value after a missing `get()` refreshes
-  // expiration metadata. Type the set honestly and optional-chain the read; the
-  // unguarded `entry.mastra` threw during `Mastra.shutdown()`.
+// `values()` can yield undefined: with `updateAgeOnGet`, `get()` on a missing
+// runId schedules an expiration for a key that has no value. Pinned active
+// segments are included (deduplicated) because TTL/capacity eviction may have
+// removed them from the cache while they are still running.
+function registryEntries(): RunRegistryEntry[] {
   const entries = new Set<RunRegistryEntry | undefined>([
     ...globalRunRegistry.values(),
     ...[...pinnedRunRegistry.values()].map(({ entry }) => entry),
   ]);
-  return Array.from(entries).flatMap(entry =>
-    entry?.mastra === mastra && entry.workflowExecution ? [entry.workflowExecution] : [],
+  return Array.from(entries).filter((entry): entry is RunRegistryEntry => entry !== undefined);
+}
+
+/**
+ * Collect the in-flight durable workflow executions owned by `mastra` so graceful
+ * shutdown can await them.
+ */
+export function getActiveDurableAgentWorkflowExecutions(mastra: Mastra): Promise<unknown>[] {
+  // `globalRunRegistry` is a TTLCache, and — as the `dispose` handler above already
+  // documents — it can surface an `undefined` value after a missing `get()` refreshes
+  // expiration metadata. Pinned segments are included: an active segment may have
+  // been evicted from the TTL cache while it is still running.
+  return registryEntries().flatMap(entry =>
+    entry.mastra === mastra && entry.workflowExecution ? [entry.workflowExecution] : [],
   );
+}
+
+/**
+ * Abandon the durable-agent executions `mastra` is still running: each stops
+ * without writing and releases its run, so recovery can take it right away.
+ * Executions that already settled are left alone.
+ */
+export async function abandonDurableAgentExecutions(mastra: Mastra): Promise<void> {
+  const fences = registryEntries().flatMap(entry =>
+    entry.mastra === mastra && entry.executionFence ? [entry.executionFence] : [],
+  );
+  await Promise.allSettled(fences.map(fence => fence.abandon()));
 }
 
 /**

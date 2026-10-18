@@ -130,6 +130,7 @@ export function createDynamicTools(
   storage?: MastraCompositeStore,
   pluginTools?: Record<string, ToolLike>,
   backgroundToolsEnabled = false,
+  builtinTools?: Record<string, ToolLike>,
 ) {
   // Returns the framework's own `ToolsInput` so this stays assignable to the agent
   // config's `tools` slot. Upstream narrowed the provider-defined branch of `ToolsInput`
@@ -164,6 +165,9 @@ export function createDynamicTools(
       [WORKFLOW_MANAGEMENT_TOOL_IDS.runWorkflow]: runWorkflowTool,
       [WORKFLOW_MANAGEMENT_TOOL_IDS.deleteWorkflow]: deleteWorkflowTool,
     };
+
+    // Opt-in built-ins (e.g. the experimental schedule tools).
+    if (builtinTools) Object.assign(tools, builtinTools);
 
     if (storage) {
       tools[MC_TOOLS.NOTIFICATION_INBOX] = createNotificationInboxTool({

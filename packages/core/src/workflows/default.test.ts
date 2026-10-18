@@ -8,6 +8,7 @@ import { Mastra } from '../mastra';
 import { createObservabilityContext, SpanType } from '../observability';
 import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_AUTH_TOKEN_KEY } from '../request-context';
 import { MockStore } from '../storage/mock';
+import { WORKFLOW_CANCELLED_SYMBOL } from './constants';
 import { createWorkflow } from './create';
 import { DefaultExecutionEngine } from './default';
 import type { Step } from './step';
@@ -1766,7 +1767,7 @@ describe('DefaultExecutionEngine.execute cancellation onFinish contract', () => 
       outputSchema: z.any(),
       execute: async ({ inputData }: any) => {
         // Trigger cancel during step 1 so step 2 is skipped and engine loop catches cancellation
-        abortController.abort();
+        abortController.abort(WORKFLOW_CANCELLED_SYMBOL);
         // Return a payload matching input to test deduplication
         return {
           ...inputData,
@@ -1854,7 +1855,9 @@ describe('DefaultExecutionEngine.execute cancellation onFinish contract', () => 
     const pubsub = new EventEmitterPubSub();
     const requestContext = new RequestContext();
     const abortController = new AbortController();
-    abortController.abort();
+    // Upstream #24684: only an explicit cancellation (WORKFLOW_CANCELLED_SYMBOL) is terminal; a
+    // bare abort is an executor interruption that leaves the run `waiting`.
+    abortController.abort(WORKFLOW_CANCELLED_SYMBOL);
 
     const engine = new DefaultExecutionEngine({
       mastra: undefined,

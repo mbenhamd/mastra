@@ -118,6 +118,7 @@ export interface RunLoopScenarioOptions {
    */
   defaultOptions?: {
     autoResumeSuspendedTools?: boolean;
+    inputProcessors?: any;
   };
   /** Tools available to the loop. Tool ids must match the scripted tool-call names. */
   tools?: ToolsInput;

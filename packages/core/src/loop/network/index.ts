@@ -22,10 +22,12 @@ import { escapeUnescapedControlCharsInJsonStrings } from '../../stream/base/outp
 import { MastraAgentNetworkStream } from '../../stream/MastraAgentNetworkStream';
 import { resolveToolRequiresApproval } from '../../tools/approval';
 import type { IdGeneratorContext } from '../../types';
+import { safeStringify } from '../../utils/safe-stringify';
 import { createWorkflow } from '../../workflows/create';
 import type { Step, SuspendOptions } from '../../workflows/step';
 import { createStep } from '../../workflows/workflow';
 import { PRIMITIVE_TYPES } from '../types';
+import { runBeforeApprovalHook } from '../workflows/agentic-execution/tool-approval-verdict';
 import { pruneAgentLoopSnapshot } from '../workflows/prune-snapshot';
 
 /**
@@ -407,15 +409,16 @@ export async function prepareMemoryStep({
         promises.push(
           routingAgent
             .genTitle(userMessage, requestContext, observabilityContext, titleModel, titleInstructions)
-            .then(title => {
-              if (title) {
-                return memory.createThread({
-                  threadId: thread.id,
-                  resourceId: thread.resourceId,
-                  memoryConfig,
-                  title,
-                  metadata: thread.metadata,
-                });
+            .then(async title => {
+              if (!title) return;
+              // Update-only: the thread may have been deleted while the title was generating (#25203).
+              if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+              try {
+                await memory.updateThread({ id: thread.id, title, memoryConfig });
+              } catch (error) {
+                // A delete can still land between the check and the update; only swallow that case.
+                if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+                throw error;
               }
             }),
         );
@@ -1584,8 +1587,13 @@ export async function createNetworkLoop({
         stepType: 'tool-execution',
       });
 
-      const returnApprovalRejection = async () => {
-        const rejectionResult = resolveDeclineReason(resumeData);
+      const returnApprovalRejection = async (hookRejectionOutput?: unknown) => {
+        const rejectionResult =
+          hookRejectionOutput !== undefined
+            ? typeof hookRejectionOutput === 'string'
+              ? hookRejectionOutput
+              : safeStringify(hookRejectionOutput)
+            : resolveDeclineReason(resumeData);
         await saveMessagesWithProcessors(
           memory,
           [
@@ -1742,7 +1750,15 @@ export async function createNetworkLoop({
             task: inputData.task,
           });
         }
-        if (!resumeData) {
+        const rejection = resumeData
+          ? undefined
+          : await runBeforeApprovalHook({
+              tool,
+              input: inputDataToUse,
+              context: { toolCallId, toolName: toolId, requestContext },
+              logger,
+            });
+        if (!resumeData && !rejection) {
           const requireApprovalResumeSchema = JSON.stringify(
             standardSchemaToJSONSchema(toStandardSchema(toolApprovalSchema)),
           );
@@ -1812,6 +1828,9 @@ export async function createNetworkLoop({
               toolCallId,
             },
           });
+        } else if (rejection) {
+          // Upstream #26927: a beforeApproval hook rejected the call before the approval gate.
+          return returnApprovalRejection(rejection.output);
         } else if (!isKnownSuspensionResume) {
           if (!hasApprovalResumeShape || !resumeData.approved) {
             return returnApprovalRejection();

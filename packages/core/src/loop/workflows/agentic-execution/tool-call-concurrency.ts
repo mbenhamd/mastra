@@ -78,7 +78,11 @@ export function effectiveToolSetRequiresSequentialExecution({
   const consideredToolEntries =
     strategy === 'called'
       ? (calledToolNames ?? []).flatMap(toolName => {
-          const tool = tools[toolName];
+          // Mirror the tool-call step's lookup (key, provider name, then tool id).
+          const tool =
+            tools[toolName] ||
+            findProviderToolByName(tools, toolName) ||
+            Object.values(tools).find(t => 'id' in t && t.id === toolName);
           return tool ? ([[toolName, tool]] as const) : [];
         })
       : activeTools === undefined
@@ -110,11 +114,9 @@ export function effectiveToolSetRequiresSequentialExecution({
     if (maybeTool.hasSuspendSchema) {
       return true;
     }
-    // Function-valued policies the caller already evaluated per emitted call
-    // (with the call's actual arguments) do not force sequential execution
-    // here; their verdicts are applied at the tool-call step instead.
-    if (dynamicApprovalEvaluated && getNeedsApprovalFn(tool)) {
-      return false;
+    // An unevaluated `needsApprovalFn` may require approval, so stay sequential.
+    if (getNeedsApprovalFn(tool)) {
+      return !dynamicApprovalEvaluated;
     }
     return Boolean(maybeTool.requireApproval || maybeTool.needsApproval || maybeTool.needsApprovalFn);
   });

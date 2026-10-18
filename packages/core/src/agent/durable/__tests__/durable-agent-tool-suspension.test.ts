@@ -224,9 +224,13 @@ describe('DurableAgent tool suspension', () => {
       });
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-      const { runId, cleanup } = await durableAgent.stream('Please confirm this action');
+      const { runId, cleanup, fullStream } = await durableAgent.stream('Please confirm this action');
 
       expect(runId).toBeDefined();
+      // Wait for the run to suspend before releasing it: since #25974 a cleanup() of a run still
+      // executing waits for its terminal event, and an abandoned run would keep executing into the
+      // next case, which reuses its deterministic run and binding ids.
+      for await (const chunk of fullStream) if (chunk.type === 'tool-call-suspended') break;
       cleanup();
     });
 
@@ -334,9 +338,13 @@ describe('DurableAgent tool suspension', () => {
       });
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-      const { runId, cleanup } = await durableAgent.stream('Start the chain');
+      const { runId, cleanup, fullStream } = await durableAgent.stream('Start the chain');
 
       expect(runId).toBeDefined();
+      // Wait for the run to suspend before releasing it: since #25974 a cleanup() of a run still
+      // executing waits for its terminal event, and an abandoned run would keep executing into the
+      // next case, which reuses its deterministic run and binding ids.
+      for await (const chunk of fullStream) if (chunk.type === 'tool-call-suspended') break;
       cleanup();
     });
   });

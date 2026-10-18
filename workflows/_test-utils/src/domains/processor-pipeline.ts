@@ -126,8 +126,15 @@ export function createProcessorPipelineTests(context: DurableAgentTestContext) {
 
         try {
           const registryEntry = globalRunRegistry.get(result.runId);
+          // The agent adds its default error processors after the caller's own.
           expect(registryEntry?.errorProcessors).toBeDefined();
-          expect(registryEntry?.errorProcessors?.length).toBe(1);
+          expect(registryEntry?.errorProcessors!.map(p => p.id)).toEqual([
+            'test-error-processor',
+            'provider-history-compat',
+            'prefill-error-handler',
+            'unsupported-file-handler',
+            'stream-error-retry-processor',
+          ]);
         } finally {
           result.cleanup();
         }

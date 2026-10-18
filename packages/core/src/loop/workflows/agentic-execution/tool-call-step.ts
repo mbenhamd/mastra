@@ -1,6 +1,7 @@
 import type { ToolSet } from '@internal/ai-sdk-v5';
 import { z } from 'zod/v4';
 import { stopGoalActivity } from '../../../agent/goal';
+import { MemoryMessageRefs } from '../../../agent/message-list/memory-message-refs';
 import { resolveDeclineReason } from '../../../agent/tool-approval';
 import {
   createToolCallIdentityDigest,
@@ -51,6 +52,7 @@ import {
   BACKGROUND_TASK_MANAGER_KEY,
   EDITED_APPROVAL_RESUME_LOADER_KEY,
   EAGER_TOOL_EXECUTION_KEY,
+  FIXED_MEMORY_KEY,
   GENERATE_ID_KEY,
   MEMORY_CONFIG_KEY,
   MEMORY_KEY,
@@ -67,6 +69,7 @@ import {
   TOOL_APPROVAL_VERDICTS_KEY,
   TOOL_PAYLOAD_TRANSFORM_KEY,
 } from '../../run-scope-keys';
+import { approvalResumeSchema } from '../../shared/approval-schema';
 import { dispatchBackgroundTool } from '../../shared/steps/background-dispatch-core';
 import { applyBackgroundToolResult } from '../../shared/steps/background-task-result-core';
 import { executeToolCall } from '../../shared/steps/execute-tool-core';
@@ -75,6 +78,7 @@ import { resolveFrameworkSuspendedToolIdentity } from '../../shared/suspended-to
 import type { ResolvedSuspendedToolIdentity } from '../../shared/suspended-tool-run-id';
 import { applyToolPayloadTransformToChunk } from '../../shared/tool-payload-transform';
 import { raceAgainstAbort } from '../../timeout';
+import { dehydrateStreamState } from '../../suspended-stream-state';
 import type { OuterLLMRun } from '../../types';
 import { serializeToolError, ToolNotFoundError } from '../errors';
 import { toolCallInputSchema, toolCallOutputSchema } from '../schema';
@@ -89,6 +93,7 @@ import {
 } from './eager-tool-execution';
 import type { EagerSuspensionIntent, EagerToolBailout } from './eager-tool-execution';
 import { notifyToolDenied, TOOL_DENIED_CALLBACK_KEY, type ToolDeniedCallback } from './tool-permission-notify';
+import { runBeforeApprovalHook } from './tool-approval-verdict';
 
 type AddToolMetadataOptions = {
   toolCallId: string;
@@ -168,6 +173,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
   logger,
   agentId,
   agentVersionId,
+  resolvedScopes,
   mastra,
   requireToolApproval: requireToolApprovalFromFactory,
   requestContext: factoryRequestContext,
@@ -188,6 +194,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
   const onToolDeniedFromFactory = factoryRequestContext?.get(TOOL_DENIED_CALLBACK_KEY) as
     | ToolDeniedCallback
     | undefined;
+  // Shared by every suspension of the run, so parallel suspends verify recalled messages once.
+  const memoryMessageRefs = new MemoryMessageRefs();
   return createStep({
     id: 'toolCallStep',
     inputSchema: toolCallInputSchema,
@@ -440,9 +448,12 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
       const removeToolMetadata = async (
         target: { toolCallId?: string; toolName: string; runId?: string },
         type: 'suspension' | 'approval',
-      ) => {
+      ): Promise<Record<string, any> | undefined> => {
         const { saveQueueManager, memoryConfig, threadId } = _internal || {};
-        if (!saveQueueManager || !threadId) return;
+        // Fork: without a persisting memory the suspension metadata is the only resume record
+        // (auto-resume reconstructs the call from it), so leave it in place and only report the
+        // matched entry for the upstream #25491 `tool-call-resumed` chunk.
+        const retireMetadata = Boolean(saveQueueManager && threadId);
 
         const metadataKey = type === 'suspension' ? 'suspendedTools' : 'pendingToolApprovals';
         const expectedPartType = type === 'suspension' ? 'data-tool-call-suspended' : 'data-tool-call-approval';
@@ -455,6 +466,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         };
 
         const changedMessages: MastraDBMessage[] = [];
+        let matchedEntry: Record<string, any> | undefined;
         for (const message of messageList.get.all.db()) {
           if (message.role !== 'assistant') continue;
 
@@ -467,16 +479,19 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           if (entries) {
             for (const [key, entry] of Object.entries(entries)) {
               if (entryMatches(entry, key)) {
+                matchedEntry ??= { ...entry, toolCallId: entry?.toolCallId ?? key };
+                if (!retireMetadata) continue;
                 delete entries[key];
                 messageChanged = true;
               }
             }
-            if (Object.keys(entries).length === 0) delete metadata![metadataKey];
+            if (retireMetadata && Object.keys(entries).length === 0) delete metadata![metadataKey];
           }
 
           message.content.parts = message.content.parts?.map(part => {
             if (part.type !== expectedPartType || !entryMatches(part.data)) return part;
-            if ((part.data as { resumed?: boolean }).resumed) return part;
+            matchedEntry ??= { ...(part.data as Record<string, any>) };
+            if (!retireMetadata || (part.data as { resumed?: boolean }).resumed) return part;
             messageChanged = true;
             return { ...part, data: { ...(part.data as any), resumed: true } };
           });
@@ -484,7 +499,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           if (messageChanged) changedMessages.push(message);
         }
 
-        if (changedMessages.length === 0) return;
+        if (changedMessages.length === 0 || !saveQueueManager || !threadId) return matchedEntry;
         // `add` re-marks the mutated messages unsaved in the response view so the
         // flush below persists the removal. It is mandatory: the real save queue persists only
         // `snapshotUnsavedMessages`, whose membership depends on tracked unsaved sets, so the
@@ -494,11 +509,43 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // message — a recalled, unsealed suspended message would otherwise have its
         // parts duplicated into the resumed turn's response.
         messageList.add(changedMessages, 'response', { merge: false });
+        // Upstream #27056: a read-only memory never persists the removal.
+        if (memoryConfig?.readOnly) return matchedEntry;
         try {
           await saveQueueManager.flushMessages(messageList, threadId, memoryConfig);
         } catch (error) {
           logger?.error('Error removing tool suspension metadata:', error);
         }
+        return matchedEntry;
+      };
+
+      // Live counterpart of the persisted `resumed: true` marker. The eventual `tool-result` reuses
+      // this toolCallId, so clients need an explicit signal that the suspension/approval was answered.
+      // The payload mirrors the cleared entry so the replacement client part keeps the question.
+      const emitToolCallResumed = async (entry: Record<string, any>, kind: 'suspension' | 'approval') => {
+        const resumedChunk = await transformChunk(
+          {
+            type: 'tool-call-resumed',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            // Auto-resume re-calls the tool under a new id; ack the id the client saw suspended.
+            toolCallId: entry.toolCallId ?? inputData.toolCallId,
+            toolName: entry.toolName ?? inputData.toolName,
+            kind,
+            args: entry.args,
+            ...(kind === 'suspension' ? { suspendPayload: entry.suspendPayload } : {}),
+            resumeSchema: entry.resumeSchema,
+          },
+            ...(entry.metadata ? { metadata: entry.metadata } : {}),
+          },
+          // Fork: the resumed ack carries the cleared entry's args (and suspend
+          // payload), so it gets the same phase transform metadata as the
+          // approval/suspension chunk it answers.
+          kind === 'suspension' ? 'suspend' : 'approval',
+          kind === 'suspension' ? { suspendPayload: entry.suspendPayload } : undefined,
+        );
+        safeEnqueue(controller, resumedChunk);
       };
 
       // Helper function to flush messages before suspension
@@ -535,6 +582,18 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           logger?.error('Error flushing messages before suspension:', error);
         }
       };
+
+      // Recalled messages become refs only when memory is a fixed instance: a resume may not
+      // repeat the request context that function or inherited memory resolved against.
+      const serializeStreamStateForSuspend = () =>
+        dehydrateStreamState(
+          streamState.serialize(),
+          memoryMessageRefs,
+          readScoped(scopeCtx, FIXED_MEMORY_KEY, 'fixedMemory')
+            ? readScoped(scopeCtx, MEMORY_KEY, 'memory')
+            : undefined,
+          logger,
+        );
 
       // Provider-executed tools are handled entirely by the stream path
       // (tool-call and tool-result chunks in llm-execution-step), so skip client execution.
@@ -590,6 +649,9 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
       let approvalGrant: { approval: ToolApprovalGrant } | undefined;
       let verifiedApprovedArgs: Record<string, unknown> | undefined;
       let resumeTargetToolCallId: string | undefined;
+      // Fork: the authenticated resume retires its metadata before execution, so the later
+      // upstream #25491 ack sites read the entry cleared here.
+      let retiredResumeEntry: Record<string, any> | undefined;
       let resumedFromSuspension = false;
 
       try {
@@ -1238,9 +1300,15 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         }
 
         if (isApprovalResumeData) {
-          await removeToolMetadata({ toolCallId: metadataToolCallId, toolName: inputData.toolName }, 'approval');
+          retiredResumeEntry = await removeToolMetadata(
+            { toolCallId: metadataToolCallId, toolName: inputData.toolName },
+            'approval',
+          );
         } else if (isKnownSuspensionResume) {
-          await removeToolMetadata({ toolCallId: metadataToolCallId, toolName: inputData.toolName }, 'suspension');
+          retiredResumeEntry = await removeToolMetadata(
+            { toolCallId: metadataToolCallId, toolName: inputData.toolName },
+            'suspension',
+          );
         }
 
         // Only framework-persisted runs are applied here. A model-supplied run id
@@ -1372,6 +1440,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const approvalVerdicts = readScoped(scopeCtx, TOOL_APPROVAL_VERDICTS_KEY, 'toolApprovalVerdicts');
         const cachedApprovalRequirement = approvalVerdicts?.get(inputData.toolCallId);
         approvalVerdicts?.delete(inputData.toolCallId);
+        const approvalWorkspace = readScoped(scopeCtx, STEP_WORKSPACE_KEY, 'stepWorkspace');
         // Upstream #24763: reuse the scheduling evaluation (verdict AND its reasons) so a
         // possibly stateful policy runs exactly once per call.
         const approvalRequirement =
@@ -1383,7 +1452,8 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             // policy; resolveToolApprovalRequirement evaluates it (fail-safe true).
             requireToolApproval: requireToolApproval as RequireToolApproval | undefined,
             requestContext,
-            workspace: _internal?.stepWorkspace,
+            // Read through the run scope: a resume rebuilds `_internal` without step values.
+            workspace: approvalWorkspace,
             logger,
             toolName: inputData.toolName,
           }));
@@ -1464,7 +1534,6 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             .optional()
             .describe('Optional explanation for the decision, surfaced to the model when the tool call is declined'),
         });
-        const approvalSchema = toStandardSchema(approvalInputSchema);
         const toolGateApprovalSchema = toStandardSchema(
           supportsEditedApprovalArgs
             ? approvalInputSchema.extend({
@@ -1476,7 +1545,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         // The real suspension sequence, extracted so it has exactly one implementation with
         // two entry points: the tool's own `suspend()` closure below, and the hand-back of an
         // eager attempt that suspended at runtime. Defined here because it closes over
-        // `args`, `transformChunk`, `flushMessagesBeforeSuspension` and `approvalSchema`, and
+        // `args`, `transformChunk`, `flushMessagesBeforeSuspension` and `approvalResumeSchema`, and
         // called before approval gating so a handed-back call is never re-gated or re-run.
         const raiseToolSuspension = async (suspendPayload: any, options?: SuspendOptions): Promise<any> => {
           const delegatedSuspendedToolCallId =
@@ -1513,7 +1582,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   args: approvalArgs,
                   parentToolName: inputData.toolName,
                   parentArgs: inputData.args,
-                  resumeSchema: JSON.stringify(standardSchemaToJSONSchema(approvalSchema)),
+                  resumeSchema: approvalResumeSchema,
                 },
               },
               'approval',
@@ -1535,7 +1604,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               type: 'approval',
               approvalSource: 'tool-execution',
               suspendedToolRunId: options.runId,
-              resumeSchema: JSON.stringify(standardSchemaToJSONSchema(approvalSchema)),
+              resumeSchema: approvalResumeSchema,
               metadata: approvalChunk.metadata,
             });
 
@@ -1560,9 +1629,12 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   toolName: approvalToolName,
                   args: approvalArgs,
                 },
-                __streamState: streamState.serialize(),
+                __streamState: await serializeStreamStateForSuspend(),
                 __agentId: agentId,
                 ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
+                // Persisted unconditionally — [] included — so absence marks a pre-upgrade snapshot,
+                // whose resume adopts the supplied scopes instead of rejecting them.
+                __resolvedScopes: resolvedScopes ?? [],
                 // Persist the inner suspended run id in the workflow snapshot, partitioned per
                 // tool call (resumeLabel = toolCallId). Persisted message metadata exposes the
                 // same id as delegatedRunId for cold reloads, while the snapshot remains the
@@ -1622,9 +1694,12 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   ...(approvalGrant ?? {}),
                 },
                 toolCallSuspended: suspendPayload,
-                __streamState: streamState.serialize(),
+                __streamState: await serializeStreamStateForSuspend(),
                 __agentId: agentId,
                 ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
+                // Persisted unconditionally — [] included — so absence marks a pre-upgrade snapshot,
+                // whose resume adopts the supplied scopes instead of rejecting them.
+                __resolvedScopes: resolvedScopes ?? [],
                 toolCallId: metadataToolCallId,
                 toolName: inputData.toolName,
                 resumeLabel: options?.resumeLabel,
@@ -1656,6 +1731,23 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           // would suspend again instead of resuming. Fresh gated calls (no
           // resume at all) still suspend for approval here.
           if (!approvalDecision && !isAnyResume) {
+            // Upstream #26927: a per-tool beforeApproval hook may reject a fresh call before
+            // the approval gate. The tool never executes, so no grant is involved.
+            const rejection = await runBeforeApprovalHook({
+              tool,
+              input: args,
+              context: {
+                toolCallId: inputData.toolCallId,
+                toolName: inputData.toolName,
+                requestContext,
+                workspace: approvalWorkspace,
+                actor,
+              },
+              logger,
+            });
+            if (rejection) {
+              return { result: rejection.output, ...inputData };
+            }
             await stopGoalActivity({
               agentId,
               runId,
@@ -1713,16 +1805,25 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   args: inputData.args,
                   ...(approvalReasons.length > 0 ? { approvalReasons } : {}),
                 },
-                __streamState: streamState.serialize(),
+                __streamState: await serializeStreamStateForSuspend(),
                 __agentId: agentId,
                 ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
+                // Persisted unconditionally — [] included — so absence marks a pre-upgrade snapshot,
+                // whose resume adopts the supplied scopes instead of rejecting them.
+                __resolvedScopes: resolvedScopes ?? [],
               },
               {
                 resumeLabel: inputData.toolCallId,
               },
             );
           } else if (!isAnyResume) {
-            await removeToolMetadata({ toolCallId: metadataToolCallId, toolName: inputData.toolName }, 'approval');
+            // Remove approval metadata since we're resuming (either approved or declined)
+            const clearedApproval = await removeToolMetadata(
+              { toolCallId: metadataToolCallId, toolName: inputData.toolName },
+              'approval',
+            );
+            const ackedApproval = clearedApproval ?? retiredResumeEntry;
+            if (ackedApproval) await emitToolCallResumed(ackedApproval, 'approval');
 
             // Return the approval decision (not a `result` string) so it persists as
             // `state: 'output-denied'` with `approval`. The denial reason carries the
@@ -1787,6 +1888,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           messages: isAgentTool
             ? (readScoped(scopeCtx, STEP_MODEL_MESSAGES_KEY, 'stepModelMessages') ?? messageList.get.all.aiV5.model())
             : messageList.get.input.aiV5.model(),
+          getMessages: () => messageList.get.all.db(),
           outputWriter,
           // Pass current step span as parent for tool call spans
           tracingContext: modelSpanTracker?.getTracingContext(),
@@ -1803,7 +1905,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
             const sqm = readScoped(scopeCtx, SAVE_QUEUE_MANAGER_KEY, 'saveQueueManager');
             const tid = readScoped(scopeCtx, THREAD_ID_KEY, 'threadId');
             const mcfg = readScoped(scopeCtx, MEMORY_CONFIG_KEY, 'memoryConfig');
-            return sqm && tid ? () => sqm.flushMessages(messageList, tid, mcfg) : undefined;
+            return sqm && tid && !mcfg?.readOnly ? () => sqm.flushMessages(messageList, tid, mcfg) : undefined;
           })(),
           suspend: async (suspendPayload: any, options?: SuspendOptions) => {
             // A tool can suspend at runtime without declaring a suspend schema, so the
@@ -1963,11 +2065,12 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           // Single-target retirement: always retire the authenticated effective target established
           // before lookup. Never retire an independently resolved other call.
           const cleanupTarget = { toolCallId: metadataToolCallId, toolName: inputData.toolName };
-          if (cleanupTarget) {
-            await removeToolMetadata(
-              cleanupTarget,
-              resolvedSuspensionIdentity?.type ?? storedResumeMetadata?.type ?? 'suspension',
-            );
+          const cleanupType = resolvedSuspensionIdentity?.type ?? storedResumeMetadata?.type ?? 'suspension';
+          const clearedEntry = (await removeToolMetadata(cleanupTarget, cleanupType)) ?? retiredResumeEntry;
+          // Upstream #25491: model-supplied `resumeData` alone is not proof of a suspension;
+          // only ack a cleared entry.
+          if (clearedEntry) {
+            await emitToolCallResumed(clearedEntry, cleanupType);
           }
         }
 
@@ -2277,6 +2380,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                       );
                       emittedReplayedToolCalls.add(replayKey);
                     }
+
+                    // Awaited calls return their authoritative outcome through the
+                    // normal mapping step, which emits the terminal tool chunk.
+                    // Synthetic terminal chunks are only needed for deferred calls.
+                    if (info.disposition === 'awaited') return;
 
                     if (chunk.type === 'background-task-completed') {
                       safeEnqueue(

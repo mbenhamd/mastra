@@ -47,6 +47,7 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
     race: 'run-rollback-finalize-race',
     skipped: 'run-skipped',
     missing: 'run-missing',
+    deleted: 'run-deleted-stale-step',
   };
   const admissionFor = (runId: string): AdmitWorkflowResumeInput => ({
     workflowName: options.workflowName,
@@ -224,6 +225,29 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
     ).resolves.toEqual({ status: 'missing_run' });
     await expect(
       options.primary.loadWorkflowSnapshot({ workflowName: options.workflowName, runId: runIds.missing }),
+    ).resolves.toBeNull();
+
+    // PF-4385 tombstone: a late step write from an aborted or stale execution
+    // (generation-fenced, no resume operation) must not recreate a deleted run.
+    await options.primary.persistWorkflowSnapshot({
+      workflowName: options.workflowName,
+      runId: runIds.deleted,
+      resourceId,
+      snapshot: suspendedSnapshot(runIds.deleted, resourceId),
+    });
+    await options.primary.deleteWorkflowRunById({ workflowName: options.workflowName, runId: runIds.deleted });
+    await expect(
+      secondary.persistWorkflowStepUpdate({
+        workflowName: options.workflowName,
+        runId: runIds.deleted,
+        resourceId,
+        expectedExecutionGeneration: 'wfeg:atomic-resume-contract',
+        expectedLifecycleResumeAttempt: 0,
+        snapshot: { ...suspendedSnapshot(runIds.deleted, resourceId), status: 'running' },
+      }),
+    ).resolves.toEqual({ status: 'missing_run' });
+    await expect(
+      options.primary.loadWorkflowSnapshot({ workflowName: options.workflowName, runId: runIds.deleted }),
     ).resolves.toBeNull();
 
     const consumeInput = {

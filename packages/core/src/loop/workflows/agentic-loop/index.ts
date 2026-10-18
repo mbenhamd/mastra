@@ -3,12 +3,12 @@ import type { StepResult, ToolSet } from '@internal/ai-sdk-v5';
 import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../../agent/merge-execution-options';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../../error';
 import type { MastraDBMessage } from '../../../memory';
-import { InternalSpans } from '../../../observability';
+import { InternalSpans, resolveExportedSpanId, SpanType } from '../../../observability';
 import { safeEnqueue } from '../../../stream/base';
 import type { ChunkType } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
 import { createWorkflow as createDirectWorkflow, createEventedWorkflow } from '../../../workflows/create';
-import type { OutputWriter } from '../../../workflows/types';
+import type { OutputWriter, WorkflowStateTracingContext } from '../../../workflows/types';
 import type { RunScopeContext } from '../../run-scope-access';
 import { readScoped, writeScoped } from '../../run-scope-access';
 import { DELEGATION_BAILED_KEY, DRAIN_PENDING_SIGNALS_KEY, RESOURCE_ID_KEY, THREAD_ID_KEY } from '../../run-scope-keys';
@@ -77,7 +77,30 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
 
   const createWorkflow = process.env.MASTRA_EVENTED_EXECUTION === 'true' ? createEventedWorkflow : createDirectWorkflow;
 
-  return createWorkflow({
+  // Upstream #27149 (mirrors AgenticLoopBuilder.build): keep all resumed
+  // invocations under the initial agent run, not the generation that happened
+  // to be active when the internal workflow suspended. Only reuse the saved
+  // parent when this invocation actually resumed beneath it; an explicit caller
+  // tracing context can start a different lineage.
+  const currentSpan = rest.tracingContext?.currentSpan;
+  const agentSpan = currentSpan?.type === SpanType.AGENT_RUN ? currentSpan : currentSpan?.findParent(SpanType.AGENT_RUN);
+  let resumeTracingContext: WorkflowStateTracingContext | undefined;
+  if (agentSpan) {
+    const previousContext = rest.resumeContext?.snapshot?.tracingContext;
+    const continuesSavedLineage =
+      previousContext?.spanId &&
+      agentSpan.traceId === previousContext.traceId &&
+      agentSpan.getParentSpanId() === previousContext.spanId;
+    resumeTracingContext = continuesSavedLineage
+      ? { ...previousContext }
+      : {
+          traceId: agentSpan.traceId,
+          spanId: resolveExportedSpanId(agentSpan),
+          parentSpanId: agentSpan.getParentSpanId(),
+        };
+  }
+
+  const workflow = createWorkflow({
     id: 'agentic-loop',
     inputSchema: llmIterationOutputSchema,
     outputSchema: llmIterationOutputSchema,
@@ -185,6 +208,40 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           user: messageList.get.input.aiV5.model(),
           nonUser: messageList.get.response.aiV5.model(),
         };
+      }
+
+      // Upstream #25861: a signal replaces the physical request, not the logical step
+      // or its budget. The preempted request emits no step-finish, so MODEL_STEP stays
+      // open and the replacement request gets its own MODEL_INFERENCE under it.
+      if (typedInputData.stepResult?.signalPreempted) {
+        if (typedInputData.stepResult.reason !== 'abort') return typedInputData.stepResult.isContinued;
+        // Fork: the bailed preemption still reaches this predicate. A run abort that raced it
+        // ends the run (the step already reported `abort`) without completing the discarded
+        // request as a step: no step-finish and no completed-step callback, only the final
+        // iteration notice upstream #26345 gives every aborted run.
+        typedInputData.stepResult.isContinued = false;
+        if (rest.onIterationComplete && !typedInputData.backgroundTaskPending) {
+          try {
+            await rest.onIterationComplete({
+              iteration: accumulatedSteps.length + 1,
+              maxIterations: rest.maxSteps,
+              text: '',
+              toolCalls: [],
+              toolResults: [],
+              isFinal: true,
+              finishReason: 'abort',
+              runId,
+              threadId: readScoped(scopeCtx, THREAD_ID_KEY, 'threadId'),
+              resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),
+              agentId: rest.agentId,
+              agentName: rest.agentName || rest.agentId,
+              messages: messageList.get.all.db(),
+            });
+          } catch (error) {
+            rest.logger?.error('Error in onIterationComplete hook:', error);
+          }
+        }
+        return false;
       }
 
       if (pendingFeedbackStop) {
@@ -368,7 +425,11 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
               hasFinishedSteps = true;
             } else if (
               iterationResult.continue === true &&
-              (hasFinishedSteps || !typedInputData.stepResult?.isContinued)
+              (hasFinishedSteps || !typedInputData.stepResult?.isContinued) &&
+              // A processor tripwire or a run abort ends the run; the iteration hook cannot
+              // resume it (upstream #26345).
+              typedInputData.stepResult?.reason !== 'tripwire' &&
+              typedInputData.stepResult?.reason !== 'abort'
             ) {
               // Forced continuation from a FINISHED state (the model returned
               // stop, or a stop condition fired). Setting the flags alone is
@@ -503,6 +564,8 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
       return forcedResponseOnlyContinuation || (typedInputData.stepResult?.isContinued ?? false);
     })
     .commit();
+  workflow.__setResumeTracingContext(resumeTracingContext);
+  return workflow;
 }
 
 function unwrapToolResultOutput(output: unknown): unknown {

@@ -418,6 +418,7 @@ export class AgentsPG extends AgentsStorage {
 
   async create(input: { agent: StorageCreateAgentInput }): Promise<StorageAgentType> {
     const { agent } = input;
+    let draftInserted = false;
     try {
       const agentsTable = getTableName({ indexName: TABLE_AGENTS, schemaName: getSchemaName(this.#schema) });
       const now = new Date();
@@ -448,6 +449,7 @@ export class AgentsPG extends AgentsStorage {
           nowIso,
         ],
       );
+      draftInserted = true;
 
       // 2. Extract config fields from the flat input
       const { id: _id, authorId: _authorId, visibility: _visibility, metadata: _metadata, ...snapshotConfig } = agent;
@@ -476,18 +478,21 @@ export class AgentsPG extends AgentsStorage {
         updatedAt: now,
       };
     } catch (error) {
-      if (error instanceof MastraError) throw error;
-      // Best-effort cleanup to prevent orphaned draft records
-      try {
-        const agentsTable = getTableName({ indexName: TABLE_AGENTS, schemaName: getSchemaName(this.#schema) });
-        await this.#db.client.none(
-          `DELETE FROM ${agentsTable} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
-          [agent.id],
-        );
-      } catch {
-        // Ignore cleanup errors
+      // Best-effort cleanup, only for a draft this call inserted. If our INSERT failed
+      // (e.g. duplicate id), the row belongs to a concurrent creator and must be kept.
+      if (draftInserted) {
+        try {
+          const agentsTable = getTableName({ indexName: TABLE_AGENTS, schemaName: getSchemaName(this.#schema) });
+          await this.#db.client.none(
+            `DELETE FROM ${agentsTable} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
+            [agent.id],
+          );
+        } catch {
+          // Ignore cleanup errors
+        }
       }
 
+      if (error instanceof MastraError) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('PG', 'CREATE_AGENT', 'FAILED'),

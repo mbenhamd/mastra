@@ -159,3 +159,26 @@ export function wrapToolsWithHooks(
     Object.entries(tools).map(([toolName, tool]) => [toolName, wrapToolWithHooks(toolName, tool, hooks, metadata)]),
   );
 }
+
+/**
+ * Re-applies the hook binding an earlier execution segment wrapped `previous` with onto
+ * `replacement`, or removes any binding when `previous` carried none.
+ *
+ * A same-process resume replaces the step tools with the resuming call's tools (upstream
+ * #26686, so they close over the resume call's request context), but the suspended call
+ * belongs to the segment that produced it and keeps that segment's hooks. Fresh calls of the
+ * resumed segment are rebound to its own hooks when the next model step wraps its tools.
+ *
+ * @internal
+ */
+export function retainToolHookBinding(toolName: string, replacement: CoreTool, previous: CoreTool): CoreTool {
+  const previousState = (previous.execute as HookWrappedExecute | undefined)?.[TOOL_HOOK_WRAPPER_STATE];
+  const [unwrapped] = Object.values(unwrapToolsFromHooks({ [toolName]: replacement }));
+  if (!previousState || !unwrapped) return unwrapped ?? replacement;
+  return wrapToolWithHooks(
+    toolName,
+    unwrapped,
+    { beforeToolCall: previousState.beforeToolCall, afterToolCall: previousState.afterToolCall },
+    { agentId: previousState.agentId, agentName: previousState.agentName },
+  );
+}

@@ -371,6 +371,8 @@ const SKIP_HEADERS = [
   // Account metadata that should not end up in committed fixtures
   'openai-organization',
   'openai-project',
+  'anthropic-organization-id',
+  'anthropic-workspace-id',
 ];
 
 /**

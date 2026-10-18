@@ -20,12 +20,14 @@ import {
   convertFullStreamChunkToUIMessageStream,
 } from './helpers';
 import type { ToolAgentChunkType, ToolWorkflowChunkType, ToolNetworkChunkType } from './helpers';
+import type { WithTraceId } from './public-types';
 import {
   isAgentExecutionDataChunkType,
   isDataChunkType,
   isWorkflowExecutionDataChunkType,
   safeParseErrorObject,
   isMastraTextStreamChunk,
+  toUIDataChunk,
 } from './utils';
 
 type LanguageModelV2Usage = {
@@ -399,7 +401,7 @@ export function createAgentStreamToAISDKTransformer<OUTPUT>(
     sendFinish?: boolean;
     sendReasoning?: boolean;
     sendSources?: boolean;
-    messageMetadata?: (args: { part: any }) => unknown;
+    messageMetadata?: (args: { part: any; traceId?: string }) => unknown;
     onError?: (error: unknown) => string;
     includeSubAgentMetadata?: boolean;
   },
@@ -440,7 +442,9 @@ export function createAgentStreamToAISDKTransformer<OUTPUT>(
         part: p as any,
         sendReasoning,
         sendSources,
-        messageMetadataValue: p ? messageMetadata?.({ part: p as TextStreamPart<ToolSet> }) : undefined,
+        messageMetadataValue: p
+          ? messageMetadata?.({ part: p as TextStreamPart<ToolSet>, traceId: chunk.traceId })
+          : undefined,
         sendStart,
         sendFinish,
         responseMessageId: lastMessageId,
@@ -579,7 +583,7 @@ export function AgentStreamToAISDKTransformer<OUTPUT>({
   sendFinish?: boolean;
   sendReasoning?: boolean;
   sendSources?: boolean;
-  messageMetadata?: UIMessageStreamOptions<UIMessage>['messageMetadata'];
+  messageMetadata?: WithTraceId<UIMessageStreamOptions<UIMessage>['messageMetadata']>;
   onError?: UIMessageStreamOptions<UIMessage>['onError'];
   includeSubAgentMetadata?: boolean;
 }) {
@@ -610,7 +614,7 @@ export function AgentStreamToAISDKV6Transformer<OUTPUT>({
   sendFinish?: boolean;
   sendReasoning?: boolean;
   sendSources?: boolean;
-  messageMetadata?: UIMessageStreamOptionsV6<UIMessageV6>['messageMetadata'];
+  messageMetadata?: WithTraceId<UIMessageStreamOptionsV6<UIMessageV6>['messageMetadata']>;
   onError?: UIMessageStreamOptionsV6<UIMessageV6>['onError'];
   includeSubAgentMetadata?: boolean;
 }) {
@@ -1285,8 +1289,7 @@ export function transformWorkflow<OUTPUT>(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(output)}`,
           );
         }
-        const { type, data, id } = output;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(output);
       }
       return null;
     }
@@ -1298,13 +1301,7 @@ export function transformWorkflow<OUTPUT>(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(payload)}`,
           );
         }
-        const { type, data, id } = payload;
-
-        return {
-          type,
-          data,
-          ...(id !== undefined && { id }),
-        };
+        return toUIDataChunk(payload);
       }
       return null;
     }
@@ -1654,8 +1651,7 @@ export function transformNetwork(
           );
         }
 
-        const { type, data, id } = payload.payload;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(payload.payload);
       }
       if (isWorkflowExecutionDataChunkType(payload)) {
         if (!('data' in payload.payload)) {
@@ -1663,8 +1659,7 @@ export function transformNetwork(
             `UI Messages require a data property when using data- prefixed chunks \n ${JSON.stringify(payload)}`,
           );
         }
-        const { type, data, id } = payload.payload;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(payload.payload);
       }
 
       if (payload.type.startsWith('agent-execution-event-')) {
@@ -1765,8 +1760,7 @@ export function transformNetwork(
           );
         }
 
-        const { type, data, id } = payload;
-        return { type, data, ...(id !== undefined && { id }) };
+        return toUIDataChunk(payload);
       }
       return null;
     }

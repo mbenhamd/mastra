@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type { ActorSignal } from '@mastra/core/auth/ee';
 import type { RequestContext } from '@mastra/core/di';
 import { getErrorFromUnknown, MastraNonRetryableError } from '@mastra/core/error';
@@ -688,7 +688,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         (explicitNestedResume || (resumeRunId !== undefined && legacyNestedResumeOwned));
 
       if (isResume && resume) {
-        runId = resumeRunId ?? randomUUID();
+        runId = resumeRunId ?? globalThis.crypto.randomUUID();
         const workflowsStore = workflowsStoreForResume ?? (await this.mastra?.getStorage()?.getStore('workflows'));
         const snapshot: any =
           legacyNestedResumeSnapshot ??
@@ -979,7 +979,7 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         result = failedResult;
         // Compact nested failures carry the child run identifier beside the
         // workflow result so cancellation and resume stay scoped to it.
-        runId = failedResult.runId || randomUUID();
+        runId = failedResult.runId || globalThis.crypto.randomUUID();
       } else {
         // Log before flattening: Error objects don't survive snapshot
         // serialization (JSON.stringify(new Error('x')) is `{}`), so without
@@ -987,11 +987,16 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         this.logger?.error(
           `Nested workflow step ${step.id} failed: ` + (e instanceof Error ? (e.stack ?? e.message) : String(e)),
         );
-        // Fallback: if we can't get the result from error, construct a basic failed result
-        runId = runId! || randomUUID();
+        // Fallback: if we can't get the result from error, construct a basic failed result.
+        // The error is returned from the memoized step.run() below, so it must serialize
+        // with its message (a raw StepError would keep only `stepId` and `name`).
+        runId = runId! || globalThis.crypto.randomUUID();
+        // Upstream types this as a compact NestedWorkflowResult; the fork keeps the
+        // full WorkflowResult here, whose failed `error` is a plain Error.
+        const error: Error = getErrorFromUnknown(e, { serializeStack: true, fallbackMessage: 'Nested workflow failed' });
         result = {
           status: 'failed',
-          error: e instanceof Error ? e : new Error(String(e)),
+          error,
         } as WorkflowResult<any, any, any, any>;
       }
     }

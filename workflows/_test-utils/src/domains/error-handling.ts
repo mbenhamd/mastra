@@ -690,6 +690,12 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         }
 
         const persistSpy = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+        // Stores with fenced step updates persist step/terminal snapshots through
+        // persistWorkflowStepUpdate instead (PapersFlow fork lineage fencing).
+        const stepUpdateSpy =
+          typeof (workflowsStore as any).persistWorkflowStepUpdate === 'function'
+            ? vi.spyOn(workflowsStore as any, 'persistWorkflowStepUpdate')
+            : undefined;
 
         const entry = registry!['error-persist-without-stack']!;
         const { workflow, errorMessage } = entry;
@@ -698,10 +704,10 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         const result = await execute(workflow, {}, { runId });
 
         expect(result.status).toBe('failed');
-        expect(persistSpy).toHaveBeenCalled();
+        expect(persistSpy.mock.calls.length + (stepUpdateSpy?.mock.calls.length ?? 0)).toBeGreaterThan(0);
 
         // Find the last persist call with failed status
-        const persistCalls = persistSpy.mock.calls;
+        const persistCalls = [...persistSpy.mock.calls, ...((stepUpdateSpy?.mock.calls ?? []) as any[])];
         const failedCall = persistCalls.find((call: any) => call[0]?.snapshot?.status === 'failed');
 
         expect(failedCall).toBeDefined();
@@ -725,6 +731,7 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         expect(serialized).not.toContain('"stack"');
 
         persistSpy.mockRestore();
+        stepUpdateSpy?.mockRestore();
       },
     );
 
@@ -747,6 +754,12 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         }
 
         const persistSpy = vi.spyOn(workflowsStore, 'persistWorkflowSnapshot');
+        // Stores with fenced step updates persist step/terminal snapshots through
+        // persistWorkflowStepUpdate instead (PapersFlow fork lineage fencing).
+        const stepUpdateSpy =
+          typeof (workflowsStore as any).persistWorkflowStepUpdate === 'function'
+            ? vi.spyOn(workflowsStore as any, 'persistWorkflowStepUpdate')
+            : undefined;
 
         const entry = registry!['error-persist-mastra-error']!;
         const { workflow, errorMessage } = entry;
@@ -755,10 +768,10 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         const result = await execute(workflow, {}, { runId });
 
         expect(result.status).toBe('failed');
-        expect(persistSpy).toHaveBeenCalled();
+        expect(persistSpy.mock.calls.length + (stepUpdateSpy?.mock.calls.length ?? 0)).toBeGreaterThan(0);
 
         // Find the last persist call with failed status
-        const persistCalls = persistSpy.mock.calls;
+        const persistCalls = [...persistSpy.mock.calls, ...((stepUpdateSpy?.mock.calls ?? []) as any[])];
         const failedCall = persistCalls.find((call: any) => call[0]?.snapshot?.status === 'failed');
 
         expect(failedCall).toBeDefined();
@@ -782,6 +795,7 @@ export function createErrorHandlingTests(ctx: WorkflowTestContext, registry?: Wo
         expect(serialized).not.toContain('"stack"');
 
         persistSpy.mockRestore();
+        stepUpdateSpy?.mockRestore();
       },
     );
 

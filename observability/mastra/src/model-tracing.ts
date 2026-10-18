@@ -27,6 +27,7 @@ import type {
   PreparedModelRequestAggregateMetrics,
   PreparedModelRequestMetrics,
   ProviderUsageMeasurementState,
+  ModelSpanTrackerOptions,
   ModelStepInput,
   Span,
   TracingContext,
@@ -789,6 +790,30 @@ function extractStepInput(payload?: StepStartPayload): StepInputPreview {
 }
 
 /**
+ * Chunks that come from the model provider. The first one marks the response's
+ * first chunk, matching OTel's `gen_ai.response.time_to_first_chunk`. Everything
+ * else, such as lifecycle markers or `data-*` parts a processor writes before the
+ * model call, is Mastra's own and does not count.
+ */
+const MODEL_RESPONSE_CHUNK_TYPES = new Set<string>([
+  'response-metadata',
+  'raw',
+  'text-start',
+  'text-delta',
+  'reasoning-start',
+  'reasoning-delta',
+  'reasoning-file',
+  'tool-call-input-streaming-start',
+  'tool-call-delta',
+  'tool-call',
+  'source',
+  'file',
+  // Fork: structured-output chunks also count as first response content.
+  'object',
+  'object-result',
+]);
+
+/**
  * Manages MODEL_STEP and MODEL_CHUNK span tracking for streaming Model responses.
  *
  * Should be instantiated once per MODEL_GENERATION span and shared across
@@ -807,6 +832,15 @@ export class ModelSpanTracker {
   #completionStartTime?: Date;
   /** First provider content for the currently open inference only. */
   #currentInferenceCompletionStartTime?: Date;
+  /**
+   * True between a step's `step-start` and `step-finish` chunks, the window in which
+   * the provider responds. Chunks outside it, such as a `tool-call` replayed for a
+   * finished background task on resume, are Mastra's own and never start the clock.
+   * Durable runs wrap one step's provider stream at a time, so every chunk there counts.
+   */
+  #inModelResponse = false;
+  /** Set only by the agent's main loop; receives the first chunk's completionStartTime. */
+  #agentRunSpan?: Span<SpanType.AGENT_RUN>;
   #currentStepInputIsFinal: boolean = false;
   /** When true, step-finish chunks don't auto-close the step span (for durable execution) */
   #deferStepClose: boolean = false;
@@ -848,7 +882,7 @@ export class ModelSpanTracker {
   /** Whether the current step is expected to reach a provider boundary. */
   #currentStepInferenceApplicable: boolean = true;
 
-  constructor(modelSpan?: Span<SpanType.MODEL_GENERATION>) {
+  constructor(modelSpan?: Span<SpanType.MODEL_GENERATION>, options?: ModelSpanTrackerOptions) {
     this.#modelSpan = modelSpan;
     this.#requestContext = inheritedRequestContext(modelSpan);
     const modelAttributes = runSpanOperation(() => modelSpan?.attributes);
@@ -871,6 +905,7 @@ export class ModelSpanTracker {
       this.#preparedRequestAggregate.providerInferenceCount > 0 ||
       this.#providerUsageState === 'reported' ||
       this.#providerUsageState === 'provider_not_reported';
+    this.#agentRunSpan = options?.agentRunSpan;
   }
 
   /**
@@ -938,16 +973,27 @@ export class ModelSpanTracker {
   }
 
   /**
-   * Capture the completion start time (time to first token) when the first content chunk arrives.
+   * Record when the provider's first chunk arrived and copy that clock up the
+   * agent's own chain (inference → step → generation → agent run), first write
+   * wins at each level. Time to first chunk is derived later as
+   * `completionStartTime - startTime` on whichever span is being read.
    */
   #captureCompletionStartTime(): void {
     // Older callers may omit the explicit pre-dispatch startInference() call.
     // Open its bounded fallback before taking the timestamp so TTFT never
     // predates the inference span that owns it.
     if (!this.#currentInferenceSpan) this.#ensureStepAndInference();
+    if (this.#currentInferenceCompletionStartTime) return;
     const completionStartedAt = new Date();
     this.#completionStartTime ??= completionStartedAt;
-    this.#currentInferenceCompletionStartTime ??= completionStartedAt;
+    this.#currentInferenceCompletionStartTime = completionStartedAt;
+    for (const span of [this.#currentStepSpan, this.#modelSpan, this.#agentRunSpan]) {
+      runSpanOperation(() => {
+        if (span && !span.attributes?.completionStartTime) {
+          span.update({ attributes: { completionStartTime: completionStartedAt } });
+        }
+      });
+    }
   }
 
   /**
@@ -1077,13 +1123,19 @@ export class ModelSpanTracker {
             : {}),
           ...this.#preparedRequestAggregate,
           ...this.#providerOutcomeCounts,
-          completionStartTime: this.#completionStartTime,
+          // Durable execution ends the generation from a fresh tracker and passes the
+          // clock it carried through the loop state.
+          completionStartTime: this.#completionStartTime ?? spanOptions.attributes?.completionStartTime,
           usage: normalizedUsage,
           providerUsageState,
           ...(costContext === undefined ? {} : { costContext }),
         },
       });
     });
+  }
+
+  getCompletionStartTime(): Date | undefined {
+    return this.#completionStartTime;
   }
 
   /**
@@ -1184,8 +1236,9 @@ export class ModelSpanTracker {
     this.#deferredStepCloseRequested = false;
     this.#currentInferenceResponse = undefined;
     this.#hasNormalizedInferenceResponse = false;
-    // Reset chunk sequence for new step
+    // Reset chunk sequence and first-chunk clock for new step
     this.#chunkSequence = 0;
+    this.#currentInferenceCompletionStartTime = undefined;
   }
 
   /** End the active step without closing its generation. */
@@ -1391,6 +1444,7 @@ export class ModelSpanTracker {
           ...(ctx?.parameters !== undefined ? { parameters: ctx.parameters } : {}),
           ...(ctx?.providerOptions !== undefined ? { providerOptions: ctx.providerOptions } : {}),
           ...(ctx?.availableTools !== undefined ? { availableTools: ctx.availableTools } : {}),
+          ...(ctx?.tools !== undefined ? { tools: ctx.tools } : {}),
           ...(ctx?.toolChoice !== undefined ? { toolChoice: ctx.toolChoice } : {}),
           ...(ctx?.responseFormat !== undefined ? { responseFormat: ctx.responseFormat } : {}),
         },
@@ -1523,6 +1577,39 @@ export class ModelSpanTracker {
   }
 
   /**
+   * End the open MODEL_INFERENCE span as interrupted while keeping MODEL_STEP open,
+   * so a replacement request for the same step gets its own inference span.
+   */
+  interruptInference(): void {
+    this.#endChunkSpan();
+    const inferenceSpan = this.#currentInferenceSpan;
+    if (!inferenceSpan && !this.#currentInferenceLifecycleOpen) return;
+    const completionStartTime = this.#currentInferenceCompletionStartTime;
+    const inferenceResponse = this.#currentInferenceResponse;
+    this.#currentInferenceSpan = undefined;
+    this.#currentInferenceCompletionStartTime = undefined;
+    this.#currentInferenceResponse = undefined;
+    this.#hasNormalizedInferenceResponse = false;
+    this.#pendingInferenceFinishPayload = undefined;
+    this.#pendingInferenceEndTime = undefined;
+    // Mastra abandoned this provider attempt for a replacement request in the
+    // same step: close the lifecycle as aborted and keep usage fail-closed,
+    // but leave the step and generation open.
+    this.#recordProviderOutcome('abort');
+    this.#providerUsageState = 'provider_not_reported';
+    runSpanOperation(() =>
+      inferenceSpan?.end({
+        attributes: {
+          finishReason: 'interrupted',
+          ...(completionStartTime === undefined ? {} : { completionStartTime }),
+          ...inferenceResponse,
+        },
+      }),
+    );
+    runSpanOperation(() => this.#modelSpan?.update({ attributes: { providerUsageState: this.#providerUsageState } }));
+  }
+
+  /**
    * Update the current step span with additional payload data.
    * Called when step-start chunk arrives with request/warnings info.
    */
@@ -1636,7 +1723,9 @@ export class ModelSpanTracker {
       // Remove verbose/redundant fields from metadata.
       const cleanMetadata = metadata ? { ...metadata } : undefined;
       if (cleanMetadata) {
-        for (const key of ['request', 'id', 'timestamp', 'modelId', 'modelVersion', 'modelProvider']) {
+        // `body` is the raw provider HTTP response body; it duplicates output/usage and can be very
+        // large. `headers` is intentionally kept (provider request IDs, rate-limit info).
+        for (const key of ['request', 'body', 'id', 'timestamp', 'modelId', 'modelVersion', 'modelProvider']) {
           delete cleanMetadata[key];
         }
       }
@@ -2075,17 +2164,16 @@ export class ModelSpanTracker {
         transform: (chunk, controller) => {
           const providerObservedAt = this.#takeProviderChunkTimestamp(chunk);
           this.#markProviderObserved(chunk);
-          // Capture completion start time on first actual content (for time-to-first-token)
+          // Capture completion start time on the provider's first response chunk
+          // (time to first chunk). Chunks outside a step's provider window are
+          // Mastra's own and never start the clock.
           runSpanOperation(() => {
-            switch (chunk.type) {
-              case 'text-delta':
-              case 'tool-call-delta':
-              case 'tool-call':
-              case 'reasoning-delta':
-              case 'object':
-              case 'object-result':
-                this.#captureCompletionStartTime();
-                break;
+            // The fork's explicit pre-dispatch startInference() also opens that window.
+            if (
+              (this.#inModelResponse || this.#deferStepClose || this.#currentInferenceLifecycleOpen) &&
+              MODEL_RESPONSE_CHUNK_TYPES.has(chunk.type)
+            ) {
+              this.#captureCompletionStartTime();
             }
           });
 
@@ -2117,6 +2205,7 @@ export class ModelSpanTracker {
                 break;
 
               case 'step-start':
+                this.#inModelResponse = true;
                 // If step already started (via startStep()), just update with payload data
                 // Otherwise start a new step (for backwards compatibility)
                 if (this.#currentStepSpan) {
@@ -2134,6 +2223,7 @@ export class ModelSpanTracker {
                 break;
 
               case 'step-finish':
+                this.#inModelResponse = false;
                 if (this.#deferStepClose) {
                   // Durable mode: save payload for later, don't close the step.
                   // Close MODEL_INFERENCE eagerly though - the provider stream is

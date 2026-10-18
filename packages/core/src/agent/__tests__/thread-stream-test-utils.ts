@@ -60,10 +60,20 @@ export class LeasePubSub extends PubSub implements LeaseProvider {
     }
     // Real backends assign each published event its own transport id, stable
     // across replay; consumers that dedupe redeliveries by id rely on that.
-    const stamped = { ...event, id: `evt-${++this.#nextEventId}`, createdAt: event.createdAt ?? new Date() };
+    // A caller-supplied id is kept (upstream #25764).
+    const stamped = {
+      ...event,
+      id: event.id ?? `evt-${++this.#nextEventId}`,
+      createdAt: event.createdAt ?? new Date(),
+    };
     if (this.retain) this.#retained.set(topic, [...(this.#retained.get(topic) ?? []), stamped]);
     for (const subscriber of [...(this.#subscribers.get(topic) ?? [])]) {
       await this.#deliver(topic, stamped, subscriber);
+    }
+  }
+  async redeliver(topic: string, event: any): Promise<void> {
+    for (const subscriber of [...(this.#subscribers.get(topic) ?? [])]) {
+      await this.#deliver(topic, event, subscriber);
     }
   }
   override async trimTopic(

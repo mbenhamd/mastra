@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { RequestContext } from '@mastra/core/di';
 import type {
   CommandResult,
@@ -15,6 +17,7 @@ import {
   MastraSandbox,
   ProcessHandle,
   UnsupportedStdinCloseError,
+  SandboxError,
   SandboxNotReadyError,
   SandboxProcessManager,
 } from '@mastra/core/workspace';
@@ -63,6 +66,15 @@ export interface PlatformSandboxOptions extends Omit<MastraSandboxOptions, 'proc
   id?: string;
   environmentId?: string;
   sandboxId?: string;
+  /**
+   * What `start()` does when `sandboxId` is set but the platform reports that
+   * sandbox is gone (404, 410, or a destroyed record).
+   *
+   * - `'best-effort'` (default): provision a replacement sandbox.
+   * - `'required'`: throw a `SandboxError` with code `SANDBOX_REATTACH_FAILED`
+   *   instead of provisioning, so the caller can surface the lost VM.
+   */
+  reattach?: 'best-effort' | 'required';
   /** Boot-only fallback checkpoint for a fresh sandbox whose primary recovery key has no state. */
   seedCheckpointName?: string;
   /**
@@ -428,6 +440,17 @@ export class PlatformSandbox extends MastraSandbox {
    */
   templatePending?: SandboxTemplatePending;
 
+  /**
+   * The platform's id for the provisioned sandbox, as returned by the create
+   * or reattach response. Persist this to reattach later via the `sandboxId`
+   * option. Undefined until the sandbox has been started in this process; a
+   * `sandboxId` passed to the constructor is only a hint for `start()` and is
+   * not reported here until the proxy confirms it.
+   */
+  get sandboxId(): string | undefined {
+    return this.status === 'running' ? this._sandboxId : undefined;
+  }
+
   private readonly _client: PlatformClient;
   private readonly _usesProviderRoutes: boolean;
   private readonly _sandboxProviderExplicit: boolean;
@@ -437,6 +460,9 @@ export class PlatformSandbox extends MastraSandbox {
   private _sandboxGeneration = 0;
   /** Last VM associated with the recovery key; retained across stop() for a later destroy(). */
   private _checkpointTarget?: SandboxIdentity;
+  /** Whether the current teardown already ran destroy()'s checkpoint and VM release. */
+  private _destroyWorkDone = false;
+  private readonly _reattach: 'best-effort' | 'required';
   private readonly _seedCheckpointName?: string;
   private _templateDefinition?: SerializedSandboxTemplate;
   private _templateBuildEnvs?: Record<string, string>;
@@ -538,6 +564,7 @@ export class PlatformSandbox extends MastraSandbox {
       this._sandboxGeneration = 1;
       this._checkpointTarget = { sandboxId: options.sandboxId, generation: this._sandboxGeneration };
     }
+    this._reattach = options.reattach ?? 'best-effort';
     this._seedCheckpointName = options.seedCheckpointName;
     this._usesProviderRoutes = options.template !== undefined;
     this._template = options.template;
@@ -577,6 +604,21 @@ export class PlatformSandbox extends MastraSandbox {
       this._addressRegistry?.delete(previousSandboxId);
     }
     return identity;
+  }
+
+  private _failIfReattachRequired(reason: string, cause?: unknown): void {
+    if (this._reattach !== 'required') return;
+    throw new SandboxError(
+      `Platform sandbox ${this._sandboxId} could not be reattached (${reason}); refusing to provision a replacement because reattach is 'required'. Clear the persisted sandboxId to start a fresh sandbox.`,
+      'SANDBOX_REATTACH_FAILED',
+      {
+        provider: 'platform',
+        sandboxId: this._sandboxId,
+        logicalId: this.id,
+        reason,
+        ...(cause !== undefined && { cause }),
+      },
+    );
   }
 
   private _request(path: string, options: PlatformRequestOptions = {}): Promise<Response> {
@@ -620,6 +662,7 @@ export class PlatformSandbox extends MastraSandbox {
       fetch: this._client.fetch,
       environmentId: this._environmentId,
       ...(options.sandboxId !== undefined && { sandboxId: options.sandboxId }),
+      reattach: this._reattach,
       ...(seedCheckpointName !== undefined && { seedCheckpointName }),
       ...(this._template !== undefined && { template: this._template }),
       idleTimeoutMinutes: options.idleTimeoutMinutes ?? this._idleTimeoutMinutes,
@@ -686,9 +729,14 @@ export class PlatformSandbox extends MastraSandbox {
           if (!this._teardownInFlight) this._teardownStarted = false;
           return { outcome: 'connected' };
         }
+        this._failIfReattachRequired('destroyed');
         this._clearDestroyedState(reattachIdentity);
       } catch (error) {
-        if (!(error instanceof PlatformApiError) || error.status !== 404) throw error;
+        // 404: the proxy never issued this id. 410: it did, and has since
+        // marked the record destroyed (idle GC, manual delete). Neither is
+        // reattachable; both fall through to a fresh provision.
+        if (!(error instanceof PlatformApiError) || (error.status !== 404 && error.status !== 410)) throw error;
+        this._failIfReattachRequired(String(error.status), error);
         this._clearDestroyedState(reattachIdentity);
       }
     }
@@ -793,6 +841,18 @@ export class PlatformSandbox extends MastraSandbox {
       mode,
       totalMs: Date.now() - startedAt,
       requestMs,
+      // Only a provision ran the template; on reattach the stored definition
+      // is whatever this instance provisioned earlier, not what is running.
+      ...(mode === 'provision' && this._templateDefinition
+        ? {
+            templateHash: templateHash(this._templateDefinition),
+            // `exact` means the proxy booted the requested build. `pending`
+            // means it booted a prior family build or the base image while
+            // that build runs; the proxy does not say which of the two.
+            templateBoot: this.templatePending ? 'pending' : 'exact',
+            ...(this.templatePending ? { pendingTemplateId: this.templatePending.templateId } : {}),
+          }
+        : {}),
     });
   }
 
@@ -940,17 +1000,19 @@ export class PlatformSandbox extends MastraSandbox {
   }
 
   /**
-   * Stop the sandbox while **preserving its recovery checkpoint**.
+   * Stop this process's use of the sandbox without touching the remote one.
    *
-   * Semantic parity with `@mastra/railway` `RailwaySandbox.stop()`: the VM
-   * is released but the on-provider checkpoint survives, so a subsequent
-   * `start()` on a sandbox constructed with the same `id` can restore from
-   * it. Any in-flight capture is awaited first so the preserved checkpoint
-   * reflects the latest disk state we asked for.
+   * Nothing is sent to workspace-proxy. The VM keeps running and idles out
+   * under the environment's own idle policy, the recovery checkpoint stays,
+   * and `_sandboxId` is kept so a later `start()` on this instance, or on a
+   * new instance constructed with the same `id` or `sandboxId`, reattaches
+   * instead of provisioning. `Mastra.shutdown()` stops every registered
+   * workspace on SIGINT; releasing the VM here would destroy every live
+   * session on a host restart. Use {@link destroy} to release the VM and
+   * its checkpoint.
    *
-   * Corresponds to `DELETE /v1/:provider/projects/:pid/sandbox/:sandboxId` on
-   * workspace-proxy, which by contract does not touch the checkpoint. Use
-   * {@link destroy} when you want the checkpoint released too.
+   * Any in-flight capture is awaited first so the checkpoint reflects the
+   * latest disk state the caller asked for.
    */
   async stop(): Promise<void> {
     return this._beginTeardown('stop');
@@ -993,6 +1055,11 @@ export class PlatformSandbox extends MastraSandbox {
         if (!baseLifecycleOwnsStatus) this.status = 'destroying';
 
         const promotedPromise = this._teardownInFlight
+          .then(async () => {
+            // stop() keeps the VM and checkpoint, and usually finishes before a
+            // promoting destroy() observes it. Release whatever it retained.
+            if (!this._destroyWorkDone) await this._releaseForDestroy();
+          })
           .then(
             () => {
               if (!baseLifecycleOwnsStatus) this.status = 'pending';
@@ -1013,6 +1080,7 @@ export class PlatformSandbox extends MastraSandbox {
 
     this._teardownIntent = intent;
     this._teardownStarted = true;
+    this._destroyWorkDone = false;
     if (!baseLifecycleOwnsStatus) this.status = expectedStatus;
 
     const teardownPromise = this._performTeardown()
@@ -1064,22 +1132,33 @@ export class PlatformSandbox extends MastraSandbox {
       }
     }
 
-    let checkpointDeleted = false;
-    if (this._teardownIntent === 'destroy' && this._checkpointTarget) {
-      const checkpointTarget = this._checkpointTarget;
-      await this._deleteRecoveryCheckpoint(checkpointTarget);
-      checkpointDeleted = true;
+    if (this._teardownIntent === 'destroy') {
+      await this._releaseForDestroy();
+    } else {
+      // stop() keeps the remote VM (upstream #26488): it idles out under the
+      // environment's policy and a later start() reattaches by `_sandboxId`.
+      // Drop only what is tied to this process: the sidecar probe and the exec
+      // lease. The next start() re-populates both from the proxy's response.
+      this._probeGeneration++;
+      this._probeTarget = null;
+      this._transportReadyPromise = null;
+      this._lease = null;
     }
 
+    // If destroy promoted a stop while the branch above was still awaiting,
+    // it observed `stop`. Release the retained checkpoint and VM now rather
+    // than silently downgrading destroy to stop.
+    if (this._teardownIntent === 'destroy' && !this._destroyWorkDone) {
+      await this._releaseForDestroy();
+    }
+  }
+
+  /** destroy()'s release: the recovery checkpoint first, then the VM. */
+  private async _releaseForDestroy(): Promise<void> {
+    this._destroyWorkDone = true;
+    if (this._checkpointTarget) await this._deleteRecoveryCheckpoint(this._checkpointTarget);
     const activeIdentity = this._currentIdentity();
     if (activeIdentity) await this._teardownSandbox(activeIdentity);
-
-    // If destroy promoted a stop while the VM DELETE was already in flight,
-    // the pre-delete branch above observed `stop`. Release the retained
-    // checkpoint now rather than silently downgrading destroy to stop.
-    if (this._teardownIntent === 'destroy' && !checkpointDeleted && this._checkpointTarget) {
-      await this._deleteRecoveryCheckpoint(this._checkpointTarget);
-    }
   }
 
   private async _deleteRecoveryCheckpoint(target: SandboxIdentity): Promise<void> {
@@ -1110,12 +1189,9 @@ export class PlatformSandbox extends MastraSandbox {
   /**
    * Release the remote sandbox VM and clear the local state pointing at it.
    *
-   * Shared body of {@link stop} and {@link destroy} — both funnel through
-   * here after they've dealt with the checkpoint (preserve vs release).
-   * The VM DELETE is safe to issue in either mode: the proxy's DELETE
-   * route does not touch the checkpoint on its own, so `stop()` correctly
-   * leaves the checkpoint intact and `destroy()` has already removed it
-   * before this call.
+   * Body of {@link destroy}, called after the checkpoint has been released.
+   * The proxy's DELETE route releases the VM (on E2B that kills it), so
+   * only destroy() may reach here; stop() never does.
    */
   private async _teardownSandbox(identity: SandboxIdentity): Promise<void> {
     const destroyedSandboxId = identity.sandboxId;
@@ -1682,7 +1758,12 @@ export class PlatformSandbox extends MastraSandbox {
   }
 
   async getInfo(): Promise<SandboxInfo> {
-    if (!this._sandboxId) {
+    // Before this process has started the sandbox, `_sandboxId` is at best a
+    // caller-supplied hint for `start()` to reattach by. Asking the proxy
+    // about it here would surface a 404 for a hint the proxy does not know
+    // (and the workspace tools call `getInfo()` before their first exec),
+    // where `start()` would have fallen through to a fresh provision.
+    if (!this._sandboxId || this.status !== 'running') {
       return {
         id: this.id,
         name: this.name,
@@ -1744,4 +1825,16 @@ export class PlatformSandbox extends MastraSandbox {
     if (typeof this._instructionsOverride === 'string') return this._instructionsOverride;
     return defaultInstructions;
   }
+}
+
+/**
+ * Diagnostic fingerprint of the serialized template a sandbox was provisioned
+ * with: the same definition (repositories, pinned heads, setup commands,
+ * resources) hashes the same on warm and cold boots. `family` is excluded, as
+ * in the server's exact-content identity. Not the server's cache digest, which
+ * also normalizes resources.
+ */
+function templateHash(definition: SerializedSandboxTemplate): string {
+  const { family: _family, ...content } = definition;
+  return createHash('sha256').update(JSON.stringify(content)).digest('hex').slice(0, 16);
 }

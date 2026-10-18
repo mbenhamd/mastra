@@ -36,7 +36,7 @@
  * ```
  */
 
-import type { Agent, AgentExecutionOptions } from '@mastra/core/agent';
+import type { Agent, AgentExecutionOptions, StructuredOutputOptions } from '@mastra/core/agent';
 import {
   AGENT_STREAM_TOPIC,
   agentThreadStreamRuntime,
@@ -54,6 +54,8 @@ import {
   TOOL_PERMISSION_POLICY_KEY,
   TOOL_PERMISSION_POLICY_REQUIRED_KEY,
   snapshotDurableRequestContextEntries,
+  getRunRegistryEntry,
+  normalizeResumeGenerateArgs,
 } from '@mastra/core/agent/durable';
 import type {
   AgentStepFinishEventData,
@@ -64,11 +66,13 @@ import type {
 import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import type { MastraServerCache } from '@mastra/core/cache';
+import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { CachingPubSub, isRunLocalTopic } from '@mastra/core/events';
 import type { Event, EventCallback, PubSub, SubscribeOptions } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import type { MastraModelOutput, ChunkType, FullOutput, MastraOnFinishCallback } from '@mastra/core/stream';
+import { deepMerge } from '@mastra/core/utils';
 import type { ShouldPersistSnapshotFn, Workflow } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
@@ -82,6 +86,7 @@ import {
   createInngestDurableAgenticWorkflow,
   createInngestDurableAgenticWorkflowIds,
 } from './create-inngest-agentic-workflow';
+import { keepSuspendedRunScopes } from './resume-scopes';
 
 /**
  * Internal sentinel used by {@link InngestAgent.generate} and
@@ -148,6 +153,19 @@ const STREAM_CLEANUP = Symbol('mastra.durable.inngest.streamCleanup');
 
 const RESUME_SNAPSHOT_WAIT_MS = 10_000;
 const RESUME_SNAPSHOT_POLL_MS = 100;
+
+/**
+ * Merges the wrapped agent's `defaultOptions` under the call options, matching
+ * core `DurableAgent`, so lifecycle callbacks configured as defaults fire unless
+ * the caller overrides them.
+ */
+async function withDefaultOptions<T extends { requestContext?: AgentExecutionOptions<any>['requestContext'] }>(
+  agent: Agent<any, any, any>,
+  options: T | undefined,
+): Promise<T> {
+  const defaults = await agent.getDefaultOptions({ requestContext: options?.requestContext });
+  return deepMerge((defaults ?? {}) as Record<string, unknown>, (options ?? {}) as Record<string, unknown>) as T;
+}
 
 // =============================================================================
 // Types
@@ -304,7 +322,7 @@ export interface InngestAgentStreamOptions<OUTPUT = undefined> {
   /** Callback when chunk is received */
   onChunk?: (chunk: ChunkType<OUTPUT>) => void | Promise<void>;
   /** Callback when step finishes */
-  onStepFinish?: (result: AgentStepFinishEventData) => void | Promise<void>;
+  onStepFinish?: (result: AgentStepFinishEventData & { runId: string }) => void | Promise<void>;
   /** Callback when execution finishes */
   onFinish?: MastraOnFinishCallback<OUTPUT>;
   /** Callback on error */
@@ -411,7 +429,7 @@ export interface InngestAgentResumeOptions<OUTPUT = undefined> {
    */
   actor?: AgentExecutionOptions<OUTPUT>['actor'];
   onChunk?: (chunk: ChunkType<OUTPUT>) => void | Promise<void>;
-  onStepFinish?: (result: AgentStepFinishEventData) => void | Promise<void>;
+  onStepFinish?: (result: AgentStepFinishEventData & { runId: string }) => void | Promise<void>;
   onFinish?: MastraOnFinishCallback<OUTPUT>;
   onError?: ({ error }: { error: Error | string }) => void | Promise<void>;
   onSuspended?: (data: AgentSuspendedEventData) => void | Promise<void>;
@@ -507,12 +525,34 @@ export interface InngestAgent<TOutput = undefined> {
     options?: {
       offset?: number;
       onChunk?: (chunk: ChunkType<TOutput>) => void | Promise<void>;
-      onStepFinish?: (result: AgentStepFinishEventData) => void | Promise<void>;
+      onStepFinish?: (result: AgentStepFinishEventData & { runId: string }) => void | Promise<void>;
       onFinish?: MastraOnFinishCallback<TOutput>;
       onError?: ({ error }: { error: Error | string }) => void | Promise<void>;
       onSuspended?: (data: AgentSuspendedEventData) => void | Promise<void>;
     },
   ): Promise<Omit<InngestAgentStreamResult<TOutput>, 'threadId' | 'resourceId'> & { runId: string }>;
+
+  /**
+   * Not supported. Inngest owns durability for this agent (see the `retries`
+   * option), so Mastra never re-drives Inngest runs.
+   * Use {@link InngestAgent.observe} to reconnect to a running run's stream.
+   *
+   * @throws MastraError `INNGEST_AGENT_RECOVER_NOT_SUPPORTED` (HTTP 400)
+   */
+  recover(runId: string, options?: unknown): Promise<never>;
+
+  /**
+   * Not supported, for the same reason as {@link InngestAgent.recover}.
+   *
+   * @throws MastraError `INNGEST_AGENT_RECOVER_NOT_SUPPORTED` (HTTP 400)
+   */
+  listActiveRuns(options?: unknown): Promise<never>;
+
+  /**
+   * No-op. Inngest owns durability for its runs, so boot-time durable
+   * agent recovery has nothing to re-drive and skips Inngest agents.
+   */
+  recoverActiveRuns(options?: unknown): Promise<{ recovered: never[]; succeeded: number; failed: number }>;
 
   /**
    * Get the durable workflows required by this agent.
@@ -554,6 +594,11 @@ export interface InngestAgent<TOutput = undefined> {
    * {@link FullOutput}. Mirrors {@link DurableAgent.resumeGenerate} on top
    * of {@link InngestAgent.resume}.
    */
+  resumeGenerate(
+    resumeData: unknown,
+    options: InngestAgentResumeOptions<TOutput> & { runId: string },
+  ): Promise<FullOutput<TOutput>>;
+  /** @deprecated Use `resumeGenerate(resumeData, { runId, ...options })`, matching `Agent.resumeGenerate`. */
   resumeGenerate(
     runId: string,
     resumeData: unknown,
@@ -611,10 +656,37 @@ export interface InngestAgent<TOutput = undefined> {
   /** Get the active run id for a thread. Forwarded to the underlying Agent. */
   getActiveThreadRunId: Agent<any, any, TOutput>['getActiveThreadRunId'];
   /**
+   * Abort the thread's active run, including on the Inngest worker executing it.
+   * Returns `false` when there is no matching active run.
+   */
+  abortThreadStream: Agent<any, any, TOutput>['abortThreadStream'];
+  /** Abort a run by id, including on the Inngest worker executing it. */
+  abortRunStream: Agent<any, any, TOutput>['abortRunStream'];
+  /**
    * Resume a suspended durable run and return its streaming output. Routes
    * through {@link InngestAgent.resume}; requires `runId` in `streamOptions`.
    */
   resumeStream(resumeData: any, streamOptions?: any): Promise<MastraModelOutput<TOutput>>;
+  /**
+   * @deprecated Use `stream(messages, { untilIdle: true })` instead.
+   *
+   * Runs through the durable {@link InngestAgent.stream} with `untilIdle`, so
+   * every turn executes on Inngest.
+   */
+  streamUntilIdle(
+    messages: MessageListInput,
+    streamOptions?: InngestAgentStreamOptions<TOutput> & { maxIdleMs?: number },
+  ): Promise<InngestAgentStreamResult<TOutput>>;
+  /**
+   * @deprecated Use `resumeStream(resumeData, { runId, untilIdle: true })` instead.
+   *
+   * Runs through the durable {@link InngestAgent.resumeStream} with `untilIdle`;
+   * requires `runId` in `streamOptions`.
+   */
+  resumeStreamUntilIdle(
+    resumeData: any,
+    streamOptions?: { runId?: string; maxIdleMs?: number } & Record<string, any>,
+  ): Promise<MastraModelOutput<TOutput>>;
   /** Approve a pending tool call on a suspended durable run (via {@link InngestAgent.resumeStream}). */
   approveToolCall(
     options: { runId: string; toolCallId?: string } & Record<string, any>,
@@ -623,6 +695,12 @@ export interface InngestAgent<TOutput = undefined> {
   declineToolCall(
     options: { runId: string; toolCallId?: string; reason?: string } & Record<string, any>,
   ): Promise<MastraModelOutput<TOutput>>;
+  /**
+   * Approve or decline a pending tool call on a thread (used by Studio and the
+   * `send-tool-approval` route). Resolves the suspended run like the base Agent,
+   * then resumes it through the durable {@link InngestAgent.resumeStream}.
+   */
+  sendToolApproval: Agent<any, any, TOutput>['sendToolApproval'];
   /** Approve a pending tool call and drain the resumed run (via {@link InngestAgent.resumeGenerate}). */
   approveToolCallGenerate(
     options: { runId: string; toolCallId?: string } & Record<string, any>,
@@ -990,7 +1068,10 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     return localBinding;
   }
 
-  async function resolveSuspendedRuntimeBindingId(runId: string): Promise<string> {
+  async function resolveSuspendedRuntimeBindingId(
+    runId: string,
+    toolCallId?: string,
+  ): Promise<{ runtimeBindingId: string; snapshot: any }> {
     const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
     if (!workflowsStore) {
       throw new TypeError('Cannot resume Inngest durable-agent run: workflow storage is unavailable');
@@ -1004,10 +1085,15 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     // loop's finalize step persists the suspended snapshot. Wait (bounded) for
     // that write; the fence below still fails closed if the run never becomes
     // suspended. The fork's lifecycle-tuple fence may still reject a resume
-    // dispatched inside that window (tracked in PF-4629).
+    // dispatched inside that window (tracked in PF-4629). After a resume
+    // re-suspends, the stored snapshot is still the previous suspended one until
+    // the new suspension lands, so a named tool call also waits for its label
+    // (upstream #25158).
+    const isReady = (candidate: any) =>
+      candidate?.status === 'suspended' && (!toolCallId || !!candidate.resumeLabels?.[toolCallId]);
     let snapshot = await loadSnapshot();
     const deadline = Date.now() + RESUME_SNAPSHOT_WAIT_MS;
-    while (snapshot?.status !== 'suspended' && Date.now() < deadline) {
+    while (!isReady(snapshot) && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, RESUME_SNAPSHOT_POLL_MS));
       snapshot = await loadSnapshot();
     }
@@ -1018,7 +1104,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     if (typeof runtimeBindingId !== 'string' || runtimeBindingId.length === 0) {
       throw new TypeError(`Cannot resume Inngest durable-agent run ${runId}: runtime binding is unavailable`);
     }
-    return runtimeBindingId;
+    return { runtimeBindingId, snapshot };
   }
 
   /**
@@ -1057,6 +1143,36 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     }
   }
 
+  // Recovery re-drives a run from Mastra's persisted snapshot. Inngest drives
+  // these runs (re-invoking and replaying memoized steps when `retries` is
+  // configured), so doing it here would race Inngest.
+  const recoverNotSupportedError = (method: 'recover' | 'listActiveRuns') =>
+    new MastraError({
+      id: 'INNGEST_AGENT_RECOVER_NOT_SUPPORTED',
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.USER,
+      text: `InngestAgent.${method}() is not supported. Inngest owns durability for this agent: configure \`retries\` on createInngestAgent() to have Inngest re-invoke interrupted runs. Use observe(runId) to reconnect to a running run's stream.`,
+      details: { status: 400, agentId, method },
+    });
+
+  /**
+   * Stop `runId` wherever it is executing: the controller this process holds
+   * for it, if any, plus the abort request that reaches the Inngest step
+   * worker. Mirrors the `abort()` handed out with a stream result.
+   */
+  function abortDurableRun(runId: string): void {
+    const controller = getRunRegistryEntry(runId, mastra)?.abortController;
+    if (controller && !controller.signal.aborted) {
+      controller.abort(new Error('Aborted'));
+    }
+    // Abort requests are binding-scoped so a reused run ID cannot inherit a
+    // retained abort; resolve the run's binding first. Best-effort: the warning
+    // is recorded by requestRemoteAbort.
+    void resolveRuntimeBindingId(runId)
+      .then(runtimeBindingId => requestRemoteAbort(runId, runtimeBindingId))
+      .catch(() => {});
+  }
+
   // Return the InngestAgent object (Agent methods are added by the Proxy below)
   const inngestAgent: Pick<
     InngestAgent<TOutput>,
@@ -1070,13 +1186,21 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     | 'resume'
     | 'prepare'
     | 'observe'
+    | 'recover'
+    | 'listActiveRuns'
+    | 'recoverActiveRuns'
     | 'generate'
     | 'resumeGenerate'
     | 'resumeStream'
+    | 'streamUntilIdle'
+    | 'resumeStreamUntilIdle'
     | 'approveToolCall'
     | 'declineToolCall'
+    | 'sendToolApproval'
     | 'approveToolCallGenerate'
     | 'declineToolCallGenerate'
+    | 'abortThreadStream'
+    | 'abortRunStream'
     | '__fork'
     | 'getDurableWorkflows'
     | 'durableLoopWorkflowName'
@@ -1131,6 +1255,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       const requestContext = callerRequestContext ?? defaultOptions.requestContext;
       assertInngestResponseRecoveryDisabled(streamOptions);
       assertInngestResponseRecoveryDisabled(defaultOptions);
+      // Lifecycle callbacks configured as Agent defaults fire unless the caller
+      // overrides them (upstream #26533), from the same single resolution.
+      const callbackOptions = deepMerge(
+        (defaultOptions ?? {}) as Record<string, unknown>,
+        (streamOptions ?? {}) as Record<string, unknown>,
+      ) as InngestAgentStreamOptions<TOutput>;
 
       // 1. Prepare for durable execution
       const preparation = await prepareForDurableExecution<TOutput>({
@@ -1206,6 +1336,9 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           deleteBoundRunRegistryEntry(runId, runtimeBindingId, abortController);
         };
 
+        const closeStreamOnSuspend =
+          (streamOptions as any)?.[CLOSE_ON_SUSPEND] === true || streamOptions?.closeOnSuspend === true;
+
         // 2. Create the durable agent stream (subscribes to pubsub)
         const {
           output,
@@ -1222,38 +1355,39 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           },
           threadId,
           resourceId,
-          onChunk: streamOptions?.onChunk,
-          onStepFinish: streamOptions?.onStepFinish,
+          structuredOutput: registryEntry.structuredOutput as StructuredOutputOptions<TOutput> | undefined,
+          onChunk: callbackOptions.onChunk,
+          onStepFinish: callbackOptions.onStepFinish,
           onFinish: async result => {
             try {
-              await streamOptions?.onFinish?.(result);
+              await callbackOptions.onFinish?.(result);
             } finally {
               finalizeGlobalRegistry();
             }
           },
           onError: async errorArg => {
             try {
-              await streamOptions?.onError?.(errorArg);
+              await callbackOptions.onError?.(errorArg);
             } finally {
               finalizeGlobalRegistry();
             }
           },
-          onSuspended: streamOptions?.onSuspended,
+          onSuspended: callbackOptions.onSuspended,
           onAbort: async data => {
             try {
-              await (streamOptions?.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
+              await (callbackOptions.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
             } finally {
               finalizeGlobalRegistry();
             }
           },
-          onIterationComplete: streamOptions?.onIterationComplete
+          onIterationComplete: callbackOptions.onIterationComplete
             ? async data => {
-                await (streamOptions.onIterationComplete as (ctx: any) => void | Promise<void>)?.(data);
+                await (callbackOptions.onIterationComplete as (ctx: any) => void | Promise<void>)?.(data);
               }
             : undefined,
           // Honour upstream's public option as well as the fork's internal symbol:
           // generate()/resumeGenerate() now pass `closeOnSuspend: true`.
-          closeOnSuspend: (streamOptions as any)?.[CLOSE_ON_SUSPEND] === true || streamOptions?.closeOnSuspend === true,
+          closeOnSuspend: closeStreamOnSuspend,
         });
 
         initialStreamCleanup = streamCleanup;
@@ -1306,11 +1440,14 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
             if (releaseThreadReservation) break;
             await agentThreadStreamRuntime.waitForThreadRunReservation(threadStreamOptions, runtimePubSub, agentId);
           }
+          // A suspended run stays the thread's active run so a resume continues
+          // it on the thread feed (upstream #25759).
           const threadRegistration = agentThreadStreamRuntime.registerRun(
             proxyRef as unknown as Agent<any, any, any, any>,
             output,
             threadStreamOptions,
             runtimePubSub,
+            closeStreamOnSuspend ? undefined : { continuation: 'across-suspension' },
           );
           void threadRegistration?.catch(() => {});
         } catch (error) {
@@ -1425,6 +1562,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       let resumeSubscriptionReady = false;
       let resumeCancelledBeforeReady = false;
       let resumeDispatchStarted = false;
+      let callerOnlyResumeRejection = false;
       const rollbackResumeSetup = () => {
         if (resumeSetupRolledBack) return;
         resumeSetupRolledBack = true;
@@ -1450,7 +1588,10 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         }
       };
       try {
-        const runtimeBindingId = await resolveSuspendedRuntimeBindingId(runId);
+        const { runtimeBindingId, snapshot: suspendedSnapshot } = await resolveSuspendedRuntimeBindingId(
+          runId,
+          resumeOptions?.toolCallId,
+        );
         const resumePubsub = getPubsub();
 
         // Upstream #24813: settle the prior segment before taking its event
@@ -1460,6 +1601,22 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           /* errors already handled by the prior segment */
         });
         const resumeOffset = await getPubsubOffset(runId);
+
+        // Resolve defaults against the run's saved request context with the
+        // caller's values on top, matching core `DurableAgent.resume`, so dynamic
+        // defaults pick the same callbacks they did for the original run (upstream
+        // #26533). A resume in a fresh process has no registry entry, so the
+        // suspended snapshot supplies the saved context.
+        const savedRequestContext: Iterable<readonly [string, unknown]> =
+          getBoundRunRegistryEntry(runId, runtimeBindingId)?.requestContext?.entries() ??
+          Object.entries(suspendedSnapshot?.requestContext ?? {});
+        const callbackOptions = await withDefaultOptions(agent, {
+          ...resumeOptions,
+          requestContext: new RequestContext([
+            ...savedRequestContext,
+            ...(resumeOptions?.requestContext?.entries() ?? []),
+          ]),
+        });
 
         // Install a fresh abort controller scoped to the resumed segment and
         // attach it to the run-registry entry so the durable LLM step (when
@@ -1521,6 +1678,9 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           deleteBoundRunRegistryEntry(runId, runtimeBindingId, abortController);
         };
 
+        const closeResumeOnSuspend =
+          (resumeOptions as any)?.[CLOSE_ON_SUSPEND] === true || resumeOptions?.closeOnSuspend === true;
+
         // Re-subscribe to the stream
         const {
           output,
@@ -1538,34 +1698,39 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           },
           threadId: resumeOptions?.threadId,
           resourceId: resumeOptions?.resourceId,
-          onChunk: resumeOptions?.onChunk,
-          onStepFinish: resumeOptions?.onStepFinish,
+          structuredOutput: existingEntry.structuredOutput as StructuredOutputOptions<TOutput> | undefined,
+          onChunk: callbackOptions.onChunk,
+          onStepFinish: callbackOptions.onStepFinish,
           onFinish: async result => {
             try {
-              await resumeOptions?.onFinish?.(result);
+              await callbackOptions.onFinish?.(result);
             } finally {
               finalizeResumeRegistry();
             }
           },
           onError: async errorArg => {
             try {
-              await resumeOptions?.onError?.(errorArg);
+              await callbackOptions.onError?.(errorArg);
             } finally {
               finalizeResumeRegistry();
             }
           },
-          onSuspended: resumeOptions?.onSuspended,
+          onSuspended: callbackOptions.onSuspended,
           onAbort: async data => {
             try {
-              await (resumeOptions?.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
+              await (callbackOptions.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
             } finally {
               finalizeResumeRegistry();
             }
           },
           // Honour upstream's public option as well as the fork's internal symbol:
           // generate()/resumeGenerate() now pass `closeOnSuspend: true`.
-          closeOnSuspend: (resumeOptions as any)?.[CLOSE_ON_SUSPEND] === true || resumeOptions?.closeOnSuspend === true,
+          closeOnSuspend: closeResumeOnSuspend,
         });
+        const didThreadRunPublishTerminal = agentThreadStreamRuntime.captureThreadRunTerminalPublish(
+          runId,
+          agent.getPubSub(),
+        );
 
         const dispatch = ready.then(
           async () => {
@@ -1633,6 +1798,25 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
                     : { parentSpanId: suspendedTracingContext.spanId }),
                 }
               : undefined;
+            // A resumed run keeps the scopes it started with (upstream #26593).
+            // A rejection belongs to this caller only: the parked run stays
+            // resumable, so it is not published to the run's shared stream.
+            const resumeScopeEntries: Record<string, unknown> = {};
+            try {
+              keepSuspendedRunScopes(snapshot, resumeScopeEntries, resumeOptions);
+            } catch (error) {
+              callerOnlyResumeRejection = true;
+              throw error;
+            }
+            let resumeRequestContext = prepareResumeRequestContext(
+              resumeOptions?.requestContext,
+              resumeOptions?.requireToolPermissionPolicy,
+              snapshot.requestContext,
+            );
+            for (const [key, value] of Object.entries(resumeScopeEntries)) {
+              resumeRequestContext ??= new RequestContext();
+              resumeRequestContext.set(key, value);
+            }
             const run = (await admittedWorkflow.createRun({
               runId,
               resourceId: resumeOptions?.resourceId,
@@ -1641,11 +1825,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
             await run.resumeAsync({
               resumeData,
               step: steps,
-              requestContext: prepareResumeRequestContext(
-                resumeOptions?.requestContext,
-                resumeOptions?.requireToolPermissionPolicy,
-                snapshot.requestContext,
-              ),
+              requestContext: resumeRequestContext,
               // Generic workflows merge snapshot context. Durable agents replace
               // it with the independently allowlisted snapshot/fresh subset above
               // so pre-hardening snapshots can't reintroduce stored credentials.
@@ -1662,6 +1842,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         );
 
         const workflowExecution = dispatch.catch(async error => {
+          if (callerOnlyResumeRejection) return;
           await emitError(runId, error instanceof Error ? error : new Error(String(error))).catch(() => {});
         });
         void dispatch.finally(releaseResumeReservation).catch(() => {});
@@ -1676,6 +1857,45 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         } catch (error) {
           streamCleanup();
           throw error;
+        }
+
+        // Publish the resumed segment to the thread feed (upstream #25759):
+        // continue the thread's registered run, or register this segment when
+        // the original run is no longer tracked here.
+        const resumeMemory = (
+          resumeOptions as InngestAgentResumeOptions<TOutput> & {
+            memory?: AgentExecutionOptions<TOutput>['memory'];
+          }
+        )?.memory;
+        const thread = resumeOptions?.threadId ?? resumeMemory?.thread;
+        const resumeStreamOptions = {
+          ...(resumeOptions ?? {}),
+          runId,
+          ...(thread
+            ? {
+                memory: {
+                  ...(resumeMemory ?? {}),
+                  thread,
+                  resource: resumeMemory?.resource ?? resumeOptions?.resourceId,
+                },
+              }
+            : {}),
+        } as AgentExecutionOptions<TOutput>;
+        const continued = agentThreadStreamRuntime.continueRun(
+          proxyRef as unknown as Agent<any, any, any, any>,
+          output,
+          resumeStreamOptions,
+          agent.getPubSub(),
+        );
+        const terminalPublishedDuringDispatch = !closeResumeOnSuspend && didThreadRunPublishTerminal?.();
+        if (!continued && !terminalPublishedDuringDispatch) {
+          await agentThreadStreamRuntime.registerRun(
+            proxyRef as unknown as Agent<any, any, any, any>,
+            output,
+            resumeStreamOptions,
+            agent.getPubSub(),
+            closeResumeOnSuspend ? undefined : { continuation: 'across-suspension' },
+          );
         }
 
         const abort = async (reason?: unknown) => {
@@ -1757,6 +1977,18 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       };
     },
 
+    async recover() {
+      throw recoverNotSupportedError('recover');
+    },
+
+    async listActiveRuns() {
+      throw recoverNotSupportedError('listActiveRuns');
+    },
+
+    async recoverActiveRuns() {
+      return { recovered: [], succeeded: 0, failed: 0 };
+    },
+
     async observe(runId, observeOptions) {
       const runtimeBindingId = await resolveRuntimeBindingId(runId);
 
@@ -1775,6 +2007,9 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           version: 'v3',
         },
         offset: observeOptions?.offset,
+        structuredOutput: getRunRegistryEntry(runId, mastra)?.structuredOutput as
+          | StructuredOutputOptions<TOutput>
+          | undefined,
         onChunk: observeOptions?.onChunk,
         onStepFinish: observeOptions?.onStepFinish,
         onFinish: observeOptions?.onFinish,
@@ -1828,7 +2063,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         // snapshot has landed before returning — otherwise a follow-up
         // resumeGenerate() may race the storage write.
         if (suspended) {
-          await globalRunRegistry.get(result.runId)?.workflowExecution;
+          await getRunRegistryEntry(result.runId, mastra)?.workflowExecution;
         }
         if (!fullOutput.runId) {
           (fullOutput as { runId?: string }).runId = result.runId;
@@ -1848,10 +2083,15 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       }
     },
 
-    async resumeGenerate(runId, resumeData, resumeOptions): Promise<FullOutput<TOutput>> {
+    async resumeGenerate(...args: unknown[]): Promise<FullOutput<TOutput>> {
+      const {
+        runId,
+        resumeData,
+        options: resumeOptions,
+      } = normalizeResumeGenerateArgs<InngestAgentResumeOptions<TOutput>>(args);
       // `resumeGenerate` is a one-shot drain; strip `untilIdle` so the
       // underlying resume() never delegates to the idle-loop wrapper.
-      const { untilIdle, ...rest } = resumeOptions ?? {};
+      const { untilIdle, ...rest } = resumeOptions;
       void untilIdle;
       const result = await proxyRef!.resume(runId, resumeData, {
         ...rest,
@@ -1866,7 +2106,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         }
         suspended = fullOutput.finishReason === 'suspended';
         if (suspended) {
-          await globalRunRegistry.get(result.runId)?.workflowExecution;
+          await getRunRegistryEntry(result.runId, mastra)?.workflowExecution;
         }
         if (!fullOutput.runId) {
           (fullOutput as { runId?: string }).runId = result.runId;
@@ -1896,6 +2136,24 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       return result.output;
     },
 
+    // Without these, the Proxy forwards the deprecated shims to the wrapped
+    // Agent, which runs the idle loop in-process and never creates an Inngest run.
+    async streamUntilIdle(messages, streamOptions) {
+      const { maxIdleMs, ...options } = streamOptions ?? {};
+      return proxyRef!.stream(messages, {
+        ...options,
+        untilIdle: maxIdleMs === undefined ? true : { maxIdleMs },
+      });
+    },
+
+    async resumeStreamUntilIdle(resumeData, streamOptions) {
+      const { maxIdleMs, ...options } = streamOptions ?? {};
+      return proxyRef!.resumeStream(resumeData, {
+        ...options,
+        untilIdle: maxIdleMs === undefined ? true : { maxIdleMs },
+      });
+    },
+
     async approveToolCall(options) {
       return proxyRef!.resumeStream({ approved: true }, options);
     },
@@ -1905,12 +2163,195 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       return proxyRef!.resumeStream({ approved: false, ...(reason !== undefined ? { reason } : {}) }, resumeOptions);
     },
 
+    // The base Agent's sendToolApproval resumes through its in-process path,
+    // which looks up the snapshot under the non-durable workflow name.
+    async sendToolApproval(options) {
+      const {
+        threadId,
+        resourceId,
+        approved,
+        resumeData: customResumeData,
+        declineContext,
+        messages,
+        streamOptions,
+        ...executionOptions
+      } = options;
+
+      // Message continuations start a new turn; pass the durable wrapper so
+      // the runtime calls its stream() and tracks the turn under proxyRef.
+      if (messages && approved) {
+        const continuation = agentThreadStreamRuntime.continueWithMessages(
+          proxyRef as unknown as Agent<any, any, any, any>,
+          messages,
+          {
+            resourceId,
+            threadId,
+            runId: executionOptions.runId,
+            streamOptions: deepMerge(
+              (streamOptions ?? {}) as Record<string, any>,
+              executionOptions as Record<string, any>,
+            ) as AgentExecutionOptions<any>,
+          },
+          agent.getPubSub(),
+        );
+        return { accepted: continuation.accepted, runId: continuation.runId, toolCallId: options.toolCallId };
+      }
+
+      let runId = executionOptions.runId ?? agent.getActiveThreadRunId({ threadId, resourceId });
+      let suspendedRun: Awaited<ReturnType<typeof agent.listSuspendedRuns>>['runs'][number] | undefined;
+      if (!runId) {
+        // listSuspendedRuns also queries this agent's durableLoopWorkflowName.
+        let runs: Awaited<ReturnType<typeof agent.listSuspendedRuns>>['runs'] = [];
+        try {
+          ({ runs } = await agent.listSuspendedRuns({ threadId, resourceId }));
+        } catch (error) {
+          if (!(error instanceof MastraError) || error.id !== 'AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE') {
+            throw error;
+          }
+        }
+        const matchingRuns = options.toolCallId
+          ? runs.filter(run => run.toolCalls.some(toolCall => toolCall.toolCallId === options.toolCallId))
+          : runs;
+        if (matchingRuns.length > 1) {
+          throw new MastraError({
+            id: 'AGENT_SEND_TOOL_APPROVAL_AMBIGUOUS_SUSPENDED_RUNS',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.USER,
+            text:
+              `Agent "${agent.name}" sendToolApproval() found ${matchingRuns.length} suspended runs for thread "${threadId}". ` +
+              `Pass a toolCallId to disambiguate, or resume a specific run with approveToolCall()/declineToolCall() and an explicit runId.`,
+            details: {
+              threadId,
+              resourceId,
+              agentName: agent.name,
+              runIds: matchingRuns.map(run => run.runId).join(', '),
+            },
+          });
+        }
+        suspendedRun = matchingRuns[0];
+        runId = suspendedRun?.runId;
+      }
+
+      if (!runId) {
+        throw new MastraError({
+          id: 'AGENT_SEND_TOOL_APPROVAL_NO_ACTIVE_THREAD_RUN',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text:
+            `Agent "${agent.name}" sendToolApproval() could not find an active or suspended run for thread "${threadId}". ` +
+            `The run may have already completed or been resumed.`,
+          details: { threadId, resourceId, agentName: agent.name },
+        });
+      }
+
+      const inMemorySuspension = agentThreadStreamRuntime.getResumableThreadRunSuspension(
+        { threadId, resourceId, runId, toolCallId: options.toolCallId },
+        agent.getPubSub(),
+      );
+      if (!suspendedRun && !inMemorySuspension) {
+        let storageUnavailable = false;
+        const findTargetRun = async () => {
+          try {
+            const { runs } = await agent.listSuspendedRuns({ threadId, resourceId });
+            return runs.find(
+              run =>
+                run.runId === runId &&
+                (!options.toolCallId || run.toolCalls.some(toolCall => toolCall.toolCallId === options.toolCallId)),
+            );
+          } catch (error) {
+            if (error instanceof MastraError && error.id === 'AGENT_LIST_SUSPENDED_RUNS_NO_STORAGE') {
+              storageUnavailable = true;
+              return undefined;
+            }
+            throw error;
+          }
+        };
+
+        suspendedRun = await findTargetRun();
+        const deadline = Date.now() + RESUME_SNAPSHOT_WAIT_MS;
+        while (!suspendedRun && !storageUnavailable && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, RESUME_SNAPSHOT_POLL_MS));
+          suspendedRun = await findTargetRun();
+        }
+        if (!suspendedRun && !storageUnavailable) {
+          throw new MastraError({
+            id: 'AGENT_SEND_STREAM_RESUME_NO_SUSPENDED_THREAD_RUN',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.USER,
+            text: `Agent "${agent.name}" sendToolApproval() could not resolve suspended run "${runId}" before resuming it.`,
+            details: {
+              threadId,
+              resourceId,
+              runId,
+              agentName: agent.name,
+              ...(options.toolCallId ? { toolCallId: options.toolCallId } : {}),
+            },
+          });
+        }
+      }
+
+      const suspendedToolCall = options.toolCallId
+        ? suspendedRun?.toolCalls.find(toolCall => toolCall.toolCallId === options.toolCallId)
+        : suspendedRun?.toolCalls[0];
+      const approvalGated = inMemorySuspension
+        ? inMemorySuspension.kind === 'approval'
+        : suspendedToolCall?.requiresApproval === true;
+      const customResumeDataCanCarryApproval =
+        typeof customResumeData === 'object' && customResumeData !== null && !Array.isArray(customResumeData);
+      if (approvalGated && customResumeData !== undefined && !customResumeDataCanCarryApproval) {
+        throw new MastraError({
+          id: 'AGENT_SEND_TOOL_APPROVAL_INVALID_RESUME_DATA',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: `Agent "${agent.name}" sendToolApproval() requires custom resumeData to be a non-null object for an approval-gated tool call.`,
+          details: {
+            threadId,
+            resourceId,
+            runId,
+            agentName: agent.name,
+            ...(options.toolCallId ? { toolCallId: options.toolCallId } : {}),
+          },
+        });
+      }
+
+      const resumeData =
+        customResumeData !== undefined
+          ? approvalGated && customResumeDataCanCarryApproval
+            ? { ...customResumeData, ...(!approved && declineContext ? declineContext : {}), approved }
+            : customResumeData
+          : approved
+            ? { approved }
+            : { ...(declineContext ?? {}), approved };
+      const resumeOptions = deepMerge(
+        (streamOptions ?? {}) as Record<string, any>,
+        executionOptions as Record<string, any>,
+      );
+
+      await proxyRef!.resumeStream(resumeData, {
+        ...resumeOptions,
+        runId,
+        ...(options.toolCallId ? { toolCallId: options.toolCallId } : {}),
+        memory: {
+          ...(resumeOptions.memory ?? {}),
+          thread: resumeOptions.memory?.thread ?? threadId,
+          resource: resumeOptions.memory?.resource ?? resourceId,
+        },
+      });
+      return { accepted: true, runId, toolCallId: options.toolCallId };
+    },
+
     async approveToolCallGenerate(options) {
       const { runId, ...resumeOptions } = options;
       if (!runId) {
         throw new Error('approveToolCallGenerate() on InngestAgent requires a runId.');
       }
-      return proxyRef!.resumeGenerate(runId, { approved: true }, resumeOptions as InngestAgentResumeOptions<TOutput>);
+      return proxyRef!.resumeGenerate(
+        { approved: true },
+        {
+          ...(resumeOptions as InngestAgentResumeOptions<TOutput>),
+          runId,
+        },
+      );
     },
 
     async declineToolCallGenerate(options) {
@@ -1919,10 +2360,30 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         throw new Error('declineToolCallGenerate() on InngestAgent requires a runId.');
       }
       return proxyRef!.resumeGenerate(
-        runId,
         { approved: false, ...(reason !== undefined ? { reason } : {}) },
-        resumeOptions as InngestAgentResumeOptions<TOutput>,
+        { ...(resumeOptions as InngestAgentResumeOptions<TOutput>), runId },
       );
+    },
+
+    // The wrapped Agent's thread/run abort only reaches in-process state; an
+    // Inngest run executes on the step worker, which must be told to stop.
+    abortThreadStream(abortOptions) {
+      // Resolve the run before the base call: aborting releases the thread
+      // lease, after which the thread no longer has an active run to look up.
+      const runId = agent.getActiveThreadRunId(abortOptions);
+      const aborted = agent.abortThreadStream(abortOptions);
+      if (!aborted || !runId) return aborted;
+
+      abortDurableRun(runId);
+      return true;
+    },
+
+    abortRunStream(runId) {
+      const aborted = agent.abortRunStream(runId);
+      // Publish regardless of local knowledge: the run is normally executing
+      // on an Inngest worker this process cannot see.
+      abortDurableRun(runId);
+      return aborted || getRunRegistryEntry(runId, mastra) !== undefined;
     },
 
     __fork() {

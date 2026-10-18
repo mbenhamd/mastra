@@ -19,7 +19,7 @@ import type { Mastra } from '../../../mastra';
 import type { MastraMemory } from '../../../memory';
 import type { ProcessorStreamWriterOptions } from '../../../processors';
 import { createProcessorSendSignal } from '../../../processors/send-signal';
-import { RequestContext } from '../../../request-context';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../../request-context';
 import type { GoalObjectiveRecord } from '../../../storage/domains/thread-state/base';
 import type { ChunkType, GoalEvaluationActivity } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
@@ -36,6 +36,11 @@ export type GoalOutcome =
    * happened, so callers only need to flip `isContinued`.
    */
   | { evaluated: true; kind: 'budget-guard'; shouldContinue: false }
+  /**
+   * The objective was paused, cleared, or replaced while the judge ran. The
+   * verdict is discarded (nothing persisted, no signal sent) and the loop stops.
+   */
+  | { evaluated: true; kind: 'superseded'; shouldContinue: false }
   /**
    * The judge ran (or failed and was converted into a paused verdict). The
    * transcript gained the goal feedback signal and the response message id may
@@ -351,11 +356,21 @@ export async function evaluateGoal(deps: {
     // scorer needs it — a custom scorer brings its own judging, so we avoid
     // resolving (and potentially failing on) the judge model in that case.
     let scorer: MastraScorer<any, any, any, any> | undefined;
-    if (goal.scorer) {
+    if (typeof goal.scorer === 'string') {
+      // Match the scorer's id (or name) first, as documented, then fall back to
+      // the registration key.
+      const scorerRef = goal.scorer;
+      const registered = (mastra?.listScorers?.() ?? {}) as Record<string, MastraScorer<any, any, any, any>>;
+      const candidates = Object.values(registered);
       scorer =
-        typeof goal.scorer === 'string'
-          ? (mastra?.getScorer?.(goal.scorer as any) as MastraScorer<any, any, any, any> | undefined)
-          : goal.scorer;
+        candidates.find(s => s?.id === scorerRef) ??
+        candidates.find(s => s?.name === scorerRef) ??
+        registered[scorerRef];
+      if (!scorer) {
+        throw new Error(`Goal scorer "${scorerRef}" not found (matched by scorer id or registration key)`);
+      }
+    } else if (goal.scorer) {
+      scorer = goal.scorer;
     }
     if (!scorer) {
       // Resolve a bare model id (string) through the model router/gateways so
@@ -375,7 +390,15 @@ export async function evaluateGoal(deps: {
           ? ((await (goal.tools as (args: any) => unknown)({ requestContext, mastra })) as ToolsInput | undefined)
           : goal.tools;
       const goalId = record.id ?? `${threadId}:${record.startedAt}`;
-      const judgeRequestContext = requestContext ? new RequestContext(requestContext.entries()) : undefined;
+      // Drop the run's reserved memory IDs: they take precedence over the judge's
+      // own `defaultMemoryOptions` and would bind the judge to the parent thread.
+      const judgeRequestContext = requestContext
+        ? new RequestContext<unknown>(
+            [...requestContext.entries()].filter(
+              ([key]) => key !== MASTRA_THREAD_ID_KEY && key !== MASTRA_RESOURCE_ID_KEY,
+            ),
+          )
+        : undefined;
       scorer = createGoalScorer({
         mastra,
         judgeModel,
@@ -528,7 +551,7 @@ export async function evaluateGoal(deps: {
   // another iteration, surface a stale final chunk, or inject feedback for a
   // verdict that never landed.
   if (!commit?.applied) {
-    return { evaluated: true, kind: 'judged', shouldContinue: false, messageId: deps.messageId };
+    return { evaluated: true, kind: 'superseded', shouldContinue: false };
   }
   const { runsUsed, maxRuns, maxRunsReached, status, pausedReason } = commit;
 
@@ -578,12 +601,16 @@ export async function evaluateGoal(deps: {
   const continuation = shouldContinue
     ? `[Goal attempt ${runsUsed}/${maxRuns}] The goal is not yet complete. Judge feedback: ${feedback}\n\nContinue working toward the goal: ${record.objective}`
     : `${status} (${runsUsed}/${maxRuns})\n${goalEvaluationPayload.reason ?? ''}`;
-  await sendSignal({
-    type: 'system-reminder',
-    contents: continuation,
-    attributes: { type: 'goal-judge' },
-    metadata: { goalEvaluation: goalEvaluationPayload },
-  });
+  try {
+    await sendSignal({
+      type: 'system-reminder',
+      contents: continuation,
+      attributes: { type: 'goal-judge' },
+      metadata: { goalEvaluation: goalEvaluationPayload },
+    });
+  } catch {
+    // Best-effort — the signal is already in the transcript; only the transport write failed.
+  }
 
   // Emit the final goal chunk for external observers.
   try {

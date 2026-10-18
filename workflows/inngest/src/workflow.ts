@@ -1,5 +1,4 @@
-import { randomUUID } from 'node:crypto';
-import { AGENT_CONTROL_TOPIC, emitErrorEvent } from '@mastra/core/agent/durable';
+import { AGENT_CONTROL_TOPIC, DURABLE_STOP_WHEN_ERROR_ID, emitErrorEvent } from '@mastra/core/agent/durable';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import { RequestContext } from '@mastra/core/di';
 import { getErrorFromUnknown } from '@mastra/core/error';
@@ -60,8 +59,9 @@ export async function finalizeDurableAgentFailureTransport(
   pubsub: PubSub,
   input: { runId: string; runtimeBindingId?: string },
   error: Error,
+  delivery?: 'reject',
 ): Promise<void> {
-  await emitErrorEvent(pubsub, input.runId, error);
+  await emitErrorEvent(pubsub, input.runId, error, undefined, delivery);
   if (typeof input.runtimeBindingId === 'string' && input.runtimeBindingId.length > 0) {
     await pubsub.clearTopicOrThrow(AGENT_CONTROL_TOPIC(input.runId, input.runtimeBindingId));
   }
@@ -162,6 +162,46 @@ function lifecycleStepStatesEqual(
         right[coordinate]?.stepCallId === state.stepCallId && right[coordinate]?.stepAttempt === state.stepAttempt,
     )
   );
+}
+
+function durableAgentWorkflowError(error: unknown): { error: Error; delivery?: 'reject' } {
+  const serialized = error as {
+    code?: unknown;
+    id?: unknown;
+    name?: unknown;
+    message?: unknown;
+    stepId?: unknown;
+    details?: { name?: unknown; message?: unknown };
+    cause?: { name?: unknown; message?: unknown };
+  };
+  const isMarkedStopWhenError =
+    serialized?.code === DURABLE_STOP_WHEN_ERROR_ID || serialized?.id === DURABLE_STOP_WHEN_ERROR_ID;
+  // Inngest's serve transport serializes predicate failures as StepErrors and drops
+  // the MastraError id/details. Keep this prefix in sync with the memoized step id
+  // in create-inngest-agentic-workflow.ts; any failure in that step is classified
+  // as a stopWhen failure.
+  const isStopWhenStepError = typeof serialized?.stepId === 'string' && serialized.stepId.startsWith('stop-when-');
+  if (isMarkedStopWhenError || isStopWhenStepError) {
+    const normalized = new Error(
+      typeof serialized.details?.message === 'string'
+        ? serialized.details.message
+        : typeof serialized.cause?.message === 'string'
+          ? serialized.cause.message
+          : typeof serialized.message === 'string'
+            ? serialized.message
+            : 'Workflow execution failed',
+    );
+    normalized.name =
+      typeof serialized.details?.name === 'string'
+        ? serialized.details.name
+        : typeof serialized.cause?.name === 'string'
+          ? serialized.cause.name
+          : typeof serialized.name === 'string'
+            ? serialized.name
+            : 'Error';
+    return { error: normalized, delivery: 'reject' };
+  }
+  return { error: getErrorFromUnknown(error, { fallbackMessage: 'Workflow execution failed' }) };
 }
 
 /**
@@ -469,7 +509,7 @@ export class InngestWorkflow<
         'Inngest createRun({ pubsub }) is unsupported because remote function replicas cannot reconstruct a per-run PubSub object; set pubsubFactory on the workflow instead',
       );
     }
-    const runIdToUse = options?.runId || randomUUID();
+    const runIdToUse = options?.runId || globalThis.crypto.randomUUID();
     const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
     const existingSnapshot = (await workflowsStore?.loadWorkflowSnapshot({
       workflowName: this.id,
@@ -477,7 +517,7 @@ export class InngestWorkflow<
     })) as InngestWorkflowRunState | null | undefined;
     const resourceId = options?.resourceId ?? existingSnapshot?.resourceId;
     const persistedDisableScorers = existingSnapshot?.runOptions?.disableScorers;
-    const defaultPubsub = new InngestPubSub(this.inngest, this.id);
+    const defaultPubsub = new InngestPubSub(this.inngest, this.id, this.logger);
     const pubsub = this.lifecyclePubsub(defaultPubsub);
 
     // Return a new Run instance with object parameters
@@ -670,7 +710,7 @@ export class InngestWorkflow<
           // run. Warn rather than reject: an unnamed run is still a valid way to
           // start a workflow, it just can't be cancelled by id afterwards.
           runId = await step.run(`workflow.${this.id}.runIdGen`, async () => {
-            return randomUUID();
+            return globalThis.crypto.randomUUID();
           });
           this.logger.warn?.(
             `Workflow "${this.id}" was triggered without a runId, so run "${runId}" cannot be cancelled by id. ` +
@@ -895,7 +935,7 @@ export class InngestWorkflow<
         // Hosts (e.g. `createInngestAgent`) can override via `__setPubsubFactory` to
         // wrap this default - typically with a `CachingPubSub` so `observe()` can replay
         // cached history - without disturbing per-workflow channel isolation.
-        const defaultPubsub = new InngestPubSub(this.inngest, this.id);
+        const defaultPubsub = new InngestPubSub(this.inngest, this.id, this.logger);
         const pubsub = new WorkflowEventPolicyPubSub(this.lifecyclePubsub(defaultPubsub), this.#emitWorkflowEvents);
 
         // Create requestContext before execute so we can reuse it in finalize
@@ -1094,8 +1134,10 @@ export class InngestWorkflow<
             // For durable agent workflows, emit error event on failure so the
             // client's stream can receive the error and close properly.
             if (result.status === 'failed' && inputData?.__workflowKind === 'durable-agent' && inputData?.runId) {
-              const error = result.error instanceof Error ? result.error : new Error(String(result.error));
-              await finalizeDurableAgentFailureTransport(pubsub, inputData, error);
+              // Classify stopWhen predicate failures for rejecting delivery; then publish the
+              // terminal failure before clearing retained abort intent (both reject so Inngest retries).
+              const { error, delivery } = durableAgentWorkflowError(result.error);
+              await finalizeDurableAgentFailureTransport(pubsub, inputData, error, delivery);
             }
 
             if (result.status !== 'paused') {
@@ -1125,7 +1167,7 @@ export class InngestWorkflow<
 
                 if (result.status === 'failed') {
                   workflowSpan.error({
-                    error: result.error instanceof Error ? result.error : new Error(String(result.error)),
+                    error: getErrorFromUnknown(result.error, { fallbackMessage: 'Workflow execution failed' }),
                     attributes: { status: 'failed' },
                   });
                 } else {
@@ -1216,6 +1258,15 @@ export class InngestWorkflow<
                 ? (receiptKey ?? `miwr:v1:${resumeOperationHash.slice('sha256:'.length)}`)
                 : undefined;
 
+            // A configured pruneSnapshot shapes what is persisted; the lifecycle
+            // execution fence fields always survive it.
+            const persistedFinalSnapshot: InngestWorkflowRunState = this.options.pruneSnapshot
+              ? {
+                  ...this.options.pruneSnapshot({ snapshot: finalSnapshot, workflowStatus: result.status }),
+                  ...finalLifecycleExecution,
+                }
+              : finalSnapshot;
+
             if (resume) {
               const resumeCapabilities = workflowsStore?.getWorkflowResumeCapabilities();
               if (
@@ -1235,7 +1286,7 @@ export class InngestWorkflow<
                 resumeOperationHash,
                 ...finalLifecycleExecution,
                 shouldPersistSnapshot: shouldPersistFinalSnapshot,
-                snapshot: finalSnapshot,
+                snapshot: persistedFinalSnapshot,
                 receiptKey: resolvedResumeReceiptKey,
                 result: workflowResult,
               });
@@ -1250,7 +1301,7 @@ export class InngestWorkflow<
                 workflowName: this.id,
                 runId,
                 resourceId,
-                snapshot: finalSnapshot,
+                snapshot: persistedFinalSnapshot,
               });
             }
 

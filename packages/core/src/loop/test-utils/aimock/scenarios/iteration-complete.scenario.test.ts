@@ -157,6 +157,9 @@ describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine =
     await runLoopScenario({
       engine,
       llm: getMock(),
+      // Agents now resolve the shared stability error processors, whose retry would change the
+      // request/step counts this case asserts. Opt out to keep its subject under test.
+      errorProcessors: [],
       prompt: 'Search for test',
       tools: { search: searchTool },
       stopWhen: ({ steps }: { steps: number }) => steps >= 2,
@@ -703,7 +706,10 @@ describeForAllEngines(
 
       expect(requests).toHaveLength(3);
       expect(requests[0]?.body?.tools ?? []).toHaveLength(1);
-      expect(requests[1]?.body?.tools ?? []).toHaveLength(0);
+      // Upstream #26232: `toolChoice: 'none'` keeps the definitions but no tool is callable.
+      expect(requests[1]?.body?.tools ?? []).toHaveLength(1);
+      expect(requests[1]?.body?.tool_choice).toBe('none');
+      // The recovery step is bounded by what the previous request let the model call: nothing.
       expect(requests[2]?.body?.tools ?? []).toHaveLength(0);
     });
 

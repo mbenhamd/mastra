@@ -379,7 +379,8 @@ describe('DurableAgent RequestContext reserved keys', () => {
       // entries.
       const entries = (result.workflowInput as { requestContextEntries?: Record<string, unknown> })
         .requestContextEntries;
-      expect(entries).toEqual({ userId: 'user-123' });
+      // The run's (empty) scope set is Core-written run state, always persisted.
+      expect(entries).toEqual({ userId: 'user-123', mastra__scopes: [] });
       result.cleanup();
     });
 
@@ -401,7 +402,8 @@ describe('DurableAgent RequestContext reserved keys', () => {
 
       const result = await durableAgent.prepare('Hello', { requestContext });
 
-      expect(result.workflowInput.requestContextEntries).toBeUndefined();
+      // Only the Core-written (empty) scope set is persisted; no caller entries.
+      expect(result.workflowInput.requestContextEntries).toEqual({ mastra__scopes: [] });
       expect(result.workflowInput.requiredRequestContextCapabilities).toEqual({ authToken: true });
       expect(globalRunRegistry.get(result.runId)?.requestContext?.get(MASTRA_AUTH_TOKEN_KEY)).toBe(
         'Bearer raw-secret-token',
@@ -431,6 +433,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
       expect(result.workflowInput.requestContextEntries).toEqual({
         userId: 'user-123',
         connectionRef: { provider: 'drive', id: 'connection-456' },
+        mastra__scopes: [],
       });
       result.cleanup();
     });
@@ -508,6 +511,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
       expect(result.workflowInput.requestContextEntries).toEqual({
         tokenBudget: 4_096,
         connectionId: 'connection-123',
+        mastra__scopes: [],
       });
       result.cleanup();
     });
@@ -567,7 +571,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
 
       const entries = (result.workflowInput as { requestContextEntries?: Record<string, unknown> })
         .requestContextEntries;
-      expect(entries).toEqual({ userId: 'user-123' });
+      expect(entries).toEqual({ userId: 'user-123', mastra__scopes: [] });
     });
 
     it('should not persist the framework-managed auth token into workflow input', async () => {
@@ -598,7 +602,7 @@ describe('DurableAgent RequestContext reserved keys', () => {
 
       const entries = (result.workflowInput as { requestContextEntries?: Record<string, unknown> })
         .requestContextEntries;
-      expect(entries).toEqual({ userId: 'user-123' });
+      expect(entries).toEqual({ userId: 'user-123', mastra__scopes: [] });
     });
   });
 });

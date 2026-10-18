@@ -88,6 +88,9 @@ function createFakeRun(runId: string) {
         payload: { toolCallId, toolName: 'askUser' },
       });
     },
+    emitFinishPart() {
+      streamController.enqueue({ type: 'finish', finishReason: 'stop' });
+    },
     settle(finalStatus: 'suspended' | 'success') {
       status = finalStatus;
       streamController.close();
@@ -143,6 +146,7 @@ describe('suspended run in-memory TTL', () => {
       run.output,
       { memory: { thread: threadId, resource: RESOURCE_ID } },
       pubsub,
+      { continuation: 'across-suspension' },
     );
     void completion?.catch(() => {});
 
@@ -193,9 +197,11 @@ describe('suspended run in-memory TTL', () => {
   it('evicts a suspended run once it has been parked past the TTL', async () => {
     const watcher = await watchThread(pubsub, 'thread-1');
     await registerSuspendedRun('run-1', 'thread-1', watcher);
+    const didPublishTerminal = runtime.captureThreadRunTerminalPublish('run-1', pubsub);
 
     await sweepAfter(SUSPENDED_RUN_TTL_MS + 1);
 
+    expect(didPublishTerminal?.()).toBe(false);
     expect(
       runtime.getResumableThreadRun({ threadId: 'thread-1', resourceId: RESOURCE_ID, runId: 'run-1' }, pubsub),
     ).toBeUndefined();
@@ -284,9 +290,11 @@ describe('suspended run in-memory TTL', () => {
       longRun.output,
       { memory: { thread: 'thread-1', resource: RESOURCE_ID } },
       pubsub,
+      { continuation: 'across-suspension' },
     );
     void longRunCompletion?.catch(() => {});
     await watcher.waitFor('run-registered', 'run-1');
+    const didPublishTerminal = runtime.captureThreadRunTerminalPublish('run-1', pubsub);
 
     await sweepAfter(SUSPENDED_RUN_TTL_MS * 10);
 
@@ -296,8 +304,13 @@ describe('suspended run in-memory TTL', () => {
     expect(runtime.getThreadState({ threadId: 'thread-1', resourceId: RESOURCE_ID }, pubsub)).toBe('active');
     expect(releaseLease.mock.calls.some(([key]) => key === threadKey(RESOURCE_ID, 'thread-1'))).toBe(false);
     expect(watcher.has('run-completed', 'run-1')).toBe(false);
+    expect(didPublishTerminal?.()).toBe(false);
 
+    longRun.emitFinishPart();
+    await watcher.waitFor('stream-part', 'run-1');
+    expect(didPublishTerminal?.()).toBe(true);
     longRun.settle('success');
+    await watcher.waitFor('run-completed', 'run-1');
     await longRunCompletion;
   });
 

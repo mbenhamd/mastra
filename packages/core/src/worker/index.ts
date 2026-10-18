@@ -10,7 +10,7 @@ export { HarnessWakeupWorker } from './workers/harness-wakeup-worker';
 export type { HarnessWakeupWorkerConfig } from './workers/harness-wakeup-worker';
 export { HarnessChannelOutboxWorker } from './workers/harness-channel-outbox-worker';
 export type { HarnessChannelOutboxWorkerConfig } from './workers/harness-channel-outbox-worker';
-export type { StepExecutionStrategy, StepExecutionParams } from './types';
+export type { StepExecutionStrategy, StepExecutionParams, StepExecutionParentWorkflow } from './types';
 export { InProcessStrategy } from './strategies/in-process-strategy';
 export { HttpRemoteStrategy, StepExecutionError } from './strategies/http-remote-strategy';
 export type { WorkerTransport, WorkerTransportStopOptions, EventRouter } from './transport/transport';

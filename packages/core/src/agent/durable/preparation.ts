@@ -1,20 +1,28 @@
 import type { StandardSchemaWithJSON } from '@mastra/schema-compat/schema';
+import { MastraFGAPermissions } from '../../auth/ee';
+import type { MastraFGAPermissionInput } from '../../auth/ee';
 import type { AgentBackgroundConfig } from '../../background-tasks/types';
 import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import { validateMaxSteps, validateRecoveryMaxSteps } from '../../llm/model/max-steps';
 import { validateModelTimeoutSettings } from '../../llm/model/model-settings';
-import type { MastraLanguageModel } from '../../llm/model/shared.types';
+import type { MastraLanguageModel, MastraModelConfig } from '../../llm/model/shared.types';
 import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
 import type { MastraMemory } from '../../memory/memory';
 import type { MemoryConfig, MemoryConfig as _MemoryConfig, StorageThreadType } from '../../memory/types';
 import { EntityType, SpanType, createObservabilityContext, getOrCreateSpan } from '../../observability';
-import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow, ErrorProcessorOrWorkflow } from '../../processors';
+import type {
+  InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
+  OutputProcessorOrWorkflow,
+  ErrorProcessorOrWorkflow,
+} from '../../processors';
 import type { ProcessorState } from '../../processors/runner';
 import {
   MASTRA_AUTH_TOKEN_KEY,
   RequestContext,
   MASTRA_RESOURCE_ID_KEY,
+  MASTRA_SCOPES_KEY,
   MASTRA_THREAD_ID_KEY,
   MASTRA_VERSIONS_KEY,
   isInfrastructureRequestContextKey,
@@ -27,6 +35,7 @@ import { assertObservationalMemorySourceWriteGuardSupported } from '../../storag
 import { asJsonSchema } from '../../stream/base/schema';
 import { normalizeToolPayloadTransformPolicy } from '../../tools/payload-transform';
 import type { CoreTool, ToolHooks, ToolPayloadTransformPolicy } from '../../tools/types';
+import type { DynamicArgument } from '../../types';
 import { boundedStringify } from '../../utils';
 import type { Workspace } from '../../workspace';
 import type { Agent } from '../agent';
@@ -37,8 +46,9 @@ import { mergeAgentExecutionOptions, omitLogicalMessageIdentity } from '../merge
 import { MessageList } from '../message-list';
 import type { MastraDBMessage, MessageListInput } from '../message-list';
 import { SaveQueueManager } from '../save-queue';
+import { applyResolvedAgentScopes, resolveAgentScopes } from '../scopes';
 import type { CreatedAgentSignal } from '../signals';
-import { mastraDBMessageToSignal } from '../signals';
+import { mastraDBMessageToSignal, signalSpanAttributes } from '../signals';
 import { ON_BEFORE_TOOL_EXECUTION_KEY, TOOL_PERMISSION_POLICY_KEY } from '../tool-permission-prefilter';
 import {
   clearToolSurfaceFence,
@@ -52,6 +62,7 @@ import type {
   AgentMethodType,
   AgentModelManagerConfig,
   GoalConfig,
+  ModelFallbackSettings,
   ToolsetsInput,
   ToolsInput,
 } from '../types';
@@ -59,8 +70,17 @@ import {
   applyClientToolModelOutput,
   fireClientToolOutputHooks,
 } from '../workflows/prepare-stream/client-tool-output-hooks';
+import { authorizeDurableMemory } from './memory-fga';
+import { recordRunSavedMessages } from './run-message-refs';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
-import { createRuntimeDependencyFingerprint, createWorkflowInput } from './utils/serialize-state';
+import {
+  createRuntimeDependencyFingerprint,
+  createWorkflowInput,
+  serializeClientTools,
+  serializeModelConfig,
+  serializeToolsetToolNames,
+} from './utils/serialize-state';
+import { isJsonSafe } from './workflows/shared/schemas';
 
 /**
  * Persist only explicitly allowlisted, non-infrastructure RequestContext
@@ -275,12 +295,20 @@ interface DurablePreparationAgent {
   maxRetries?: number;
   requestContextSchema?: StandardSchemaWithJSON<unknown>;
   getDefaultOptions(opts: { requestContext: RequestContext }): AgentDefaultOptions | Promise<AgentDefaultOptions>;
+  getScopes?(opts: { requestContext: RequestContext }): Promise<string[] | undefined>;
   getInstructions(opts: { requestContext: RequestContext }): AgentInstructions | Promise<AgentInstructions>;
   getModel(opts: { requestContext: RequestContext }): MastraLanguageModel | Promise<MastraLanguageModel>;
   getModelList(requestContext: RequestContext): Promise<AgentModelManagerConfig[] | null>;
+  /** Fork: one selection snapshot; disabled fallbacks are never resolved. */
   __resolveExecutionModels(opts: { requestContext: RequestContext }): Promise<{
     model: MastraLanguageModel;
     modelList: AgentModelManagerConfig[] | null;
+  }>;
+  /** Upstream: resolves a per-call `model` override (`stream(msgs, { model })`). */
+  __getModelAndModelList(opts: { requestContext: RequestContext; model?: unknown }): Promise<{
+    model: MastraLanguageModel;
+    modelList: AgentModelManagerConfig[] | null;
+    fallbackTimeouts: Array<ModelFallbackSettings['timeout'] | undefined>;
   }>;
   getMemory(opts: { requestContext: RequestContext }): Promise<MastraMemory | undefined>;
   getWorkspace(opts: { requestContext: RequestContext }): Promise<Workspace | undefined>;
@@ -310,6 +338,7 @@ interface DurablePreparationAgent {
     processorMessages?: MastraDBMessage[];
     backgroundTaskEnabled?: boolean;
     backgroundTaskPolicy?: AgentExecutionOptions<any>['backgroundTaskPolicy'];
+    model?: MastraLanguageModel;
   }): Promise<Record<string, CoreTool>>;
   listInputProcessors(
     requestContext?: RequestContext,
@@ -319,7 +348,10 @@ interface DurablePreparationAgent {
     requestContext?: RequestContext,
     resolvedMemory?: ResolvedAgentMemory,
   ): Promise<OutputProcessorOrWorkflow[]>;
-  listErrorProcessors(requestContext?: RequestContext): Promise<ErrorProcessorOrWorkflow[]>;
+  __resolveRunErrorProcessors(
+    requestContext: RequestContext,
+    overrides?: ErrorProcessorOrWorkflow[],
+  ): Promise<{ errorProcessors: ErrorProcessorOrWorkflow[]; hasConfiguredErrorProcessors: boolean }>;
   getBackgroundTasksConfig(): AgentBackgroundConfig | undefined;
   __assertAgentResumePreflight(options: {
     requestContext?: RequestContext;
@@ -331,22 +363,35 @@ interface DurablePreparationAgent {
   }): Promise<void>;
   getToolPayloadTransform?(): ToolPayloadTransformPolicy | undefined;
   __getDrainPendingSignals(): (runId: string, scope?: 'pending' | 'pre-run') => CreatedAgentSignal[];
+  __getSubscribePendingSignals(): (runId: string, listener: () => void) => () => void;
   __getGoalConfig(): GoalConfig | undefined;
+  __hasFixedMemory(): boolean;
   __getMaxRetriesConfigured?(): boolean;
+  __getMaxProcessorRetries?(): number | undefined;
   __listLLMRequestProcessors(
     requestContext?: RequestContext,
-    resolvedMemory?: ResolvedAgentMemory,
-  ): Promise<InputProcessorOrWorkflow[]>;
+    errorProcessorOverrides?: ErrorProcessorOrWorkflow[],
+  ): Promise<LLMRequestProcessorOrWorkflow[]>;
+  /**
+   * Resolves the run's whole processor surface once (fork single-resolution
+   * boundary). Error processors follow upstream semantics: call-time overrides
+   * replace the configured list including the framework defaults, memory
+   * error processors are appended, and `hasConfiguredErrorProcessors` excludes
+   * framework defaults. `llmRequestInputProcessors` includes the resolved
+   * error-phase processors (upstream #26029).
+   */
   __resolveExecutionProcessors(
     requestContext?: RequestContext,
     resolvedMemory?: ResolvedAgentMemory,
     outputProcessorOverrides?: OutputProcessorOrWorkflow[],
+    errorProcessorOverrides?: ErrorProcessorOrWorkflow[],
   ): Promise<{
     configuredInputProcessors: InputProcessorOrWorkflow[];
     inputProcessors: InputProcessorOrWorkflow[];
-    llmRequestInputProcessors: InputProcessorOrWorkflow[];
+    llmRequestInputProcessors: LLMRequestProcessorOrWorkflow[];
     outputProcessors: OutputProcessorOrWorkflow[];
     errorProcessors: ErrorProcessorOrWorkflow[];
+    hasConfiguredErrorProcessors: boolean;
   }>;
 }
 
@@ -391,6 +436,17 @@ export interface PreparationOptions<OUTPUT = undefined> {
   resolvedMemory?: ResolvedAgentMemory;
   /** Explicit non-secret application keys that may cross the durable boundary. */
   durableRequestContextKeys?: readonly string[];
+  /**
+   * Whether agent scopes were already applied to `options` (DurableAgent does this itself).
+   * When false, preparation resolves scopes so wrappers that call it directly honor them.
+   */
+  scopesResolved?: boolean;
+  /**
+   * Scopes the caller passed. When the property is absent, `options.scopes`; set it (even to
+   * undefined) when `options` already include the agent defaults, so the Agent's own
+   * `defaultOptions.scopes` are not treated as caller input.
+   */
+  callScopes?: string[];
   /** Run ID (will be generated if not provided) */
   runId?: string;
   /** Request context */
@@ -490,6 +546,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     messages,
     options: rawExecOptions,
     optionsAreResolved = false,
+    scopesResolved = false,
     requestContext: providedRequestContext,
     logger,
     mastra,
@@ -520,7 +577,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const defaultOptions = resolvedDefaultOptions
     ? (omitLogicalMessageIdentity(resolvedDefaultOptions as Record<string, any>) as AgentExecutionOptions<OUTPUT>)
     : undefined;
-  const execOptions: AgentExecutionOptions<OUTPUT> = optionsAreResolved
+  let execOptions: AgentExecutionOptions<OUTPUT> = optionsAreResolved
     ? (rawExecOptions ?? ({} as AgentExecutionOptions<OUTPUT>))
     : (mergeAgentExecutionOptions(
         (defaultOptions ?? {}) as Record<string, any>,
@@ -568,6 +625,29 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     }
   }
 
+  // An explicit `callScopes`, even undefined, means `options` already carry the Agent defaults.
+  const callScopes = 'callScopes' in options ? options.callScopes : rawExecOptions?.scopes;
+
+  // 2a'. Resolve agent scopes for callers that did not (upstream #26593).
+  // Durable runs read identity from `memory` only, so nothing changes without scopes.
+  if (!scopesResolved) {
+    const configuredScopes = (await typedAgent.getScopes?.({ requestContext })) ?? [];
+    const defaultScopes = optionsAreResolved ? [] : (defaultOptions?.scopes ?? []);
+    const agentScopes = [...configuredScopes, ...defaultScopes];
+    if (agentScopes.length || callScopes?.length || requestContext.has(MASTRA_SCOPES_KEY)) {
+      const resolved = resolveAgentScopes({
+        requestContext,
+        agentScopes,
+        callScopes,
+        memory: execOptions.memory,
+        mastra,
+      });
+      execOptions = applyResolvedAgentScopes({ ...execOptions, requestContext }, resolved, requestContext);
+      requestContext = execOptions.requestContext ?? requestContext;
+      execOptions.requestContext = requestContext;
+    }
+  }
+
   validateModelTimeoutSettings(execOptions.modelSettings?.timeout);
 
   if (execOptions.eagerToolExecution) {
@@ -584,6 +664,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const requiredRequestContextCapabilities = requestContext.has(MASTRA_AUTH_TOKEN_KEY)
     ? { authToken: true as const }
     : undefined;
+  // 3. Authorization and version overrides (Mastra defaults < requestContext <
+  // call-site) are merged by the preflight boundary.
   const preflight = await preflightDurableExecution({
     ...options,
     options: execOptions,
@@ -594,6 +676,36 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   const { runId, mergedVersions } = preflight;
   const messageId = crypto.randomUUID();
   const runtimeBindingId = crypto.randomUUID();
+
+  // Resolve and validate the complete model selection before durable preparation
+  // can persist a thread or run user-defined processors, tools, or hooks
+  // (upstream), but only after the preflight above admitted the call (fork):
+  // tenant-scoped model factories never run for an unauthorized caller. One
+  // selection snapshot serves the whole run; disabled fallbacks are never
+  // resolved. A per-call `model` override resolves through the upstream path.
+  const modelOverride = (execOptions as { model?: DynamicArgument<MastraModelConfig> }).model;
+  let resolvedModels:
+    | Awaited<ReturnType<typeof typedAgent.__getModelAndModelList>>
+    | Awaited<ReturnType<typeof typedAgent.__resolveExecutionModels>>;
+  if (modelOverride) {
+    const overrideModels = await typedAgent.__getModelAndModelList({ requestContext, model: modelOverride });
+    if (!overrideModels.model) {
+      throw new Error('Agent model not available');
+    }
+    for (const timeout of overrideModels.fallbackTimeouts) {
+      validateModelTimeoutSettings(timeout);
+    }
+    resolvedModels = overrideModels;
+  } else {
+    const executionModels = await typedAgent.__resolveExecutionModels({ requestContext });
+    if (!executionModels.model) {
+      throw new Error('Agent model not available');
+    }
+    for (const modelConfig of executionModels.modelList ?? []) {
+      validateModelTimeoutSettings(modelConfig.modelSettings?.timeout);
+    }
+    resolvedModels = executionModels;
+  }
   // 4. Resolve thread/memory context
   const requestedThread =
     typeof execOptions?.memory?.thread === 'string' ? { id: execOptions.memory.thread } : execOptions?.memory?.thread;
@@ -705,6 +817,21 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     // thread this preparation created (never a pre-existing one).
     processorMemory = memory;
     const memoryConfig = execOptions?.memory?.options;
+    // Upstream #26092: internal memory reads/writes are FGA-authorized for the
+    // run's thread. Checks are memoized per permission and parked on the
+    // registry so durable steps reuse the same decisions.
+    const memoryAuthorizationChecks = new Map<MastraFGAPermissionInput, Promise<void>>();
+    const authorizeMemory = (permission: MastraFGAPermissionInput) =>
+      authorizeDurableMemory(memoryAuthorizationChecks, {
+        mastra,
+        user: requestContext.get('user'),
+        threadId: threadId!,
+        resourceId,
+        agentId: publicAgentId,
+        requestContext,
+        permission,
+        actor: execOptions?.actor,
+      });
     // Native OM source fencing is configured on the Memory instance. Validate any
     // per-execution override before preparing the guard or reading the thread.
     if (memory && memoryConfig?.observationalMemory !== undefined) {
@@ -713,6 +840,10 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     // Capture the source-write fence before any guarded thread lookup/create.
     // A resumed execution already carries its original token; fresh execution
     // must bind the token before admission and reuse it for thread creation.
+    // Authorize the run's memory read before any thread or OM record lookup.
+    if (memory && threadId && resourceId) {
+      await authorizeMemory(MastraFGAPermissions.MEMORY_READ);
+    }
     let observationalMemorySourceWriteGuard = execOptions.observationalMemorySourceWriteGuard;
     if (!observationalMemorySourceWriteGuard && memory && threadId) {
       observationalMemorySourceWriteGuard = await memory.prepareObservationalMemorySourceWriteGuard(
@@ -733,6 +864,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         assertThreadOwnedByResource({ thread: existingThread, resourceId, agentName: publicAgentName });
         threadObject = existingThread;
       } else {
+        await authorizeMemory(MastraFGAPermissions.MEMORY_WRITE);
         threadObject = await memory.createThread({
           threadId,
           metadata: thread?.metadata,
@@ -764,8 +896,27 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     // Resolve input processors now that the memory context is in place.
     const processorStates = new Map<string, ProcessorState>();
     const resolvedMemory = { value: memory } satisfies ResolvedAgentMemory;
-    const { configuredInputProcessors, inputProcessors, llmRequestInputProcessors, outputProcessors, errorProcessors } =
-      await typedAgent.__resolveExecutionProcessors(requestContext, resolvedMemory, execOptions?.outputProcessors);
+    // One resolution for the whole run. Call-time errorProcessors replace the
+    // resolved list (framework defaults included); `hasConfiguredErrorProcessors`
+    // excludes framework defaults and gates the implicit retry-cap warning.
+    const {
+      configuredInputProcessors,
+      inputProcessors,
+      llmRequestInputProcessors,
+      outputProcessors,
+      errorProcessors,
+      hasConfiguredErrorProcessors,
+    } = await typedAgent.__resolveExecutionProcessors(
+      requestContext,
+      resolvedMemory,
+      execOptions?.outputProcessors,
+      execOptions?.errorProcessors,
+    );
+    if (typeof hasConfiguredErrorProcessors !== 'boolean') {
+      // Fail closed: an Agent without the merged processor contract would make
+      // durable recovery treat configured error processors as absent.
+      throw new Error('DurableAgent requires Agent.__resolveExecutionProcessors to report hasConfiguredErrorProcessors.');
+    }
 
     // Open AGENT_RUN here so processor_run spans (and their MEMORY_OPERATION
     // children) parent to it. MODEL_GENERATION is opened later under it.
@@ -778,6 +929,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     const resolvedVersionId = rawConfig?.resolvedVersionId as string | undefined;
     const agentTracingPolicy =
       typeof (agent as any).getTracingPolicy === 'function' ? (agent as any).getTracingPolicy() : undefined;
+    const startingSignal = signalSpanAttributes(messages);
     agentSpan = getOrCreateSpan({
       type: SpanType.AGENT_RUN,
       name: `agent run: '${publicAgentId}'`,
@@ -788,6 +940,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       attributes: {
         conversationId: threadId,
         instructions: convertInstructionsToString(instructions),
+        ...(startingSignal ? { signal: startingSignal } : {}),
         // @deprecated — use entityVersionId (top-level span context field) instead.
         // Kept for backward compatibility during migration.
         ...(resolvedVersionId ? { resolvedVersionId } : {}),
@@ -851,6 +1004,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
             },
             error,
           );
+          // End the whole run span tree on a hard input-processor failure (upstream).
+          agentSpan?.error({ error: processorError, endTree: true });
+          spanEndedPreparationErrors.add(processorError);
           throw processorError;
         }
       }
@@ -870,6 +1026,19 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       requestContext,
       options.durableRequestContextKeys,
     );
+    // Persist the run's scope set unconditionally — [] included — so a cold
+    // resume can tell "held no scopes" (recorded [], re-supplied scopes are
+    // rejected) from a pre-upgrade snapshot (key absent, supplied scopes are
+    // adopted). This is Core-written run state, never a caller allowlist entry
+    // (infrastructure keys are rejected from the allowlist above); the live run
+    // context omits the key when the run has no non-identity scopes (upstream #26593).
+    const runScopes = requestContext.get(MASTRA_SCOPES_KEY);
+    requestContextEntriesSnapshot = {
+      ...requestContextEntriesSnapshot,
+      [MASTRA_SCOPES_KEY]: Array.isArray(runScopes)
+        ? runScopes.filter((scope): scope is string => typeof scope === 'string')
+        : [],
+    };
 
     // 7. Convert tools to CoreTool format for execution
     let tools: Record<string, CoreTool> = {};
@@ -887,7 +1056,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         }
       : undefined;
     toolSurfaceFenceOwnerId = crypto.randomUUID();
-    const resolvedModels = await typedAgent.__resolveExecutionModels({ requestContext });
     try {
       tools = await typedAgent.getToolsForExecution({
         toolsets: execOptions?.toolsets,
@@ -908,6 +1076,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         resolvedDefaultOptions: defaultOptions as AgentExecutionOptions<any>,
         resolvedMemory,
         resolvedModel: resolvedModels.model,
+        model: resolvedModels.model,
         resolvedInputProcessors: configuredInputProcessors,
         processorMessages: messageList.get.all.db(),
         backgroundTaskEnabled: Boolean(backgroundTaskManager),
@@ -955,10 +1124,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       });
     }
 
+    // Fallback timeouts were validated with the model selection above.
     const modelList = resolvedModels.modelList;
-    for (const modelConfig of modelList ?? []) {
-      validateModelTimeoutSettings(modelConfig.modelSettings?.timeout);
-    }
 
     // 8b. Get scorers configuration
     const overrideScorers = (execOptions as any)?.scorers;
@@ -982,6 +1149,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       ? new SaveQueueManager({
           logger,
           memory,
+          onSaved: recordRunSavedMessages(runId),
         })
       : undefined;
 
@@ -995,14 +1163,24 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       if (structuredOutputSchema) {
         serializedStructuredOutput = {
           jsonPromptInjection: so.jsonPromptInjection,
-          // `instructions` means two different things depending on `model`: structuring-agent
-          // instructions when a separate structuring pass runs, injected prompt text when it
-          // does not. The durable path has no structuring pass (`structuringModelConfig` is
-          // never populated, so `llm-execution.ts` always takes the direct branch), so carrying
-          // the field when `model` is set would inject structuring-agent prose as the model's
-          // only output guidance. Withhold it there and let the generated schema instruction stand.
-          instructions: so.model ? undefined : so.instructions,
+          // With `model` set these are structuring-agent instructions for the finish-time
+          // structuring pass (upstream #26571); otherwise they are injected into the main
+          // model's prompt.
+          instructions: so.instructions,
           useAgent: so.useAgent,
+          hasStructuringModel: so.model ? true : undefined,
+          // Workers without the live config (remote/recovered runs) resolve the structuring
+          // model from this. Model instances persist as `provider/modelId`, like the main model.
+          structuringModelConfig:
+            typeof so.model === 'string'
+              ? { provider: so.model.split('/')[0] ?? '', modelId: so.model, originalConfig: so.model }
+              : so.model && typeof so.model.provider === 'string' && typeof so.model.modelId === 'string'
+                ? serializeModelConfig(so.model)
+                : undefined,
+          errorStrategy: so.errorStrategy,
+          // A non-JSON-safe fallback would fail options validation; in-process runs still
+          // have it through the run registry's live config.
+          fallbackValue: isJsonSafe(so.fallbackValue) ? so.fallbackValue : undefined,
           // Always convert to plain JSON Schema: this crosses step boundaries as JSON, and a
           // live Zod/standard-schema instance does not survive that round trip.
           schema: asJsonSchema(structuredOutputSchema),
@@ -1054,7 +1232,10 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       // after a newer publish still re-resolves to the started version.
       agentVersionId: resolvedVersionId,
       versions: mergedVersions,
-      hasProcessors: inputProcessors.length > 0 || outputProcessors.length > 0 || errorProcessors.length > 0,
+      // Framework-default error processors (the upstream stability stack) carry
+      // no request-local state, so only configured ones mark the run as holding
+      // processor state that cold recovery cannot restore.
+      hasProcessors: inputProcessors.length > 0 || outputProcessors.length > 0 || hasConfiguredErrorProcessors,
       runtimeBindings: {
         memory: createRuntimeDependencyFingerprint(memory),
         workspace: createRuntimeDependencyFingerprint(workspace),
@@ -1066,6 +1247,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       scorers,
       options: {
         observationalMemorySourceWriteGuard: execOptions?.observationalMemorySourceWriteGuard,
+        clientTools: serializeClientTools(execOptions?.clientTools, tools),
+        toolsetToolNames: serializeToolsetToolNames(execOptions?.toolsets),
         maxSteps: execOptions?.maxSteps,
         recoveryMaxSteps: execOptions?.recoveryMaxSteps,
         toolChoice: execOptions?.toolChoice as any,
@@ -1099,10 +1282,14 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         onBeforeToolExecutionRequired: typeof requestContext.get(ON_BEFORE_TOOL_EXECUTION_KEY) === 'function',
         toolCallConcurrency: execOptions?.toolCallConcurrency,
         autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
-        maxProcessorRetries: execOptions?.maxProcessorRetries,
+        maxProcessorRetries: execOptions?.maxProcessorRetries ?? typedAgent.__getMaxProcessorRetries?.(),
         includeRawChunks: execOptions?.includeRawChunks,
         returnScorerData: execOptions?.returnScorerData,
-        hasErrorProcessors: errorProcessors.length > 0,
+        // "Configured" excludes framework default processors — the durable step
+        // uses this to gate the implicit retry-cap warning (the cap itself is
+        // driven by the resolved list from the run registry).
+        hasErrorProcessors: hasConfiguredErrorProcessors,
+        emptyErrorProcessorOverride: execOptions?.errorProcessors?.length === 0 ? true : undefined,
         providerOptions: execOptions?.providerOptions,
         structuredOutput: serializedStructuredOutput,
         skipBgTaskWait: (execOptions as any)?._skipBgTaskWait,
@@ -1131,6 +1318,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         threadExists,
         savePerStep,
         observationalMemory,
+        fixedMemory: typedAgent.__hasFixedMemory(),
       },
       messageId,
       agentSpanData: agentSpan?.exportSpan(),
@@ -1160,10 +1348,14 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       threadId,
       resourceId,
       tools,
+      // The tools built for this request; a warm resume refreshes only entries
+      // still holding one of these (upstream #26686).
+      requestTools: tools,
       replacementToolSurface,
       toolHookPolicy: perExecutionToolHooks ? { id: toolHookPolicy!.id, hooks: perExecutionToolHooks } : undefined,
       saveQueueManager,
       memory,
+      memoryAuthorizationChecks,
       model,
       modelList: modelList
         ? modelList.map((entry: AgentModelManagerConfig) => ({
@@ -1204,6 +1396,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       // Signal drain — the closure reads from AgentThreadStreamRuntime's queues.
       // Non-serializable; cross-process engines lose it and signals go undelivered.
       drainPendingSignals: scope => typedAgent.__getDrainPendingSignals()(runId, scope),
+      subscribePendingSignals: listener => typedAgent.__getSubscribePendingSignals()(runId, listener),
       // Thread title generation — mirrors the non-durable `#executeOnFinish` branch,
       // which was never ported to the durable finish step (so `generateTitle` never
       // fired for durable/evented agents). Parked here because the agent instance is
@@ -1335,10 +1528,14 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       requestContext.set('MastraMemory', inheritedMastraMemory);
     }
     const preparationError = error instanceof Error ? error : new Error(String(error));
-    agentSpan?.error({ error: preparationError, endSpan: true });
+    // A failure that already ended the run's span tree must not record the error a second time.
+    if (!spanEndedPreparationErrors.has(preparationError)) agentSpan?.error({ error: preparationError, endSpan: true });
     throw error;
   }
 }
+
+/** Preparation failures whose handler already ended the run's span tree. */
+const spanEndedPreparationErrors = new WeakSet<Error>();
 
 /**
  * Extract string-valued headers from `modelSettings.headers` for storage on the

@@ -1,6 +1,9 @@
 import type { StepFlowEntry, WorkflowRunState } from '../..';
 import { RequestContext } from '../../../di';
 import type { PubSub } from '../../../events';
+import type { WorkflowsStorage } from '../../../storage/domains/workflows';
+import { isStaleExecutionResult } from '../../../storage/types';
+import { getPersistedRequestContext, withoutAuthToken } from '../helpers';
 import type { StepExecutor } from '../step-executor';
 import { getStepId } from './utils';
 import type { ProcessorArgs } from '.';
@@ -44,7 +47,7 @@ export async function processWorkflowWaitForEvent(
       stepResults: currentState?.context,
       prevResult,
       activeStepsPath: {},
-      requestContext: currentState?.requestContext,
+      requestContext: withoutAuthToken(currentState?.requestContext),
       // Known gap (deliberately deferred — PR #24569 review, Superagent P2):
       // the actor signal is not persisted in the workflow snapshot, so a run
       // continued from a waitForEvent only keeps the actor if the resuming
@@ -59,6 +62,67 @@ export async function processWorkflowWaitForEvent(
       perStep: workflowData.perStep,
     },
   });
+}
+
+/**
+ * Upstream #26268 records a sleeping step as `waiting` (and the run as `running` at that path) so a
+ * restart replays the sleep. Fork: both writes are fenced to this execution lifetime (PF-4387 result
+ * generation fence; lineage CAS on the run row), so a superseded or terminal lineage is never moved
+ * back to `running`. Returns false when the write was rejected and the handler must stop.
+ */
+async function recordSleepWaiting({
+  workflowsStore,
+  workflowId,
+  runId,
+  stepId,
+  executionGeneration,
+  lifecycleResumeAttempt,
+  executionPath,
+  activeStepsPath,
+  payload,
+  startedAt,
+  requestContext,
+}: {
+  workflowsStore?: WorkflowsStorage;
+  workflowId: string;
+  runId: string;
+  stepId: string;
+  executionGeneration?: string;
+  lifecycleResumeAttempt?: number;
+  executionPath: number[];
+  activeStepsPath: Record<string, number[]>;
+  payload: unknown;
+  startedAt: number;
+  requestContext?: Record<string, any>;
+}): Promise<boolean> {
+  if (!workflowsStore) return true;
+  const write = await workflowsStore.updateWorkflowResults({
+    workflowName: workflowId,
+    runId,
+    stepId,
+    result: { status: 'waiting', payload, startedAt } as any,
+    requestContext: getPersistedRequestContext(requestContext ?? {}),
+    executionGeneration,
+  });
+  if (isStaleExecutionResult(write)) return false;
+  const concurrentCas = workflowsStore.supportsConcurrentUpdates();
+  const updated = await workflowsStore.updateWorkflowState({
+    workflowName: workflowId,
+    runId,
+    opts: {
+      status: 'running',
+      activePaths: executionPath,
+      activeStepsPath: { ...activeStepsPath, [stepId]: executionPath },
+      ...(concurrentCas && executionGeneration
+        ? {
+            expectedStatus: ['running', 'waiting'],
+            expectedExecutionGeneration: executionGeneration,
+            expectedLifecycleResumeAttempt: lifecycleResumeAttempt ?? 0,
+          }
+        : {}),
+    },
+  });
+  return !(concurrentCas && executionGeneration) || updated !== undefined;
 }
 
 export async function processWorkflowSleep(
@@ -85,10 +149,12 @@ export async function processWorkflowSleep(
   {
     pubsub,
     stepExecutor,
+    workflowsStore,
     step,
   }: {
     pubsub: PubSub;
     stepExecutor: StepExecutor;
+    workflowsStore?: WorkflowsStorage;
     step: Extract<StepFlowEntry, { type: 'sleep' }>;
   },
 ) {
@@ -110,6 +176,24 @@ export async function processWorkflowSleep(
         },
       },
     });
+  }
+
+  if (
+    !(await recordSleepWaiting({
+      workflowsStore,
+      workflowId,
+      runId,
+      stepId: step.id,
+      executionGeneration,
+      lifecycleResumeAttempt,
+      executionPath,
+      activeStepsPath,
+      payload: prevResult.status === 'success' ? prevResult.output : undefined,
+      startedAt,
+      requestContext,
+    }))
+  ) {
+    return;
   }
 
   // Create a proper RequestContext from the plain object passed in ProcessorArgs
@@ -210,10 +294,12 @@ export async function processWorkflowSleepUntil(
   {
     pubsub,
     stepExecutor,
+    workflowsStore,
     step,
   }: {
     pubsub: PubSub;
     stepExecutor: StepExecutor;
+    workflowsStore?: WorkflowsStorage;
     step: Extract<StepFlowEntry, { type: 'sleepUntil' }>;
   },
 ) {
@@ -221,6 +307,24 @@ export async function processWorkflowSleepUntil(
   // `workflows` routing publish below is never gated — it drives execution.
   const emitStepEvents = workflow.options.emitStepEvents !== false;
   const startedAt = Date.now();
+
+  if (
+    !(await recordSleepWaiting({
+      workflowsStore,
+      workflowId,
+      runId,
+      stepId: step.id,
+      executionGeneration,
+      lifecycleResumeAttempt,
+      executionPath,
+      activeStepsPath,
+      payload: prevResult.status === 'success' ? prevResult.output : undefined,
+      startedAt,
+      requestContext,
+    }))
+  ) {
+    return;
+  }
 
   // Create a proper RequestContext from the plain object passed in ProcessorArgs
   const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);

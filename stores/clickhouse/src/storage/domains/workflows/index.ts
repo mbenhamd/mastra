@@ -48,6 +48,7 @@ export class WorkflowsStorageClickhouse extends WorkflowsStorage {
       tableName: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
       schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT_HANDOFF],
     });
+    await this.#db.ensureSkipIndexes(TABLE_WORKFLOW_SNAPSHOT);
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -336,6 +337,9 @@ export class WorkflowsStorageClickhouse extends WorkflowsStorage {
             `,
         query_params: values,
         format: 'JSONEachRow',
+        // run_id and workflow_name are sort-key columns shared by every version,
+        // so the run_id skip index is safe to use under FINAL.
+        clickhouse_settings: { use_skip_indexes_if_final: 1 },
       });
 
       const resultJson = await result.json();

@@ -13,8 +13,14 @@
  * event is ever published, leaving stream consumers hanging forever.
  */
 import type { PubSub } from '../../events';
+import type { Mastra } from '../../mastra';
 import { AGENT_CONTROL_TOPIC, AgentControlEventTypes } from './constants';
-import { getBoundRunRegistryEntry, getGlobalRunRegistryEntry, globalRunRegistry } from './run-registry';
+import {
+  getBoundRunRegistryEntry,
+  getGlobalRunRegistryEntry,
+  getRunRegistryEntry,
+  setRunRegistryEntry,
+} from './run-registry';
 import type { RunRegistryEntry } from './types';
 
 /**
@@ -82,6 +88,7 @@ export async function ensureRemoteAbortListener(
   pubsub: PubSub,
   runId: string,
   runtimeBindingId?: string,
+  mastra?: Mastra,
 ): Promise<void> {
   if (!runtimeBindingId) {
     throw new Error(`Durable run ${runId} cannot install remote abort transport without a runtime binding.`);
@@ -90,6 +97,8 @@ export async function ensureRemoteAbortListener(
   // to (or abort) a newer execution that reused the same caller-supplied ID.
   getBoundRunRegistryEntry(runId, runtimeBindingId);
   let entry = getGlobalRunRegistryEntry(runId);
+  // An entry owned by another Mastra instance in this process is not ours.
+  if (entry && mastra && !getRunRegistryEntry(runId, mastra)) return;
   if (entry?.isPlaceholder) {
     if (entry.runtimeBindingId && entry.runtimeBindingId !== runtimeBindingId) {
       throw new Error(
@@ -109,7 +118,8 @@ export async function ensureRemoteAbortListener(
     // The bound read above includes active pinned entries, so reaching this
     // branch proves no execution currently owns the identifier in this process.
     // Store the placeholder in the TTL cache; active steps pin it later.
-    globalRunRegistry.set(runId, entry);
+    // Another instance's live run holds this runId; don't wire our abort to it.
+    if (!setRunRegistryEntry(runId, entry, mastra)) return;
   }
 
   if (entry.remoteAbortListenerInstalled) return;
@@ -142,6 +152,8 @@ export async function ensureRemoteAbortListener(
       } catch {
         return;
       }
+      // Another Mastra instance's live run holds this runId; don't abort it.
+      if (currentEntry && mastra && !getRunRegistryEntry(runId, mastra)) return;
       const controller = currentEntry?.abortController ?? entry.abortController;
       if (controller && !controller.signal.aborted) {
         controller.abort(new Error('Aborted'));

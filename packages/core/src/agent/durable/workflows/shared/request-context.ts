@@ -1,4 +1,5 @@
 import { RequestContext } from '../../../../request-context';
+import { restoreRunAgentScopes } from '../../../scopes';
 
 export interface DurableRequestContextResolution {
   requestContext: RequestContext;
@@ -17,7 +18,13 @@ export function resolveDurableRequestContext(
   liveRequestContext: RequestContext | undefined,
   persistedEntries: Record<string, unknown> | undefined,
 ): DurableRequestContextResolution {
-  const requestContext = liveRequestContext ?? new RequestContext(Object.entries(persistedEntries ?? {}));
+  let requestContext = liveRequestContext;
+  if (!requestContext) {
+    requestContext = new RequestContext(Object.entries(persistedEntries ?? {}));
+    // Persisted entries lose the run-scope registration; re-register agent
+    // scopes so cold-recovered steps see the same scope set as the live run.
+    restoreRunAgentScopes(requestContext);
+  }
   const customContext = Object.fromEntries(requestContext.entries());
 
   return {

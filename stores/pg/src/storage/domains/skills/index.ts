@@ -197,6 +197,7 @@ export class SkillsPG extends SkillsStorage {
 
   async create(input: { skill: StorageCreateSkillInput }): Promise<StorageSkillType> {
     const { skill } = input;
+    let draftInserted = false;
     try {
       const tableName = getTableName({ indexName: TABLE_SKILLS, schemaName: getSchemaName(this.#schema) });
       const now = new Date();
@@ -212,6 +213,7 @@ export class SkillsPG extends SkillsStorage {
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [skill.id, 'draft', null, skill.authorId ?? null, visibility ?? null, 0, nowIso, nowIso, nowIso, nowIso],
       );
+      draftInserted = true;
 
       // 2. Extract snapshot fields and create version 1
       const { id: _id, authorId: _authorId, visibility: _visibility, ...snapshotConfig } = skill;
@@ -236,18 +238,21 @@ export class SkillsPG extends SkillsStorage {
         updatedAt: now,
       };
     } catch (error) {
-      // Best-effort cleanup
-      try {
-        const tableName = getTableName({
-          indexName: TABLE_SKILLS,
-          schemaName: getSchemaName(this.#schema),
-        });
-        await this.#db.client.none(
-          `DELETE FROM ${tableName} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
-          [skill.id],
-        );
-      } catch {
-        // Ignore cleanup errors
+      // Best-effort cleanup, only for a draft this call inserted. If our INSERT failed
+      // (e.g. duplicate id), the row belongs to a concurrent creator and must be kept.
+      if (draftInserted) {
+        try {
+          const tableName = getTableName({
+            indexName: TABLE_SKILLS,
+            schemaName: getSchemaName(this.#schema),
+          });
+          await this.#db.client.none(
+            `DELETE FROM ${tableName} WHERE id = $1 AND status = 'draft' AND "activeVersionId" IS NULL`,
+            [skill.id],
+          );
+        } catch {
+          // Ignore cleanup errors
+        }
       }
 
       if (error instanceof MastraError) throw error;
@@ -379,13 +384,7 @@ export class SkillsPG extends SkillsStorage {
 
       values.push(id);
 
-      if (setClauses.length > 2 || versionCreated) {
-        // More than just updatedAt and updatedAtZ, or a new version was created
-        await this.#db.client.none(
-          `UPDATE ${tableName} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`,
-          values,
-        );
-      }
+      await this.#db.client.none(`UPDATE ${tableName} SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`, values);
 
       const updatedSkill = await this.#getById(this.#db.client, id);
       if (!updatedSkill) {

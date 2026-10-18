@@ -282,7 +282,9 @@ export interface GoalEvaluationCommit {
  * alone would let the previous objective's verdict land on the new one.
  */
 function isSameObjective(a: GoalObjectiveRecord, b: GoalObjectiveRecord): boolean {
-  if (a.id !== undefined && b.id !== undefined) return a.id === b.id;
+  // Every setObjective resets `startedAt`, so a replacement that reuses the
+  // same id and objective text is still a different objective (upstream #26093).
+  if (a.id !== undefined && b.id !== undefined && a.id !== b.id) return false;
   return a.objective === b.objective && a.startedAt === b.startedAt;
 }
 
@@ -335,7 +337,8 @@ export async function commitGoalEvaluation(args: {
       // `updateObjectiveOptions` may have raised `maxRuns` to keep the goal
       // going, and parking it on the stale budget would undo exactly that.
       const effective = resolveEffectiveGoalSettings(current, agentDefaults);
-      const runsUsed = current.runsUsed + 1;
+      // A failed judge produced no verdict, so it does not consume the run budget (upstream #25205).
+      const runsUsed = decision.judgeFailed ? current.runsUsed : current.runsUsed + 1;
       const maxRunsReached = runsUsed >= effective.maxRuns;
 
       // Precedence: judge failure → paused; complete → done; budget exhausted →
@@ -355,7 +358,7 @@ export async function commitGoalEvaluation(args: {
         // of leaving it `active` but stuck. Raising maxRuns + setting status
         // back to `active` (updateObjectiveOptions) resumes evaluation.
         status = 'paused';
-        pausedReason = `Ran out of evaluation budget (${effective.maxRuns} runs) before reaching the goal — raise maxRuns to resume.`;
+        pausedReason = formatGoalBudgetPausedReason(effective.maxRuns);
       }
 
       const value: GoalObjectiveRecord = {

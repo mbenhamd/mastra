@@ -202,17 +202,18 @@ Add an `outputSchema` to request structured output from the agent:
 
 Use a `mapping` entry before an agent to build its `{ prompt }` input from workflow data.
 
-Agent entries accept an optional `description` and an `options` object:
+Agent entries accept an `options` object:
 
 ```json
 {
   "type": "agent",
   "id": "summarize",
   "agentId": "support-agent",
-  "description": "Summarize the incoming request",
   "options": { "retries": 2, "metadata": { "team": "support" } }
 }
 ```
+
+The step description comes from the registered agent. A `description` set on the agent entry is ignored when the workflow is rehydrated.
 
 Agent options persist when they belong to the serialized subset and contain only JSON-safe values. In addition to `retries` and `metadata`, the subset is `maxSteps`, `toolChoice`, `activeTools`, `modelSettings`, `providerOptions`, `instructions`, `system`, `temperature`, `savePerStep`, `maxProcessorRetries`, `returnScorerData`, `requireToolApproval`, `autoResumeSuspendedTools`, `toolCallConcurrency`, `includeRawChunks`, `toolsetsMode`, `disableBackgroundTasks`, and `versions`. A `structuredOutput.schema` from a code-defined workflow is stored as the entry's `outputSchema`. Function-valued callbacks and every option outside the serialized subset are rejected rather than silently dropped.
 

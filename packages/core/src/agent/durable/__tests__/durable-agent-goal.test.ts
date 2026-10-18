@@ -347,7 +347,8 @@ describe('DurableAgent goal step', () => {
       requestContext,
       memory: { thread: THREAD, resource: RESOURCE },
     });
-    expect(prepared.workflowInput.requestContextEntries).toBeUndefined();
+    // Only the Core-written (empty) run scope set is persisted (upstream #26593).
+    expect(prepared.workflowInput.requestContextEntries).toEqual({ mastra__scopes: [] });
     prepared.cleanup();
 
     const result = await durableAgent.stream('Verify scorer context', {
@@ -415,6 +416,72 @@ describe('DurableAgent goal step', () => {
         message.role === 'signal' && message.content?.metadata?.signal?.attributes?.type === 'goal-judge',
     );
     expect(goalSignals).toEqual([]);
+  });
+
+  it.each([
+    ['durable', createDurableAgent],
+    ['evented', createEventedAgent],
+  ] as const)('%s abort preserves the objective without judging partial work', async (kind, createAgent) => {
+    const scorerRun = vi.fn().mockResolvedValue({ score: 1, reason: 'Goal achieved' });
+    const threadId = `${kind}-goal-abort-thread`;
+    const model = new MockLanguageModelV2({
+      doStream: async ({ abortSignal }) => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue({ type: 'text-start', id: 'partial' });
+            controller.enqueue({ type: 'text-delta', id: 'partial', delta: 'Unfinished work' });
+            abortSignal?.addEventListener(
+              'abort',
+              () => {
+                const error = new Error('Aborted');
+                error.name = 'AbortError';
+                controller.error(error);
+              },
+              { once: true },
+            );
+          },
+        }),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      }),
+    });
+    const agent = createAgent({
+      agent: new Agent({
+        id: `${kind}-goal-abort-agent`,
+        name: 'Goal Abort Agent',
+        instructions: 'Test',
+        model,
+        memory: new MockMemory(),
+        goal: {
+          judge: 'mock-judge',
+          maxRuns: 5,
+          scorer: { id: 'goal-scorer', name: 'Goal Scorer', run: scorerRun } as any,
+        },
+      }),
+      pubsub,
+    });
+    new Mastra({ agents: { agent }, storage: new InMemoryStore(), pubsub, logger: false });
+    const objective = await agent.setObjective('Finish the task', { threadId, resourceId: 'user-1' });
+    const onAbort = vi.fn();
+    const completionRun = vi.fn().mockResolvedValue({ score: 1, reason: 'Task complete' });
+    const result = await agent.stream('Go', {
+      memory: { thread: threadId, resource: 'user-1' },
+      onAbort,
+      isTaskComplete: {
+        scorers: [{ id: 'completion-scorer', name: 'Completion Scorer', run: completionRun } as any],
+      },
+    });
+    const chunks = [];
+    for await (const chunk of result.output.fullStream) {
+      chunks.push(chunk);
+      if (chunk.type === 'text-delta') await result.abort();
+    }
+    expect(onAbort).toHaveBeenCalledOnce();
+    expect(scorerRun).not.toHaveBeenCalled();
+    expect(completionRun).not.toHaveBeenCalled();
+    expect(chunks.filter(chunk => chunk.type === 'goal')).toEqual([]);
+    expect(await agent.getObjective({ threadId, resourceId: 'user-1' })).toEqual(objective);
+    result.cleanup();
   });
 
   it('no-ops when no goal is configured', async () => {

@@ -121,6 +121,11 @@ function makeSupervisorModel() {
   });
 }
 
+const PROCESSOR_STATE_UNRECOVERABLE = {
+  id: 'DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE',
+  message: expect.stringContaining('because request-local processor state was not persisted'),
+};
+
 describe('durable delegated non-approval suspension persisted runId', () => {
   let pubsub: EventEmitterPubSub;
 
@@ -285,10 +290,12 @@ describe('durable delegated non-approval suspension persisted runId', () => {
     const freshAgent = createDurableAgent({ agent: buildSupervisor(mockMemory, toolExecutions), pubsub });
     new Mastra({ agents: { durableAgent: freshAgent }, storage, logger: false });
 
-    const resumed = await freshAgent.resumeStream(
-      { extraInfo: 'the missing detail' },
-      { runId: entry.runId, toolCallId: entry.toolCallId, memory },
-    );
-    await drainAndAssertResumed(resumed, toolExecutions);
+    // PF-1875 (PF-5928 decision, option a): the fork refuses memory-backed cold recovery because request-local processor state is not persisted.
+    await expect(
+      freshAgent.resumeStream(
+        { extraInfo: 'the missing detail' },
+        { runId: entry.runId, toolCallId: entry.toolCallId, memory },
+      ),
+    ).rejects.toMatchObject(PROCESSOR_STATE_UNRECOVERABLE);
   }, 30000);
 });

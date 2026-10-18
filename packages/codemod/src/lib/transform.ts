@@ -43,8 +43,10 @@ export function getJscodeshiftBin(): string {
 }
 
 export function buildArgs(codemodPath: string, targetPath: string, options: TransformOptions): string[] {
-  // Ignoring everything under `.*/` covers `.mastra/` along with any other
-  // framework build related or otherwise intended-to-be-hidden directories.
+  // Ignore hidden directories (`.mastra/` and other build or intended-to-be-hidden
+  // directories) inside the target without matching hidden directories that
+  // contain the target itself.
+  const hiddenDirectoryPattern = path.join(targetPath, '**/.*/**');
   const args = [
     '-t',
     codemodPath,
@@ -216,6 +218,8 @@ function scheduleProcessTreeTimeout(subprocess: KillableSubprocess) {
 async function runJscodeshift(args: string[]): Promise<string> {
   const subprocess = execa(process.execPath, [getJscodeshiftBin(), ...args], {
     encoding: 'utf8',
+    // --print and --verbose can legitimately emit more than Node's default 1 MiB
+    // buffer; keep a bounded ceiling well above it.
     maxBuffer: 100 * 1024 * 1024,
     detached: process.platform !== 'win32',
   });

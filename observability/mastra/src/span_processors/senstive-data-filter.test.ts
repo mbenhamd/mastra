@@ -170,6 +170,36 @@ describe('Tracing', () => {
           expect(span.input).toBe(input);
         });
       });
+      it('redacts sensitive keys inside a provider error body recorded as an object', () => {
+        const mockSpan = {
+          id: 'test-span-err',
+          name: 'test-span',
+          type: SpanType.AGENT_RUN,
+          startTime: new Date(),
+          traceId: 'trace-123',
+          trace: { traceId: 'trace-123' } as any,
+          errorInfo: {
+            message: 'Unauthorized',
+            name: 'AI_APICallError',
+            details: {
+              statusCode: 401,
+              responseBody: { error: { message: 'bad key', api_key: 'sk-live-123' } },
+            },
+          },
+          observabilityInstance: {} as any,
+          end: () => {},
+          error: () => {},
+          update: () => {},
+          createChildSpan: () => ({}) as any,
+        } as any;
+
+        const filtered = new SensitiveDataFilter().process(mockSpan);
+
+        expect(filtered!.errorInfo?.details?.responseBody).toEqual({
+          error: { message: 'bad key', api_key: '[REDACTED]' },
+        });
+      });
+
       it('should redact default sensitive fields (case-insensitive)', () => {
         const processor = new SensitiveDataFilter();
 
@@ -856,8 +886,9 @@ describe('Tracing', () => {
           for (const event of testExporter.events) {
             expect(event.exportedSpan.input).toMatchObject({ password: '[REDACTED]' });
             expect(JSON.stringify(event.exportedSpan.input)).toContain('[MaxDepth]');
-            expect(event.exportedSpan.requestContext).toMatchObject({ token: '[REDACTED]' });
-            expect(JSON.stringify(event.exportedSpan.requestContext)).toContain('[MaxDepth]');
+            // Fork: RequestContext.serializeForSpan labels objects instead of traversing them,
+            // so the nested request-context value is a type label, not a depth-limited copy.
+            expect(event.exportedSpan.requestContext).toEqual({ token: '[REDACTED]', nested: '[object]' });
           }
           expect(testExporter.events[1].exportedSpan.output).toMatchObject({ token: '[REDACTED]' });
           expect(JSON.stringify(testExporter.events[1].exportedSpan.output)).toContain('[MaxDepth]');
@@ -964,8 +995,10 @@ describe('Tracing', () => {
           const exported = event.exportedSpan.requestContext as any;
           expect(exported?.['token']).toBe('[REDACTED]');
           expect(exported?.['tenantId']).toBe('tenant-1');
-          expect(exported?.['user']?.['id']).toBe('user-1');
-          expect(exported?.['user']?.['password']).toBe('[REDACTED]');
+          // Fork: objects are exported as type labels (never traversed), so the nested
+          // password cannot reach the exporter at all.
+          expect(exported?.['user']).toBe('[object]');
+          expect(JSON.stringify(exported)).not.toContain('hunter2');
         }
         expect(testExporter.events.length).toBeGreaterThan(0);
       });

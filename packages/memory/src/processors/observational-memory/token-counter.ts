@@ -54,7 +54,7 @@ const IMAGE_FILE_EXTENSIONS = new Set([
   'avif',
 ]);
 
-const TOKEN_ESTIMATE_CACHE_VERSION = 7;
+const TOKEN_ESTIMATE_CACHE_VERSION = 8;
 
 /**
  * Cache `source` marker for token estimates supplied by the caller via
@@ -353,6 +353,11 @@ function isValidCacheEntry(
   );
 }
 
+// Shared across all TokenCounter instances on purpose: on async_hooks-based ALS (Node < 24), every
+// AsyncLocalStorage that has run() is registered process-wide forever and taxes every async resource
+// creation. A per-instance ALS therefore degrades CPU linearly when Memory/OM is constructed per request.
+const modelContextStorage = new AsyncLocalStorage<ReadonlyMap<TokenCounter, TokenCounterModelContext | undefined>>();
+
 function parseModelContext(model?: string | TokenCounterModelContext): TokenCounterModelContext | undefined {
   if (!model) return undefined;
   if (typeof model === 'object') {
@@ -420,7 +425,7 @@ function getFiniteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-function isHttpUrlString(value: unknown): boolean {
+export function isHttpUrlString(value: unknown): boolean {
   return typeof value === 'string' && /^https?:\/\//i.test(value);
 }
 
@@ -443,7 +448,11 @@ function isLikelyBase64Content(value: string): boolean {
   return /^[A-Za-z0-9+/]+={0,2}$/.test(value);
 }
 
-function decodeImageBuffer(value: unknown): Buffer | undefined {
+/**
+ * Decodes a stored attachment payload (data URI, raw base64, Buffer, or typed array) into bytes.
+ * Returns undefined for remote URLs, filesystem paths, and anything that isn't a decodable payload.
+ */
+export function decodeImageBuffer(value: unknown): Buffer | undefined {
   if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
     return value;
   }
@@ -1222,7 +1231,6 @@ async function fetchGoogleAttachmentTokenEstimate(modelId: string, part: Cacheab
 export class TokenCounter {
   private readonly cacheSource: string;
   private readonly defaultModelContext?: TokenCounterModelContext;
-  private readonly modelContextStorage = new AsyncLocalStorage<TokenCounterModelContext | undefined>();
   private readonly inFlightAttachmentCounts = new Map<string, Promise<number | undefined>>();
   private readonly multimodalToolResultCounts = new WeakMap<object, { resultKey: string; tokens: number }>();
 
@@ -1238,11 +1246,13 @@ export class TokenCounter {
   }
 
   runWithModelContext<T>(model: string | TokenCounterModelContext | undefined, fn: () => T): T {
-    return this.modelContextStorage.run(parseModelContext(model), fn);
+    const contexts = new Map(modelContextStorage.getStore());
+    contexts.set(this, parseModelContext(model));
+    return modelContextStorage.run(contexts, fn);
   }
 
   private getModelContext(): TokenCounterModelContext | undefined {
-    return this.modelContextStorage.getStore() ?? this.defaultModelContext;
+    return modelContextStorage.getStore()?.get(this) ?? this.defaultModelContext;
   }
 
   /**

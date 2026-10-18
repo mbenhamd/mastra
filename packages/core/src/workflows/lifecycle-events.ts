@@ -193,11 +193,15 @@ function scheduleWorkflowLifecycleTopicCleanup(pubsub: PubSub, topic: string): v
   const existing = timers.get(topic);
   if (existing) clearTimeout(existing);
 
-  const deadline = Date.now() + retentionMs;
+  // Count the retention down by the delays actually scheduled rather than re-reading the
+  // wall clock: a timer only re-arms to cover setTimeout's 2^31-1 ms cap, so a clock that
+  // does not advance with the timers (fake timers, a mocked Date.now) cannot re-arm forever.
+  let remaining = retentionMs;
   const arm = () => {
-    const remaining = deadline - Date.now();
     if (remaining > 0) {
-      const timer = setTimeout(arm, Math.min(remaining, 2_147_483_647));
+      const delay = Math.min(remaining, 2_147_483_647);
+      remaining -= delay;
+      const timer = setTimeout(arm, delay);
       timer.unref?.();
       timers!.set(topic, timer);
       return;

@@ -287,7 +287,8 @@ describe('DurableAgent isTaskComplete', () => {
         scorers: [scorer as any],
       } as any,
     });
-    expect(prepared.workflowInput.requestContextEntries).toBeUndefined();
+    // Only the Core-written (empty) run scope set is persisted (upstream #26593).
+    expect(prepared.workflowInput.requestContextEntries).toEqual({ mastra__scopes: [] });
     prepared.cleanup();
 
     const { output, cleanup } = await durableAgent.stream('go', {
