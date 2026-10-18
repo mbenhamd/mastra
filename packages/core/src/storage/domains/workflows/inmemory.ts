@@ -320,16 +320,17 @@ function plainErasureSnapshot<T>(value: T): T {
   } catch {
     // A non-configurable own accessor stays; `status` below is still the value read.
   }
-  // Then each other top-level field once, including one an earlier accessor
-  // introduced; an accessor that throws leaves its field out.
-  // Own fields keep their enumerability (a non-enumerable one included);
+  // Then each other top-level field once, including one the status accessor
+  // introduced; an accessor that throws leaves its field out. Own fields keep
+  // their enumerability (non-enumerable own data included, symbols too);
   // inherited enumerable fields become own enumerable ones. Fields are
   // defined, never assigned, so a `__proto__` key stays a field.
   const fields: Record<string, unknown> = {};
   const names = new Map<PropertyKey, boolean>();
   const own = Object.getOwnPropertyDescriptors(record);
   for (const name of Reflect.ownKeys(own)) {
-    names.set(name, (own as Record<PropertyKey, PropertyDescriptor>)[name]!.enumerable ?? false);
+    const descriptor = (own as Record<PropertyKey, PropertyDescriptor>)[name]!;
+    if (descriptor.enumerable || 'value' in descriptor) names.set(name, descriptor.enumerable ?? false);
   }
   for (
     let level: object | null = Object.getPrototypeOf(record);
