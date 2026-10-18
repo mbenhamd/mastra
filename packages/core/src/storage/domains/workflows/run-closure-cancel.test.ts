@@ -810,7 +810,8 @@ describe('WorkflowsInMemory erasure cancel', () => {
     const { workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-shared-cause' };
     const cause = new Error('root cause');
-    const failure = new Error('wrapped', { cause });
+    const brand = Symbol.for('test.error.brand');
+    const failure = Object.assign(new Error('wrapped', { cause }), { [brand]: true });
     await workflows.persistWorkflowSnapshot({
       ...run,
       resourceId: RESOURCE,
@@ -829,5 +830,6 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(result.failure.message).toBe('wrapped');
     expect(typeof result.failure.stack).toBe('string');
     expect(result.diagnostics.get(result.failure.cause)).toBe('logged');
+    expect((result.failure as unknown as Record<symbol, unknown>)[brand]).toBe(true);
   });
 });

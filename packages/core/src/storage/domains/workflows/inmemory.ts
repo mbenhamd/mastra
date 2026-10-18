@@ -234,10 +234,13 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   if (value instanceof Error) {
     const error: object = Object.create(Object.getPrototypeOf(value));
     seen.set(value, error);
-    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+    // Every own key, symbols included (an SDK error's brand is one).
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (const name of Reflect.ownKeys(descriptors)) {
+      const descriptor = descriptors[name as keyof typeof descriptors] as PropertyDescriptor;
       let field: unknown;
       try {
-        field = 'value' in descriptor ? descriptor.value : (value as unknown as Record<string, unknown>)[name];
+        field = 'value' in descriptor ? descriptor.value : (value as unknown as Record<PropertyKey, unknown>)[name];
       } catch {
         continue;
       }
