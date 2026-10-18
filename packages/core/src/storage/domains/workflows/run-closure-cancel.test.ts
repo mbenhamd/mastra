@@ -677,6 +677,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
           failures: new Map([['first', new Error('first kept')]]),
           tags: new Set([new Error('tag kept')]),
           source: new URL('https://example.org/paper'),
+          bytes: Buffer.from('payload'),
         },
       },
     });
@@ -690,6 +691,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
       failures: Map<string, Error>;
       tags: Set<Error>;
       source: URL;
+      bytes: Buffer;
     };
     expect(result.finishedAt).toEqual(finishedAt);
     expect(result.counts.get('papers')).toBe(3);
@@ -697,6 +699,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(result.failures.get('first')?.message).toBe('first kept');
     expect([...result.tags][0]?.message).toBe('tag kept');
     expect(result.source.href).toBe('https://example.org/paper');
+    expect(Buffer.isBuffer(result.bytes) && result.bytes.toString('base64')).toBe('cGF5bG9hZA==');
   });
 
   it('finishes the erasure of a run reopened and then settled with another status', async () => {
