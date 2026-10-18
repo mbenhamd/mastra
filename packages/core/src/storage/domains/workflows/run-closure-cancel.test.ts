@@ -867,27 +867,43 @@ describe('WorkflowsInMemory erasure cancel', () => {
   });
 
   it('never runs a stored error accessor on the stored error during a refused cancel', async () => {
-    const { db, workflows } = setup();
+    const { workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-error-accessor' };
-    await persist(workflows, run, 'running');
-    const key = JSON.stringify([run.workflowName, run.runId]);
-    const record = db.workflows.get(key)!;
     const failure = new Error('stored');
     let receiver: unknown;
-    Object.defineProperty(failure, 'detail', {
-      enumerable: false,
-      get() {
-        receiver = this;
-        (this as { message: string }).message = 'mutated';
-        return 'detail';
+    let boundReads = 0;
+    Object.defineProperties(failure, {
+      detail: {
+        enumerable: false,
+        get: new Proxy(function (this: Error) {
+          receiver = this;
+          this.message = 'mutated';
+          return 'detail';
+        }, {}),
+      },
+      boundDetail: {
+        enumerable: false,
+        get: function () {
+          boundReads++;
+          return 'bound detail';
+        }.bind(undefined),
       },
     });
-    const snapshot = record.snapshot as WorkflowRunState;
-    db.workflows.set(key, { ...record, snapshot: { ...snapshot, result: { failure } } as WorkflowRunState });
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'running', result: { failure } },
+    });
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({
+      result: { failure: { message: 'stored' } },
+    });
 
     await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
-    expect(failure.message).toBe('stored');
-    expect(receiver).not.toBe(failure);
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({
+      result: { failure: { message: 'stored' } },
+    });
+    expect(receiver).toBeUndefined();
+    expect(boundReads).toBe(0);
   });
 
   it('keeps references a settled payload shares through symbol-keyed fields', async () => {

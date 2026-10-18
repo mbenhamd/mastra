@@ -204,7 +204,7 @@ export function cloneRunData<T>(value: T): T {
 }
 
 /**
- * A structural copy that never invokes an accessor: data properties are copied
+ * A structural copy that never invokes a caller accessor: data properties are copied
  * recursively, accessors are copied as accessors. An accessor read on the copy
  * then mutates the copy, never the stored row.
  */
@@ -228,9 +228,9 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
     return set;
   }
   // An error keeps its prototype; its own fields are detached through the
-  // same memo (a `cause` shared with the payload stays shared), and a native
-  // accessor such as V8's lazy `stack` is read on the error itself and kept
-  // as data.
+  // same memo (a `cause` shared with the payload stays shared). V8's lazy
+  // `stack` accessor is recognized by identity, read on the error itself,
+  // and kept as data.
   if (value instanceof Error) {
     const error: object = Object.create(Object.getPrototypeOf(value));
     seen.set(value, error);
@@ -238,14 +238,14 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
     const descriptors = Object.getOwnPropertyDescriptors(value);
     for (const name of Reflect.ownKeys(descriptors)) {
       const descriptor = descriptors[name as keyof typeof descriptors] as PropertyDescriptor;
-      if (!('value' in descriptor) && descriptor.get && !isNativeFunction(descriptor.get)) {
+      if (!('value' in descriptor) && descriptor.get && descriptor.get !== NATIVE_ERROR_STACK_GET) {
         // A caller accessor is copied as an accessor and read later, on the copy.
         Object.defineProperty(error, name, { ...descriptor, configurable: true });
         continue;
       }
       let field: unknown;
       try {
-        // A native accessor (V8's lazy `stack`) needs the real error to read.
+        // V8's recognized lazy `stack` accessor needs the real error to read.
         field = 'value' in descriptor ? descriptor.value : (value as unknown as Record<PropertyKey, unknown>)[name];
       } catch {
         continue;
@@ -283,15 +283,6 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   }
   Object.defineProperties(copy, descriptors);
   return copy;
-}
-
-/** True for an engine-provided function, which runs no caller code. */
-function isNativeFunction(fn: Function): boolean {
-  try {
-    return /\{\s*\[native code\]\s*\}\s*$/.test(Function.prototype.toString.call(fn));
-  } catch {
-    return false;
-  }
 }
 
 /** Reads a field once on a detached copy; an accessor that throws yields `undefined`. */
