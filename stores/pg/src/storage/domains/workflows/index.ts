@@ -6158,12 +6158,13 @@ export class WorkflowsPG extends WorkflowsStorage {
         const now = new Date();
         await t.none(
           `UPDATE ${this.workflowSnapshotTableName()}
-           SET snapshot = $3, "updatedAt" = $4, "updatedAtZ" = $4
+           SET snapshot = $3, "updatedAt" = $4, "updatedAtZ" = $5
            WHERE workflow_name = $1 AND run_id = $2`,
           [
             workflowName,
             runId,
             snapshotColumnType === 'jsonb' ? toPgJson(canceled) : sanitizeJsonForPg(JSON.stringify(canceled)),
+            now,
             now,
           ],
         );

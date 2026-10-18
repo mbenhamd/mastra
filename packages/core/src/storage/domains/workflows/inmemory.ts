@@ -881,9 +881,18 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     if (this.db.workflowTerminalParentRevisions.has(key) && !this.db.workflows.has(key)) {
       return { status: 'missing_run' };
     }
+    // What each parent looked like when checked: re-verified right before the
+    // commit, since reading a parent's graph can run caller code (a getter)
+    // that cancels or rewrites the parent in between.
+    const checkedParents: { key: string; run: StorageWorkflowRun | undefined; generation: number | undefined }[] = [];
     for (const frame of desired.ancestry) {
       const parentKey = this.getWorkflowKey(frame.parentWorkflowName, frame.parentRunId);
       const parentRevision = this.db.workflowTerminalParentRevisions.get(parentKey);
+      checkedParents.push({
+        key: parentKey,
+        run: this.db.workflows.get(parentKey),
+        generation: parentRevision?.generation,
+      });
       if (parentRevision?.terminalStatus) {
         throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
       }
@@ -921,6 +930,16 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       ).ancestryHash;
       if (expectedTailHash !== retainedTailHash) {
         return { status: 'ancestry_conflict' };
+      }
+    }
+    for (const checked of checkedParents) {
+      const revision = this.db.workflowTerminalParentRevisions.get(checked.key);
+      if (
+        this.db.workflows.get(checked.key) !== checked.run ||
+        revision?.generation !== checked.generation ||
+        revision?.terminalStatus
+      ) {
+        throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
       }
     }
     this.db.workflowTerminalRecoveryAncestries.set(key, copyWorkflowTerminalRecoveryAncestryRecord(desired));
@@ -2102,8 +2121,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // id starts running again. The generation still moves forward.
     const kept = this.db.workflowTerminalParentRevisions.get(key);
     if (kept && kept.terminalStatus !== null) {
+      const { erasureCancelled: _erasureCancelled, ...unlatched } = kept;
       this.db.workflowTerminalParentRevisions.set(key, {
-        ...kept,
+        ...unlatched,
         generation: snapshotDeleted ? kept.generation : kept.generation + 1,
         terminalStatus: null,
       });
@@ -2152,6 +2172,8 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       updatedAt: new Date(),
     });
     this.bumpParentRevision(key);
+    const latched = this.db.workflowTerminalParentRevisions.get(key);
+    if (latched) this.db.workflowTerminalParentRevisions.set(key, { ...latched, erasureCancelled: true });
     return { status: 'cancelled' };
   }
 
@@ -2690,13 +2712,22 @@ export class WorkflowsInMemory extends WorkflowsStorage {
           throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
         }
       }
-      // Cloning the caller snapshot can invoke toJSON/getters that reenter
-      // this map; restart if a reentrant write changed the row so a persisted
+      // Cloning the caller snapshot and reading an inherited status getter
+      // can reenter this map; restart if either changed the row so a persisted
       // snapshot never silently overwrites a newer record.
       const clonedSnapshot = cloneRunData(snapshot);
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      const snapshotStatus = revision?.erasureCancelled ? clonedSnapshot?.status : undefined;
       if (this.db.workflows.get(key) !== existing) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      // An erasure cancel's `canceled` latch refuses a snapshot whose status
+      // disagrees, before anything is written, as the PostgreSQL store's
+      // parent revision bump refuses it: a queued engine write cannot reopen
+      // a cancelled run.
+      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
       const data: StorageWorkflowRun = {
         workflow_name: workflowName,

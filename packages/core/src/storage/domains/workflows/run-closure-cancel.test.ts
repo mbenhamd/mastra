@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { WorkflowRunState } from '../../../workflows';
 import { createWorkflowTerminalGraphFingerprint } from '../../../workflows/terminal-continuation';
 import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
+import { WorkflowStaleSnapshotPersistError } from '../../workflow-snapshot-handoff';
 import { InMemoryDB } from '../inmemory-db';
 import { WorkflowsInMemory } from './inmemory';
 
@@ -139,5 +140,106 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'failed',
       result: { draft: `${settled.runId} draft` },
     });
+  });
+
+  it('moves the parent revision and latches canceled, so a later snapshot write is refused', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-latched' };
+    await persist(workflows, run, 'waiting');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const before = db.workflowTerminalParentRevisions.get(key);
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'cancelled' });
+    const after = db.workflowTerminalParentRevisions.get(key);
+    expect(after?.generation).toBe((before?.generation ?? 0) + 1);
+    expect(after?.terminalStatus).toBe('canceled');
+
+    // A queued engine write after the cancel cannot reopen the erased run.
+    await expect(persist(workflows, run, 'running')).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'canceled' });
+
+    // Matching canceled writes remain valid. An inherited status getter can
+    // reenter persist, so an omitted resource must use the latest row's owner.
+    const canceled = (await workflows.loadWorkflowSnapshot(run))!;
+    const { status: _status, ...snapshot } = canceled;
+    const nextResource = 'workspace-2:user-1';
+    let reentered = false;
+    let reentrantWrite: Promise<void> | undefined;
+    const statusReader = {
+      get status() {
+        if (!reentered) {
+          reentered = true;
+          reentrantWrite = workflows.persistWorkflowSnapshot({
+            ...run,
+            resourceId: nextResource,
+            snapshot: canceled,
+          });
+        }
+        return 'canceled';
+      },
+    };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      snapshot: Object.assign(Object.create(statusReader), snapshot),
+    });
+    await reentrantWrite;
+    expect(reentered).toBe(true);
+    expect(db.workflows.get(key)?.resourceId).toBe(nextResource);
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: nextResource }),
+    ).resolves.toMatchObject({
+      status: 'deleted',
+    });
+    await persist(workflows, run, 'running');
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
+  });
+
+  it('refuses a child ancestry admission when the parent is cancelled while its graph is read', async () => {
+    const { db, workflows } = setup();
+    const parent = { workflowName: 'deep-scan', runId: 'run-parent-raced' };
+    const child = { workflowName: 'deep-scan-child', runId: 'run-child-raced' };
+    await persist(workflows, parent, 'running');
+    await persist(workflows, child, 'running');
+    // The parent's stored graph is read through a getter that cancels the
+    // parent first, as a cancel interleaving with the admission would.
+    const parentKey = JSON.stringify([parent.workflowName, parent.runId]);
+    const record = db.workflows.get(parentKey)!;
+    const { serializedStepGraph: _graph, ...rest } = record.snapshot as WorkflowRunState;
+    let cancelled = false;
+    const graphReader = {
+      get serializedStepGraph() {
+        if (!cancelled) {
+          cancelled = true;
+          void cancel(workflows, parent);
+        }
+        return NESTED_GRAPH;
+      },
+    };
+    db.workflows.set(parentKey, { ...record, snapshot: Object.assign(Object.create(graphReader), rest) });
+
+    await expect(
+      workflows.persistWorkflowTerminalRecoveryAncestry({
+        ...child,
+        ancestry: [
+          {
+            version: 1,
+            childWorkflowName: child.workflowName,
+            childRunId: child.runId,
+            parentWorkflowName: parent.workflowName,
+            parentRunId: parent.runId,
+            parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(NESTED_GRAPH),
+            source: { kind: 'step', stepId: NESTED_STEP, executionPath: [0] },
+            inputPointer: { kind: 'parent-source-payload', stepId: NESTED_STEP },
+            resultPointer: { kind: 'retained-terminal-result', ...child },
+            resumeMetadata: { wasResume: false, resumeSteps: [] },
+          },
+        ],
+      }),
+    ).rejects.toThrow('Workflow terminal recovery ancestry parent evidence is unavailable');
+    expect(cancelled).toBe(true);
+    await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+      status: 'missing_ancestry',
+    });
+    await expect(workflows.loadWorkflowSnapshot(parent)).resolves.toMatchObject({ status: 'canceled' });
   });
 });

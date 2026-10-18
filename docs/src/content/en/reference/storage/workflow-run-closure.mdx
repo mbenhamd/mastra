@@ -72,14 +72,14 @@ Settles a run that will never settle on its own, so its closure can be erased. F
 
 Input: `{ workflowName, runId, expectedResourceId }`.
 
-Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write happen in one atomic step, under the same locks as `deleteWorkflowRunClosure`. So no journal and no nested child can appear between a check and the write. The checks run in this order, and nothing changes unless the result is `cancelled`:
+Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write happen in one atomic step, under the same locks as `deleteWorkflowRunClosure`. A journal or nested child can't appear between a check and the write. The checks run in this order, and nothing changes unless the result is `cancelled`:
 
 - `missing`: storage holds no snapshot for the run.
 - `resource_mismatch`: the snapshot, handoff or terminal snapshot records another resource, or the snapshot records none.
 - `fenced`: an unreleased handoff, pending or completed, fences the run's snapshot writes. This is the same fence `persistWorkflowSnapshot` enforces.
 - `journaled`: the run has a terminalization journal, in any phase. Its owner settles the run, so the run is never overwritten.
 - `active`: retry later. Either a nested child run hasn't completed its terminal journal, or the run's parent revision latched a terminal status that its snapshot doesn't show yet. The nested child can be linked by a parent effect or by recovery ancestry, whatever its resource.
-- `settled`: the snapshot status is already settled. There is nothing to overwrite.
+- `settled`: the snapshot status is already settled and remains unchanged.
 - `cancelled`: the snapshot is now an empty `canceled` snapshot. The parent revision moved, and latched `canceled`, as for any snapshot write.
 - `unsupported`: the store doesn't implement the erasure cancel.
 

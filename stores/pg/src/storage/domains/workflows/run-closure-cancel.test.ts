@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createEmptyWorkflowSnapshot, createWorkflowTerminalGraphFingerprint } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
+import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PostgresStore, WorkflowsPG } from '../../index';
 
@@ -109,7 +110,26 @@ describe('WorkflowsPG erasure cancel', () => {
     expect(Number(after.generation)).toBe(Number(before.generation) + 1);
     expect(after.terminal_status).toBe('canceled');
 
+    await expect(workflows.persistWorkflowSnapshot({ ...run, snapshot: stored! })).resolves.toBeUndefined();
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'canceled' });
     await expect(cancel(run)).resolves.toEqual({ status: 'settled' });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+    await persist(run, 'running');
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
+  });
+
+  it('rolls back a late snapshot write after the cancel, so the closure delete still erases the run', async () => {
+    const run = newRun();
+    await persist(run, 'waiting');
+    await expect(cancel(run)).resolves.toEqual({ status: 'cancelled' });
+    const latched = await parentRevision(run);
+
+    // A queued engine write after the cancel: the parent revision conflict rolls it back.
+    await expect(persist(run, 'running')).rejects.toThrow();
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'canceled' });
+    await expect(parentRevision(run)).resolves.toEqual(latched);
     await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toMatchObject({
       status: 'deleted',
     });
@@ -162,6 +182,155 @@ describe('WorkflowsPG erasure cancel', () => {
     await expect(workflows.loadWorkflowSnapshot(settled)).resolves.toMatchObject({
       status: 'failed',
       result: { draft: `${settled.runId} draft` },
+    });
+  });
+
+  describe('under contention on the run lock', () => {
+    const lockKey = (run: Run) => JSON.stringify([run.workflowName, run.runId]);
+    /** A separate session that holds the run lock while the store's calls queue on it. */
+    const lockPool = new Pool({ connectionString, max: 1 });
+    afterAll(async () => {
+      await lockPool.end();
+    });
+
+    /** Waits until `count` sessions queue on the run's advisory lock. */
+    async function untilQueued(run: Run, count: number) {
+      for (let attempt = 0; attempt < 400; attempt++) {
+        const queued = await store.db.one<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_locks
+           WHERE locktype = 'advisory' AND NOT granted
+             AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)`,
+          [lockKey(run)],
+        );
+        if (queued.n >= count) return;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      throw new Error(`fewer than ${count} sessions queued on the run lock`);
+    }
+
+    /**
+     * Holds the run's advisory lock (the first lock both the cancel and its
+     * competitor take) while it starts `first`, then `second`, then lets go.
+     */
+    async function inLockOrder<A, B>(run: Run, first: () => Promise<A>, second: () => Promise<B>) {
+      const holder = await lockPool.connect();
+      const pending: Promise<unknown>[] = [];
+      let transactionOpen = false;
+      try {
+        await holder.query('BEGIN');
+        transactionOpen = true;
+        await holder.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [lockKey(run)]);
+        const a = first();
+        pending.push(Promise.allSettled([a]));
+        await untilQueued(run, 1);
+        const b = second();
+        pending.push(Promise.allSettled([b]));
+        await untilQueued(run, 2);
+        await holder.query('COMMIT');
+        transactionOpen = false;
+        return await Promise.allSettled([a, b]);
+      } finally {
+        try {
+          if (transactionOpen) await holder.query('ROLLBACK');
+        } finally {
+          // Destroy an interrupted holder even if rollback failed, releasing
+          // its advisory lock before draining every call already started.
+          holder.release(transactionOpen);
+          await Promise.allSettled(pending);
+        }
+      }
+    }
+
+    const ancestryOf = (child: Run, parent: Run) => ({
+      ...child,
+      ancestry: [
+        {
+          version: 1 as const,
+          childWorkflowName: child.workflowName,
+          childRunId: child.runId,
+          parentWorkflowName: parent.workflowName,
+          parentRunId: parent.runId,
+          parentGraphFingerprint: createWorkflowTerminalGraphFingerprint(NESTED_GRAPH),
+          source: { kind: 'step' as const, stepId: NESTED_STEP, executionPath: [0] },
+          inputPointer: { kind: 'parent-source-payload' as const, stepId: NESTED_STEP },
+          resultPointer: { kind: 'retained-terminal-result' as const, ...child },
+          resumeMetadata: { wasResume: false, resumeSteps: [] },
+        },
+      ],
+    });
+
+    it('waits behind a journal claim on the run lock, then answers journaled', async () => {
+      const run = newRun();
+      await persist(run, 'running');
+      const [claim, cancelled] = await inLockOrder(
+        run,
+        () =>
+          workflows.claimWorkflowTerminalization({
+            ...run,
+            eventKey: `${run.runId}-event`,
+            terminalStatus: 'success',
+            ownerId: `${run.runId}-owner`,
+            leaseMs: 60_000,
+          }),
+        () => cancel(run),
+      );
+      expect(claim).toMatchObject({ status: 'fulfilled', value: { status: 'acquired' } });
+      expect(cancelled).toEqual({ status: 'fulfilled', value: { status: 'journaled' } });
+      await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
+    });
+
+    it('serializes a child ancestry admission with the cancel of its parent, in either order', async () => {
+      const parent = newRun();
+      const child = newRun();
+      await persist(parent, 'running');
+      await persist(child, 'running');
+      // The cancel first: the admission then finds the parent latched canceled.
+      const [cancelled, admitted] = await inLockOrder(
+        parent,
+        () => cancel(parent),
+        () => workflows.persistWorkflowTerminalRecoveryAncestry(ancestryOf(child, parent)),
+      );
+      expect(cancelled).toEqual({ status: 'fulfilled', value: { status: 'cancelled' } });
+      expect(admitted).toMatchObject({ status: 'rejected' });
+      await expect(workflows.getWorkflowTerminalRecoveryAncestry(child)).resolves.toEqual({
+        status: 'missing_ancestry',
+      });
+
+      const otherParent = newRun();
+      const otherChild = newRun();
+      await persist(otherParent, 'running');
+      await persist(otherChild, 'running');
+      // The admission first: the parent now has a pending dependent.
+      const [admittedFirst, refused] = await inLockOrder(
+        otherParent,
+        () => workflows.persistWorkflowTerminalRecoveryAncestry(ancestryOf(otherChild, otherParent)),
+        () => cancel(otherParent),
+      );
+      expect(admittedFirst).toMatchObject({ status: 'fulfilled', value: { status: 'persisted' } });
+      expect(refused).toEqual({ status: 'fulfilled', value: { status: 'active' } });
+      await expect(workflows.loadWorkflowSnapshot(otherParent)).resolves.toMatchObject({ status: 'running' });
+    });
+
+    it('serializes the closure delete with the cancel without a deadlock, in either order', async () => {
+      const run = newRun();
+      await persist(run, 'suspended');
+      const [cancelled, deleted] = await inLockOrder(
+        run,
+        () => cancel(run),
+        () => workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource }),
+      );
+      expect(cancelled).toEqual({ status: 'fulfilled', value: { status: 'cancelled' } });
+      expect(deleted).toMatchObject({ status: 'fulfilled', value: { status: 'deleted' } });
+
+      const other = newRun();
+      await persist(other, 'suspended');
+      const [active, cancelledAfter] = await inLockOrder(
+        other,
+        () => workflows.deleteWorkflowRunClosure({ ...other, expectedResourceId: resource }),
+        () => cancel(other),
+      );
+      expect(active).toEqual({ status: 'fulfilled', value: { status: 'active' } });
+      expect(cancelledAfter).toEqual({ status: 'fulfilled', value: { status: 'cancelled' } });
     });
   });
 });
