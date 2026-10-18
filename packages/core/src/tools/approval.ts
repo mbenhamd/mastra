@@ -1,3 +1,4 @@
+import { isApprovalExempt } from './toolchecks';
 import type { RequireToolApproval, ToolApprovalContext } from './types';
 
 type RequestContextLike = Record<string, unknown> | { entries(): Iterable<[string, unknown]> };
@@ -78,6 +79,10 @@ export async function resolveToolApprovalRequirement({
   logger,
   toolName,
 }: ResolveToolApprovalParams): Promise<ResolvedToolApproval> {
+  // Upstream #27296: approval-exempt tools (Mastra skill tools) never pause for
+  // approval, not even under a global `requireToolApproval`.
+  if (tool && isApprovalExempt(tool)) return { required: false, reasons: [] };
+
   // Evaluate the global policy first — it can be a per-call function (#17337).
   let globalRequiresApproval: boolean;
   if (typeof requireToolApproval === 'function') {

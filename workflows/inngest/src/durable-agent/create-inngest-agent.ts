@@ -1681,10 +1681,17 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         const closeResumeOnSuspend =
           (resumeOptions as any)?.[CLOSE_ON_SUSPEND] === true || resumeOptions?.closeOnSuspend === true;
 
+        // Upstream #27372: the segment being resumed publishes its SUSPENDED event
+        // after its snapshot is saved, so it can land after `resumeOffset`. Every
+        // real re-suspension of this segment streams its own chunk first, so a
+        // SUSPENDED event seen before any chunk belongs to the earlier segment and
+        // must not close (or be reported by) this stream.
+        let resumedChunkSeen = false;
         // Re-subscribe to the stream
         const {
           output,
           cleanup: streamCleanup,
+          detach: detachStream,
           ready,
         } = createDurableAgentStream<TOutput>({
           pubsub: resumePubsub,
@@ -1699,7 +1706,10 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           threadId: resumeOptions?.threadId,
           resourceId: resumeOptions?.resourceId,
           structuredOutput: existingEntry.structuredOutput as StructuredOutputOptions<TOutput> | undefined,
-          onChunk: callbackOptions.onChunk,
+          onChunk: chunk => {
+            resumedChunkSeen = true;
+            return callbackOptions.onChunk?.(chunk);
+          },
           onStepFinish: callbackOptions.onStepFinish,
           onFinish: async result => {
             try {
@@ -1715,7 +1725,14 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
               finalizeResumeRegistry();
             }
           },
-          onSuspended: callbackOptions.onSuspended,
+          onSuspended: async data => {
+            if (!resumedChunkSeen) return;
+            try {
+              await callbackOptions.onSuspended?.(data);
+            } finally {
+              if (closeResumeOnSuspend) detachStream();
+            }
+          },
           onAbort: async data => {
             try {
               await (callbackOptions.onAbort as ((event: any) => void | Promise<void>) | undefined)?.(data);
@@ -1723,9 +1740,9 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
               finalizeResumeRegistry();
             }
           },
-          // Honour upstream's public option as well as the fork's internal symbol:
-          // generate()/resumeGenerate() now pass `closeOnSuspend: true`.
-          closeOnSuspend: closeResumeOnSuspend,
+          // Closing on suspend (upstream's public option or the fork's internal
+          // symbol) is handled in onSuspended above (upstream #27372).
+          closeOnSuspend: false,
         });
         const didThreadRunPublishTerminal = agentThreadStreamRuntime.captureThreadRunTerminalPublish(
           runId,

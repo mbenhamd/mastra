@@ -1840,13 +1840,9 @@ export class WorkflowEventProcessor extends EventProcessor {
       // at start — and without the terminal update it would leak forever as a
       // stale record byte-identical to a genuinely orphaned run, polluting
       // `listActiveRuns()` / `recoverActiveRuns()` (issue #22209). Terminal
-      // runs can't be resumed, so drop the row entirely. Best-effort: a storage
-      // failure here must not abort run completion.
-      try {
-        await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: workflowId });
-      } catch (e) {
-        this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
-      }
+      // runs can't be resumed, so the row is dropped, but only after the
+      // terminal publications succeed (upstream #27355: `deleteSnapshotAfterEnd`
+      // on the workflow.end handoff, deleted in processWorkflowEnd).
       // Storage has no atomic compare-and-delete contract. This branch keeps
       // the historical opt-out cleanup behavior; concurrent ownership cannot
       // be claimed from the delete result.
@@ -1932,11 +1928,18 @@ export class WorkflowEventProcessor extends EventProcessor {
     await this.mastra.pubsub.publish('workflows', {
       type: 'workflow.end',
       runId,
-      data: { ...args, prevResult: normalizedPrevResult, workflow: undefined },
+      data: {
+        ...args,
+        prevResult: normalizedPrevResult,
+        workflow: undefined,
+        deleteSnapshotAfterEnd: !shouldPersist && finalStatus !== 'paused',
+      },
     });
   }
 
-  protected async processWorkflowEnd(args: ProcessorArgs) {
+  protected async processWorkflowEnd(args: ProcessorArgs & { deleteSnapshotAfterEnd?: boolean }) {
+    // Keep cleanup intent local to this serialized handoff, not downstream notifications.
+    const { deleteSnapshotAfterEnd, ...finishArgs } = args;
     const {
       resumeSteps,
       prevResult,
@@ -2056,8 +2059,19 @@ export class WorkflowEventProcessor extends EventProcessor {
     await this.mastra.pubsub.publish('workflows-finish', {
       type: 'workflow.end',
       runId,
-      data: { ...args, workflow: undefined, state: finalState },
+      data: { ...finishArgs, workflow: undefined, state: finalState },
     });
+
+    if (deleteSnapshotAfterEnd === true) {
+      // Declined terminal snapshots must not outlive completed runs (#22209),
+      // but remain recoverable until parent/loop and finish publications succeed.
+      try {
+        const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
+        await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: workflowId });
+      } catch (e) {
+        this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
+      }
+    }
 
     // Clean up run-scoped internal workflow registrations (e.g. execution-workflow)
     // now that all events for this run have been processed.
@@ -2229,7 +2243,8 @@ export class WorkflowEventProcessor extends EventProcessor {
     // Upstream #26418: when another execution took over the run it drives the run from the
     // stored snapshot; this execution neither marks it failed, deletes it, nor publishes a
     // terminal result (fail closed on terminal admission).
-    if (workflow?.options?.isOwnershipLostError?.((prevResult as any)?.error)) {
+    const ownershipLost = workflow?.options?.isOwnershipLostError?.((prevResult as any)?.error);
+    if (ownershipLost) {
       terminalAdmission = false;
     } else if (shouldPersist && workflowsStore) {
       const updated = await workflowsStore.updateWorkflowState({
@@ -2255,12 +2270,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       // Mirrors endWorkflow: a run whose workflow opted out of persisting the
       // terminal 'failed' status would otherwise leak its earlier-phase
       // ('running'/'pending'/'suspended') snapshot row forever (issue #22209).
-      // Best-effort: a storage failure here must not abort run completion.
-      try {
-        await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: workflowId });
-      } catch (e) {
-        this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
-      }
+      // The row is deleted after every terminal publication (upstream #27355).
       // There is no atomic compare-and-delete contract. Preserve this legacy
       // opt-out cleanup branch without claiming concurrent ownership.
       terminalAdmission = true;
@@ -2338,6 +2348,15 @@ export class WorkflowEventProcessor extends EventProcessor {
       runId,
       data: { ...args, workflow: undefined, state: finalState },
     });
+
+    if (!ownershipLost && !shouldPersist) {
+      // As with successful runs, cleanup must wait for every terminal publication.
+      try {
+        await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: workflowId });
+      } catch (e) {
+        this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
+      }
+    }
 
     // Clean up run-scoped internal workflow registrations (e.g. execution-workflow)
     // now that all events for this run have been processed.

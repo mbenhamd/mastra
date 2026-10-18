@@ -510,6 +510,10 @@ Discovers runs stuck in `running` status for this agent and re-drives them from 
 
 Before a run is re-driven, Mastra acquires a recovery lease keyed by agent and run. That lease is process-local with `EventEmitterPubSub`. Cross-replica exclusion requires the agent's shared PubSub backend to implement `LeaseProvider`, such as `RedisStreamsPubSub` or `ValkeyStreamsPubSub`; otherwise use a single recovery replica or external leader election.
 
+Attempts run serially. Each attempt has a single 30-second wait budget covering both `recover()` setup and settlement of the whole recovered workflow. When the budget expires, recovery moves to the next run and returns `status: 'skipped'` with `reason: 'recovery-timeout'` and no `retryAt`. The timeout doesn't cancel setup or execution, release a live claim, or count as success or failure. The attempt continues in the background, and its eventual outcome doesn't change the returned results. Mastra doesn't automatically retry a timed-out attempt.
+
+The budget applies only to each run attempt in `recoverActiveRuns()`, not to discovery, a direct `recover()` call, or overridden custom recovery methods. When shutdown begins, recovery stops dispatching new runs. The original attempt remains tracked for Mastra's shared shutdown drain even after the wait times out.
+
 ```typescript
 const result = await durableAgent.recoverActiveRuns()
 // {
@@ -535,6 +539,7 @@ A run that another execution still drives isn't taken over. Its entry has `statu
 | `run-active` | Another execution, possibly in another process, holds the run. Sets `retryAt`. |
 | `run-active-locally` | This process is executing the run. |
 | `already-in-progress` | This process is already recovering the run. |
+| `recovery-timeout` | The 30-second wait budget expired. The attempt continues in the background, with no `retryAt` or automatic retry. |
 
 Returns:
 
@@ -544,7 +549,7 @@ interface DurableAgentRecoverActiveRunsResult {
     runId: string
     status: 'success' | 'failed' | 'skipped'
     error?: Error
-    reason?: 'run-active' | 'run-active-locally' | 'already-in-progress'
+    reason?: 'run-active' | 'run-active-locally' | 'already-in-progress' | 'recovery-timeout'
     // Epoch milliseconds
     retryAt?: number
   }>

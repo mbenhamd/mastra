@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { getBuiltToolFGAResourceId } from '../../auth/ee/fga-check';
 import { noopLogger } from '../../logger';
-import { runBeforeApprovalHook } from '../../loop/workflows/agentic-execution/tool-approval-verdict';
+import { runBeforeApprovalChecks } from '../../loop/workflows/agentic-execution/tool-approval-verdict';
 import { SpanType } from '../../observability';
 import type { AnySpan } from '../../observability';
 import { RequestContext } from '../../request-context';
@@ -257,7 +257,7 @@ describe('CoreToolBuilder FGA', () => {
 
     const builtTool = builder.build();
     await expect(
-      runBeforeApprovalHook({
+      runBeforeApprovalChecks({
         tool: builtTool,
         input: { query: 'docs' },
         context: { toolCallId: 'call-1', toolName: 'search', requestContext },
@@ -273,7 +273,7 @@ describe('CoreToolBuilder FGA', () => {
 
     fgaProvider.require.mockResolvedValue(undefined);
     await expect(
-      runBeforeApprovalHook({
+      runBeforeApprovalChecks({
         tool: builtTool,
         input: { query: 'docs' },
         context: { toolCallId: 'call-2', toolName: 'search', requestContext },

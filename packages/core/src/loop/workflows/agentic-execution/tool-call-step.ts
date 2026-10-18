@@ -93,7 +93,7 @@ import {
 } from './eager-tool-execution';
 import type { EagerSuspensionIntent, EagerToolBailout } from './eager-tool-execution';
 import { notifyToolDenied, TOOL_DENIED_CALLBACK_KEY, type ToolDeniedCallback } from './tool-permission-notify';
-import { runBeforeApprovalHook } from './tool-approval-verdict';
+import { runBeforeApprovalChecks } from './tool-approval-verdict';
 
 type AddToolMetadataOptions = {
   toolCallId: string;
@@ -1733,7 +1733,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
           if (!approvalDecision && !isAnyResume) {
             // Upstream #26927: a per-tool beforeApproval hook may reject a fresh call before
             // the approval gate. The tool never executes, so no grant is involved.
-            const rejection = await runBeforeApprovalHook({
+            const rejection = await runBeforeApprovalChecks({
               tool,
               input: args,
               context: {
@@ -2615,8 +2615,11 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
               );
             }
 
+            // Normalize a void result to null like executeToolCall does, so the loop continues
+            // instead of treating the call as pending client work.
+            const serializedResult = ensureSerializable(completedTask.result);
             return {
-              result: ensureSerializable(completedTask.result),
+              result: serializedResult === undefined ? null : serializedResult,
               ...inputData,
               // Preserve the resume/approval envelope on the authoritative
               // result exactly like the sync path below: the model and the

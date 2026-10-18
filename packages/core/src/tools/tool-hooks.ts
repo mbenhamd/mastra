@@ -1,3 +1,4 @@
+import { isApprovalExempt, markApprovalExempt } from './toolchecks';
 import type { CoreTool, MastraToolInvocationOptions, ToolHooks } from './types';
 
 type ToolExecute = NonNullable<CoreTool['execute']>;
@@ -13,6 +14,12 @@ type ToolHookWrapperState = {
 };
 
 const TOOL_HOOK_WRAPPER_STATE = Symbol('mastra.toolHookWrapperState');
+
+/** A spread drops the non-enumerable approval-exemption marker (upstream #27296); carry it over. */
+function withApprovalExemption(source: CoreTool, clone: CoreTool): CoreTool {
+  if (isApprovalExempt(source)) markApprovalExempt(clone);
+  return clone;
+}
 
 type HookWrappedExecute = ToolExecute & {
   [TOOL_HOOK_WRAPPER_STATE]?: ToolHookWrapperState;
@@ -52,10 +59,10 @@ export function unwrapToolsFromHooks(tools: Record<string, CoreTool>): Record<st
     changed = true;
     return [
       toolName,
-      {
+      withApprovalExemption(tool, {
         ...tool,
         execute: state.originalExecute.bind(state.originalReceiver) as ToolExecute,
-      },
+      }),
     ] as const;
   });
 
@@ -132,10 +139,10 @@ function wrapToolWithHooks(
     } satisfies ToolHookWrapperState,
   });
 
-  return {
+  return withApprovalExemption(tool, {
     ...tool,
     execute: wrappedExecute,
-  };
+  });
 }
 
 /**

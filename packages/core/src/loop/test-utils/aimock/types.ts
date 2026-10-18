@@ -77,8 +77,25 @@ export interface LoopScenarioResult {
  *   whose inputs the file-routing path cannot model (dynamic-function
  *   instructions, `sharedAgent`, `workflows`-as-tool, durable resume/suspension)
  *   skip this variant via `{ skip: ['fs'] }`.
+ * - `'inngest'` — durable execution on Inngest via `createInngestAgent`. Core
+ *   cannot depend on `@mastra/inngest`, so this variant only runs when the
+ *   Inngest package registers a {@link ScenarioEngineHost} (see
+ *   `setScenarioEngineHost`); the host then replaces the four in-repo variants.
+ *   Skipping `'durable'` also skips `'inngest'`.
  */
-export type EngineVariant = 'normal' | 'durable' | 'evented' | 'fs';
+export type EngineVariant = 'normal' | 'durable' | 'evented' | 'fs' | 'inngest';
+
+/**
+ * An engine provided from outside core (e.g. `@mastra/inngest`). When set, scenarios run only on
+ * this engine; the host wraps each scenario agent and owns the Mastra instance that serves it.
+ */
+export interface ScenarioEngineHost {
+  engine: EngineVariant;
+  /** Mastra instance the engine's worker resolves agents from. Scenario agents are added to it. */
+  getMastra(): any;
+  /** Wrap a plain scenario `Agent` for this engine. */
+  wrapAgent(agent: any): any;
+}
 
 /** All supported engine variants for parameterised test runs. */
 export const ALL_ENGINE_VARIANTS: readonly EngineVariant[] = ['normal', 'durable', 'evented', 'fs'] as const;
@@ -90,7 +107,7 @@ export const ALL_ENGINE_VARIANTS: readonly EngineVariant[] = ['normal', 'durable
  * automatically covers the evented variant too.
  */
 export function isDurableEngineVariant(engine: EngineVariant | undefined): boolean {
-  return engine === 'durable' || engine === 'evented';
+  return engine === 'durable' || engine === 'evented' || engine === 'inngest';
 }
 
 export interface RunLoopScenarioOptions {
@@ -154,6 +171,11 @@ export interface RunLoopScenarioOptions {
    * drive dynamic instructions / configuration.
    */
   requestContext?: RequestContext<any>;
+  /**
+   * Forwarded to `agent.stream({ requireToolApproval })`. `runApprovalScenario` defaults it to `true`;
+   * pass `false` to test tool-level `requireApproval`, or a function to decide per tool call.
+   */
+  requireToolApproval?: boolean | ((context: { toolName: string; args?: unknown }) => boolean);
   /**
    * Stop condition for the loop. Forwarded to `agent.stream({ stopWhen })`.
    * Use this to bound long/looping tool scenarios.
@@ -331,6 +353,8 @@ export interface RunLoopScenarioOptions {
   outputProcessors?: any;
   /** Tool payload transform policy forwarded to `agent.stream`. */
   transform?: ToolPayloadTransformPolicy;
+  /** Forwarded to `agent.stream({ maxProcessorRetries })`. */
+  maxProcessorRetries?: number;
   /**
    * Input processors forwarded to `agent.stream({ inputProcessors })`. Run before
    * the user message reaches the model request — assert on `requests[0]`.
@@ -401,22 +425,19 @@ export interface RunLoopScenarioOptions {
 }
 
 /**
- * Options for {@link runApprovalScenario}. Extends {@link RunLoopScenarioOptions}
- * with a per-approval decision callback. The loop runs with
- * `requireToolApproval: true`; each suspended tool call is approved or declined
- * based on `decision`.
+ * Options for {@link runApprovalScenario}: the subset of
+ * {@link RunLoopScenarioOptions} it forwards, plus a per-approval decision
+ * callback. The loop runs with `requireToolApproval: true` unless overridden;
+ * each suspended tool call is approved or declined based on `decision`.
  */
-export interface RunApprovalScenarioOptions extends RunLoopScenarioOptions {
+export interface RunApprovalScenarioOptions extends Pick<
+  RunLoopScenarioOptions,
+  'llm' | 'fixtures' | 'prompt' | 'tools' | 'instructions' | 'stopWhen' | 'requireToolApproval' | 'engine'
+> {
   /**
    * Decide whether to approve (`true`) or decline (`false`) each suspended tool
    * call. Called once per approval, in order. `approvalIndex` is the 0-based
    * count of approvals resolved so far.
    */
   decision: (context: { toolCallId: string; approvalIndex: number }) => boolean;
-  /**
-   * Whether to set stream-level `requireToolApproval: true`. Defaults to `true`.
-   * Set to `false` to test tool-level `requireApproval: true` on specific tools.
-   * Can also be a function that decides per-tool-call: `({ toolName }) => boolean`.
-   */
-  requireToolApproval?: boolean | ((context: { toolName: string; args?: unknown }) => boolean);
 }

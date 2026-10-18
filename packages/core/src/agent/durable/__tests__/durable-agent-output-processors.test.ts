@@ -1,8 +1,8 @@
 /**
- * DurableAgent output processor tests for tool chunks.
- *
- * Verifies that tool-result and tool-error chunks are processed through
- * output processors (Bug 4 parity fix).
+ * DurableAgent output processor tests for tool chunks that the aimock scenarios
+ * (output-stream-processor.scenario.test.ts) cannot reach: provider-executed tool
+ * results (an OpenAI chat fixture cannot emit them), a worker with no processors
+ * in its run registry, and replay from the resumable-stream cache.
  */
 
 import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
@@ -326,104 +326,6 @@ describe('DurableAgent output processors run once per tool chunk', () => {
     return { chunks, executeSpy };
   }
 
-  it('processOutputStream sees a tool-result chunk exactly once', async () => {
-    let streamToolResults = 0;
-    let toolResultHook = 0;
-    const processor = {
-      id: 'counter',
-      name: 'Counter',
-      processToolResult: async () => {
-        toolResultHook++;
-      },
-      processOutputStream: async ({ part }: any) => {
-        if (part.type === 'tool-result') streamToolResults++;
-        return part;
-      },
-    };
-
-    const { chunks, executeSpy } = await runWithTool(async () => ({ temp: 72 }), processor);
-
-    expect(executeSpy).toHaveBeenCalledTimes(1);
-    expect(toolResultHook).toBe(1);
-    expect(chunks.filter(c => c.type === 'tool-result')).toHaveLength(1);
-    expect(chunks.at(-1)?.type).toBe('finish');
-    expect(streamToolResults).toBe(1);
-  });
-
-  it('a processOutputStream mutation of tool-result is applied exactly once', async () => {
-    const processor = {
-      id: 'marker',
-      name: 'Marker',
-      processOutputStream: async ({ part }: any) => {
-        if (part.type === 'tool-result') {
-          return { ...part, payload: { ...part.payload, result: `${part.payload.result}|marked` } };
-        }
-        return part;
-      },
-    };
-
-    const { chunks } = await runWithTool(async () => 'sunny', processor);
-
-    const toolResults = chunks.filter(c => c.type === 'tool-result');
-    expect(toolResults).toHaveLength(1);
-    expect(toolResults[0].payload.result).toBe('sunny|marked');
-  });
-
-  it('processOutputStream sees a tool-error chunk exactly once', async () => {
-    let streamToolErrors = 0;
-    const processor = {
-      id: 'error-counter',
-      name: 'Error Counter',
-      processOutputStream: async ({ part }: any) => {
-        if (part.type === 'tool-error') streamToolErrors++;
-        return part;
-      },
-    };
-
-    const { chunks, executeSpy } = await runWithTool(async () => {
-      throw new Error('weather service down');
-    }, processor);
-
-    expect(executeSpy).toHaveBeenCalledTimes(1);
-    expect(chunks.filter(c => c.type === 'tool-error')).toHaveLength(1);
-    expect(chunks.at(-1)?.type).toBe('finish');
-    expect(streamToolErrors).toBe(1);
-  });
-
-  it('a tool-not-found tool-error is processed exactly once', async () => {
-    let streamToolErrors = 0;
-    const processor = {
-      id: 'error-counter',
-      name: 'Error Counter',
-      processOutputStream: async ({ part }: any) => {
-        if (part.type === 'tool-error') streamToolErrors++;
-        return part;
-      },
-    };
-
-    const baseAgent = new Agent({
-      id: 'missing-tool-agent',
-      name: 'Missing Tool Agent',
-      instructions: 'You are a helpful agent.',
-      model: createToolCallingModel('missingTool', {}) as LanguageModelV2,
-      outputProcessors: [processor as any],
-    });
-
-    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-    new Mastra({
-      agents: { 'missing-tool-agent': durableAgent as any },
-      logger: false,
-      storage: new InMemoryStore(),
-      pubsub,
-    });
-
-    const result = await durableAgent.stream('Hi', { maxSteps: 3 });
-    const chunks = await drain(result.fullStream);
-
-    expect(chunks.filter(c => c.type === 'tool-error')).toHaveLength(1);
-    expect(streamToolErrors).toBe(1);
-  });
-
   it('a provider-executed tool-result is processed exactly once', async () => {
     let streamToolResults = 0;
     const processor = {
@@ -567,40 +469,6 @@ describe('DurableAgent output processors run once per tool chunk', () => {
     });
 
     const result = await agent.stream('Search mastra', { maxSteps: 3 });
-    const chunks = await drain(result.fullStream);
-
-    expect(chunks.filter(c => c.type === 'tool-result')).toHaveLength(1);
-    expect(streamToolResults).toBe(1);
-  });
-
-  it('matches the regular Agent, which also processes a tool-result once', async () => {
-    let streamToolResults = 0;
-    const agent = new Agent({
-      id: 'regular-agent',
-      name: 'Regular Agent',
-      instructions: 'You are a helpful agent.',
-      model: createToolCallingModel('getWeather', { city: 'NYC' }) as LanguageModelV2,
-      tools: {
-        getWeather: createTool({
-          id: 'getWeather',
-          description: 'Get weather',
-          inputSchema: z.object({ city: z.string() }),
-          execute: async () => 'sunny',
-        }),
-      },
-      outputProcessors: [
-        {
-          id: 'regular-counter',
-          name: 'Regular Counter',
-          processOutputStream: async ({ part }: any) => {
-            if (part.type === 'tool-result') streamToolResults++;
-            return part;
-          },
-        } as any,
-      ],
-    });
-
-    const result = await agent.stream('What is the weather in NYC?', { maxSteps: 3 });
     const chunks = await drain(result.fullStream);
 
     expect(chunks.filter(c => c.type === 'tool-result')).toHaveLength(1);

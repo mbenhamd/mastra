@@ -61,6 +61,11 @@ export type TestCapabilities = {
    * columns must reject scoped calls; the suite asserts that rejection.
    */
   scopedTraceDeletion?: boolean;
+  /**
+   * Whether skills list/listResolved apply the `metadata` filter against the
+   * resolved version (defaults to true). Pending adapters: MongoDB, MySQL, Spanner.
+   */
+  skillsMetadataFilter?: boolean;
 };
 
 export function createTestSuite(storage: MastraStorage, capabilities: TestCapabilities = {}) {
@@ -156,7 +161,7 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
     createExperimentsTests({ storage, capabilities });
     createBackgroundTasksTests({ storage });
     createFavoritesTests({ storage });
-    createSkillsTests({ storage });
+    createSkillsTests({ storage, metadataFilter: capabilities.skillsMetadataFilter ?? true });
     createSchedulesTests({ storage });
     createChannelsTests({ storage });
     createToolProviderConnectionsTests({ storage });

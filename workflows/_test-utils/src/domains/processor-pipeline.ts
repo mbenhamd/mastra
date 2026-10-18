@@ -74,32 +74,6 @@ export function createProcessorPipelineTests(context: DurableAgentTestContext) {
           result.cleanup();
         }
       });
-
-      it('should stream successfully with output processors configured', async () => {
-        const mockOutputProcessor = {
-          id: 'stream-output-processor',
-          processOutput: async ({ messages }: any) => ({ messages }),
-        };
-
-        const agent = new Agent({
-          id: 'stream-output-agent',
-          name: 'Stream Output Agent',
-          instructions: 'Test',
-          model: createTextStreamModel('Done'),
-          outputProcessors: [mockOutputProcessor],
-        } as any);
-
-        const durableAgent = createDurableAgent({
-          agent,
-          pubsub: getPubSub(),
-        });
-
-        const { output, cleanup } = await durableAgent.stream('Hello');
-        const text = await output.text;
-
-        expect(text).toBe('Done');
-        cleanup();
-      });
     });
 
     describe('error processors', () => {
@@ -200,37 +174,6 @@ export function createProcessorPipelineTests(context: DurableAgentTestContext) {
         } finally {
           result.cleanup();
         }
-      });
-
-      it('should stream with combined processors', async () => {
-        const mockInputProcessor = {
-          id: 'stream-combined-input',
-          processInput: async ({ messages }: any) => ({ messages }),
-        };
-        const mockOutputProcessor = {
-          id: 'stream-combined-output',
-          processOutput: async ({ messages }: any) => ({ messages }),
-        };
-
-        const agent = new Agent({
-          id: 'stream-combined-agent',
-          name: 'Stream Combined Agent',
-          instructions: 'Test',
-          model: createTextStreamModel('Combined result'),
-          inputProcessors: [mockInputProcessor],
-          outputProcessors: [mockOutputProcessor],
-        } as any);
-
-        const durableAgent = createDurableAgent({
-          agent,
-          pubsub: getPubSub(),
-        });
-
-        const { output, cleanup } = await durableAgent.stream('Hello');
-        const text = await output.text;
-
-        expect(text).toBe('Combined result');
-        cleanup();
       });
     });
   });

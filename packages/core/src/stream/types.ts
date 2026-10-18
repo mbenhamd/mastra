@@ -844,6 +844,12 @@ interface ToolCallApprovalPayload {
   approvalReasons?: readonly string[];
   /** Epoch ms when approval was requested; matches the tool part's `updatedAt`. */
   updatedAt?: number;
+  /**
+   * Token usage of the model step that produced this tool call (upstream #27425 type parity).
+   * The PapersFlow fork never populates it: suspended-step usage is recorded out of band on the
+   * run output, never on a chunk or suspend payload (PF-5349).
+   */
+  usage?: LanguageModelUsage;
 }
 
 interface ToolCallSuspendedPayload {
@@ -859,6 +865,12 @@ interface ToolCallSuspendedPayload {
   args: Record<string, any>;
   resumeSchema: string;
   approval?: { id: string; approved: true; reason?: string };
+  /**
+   * Token usage of the model step that produced this tool call (upstream #27425 type parity).
+   * The PapersFlow fork never populates it: suspended-step usage is recorded out of band on the
+   * run output, never on a chunk or suspend payload (PF-5349).
+   */
+  usage?: LanguageModelUsage;
 }
 
 interface ToolCallResumedPayload {
@@ -1216,6 +1228,11 @@ export type MastraOnFinishCallbackArgs<OUTPUT = undefined> = LLMStepResult<OUTPU
   terminalToolResult?: TerminalToolResult;
   /** Model messages the run added to the conversation (the response messages). */
   messages?: ModelMessage[];
+  /**
+   * @internal Cumulative usage already recorded by earlier suspended legs of this run, so the
+   * MODEL_GENERATION span of a resumed leg records only its own share.
+   */
+  generationReportedUsage?: LanguageModelUsage;
 };
 
 /**

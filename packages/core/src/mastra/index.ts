@@ -895,6 +895,7 @@ const DURABLE_RECOVERY_RECHECK_JITTER_MS = 5_000;
 // DURABLE_RECOVERY_RECHECK_MAX_RETRIES times.
 const DURABLE_RECOVERY_RECHECK_RETRY_BASE_MS = 30_000;
 const DURABLE_RECOVERY_RECHECK_MAX_RETRIES = 5;
+const DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MS = 30_000;
 
 /**
  * Registers and coordinates agents, workflows, storage, and other Mastra services.
@@ -965,7 +966,7 @@ export class Mastra<
     durableAgents: 'off',
   };
   #durableRecoveryRechecks = new Map<string, ReturnType<typeof setTimeout>>();
-  #durableRecoveryRechecksInFlight = new Set<Promise<void>>();
+  #durableRecoveryRechecksInFlight = new Set<Promise<unknown>>();
   #shuttingDown = false;
   #scorers?: TScorers;
   #classifiers?: TClassifiers;
@@ -5041,33 +5042,55 @@ export class Mastra<
       `Recovering active durable-agent runs across ${durableAgents.length} agent${durableAgents.length > 1 ? 's' : ''}`,
     );
 
-    let recovered = 0;
-    let succeeded = 0;
-    let failed = 0;
-    let skipped = 0;
+    return this.#trackDurableRecovery(
+      (async () => {
+        let recovered = 0;
+        let succeeded = 0;
+        let failed = 0;
+        let skipped = 0;
 
-    for (const agent of durableAgents) {
-      try {
-        const result = await agent.recoverActiveRuns();
-        for (const run of result.recovered) {
-          if (run.status === 'skipped') {
-            skipped++;
-            this.#scheduleDurableRecoveryRecheck(agent, run);
-          } else {
-            recovered++;
+        for (const agent of durableAgents) {
+          if (this.#shuttingDown) break;
+          try {
+            const result = await agent.recoverActiveRuns();
+            for (const run of result.recovered) {
+              if (run.status === 'skipped') {
+                skipped++;
+                this.#scheduleDurableRecoveryRecheck(agent, run);
+              } else {
+                recovered++;
+              }
+            }
+            succeeded += result.succeeded;
+            failed += result.failed;
+          } catch (error) {
+            this.#logger.error('Failed to recover active runs for durable agent', {
+              agentId: agent.id,
+              error,
+            });
           }
         }
-        succeeded += result.succeeded;
-        failed += result.failed;
-      } catch (error) {
-        this.#logger.error('Failed to recover active runs for durable agent', {
-          agentId: agent.id,
-          error,
-        });
-      }
-    }
 
-    return { agents: durableAgents.length, recovered, succeeded, failed, skipped };
+        return { agents: durableAgents.length, recovered, succeeded, failed, skipped };
+      })(),
+    );
+  }
+
+  #trackDurableRecovery<T>(promise: Promise<T>): Promise<T> {
+    this.#durableRecoveryRechecksInFlight.add(promise);
+    const remove = () => this.#durableRecoveryRechecksInFlight.delete(promise);
+    void promise.then(remove, remove);
+    return promise;
+  }
+
+  /** @internal Bound waiting, not execution; shutdown must still drain the original attempt. */
+  __awaitDurableRecoveryAttempt<T>(promise: Promise<T>, description: string): Promise<{ value: T } | undefined> {
+    return this.#awaitBounded(
+      this.#trackDurableRecovery(promise).then(value => ({ value })),
+      DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MS,
+      description,
+      `Durable recovery timed out after ${DURABLE_RECOVERY_ATTEMPT_TIMEOUT_MS}ms waiting for ${description}; the attempt continues in the background`,
+    );
   }
 
   /**
@@ -6335,6 +6358,8 @@ export class Mastra<
       tools[tool.id] = schemas;
     }
     const classifiers: NonNullable<WorkflowRegistryIndex['classifiers']> = {};
+    const refusedAnswerDescription =
+      "When the model refuses the question, the answer is { type: 'refusal' } with no choice, score, probability, or probabilities.";
     for (const [key, classifier] of Object.entries(this.listClassifiers() ?? {})) {
       const questions = classifier.questions
         ? Object.fromEntries(
@@ -6348,6 +6373,8 @@ export class Mastra<
             ]),
           )
         : undefined;
+      // A decision model may refuse any question. A refused answer is `{ type: 'refusal' }`
+      // with no payload fields, so only `type` is required.
       const answerProperties = questions
         ? Object.fromEntries(
             Object.entries(questions).map(([questionId, question]) => [
@@ -6356,7 +6383,7 @@ export class Mastra<
                 ? {
                     type: 'object',
                     properties: {
-                      type: { type: 'string', enum: ['choice'] },
+                      type: { type: 'string', enum: ['choice', 'refusal'] },
                       choice: { type: 'string', enum: question.choices },
                       probabilities: {
                         type: 'object',
@@ -6364,13 +6391,14 @@ export class Mastra<
                         additionalProperties: false,
                       },
                     },
-                    required: ['type', 'choice'],
+                    required: ['type'],
+                    description: refusedAnswerDescription,
                   }
                 : question.type === 'score'
                   ? {
                       type: 'object',
                       properties: {
-                        type: { type: 'string', enum: ['score'] },
+                        type: { type: 'string', enum: ['score', 'refusal'] },
                         score: { type: 'number', minimum: question.min, maximum: question.max },
                         probabilities: {
                           type: 'object',
@@ -6383,15 +6411,17 @@ export class Mastra<
                           additionalProperties: false,
                         },
                       },
-                      required: ['type', 'score'],
+                      required: ['type'],
+                      description: refusedAnswerDescription,
                     }
                   : {
                       type: 'object',
                       properties: {
-                        type: { type: 'string', enum: ['boolean'] },
+                        type: { type: 'string', enum: ['boolean', 'refusal'] },
                         probability: { type: 'number', minimum: 0, maximum: 1 },
                       },
-                      required: ['type', 'probability'],
+                      required: ['type'],
+                      description: refusedAnswerDescription,
                     },
             ]),
           )
@@ -8812,7 +8842,12 @@ export class Mastra<
    * budget is exhausted — the work keeps running in the background so teardown
    * stays best-effort but bounded.
    */
-  async #awaitBounded<T>(promise: Promise<T>, timeoutMs: number, description: string): Promise<T | undefined> {
+  async #awaitBounded<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    description: string,
+    timeoutMessage = `Shutdown drain timed out after ${timeoutMs}ms; abandoning ${description}`,
+  ): Promise<T | undefined> {
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
       const outcome = await Promise.race([
@@ -8822,7 +8857,7 @@ export class Mastra<
         }),
       ]);
       if (outcome.timedOut) {
-        this.#logger?.warn(`Shutdown drain timed out after ${timeoutMs}ms; abandoning ${description}`);
+        this.#logger?.warn(timeoutMessage);
         return undefined;
       }
       return outcome.value;

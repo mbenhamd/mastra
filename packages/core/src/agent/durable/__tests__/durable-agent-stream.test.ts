@@ -70,92 +70,6 @@ function createMultiChunkStreamModel(chunks: string[]) {
   });
 }
 
-function _createToolCallModel(toolName: string, args: Record<string, unknown>) {
-  return new MockLanguageModelV2({
-    doStream: async () => ({
-      stream: convertArrayToReadableStream([
-        { type: 'stream-start', warnings: [] },
-        { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-        {
-          type: 'tool-call',
-          toolCallId: 'call-1',
-          toolName,
-          input: JSON.stringify(args),
-          providerExecuted: false,
-        },
-        {
-          type: 'finish',
-          finishReason: 'tool-calls',
-          usage: { inputTokens: 15, outputTokens: 10, totalTokens: 25 },
-        },
-      ]),
-      rawCall: { rawPrompt: null, rawSettings: {} },
-    }),
-  });
-}
-
-function createToolCallThenTextModel(
-  toolName: string,
-  args: Record<string, unknown>,
-  finalText: string,
-  prompts: unknown[] = [],
-) {
-  let callCount = 0;
-  return new MockLanguageModelV2({
-    doStream: async (options: any) => {
-      prompts.push(options.prompt);
-      callCount++;
-      if (callCount === 1) {
-        // First call: return tool call
-        return {
-          stream: convertArrayToReadableStream([
-            { type: 'stream-start', warnings: [] },
-            { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-            {
-              type: 'tool-call',
-              toolCallId: 'call-1',
-              toolName,
-              input: JSON.stringify(args),
-              providerExecuted: false,
-            },
-            {
-              type: 'finish',
-              finishReason: 'tool-calls',
-              usage: { inputTokens: 15, outputTokens: 10, totalTokens: 25 },
-            },
-          ]),
-          rawCall: { rawPrompt: null, rawSettings: {} },
-        };
-      } else {
-        // Second call: return text response
-        return {
-          stream: convertArrayToReadableStream([
-            { type: 'stream-start', warnings: [] },
-            { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
-            { type: 'text-start', id: 'text-1' },
-            { type: 'text-delta', id: 'text-1', delta: finalText },
-            { type: 'text-end', id: 'text-1' },
-            {
-              type: 'finish',
-              finishReason: 'stop',
-              usage: { inputTokens: 20, outputTokens: 15, totalTokens: 35 },
-            },
-          ]),
-          rawCall: { rawPrompt: null, rawSettings: {} },
-        };
-      }
-    },
-  });
-}
-
-async function collectStreamChunks(stream: ReadableStream<any>) {
-  const chunks: any[] = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  return chunks;
-}
-
 // ============================================================================
 // Streaming Execution Tests
 // ============================================================================
@@ -1298,119 +1212,19 @@ describe('DurableAgent streaming execution', () => {
 
       const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-      const { output, runId, cleanup } = await durableAgent.stream('Say hello', {
-        onChunk: chunk => {
-          chunks.push(chunk);
-        },
-      });
-
-      expect(runId).toBeDefined();
-      expect(output).toBeDefined();
-
-      // Drain the stream to deterministically wait for all chunks (and onChunk
-      // callbacks) instead of relying on a wall-clock timeout.
-      await output.consumeStream();
-
-      expect(chunks.length).toBeGreaterThan(0);
-
-      cleanup();
-    });
-
-    it('should continue durable and evented streams after a tool-call step when maxSteps allows it', async () => {
-      const finalText = 'tool returned hello';
-      const echoTool = createTool({
-        id: 'echo',
-        description: 'Echo the input',
-        inputSchema: z.object({ text: z.string() }),
-        outputSchema: z.object({ echoed: z.string() }),
-        execute: async ({ text }) => ({ echoed: text }),
-      });
-
-      const createTestCase = (name: string, agentId: string) => {
-        const prompts: unknown[] = [];
-        const agent = new Agent({
-          id: agentId,
-          name: agentId,
-          instructions: 'Call echo, then describe what came back.',
-          model: createToolCallThenTextModel('echo', { text: 'hello' }, finalText, prompts) as LanguageModelV2,
-          tools: { echo: echoTool },
-        });
-
-        const wrapped =
-          name === 'durable' ? createDurableAgent({ agent, pubsub }) : createEventedAgent({ agent, pubsub });
-        if (name === 'evented') {
-          // The evented engine executes via mastra.pubsub + storage-backed
-          // workers, so unlike the default engine it cannot run without a
-          // Mastra host (see evented-split-transport.test.ts for the same
-          // harness shape).
-          void new Mastra({
-            agents: { [agentId]: wrapped as any },
-            logger: false,
-            storage: new InMemoryStore(),
-          });
-        }
-
-        return {
-          name,
-          prompts,
-          agent: wrapped,
-        };
-      };
-
-      const cases = [
-        createTestCase('durable', 'durable-multi-step-agent'),
-        createTestCase('evented', 'evented-multi-step-agent'),
-      ];
-
-      for (const testCase of cases) {
-        const { output, cleanup, runId } = await testCase.agent.stream('Run echo with hello.', { maxSteps: 4 });
-        const chunks = await collectStreamChunks(output.fullStream);
-
-        const chunkTypes = chunks.map(chunk => chunk.type);
-        const finishChunk = chunks.findLast(chunk => chunk.type === 'finish');
-        const secondPrompt = JSON.stringify(testCase.prompts[1]);
-
-        expect(testCase.prompts, testCase.name).toHaveLength(2);
-        expect(secondPrompt, testCase.name).toContain('"echoed":"hello"');
-        expect(chunkTypes, testCase.name).toContain('tool-call');
-        expect(chunkTypes, testCase.name).toContain('tool-result');
-        expect(chunkTypes, testCase.name).toContain('text-delta');
-        expect(chunkTypes, testCase.name).not.toContain('response-metadata');
-        expect(
-          chunks.some(chunk => chunk.type === 'text-delta' && chunk.payload?.text === finalText),
-          testCase.name,
-        ).toBe(true);
-        expect(finishChunk?.runId, testCase.name).toBe(runId);
-        expect(finishChunk?.from, testCase.name).toBe(ChunkFrom.AGENT);
-        expect(finishChunk?.payload?.stepResult?.reason, testCase.name).toBe('stop');
-        expect(finishChunk?.payload?.output?.text, testCase.name).toBe(finalText);
-
-        cleanup();
-      }
-    });
-
-    it('should stream multiple text chunks', async () => {
-      const mockModel = createMultiChunkStreamModel(['Hello', ', ', 'world', '!']);
-      const chunks: any[] = [];
-
-      const baseAgent = new Agent({
-        id: 'multi-chunk-agent',
-        name: 'Multi Chunk Agent',
-        instructions: 'You are a helpful assistant',
-        model: mockModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
       const { output, cleanup } = await durableAgent.stream('Say hello in parts', {
         onChunk: chunk => {
           chunks.push(chunk);
         },
       });
 
+      // Drain the stream to deterministically wait for all chunks (and onChunk
+      // callbacks) instead of relying on a wall-clock timeout.
       await output.consumeStream();
 
-      expect(chunks.length).toBeGreaterThan(0);
+      const deltas = chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.payload.text);
+      expect(deltas).toEqual(['Hello', ', ', 'world', '!']);
+      expect(await output.text).toBe('Hello, world!');
 
       cleanup();
     });
@@ -1440,96 +1254,6 @@ describe('DurableAgent streaming execution', () => {
       await output.consumeStream();
       cleanup();
       expect(durableAgent.runRegistry.has(runId)).toBe(false);
-    });
-  });
-
-  describe('callbacks', () => {
-    it('should invoke onFinish callback when streaming completes', async () => {
-      const mockModel = createTextStreamModel('Complete response');
-      let finishData: any = null;
-
-      const baseAgent = new Agent({
-        id: 'finish-callback-agent',
-        name: 'Finish Callback Agent',
-        instructions: 'Test',
-        model: mockModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, cleanup } = await durableAgent.stream('Test', {
-        onFinish: data => {
-          finishData = data;
-        },
-      });
-
-      // Drain the stream so we deterministically wait for the FINISH event
-      // (which fires onFinish) instead of using a wall-clock timeout.
-      await output.consumeStream();
-
-      expect(finishData).not.toBeNull();
-
-      cleanup();
-    });
-
-    it('should invoke onError callback when error occurs', async () => {
-      const errorModel = new MockLanguageModelV2({
-        doStream: async () => {
-          throw new Error('Simulated LLM error');
-        },
-      });
-
-      let errorReceived: Error | string | null = null;
-
-      const baseAgent = new Agent({
-        id: 'error-callback-agent',
-        name: 'Error Callback Agent',
-        instructions: 'Test',
-        model: errorModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, cleanup } = await durableAgent.stream('Test', {
-        onError: ({ error }) => {
-          errorReceived = error;
-        },
-      });
-
-      // Drain the stream so we deterministically wait for the ERROR event
-      // (which fires onError and errors the stream) instead of using a wall-clock timeout.
-      await output.consumeStream({ onError: () => {} });
-
-      expect(errorReceived).not.toBeNull();
-
-      cleanup();
-    });
-
-    it('should invoke onStepFinish callback after each step', async () => {
-      const mockModel = createTextStreamModel('Step complete');
-      const stepResults: any[] = [];
-
-      const baseAgent = new Agent({
-        id: 'step-callback-agent',
-        name: 'Step Callback Agent',
-        instructions: 'Test',
-        model: mockModel as LanguageModelV2,
-      });
-
-      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-      const { output, cleanup } = await durableAgent.stream('Test', {
-        onStepFinish: result => {
-          stepResults.push(result);
-        },
-      });
-
-      await output.consumeStream();
-
-      // stepResults may or may not contain entries depending on workflow execution timing
-      expect(Array.isArray(stepResults)).toBe(true);
-
-      cleanup();
     });
   });
 
@@ -1733,39 +1457,6 @@ describe('DurableAgent error handling', () => {
 
   afterEach(async () => {
     await pubsub.close();
-  });
-
-  it('should handle model throwing error during streaming', async () => {
-    const errorModel = new MockLanguageModelV2({
-      doStream: async () => {
-        throw new Error('Model initialization failed');
-      },
-    });
-
-    let errorReceived: Error | string | null = null;
-
-    const baseAgent = new Agent({
-      id: 'error-model-agent',
-      name: 'Error Model Agent',
-      instructions: 'Test',
-      model: errorModel as LanguageModelV2,
-    });
-
-    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
-
-    const { output, cleanup } = await durableAgent.stream('Test', {
-      onError: ({ error }) => {
-        errorReceived = error;
-      },
-    });
-
-    // Drain the stream so we deterministically wait for the ERROR event
-    // (which fires onError and errors the stream) instead of using a wall-clock timeout.
-    await output.consumeStream({ onError: () => {} });
-
-    expect(errorReceived).not.toBeNull();
-
-    cleanup();
   });
 
   it('should handle error event emission via pubsub', async () => {

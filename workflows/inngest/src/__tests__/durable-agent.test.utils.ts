@@ -23,8 +23,12 @@ import {
   InngestTestRuntimeManager,
 } from './inngest-test-runtime';
 
-export const INNGEST_PORT = 4100;
-export const HANDLER_PORT = 4101;
+// Set INNGEST_TEST_PORT_OFFSET to run several dev servers side by side (one per test worker).
+const PORT_OFFSET = Number(process.env.INNGEST_TEST_PORT_OFFSET ?? 0);
+export const INNGEST_PORT = 4100 + PORT_OFFSET;
+export const HANDLER_PORT = 4101 + PORT_OFFSET;
+// The fork runs a digest-pinned Inngest runtime (inngest-test-runtime) instead of the CLI dev
+// server, so upstream's dev-server connect-port offsets (#27372) do not apply here.
 
 const DURABLE_AGENT_TEST_ENDPOINTS = createLocalTestEndpoints({
   inngestPort: INNGEST_PORT,

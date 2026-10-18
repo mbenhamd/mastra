@@ -145,7 +145,7 @@ import { createWebSearchProviderTool, isWebSearchTool, normalizeWebSearchProvide
 import { normalizeToolPayloadTransformPolicy } from '../tools/payload-transform';
 import type { ToolToConvert } from '../tools/tool-builder/builder';
 import { unwrapToolsFromHooks, wrapToolsWithHooks } from '../tools/tool-hooks';
-import { isMastraTool, isProviderTool } from '../tools/toolchecks';
+import { isMastraTool, isProviderTool, markApprovalExempt } from '../tools/toolchecks';
 import type {
   CoreTool,
   McpMetadata,
@@ -5322,6 +5322,8 @@ export class Agent<
           autoResumeSuspendedTools,
           backgroundTaskEnabled,
         );
+        // Exempt from a global `requireToolApproval` too, not just tool-level approval.
+        markApprovalExempt(convertedToCoreTool);
         convertedSkillTools[toolName] = convertedToCoreTool;
       }
     }

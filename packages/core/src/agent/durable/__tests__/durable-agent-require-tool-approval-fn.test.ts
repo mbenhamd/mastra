@@ -1,132 +1,41 @@
 /**
- * DurableAgent function-form requireToolApproval tests
+ * DurableAgent function-form requireToolApproval serialization.
  *
- * Verifies that the per-call function policy is preserved in-process: the closure
- * lives on the run registry and is evaluated with the real (toolName, args) per
- * tool call. Cross-process engines fall back to the boolean shadow (true).
+ * A function policy cannot cross a process boundary: the closure stays on the in-process run
+ * registry, and the serialized workflow input carries the safe `true` shadow. Behaviour (per-call
+ * evaluation, throwing policies, resume context) is covered on every engine by the
+ * `approval-policy` aimock scenario.
  */
 
 import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
-import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
-import { Mastra } from '../../../mastra';
-import { RequestContext } from '../../../request-context';
-import { MockStore } from '../../../storage/mock';
 import { createTool } from '../../../tools';
-import { delay } from '../../../utils';
 import { Agent } from '../../agent';
-import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import { globalRunRegistry } from '../run-registry';
-import type { AgentStreamEvent } from '../types';
-
-function createMultipleToolCallsModel(tools: Array<{ name: string; args: object }>) {
-  return new MockLanguageModelV2({
-    doStream: async () => ({
-      stream: convertArrayToReadableStream([
-        { type: 'stream-start', warnings: [] },
-        { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-        ...tools.map((tool, index) => ({
-          type: 'tool-call' as const,
-          toolCallType: 'function' as const,
-          toolCallId: `call-${index + 1}`,
-          toolName: tool.name,
-          input: JSON.stringify(tool.args),
-          providerExecuted: false,
-        })),
-        {
-          type: 'finish',
-          finishReason: 'tool-calls',
-          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
-        },
-      ]),
-      rawCall: { rawPrompt: null, rawSettings: {} },
-      warnings: [],
-    }),
-  });
-}
-
-/** Creates a model that requests one tool call, then completes after the tool resumes. */
-function createToolCallThenTextModel(tool: { name: string; args: object }) {
-  let callCount = 0;
-  return new MockLanguageModelV2({
-    doStream: async () => {
-      callCount++;
-      return {
-        stream: convertArrayToReadableStream(
-          callCount === 1
-            ? [
-                { type: 'stream-start', warnings: [] },
-                { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
-                {
-                  type: 'tool-call',
-                  toolCallType: 'function',
-                  toolCallId: 'call-1',
-                  toolName: tool.name,
-                  input: JSON.stringify(tool.args),
-                  providerExecuted: false,
-                },
-                {
-                  type: 'finish',
-                  finishReason: 'tool-calls',
-                  usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
-                },
-              ]
-            : [
-                { type: 'stream-start', warnings: [] },
-                { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
-                { type: 'text-start', id: 'text-1' },
-                { type: 'text-delta', id: 'text-1', delta: 'done' },
-                { type: 'text-end', id: 'text-1' },
-                {
-                  type: 'finish',
-                  finishReason: 'stop',
-                  usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
-                },
-              ],
-        ),
-        rawCall: { rawPrompt: null, rawSettings: {} },
-        warnings: [],
-      };
-    },
-  });
-}
-
-function collectPubsubEvents(pubsub: EventEmitterPubSub, runId: string) {
-  const events: AgentStreamEvent[] = [];
-  pubsub.subscribe(AGENT_STREAM_TOPIC(runId), event => {
-    events.push(event as unknown as AgentStreamEvent);
-  });
-  return events;
-}
 
 describe('DurableAgent function-form requireToolApproval', () => {
-  let pubsub: EventEmitterPubSub;
-
-  beforeEach(() => {
-    pubsub = new EventEmitterPubSub();
-  });
+  const pubsub = new EventEmitterPubSub();
 
   afterEach(async () => {
     await pubsub.close();
   });
 
   it('stores function policy on the registry and serializes a `true` shadow into workflow input', async () => {
-    const mockModel = createMultipleToolCallsModel([{ name: 'safeTool', args: { x: 1 } }]);
     const safeTool = createTool({
       id: 'safeTool',
       description: 'safe',
       inputSchema: z.object({ x: z.number() }),
       execute: async () => 'ok',
     });
-
     const baseAgent = new Agent({
       id: 'fn-policy-agent',
       name: 'Fn Policy Agent',
       instructions: 'tools',
-      model: mockModel as LanguageModelV2,
+      model: new MockLanguageModelV2() as LanguageModelV2,
       tools: { safeTool },
     });
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
@@ -136,7 +45,6 @@ describe('DurableAgent function-form requireToolApproval', () => {
 
     // Cross-process shadow is the safe default `true`.
     expect(prep.workflowInput.options.requireToolApproval).toBe(true);
-
     // In-process registry preserves the closure verbatim.
     const entry = globalRunRegistry.get(prep.runId);
     expect(entry?.requireToolApproval).toBe(policy);

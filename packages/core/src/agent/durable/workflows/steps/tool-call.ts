@@ -16,7 +16,7 @@ import { withToolResultStatusProviderMetadata } from '../../../../loop/shared/st
 import { resolveFrameworkSuspendedToolIdentity } from '../../../../loop/shared/suspended-tool-run-id';
 import type { ResolvedSuspendedToolIdentity } from '../../../../loop/shared/suspended-tool-run-id';
 import { applyToolPayloadTransformToChunk } from '../../../../loop/shared/tool-payload-transform';
-import { runBeforeApprovalHook } from '../../../../loop/workflows/agentic-execution/tool-approval-verdict';
+import { runBeforeApprovalChecks } from '../../../../loop/workflows/agentic-execution/tool-approval-verdict';
 import { notifyToolDenied } from '../../../../loop/workflows/agentic-execution/tool-permission-notify';
 import type { Mastra } from '../../../../mastra';
 import type { MastraMemory } from '../../../../memory/memory';
@@ -71,7 +71,13 @@ import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
 import { assertExecutionNotSuperseded, assertExecutionOwned, isExecutionFenceError } from '../../execution-fence';
 import { authorizeDurableMemory, getDurableMemoryAuthorizationChecks } from '../../memory-fga';
-import { getBoundRunRegistryEntry, getRunRegistryEntry, globalRunRegistry, markRunActive } from '../../run-registry';
+import {
+  clearResumeInFlight,
+  getBoundRunRegistryEntry,
+  getRunRegistryEntry,
+  globalRunRegistry,
+  markRunActive,
+} from '../../run-registry';
 import { emitSuspendedEvent, emitChunkEvent } from '../../stream-adapter';
 import type {
   DurableToolCallInput,
@@ -888,9 +894,18 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       // Hold suspension chunks/events until the engine has saved the suspended
       // snapshot, when the running engine supports that (#26435).
       const publishAfterPersist = async (publish: () => Promise<void>) => {
-        const pending = getBoundRunRegistryEntry(runId, runtimeBindingId)?.pendingSuspensionEvents;
-        if (pending) pending.push(publish);
-        else await publish();
+        const entry = getBoundRunRegistryEntry(runId, runtimeBindingId);
+        // Upstream #27379: once the new suspension is saved, a later resume of the tool call is
+        // a decision on that suspension, not a duplicate. Clearing earlier would let a duplicate
+        // approval of the previous gate approve the new one (#27365).
+        const resumedToolCallId = entry?.resumeToolCallId;
+        const clearAndPublish = async () => {
+          if (resumedToolCallId !== undefined) clearResumeInFlight(runId, resumedToolCallId);
+          await publish();
+        };
+        const pending = entry?.pendingSuspensionEvents;
+        if (pending) pending.push(clearAndPublish);
+        else await clearAndPublish();
       };
       let resumeMessageList = messageList;
       // A durable engine can replay the completed LLM step on a cold resume,
@@ -1296,7 +1311,27 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
 
       const resumeTarget = metadataToolCallId !== toolCallId ? { resumeTargetToolCallId: metadataToolCallId } : {};
 
-      if (hasValidApprovalDecision && approvalDecision.approved === false) {
+      // Upstream #27374: a decline of an approval the delegated sub-agent raised
+      // mid-execution is the sub-agent's decision to act on, so it is forwarded to
+      // the suspended sub-agent instead of being denied here. Only the
+      // authenticated tool-execution approval record plus a framework-resolved
+      // inner run id identifies it (never model-supplied coordinates); a decline
+      // of this step's own gate is still denied locally below. It carries no
+      // approval grant.
+      const isResumableTool = toolName?.startsWith('agent-') || toolName?.startsWith('workflow-');
+      const delegatedDeclineIdentity: ResolvedSuspendedToolIdentity | undefined =
+        hasValidApprovalDecision && approvalDecision.approved === false && isToolExecutionApprovalResume && isResumableTool
+          ? resolveFrameworkSuspendedToolIdentity({
+              toolCallId,
+              toolName,
+              resumeSource: 'framework',
+              suspendData,
+              messages: messageList?.get.all.db() ?? [],
+            })
+          : undefined;
+      const isDelegatedDeclineResume = delegatedDeclineIdentity?.type === 'approval' && !!delegatedDeclineIdentity.runId;
+
+      if (hasValidApprovalDecision && approvalDecision.approved === false && !isDelegatedDeclineResume) {
         // Remove pending-approval metadata since we're resuming with a decision.
         await removeToolMetadata({ toolCallId: metadataToolCallId, toolName }, 'approval');
         const approval = {
@@ -1539,7 +1574,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         // Per-tool beforeApproval hook (#26927): it may reject a fresh call
         // before the approval gate. Runs only after the live permission checks
         // above and the schema preflight, and never on an authenticated resume.
-        const rejection = await runBeforeApprovalHook({
+        const rejection = await runBeforeApprovalChecks({
           tool,
           input: args,
           context: { toolCallId, toolName, requestContext: approvalRequestContext, workspace, actor },
@@ -1681,7 +1716,8 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
 
       // Preserve approval provenance even when a dynamic approval predicate changes between
       // suspension and resume, or when the approval was requested from inside tool execution.
-      const approvalGrant = hasValidApprovalDecision
+      const approvalGrant =
+        hasValidApprovalDecision && !isDelegatedDeclineResume
         ? ({
             approval: {
               id: metadataToolCallId,
@@ -1734,10 +1770,10 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
 
       // Delegated identity is trusted only after it is tied to framework-persisted
       // suspension state. The suspend payload remains the primary per-tool-call source.
-      const isResumableTool = toolName?.startsWith('agent-') || toolName?.startsWith('workflow-');
       const needsRunIdLookup = isResumableTool && (resumeData !== undefined || !!approvalGrant);
       // Nullish model data follows the framework resume path; false, 0, and empty strings remain valid model payloads.
-      const hasModelResumeData = resumeDataFromArgs != null;
+      // A forwarded delegated decline always resolves from framework state (upstream #27374).
+      const hasModelResumeData = resumeDataFromArgs != null && !isDelegatedDeclineResume;
       const resolvedSuspensionIdentity: ResolvedSuspendedToolIdentity | undefined = needsRunIdLookup
         ? resolveFrameworkSuspendedToolIdentity({
             toolCallId,
@@ -1753,8 +1789,9 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       // When the delegation tool is itself approval-gated, an `{ approved: true }`
       // resume is ambiguous: it can answer this step's pre-execution gate (execute
       // fresh) or a delegated approval raised mid-execution by the sub-agent. A
-      // framework-resolved inner run id disambiguates the delegated approval.
-      const isDelegatedApprovalResume = !!approvalGrant && !!suspendedToolRunId;
+      // framework-resolved inner run id disambiguates the delegated approval. A
+      // forwarded delegated decline (upstream #27374) is delegated without a grant.
+      const isDelegatedApprovalResume = (!!approvalGrant || isDelegatedDeclineResume) && !!suspendedToolRunId;
       // Mirror the non-durable step: a bare `{ approved }` belongs to the gate and is
       // dropped, but an approval carrying extra keys is caller data for the tool
       // (#25562). Fork: only an authenticated approval resume qualifies.
@@ -2250,6 +2287,8 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               }
 
               if (chunk.type === 'background-task-completed') {
+                const awaitedVoidAsNull = (result: unknown) =>
+                  info.disposition === 'awaited' && result === undefined ? null : result;
                 void emitChunkEvent(pubsub, bgRunId, {
                   type: 'tool-result',
                   runId: bgRunId,
@@ -2258,10 +2297,11 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                     toolCallId: chunk.payload.toolCallId,
                     toolName: chunk.payload.toolName,
                     args: cleanedArgs,
-                    result: chunk.payload.result,
+                    // Upstream #27482: match the awaited step result below: a void result is reported as null.
+                    result: awaitedVoidAsNull(chunk.payload.result),
                     providerMetadata: withToolResultStatusProviderMetadata({
                       tool: tool as { resultStatus?: (output: unknown) => unknown },
-                      result: chunk.payload.result,
+                      result: awaitedVoidAsNull(chunk.payload.result),
                       providerMetadata: backgroundResultMetadata(chunk.payload.taskId, 'completed'),
                     }) as ProviderMetadata | undefined,
                     providerExecuted,
@@ -2471,10 +2511,11 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
           return {
             ...typedInput,
             args: cleanedArgs,
-            result: completedTask.result,
+            // Upstream #27482: normalize a void result to null like executeToolCall does, so the loop continues.
+            result: completedTask.result === undefined ? null : completedTask.result,
             providerMetadata: withToolResultStatusProviderMetadata({
               tool: tool as { resultStatus?: (output: unknown) => unknown },
-              result: completedTask.result,
+              result: completedTask.result === undefined ? null : completedTask.result,
               providerMetadata: backgroundResultMetadata(bgOutcome.taskId, 'completed'),
             }) as ProviderMetadata | undefined,
             // Fork (PF-4402): the authenticated grant must survive every awaited

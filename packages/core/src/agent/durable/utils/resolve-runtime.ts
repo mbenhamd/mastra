@@ -869,7 +869,8 @@ export function resolveTool(toolName: string, mastra?: Mastra): CoreTool | undef
  *  - Function-form global `requireToolApproval` is evaluated per call with
  *    `(toolName, args, ...)`. Throwing defaults to "require approval" (safe).
  *  - Boolean global / tool-level `requireApproval` seed the decision.
- *  - A per-tool `needsApprovalFn` (e.g. skill tools) is authoritative when
+ *  - Approval-exempt tools (skill tools) never require approval.
+ *  - A per-tool `needsApprovalFn` is authoritative when
  *    present and overrides the seed. It receives `{ requestContext, workspace }`
  *    as its second argument, exactly like the non-durable loop.
  *

@@ -67,6 +67,38 @@ const detailUsageCountKeys = [
 ] as const satisfies ReadonlyArray<keyof LanguageModelUsage>;
 const usageCountKeys = [...primaryUsageCountKeys, ...detailUsageCountKeys] as const;
 
+function accumulateUsage(
+  target: Partial<LanguageModelUsage>,
+  missing: Set<(typeof primaryUsageCountKeys)[number]>,
+  usage: Partial<LanguageModelUsage>,
+) {
+  // Primary totals describe the whole request, so any omitted contribution
+  // makes that aggregate incomplete. Explicit zeroes remain valid values.
+  for (const key of primaryUsageCountKeys) {
+    const value = usage[key];
+    if (value === undefined) {
+      missing.add(key);
+      target[key] = undefined;
+    } else if (!missing.has(key)) {
+      target[key] = (target[key] ?? 0) + value;
+    }
+  }
+
+  // Detail counters are present-when-reported and remain additive across
+  // providers that omit unsupported cache or reasoning measurements.
+  for (const key of detailUsageCountKeys) {
+    const value = usage[key];
+    if (value !== undefined) {
+      target[key] = (target[key] ?? 0) + value;
+    }
+  }
+
+  // raw is provider-specific and not summable; keep the latest step's raw
+  if (usage.raw !== undefined) {
+    target.raw = usage.raw;
+  }
+}
+
 /**
  * Helper function to create a destructurable version of MastraModelOutput.
  * This wraps the output to ensure properties maintain their context when destructured.
@@ -723,6 +755,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    * because goal truncation clears that buffer while usage keeps accumulating.
    */
   #lastStepUsage: LLMStepResult<OUTPUT>['usage'] | undefined = undefined;
+  /**
+   * Cumulative usage the MODEL_GENERATION spans of earlier suspended legs of this run already
+   * recorded. Resumed legs report cumulative totals, so their generation span subtracts this to
+   * keep token metrics counted once. Serialized with the run state.
+   */
+  #generationReportedUsage: LanguageModelUsage | undefined = undefined;
   #finishUsageIsTotal = false;
   #tripwire: StepTripwireData | undefined = undefined;
   #wasSuspended = false;
@@ -2342,6 +2380,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   },
                   usage: chunk.payload.output.usage,
                   totalUsage: self.#getTotalUsage(),
+                  ...(self.#generationReportedUsage && { generationReportedUsage: self.#generationReportedUsage }),
                   toolCalls: await self.toolCalls,
                   toolResults: await self.toolResults,
                   staticToolCalls: (await self.toolCalls).filter(toolCall => toolCall?.payload?.dynamic === false),
@@ -2396,6 +2435,23 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               }
 
               self.#closeTransportIfNeeded();
+
+              // A `processOutputResult` tripwire rejects the run: end the stream with a
+              // `tripwire` chunk instead of the `finish` chunk, matching every other tripwire.
+              if (outputResultTripwire) {
+                if (self.#status !== 'failed' && self.#status !== 'canceled') {
+                  self.#status = 'tripwire';
+                }
+                const tripwireChunk = {
+                  type: 'tripwire',
+                  runId: chunk.runId,
+                  from: chunk.from,
+                  payload: { ...outputResultTripwire },
+                } as ChunkType<OUTPUT>;
+                self.#emitChunk(tripwireChunk);
+                controller.enqueue(tripwireChunk);
+                return;
+              }
               break;
 
             case 'goal':
@@ -2713,32 +2769,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     if (!usage) {
       return;
     }
-
-    // Primary totals describe the whole request, so any omitted contribution
-    // makes that aggregate incomplete. Explicit zeroes remain valid values.
-    for (const key of primaryUsageCountKeys) {
-      const value = usage[key];
-      if (value === undefined) {
-        this.#usageCountMissing.add(key);
-        this.#usageCount[key] = undefined;
-      } else if (!this.#usageCountMissing.has(key)) {
-        this.#usageCount[key] = (this.#usageCount[key] ?? 0) + value;
-      }
-    }
-
-    // Detail counters are present-when-reported and remain additive across
-    // providers that omit unsupported cache or reasoning measurements.
-    for (const key of detailUsageCountKeys) {
-      const value = usage[key];
-      if (value !== undefined) {
-        this.#usageCount[key] = (this.#usageCount[key] ?? 0) + value;
-      }
-    }
-
-    // raw is provider-specific and not summable; keep the latest step's raw
-    if (usage.raw !== undefined) {
-      this.#usageCount.raw = usage.raw;
-    }
+    accumulateUsage(this.#usageCount, this.#usageCountMissing, usage);
   }
 
   populateUsageCount(usage: Partial<LanguageModelUsage>) {
@@ -3227,6 +3258,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       response: {},
       steps: [],
       totalUsage: this.#lastStepUsage ? this.#getTotalUsage() : emptyUsage,
+      ...(this.#generationReportedUsage && { generationReportedUsage: this.#generationReportedUsage }),
       object: undefined as OUTPUT,
     };
   }
@@ -3238,10 +3270,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     toolName: string;
     toolCallId: string;
   } {
-    // Suspend flow invokes options?.onFinish so map-results-step.ts can close the AGENT_RUN span.
-    // That span path only reads finishReason + suspendReason/toolName/toolCallId. The remaining
+    // Suspend flow invokes options?.onFinish so map-results-step.ts can close the AGENT_RUN span
+    // and the MODEL_GENERATION span (which records the usage below). The remaining
     // LLMStepResult fields are empty defaults to satisfy the MastraOnFinishCallback shape without
     // reconstructing partial buffered text/tool/message state from a half-finished stream.
+    const totalUsage = this.#getTotalUsage(this.#suspendedUsage());
+    const generationReportedUsage = this.#generationReportedUsage;
+    this.#generationReportedUsage = totalUsage;
     return {
       finishReason: 'suspended',
       suspendReason: chunk.type,
@@ -3260,13 +3295,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       dynamicToolCalls: [],
       dynamicToolResults: [],
       content: [],
-      usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+      usage: this.#suspendedUsage(),
       warnings: [],
       providerMetadata: undefined,
       request: {},
       response: {},
       steps: [],
-      totalUsage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+      totalUsage,
+      ...(generationReportedUsage && { generationReportedUsage }),
       object: undefined as OUTPUT,
     };
   }
@@ -3426,6 +3462,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       usageCount: this.#usageCount,
       usageCountMissing: [...this.#usageCountMissing],
       lastStepUsage: this.#lastStepUsage,
+      generationReportedUsage: this.#generationReportedUsage,
       tripwire: this.#tripwire,
       wasSuspended: this.#wasSuspended,
       terminalToolResult: this.#terminalToolResult,
@@ -3478,6 +3515,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
     this.#tripwire = state.tripwire;
     this.#lastStepUsage = state.lastStepUsage ?? state.bufferedSteps?.at(-1)?.usage;
+    this.#generationReportedUsage = state.generationReportedUsage;
     this.#wasSuspended = state.wasSuspended ?? state.status === 'suspended';
     this.#terminalToolResult = state.terminalToolResult
       ? materializeTerminalToolResult(state.terminalToolResult)
