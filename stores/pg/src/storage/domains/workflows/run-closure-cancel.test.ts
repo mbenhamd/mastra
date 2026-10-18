@@ -111,6 +111,9 @@ describe('WorkflowsPG erasure cancel', () => {
     expect(after.terminal_status).toBe('canceled');
 
     await expect(workflows.persistWorkflowSnapshot({ ...run, snapshot: stored! })).resolves.toBeUndefined();
+    await expect(workflows.updateWorkflowState({ ...run, opts: { status: 'canceled' } })).resolves.toMatchObject({
+      status: 'canceled',
+    });
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'canceled' });
     await expect(cancel(run)).resolves.toEqual({ status: 'settled' });
     await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toMatchObject({
@@ -120,7 +123,7 @@ describe('WorkflowsPG erasure cancel', () => {
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
   });
 
-  it('rolls back a late snapshot write after the cancel, so the closure delete still erases the run', async () => {
+  it('rolls back late snapshot and state writes after the cancel, so the closure delete still erases the run', async () => {
     const run = newRun();
     await persist(run, 'waiting');
     await expect(cancel(run)).resolves.toEqual({ status: 'cancelled' });
@@ -128,6 +131,9 @@ describe('WorkflowsPG erasure cancel', () => {
 
     // A queued engine write after the cancel: the parent revision conflict rolls it back.
     await expect(persist(run, 'running')).rejects.toThrow();
+    for (const status of ['running', 'suspended'] as const) {
+      await expect(workflows.updateWorkflowState({ ...run, opts: { status } })).rejects.toThrow();
+    }
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'canceled' });
     await expect(parentRevision(run)).resolves.toEqual(latched);
     await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toMatchObject({

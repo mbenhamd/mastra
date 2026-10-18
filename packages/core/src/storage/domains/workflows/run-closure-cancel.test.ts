@@ -142,9 +142,14 @@ describe('WorkflowsInMemory erasure cancel', () => {
     });
   });
 
-  it('moves the parent revision and latches canceled, so a later snapshot write is refused', async () => {
+  it('moves the parent revision and latches canceled, so later snapshot and state writes are refused', async () => {
     const { db, workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-latched' };
+    const ordinary = { ...run, runId: 'run-ordinary-canceled' };
+    await persist(workflows, ordinary, 'canceled');
+    await workflows.updateWorkflowState({ ...ordinary, opts: { status: 'running' } });
+    await expect(workflows.loadWorkflowSnapshot(ordinary)).resolves.toMatchObject({ status: 'running' });
+
     await persist(workflows, run, 'waiting');
     const key = JSON.stringify([run.workflowName, run.runId]);
     const before = db.workflowTerminalParentRevisions.get(key);
@@ -156,7 +161,16 @@ describe('WorkflowsInMemory erasure cancel', () => {
 
     // A queued engine write after the cancel cannot reopen the erased run.
     await expect(persist(workflows, run, 'running')).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    for (const status of ['running', 'suspended'] as const) {
+      await expect(workflows.updateWorkflowState({ ...run, opts: { status } })).rejects.toBeInstanceOf(
+        WorkflowStaleSnapshotPersistError,
+      );
+      expect(db.workflowTerminalParentRevisions.get(key)).toEqual(after);
+    }
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'canceled' });
+    await expect(workflows.updateWorkflowState({ ...run, opts: { status: 'canceled' } })).resolves.toMatchObject({
+      status: 'canceled',
+    });
 
     // Matching canceled writes remain valid. An inherited status getter can
     // reenter persist, so an omitted resource must use the latest row's owner.
@@ -191,7 +205,8 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'deleted',
     });
     await persist(workflows, run, 'running');
-    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
+    await workflows.updateWorkflowState({ ...run, opts: { status: 'suspended' } });
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'suspended' });
   });
 
   it('refuses a child ancestry admission when the parent is cancelled while its graph is read', async () => {

@@ -2659,11 +2659,18 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         nextSnapshot.timestamp = finalTimestamp;
       }
       const storedSnapshot = cloneRunData(nextSnapshot);
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      const snapshotStatus = revision?.erasureCancelled ? storedSnapshot.status : undefined;
       // Caller code above may reenter this map; restart if the source row
       // changed so the CAS merge never overwrites a newer record.
       if (this.db.workflows.get(key) !== run) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      // A late state update must respect the same erasure-only terminal
+      // fence as a snapshot persist, without reopening the canceled row.
+      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
       this.setWorkflowRunRecord(workflowName, runId, {
         ...run,
