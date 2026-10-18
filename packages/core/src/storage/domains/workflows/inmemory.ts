@@ -212,15 +212,28 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   if (value === null || typeof value !== 'object') return value;
   const known = seen.get(value);
   if (known !== undefined) return known;
-  // Built-ins keep their payload in internal slots (a native error's stack
-  // included) that a prototype shell would lose: copy them with cloneRunData,
-  // as an ordinary persist does, so an accessor run on the detached copy can
-  // only change the copy.
+  // Collections are copied entry by entry through the same memo, so their
+  // entries are detached too and references shared with the rest of the
+  // payload stay shared.
+  if (value instanceof Map) {
+    const map = new Map<unknown, unknown>();
+    seen.set(value, map);
+    for (const [key, entry] of value) map.set(detachedErasureCopy(key, seen), detachedErasureCopy(entry, seen));
+    return map;
+  }
+  if (value instanceof Set) {
+    const set = new Set<unknown>();
+    seen.set(value, set);
+    for (const entry of value) set.add(detachedErasureCopy(entry, seen));
+    return set;
+  }
+  // Other built-ins keep their payload in internal slots (a native error's
+  // stack included) that a prototype shell would lose: copy them with
+  // cloneRunData, as an ordinary persist does, so an accessor run on the
+  // detached copy can only change the copy.
   if (
     value instanceof Date ||
     value instanceof RegExp ||
-    value instanceof Map ||
-    value instanceof Set ||
     value instanceof URL ||
     value instanceof Error ||
     value instanceof ArrayBuffer ||

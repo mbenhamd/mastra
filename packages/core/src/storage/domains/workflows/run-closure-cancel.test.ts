@@ -762,4 +762,28 @@ describe('WorkflowsInMemory erasure cancel', () => {
     await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
     expect([...values.keys()]).toEqual(['kept']);
   });
+
+  it('keeps references a settled payload shares across collections when it is selected for erasure', async () => {
+    const { workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-shared-references' };
+    const paper = { id: 'paper-1' };
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(run.runId),
+        status: 'success',
+        result: { papers: [paper], scores: new Map([[paper, 3]]), selected: new Set([paper]) },
+      },
+    });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const result = (await workflows.loadWorkflowSnapshot(run))!.result as {
+      papers: object[];
+      scores: Map<object, number>;
+      selected: Set<object>;
+    };
+    expect(result.scores.get(result.papers[0]!)).toBe(3);
+    expect(result.selected.has(result.papers[0]!)).toBe(true);
+  });
 });
