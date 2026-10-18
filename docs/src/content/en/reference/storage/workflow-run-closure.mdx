@@ -87,7 +87,7 @@ A nested child admitted after the cancel finds its parent terminal and is refuse
 
 :::warning
 
-The store has no executor lease or liveness check. A `running` run with no journal, no unreleased handoff and no pending nested child is cancelled even if an executor in another process is still running it. That executor's next generation-guarded persist then fails as stale, and its work is discarded. `active` means a settlement or a nested child is in flight; it doesn't mean an executor is running. Call `cancelWorkflowRunForErasure` only for runs that will never settle on their own: their owner is gone and no executor can be admitted for them.
+The store has no executor lease or liveness check. It cancels a `running` run that lacks a journal, an unreleased handoff and a pending nested child, even while an executor in another process still runs it. That executor's next generation-guarded persist then fails as stale, and its work is discarded. An `active` result reports a settlement or a nested child in flight. It says nothing about running executors. Call `cancelWorkflowRunForErasure` only for runs that will never settle on their own, whose owner is gone and for which no executor can be admitted.
 
 :::
 
