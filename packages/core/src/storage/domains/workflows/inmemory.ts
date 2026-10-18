@@ -233,7 +233,13 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
     seen.set(value, url);
     return url;
   }
-  if (value instanceof Date || value instanceof RegExp || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+  if (ArrayBuffer.isView(value)) {
+    // Binary data (a Buffer included) keeps its own type, as cloneRunData keeps it.
+    const copy = cloneRunData(value);
+    seen.set(value, copy);
+    return copy;
+  }
+  if (value instanceof Date || value instanceof RegExp || value instanceof ArrayBuffer) {
     const copy = structuredClone(value);
     seen.set(value, copy);
     return copy;
@@ -288,7 +294,8 @@ function plainErasureValue(value: unknown, seen: Map<object, unknown>): unknown 
   if (value instanceof Date) return new Date(value.getTime());
   if (value instanceof RegExp) return new RegExp(value.source, value.flags);
   if (value instanceof URL) return new URL(value.href);
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return structuredClone(value);
+  if (ArrayBuffer.isView(value)) return cloneRunData(value);
+  if (value instanceof ArrayBuffer) return structuredClone(value);
   if (value instanceof Map) {
     const map = new Map<unknown, unknown>();
     seen.set(value, map);
