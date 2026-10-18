@@ -218,6 +218,17 @@ describe('WorkflowsPG erasure cancel', () => {
     });
   });
 
+  it('refuses a settled run whose parent revision evidence is missing instead of answering settled', async () => {
+    const run = newRun();
+    await persist(run, 'success');
+    await store.db.none(`DELETE FROM mastra_workflow_parent_revisions WHERE workflow_name = $1 AND run_id = $2`, [
+      run.workflowName,
+      run.runId,
+    ]);
+    await expect(cancel(run)).rejects.toThrow();
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'success' });
+  });
+
   it('refuses a parent a nested child still needs, and the child whose journal is claimed, without changes', async () => {
     const parent = newRun();
     await persist(parent, 'running');

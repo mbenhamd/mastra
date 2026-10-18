@@ -6153,8 +6153,10 @@ export class WorkflowsPG extends WorkflowsStorage {
         // A nested child that has not completed its terminal journal still
         // applies its result to this run's snapshot.
         if (await this.hasPendingTerminalDependents(t, workflowName, runId)) return { status: 'active' };
-        if (isSettledWorkflowRunStatus(snapshot.status)) return { status: 'settled' };
+        // Missing revision evidence is corruption whatever the status: the
+        // closure delete a `settled` answer leads to would refuse it too.
         if (!revision) throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        if (isSettledWorkflowRunStatus(snapshot.status)) return { status: 'settled' };
         // A latched terminal status the snapshot does not show yet: its
         // settlement is in flight.
         if (revision.terminalStatus !== null) return { status: 'active' };

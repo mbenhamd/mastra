@@ -813,4 +813,48 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(result.diagnostics.get(result.failure.cause)).toBe('logged');
     expect((result.failure as unknown as Record<symbol, unknown>)[brand]).toBe(true);
   });
+
+  it('keeps non-enumerable and __proto__ fields of a settled snapshot selected for erasure', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-odd-fields' };
+    await persist(workflows, run, 'success');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const stored = record.snapshot as WorkflowRunState & Record<string, unknown>;
+    Object.defineProperty(stored, 'audit', { value: { by: 'engine' }, enumerable: false, writable: true });
+    Object.defineProperty(stored, '__proto__', { value: { kept: true }, enumerable: true, writable: true });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const after = db.workflows.get(key)!.snapshot as Record<string, unknown>;
+    expect(Object.getOwnPropertyDescriptor(after, 'audit')).toMatchObject({
+      value: { by: 'engine' },
+      enumerable: false,
+    });
+    expect(Object.getOwnPropertyDescriptor(after, '__proto__')?.value).toEqual({ kept: true });
+    expect(Object.getPrototypeOf(after)).toBe(Object.prototype);
+  });
+
+  it('never runs a stored error accessor on the stored error during a refused cancel', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-error-accessor' };
+    await persist(workflows, run, 'running');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const failure = new Error('stored');
+    let receiver: unknown;
+    Object.defineProperty(failure, 'detail', {
+      enumerable: false,
+      get() {
+        receiver = this;
+        (this as { message: string }).message = 'mutated';
+        return 'detail';
+      },
+    });
+    const snapshot = record.snapshot as WorkflowRunState;
+    db.workflows.set(key, { ...record, snapshot: { ...snapshot, result: { failure } } as WorkflowRunState });
+
+    await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
+    expect(failure.message).toBe('stored');
+    expect(receiver).not.toBe(failure);
+  });
 });

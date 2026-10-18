@@ -238,8 +238,14 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
     const descriptors = Object.getOwnPropertyDescriptors(value);
     for (const name of Reflect.ownKeys(descriptors)) {
       const descriptor = descriptors[name as keyof typeof descriptors] as PropertyDescriptor;
+      if (!('value' in descriptor) && descriptor.get && !isNativeFunction(descriptor.get)) {
+        // A caller accessor is copied as an accessor and read later, on the copy.
+        Object.defineProperty(error, name, { ...descriptor, configurable: true });
+        continue;
+      }
       let field: unknown;
       try {
+        // A native accessor (V8's lazy `stack`) needs the real error to read.
         field = 'value' in descriptor ? descriptor.value : (value as unknown as Record<PropertyKey, unknown>)[name];
       } catch {
         continue;
@@ -277,6 +283,15 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   return copy;
 }
 
+/** True for an engine-provided function, which runs no caller code. */
+function isNativeFunction(fn: Function): boolean {
+  try {
+    return /\{\s*\[native code\]\s*\}\s*$/.test(Function.prototype.toString.call(fn));
+  } catch {
+    return false;
+  }
+}
+
 /** Reads a field once on a detached copy; an accessor that throws yields `undefined`. */
 function readErasureField(owner: object, name: string): unknown {
   try {
@@ -307,21 +322,35 @@ function plainErasureSnapshot<T>(value: T): T {
   }
   // Then each other top-level field once, including one an earlier accessor
   // introduced; an accessor that throws leaves its field out.
+  // Own fields keep their enumerability (a non-enumerable one included);
+  // inherited enumerable fields become own enumerable ones. Fields are
+  // defined, never assigned, so a `__proto__` key stays a field.
   const fields: Record<string, unknown> = {};
-  const names = new Set<string>();
-  for (let level: object | null = record; level && level !== Object.prototype; level = Object.getPrototypeOf(level)) {
+  const names = new Map<PropertyKey, boolean>();
+  const own = Object.getOwnPropertyDescriptors(record);
+  for (const name of Reflect.ownKeys(own)) {
+    names.set(name, (own as Record<PropertyKey, PropertyDescriptor>)[name]!.enumerable ?? false);
+  }
+  for (
+    let level: object | null = Object.getPrototypeOf(record);
+    level && level !== Object.prototype;
+    level = Object.getPrototypeOf(level)
+  ) {
     for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(level))) {
-      if (descriptor.enumerable && name !== 'status') names.add(name);
+      if (descriptor.enumerable && !names.has(name)) names.set(name, true);
     }
   }
-  for (const name of names) {
+  names.delete('status');
+  for (const [name, enumerable] of names) {
+    let field: unknown;
     try {
-      fields[name] = record[name];
+      field = (record as Record<PropertyKey, unknown>)[name];
     } catch {
-      // Left out.
+      continue;
     }
+    Object.defineProperty(fields, name, { value: field, writable: true, enumerable, configurable: true });
   }
-  fields.status = status;
+  Object.defineProperty(fields, 'status', { value: status, writable: true, enumerable: true, configurable: true });
   return cloneRunData(fields) as T;
 }
 
