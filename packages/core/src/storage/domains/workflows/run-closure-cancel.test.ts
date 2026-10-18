@@ -659,4 +659,45 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'deleted',
     });
   });
+
+  it('keeps the built-in payload values of a settled run selected for erasure', async () => {
+    const { workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-built-ins' };
+    const finishedAt = new Date('2026-10-18T00:00:00.000Z');
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(run.runId),
+        status: 'success',
+        result: { finishedAt, counts: new Map([['papers', 3]]), failure: new Error('kept') },
+      },
+    });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const stored = (await workflows.loadWorkflowSnapshot(run))!;
+    const result = stored.result as { finishedAt: Date; counts: Map<string, number>; failure: Error };
+    expect(result.finishedAt).toEqual(finishedAt);
+    expect(result.counts.get('papers')).toBe(3);
+    expect(result.failure.message).toBe('kept');
+  });
+
+  it('finishes the erasure of a run reopened and then settled with another status', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-resettled' };
+    await persist(workflows, run, 'success');
+    await workflows.updateWorkflowState({ ...run, opts: { status: 'running' } });
+    await workflows.updateWorkflowState({ ...run, opts: { status: 'failed' } });
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    expect(db.workflowTerminalParentRevisions.get(key)?.terminalStatus).toBe('success');
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    expect(db.workflowTerminalParentRevisions.get(key)).toMatchObject({
+      terminalStatus: 'failed',
+      erasureCancelled: true,
+    });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
 });

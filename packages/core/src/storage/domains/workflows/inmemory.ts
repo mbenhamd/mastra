@@ -212,6 +212,25 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   if (value === null || typeof value !== 'object') return value;
   const known = seen.get(value);
   if (known !== undefined) return known;
+  // Built-ins keep their payload in internal slots a prototype shell would
+  // lose: copy them whole (their accessors live on the built-in prototypes).
+  if (
+    value instanceof Date ||
+    value instanceof Map ||
+    value instanceof Set ||
+    value instanceof RegExp ||
+    value instanceof ArrayBuffer ||
+    ArrayBuffer.isView(value)
+  ) {
+    let copy: unknown;
+    try {
+      copy = structuredClone(value);
+    } catch {
+      copy = value;
+    }
+    seen.set(value, copy);
+    return copy;
+  }
   const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
   seen.set(value, copy);
   const descriptors = Object.getOwnPropertyDescriptors(value);
@@ -228,51 +247,97 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
  * caller accessor runs inside a fenced check-then-write, and a later read sees
  * the value that was checked.
  */
-function plainErasureSnapshot<T>(value: T): T {
-  const detached = detachedErasureCopy(value);
-  let flat: unknown = detached;
-  if (detached !== null && typeof detached === 'object' && !Array.isArray(detached)) {
-    const copy = detached as Record<string, unknown>;
-    const fields: Record<string, unknown> = {};
-    // `status` first, pinned as data on the copy, so no later accessor can
-    // change the value that is checked and stored.
-    let status: unknown;
-    try {
-      status = copy.status;
-    } catch {
-      status = undefined;
-    }
-    try {
-      Object.defineProperty(copy, 'status', { value: status, writable: true, enumerable: true, configurable: true });
-    } catch {
-      // A non-configurable own accessor stays; `status` below is still the value read.
-    }
-    // Then each other top-level field once, own or inherited, including one
-    // an earlier accessor introduced; an accessor that throws leaves its field out.
-    const names = new Set<string>();
-    for (let level: object | null = copy; level && level !== Object.prototype; level = Object.getPrototypeOf(level)) {
-      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(level))) {
-        if (descriptor.enumerable && name !== 'status') names.add(name);
-      }
-    }
-    for (const name of names) {
-      let field: unknown;
-      try {
-        field = copy[name];
-      } catch {
-        continue;
-      }
-      if (field !== undefined) fields[name] = field;
-    }
-    if (status !== undefined) fields.status = status;
-    flat = fields;
-  }
+/** Reads a field once on a detached copy; an accessor that throws yields `undefined`. */
+function readErasureField(owner: object, name: string | number): unknown {
   try {
-    return structuredClone(flat) as T;
+    return (owner as Record<string | number, unknown>)[name];
   } catch {
-    // A value structuredClone cannot carry (a function): keep its JSON data.
-    return JSON.parse(JSON.stringify(flat)) as T;
+    return undefined;
   }
+}
+
+/** The own and inherited enumerable field names of a detached copy, and an error's own fields. */
+function erasureFieldNames(value: object): string[] {
+  const names = new Set<string>();
+  if (value instanceof Error) for (const name of Object.getOwnPropertyNames(value)) names.add(name);
+  for (let level: object | null = value; level && level !== Object.prototype; level = Object.getPrototypeOf(level)) {
+    if (level === Error.prototype) break;
+    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(level))) {
+      if (descriptor.enumerable) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+/**
+ * Plain data from a detached copy: every accessor is read once (on the copy)
+ * and kept as a data value; built-ins keep their payload; functions are dropped.
+ */
+function plainErasureValue(value: unknown, seen: Map<object, unknown>): unknown {
+  if (typeof value === 'function') return undefined;
+  if (value === null || typeof value !== 'object') return value;
+  const known = seen.get(value);
+  if (known !== undefined) return known;
+  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return structuredClone(value);
+  if (value instanceof Map) {
+    const map = new Map<unknown, unknown>();
+    seen.set(value, map);
+    for (const [key, entry] of value) map.set(plainErasureValue(key, seen), plainErasureValue(entry, seen));
+    return map;
+  }
+  if (value instanceof Set) {
+    const set = new Set<unknown>();
+    seen.set(value, set);
+    for (const entry of value) set.add(plainErasureValue(entry, seen));
+    return set;
+  }
+  if (Array.isArray(value)) {
+    const array: unknown[] = [];
+    seen.set(value, array);
+    for (let index = 0; index < value.length; index++) {
+      array.push(plainErasureValue(readErasureField(value, index), seen));
+    }
+    return array;
+  }
+  // An error keeps its prototype (its methods); everything else is a plain object.
+  const out: Record<string, unknown> = Object.create(
+    value instanceof Error ? Object.getPrototypeOf(value) : Object.prototype,
+  );
+  seen.set(value, out);
+  for (const name of erasureFieldNames(value)) {
+    const field = plainErasureValue(readErasureField(value, name), seen);
+    if (field === undefined) continue;
+    const enumerable = Object.getOwnPropertyDescriptor(value, name)?.enumerable ?? true;
+    Object.defineProperty(out, name, { value: field, writable: true, enumerable, configurable: true });
+  }
+  return out;
+}
+
+function plainErasureSnapshot<T>(value: T): T {
+  const copy = detachedErasureCopy(value);
+  const seen = new Map<object, unknown>();
+  if (copy === null || typeof copy !== 'object' || Array.isArray(copy)) return plainErasureValue(copy, seen) as T;
+  const record = copy as Record<string, unknown>;
+  // `status` first, pinned as data on the copy, so no later accessor can
+  // change the value that is checked and stored.
+  const status = readErasureField(record, 'status');
+  try {
+    Object.defineProperty(record, 'status', { value: status, writable: true, enumerable: true, configurable: true });
+  } catch {
+    // A non-configurable own accessor stays; `status` below is still the value read.
+  }
+  // Then each other top-level field once, including one an earlier accessor
+  // introduced.
+  const fields: Record<string, unknown> = {};
+  for (const name of erasureFieldNames(record)) {
+    if (name === 'status') continue;
+    const field = plainErasureValue(readErasureField(record, name), seen);
+    if (field !== undefined) fields[name] = field;
+  }
+  if (status !== undefined) fields.status = status;
+  return fields as T;
 }
 
 // JSON.stringify serializes an enumerable getter's return value as a fresh
@@ -2280,8 +2345,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // and is latched to the checked status before it is marked.
       if (!isTerminalParentStatus(runStatus)) return { status: 'settled' };
       const existing = this.db.workflowTerminalParentRevisions.get(key);
-      if (existing?.terminalStatus && existing.terminalStatus !== runStatus) return { status: 'active' };
-      const generation = existing === undefined ? 1 : existing.generation + (existing.terminalStatus ? 0 : 1);
+      // A latch that disagrees with the settled status, with no journal and
+      // no pending child left: an ordinary write reopened the run and it
+      // settled again differently (this store allows that, PostgreSQL does
+      // not). The checked status is the run's settlement, so the latch moves.
+      const generation =
+        existing === undefined ? 1 : existing.generation + (existing.terminalStatus === runStatus ? 0 : 1);
       if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
       // Store the checked plain data, so the closure delete reads the
       // settled status this answer latched.
