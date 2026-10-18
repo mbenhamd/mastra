@@ -227,15 +227,36 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
     for (const entry of value) set.add(detachedErasureCopy(entry, seen));
     return set;
   }
-  // Other built-ins keep their payload in internal slots (a native error's
-  // stack included) that a prototype shell would lose: copy them with
-  // cloneRunData, as an ordinary persist does, so an accessor run on the
-  // detached copy can only change the copy.
+  // An error keeps its prototype; its own fields are detached through the
+  // same memo (a `cause` shared with the payload stays shared), and a native
+  // accessor such as V8's lazy `stack` is read on the error itself and kept
+  // as data.
+  if (value instanceof Error) {
+    const error: object = Object.create(Object.getPrototypeOf(value));
+    seen.set(value, error);
+    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+      let field: unknown;
+      try {
+        field = 'value' in descriptor ? descriptor.value : (value as unknown as Record<string, unknown>)[name];
+      } catch {
+        continue;
+      }
+      Object.defineProperty(error, name, {
+        value: detachedErasureCopy(field, seen),
+        writable: true,
+        enumerable: descriptor.enumerable ?? false,
+        configurable: true,
+      });
+    }
+    return error;
+  }
+  // Other built-ins keep their payload in internal slots that a prototype
+  // shell would lose: copy them with cloneRunData, as an ordinary persist
+  // does, so an accessor run on the detached copy can only change the copy.
   if (
     value instanceof Date ||
     value instanceof RegExp ||
     value instanceof URL ||
-    value instanceof Error ||
     value instanceof ArrayBuffer ||
     ArrayBuffer.isView(value)
   ) {

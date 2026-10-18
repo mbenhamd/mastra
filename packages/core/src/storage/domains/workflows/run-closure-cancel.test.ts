@@ -786,4 +786,29 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(result.scores.get(result.papers[0]!)).toBe(3);
     expect(result.selected.has(result.papers[0]!)).toBe(true);
   });
+
+  it('keeps an error cause shared with the rest of a settled payload selected for erasure', async () => {
+    const { workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-shared-cause' };
+    const cause = new Error('root cause');
+    const failure = new Error('wrapped', { cause });
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot(run.runId),
+        status: 'failed',
+        result: { failure, diagnostics: new Map([[cause, 'logged']]) },
+      },
+    });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const result = (await workflows.loadWorkflowSnapshot(run))!.result as {
+      failure: Error;
+      diagnostics: Map<unknown, string>;
+    };
+    expect(result.failure.message).toBe('wrapped');
+    expect(typeof result.failure.stack).toBe('string');
+    expect(result.diagnostics.get(result.failure.cause)).toBe('logged');
+  });
 });
