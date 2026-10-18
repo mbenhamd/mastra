@@ -740,4 +740,26 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'deleted',
     });
   });
+
+  it('keeps stored built-ins untouched when a status accessor mutates them during a refused cancel', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-built-in-accessor' };
+    await persist(workflows, run, 'running');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const { status: _status, ...rest } = record.snapshot as WorkflowRunState;
+    const values = new Map([['kept', 1]]);
+    // An inherited status accessor that writes into a built-in through `this`.
+    const accessor = {
+      get status() {
+        (this as { context: { values: Map<string, number> } }).context.values.set('mutated', 2);
+        return 'running';
+      },
+    };
+    const stored = Object.assign(Object.create(accessor), { ...rest, context: { ...rest.context, values } });
+    db.workflows.set(key, { ...record, snapshot: stored });
+
+    await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
+    expect([...values.keys()]).toEqual(['kept']);
+  });
 });

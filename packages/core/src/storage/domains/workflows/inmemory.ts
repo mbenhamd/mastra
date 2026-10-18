@@ -213,8 +213,9 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
   const known = seen.get(value);
   if (known !== undefined) return known;
   // Built-ins keep their payload in internal slots (a native error's stack
-  // included) that a prototype shell would lose: keep them by reference, and
-  // let cloneRunData copy them as an ordinary persist does.
+  // included) that a prototype shell would lose: copy them with cloneRunData,
+  // as an ordinary persist does, so an accessor run on the detached copy can
+  // only change the copy.
   if (
     value instanceof Date ||
     value instanceof RegExp ||
@@ -225,7 +226,9 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
     value instanceof ArrayBuffer ||
     ArrayBuffer.isView(value)
   ) {
-    return value;
+    const copy = cloneRunData(value);
+    seen.set(value, copy);
+    return copy;
   }
   const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
   seen.set(value, copy);
