@@ -85,7 +85,7 @@ Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write 
 
 A nested child admitted after the cancel finds its parent terminal and is refused.
 
-In the in-memory store, both `cancelled` and `settled` protect the selected run from later `persistWorkflowSnapshot` or `updateWorkflowState` calls whose status disagrees with its retained terminal latch. Those calls throw `WorkflowStaleSnapshotPersistError`. Writes matching that latch remain valid, and an already settled run keeps its snapshot content. Closure deletion clears this protection before the same run ID is used again. Runs not selected for erasure keep their existing write behavior.
+In the in-memory store, both `cancelled` and `settled` protect the selected run from later `persistWorkflowSnapshot`, `updateWorkflowState` or `bindWorkflowNestedRunOwnership` calls whose status disagrees with its retained terminal latch. Those calls throw `WorkflowStaleSnapshotPersistError`. Writes matching that latch remain valid, and an already settled run keeps its snapshot content. Closure deletion clears this protection before the same run ID is used again. Runs not selected for erasure keep their existing write behavior.
 
 ## `listWorkflowRunClosuresByResource(input)`
 

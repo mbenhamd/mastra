@@ -492,4 +492,58 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'deleted',
     });
   });
+
+  it('keeps nested stored state untouched when a status accessor runs during a refused cancel', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-nested-accessor' };
+    await persist(workflows, run, 'running');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const { status: _status, ...rest } = record.snapshot as WorkflowRunState;
+    const probe = { reads: 1 };
+    // An inherited status accessor that writes through nested state.
+    const accessor = {
+      get status() {
+        (this as { context: { probe: { reads: number } } }).context.probe.reads += 1;
+        return 'running';
+      },
+    };
+    const stored = Object.assign(Object.create(accessor), { ...rest, context: { ...rest.context, probe } });
+    db.workflows.set(key, { ...record, snapshot: stored });
+    const revisionBefore = structuredClone(db.workflowTerminalParentRevisions.get(key));
+
+    await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
+    expect(probe.reads).toBe(1);
+    expect(db.workflowTerminalParentRevisions.get(key)).toEqual(revisionBefore);
+  });
+
+  it('latches a settled run without revision evidence before fencing it, and clears the fence on closure delete', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-settled-unlatched' };
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    // A settled run stored before any revision evidence existed for it.
+    db.workflows.set(key, {
+      workflow_name: run.workflowName,
+      run_id: run.runId,
+      resourceId: RESOURCE,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'success' },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    db.workflowTerminalParentRevisions.delete(key);
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    expect(db.workflowTerminalParentRevisions.get(key)).toMatchObject({
+      terminalStatus: 'success',
+      erasureCancelled: true,
+    });
+    await expect(persist(workflows, run, 'running')).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+    expect(db.workflowTerminalParentRevisions.get(key)).not.toHaveProperty('erasureCancelled');
+    // The same run id is usable again.
+    await persist(workflows, run, 'running');
+    await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'running' });
+  });
 });

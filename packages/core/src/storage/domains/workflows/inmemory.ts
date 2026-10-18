@@ -203,6 +203,25 @@ export function cloneRunData<T>(value: T): T {
   return deepCloneForRun(value, new Map()) as T;
 }
 
+/**
+ * A structural copy that never invokes an accessor: data properties are copied
+ * recursively, accessors are copied as accessors. An accessor read on the copy
+ * then mutates the copy, never the stored row.
+ */
+function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  const known = seen.get(value);
+  if (known !== undefined) return known;
+  const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, copy);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const descriptor of Object.values(descriptors)) {
+    if ('value' in descriptor) descriptor.value = detachedErasureCopy(descriptor.value, seen);
+  }
+  Object.defineProperties(copy, descriptors);
+  return copy;
+}
+
 function cloneErasureCancelledSnapshot(
   snapshot: WorkflowRunState,
   status: WorkflowRunState['status'],
@@ -2157,7 +2176,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // The erased lifetime's terminal latch must not carry over: a reused run
     // id starts running again. The generation still moves forward.
     const kept = this.db.workflowTerminalParentRevisions.get(key);
-    if (kept && kept.terminalStatus !== null) {
+    if (kept && (kept.terminalStatus !== null || kept.erasureCancelled)) {
       const { erasureCancelled: _erasureCancelled, ...unlatched } = kept;
       this.db.workflowTerminalParentRevisions.set(key, {
         ...unlatched,
@@ -2189,7 +2208,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // copy, never the stored row, so a refusal leaves the run unchanged.
       runStatus =
         snapshot && typeof snapshot === 'object'
-          ? Object.create(Object.getPrototypeOf(snapshot), Object.getOwnPropertyDescriptors(snapshot)).status
+          ? (detachedErasureCopy(snapshot) as { status?: unknown }).status
           : undefined;
       if (this.db.workflows.get(key) === run) break;
       throwIfWorkflowReentrantAttemptsExhausted(attempt);
@@ -2205,9 +2224,20 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     if (this.hasPendingTerminalDependents(workflowName, runId)) return { status: 'active' };
     if (isSettledWorkflowRunStatus(runStatus)) {
       // Erasure also selects already-settled runs. Keep their payload, but
-      // refuse queued writes that would reopen them before closure deletion.
-      const latched = this.db.workflowTerminalParentRevisions.get(key);
-      if (latched) this.db.workflowTerminalParentRevisions.set(key, { ...latched, erasureCancelled: true });
+      // arm the late-write fence the PostgreSQL latch enforces, so a queued
+      // write cannot reopen them before closure deletion: the revision exists
+      // and is latched to the checked status before it is marked.
+      if (!isTerminalParentStatus(runStatus)) return { status: 'settled' };
+      const existing = this.db.workflowTerminalParentRevisions.get(key);
+      if (existing?.terminalStatus && existing.terminalStatus !== runStatus) return { status: 'active' };
+      const generation = existing === undefined ? 1 : existing.generation + (existing.terminalStatus ? 0 : 1);
+      if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
+      this.db.workflowTerminalParentRevisions.set(key, {
+        ...existing,
+        generation,
+        terminalStatus: runStatus,
+        erasureCancelled: true,
+      });
       return { status: 'settled' };
     }
     // A latched terminal status the snapshot does not show yet: its

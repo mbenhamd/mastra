@@ -326,7 +326,10 @@ export interface CancelWorkflowRunForErasureInput {
 }
 
 /**
- * Checked in this order, and nothing changes unless the result is `cancelled`:
+ * Checked in this order. The run's snapshot changes only when the result is
+ * `cancelled`; a `settled` result on the in-memory store also arms the
+ * late-write fence that the PostgreSQL parent revision latch enforces, so a
+ * queued write cannot reopen the run before its closure is deleted:
  * - `missing`: storage holds no snapshot for the run (nothing to anchor).
  * - `resource_mismatch`: the snapshot, the handoff or the terminal snapshot
  *   records another resource, or the snapshot records none.
@@ -338,7 +341,8 @@ export interface CancelWorkflowRunForErasureInput {
  *   ancestry, whatever its resource) has not completed its terminal journal,
  *   or a terminal status is latched on the run's parent revision that its
  *   snapshot does not show yet. Retry later.
- * - `settled`: the snapshot status is already settled; nothing to overwrite.
+ * - `settled`: the snapshot status is already settled; nothing to overwrite
+ *   (its later writes are refused as for `cancelled`).
  * - `cancelled`: the snapshot is now an empty `canceled` snapshot, and the
  *   parent revision moved as for any snapshot write.
  * - `unsupported`: the adapter does not implement `closureCancelVersion: 1`.
