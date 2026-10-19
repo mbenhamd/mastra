@@ -469,7 +469,9 @@ export function classifyWorkflowSnapshotThreadErasure(
  * The `contentFree` rule of an unattributed thread erasure entry, over a
  * plain-data snapshot: `context` absent, `null` or `{}`, or only an `input`
  * that is `null` or `{}`; and `requestContext` absent, `null` or `{}`.
- * Accessors are not run (an accessor field counts as content).
+ * `{}` means a plain object with no fields; a class instance with no own
+ * fields (a `Date`) counts as content, as its JSON form does. Accessors are
+ * not run (an accessor field counts as content).
  */
 export function isWorkflowSnapshotThreadErasureContentFree(snapshot: unknown): boolean {
   if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
@@ -479,20 +481,22 @@ export function isWorkflowSnapshotThreadErasureContentFree(snapshot: unknown): b
     if (!('value' in descriptor)) return { present: true, accessor: true };
     return descriptor.value === undefined ? { present: false } : { present: true, value: descriptor.value };
   };
+  // Only a plain object can be empty: a class instance (a Date, a URL, a
+  // Buffer) has no own keys but serializes to content, so it counts as content.
+  const isPlainObject = (value: unknown): value is object => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+    const prototype: unknown = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  };
   const isEmptyObject = (value: unknown): boolean =>
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    Object.keys(value).every(key => field(value, key).present === false);
+    isPlainObject(value) && Object.keys(value).every(key => field(value, key).present === false);
   const nullOrEmpty = (entry: { present: boolean; value?: unknown; accessor?: boolean }): boolean =>
     !entry.present || (!entry.accessor && (entry.value === null || isEmptyObject(entry.value)));
   if (!nullOrEmpty(field(snapshot, 'requestContext'))) return false;
   const context = field(snapshot, 'context');
   if (nullOrEmpty(context)) return true;
-  if (context.accessor || context.value === null || typeof context.value !== 'object' || Array.isArray(context.value)) {
-    return false;
-  }
-  const contextValue = context.value as object;
+  if (context.accessor || !isPlainObject(context.value)) return false;
+  const contextValue = context.value;
   const keys = Object.keys(contextValue).filter(key => field(contextValue, key).present);
   return keys.length === 1 && keys[0] === 'input' && nullOrEmpty(field(contextValue, 'input'));
 }

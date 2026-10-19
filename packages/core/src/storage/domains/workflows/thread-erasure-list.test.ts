@@ -113,11 +113,23 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       durableMemoryInfo: { workflowName: 'durable-agentic-loop', runId: 'e-memory-info' },
       durableState: { workflowName: 'durable-agentic-loop', runId: 'f-state' },
     };
-    await persist(workflows, runs.pendingLoopStart, snapshots.loopStart(runs.pendingLoopStart.runId, 'pending', THREAD));
-    await persist(workflows, runs.runningLoopStart, snapshots.loopStart(runs.runningLoopStart.runId, 'running', THREAD));
+    await persist(
+      workflows,
+      runs.pendingLoopStart,
+      snapshots.loopStart(runs.pendingLoopStart.runId, 'pending', THREAD),
+    );
+    await persist(
+      workflows,
+      runs.runningLoopStart,
+      snapshots.loopStart(runs.runningLoopStart.runId, 'running', THREAD),
+    );
     await persist(workflows, runs.reservedKey, snapshots.reservedThreadKey(runs.reservedKey.runId, THREAD));
     await persist(workflows, runs.split, snapshots.splitSuspended(runs.split.runId));
-    await persist(workflows, runs.durableMemoryInfo, snapshots.durableInput(runs.durableMemoryInfo.runId, 'memoryInfo'));
+    await persist(
+      workflows,
+      runs.durableMemoryInfo,
+      snapshots.durableInput(runs.durableMemoryInfo.runId, 'memoryInfo'),
+    );
     await persist(workflows, runs.durableState, snapshots.durableInput(runs.durableState.runId, 'state'));
     // Not listed: another thread, the thread under another resource, and
     // (without includeUnattributed) a snapshot with no thread at all.
@@ -169,14 +181,35 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       createdAt,
       updatedAt,
     });
-    await persist(workflows, { workflowName: 'agentic-loop', runId: 'b-nested' }, snapshots.nestedCreateRunPending('b-nested'));
-    await persist(workflows, { workflowName: 'agentic-loop', runId: 'c-thread' }, snapshots.loopStart('c-thread', 'running', THREAD));
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'b-nested' },
+      snapshots.nestedCreateRunPending('b-nested'),
+    );
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'c-thread' },
+      snapshots.loopStart('c-thread', 'running', THREAD),
+    );
     await persist(workflows, { workflowName: 'agentic-loop', runId: 'd-other' }, snapshots.otherThread('d-other'));
     // Request context without a thread: not content-free.
-    await persist(workflows, { workflowName: 'agentic-loop', runId: 'e-context' }, {
-      ...snapshots.createRunPending('e-context'),
-      requestContext: { locale: 'en' },
-    });
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'e-context' },
+      {
+        ...snapshots.createRunPending('e-context'),
+        requestContext: { locale: 'en' },
+      },
+    );
+    // A class instance with no own fields still serializes to content.
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'e2-date' },
+      {
+        ...snapshots.createRunPending('e2-date'),
+        context: { input: new Date('2026-10-01T00:00:00.000Z') } as any,
+      },
+    );
     await persist(
       workflows,
       { workflowName: 'agentic-loop', runId: 'f-cross' },
@@ -197,6 +230,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       ['b-nested', 'unattributed'],
       ['c-thread', 'thread'],
       ['e-context', 'unattributed'],
+      ['e2-date', 'unattributed'],
     ]);
     expect(result.runs[0]).toEqual({
       workflowName: 'agentic-loop',
@@ -209,6 +243,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     });
     expect(result.runs[1]).toMatchObject({ status: 'pending', contentFree: false });
     expect(result.runs[3]).toMatchObject({ status: 'pending', contentFree: false });
+    expect(result.runs[4]).toMatchObject({ status: 'pending', contentFree: false });
   });
 
   it('pages by (workflowName, runId) in code point order', async () => {
