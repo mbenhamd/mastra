@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageList } from '../message-list';
-import { onThreadMessagesSaved } from '../thread-saves';
 import { createSignal } from '../signals';
+import { onThreadMessagesSaved } from '../thread-saves';
 import type { MastraDBMessage } from '../types';
 import { SaveQueueManager } from './index';
 

@@ -1,5 +1,14 @@
 import type { StepResult, WorkflowRunState } from '../../../workflows';
 import type {
+  ClaimRunOwnershipInput,
+  ClaimRunOwnershipResult,
+  RenewRunOwnershipInput,
+  RenewRunOwnershipResult,
+  RunFence,
+  RunOwnershipRecord,
+} from '../../run-fencing';
+import { runFencingNotSupportedError } from '../../run-fencing';
+import type {
   AdvanceWorkflowTerminalizationInput,
   AdvanceWorkflowTerminalizationResult,
   ClaimWorkflowTerminalizationInput,
@@ -73,15 +82,6 @@ import type {
   ListWorkflowRunsByThreadForErasureResult,
   WorkflowExecutionState,
 } from '../../types';
-import type {
-  ClaimRunOwnershipInput,
-  ClaimRunOwnershipResult,
-  RenewRunOwnershipInput,
-  RenewRunOwnershipResult,
-  RunFence,
-  RunOwnershipRecord,
-} from '../../run-fencing';
-import { runFencingNotSupportedError } from '../../run-fencing';
 import { StorageDomain } from '../base';
 
 export abstract class WorkflowsStorage extends StorageDomain {

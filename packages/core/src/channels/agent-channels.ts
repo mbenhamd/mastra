@@ -40,9 +40,8 @@ import { ChatChannelOutputProcessor, CHAT_CHANNEL_RENDER_CONTEXT_KEY } from './o
 import type { ChatChannelRenderContext } from './output-processor';
 import { ChatChannelProcessor } from './processor';
 import { MastraStateAdapter } from './state-adapter';
-import { extractErrorMessage } from './stream-helpers';
 import type { PendingApprovalRecord } from './stream-helpers';
-import { renderBuiltInToolEvent } from './stream-helpers';
+import { extractErrorMessage, renderBuiltInToolEvent } from './stream-helpers';
 import {
   collectThreadHistory,
   formatLegacyHistoryBlock,

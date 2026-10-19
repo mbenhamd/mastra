@@ -77,8 +77,8 @@ import { withToolResultStatusProviderMetadata } from '../../shared/steps/tool-re
 import { resolveFrameworkSuspendedToolIdentity } from '../../shared/suspended-tool-run-id';
 import type { ResolvedSuspendedToolIdentity } from '../../shared/suspended-tool-run-id';
 import { applyToolPayloadTransformToChunk } from '../../shared/tool-payload-transform';
-import { raceAgainstAbort } from '../../timeout';
 import { dehydrateStreamState } from '../../suspended-stream-state';
+import { raceAgainstAbort } from '../../timeout';
 import type { OuterLLMRun } from '../../types';
 import { serializeToolError, ToolNotFoundError } from '../errors';
 import { toolCallInputSchema, toolCallOutputSchema } from '../schema';
@@ -92,8 +92,8 @@ import {
   eagerToolCallSuspensionIntent,
 } from './eager-tool-execution';
 import type { EagerSuspensionIntent, EagerToolBailout } from './eager-tool-execution';
-import { notifyToolDenied, TOOL_DENIED_CALLBACK_KEY, type ToolDeniedCallback } from './tool-permission-notify';
 import { runBeforeApprovalChecks } from './tool-approval-verdict';
+import { notifyToolDenied, TOOL_DENIED_CALLBACK_KEY, type ToolDeniedCallback } from './tool-permission-notify';
 
 type AddToolMetadataOptions = {
   toolCallId: string;

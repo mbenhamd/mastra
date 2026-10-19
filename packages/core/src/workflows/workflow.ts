@@ -97,8 +97,8 @@ import {
 import { DefaultExecutionEngine } from './default';
 import { getAdmittedJsonSchema } from './dynamic/admitted-schema-source';
 import type { ClassifierStepOutput } from './entry-executors';
-import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
 import { getPersistedRequestContext } from './evented/helpers';
+import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
 import {
   workflowRunNotSuspendedError,
   workflowRunStillRunningError,

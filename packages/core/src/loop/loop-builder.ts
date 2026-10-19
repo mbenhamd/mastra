@@ -1,7 +1,7 @@
 import type { StepResult, ToolSet } from '@internal/ai-sdk-v5';
+import { normalizeToolOutput } from '../agent/message-list/utils/unwrap-legacy-tool-output';
 import { TOOL_PERMISSION_POLICY_KEY } from '../agent/tool-permission-prefilter';
 import type { ToolPermissionPolicy } from '../agent/tool-permission-prefilter';
-import { normalizeToolOutput } from '../agent/message-list/utils/unwrap-legacy-tool-output';
 import type { MastraDBMessage } from '../memory';
 import { InternalSpans, resolveExportedSpanId, SpanType } from '../observability';
 import { safeEnqueue } from '../stream/base';

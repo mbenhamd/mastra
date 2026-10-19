@@ -221,11 +221,10 @@ import { buildMcpServerGuidance } from './mcp-guidance';
 import { mergeAgentExecutionOptions, omitLogicalMessageIdentity } from './merge-execution-options';
 import { MessageList } from './message-list';
 import type { MessageInput, MessageListInput, UIMessageWithMetadata, MastraDBMessage } from './message-list';
-import type { SerializedMessageListState } from './message-list/state';
 import { createStoredMessageLoader } from './message-list/memory-message-refs';
+import type { SerializedMessageListState } from './message-list/state';
 import { buildResumeSpanInput } from './resume-span-input';
 import { SaveQueueManager } from './save-queue';
-import { isCreatedAgentSignal } from './signals';
 import {
   applyResolvedAgentScopes,
   parseAgentScope,
@@ -235,7 +234,7 @@ import {
 } from './scopes';
 import type { AgentScopesSnapshot, ResolvedAgentScopes } from './scopes';
 import type { CreatedAgentSignal } from './signals';
-import { signalSpanAttributes } from './signals';
+import { isCreatedAgentSignal, signalSpanAttributes } from './signals';
 import { runStreamUntilIdle, runResumeStreamUntilIdle, STREAM_UNTIL_IDLE_DEFAULT_OPTIONS } from './stream-until-idle';
 import type { SubAgent, SubAgentToolCall, SubAgentToolResult } from './subagent';
 import { agentThreadStreamRuntime, defaultAgentThreadPubSub } from './thread-stream-runtime';

@@ -66,6 +66,14 @@ import {
   ObservationalMemorySourceWriteConflictError,
 } from './base';
 import {
+  assertActiveObservationsApplied,
+  compareObservationalMemoryHeadOrder,
+  isAppendOnlySince,
+  isBufferedChunkCoveredByCursor,
+  maxObservationCursor,
+  planReflectionGenerationText,
+} from './observational-memory-lifecycle';
+import {
   applyWorkingMemorySnapshotUpdate,
   assertGovernedThreadResourceUnchanged,
   assertThreadWorkingMemoryRemoved,
@@ -83,14 +91,6 @@ import {
   writeWorkingMemorySnapshotMetadata,
   WorkingMemoryValidationError,
 } from './working-memory-snapshot';
-import {
-  assertActiveObservationsApplied,
-  compareObservationalMemoryHeadOrder,
-  isAppendOnlySince,
-  isBufferedChunkCoveredByCursor,
-  maxObservationCursor,
-  planReflectionGenerationText,
-} from './observational-memory-lifecycle';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

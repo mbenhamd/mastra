@@ -1,6 +1,6 @@
+import { MastraServer as SelectedFastifyServer } from '@mastra/fastify/selected';
 import { MastraServer as SelectedServer } from '@mastra/server/server-adapter/selected';
 import type { ServerRoute } from '@mastra/server/server-adapter/selected';
-import { MastraServer as SelectedFastifyServer } from '@mastra/fastify/selected';
 
 type SelectedServerOptions = ConstructorParameters<typeof SelectedServer>[0];
 type SelectedFastifyOptions = ConstructorParameters<typeof SelectedFastifyServer>[0];
