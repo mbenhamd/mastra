@@ -995,4 +995,34 @@ describe('WorkflowsInMemory erasure cancel', () => {
     };
     expect(after.context.scores.get(after.picked)).toBe(3);
   });
+
+  it('never lets an in-flight persist that selects the run for erasure wedge the closure delete', async () => {
+    const { workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-inflight-selection' };
+    await persist(workflows, run, 'success');
+    const base = (await workflows.loadWorkflowSnapshot(run))!;
+    const { status: _status, ...rest } = base;
+    let selection: Promise<unknown> | undefined;
+    let fired = false;
+    // The incoming snapshot's own status getter, read while the persist
+    // clones it, selects the run for erasure mid-write.
+    const incoming = Object.defineProperty({ ...rest }, 'status', {
+      enumerable: true,
+      get() {
+        if (!fired) {
+          fired = true;
+          selection = cancel(workflows, run);
+        }
+        return 'running';
+      },
+    });
+    await workflows
+      .persistWorkflowSnapshot({ ...run, resourceId: RESOURCE, snapshot: incoming as WorkflowRunState })
+      .catch((error: unknown) => expect(error).toBeInstanceOf(WorkflowStaleSnapshotPersistError));
+    await expect(selection).resolves.toMatchObject({ status: expect.stringMatching(/^(settled|cancelled)$/) });
+    expect((await workflows.loadWorkflowSnapshot(run))?.status).not.toBe('running');
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
 });

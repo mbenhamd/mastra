@@ -2376,20 +2376,23 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // delete reads the settled status this answer latches. Nothing else in
       // the stored snapshot changes (its fields, accessors and shared
       // references stay as an ordinary persist left them); only a snapshot
-      // whose status cannot be redefined is replaced by the checked copy.
-      const storedSnapshot = run.snapshot;
-      if (storedSnapshot !== null && typeof storedSnapshot === 'object') {
+      // whose status cannot be redefined is replaced by the checked copy. The
+      // row wrapper is replaced either way, so a write that read the row
+      // before this selection restarts and meets the fence.
+      let selectedSnapshot = run.snapshot;
+      if (selectedSnapshot !== null && typeof selectedSnapshot === 'object') {
         try {
-          Object.defineProperty(storedSnapshot, 'status', {
+          Object.defineProperty(selectedSnapshot, 'status', {
             value: runStatus,
             writable: true,
             enumerable: true,
             configurable: true,
           });
         } catch {
-          if (canonical) this.setWorkflowRunRecord(workflowName, runId, { ...run, snapshot: canonical });
+          if (canonical) selectedSnapshot = canonical;
         }
       }
+      this.setWorkflowRunRecord(workflowName, runId, { ...run, snapshot: selectedSnapshot });
       this.db.workflowTerminalParentRevisions.set(key, {
         ...existing,
         generation,
