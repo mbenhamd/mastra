@@ -1064,4 +1064,29 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'deleted',
     });
   });
+
+  it('keeps non-enumerable accessors when a settled snapshot with a fixed status accessor is replaced', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-fixed-status' };
+    await persist(workflows, run, 'success');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const { status: _status, ...rest } = record.snapshot as WorkflowRunState;
+    const describe = () => 'research run';
+    const stored = Object.defineProperties(
+      { ...rest },
+      {
+        // A status accessor that cannot be redefined, so the checked copy replaces the snapshot.
+        status: { get: () => 'success', enumerable: true, configurable: false },
+        summary: { get: describe, enumerable: false, configurable: true },
+      },
+    );
+    db.workflows.set(key, { ...record, snapshot: stored });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const after = db.workflows.get(key)!.snapshot as Record<string, unknown>;
+    expect(after).not.toBe(stored);
+    expect(Object.getOwnPropertyDescriptor(after, 'status')).toMatchObject({ value: 'success' });
+    expect(Object.getOwnPropertyDescriptor(after, 'summary')).toMatchObject({ get: describe, enumerable: false });
+  });
 });

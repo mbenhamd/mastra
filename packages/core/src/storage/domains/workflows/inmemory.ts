@@ -347,6 +347,14 @@ function plainErasureSnapshot<T>(value: T): T {
     }
     Object.defineProperty(fields, name, { value: field, writable: true, enumerable, configurable: true });
   }
+  // Non-enumerable own accessors are kept as accessors and never run, as
+  // cloneRunData keeps them on an ordinary persist.
+  const accessors = Object.getOwnPropertyDescriptors(record);
+  for (const name of Reflect.ownKeys(accessors)) {
+    const descriptor = (accessors as Record<PropertyKey, PropertyDescriptor>)[name]!;
+    if (name === 'status' || descriptor.enumerable || 'value' in descriptor) continue;
+    Object.defineProperty(fields, name, { ...descriptor, configurable: true });
+  }
   Object.defineProperty(fields, 'status', { value: status, writable: true, enumerable: true, configurable: true });
   // One clone memo for the whole snapshot, so references shared between
   // fields (symbol-keyed ones included) stay shared.
