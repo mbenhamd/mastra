@@ -89,13 +89,13 @@ export function unpinGlobalRunRegistryEntry(
 }
 
 /**
- * Evict the runtime binding of an execution that lost the run (its execution fence
- * was abandoned or superseded), so a recovery of the same run in this process does
- * not collide with its own crashed execution (PF-5928, #27357). Only this exact entry
- * is removed; its late finalizers are identity-gated and cannot touch a successor.
+ * Evict the runtime binding of an execution that no longer owns the run, so a
+ * recovery of the same run in this process does not collide with its own crashed
+ * execution (PF-5928, #27357). The caller decides ownership (see DurableAgent.recover);
+ * only this exact entry is removed, and its late finalizers are identity-gated and
+ * cannot touch a successor.
  */
 export function evictLostRunRegistryEntry(runId: string, entry: RunRegistryEntry): boolean {
-  if (!entry.executionFence?.isLost()) return false;
   let evicted = false;
   if (pinnedRunRegistry.get(runId)?.entry === entry) {
     pinnedRunRegistry.delete(runId);

@@ -6391,11 +6391,22 @@ export class DurableAgent<
       // owns this run ID. Reusing a run ID must never clear or terminate
       // another execution's signal.
       this.#coordinateRegistryCleanup(runId, registryEntry);
-      // PF-5928 (#27357): a local entry left by an execution of this run that already lost it
-      // (abandoned or superseded fence) is not a live owner; evict it so recovery does not
-      // collide with its own crashed execution. A live owner still collides.
+      // PF-5928 (#27357): this recovery now holds the run's claim. A local entry left by an
+      // earlier execution of the run whose fence is lost (abandoned/superseded) or is no
+      // longer this process's active fence for the run is not a live owner: evict it so
+      // recovery does not collide with its own crashed execution. An entry without a fence,
+      // or whose fence is still the active one, still collides.
       const lostEntry = getGlobalRunRegistryEntry(runId);
-      if (lostEntry && lostEntry !== registryEntry) evictLostRunRegistryEntry(runId, lostEntry);
+      const lostFence = lostEntry?.executionFence;
+      if (
+        lostEntry &&
+        lostEntry !== registryEntry &&
+        lostFence !== undefined &&
+        lostFence !== executionFence &&
+        (lostFence.isLost() || ExecutionFence.getLocalActive(runId) !== lostFence)
+      ) {
+        evictLostRunRegistryEntry(runId, lostEntry);
+      }
       this.#assertNoRegistryCollision(runId);
     } catch (error) {
       const settlement = await executionFence.settle(async () => {});
