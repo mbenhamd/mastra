@@ -47,6 +47,15 @@ describe('deferred suspension events (#26435)', () => {
       if ((args.snapshot as { status?: string })?.status === 'suspended') throw new Error('storage down');
       return persist(args);
     };
+    // PF-5928 adaptation (fork PF-2056/PF-3750): the fork's in-memory store advertises
+    // fencedStepUpdateVersion 1, so the engine saves step snapshots (including the suspended
+    // one) through the fenced persistWorkflowStepUpdate mutation instead of
+    // persistWorkflowSnapshot. Fail that write too so the suspended snapshot really is not saved.
+    const persistStepUpdate = workflows.persistWorkflowStepUpdate.bind(workflows);
+    workflows.persistWorkflowStepUpdate = async input => {
+      if ((input.snapshot as { status?: string })?.status === 'suspended') throw new Error('storage down');
+      return persistStepUpdate(input);
+    };
 
     const askUser = createTool({
       id: 'askUser',

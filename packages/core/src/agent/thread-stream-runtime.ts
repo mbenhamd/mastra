@@ -5034,7 +5034,9 @@ export class AgentThreadStreamRuntime {
     const reservedKey = state.threadKeysByRunId.get(runId);
     if (reservedKey !== undefined && reservedKey !== key) return false;
 
-    this.#clearSuspendedRun(state, runId);
+    // Keep the suspension bookkeeping (PF-5928): the same-run re-registration clears only the
+    // resumed call (#clearSuspendedToolCall, or the whole run when no call is named), so a
+    // sibling call's suspension stays resumable for a queued concurrent approval.
     state.threadRunsById.delete(runId);
     if (retainedRecord) {
       state.threadRunsByStreamId.delete(retainedRecord.streamId);
