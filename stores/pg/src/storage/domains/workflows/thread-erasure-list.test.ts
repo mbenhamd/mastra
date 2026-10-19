@@ -247,7 +247,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     // Terminal recovery envelopes, inserted as rows (the listing only reads them).
     const terminal = (runId: string, envelope: Record<string, unknown>) =>
       store.db.none(
-        `INSERT INTO mastra_workflow_terminal_snapshots
+        `INSERT INTO mastra_workflow_terminal_snapshots_v2
            (workflow_name, run_id, version, resource_id, terminal_status, envelope_hash, record_hash, envelope, created_at)
          VALUES ($1, $2, 1, $3, 'success', $4, $4, $5::jsonb, 1)`,
         ['agentic-loop', runId, resource, `sha256:${'0'.repeat(64)}`, JSON.stringify(envelope)],

@@ -6353,7 +6353,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       // as a jsonpath variable (never interpolated). Each branch reads its
       // table's resource index; the run is attributed by all of its rows.
       rows = await this.#db.client.any(
-        `SELECT workflow_name, run_id,
+        `SELECT workflow_name COLLATE "C" AS workflow_name, run_id COLLATE "C" AS run_id,
                 bool_or(matched) AS matched,
                 bool_or(any_thread) AS any_thread,
                 bool_or(kind = 'snapshot') AS has_snapshot,
