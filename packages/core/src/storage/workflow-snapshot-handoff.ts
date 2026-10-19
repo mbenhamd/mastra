@@ -406,7 +406,8 @@ const SNAPSHOT_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
 const TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
   {
     guard: `@.workflowName == "${DURABLE_AGENTIC_LOOP_WORKFLOW}"`,
-    paths: ['@.terminalResult.messageListState.memoryInfo.threadId', '@.terminalResult.state.threadId'],
+    // terminalResult is the child's step result; the loop output is its `output`.
+    paths: ['@.terminalResult.output.messageListState.memoryInfo.threadId', '@.terminalResult.output.state.threadId'],
   },
   { paths: ['@.requestContextPatch.MastraMemory.thread.id', '@.requestContextPatch."mastra__threadId"'] },
 ];
@@ -443,8 +444,8 @@ export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(
 /**
  * SQL/JSON path that is true when a terminal recovery envelope records the
  * thread id bound to `t`: its request-context patch (`MastraMemory.thread.id`,
- * `mastra__threadId`) or, for a durable-agent run, its result's MessageList
- * or durable state.
+ * `mastra__threadId`) or, for a durable-agent run, the MessageList or durable
+ * state of its step result's `output`.
  */
 export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(
   TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
@@ -531,8 +532,8 @@ export function classifyWorkflowTerminalEnvelopeThreadErasure(
     [
       ...(durable
         ? [
-            ...at(envelope, 'terminalResult.messageListState.memoryInfo.threadId'),
-            ...at(envelope, 'terminalResult.state.threadId'),
+            ...at(envelope, 'terminalResult.output.messageListState.memoryInfo.threadId'),
+            ...at(envelope, 'terminalResult.output.state.threadId'),
           ]
         : []),
       ...at(envelope, 'requestContextPatch.MastraMemory.thread.id'),

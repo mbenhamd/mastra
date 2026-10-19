@@ -124,7 +124,7 @@ A row matches only where the framework itself writes a thread id, in any run sta
 - an agent loop suspension: `context.<step>.suspendPayload.__streamState.messageList.memoryInfo.threadId`, for any step and status;
 - a durable agent run (`context.input.__workflowKind` is `durable-agent`): `messageListState.memoryInfo.threadId` and `state.threadId` of its `context.input`, of any step's `output`, and of its `result`. `state.threadId` is set even without a memory backend;
 - the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`;
-- in a terminal envelope: the same two keys in `requestContextPatch` and, for a `durable-agentic-loop` run, `terminalResult.messageListState.memoryInfo.threadId` and `terminalResult.state.threadId`.
+- in a terminal envelope: the same two keys in `requestContextPatch` and, for a `durable-agentic-loop` run, `terminalResult.output.messageListState.memoryInfo.threadId` and `terminalResult.output.state.threadId`.
 
 Application data elsewhere that only looks like thread metadata doesn't match.
 

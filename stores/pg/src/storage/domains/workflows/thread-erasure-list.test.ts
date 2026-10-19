@@ -280,7 +280,10 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     // A durable run without a memory backend records its thread only in its SerializableDurableState.
     await terminal('b2-durable-state', {
       workflowName: 'durable-agentic-loop',
-      terminalResult: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+      terminalResult: {
+        status: 'success',
+        output: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+      },
       finalState: {},
       requestContextPatch: {},
     });
@@ -293,7 +296,10 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     await persist(resource, { workflowName: LOOP, runId: 'd-bare-other' }, snapshots.createRunPending('d-bare-other'));
     await terminal('d-bare-other', {
       workflowName: 'durable-agentic-loop',
-      terminalResult: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
+      terminalResult: {
+        status: 'success',
+        output: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
+      },
       finalState: {},
       requestContextPatch: {},
     });

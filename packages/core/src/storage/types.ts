@@ -516,8 +516,8 @@ export type WorkflowRunThreadErasureEntry =
  *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
  *
  * A terminal envelope records it in its `requestContextPatch` (same two keys)
- * or, for a `durable-agentic-loop` run, in `terminalResult.messageListState.memoryInfo.threadId`
- * or `terminalResult.state.threadId`.
+ * or, for a `durable-agentic-loop` run, in `terminalResult.output.messageListState.memoryInfo.threadId`
+ * or `terminalResult.output.state.threadId` (the envelope keeps the child's step result).
  *
  * Application data shaped like thread metadata elsewhere attributes nothing.
  *

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkflowRunState } from '../../../workflows';
+import { createWorkflowTerminalGraphFingerprint } from '../../../workflows/terminal-continuation';
 import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
 import { InMemoryDB } from '../inmemory-db';
 import { WorkflowsInMemory } from './inmemory';
@@ -312,7 +313,10 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     // A durable run without a memory backend records its thread only in its SerializableDurableState.
     terminal('b2-durable-state', {
       workflowName: 'durable-agentic-loop',
-      terminalResult: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+      terminalResult: {
+        status: 'success',
+        output: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+      },
       finalState: {},
       requestContextPatch: {},
     });
@@ -331,7 +335,10 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     );
     terminal('d-bare-other', {
       workflowName: 'durable-agentic-loop',
-      terminalResult: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
+      terminalResult: {
+        status: 'success',
+        output: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
+      },
       finalState: {},
       requestContextPatch: {},
     });
@@ -371,6 +378,57 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
           status: 'pending',
           contentFree: false,
         },
+      ],
+      hasMore: false,
+    });
+  });
+
+  it('finds a durable run through the terminal envelope the terminalization journal stores', async () => {
+    const { workflows } = setup();
+    const run = { workflowName: 'durable-agentic-loop', runId: 'durable-terminal' };
+    // A durable run without a memory backend: the thread is only in its SerializableDurableState.
+    const state = { threadId: THREAD, memoryConfigured: false };
+    const input = { __workflowKind: 'durable-agent', runId: run.runId, state, messageListState: { memoryInfo: null } };
+    await persist(workflows, run, { ...createEmptyWorkflowSnapshot(run.runId), context: { input } as any });
+    const claim = await workflows.claimWorkflowTerminalization({
+      ...run,
+      eventKey: 'finish',
+      terminalStatus: 'success',
+      ownerId: 'owner',
+      leaseMs: 10_000,
+    });
+    if (claim.status !== 'acquired') throw new Error(claim.status);
+    const snapshot = { ...createEmptyWorkflowSnapshot(run.runId), status: 'success', context: { input } as any };
+    await expect(
+      workflows.persistWorkflowTerminalState({
+        ...run,
+        ownerId: claim.record.ownerId,
+        claimToken: claim.record.claimToken,
+        claimGeneration: claim.record.claimGeneration,
+        resourceId: RESOURCE,
+        snapshot: snapshot as WorkflowRunState,
+        recoveryEnvelope: {
+          version: 1,
+          ...run,
+          terminalStatus: 'success',
+          executionMode: 'continuous',
+          terminalResult: { status: 'success', output: { messageListState: { memoryInfo: null }, state } },
+          finalState: {},
+          requestContextPatch: {},
+          childGraphFingerprint: createWorkflowTerminalGraphFingerprint(snapshot.serializedStepGraph),
+          ancestry: [],
+        } as any,
+      }),
+    ).resolves.toMatchObject({ status: 'persisted' });
+    // The canonical snapshot is deleted; the retained envelope still holds the thread's data.
+    await workflows.deleteWorkflowRunById(run);
+
+    await expect(
+      workflows.listWorkflowRunsByThreadForErasure({ resourceId: RESOURCE, threadId: THREAD, limit: 10 }),
+    ).resolves.toEqual({
+      status: 'listed',
+      runs: [
+        { ...run, attribution: 'thread', rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' } },
       ],
       hasMore: false,
     });
