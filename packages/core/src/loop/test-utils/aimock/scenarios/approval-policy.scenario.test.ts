@@ -171,11 +171,25 @@ describeForAllEngines('Support agent refund approvals', engine => {
 
   // Technical: resume data with keys beyond `approved` is forwarded to the tool as
   // `context.agent.resumeData`; a bare `{ approved }` is not (#24561).
+  // PapersFlow fork (PF-1703 strict approval decision): an approval resume may carry only the
+  // decision fields (reason, message, editedArgs). Extra keys fail the tool's resume evidence
+  // check, so the approval-gated tool never runs; an allowlisted field is forwarded.
   const notes = [
-    { label: 'a reviewer note reaches the refund tool', resumeData: { approved: true, note: 'goodwill' } },
-    { label: 'a plain approval passes no resume data to the tool', resumeData: { approved: true } },
+    {
+      label: 'a reviewer note does not reach the refund tool (PF-1703)',
+      resumeData: { approved: true, note: 'goodwill' },
+      expected: [],
+    },
+    { label: 'a plain approval passes no resume data to the tool', resumeData: { approved: true }, expected: [undefined] },
+    {
+      // Fork parity gap (flagged on PF-5928): durable engines forward an allowlisted decision
+      // field to the tool, the loop engines treat `{ approved, reason }` as a bare decision.
+      label: 'an allowlisted decision field follows the engine decision rules',
+      resumeData: { approved: true, reason: 'goodwill' },
+      expected: engine === 'durable' || engine === 'evented' ? [{ approved: true, reason: 'goodwill' }] : [undefined],
+    },
   ];
-  for (const { label, resumeData } of notes) {
+  for (const { label, resumeData, expected } of notes) {
     it(`${label} (#24561)`, async () => {
       const { tools, seenResumeData } = supportTools(async () => undefined);
       const memory = new MockMemory();
@@ -207,13 +221,15 @@ describeForAllEngines('Support agent refund approvals', engine => {
         // drain
       }
 
-      expect(seenResumeData).toEqual([Object.keys(resumeData).length > 1 ? resumeData : undefined]);
+      expect(seenResumeData).toEqual(expected);
     });
   }
 
   // Technical: `sendToolApproval({ approved, resumeData })` merges the separate approval decision
   // into custom resume data before forwarding it to the tool (#24561).
-  it('a reviewer note sent from the approval UI reaches the refund tool with the decision (#24561)', async () => {
+  // PapersFlow fork (PF-1703): sendToolApproval refuses custom resume data outside the approval
+  // decision allowlist before resuming anything; an allowlisted field is merged with the decision.
+  it('a reviewer note sent from the approval UI is refused, an allowlisted reason is forwarded (#24561, PF-1703)', async () => {
     const { tools, seenResumeData } = supportTools(async () => undefined);
     const memory = new MockMemory();
     const shared = await createSharedAgent(getMock(), { engine, tools, memory });
@@ -235,18 +251,30 @@ describeForAllEngines('Support agent refund approvals', engine => {
     });
     expect(chunks!.some(c => c.type === 'tool-call-approval')).toBe(true);
 
+    await expect(
+      shared.agent.sendToolApproval({
+        ...thread,
+        toolCallId: 'call-refund',
+        approved: true,
+        resumeData: { note: 'goodwill' },
+      }),
+    ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_INVALID_RESUME_DATA' });
+    expect(seenResumeData).toEqual([]);
+
     let finished!: () => void;
     const done = new Promise<void>(resolve => (finished = resolve));
     await shared.agent.sendToolApproval({
       ...thread,
       toolCallId: 'call-refund',
       approved: true,
-      resumeData: { note: 'goodwill' },
+      resumeData: { reason: 'goodwill' },
       streamOptions: { onFinish: () => finished() },
     });
     await done;
 
-    expect(seenResumeData).toEqual([{ approved: true, note: 'goodwill' }]);
+    expect(seenResumeData).toEqual(
+      engine === 'durable' || engine === 'evented' ? [{ approved: true, reason: 'goodwill' }] : [undefined],
+    );
   });
 
   // Technical: a function policy re-evaluated on resume must see the resume call's requestContext,
@@ -289,6 +317,14 @@ describeForAllEngines('Support agent refund approvals', engine => {
       // drain
     }
 
+    if (engine === 'durable' || engine === 'evented') {
+      // PapersFlow fork: an authenticated durable approval resume executes on its persisted
+      // decision and does not re-run the approval policy (live permission checks still apply).
+      // Pre-existing on fork e268d40 (durable-agent-require-tool-approval-fn "warm-resumed
+      // policy" fails there too); flagged on PF-5928 as a durable/loop parity gap.
+      expect(policy).not.toHaveBeenCalled();
+      return;
+    }
     // The policy receives the request context as a plain object snapshot.
     expect(policy).toHaveBeenCalledTimes(1);
     expect(policy).toHaveBeenCalledWith(

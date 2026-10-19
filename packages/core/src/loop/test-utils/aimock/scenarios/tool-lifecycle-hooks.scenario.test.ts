@@ -175,7 +175,10 @@ describeForAllEngines('AIMock loop scenario: tool lifecycle hooks', engine => {
 
   // Durable and evented drop per-execution hooks: Agent.getToolsForExecution never forwards
   // `hooks` to convertTools (#27430).
-  const itPerExecutionHooks = engine === 'durable' || engine === 'evented' ? it.fails : it;
+  // PapersFlow fork: durable/evented runs forward per-execution hooks (the fork fixes them at
+  // run start, see DURABLE_AGENT_RESUME_TOOL_HOOKS_UNSUPPORTED for resume), so the case passes on
+  // every engine here and upstream's expected-failure marker does not apply.
+  const itPerExecutionHooks = it;
 
   itPerExecutionHooks(
     'lets per-execution beforeToolCall override the agent hook and short-circuit execute',

@@ -186,7 +186,13 @@ describeForAllEngines('AIMock loop scenario: tool approval suspend/resume', engi
     const first = shared.agent.approveToolCall({ runId: output.runId, toolCallId: 'call_archive' });
     const startedAt = Date.now();
     const second = shared.agent.approveToolCall({ runId: output.runId, toolCallId: 'call_archive' });
-    await expect(second).rejects.toMatchObject({ id: 'AGENT_RESUME_ALREADY_CLAIMED' });
+    if (engine === 'durable' || engine === 'evented') {
+      await expect(second).rejects.toMatchObject({ id: 'AGENT_RESUME_ALREADY_CLAIMED' });
+    } else {
+      // PapersFlow fork: the loop engines refuse the duplicate at the thread runtime's run-id
+      // reservation (fail-closed, before any execution), which reports a plain error.
+      await expect(second).rejects.toThrow(/Agent thread run id .* is already (reserved|registered)/);
+    }
     expect(Date.now() - startedAt).toBeLessThan(1_000);
 
     release();
