@@ -153,7 +153,7 @@ Every entry also carries:
 
 The intended rule for unattributed runs:
 
-- A `loopInternal` run that is `pending`, in the same resource and older than the longest turn lease plus a margin is left over from a crashed turn. Erase it with `deleteWorkflowRunClosure` whatever `contentFree` says. The `executionWorkflow` child of a crashed turn keeps the previous iteration's output, so it isn't content-free.
+- A `loopInternal` run that's `pending`, in the same resource and older than the longest turn lease plus a margin is left over from a crashed turn. Erase it with `deleteWorkflowRunClosure` whatever `contentFree` says. The `executionWorkflow` child of a crashed turn keeps the previous iteration's output, so it isn't content-free.
 - Erase any other unattributed run only when it's `pending`, `contentFree`, in the same resource and older than that lease plus a margin.
 
 ## Availability
