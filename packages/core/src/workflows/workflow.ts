@@ -6601,6 +6601,77 @@ export class Run<
       }
     }
 
+    // Upstream #25817: a nested child resumed directly claims its suspended parent before the child
+    // runs, so only one child can continue the parent; a losing child gives its own claim back
+    // (nothing ran yet) and rejects with WORKFLOW_RESUME_ALREADY_CLAIMED. Both claims are the
+    // fork's lineage compare-and-set (suspended@N -> running@N+1); a released claim returns the row
+    // to `suspended` and keeps the advanced attempt, so attempts never rewind.
+    const releaseResumeClaim = async (
+      run: { workflowId: string; runId: string },
+      claimed: WorkflowRunState,
+      generation: string,
+    ) => {
+      if (!workflowsStore?.supportsConcurrentUpdates()) return;
+      try {
+        await workflowsStore.updateWorkflowState({
+          workflowName: run.workflowId,
+          runId: run.runId,
+          opts: {
+            status: 'suspended',
+            expectedStatus: 'running',
+            expectedExecutionGeneration: generation,
+            expectedLifecycleResumeAttempt: (claimed.lifecycleResumeAttempt ?? 0) + 1,
+          },
+        });
+      } catch (releaseError) {
+        this.#mastra
+          ?.getLogger()
+          ?.warn(
+            `[Workflow ${run.workflowId}] Failed to release an unused resume claim for run ${run.runId}`,
+            releaseError,
+          );
+      }
+    };
+    let claimedParent:
+      | { run: Run<any, any, any, any, any, any>; snapshot: WorkflowRunState; generation: string }
+      | undefined;
+    if (this.parentWorkflow && !params.skipParentWorkflowClaim && workflowsStore?.supportsConcurrentUpdates()) {
+      const releaseOwnClaimIfUnused = () =>
+        params.claimedSnapshot
+          ? Promise.resolve()
+          : releaseResumeClaim({ workflowId: this.workflowId, runId: this.runId }, snapshot, loadedExecutionGeneration);
+      try {
+        const parentWorkflow = this.#getParentWorkflow(this.parentWorkflow);
+        if (!parentWorkflow) throw new Error(`Parent workflow ${this.parentWorkflow.workflowId} is not registered`);
+        const parentSnapshot = await workflowsStore.loadWorkflowSnapshot({
+          workflowName: this.parentWorkflow.workflowId,
+          runId: this.parentWorkflow.runId,
+        });
+        if (!parentSnapshot) {
+          throw new Error(`No snapshot found for parent workflow run: ${this.parentWorkflow.runId}`);
+        }
+        const parentGeneration = requireWorkflowExecutionGeneration(
+          parentSnapshot.executionGeneration,
+          `Workflow run ${this.parentWorkflow.workflowId}/${this.parentWorkflow.runId}`,
+        );
+        const parentRun = await parentWorkflow.createRun({ runId: this.parentWorkflow.runId });
+        await parentRun.claimResume({
+          workflowsStore,
+          snapshot: parentSnapshot,
+          executionGeneration: parentGeneration,
+        });
+        claimedParent = { run: parentRun, snapshot: parentSnapshot, generation: parentGeneration };
+      } catch (error) {
+        await releaseOwnClaimIfUnused();
+        workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
+        throw error;
+      }
+    }
+    const releaseParentClaim = () =>
+      claimedParent && this.parentWorkflow
+        ? releaseResumeClaim(this.parentWorkflow, claimedParent.snapshot, claimedParent.generation)
+        : Promise.resolve();
+
     const { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates } =
       this.restoreLifecycleExecution(snapshot);
     this.workflowRunStatus = 'running';
@@ -6646,25 +6717,55 @@ export class Run<
         commitTerminalStatus: status => this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
         isCancellationAdmitted: this.isCancellationAdmitted,
       }),
-    ).then(result => {
-      if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
-        this.workflowRunStatus = result.status;
-        if (!params.isVNext && result.status !== 'suspended') {
-          this.closeStreamAction?.().catch(() => {});
+    ).then(
+      result => {
+        if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
+          this.workflowRunStatus = result.status;
+          if (!params.isVNext && result.status !== 'suspended') {
+            this.closeStreamAction?.().catch(() => {});
+          }
+          if (result.status !== 'suspended') {
+            this.cleanup?.();
+          }
         }
-        if (result.status !== 'suspended') {
-          this.cleanup?.();
+        // Upstream #25817: a nested child resumed directly continues the parent it claimed above.
+        if (claimedParent && this.parentWorkflow) {
+          if (result.status === 'success') {
+            let parentExecutionStarted = false;
+            void claimedParent.run
+              .resumeClaimed({
+                step: this.parentWorkflow.stepId,
+                forEachIndex: this.parentWorkflow.foreachIndex,
+                requestContext: params.requestContext,
+                actor: params.actor,
+                claimedSnapshot: claimedParent.snapshot,
+                onExecutionStarted: () => {
+                  parentExecutionStarted = true;
+                },
+              })
+              .catch(async error => {
+                if (!parentExecutionStarted) await releaseParentClaim();
+                this.#mastra
+                  ?.getLogger()
+                  ?.error('Failed to resume parent workflow after nested child completion.', error);
+              });
+          } else {
+            void releaseParentClaim();
+          }
+        } else if (result.status === 'success' && !params.skipParentWorkflowClaim) {
+          // Stores without atomic updates cannot hold the parent claim; wake the parent as before.
+          this.#wakeParentWorkflow({ requestContext: params.requestContext, actor: params.actor });
         }
-      }
-      // Upstream #25817: a nested child resumed directly continues its suspended parent. The
-      // parent resumes through its own public path, so the fork's lineage claim guards it.
-      if (result.status === 'success' && !params.skipParentWorkflowClaim) {
-        this.#wakeParentWorkflow({ requestContext: params.requestContext, actor: params.actor });
-      }
-      result.traceId = traceId;
-      result.spanId = spanId;
-      return result;
-    });
+        result.traceId = traceId;
+        result.spanId = spanId;
+        return result;
+      },
+      async error => {
+        // The child's execution failed; the parent it claimed never ran, so give that claim back.
+        await releaseParentClaim();
+        throw error;
+      },
+    );
 
     this.executionResults = executionResultPromise;
 
