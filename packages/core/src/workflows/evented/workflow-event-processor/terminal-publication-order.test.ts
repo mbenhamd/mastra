@@ -58,23 +58,28 @@ async function setup({
   parent.commit();
   const mastra = new Mastra({ logger: false, storage, pubsub, workflows: { parent } });
   instances.push(mastra);
-  mastra.__registerInternalWorkflow(workflow, 'child-run');
+  // PapersFlow fork: run-scoped internal registrations are released by their registration generation.
+  const internalWorkflowRegistrationGeneration = mastra.__registerInternalWorkflow(workflow, 'child-run');
   const processor = new TerminalProcessor({ mastra });
   const args: ProcessorArgs = {
     workflow,
     workflowId: 'child',
     runId: 'child-run',
+    // PapersFlow fork: evented terminal handling requires a reserved lifecycle generation.
+    executionGeneration: 'child-generation',
     executionPath: [],
     resumeSteps: [],
     stepResults: {},
     activeStepsPath: {},
     requestContext: {},
+    internalWorkflowRegistrationGeneration,
     prevResult: { status: 'success', output: {}, payload: {}, startedAt: Date.now(), endedAt: Date.now() },
     ...(nested || loop
       ? {
           parentWorkflow: {
             workflowId: 'parent',
             runId: 'parent-run',
+            executionGeneration: 'parent-generation',
             executionPath: [0],
             resume: false,
             stepResults: {},
@@ -94,6 +99,7 @@ async function setup({
     snapshot: {
       runId: args.runId,
       status: 'running',
+      executionGeneration: 'child-generation',
       value: {},
       context: {},
       activePaths: [],
@@ -324,7 +330,9 @@ describe('evented terminal publication ordering', () => {
     expect(await f.row()).toEqual(f.original);
     expect(f.deleted).not.toHaveBeenCalled();
     expect(updated).not.toHaveBeenCalled();
-    expect(f.events.some(({ topic }) => topic === 'workflows-finish')).toBe(true);
+    // PapersFlow fork (upstream #26418 adopted fail-closed): an execution that lost ownership
+    // publishes no terminal result; the owning execution drives the run from its snapshot.
+    expect(f.events.some(({ topic }) => topic === 'workflows-finish')).toBe(false);
   });
 
   it('overrides inherited cleanup intent when the workflow uses default persistence', async () => {
@@ -370,7 +378,6 @@ describe('evented terminal publication ordering', () => {
   for (const failure of [false, true]) {
     it(`keeps a newer generation's row when a late ${failure ? 'failure' : 'success'} cleanup arrives`, async () => {
       const f = await setup();
-      f.args.executionGeneration = 'generation-ended';
       const newer = { ...(await f.row())!.snapshot, executionGeneration: 'generation-newer' } as any;
       if (failure) {
         f.args.prevResult = failedResult();
@@ -389,9 +396,6 @@ describe('evented terminal publication ordering', () => {
 
     it(`still deletes its own generation's ${failure ? 'failed' : 'successful'} declined row`, async () => {
       const f = await setup();
-      f.args.executionGeneration = 'generation-ended';
-      const own = { ...(await f.row())!.snapshot, executionGeneration: 'generation-ended' } as any;
-      await f.store.persistWorkflowSnapshot({ workflowName: f.args.workflowId, runId: f.args.runId, snapshot: own });
       if (failure) {
         f.args.prevResult = failedResult();
         await f.processor.fail(f.args);
