@@ -352,9 +352,11 @@ describe('evented terminal publication ordering', () => {
     expect(await f.row()).toEqual(f.original);
     expect(f.deleted).not.toHaveBeenCalled();
     expect(updated).not.toHaveBeenCalled();
-    // PapersFlow fork (upstream #26418 adopted fail-closed): an execution that lost ownership
-    // publishes no terminal result; the owning execution drives the run from its snapshot.
-    expect(f.events.some(({ topic }) => topic === 'workflows-finish')).toBe(false);
+    // Upstream #26418: the lost execution still ends its own segment (its local caller's finish
+    // callback ignores another execution's result), but writes nothing. PapersFlow fork: it also
+    // publishes no lifecycle transition for the lineage now owned elsewhere.
+    expect(f.events.some(({ topic }) => topic === 'workflows-finish')).toBe(true);
+    expect(f.events.some(({ topic }) => topic.startsWith('workflow.lifecycle'))).toBe(false);
   });
 
   it('overrides inherited cleanup intent when the workflow uses default persistence', async () => {
@@ -405,12 +407,20 @@ describe('evented terminal publication ordering', () => {
         f.args.prevResult = failedResult();
         f.rejectWhen(topic => topic === 'workflows-finish');
         await expect(f.processor.fail(f.args)).rejects.toThrow('LOADING');
-        await f.store.persistWorkflowSnapshot({ workflowName: f.args.workflowId, runId: f.args.runId, snapshot: newer });
+        await f.store.persistWorkflowSnapshot({
+          workflowName: f.args.workflowId,
+          runId: f.args.runId,
+          snapshot: newer,
+        });
         f.rejectWhen();
         await f.processor.fail(f.args);
       } else {
         await f.processor.end(f.args);
-        await f.store.persistWorkflowSnapshot({ workflowName: f.args.workflowId, runId: f.args.runId, snapshot: newer });
+        await f.store.persistWorkflowSnapshot({
+          workflowName: f.args.workflowId,
+          runId: f.args.runId,
+          snapshot: newer,
+        });
         expect(await f.consume()).toEqual({ ok: true });
       }
       expect((await f.row())?.snapshot).toMatchObject({ executionGeneration: 'generation-newer' });

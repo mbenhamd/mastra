@@ -43,6 +43,7 @@ import {
 } from '../../terminal-continuation/planning-view';
 import { materializeWorkflowTerminalRecoveryAncestry } from '../../terminal-recovery';
 import type { WorkflowTerminalRecoveryAncestryV1 } from '../../terminal-recovery';
+import { claimWorkflowRestart } from '../../restart-claim';
 import type { ScheduledWorkflowTrigger } from '../../scheduler/types';
 import {
   createRestartExecutionParams,
@@ -2317,7 +2318,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       terminalAdmission = true;
     }
 
-    if (!terminalAdmission) {
+    if (!terminalAdmission && !ownershipLost) {
       this.mastra.getLogger()?.debug?.('Evented workflow failure lost durable terminal admission', {
         workflowId,
         runId,
@@ -2326,14 +2327,21 @@ export class WorkflowEventProcessor extends EventProcessor {
       return;
     }
 
-    // Terminal ownership is admitted before cleanup or publication.
-    this.cleanupRun(runId);
+    // An execution that lost the run (upstream #26418) still ends its own segment: it tells a
+    // parent and its local caller (whose finish callback ignores another execution's result,
+    // see EventedExecutionEngine) that it stopped, but it writes nothing, publishes no lifecycle
+    // transition for the lineage now owned elsewhere, and leaves the run's local state and
+    // topics to the owner. Without this the lost caller's start() never settles.
+    if (!ownershipLost) {
+      // Terminal ownership is admitted before cleanup or publication.
+      this.cleanupRun(runId);
 
-    // 'failed' is terminal: the run stops writing to its watch topic. Arm
-    // cleanup only after the terminal snapshot update (or nested-row delete)
-    // completes, so a short test delay or slow store can't make the timer read
-    // the previous active status and incorrectly skip deletion.
-    this.scheduleRunTopicCleanup(workflowId, runId, executionGeneration);
+      // 'failed' is terminal: the run stops writing to its watch topic. Arm
+      // cleanup only after the terminal snapshot update (or nested-row delete)
+      // completes, so a short test delay or slow store can't make the timer read
+      // the previous active status and incorrectly skip deletion.
+      this.scheduleRunTopicCleanup(workflowId, runId, executionGeneration);
+    }
 
     // handle nested workflow
     if (parentWorkflow) {
@@ -2364,25 +2372,27 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
 
     const workflowError = (prevResult as { error?: unknown }).error;
-    await publishWorkflowLifecycleEvent({
-      pubsub: this.mastra.pubsub,
-      workflowId,
-      runId,
-      executionGeneration,
-      event: { type: 'workflow.failed', resumeAttempt: args.lifecycleResumeAttempt ?? 0, error: workflowError },
-    });
-    await publishWorkflowLifecycleEvent({
-      pubsub: this.mastra.pubsub,
-      workflowId,
-      runId,
-      executionGeneration,
-      event: {
-        type: 'workflow.finished',
-        resumeAttempt: args.lifecycleResumeAttempt ?? 0,
-        status: 'failed',
-        error: workflowError,
-      },
-    });
+    if (!ownershipLost) {
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: { type: 'workflow.failed', resumeAttempt: args.lifecycleResumeAttempt ?? 0, error: workflowError },
+      });
+      await publishWorkflowLifecycleEvent({
+        pubsub: this.mastra.pubsub,
+        workflowId,
+        runId,
+        executionGeneration,
+        event: {
+          type: 'workflow.finished',
+          resumeAttempt: args.lifecycleResumeAttempt ?? 0,
+          status: 'failed',
+          error: workflowError,
+        },
+      });
+    }
 
     await this.mastra.pubsub.publish('workflows-finish', {
       type: 'workflow.fail',
@@ -3449,6 +3459,25 @@ export class WorkflowEventProcessor extends EventProcessor {
           lifecycleStepStates: {},
         };
 
+        // Fork lifecycle (L32): the restarted parent derives a fresh nested generation, but the
+        // nested row still carries the crashed lifetime's. Adopt the new generation with the same
+        // compare-and-set a top-level restart uses before dispatching, or the dispatcher drops the
+        // nested start as a stale generation and the parent restart never settles. A lost claim
+        // (another lifetime took the nested run) throws WORKFLOW_RESTART_NOT_CLAIMED.
+        if (
+          workflowsStore &&
+          snapshot.executionGeneration !== undefined &&
+          snapshot.executionGeneration !== nestedLifecycleExecution.executionGeneration
+        ) {
+          await claimWorkflowRestart({
+            workflowsStore,
+            snapshot,
+            lifecycleExecution: nestedLifecycleExecution,
+            workflowId: leafId,
+            runId: nestedRunId,
+          });
+        }
+
         await this.mastra.pubsub.publish('workflows', {
           type: 'workflow.start',
           runId,
@@ -4357,6 +4386,9 @@ export class WorkflowEventProcessor extends EventProcessor {
         type: 'workflow.fail',
         runId,
         data: {
+          // Fork lifecycle (L32): every dispatched event carries its lifetime; a fail without it
+          // is rejected by the dispatcher and the lost execution's run never settles.
+          ...lifecycleExecution,
           workflowId,
           runId,
           executionPath,

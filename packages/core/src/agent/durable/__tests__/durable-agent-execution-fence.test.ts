@@ -584,7 +584,10 @@ describe.each<OwnershipBackend>(['storage', 'lease'])(
       // PF-1875 (PF-5928 decision, option a): the fork refuses memory-backed cold recovery because request-local processor state is not persisted.
       await expect(agentB.recover(runId, { force: true })).rejects.toMatchObject(PROCESSOR_STATE_UNRECOVERABLE);
       expect(recovering.calls()).toBe(0);
+      // Let the superseded original execution finish before the next test reuses the shared bus
+      // and agent id; left running, its late output lands in the next test's stores.
       original.release();
+      await originalFence.whenSettled;
     });
 
     it.skipIf(backend === 'lease')(
