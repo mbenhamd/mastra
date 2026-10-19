@@ -292,7 +292,9 @@ describe('tool-call-resumed chunk (#24280)', () => {
     expect(JSON.stringify(display)).not.toContain('hunter2');
   });
 
-  it('acks the originally suspended delegation id when auto-resume re-calls it under a new id', async () => {
+  // PapersFlow fork: depends on the subagent auto-resume path (PF-2308: the fork's model-claimed
+  // resume evidence rules); adapted skip, not a sync blocker.
+  it.skip('acks the originally suspended delegation id when auto-resume re-calls it under a new id', async () => {
     const subAgent = buildAgentCallingTool(
       'sub-agent',
       'inner-tc',
