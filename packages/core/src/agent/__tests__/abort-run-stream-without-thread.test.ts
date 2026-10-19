@@ -155,7 +155,12 @@ describe('Agent.abortRunStream without a thread', () => {
     await Promise.resolve();
 
     expect(observedAbort()).toBe(true);
-    expect(agent.abortRunStream(runId)).toBe(false);
+    // PF-5928 adaptation (fork PF-4402 bounded abort finalizer): a registered
+    // thread run stays the abortable owner until its authenticated
+    // `run-aborting`/`run-aborted` terminals publish and the finalizer hands
+    // queued input off, which settles after the provider stream finishes.
+    // A repeated abort meanwhile is an idempotent no-op that returns true.
+    await vi.waitFor(() => expect(agent.abortRunStream(runId)).toBe(false));
   });
 
   it('aborts streamUntilIdle without a thread', async () => {
@@ -208,7 +213,11 @@ describe('Agent.abortRunStream without a thread', () => {
 
     try {
       await startedPromise;
-      await agentThreadStreamRuntime.registerRun(
+      // PF-5928 adaptation (fork PF-513): a non-strict `registerRun` resolves
+      // with the run's completion watcher, not its registration publish, so
+      // awaiting it here would wait on the parked run this test aborts. The
+      // remote subscription's first part proves the registration published.
+      const completion = agentThreadStreamRuntime.registerRun(
         agent,
         stream,
         { runId, memory: { thread: scope.threadId, resource: scope.resourceId } },
@@ -219,6 +228,7 @@ describe('Agent.abortRunStream without a thread', () => {
       expect(remoteSubscription.abort()).toBe(true);
       await text;
       await stream._waitUntilFinished();
+      await completion;
 
       expect(observedAbort()).toBe(true);
     } finally {

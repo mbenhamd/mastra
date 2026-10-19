@@ -1176,7 +1176,11 @@ type ThreadLeaseOperationProvenance = {
 };
 
 export class AgentThreadStreamRuntime {
-  #id = randomUUID();
+  // Upstream parity (PF-5928): resolved lazily by `#getSourceId()`, from
+  // `globalThis.crypto`, when the runtime first participates in a thread. The
+  // fork's eager `node:crypto` initializer made the getter's fallback dead code
+  // and drew the module singleton's id at import time.
+  #id?: string;
   #statesByPubSub = new WeakMap<PubSub, AgentThreadRuntimeState>();
   #threadRegistrationListenersByPubSub = new WeakMap<PubSub, Map<string, Set<ThreadRegistrationListener>>>();
   #threadOutputRegistrations = new WeakMap<object, Promise<void>>();
@@ -1713,7 +1717,7 @@ export class AgentThreadStreamRuntime {
       const data = event.data as AgentThreadStreamRuntimeEvent | undefined;
       if (data?.type === 'signal-enqueued') {
         if (
-          (data.sourceId === this.#id && this.#isLocalSignalEcho(state, key, data.signal.id, data.runId)) ||
+          (data.sourceId === this.#getSourceId() && this.#isLocalSignalEcho(state, key, data.signal.id, data.runId)) ||
           subscription.admittedSignalIds.has(data.signal.id)
         )
           return;
@@ -1784,7 +1788,7 @@ export class AgentThreadStreamRuntime {
         }
       } else if (data?.type === 'run-registered') {
         const lost = state.lostRunsByThread.get(key);
-        if (data.sourceId === this.#id) {
+        if (data.sourceId === this.#getSourceId()) {
           const record =
             state.threadRunsByStreamId.get(data.streamId) ?? (lost?.streamId === data.streamId ? lost : undefined);
           if (record) record.registrationSeen = true;
@@ -9379,7 +9383,7 @@ export class AgentThreadStreamRuntime {
         if (supersededStreamIds.has(data.streamId)) return;
         const localRecord = state.threadRunsByStreamId.get(data.streamId);
         if (
-          data.sourceId === this.#id &&
+          data.sourceId === this.#getSourceId() &&
           (localStreamIds.has(data.streamId) || !replayedStreamIds.has(data.streamId))
         ) {
           return;
@@ -10735,7 +10739,7 @@ export class AgentThreadStreamRuntime {
             type: 'signal-enqueued',
             runId,
             signal: this.#serializeSignal(signal),
-            sourceId: this.#id,
+            sourceId: this.#getSourceId(),
           });
           void this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);
           return acceptSignal(

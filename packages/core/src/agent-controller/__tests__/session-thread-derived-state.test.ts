@@ -432,6 +432,24 @@ describe('AgentController thread-derived session state', () => {
           expect(second.stream.activeRunId()).toBeNull();
         });
 
+        // PF-5928 adaptation (fork PF-4402 preserve-by-default abort): the
+        // listener's input delivered to the aborted first action survives the
+        // abort and is handed to a follow-up run that continues that action
+        // (it inherits the aborted run's stream options, so the first session
+        // initiated it). Stop that preserved follow-up before the other session
+        // starts the next action whose navigation ownership is checked.
+        let nextCall = 1;
+        if (observation === 'delivered' || observation === 'raced-delivery') {
+          await vi.waitFor(() => expect(modelCalls).toHaveLength(2));
+          second.abort();
+          await vi.waitFor(() => expect(modelCalls[1]!.signal?.aborted).toBe(true));
+          await vi.waitFor(() => {
+            expect(second.run.isRunning()).toBe(false);
+            expect(second.stream.activeRunId()).toBeNull();
+          });
+          nextCall = 2;
+        }
+
         await first.thread.switch({ threadId });
         sending = second.sendMessage({ content: 'Start the next action from the other session' });
         void sending.catch(error => errors.push(error));
@@ -439,16 +457,16 @@ describe('AgentController thread-derived session state', () => {
           () => {
             expect(errors).toEqual([]);
             expect(second.run.getRunId()).toBeTruthy();
-            expect(modelCalls).toHaveLength(2);
+            expect(modelCalls).toHaveLength(nextCall + 1);
             expect(first.run.getRunId()).toBe(second.run.getRunId());
             expect(second.run.getRunId()).not.toBe(firstRunId);
           },
           { timeout: 5_000 },
         );
         await first.thread.switch({ threadId: 'initiator-away' });
-        expect(modelCalls[1]!.signal?.aborted).toBe(false);
+        expect(modelCalls[nextCall]!.signal?.aborted).toBe(false);
         await second.thread.switch({ threadId: 'listener-away' });
-        await vi.waitFor(() => expect(modelCalls[1]!.signal?.aborted).toBe(true));
+        await vi.waitFor(() => expect(modelCalls[nextCall]!.signal?.aborted).toBe(true));
         await sending;
       } finally {
         consumption.resolve();

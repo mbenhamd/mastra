@@ -40,8 +40,35 @@ function createOwnerModel(responseText: string, onStream?: (responseText: string
  * stays listed as sendable the whole time.
  */
 class TestPubSub extends PubSub {
-  #subscribers = new Map<string, Set<EventCallback>>();
-  ownerAnswersDiscovery = true;
+  #subscribers: Map<string, Set<EventCallback>>;
+  #network: { ownerAnswersDiscovery: boolean };
+
+  constructor(peer?: TestPubSub) {
+    super();
+    this.#subscribers = peer ? peer.#subscribers : new Map<string, Set<EventCallback>>();
+    this.#network = peer ? peer.#network : { ownerAnswersDiscovery: true };
+  }
+
+  get ownerAnswersDiscovery(): boolean {
+    return this.#network.ownerAnswersDiscovery;
+  }
+
+  set ownerAnswersDiscovery(value: boolean) {
+    this.#network.ownerAnswersDiscovery = value;
+  }
+
+  /**
+   * PF-5928 adaptation (fork PF-513 reservation ownership): another process's
+   * connection to the same transport. The claimed owner's `Agent.stream` runs on
+   * the process-wide thread runtime, whose state is keyed by PubSub. Sharing the
+   * sender's connection would put the owner's woken run in the sender's local
+   * state, where the fork refuses to let an idle wake join the sender agent's
+   * foreign local reservation of that run id. A separate connection keeps the
+   * two processes' local state apart while they share one wire.
+   */
+  connect(): TestPubSub {
+    return new TestPubSub(this);
+  }
 
   async publish(topic: string, event: any): Promise<void> {
     if (
@@ -97,22 +124,23 @@ describe('claimed-owner wake conditions', () => {
     // thread_deleted or session close, so `/new` adds a claim rather than
     // replacing one. Reported failures were suspected to come from that flow.
     const pubsub = new TestPubSub();
+    const ownerTransport = pubsub.connect();
     const ownerRuntime = new AgentThreadStreamRuntime();
-    const owner = createAgent('owner', pubsub);
+    const owner = createAgent('owner', ownerTransport);
     const sender = createAgent('sender', pubsub);
 
-    const firstClaim = await ownerRuntime.claimThreadOwnership(owner, target, pubsub);
+    const firstClaim = await ownerRuntime.claimThreadOwnership(owner, target, ownerTransport);
     const newThreadClaim = await ownerRuntime.claimThreadOwnership(
       owner,
       { resourceId: target.resourceId, threadId: 'claimed-owner-new-thread' },
-      pubsub,
+      ownerTransport,
     );
     expect(firstClaim.claimed).toBe(true);
     expect(newThreadClaim.claimed).toBe(true);
 
     // The thread the user moved away from is still advertised and still answers
     // a wake that requires its claimed owner.
-    const peers = await ownerRuntime.discoverThreadPeers({ timeoutMs: 50 }, pubsub);
+    const peers = await ownerRuntime.discoverThreadPeers({ timeoutMs: 50 }, ownerTransport);
     expect(peers.map(peer => peer.threadId)).toEqual(
       expect.arrayContaining([target.threadId, 'claimed-owner-new-thread']),
     );
@@ -129,12 +157,13 @@ describe('claimed-owner wake conditions', () => {
 
   it('rejects a required-owner wake when the owner stays advertised but cannot answer discovery', async () => {
     const pubsub = new TestPubSub();
+    const ownerTransport = pubsub.connect();
     const ownerRuntime = new AgentThreadStreamRuntime();
     const senderRuntime = new AgentThreadStreamRuntime();
-    const owner = createAgent('owner', pubsub);
+    const owner = createAgent('owner', ownerTransport);
     const sender = createAgent('sender', pubsub);
 
-    const claim = await ownerRuntime.claimThreadOwnership(owner, target, pubsub);
+    const claim = await ownerRuntime.claimThreadOwnership(owner, target, ownerTransport);
     expect(claim.claimed).toBe(true);
 
     pubsub.ownerAnswersDiscovery = false;
@@ -167,7 +196,8 @@ describe('claimed-owner wake conditions', () => {
     const storage = new MastraCompositeStore({ id: 'claimed-owner-storage', domains: { notifications } });
     const ownerRuns: string[] = [];
     const senderRuns: string[] = [];
-    const owner = createAgent('owner', pubsub, ownerRuns);
+    const ownerTransport = pubsub.connect();
+    const owner = createAgent('owner', ownerTransport, ownerRuns);
     const sender = createAgent('sender', pubsub, senderRuns);
     const mastra = new Mastra({ agents: { sender }, storage, logger: false });
 
@@ -177,7 +207,7 @@ describe('claimed-owner wake conditions', () => {
     const claim = await ownerRuntime.claimThreadOwnership(
       owner,
       { ...target, streamOptions: { untilIdle: true } },
-      pubsub,
+      ownerTransport,
     );
     pubsub.ownerAnswersDiscovery = false;
 
