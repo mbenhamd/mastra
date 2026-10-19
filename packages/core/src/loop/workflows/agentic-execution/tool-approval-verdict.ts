@@ -17,7 +17,10 @@ import type {
 } from '../../../tools/types';
 import { validateToolInput } from '../../../tools/validation';
 
-type ToolInputValidator = (input: unknown) => { data?: unknown; error?: unknown };
+type ToolInputValidationResult = { data?: unknown; error?: unknown };
+// Fork: built CoreTools may validate asynchronously (approval-input async refinements), so the
+// validator result is awaited; an un-awaited Promise would read as "valid" with no data.
+type ToolInputValidator = (input: unknown) => ToolInputValidationResult | Promise<ToolInputValidationResult>;
 
 type BeforeApprovalWithRuntime = (
   input: unknown,
@@ -125,9 +128,9 @@ export async function runBeforeApprovalChecks({
   // network loop still carry `inputSchema`.
   const validateInput = (tool as { validateInput?: unknown } | undefined)?.validateInput;
   const inputSchema = (tool as { inputSchema?: unknown } | undefined)?.inputSchema;
-  const validation =
+  const validation: ToolInputValidationResult | undefined =
     typeof validateInput === 'function'
-      ? (validateInput as ToolInputValidator)(input)
+      ? await (validateInput as ToolInputValidator)(input)
       : inputSchema
         ? validateToolInput(inputSchema as StandardSchemaWithJSON, input, context.toolName)
         : undefined;

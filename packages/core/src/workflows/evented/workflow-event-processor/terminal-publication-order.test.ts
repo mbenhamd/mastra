@@ -364,6 +364,45 @@ describe('evented terminal publication ordering', () => {
     });
   }
 
+  // PapersFlow fork: the cleanup delete runs one pubsub hop after terminal admission and is
+  // driven by event data, so it must never remove a row a newer execution generation of the
+  // same runId has written in between (fork lifecycle lineage; #504 rebuild checklist).
+  for (const failure of [false, true]) {
+    it(`keeps a newer generation's row when a late ${failure ? 'failure' : 'success'} cleanup arrives`, async () => {
+      const f = await setup();
+      f.args.executionGeneration = 'generation-ended';
+      const newer = { ...(await f.row())!.snapshot, executionGeneration: 'generation-newer' } as any;
+      if (failure) {
+        f.args.prevResult = failedResult();
+        f.rejectWhen(topic => topic === 'workflows-finish');
+        await expect(f.processor.fail(f.args)).rejects.toThrow('LOADING');
+        await f.store.persistWorkflowSnapshot({ workflowName: f.args.workflowId, runId: f.args.runId, snapshot: newer });
+        f.rejectWhen();
+        await f.processor.fail(f.args);
+      } else {
+        await f.processor.end(f.args);
+        await f.store.persistWorkflowSnapshot({ workflowName: f.args.workflowId, runId: f.args.runId, snapshot: newer });
+        expect(await f.consume()).toEqual({ ok: true });
+      }
+      expect((await f.row())?.snapshot).toMatchObject({ executionGeneration: 'generation-newer' });
+    });
+
+    it(`still deletes its own generation's ${failure ? 'failed' : 'successful'} declined row`, async () => {
+      const f = await setup();
+      f.args.executionGeneration = 'generation-ended';
+      const own = { ...(await f.row())!.snapshot, executionGeneration: 'generation-ended' } as any;
+      await f.store.persistWorkflowSnapshot({ workflowName: f.args.workflowId, runId: f.args.runId, snapshot: own });
+      if (failure) {
+        f.args.prevResult = failedResult();
+        await f.processor.fail(f.args);
+      } else {
+        await f.processor.end(f.args);
+        expect(await f.consume()).toEqual({ ok: true });
+      }
+      expect(await f.row()).toBeNull();
+    });
+  }
+
   for (const boundary of ['continuation', 'finish']) {
     it(`retains the snapshot if nested loop ${boundary} publication fails`, async () => {
       const f = await setup({ loop: true });

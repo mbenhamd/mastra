@@ -14,6 +14,7 @@ import { STALE_EXECUTION_RESULT, isStaleExecutionResult } from '../../../storage
 import type { GetWorkflowRunTerminalStatusResult, UpdateWorkflowResultsResult } from '../../../storage/types';
 import { isWorkflowStaleSnapshotPersistError } from '../../../storage/workflow-snapshot-handoff';
 import { coverNestedRun } from '../../../storage/run-fencing';
+import type { WorkflowsStorage } from '../../../storage/domains/workflows/base';
 import type { StepExecutionStrategy } from '../../../worker/types';
 import { getEntryId, getEntryRetries, getEntrySchemas, getEntryWorkflow } from '../../../workflows/step-entry';
 import type {
@@ -613,6 +614,45 @@ export class WorkflowEventProcessor extends EventProcessor {
     if (timer !== undefined) {
       clearTimeout(timer);
       this.pendingTopicCleanups.delete(cleanupKey);
+    }
+  }
+
+  /**
+   * Deletes the snapshot row of an opted-out (`!shouldPersist`) run after its
+   * terminal publications (upstream #27355), but only while the row still
+   * belongs to the execution generation that ended. The delete is deferred one
+   * pubsub hop past terminal admission and is driven by event data, so a
+   * redelivered or late cleanup must never remove the row of a newer
+   * generation that has since claimed the same runId (fork lifecycle lineage).
+   * A row without a recorded generation predates lineage and keeps upstream's
+   * #22209 cleanup. Best-effort: a storage failure must not abort completion.
+   * The read and the delete are not one atomic operation (as in
+   * `clearRunTopicUnlessActive`); a claim landing in between is the residual
+   * window, and the newer generation then rewrites its row on its next persist.
+   */
+  private async deleteDeclinedSnapshotIfCurrent(
+    workflowsStore: WorkflowsStorage | undefined,
+    workflowId: string,
+    runId: string,
+    executionGeneration: string,
+  ): Promise<void> {
+    if (!workflowsStore) return;
+    try {
+      const snapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
+      if (!snapshot) return;
+      const currentExecutionGeneration = typeof snapshot === 'string' ? undefined : snapshot.executionGeneration;
+      if (currentExecutionGeneration !== undefined && currentExecutionGeneration !== executionGeneration) {
+        this.mastra.getLogger()?.debug?.('Skipped declined snapshot cleanup owned by a newer execution', {
+          workflowId,
+          runId,
+          executionGeneration,
+          currentExecutionGeneration,
+        });
+        return;
+      }
+      await workflowsStore.deleteWorkflowRunById({ runId, workflowName: workflowId });
+    } catch (e) {
+      this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
     }
   }
 
@@ -2065,12 +2105,13 @@ export class WorkflowEventProcessor extends EventProcessor {
     if (deleteSnapshotAfterEnd === true) {
       // Declined terminal snapshots must not outlive completed runs (#22209),
       // but remain recoverable until parent/loop and finish publications succeed.
-      try {
-        const workflowsStore = await this.mastra.getStorage()?.getStore('workflows');
-        await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: workflowId });
-      } catch (e) {
-        this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
-      }
+      // Fork: only while the row still belongs to the generation that ended.
+      await this.deleteDeclinedSnapshotIfCurrent(
+        await this.mastra.getStorage()?.getStore('workflows'),
+        workflowId,
+        runId,
+        requireWorkflowExecutionGeneration(args.executionGeneration, `Evented workflow cleanup ${workflowId}/${runId}`),
+      );
     }
 
     // Clean up run-scoped internal workflow registrations (e.g. execution-workflow)
@@ -2350,12 +2391,9 @@ export class WorkflowEventProcessor extends EventProcessor {
     });
 
     if (!ownershipLost && !shouldPersist) {
-      // As with successful runs, cleanup must wait for every terminal publication.
-      try {
-        await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: workflowId });
-      } catch (e) {
-        this.mastra.getLogger()?.warn('Failed to clean up workflow snapshot', { workflowId, runId, error: e });
-      }
+      // As with successful runs, cleanup must wait for every terminal publication,
+      // and only while the row still belongs to this generation (fork lineage).
+      await this.deleteDeclinedSnapshotIfCurrent(workflowsStore, workflowId, runId, executionGeneration);
     }
 
     // Clean up run-scoped internal workflow registrations (e.g. execution-workflow)

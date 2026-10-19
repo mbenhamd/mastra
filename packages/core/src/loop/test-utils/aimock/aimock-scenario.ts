@@ -707,7 +707,7 @@ export async function runApprovalScenario(
   }
 
   return {
-    output: outputOf(run),
+    output,
     chunks,
     approvals,
     llm,

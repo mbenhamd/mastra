@@ -1451,21 +1451,6 @@ export class CoreToolBuilder extends MastraBase {
       requireApproval,
       needsApprovalFn,
       beforeApproval,
-      validateInput: (input: unknown) => {
-        const validation = validateToolInput(
-          (inputValidationSchema ?? originalSchema) as StandardSchemaWithJSON | undefined,
-          input,
-          this.options.name,
-        );
-        // suspendedToolRunId is only required when resumeData is provided (matches execute).
-        if (
-          validation.error?.message?.includes('suspendedToolRunId: Required') &&
-          !(input as Record<string, unknown> | undefined)?.resumeData
-        ) {
-          return { data: input };
-        }
-        return validation;
-      },
       hasSuspendSchema: !!this.getSuspendSchema(),
       // Approval gates run before execute(), so expose the exact runtime
       // validator separately. The agent loop uses this to keep schema-invalid
