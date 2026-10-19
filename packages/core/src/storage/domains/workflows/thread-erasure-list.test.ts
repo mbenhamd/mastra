@@ -7,6 +7,7 @@ import { WorkflowsInMemory } from './inmemory';
 const RESOURCE = 'workspace-1:user-1';
 const OTHER_RESOURCE = 'workspace-1:user-2';
 const THREAD = 'thread-target';
+const SNAPSHOT_ONLY = { snapshot: true, handoff: false, terminalSnapshot: false };
 const OTHER_THREAD = 'thread-other';
 
 function setup() {
@@ -150,12 +151,12 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     expect(result).toEqual({
       status: 'listed',
       runs: [
-        { ...runs.pendingLoopStart, attribution: 'thread' },
-        { ...runs.runningLoopStart, attribution: 'thread' },
-        { ...runs.reservedKey, attribution: 'thread' },
-        { ...runs.split, attribution: 'thread' },
-        { ...runs.durableMemoryInfo, attribution: 'thread' },
-        { ...runs.durableState, attribution: 'thread' },
+        { ...runs.pendingLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.runningLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.reservedKey, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.split, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.durableMemoryInfo, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.durableState, attribution: 'thread', rows: SNAPSHOT_ONLY },
       ],
       hasMore: false,
     });
@@ -164,7 +165,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: OTHER_RESOURCE, threadId: THREAD, limit: 100 }),
     ).resolves.toEqual({
       status: 'listed',
-      runs: [{ workflowName: 'agentic-loop', runId: 'h-cross', attribution: 'thread' }],
+      runs: [{ workflowName: 'agentic-loop', runId: 'h-cross', attribution: 'thread', rows: SNAPSHOT_ONLY }],
       hasMore: false,
     });
   });
@@ -236,6 +237,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       workflowName: 'agentic-loop',
       runId: 'a-bare',
       attribution: 'unattributed',
+      rows: SNAPSHOT_ONLY,
       status: 'pending',
       createdAt,
       updatedAt,
@@ -244,6 +246,100 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     expect(result.runs[1]).toMatchObject({ status: 'pending', contentFree: false });
     expect(result.runs[3]).toMatchObject({ status: 'pending', contentFree: false });
     expect(result.runs[4]).toMatchObject({ status: 'pending', contentFree: false });
+  });
+
+  it('finds the thread in a retained handoff snapshot and a terminal envelope', async () => {
+    const { db, workflows } = setup();
+    // A delivered handoff released with deleteRun keeps its snapshot after the canonical row goes.
+    const released = { workflowName: 'agentic-loop', runId: 'a-released' };
+    const settled = {
+      ...snapshots.loopStart(released.runId, 'running', THREAD),
+      status: 'success',
+    } as WorkflowRunState;
+    await persist(workflows, released, settled);
+    const canonical = (await workflows.loadWorkflowSnapshot(released))!;
+    const owner = { ...released, resourceId: RESOURCE, mutationFence: 'fence-a' };
+    await expect(
+      workflows.claimWorkflowSnapshotHandoff({
+        ...owner,
+        expectedCanonical: { kind: 'present', resourceId: RESOURCE, snapshot: canonical },
+        snapshot: canonical,
+      }),
+    ).resolves.toMatchObject({ status: 'created' });
+    await expect(
+      workflows.completeWorkflowSnapshotHandoff({
+        ...owner,
+        expectedResourceId: RESOURCE,
+        expectedSnapshot: canonical,
+        snapshot: canonical,
+      }),
+    ).resolves.toMatchObject({ status: 'completed' });
+    await expect(
+      workflows.releaseWorkflowSnapshotHandoff({ ...released, expectedClaimGeneration: 1, deleteRun: true }),
+    ).resolves.toMatchObject({ status: 'released' });
+    await expect(workflows.loadWorkflowSnapshot(released)).resolves.toBeNull();
+
+    // Terminal recovery envelopes, stored as the terminalization journal stores them.
+    const terminal = (runId: string, envelope: Record<string, unknown>) =>
+      db.workflowTerminalSnapshots.set(JSON.stringify(['agentic-loop', runId]), {
+        version: 1,
+        workflowName: 'agentic-loop',
+        runId,
+        resourceId: RESOURCE,
+        terminalStatus: 'success',
+        envelopeHash: `sha256:${'0'.repeat(64)}`,
+        recordHash: `sha256:${'0'.repeat(64)}`,
+        envelope: envelope as any,
+        createdAt: 1,
+      });
+    terminal('b-envelope', { terminalResult: {}, finalState: {}, requestContextPatch: { mastra__threadId: THREAD } });
+    // A content-free canonical snapshot whose terminal envelope holds data (no thread): not content-free.
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'c-bare-terminal' },
+      snapshots.createRunPending('c-bare-terminal'),
+    );
+    terminal('c-bare-terminal', { terminalResult: { text: 'result' }, finalState: {}, requestContextPatch: {} });
+    // A terminal envelope of another thread makes the run attributed (not unattributed, not listed).
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'd-bare-other' },
+      snapshots.createRunPending('d-bare-other'),
+    );
+    terminal('d-bare-other', {
+      terminalResult: { messageList: { memoryInfo: { threadId: OTHER_THREAD } } },
+      finalState: {},
+      requestContextPatch: {},
+    });
+
+    await expect(
+      workflows.listWorkflowRunsByThreadForErasure({
+        resourceId: RESOURCE,
+        threadId: THREAD,
+        limit: 10,
+        includeUnattributed: true,
+      }),
+    ).resolves.toMatchObject({
+      status: 'listed',
+      runs: [
+        { ...released, attribution: 'thread', rows: { snapshot: false, handoff: true, terminalSnapshot: false } },
+        {
+          workflowName: 'agentic-loop',
+          runId: 'b-envelope',
+          attribution: 'thread',
+          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+        },
+        {
+          workflowName: 'agentic-loop',
+          runId: 'c-bare-terminal',
+          attribution: 'unattributed',
+          rows: { snapshot: true, handoff: false, terminalSnapshot: true },
+          status: 'pending',
+          contentFree: false,
+        },
+      ],
+      hasMore: false,
+    });
   });
 
   it('pages by (workflowName, runId) in code point order', async () => {

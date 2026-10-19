@@ -82,6 +82,8 @@ import {
   captureWorkflowRunThreadErasureListInput,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH,
+  WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH,
+  WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH,
   createEmptyWorkflowSnapshot,
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
@@ -6299,25 +6301,35 @@ export class WorkflowsPG extends WorkflowsStorage {
       threadId,
       WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH,
       WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH,
+      WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH,
+      WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH,
       includeUnattributed,
     ];
-    let keyset = '';
+    let afterParams: [string, string] | undefined;
     if (after) {
       values.push(after.workflowName, after.runId);
-      keyset = `AND (workflow_name COLLATE "C", run_id COLLATE "C") > ($${values.length - 1}, $${values.length})`;
+      afterParams = [`$${values.length - 1}`, `$${values.length}`];
     }
+    const keyset = (alias: string) =>
+      afterParams
+        ? `AND (${alias}.workflow_name COLLATE "C", ${alias}.run_id COLLATE "C") > (${afterParams[0]}, ${afterParams[1]})`
+        : '';
     values.push(limit + 1);
     const limitParam = `$${values.length}`;
     let rows: Array<{
       workflow_name: string;
       run_id: string;
       matched: boolean;
+      any_thread: boolean;
+      has_snapshot: boolean;
+      has_handoff: boolean;
+      has_terminal_snapshot: boolean;
       status: string | null;
       createdAt: Date | string | null;
       createdAtZ: Date | string | null;
       updatedAt: Date | string | null;
       updatedAtZ: Date | string | null;
-      content_free: boolean;
+      snapshot_content_free: boolean;
     }>;
     try {
       const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
@@ -6333,28 +6345,60 @@ export class WorkflowsPG extends WorkflowsStorage {
           : `NULL::timestamptz AS "${column}"`;
       const emptyOrNull = (expression: string) =>
         `(${expression} IS NULL OR ${expression} = 'null'::jsonb OR ${expression} = '{}'::jsonb)`;
-      // A row's thread match is one jsonb_path_exists over the whole snapshot,
-      // with the thread id bound as a jsonpath variable (never interpolated).
-      // Rows are read in the closure index's ("resourceId", workflow_name,
-      // run_id) order, so a page stops after limit + 1 matches.
+      const threadVars = `jsonb_build_object('t', $2::text)`;
+      // Every row that can hold a copy of the run's data is read: the
+      // canonical snapshot, the handoff snapshot (kept, released or not, after
+      // the canonical row is deleted) and the terminal recovery envelope. Each
+      // row's thread match is one jsonb_path_exists with the thread id bound
+      // as a jsonpath variable (never interpolated). Each branch reads its
+      // table's resource index; the run is attributed by all of its rows.
       rows = await this.#db.client.any(
-        `SELECT workflow_name, run_id, matched, status, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ",
-                (NOT matched
-                  AND ${emptyOrNull(`snapshot_json -> 'requestContext'`)}
-                  AND (${emptyOrNull(`snapshot_json -> 'context'`)}
-                    OR (jsonb_typeof(snapshot_json -> 'context') = 'object'
-                      AND (snapshot_json -> 'context') - 'input' = '{}'::jsonb
-                      AND ${emptyOrNull(`snapshot_json -> 'context' -> 'input'`)}))) AS content_free
+        `SELECT workflow_name, run_id,
+                bool_or(matched) AS matched,
+                bool_or(any_thread) AS any_thread,
+                bool_or(kind = 'snapshot') AS has_snapshot,
+                bool_or(kind = 'handoff') AS has_handoff,
+                bool_or(kind = 'terminal_snapshot') AS has_terminal_snapshot,
+                max(status) AS status,
+                max("createdAt") AS "createdAt", max("createdAtZ") AS "createdAtZ",
+                max("updatedAt") AS "updatedAt", max("updatedAtZ") AS "updatedAtZ",
+                bool_or(snapshot_content_free) AS snapshot_content_free
          FROM (
-           SELECT snapshot.workflow_name COLLATE "C" AS workflow_name, snapshot.run_id COLLATE "C" AS run_id,
-                  snapshot."createdAt", ${timestampZ('createdAtZ')}, snapshot."updatedAt", ${timestampZ('updatedAtZ')},
-                  snapshot_json, snapshot_json ->> 'status' AS status,
-                  jsonb_path_exists(snapshot_json, $3::jsonpath, jsonb_build_object('t', $2::text)) AS matched
-           FROM ${this.workflowSnapshotTableName()} AS snapshot
-           CROSS JOIN LATERAL (SELECT ${snapshotJson} AS snapshot_json) AS parsed
-           WHERE snapshot."resourceId" = $1 ${keyset}
-         ) AS candidates
-         WHERE matched OR ($5::boolean AND NOT jsonb_path_exists(snapshot_json, $4::jsonpath))
+           SELECT workflow_name, run_id, 'snapshot' AS kind,
+                  jsonb_path_exists(snapshot_json, $3::jsonpath, ${threadVars}) AS matched,
+                  jsonb_path_exists(snapshot_json, $4::jsonpath) AS any_thread,
+                  snapshot_json ->> 'status' AS status,
+                  "createdAt", "createdAtZ", "updatedAt", "updatedAtZ",
+                  (${emptyOrNull(`snapshot_json -> 'requestContext'`)}
+                    AND (${emptyOrNull(`snapshot_json -> 'context'`)}
+                      OR (jsonb_typeof(snapshot_json -> 'context') = 'object'
+                        AND (snapshot_json -> 'context') - 'input' = '{}'::jsonb
+                        AND ${emptyOrNull(`snapshot_json -> 'context' -> 'input'`)}))) AS snapshot_content_free
+           FROM (
+             SELECT snapshot.workflow_name COLLATE "C" AS workflow_name, snapshot.run_id COLLATE "C" AS run_id,
+                    snapshot."createdAt", ${timestampZ('createdAtZ')}, snapshot."updatedAt", ${timestampZ('updatedAtZ')},
+                    ${snapshotJson} AS snapshot_json
+             FROM ${this.workflowSnapshotTableName()} AS snapshot
+             WHERE snapshot."resourceId" = $1 ${keyset('snapshot')}
+           ) AS canonical
+           UNION ALL
+           SELECT handoff.workflow_name COLLATE "C", handoff.run_id COLLATE "C", 'handoff',
+                  jsonb_path_exists(handoff.snapshot, $3::jsonpath, ${threadVars}),
+                  jsonb_path_exists(handoff.snapshot, $4::jsonpath),
+                  NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
+           FROM ${this.workflowSnapshotHandoffTableName()} AS handoff
+           WHERE handoff.resource_id = $1 ${keyset('handoff')}
+           UNION ALL
+           SELECT terminal.workflow_name COLLATE "C", terminal.run_id COLLATE "C", 'terminal_snapshot',
+                  jsonb_path_exists(terminal.envelope, $5::jsonpath, ${threadVars}),
+                  jsonb_path_exists(terminal.envelope, $6::jsonpath),
+                  NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
+           FROM ${this.terminalSnapshotTableName()} AS terminal
+           WHERE terminal.resource_id = $1 ${keyset('terminal')}
+         ) AS run_rows
+         GROUP BY workflow_name COLLATE "C", run_id COLLATE "C"
+         HAVING bool_or(matched)
+             OR ($7::boolean AND bool_or(kind = 'snapshot') AND NOT bool_or(any_thread))
          ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
          LIMIT ${limitParam}`,
         values,
@@ -6365,17 +6409,23 @@ export class WorkflowsPG extends WorkflowsStorage {
       });
     }
     const runs = rows.slice(0, limit).map((row): WorkflowRunThreadErasureEntry => {
+      const recorded = {
+        snapshot: row.has_snapshot === true,
+        handoff: row.has_handoff === true,
+        terminalSnapshot: row.has_terminal_snapshot === true,
+      };
       if (row.matched) {
-        return { workflowName: row.workflow_name, runId: row.run_id, attribution: 'thread' };
+        return { workflowName: row.workflow_name, runId: row.run_id, attribution: 'thread', rows: recorded };
       }
       return {
         workflowName: row.workflow_name,
         runId: row.run_id,
         attribution: 'unattributed',
+        rows: recorded,
         ...(row.status === null ? {} : { status: row.status }),
         createdAt: new Date((row.createdAtZ || row.createdAt) as Date | string),
         updatedAt: new Date((row.updatedAtZ || row.updatedAt) as Date | string),
-        contentFree: row.content_free === true,
+        contentFree: row.snapshot_content_free === true && !recorded.handoff && !recorded.terminalSnapshot,
       };
     });
     const hasMore = rows.length > limit;

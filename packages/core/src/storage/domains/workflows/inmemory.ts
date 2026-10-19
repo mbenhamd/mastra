@@ -93,6 +93,7 @@ import type {
   ListWorkflowRunsByThreadForErasureInput,
   ListWorkflowRunsByThreadForErasureResult,
   WorkflowRunThreadErasureEntry,
+  WorkflowRunThreadErasureRows,
   WorkflowRunClosureEntry,
   WorkflowExecutionState,
   UpdateWorkflowResultsResult,
@@ -123,6 +124,7 @@ import {
   captureWorkflowRunClosureListInput,
   captureWorkflowRunThreadErasureListInput,
   classifyWorkflowSnapshotThreadErasure,
+  classifyWorkflowTerminalEnvelopeThreadErasure,
   isWorkflowSnapshotThreadErasureContentFree,
 } from '../../workflow-snapshot-handoff';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
@@ -2485,37 +2487,84 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     input: ListWorkflowRunsByThreadForErasureInput,
   ): Promise<ListWorkflowRunsByThreadForErasureResult> {
     const { resourceId, threadId, after, limit, includeUnattributed } = captureWorkflowRunThreadErasureListInput(input);
-    const matches: WorkflowRunThreadErasureEntry[] = [];
+    type Candidate = {
+      workflowName: string;
+      runId: string;
+      rows: WorkflowRunThreadErasureRows;
+      matched: boolean;
+      anyThread: boolean;
+      canonical?: { snapshot: unknown; createdAt: Date; updatedAt: Date };
+    };
+    const candidates = new Map<string, Candidate>();
+    const candidateFor = (workflowName: string, runId: string): Candidate | undefined => {
+      if (after && compareWorkflowRunClosureCursors({ workflowName, runId }, after) <= 0) return undefined;
+      const key = this.getWorkflowKey(workflowName, runId);
+      let candidate = candidates.get(key);
+      if (!candidate) {
+        candidate = {
+          workflowName,
+          runId,
+          rows: { snapshot: false, handoff: false, terminalSnapshot: false },
+          matched: false,
+          anyThread: false,
+        };
+        candidates.set(key, candidate);
+      }
+      return candidate;
+    };
+    const note = (candidate: Candidate, attribution: 'thread' | 'other' | 'unattributed') => {
+      if (attribution === 'thread') candidate.matched = true;
+      if (attribution !== 'unattributed') candidate.anyThread = true;
+    };
+    // Every row that can hold a copy of the run's data is read, each as a
+    // detached copy (as a database would read it back), so a live object
+    // graph is never walked in place.
     for (const run of this.db.workflows.values()) {
       if (run.resourceId !== resourceId) continue;
-      if (
-        after &&
-        compareWorkflowRunClosureCursors({ workflowName: run.workflow_name, runId: run.run_id }, after) <= 0
-      ) {
-        continue;
-      }
-      // Read a detached copy, as the snapshot would be read back from a
-      // database, so a live object graph is never walked in place.
+      const candidate = candidateFor(run.workflow_name, run.run_id);
+      if (!candidate) continue;
       const snapshot: unknown = cloneRunData(
         typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot,
       );
-      const attribution = classifyWorkflowSnapshotThreadErasure(snapshot, threadId);
-      if (attribution === 'thread') {
-        matches.push({ workflowName: run.workflow_name, runId: run.run_id, attribution: 'thread' });
-      } else if (attribution === 'unattributed' && includeUnattributed) {
+      candidate.rows.snapshot = true;
+      candidate.canonical = { snapshot, createdAt: new Date(run.createdAt), updatedAt: new Date(run.updatedAt) };
+      note(candidate, classifyWorkflowSnapshotThreadErasure(snapshot, threadId));
+    }
+    for (const record of this.db.workflowSnapshotHandoffs.values()) {
+      if (record.resourceId !== resourceId) continue;
+      const candidate = candidateFor(record.workflowName, record.runId);
+      if (!candidate) continue;
+      candidate.rows.handoff = true;
+      note(candidate, classifyWorkflowSnapshotThreadErasure(cloneRunData(record.snapshot), threadId));
+    }
+    for (const record of this.db.workflowTerminalSnapshots.values()) {
+      if (record.resourceId !== resourceId) continue;
+      const candidate = candidateFor(record.workflowName, record.runId);
+      if (!candidate) continue;
+      candidate.rows.terminalSnapshot = true;
+      note(candidate, classifyWorkflowTerminalEnvelopeThreadErasure(cloneRunData(record.envelope), threadId));
+    }
+    const matches: WorkflowRunThreadErasureEntry[] = [];
+    for (const candidate of candidates.values()) {
+      const { workflowName, runId, rows } = candidate;
+      if (candidate.matched) {
+        matches.push({ workflowName, runId, attribution: 'thread', rows });
+      } else if (includeUnattributed && !candidate.anyThread && candidate.canonical) {
+        const { snapshot, createdAt, updatedAt } = candidate.canonical;
         const statusField =
           snapshot !== null && typeof snapshot === 'object'
             ? Object.getOwnPropertyDescriptor(snapshot, 'status')
             : undefined;
         const status = statusField && 'value' in statusField ? statusField.value : undefined;
         matches.push({
-          workflowName: run.workflow_name,
-          runId: run.run_id,
+          workflowName,
+          runId,
           attribution: 'unattributed',
+          rows,
           ...(typeof status === 'string' ? { status } : {}),
-          createdAt: new Date(run.createdAt),
-          updatedAt: new Date(run.updatedAt),
-          contentFree: isWorkflowSnapshotThreadErasureContentFree(snapshot),
+          createdAt,
+          updatedAt,
+          contentFree: !rows.handoff && !rows.terminalSnapshot && isWorkflowSnapshotThreadErasureContentFree(snapshot),
         });
       }
     }

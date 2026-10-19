@@ -425,16 +425,30 @@ export interface ListWorkflowRunsByThreadForErasureInput {
   includeUnattributed?: boolean;
 }
 
-/** A run whose snapshot records the thread id. */
+/**
+ * Which of the run's rows that can hold a copy of its data are recorded under
+ * the resource (the same rows `deleteWorkflowRunClosure` erases).
+ */
+export interface WorkflowRunThreadErasureRows {
+  /** The canonical snapshot. */
+  snapshot: boolean;
+  /** The handoff row and its snapshot, released or not. */
+  handoff: boolean;
+  /** The retained terminal recovery envelope. */
+  terminalSnapshot: boolean;
+}
+
+/** A run with at least one row (canonical snapshot, handoff snapshot or terminal envelope) that records the thread id. */
 export interface WorkflowRunThreadErasureThreadEntry {
   workflowName: string;
   runId: string;
   attribution: 'thread';
+  rows: WorkflowRunThreadErasureRows;
 }
 
 /**
- * A run of the resource whose snapshot records no thread id at all (listed
- * only with `includeUnattributed`). The listing never erases it; the fields
+ * A run of the resource with a canonical snapshot, none of whose rows records
+ * any thread id (listed only with `includeUnattributed`). The listing never erases it; the fields
  * below let a caller decide, from the same read, whether its own policy lets
  * it erase the run (for example: `pending`, `contentFree`, older than the
  * longest turn lease, and erased through `deleteWorkflowRunClosure`).
@@ -443,16 +457,21 @@ export interface WorkflowRunThreadErasureUnattributedEntry {
   workflowName: string;
   runId: string;
   attribution: 'unattributed';
-  /** The snapshot's `status` as stored (`undefined` when it records none). */
+  rows: WorkflowRunThreadErasureRows;
+  /** The canonical snapshot's `status` as stored (`undefined` when it records none). */
   status?: string;
   /** The store's row timestamps (not the snapshot's own `timestamp`). */
   createdAt: Date;
   updatedAt: Date;
   /**
-   * True only when the snapshot carries no run data, exactly:
-   * - `context` is absent, `null` or `{}`, or its only key is `input` and that
-   *   input is `null` or `{}`; and
-   * - `requestContext` is absent, `null` or `{}`.
+   * True only when the run holds no data beyond its canonical snapshot's
+   * shell, exactly:
+   * - the run has no handoff row and no terminal snapshot row under the
+   *   resource (`rows.handoff` and `rows.terminalSnapshot` are false);
+   * - the canonical snapshot's `context` is absent, `null` or `{}`, or its only
+   *   key is `input` and that input is `null` or `{}` (a plain empty object; a
+   *   class instance such as a `Date` is content); and
+   * - its `requestContext` is absent, `null` or `{}`.
    *
    * This is the `pending` snapshot `createRun` persists for a top-level run
    * (`context: {}`, no `requestContext`). A nested run's `pending` snapshot
@@ -469,8 +488,10 @@ export type WorkflowRunThreadErasureEntry =
   | WorkflowRunThreadErasureUnattributedEntry;
 
 /**
- * Lists the resource's canonical snapshots that record the thread id in any
- * place a snapshot can carry one, in any run status:
+ * Lists the resource's runs with a row that records the thread id: the
+ * canonical snapshot, the handoff snapshot (kept after a `deleteRun` release
+ * removes the canonical row) or the terminal recovery envelope. A snapshot
+ * records it in any place it can carry one, in any run status:
  * - any `memoryInfo.threadId`, at any depth (agentic-loop suspend payloads
  *   `context.<step>.suspendPayload.__streamState.messageList.memoryInfo`,
  *   whatever step and status, and the durable-loop input
@@ -478,6 +499,9 @@ export type WorkflowRunThreadErasureEntry =
  * - the durable-loop input state `context.input.state.threadId`;
  * - the serialized request context of a started run:
  *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
+ *
+ * A terminal envelope records it as any `memoryInfo.threadId` or in its
+ * `requestContextPatch` (`MastraMemory.thread.id`, `mastra__threadId`).
  *
  * Unlike the `threadId` filter of `listWorkflowRuns`, which reads one scalar
  * (the first suspended step's thread, else the durable input thread), this

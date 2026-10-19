@@ -402,6 +402,22 @@ export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH =
   'exists(@.requestContext.MastraMemory.thread.id ? (@.type() == "string")) || ' +
   'exists(@.requestContext."mastra__threadId" ? (@.type() == "string")))';
 
+/**
+ * SQL/JSON path that is true when a terminal recovery envelope records the
+ * thread id bound to `t`: any `memoryInfo.threadId` (in its result or final
+ * state) or its request-context patch (`MastraMemory.thread.id`,
+ * `mastra__threadId`).
+ */
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH =
+  '$ ? (@.**.memoryInfo.threadId == $t || @.requestContextPatch.MastraMemory.thread.id == $t || ' +
+  '@.requestContextPatch."mastra__threadId" == $t)';
+
+/** SQL/JSON path that is true when a terminal envelope records any string thread id where the match path reads. */
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH =
+  '$ ? (exists(@.**.memoryInfo.threadId ? (@.type() == "string")) || ' +
+  'exists(@.requestContextPatch.MastraMemory.thread.id ? (@.type() == "string")) || ' +
+  'exists(@.requestContextPatch."mastra__threadId" ? (@.type() == "string")))';
+
 /** Own enumerable data fields of a JSON-like object, as a JSON copy would keep them. Accessors are not run. */
 function threadErasureMembers(value: unknown, key: string): unknown[] {
   // Lax mode: a member accessor applied to an array applies to its elements.
@@ -455,12 +471,37 @@ export function classifyWorkflowSnapshotThreadErasure(
   snapshot: unknown,
   threadId: string,
 ): 'thread' | 'other' | 'unattributed' {
-  const values = [
-    ...threadErasureMemberPath(threadErasureDescendants(snapshot), ['memoryInfo', 'threadId']),
-    ...threadErasureMemberPath([snapshot], ['context', 'input', 'state', 'threadId']),
-    ...threadErasureMemberPath([snapshot], ['requestContext', 'MastraMemory', 'thread', 'id']),
-    ...threadErasureMemberPath([snapshot], ['requestContext', 'mastra__threadId']),
-  ].filter((value): value is string => typeof value === 'string');
+  return classifyThreadErasureValues(
+    [
+      ...threadErasureMemberPath(threadErasureDescendants(snapshot), ['memoryInfo', 'threadId']),
+      ...threadErasureMemberPath([snapshot], ['context', 'input', 'state', 'threadId']),
+      ...threadErasureMemberPath([snapshot], ['requestContext', 'MastraMemory', 'thread', 'id']),
+      ...threadErasureMemberPath([snapshot], ['requestContext', 'mastra__threadId']),
+    ],
+    threadId,
+  );
+}
+
+/**
+ * Classifies a plain-data terminal recovery envelope with the same places as
+ * {@link WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH}.
+ */
+export function classifyWorkflowTerminalEnvelopeThreadErasure(
+  envelope: unknown,
+  threadId: string,
+): 'thread' | 'other' | 'unattributed' {
+  return classifyThreadErasureValues(
+    [
+      ...threadErasureMemberPath(threadErasureDescendants(envelope), ['memoryInfo', 'threadId']),
+      ...threadErasureMemberPath([envelope], ['requestContextPatch', 'MastraMemory', 'thread', 'id']),
+      ...threadErasureMemberPath([envelope], ['requestContextPatch', 'mastra__threadId']),
+    ],
+    threadId,
+  );
+}
+
+function classifyThreadErasureValues(found: unknown[], threadId: string): 'thread' | 'other' | 'unattributed' {
+  const values = found.filter((value): value is string => typeof value === 'string');
   if (values.includes(threadId)) return 'thread';
   return values.length > 0 ? 'other' : 'unattributed';
 }

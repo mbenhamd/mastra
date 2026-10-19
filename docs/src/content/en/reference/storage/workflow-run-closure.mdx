@@ -115,23 +115,26 @@ Returns: `Promise<ListWorkflowRunClosuresByResourceResult>`:
 
 ## `listWorkflowRunsByThreadForErasure(input)`
 
-Pages a resource's runs whose snapshot records a thread id, in any run status. Use it to erase a thread or a session inside a resource that stays. The `threadId` filter of `listWorkflowRuns` reads a single value, so it misses an agent loop snapshot that is still `pending` or `running`, and a run whose first suspended step names another thread.
+Pages a resource's runs that hold a copy of a thread's data, in any run status. It reads every row `deleteWorkflowRunClosure` erases that can hold such a copy: the canonical snapshot, the handoff snapshot (kept after a `deleteRun` release removes the canonical snapshot) and the terminal recovery envelope. Use it to erase a thread or a session inside a resource that stays. The `threadId` filter of `listWorkflowRuns` reads a single value, so it misses an agent loop snapshot that is still `pending` or `running`, and a run whose first suspended step names another thread.
 
 Input: `{ resourceId, threadId, after?, limit, includeUnattributed? }`. `limit` is required and between 1 and 100. `after` is the `nextCursor` of the previous page.
 
-A snapshot matches when the thread id appears in one of these places:
+A snapshot (canonical or handoff) matches when the thread id appears in one of these places:
 
 - any `memoryInfo.threadId`, at any depth, such as an agent loop step's `suspendPayload.__streamState.messageList.memoryInfo` (any step, any status) or the durable loop's `context.input.messageListState.memoryInfo`;
 - the durable loop's `context.input.state.threadId`;
 - the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`.
 
+A terminal envelope matches on any `memoryInfo.threadId` or on its `requestContextPatch` (`MastraMemory.thread.id`, `mastra__threadId`).
+
 Returns: `Promise<ListWorkflowRunsByThreadForErasureResult>`:
 
-- `{ status: 'listed', runs, hasMore, nextCursor? }`: runs are ordered by `(workflowName, runId)` in code-point order. A matching run is `{ workflowName, runId, attribution: 'thread' }`.
+- `{ status: 'listed', runs, hasMore, nextCursor? }`: runs are ordered by `(workflowName, runId)` in code-point order. A matching run is `{ workflowName, runId, attribution: 'thread', rows }`, where `rows` is `{ snapshot, handoff, terminalSnapshot }` and says which of those rows the run has under the resource.
 - `{ status: 'unsupported' }`: the store can't answer. It never answers an empty page instead.
 
-The `pending` snapshot that `createRun` stores before a run starts records no thread. With `includeUnattributed: true`, the listing also returns the resource's snapshots that record no thread id anywhere, as `{ workflowName, runId, attribution: 'unattributed', status?, createdAt, updatedAt, contentFree }`. `createdAt` and `updatedAt` are the store's row timestamps. `contentFree` is true only when both hold:
+The `pending` snapshot that `createRun` stores before a run starts records no thread. With `includeUnattributed: true`, the listing also returns the resource's runs that have a canonical snapshot and record no thread id in any row, as `{ workflowName, runId, attribution: 'unattributed', rows, status?, createdAt, updatedAt, contentFree }`. `status`, `createdAt` and `updatedAt` come from the canonical snapshot row. `contentFree` is true only when all of these hold:
 
+- the run has no handoff and no terminal snapshot row under the resource;
 - `context` is absent, `null` or `{}`, or its only key is `input` and that input is `null` or `{}`;
 - `requestContext` is absent, `null` or `{}`.
 

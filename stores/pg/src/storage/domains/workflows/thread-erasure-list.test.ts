@@ -7,6 +7,7 @@ import { PostgresStore, WorkflowsPG } from '../../index';
 import { connectionString } from '../../test-utils';
 
 const THREAD = 'thread-target';
+const SNAPSHOT_ONLY = { snapshot: true, handoff: false, terminalSnapshot: false };
 const OTHER_THREAD = 'thread-other';
 
 type Run = { workflowName: string; runId: string };
@@ -130,12 +131,12 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     ).resolves.toEqual({
       status: 'listed',
       runs: [
-        { ...runs.pendingLoopStart, attribution: 'thread' },
-        { ...runs.runningLoopStart, attribution: 'thread' },
-        { ...runs.reservedKey, attribution: 'thread' },
-        { ...runs.split, attribution: 'thread' },
-        { ...runs.durableMemoryInfo, attribution: 'thread' },
-        { ...runs.durableState, attribution: 'thread' },
+        { ...runs.pendingLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.runningLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.reservedKey, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.split, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.durableMemoryInfo, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        { ...runs.durableState, attribution: 'thread', rows: SNAPSHOT_ONLY },
       ],
       hasMore: false,
     });
@@ -143,7 +144,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: otherResource, threadId: THREAD, limit: 100 }),
     ).resolves.toEqual({
       status: 'listed',
-      runs: [{ workflowName: 'agentic-loop', runId: 'h-cross', attribution: 'thread' }],
+      runs: [{ workflowName: 'agentic-loop', runId: 'h-cross', attribution: 'thread', rows: SNAPSHOT_ONLY }],
       hasMore: false,
     });
 
@@ -213,6 +214,103 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     expect(result.runs[3]).toMatchObject({ status: 'pending', contentFree: false });
   });
 
+  it('finds the thread in a retained handoff snapshot and a terminal envelope', async () => {
+    const resource = newResource();
+    const snapshots = fixtures(resource);
+    const released = { workflowName: 'agentic-loop', runId: 'a-released' };
+    await persist(resource, released, {
+      ...snapshots.loopStart(released.runId, 'running', THREAD),
+      status: 'success',
+    } as WorkflowRunState);
+    const canonical = (await workflows.loadWorkflowSnapshot(released))!;
+    const owner = { ...released, resourceId: resource, mutationFence: `fence-${randomUUID()}` };
+    await expect(
+      workflows.claimWorkflowSnapshotHandoff({
+        ...owner,
+        expectedCanonical: { kind: 'present', resourceId: resource, snapshot: canonical },
+        snapshot: canonical,
+      }),
+    ).resolves.toMatchObject({ status: 'created' });
+    await expect(
+      workflows.completeWorkflowSnapshotHandoff({
+        ...owner,
+        expectedResourceId: resource,
+        expectedSnapshot: canonical,
+        snapshot: canonical,
+      }),
+    ).resolves.toMatchObject({ status: 'completed' });
+    await expect(
+      workflows.releaseWorkflowSnapshotHandoff({ ...released, expectedClaimGeneration: 1, deleteRun: true }),
+    ).resolves.toMatchObject({ status: 'released' });
+    await expect(workflows.loadWorkflowSnapshot(released)).resolves.toBeNull();
+
+    // Terminal recovery envelopes, inserted as rows (the listing only reads them).
+    const terminal = (runId: string, envelope: Record<string, unknown>) =>
+      store.db.none(
+        `INSERT INTO mastra_workflow_terminal_snapshots
+           (workflow_name, run_id, version, resource_id, terminal_status, envelope_hash, record_hash, envelope, created_at)
+         VALUES ($1, $2, 1, $3, 'success', $4, $4, $5::jsonb, 1)`,
+        ['agentic-loop', runId, resource, `sha256:${'0'.repeat(64)}`, JSON.stringify(envelope)],
+      );
+    await terminal('b-envelope', {
+      terminalResult: {},
+      finalState: {},
+      requestContextPatch: { mastra__threadId: THREAD },
+    });
+    await persist(
+      resource,
+      { workflowName: 'agentic-loop', runId: 'c-bare-terminal' },
+      snapshots.createRunPending('c-bare-terminal'),
+    );
+    await terminal('c-bare-terminal', { terminalResult: { text: 'result' }, finalState: {}, requestContextPatch: {} });
+    await persist(
+      resource,
+      { workflowName: 'agentic-loop', runId: 'd-bare-other' },
+      snapshots.createRunPending('d-bare-other'),
+    );
+    await terminal('d-bare-other', {
+      terminalResult: { messageList: { memoryInfo: { threadId: OTHER_THREAD } } },
+      finalState: {},
+      requestContextPatch: {},
+    });
+
+    await expect(
+      workflows.listWorkflowRunsByThreadForErasure({
+        resourceId: resource,
+        threadId: THREAD,
+        limit: 10,
+        includeUnattributed: true,
+      }),
+    ).resolves.toMatchObject({
+      status: 'listed',
+      runs: [
+        { ...released, attribution: 'thread', rows: { snapshot: false, handoff: true, terminalSnapshot: false } },
+        {
+          workflowName: 'agentic-loop',
+          runId: 'b-envelope',
+          attribution: 'thread',
+          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+        },
+        {
+          workflowName: 'agentic-loop',
+          runId: 'c-bare-terminal',
+          attribution: 'unattributed',
+          rows: { snapshot: true, handoff: false, terminalSnapshot: true },
+          status: 'pending',
+          contentFree: false,
+        },
+      ],
+      hasMore: false,
+    });
+    const page = await workflows.listWorkflowRunsByThreadForErasure({
+      resourceId: resource,
+      threadId: THREAD,
+      limit: 10,
+      includeUnattributed: true,
+    });
+    expect(page.status === 'listed' && page.runs.length).toBe(3);
+  });
+
   it('pages by (workflowName, runId) in code point order', async () => {
     const resource = newResource();
     const snapshots = fixtures(resource);
@@ -259,7 +357,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     );
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: resource, threadId: quoted, limit: 10 }),
-    ).resolves.toMatchObject({ runs: [{ runId: 'a', attribution: 'thread' }], hasMore: false });
+    ).resolves.toMatchObject({ runs: [{ runId: 'a', attribution: 'thread', rows: SNAPSHOT_ONLY }], hasMore: false });
   });
 });
 
