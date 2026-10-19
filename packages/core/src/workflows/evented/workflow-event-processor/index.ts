@@ -2097,6 +2097,12 @@ export class WorkflowEventProcessor extends EventProcessor {
       }
     }
 
+    // PF-5928 (fork generation-checked cleanup): resolve the store before the finish
+    // publication so the generation read + delete after it take no more hops than upstream's
+    // getStore + delete; a caller awaiting start() must not observe the declined row.
+    const declinedSnapshotStore =
+      deleteSnapshotAfterEnd === true ? await this.mastra.getStorage()?.getStore('workflows') : undefined;
+
     await this.mastra.pubsub.publish('workflows-finish', {
       type: 'workflow.end',
       runId,
@@ -2108,7 +2114,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       // but remain recoverable until parent/loop and finish publications succeed.
       // Fork: only while the row still belongs to the generation that ended.
       await this.deleteDeclinedSnapshotIfCurrent(
-        await this.mastra.getStorage()?.getStore('workflows'),
+        declinedSnapshotStore,
         workflowId,
         runId,
         requireWorkflowExecutionGeneration(args.executionGeneration, `Evented workflow cleanup ${workflowId}/${runId}`),
@@ -3759,6 +3765,22 @@ export class WorkflowEventProcessor extends EventProcessor {
         incomingExecutionGeneration: executionGeneration,
       });
       this.cleanupRun(runId);
+      // PF-5928 (fork L32 generations x upstream restart): a newer generation (a restart or
+      // recover, possibly in another process) owns the run, so this execution writes and
+      // publishes nothing for it. Its own top-level caller still has to settle; tell only the
+      // caller of this generation, which reports the default engine's superseded outcome.
+      // A same-generation terminal row is settled by the handler that terminalized it.
+      if (
+        !parentWorkflow &&
+        authoritativeStateAfterExecution.executionGeneration !== undefined &&
+        authoritativeStateAfterExecution.executionGeneration !== executionGeneration
+      ) {
+        await this.mastra.pubsub.publish('workflows-finish', {
+          type: 'workflow.superseded',
+          runId,
+          data: { workflowId, runId, ...lifecycleExecution, requestContext },
+        });
+      }
       return;
     }
 

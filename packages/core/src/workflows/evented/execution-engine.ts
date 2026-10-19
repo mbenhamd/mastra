@@ -138,6 +138,17 @@ export class EventedExecutionEngine extends ExecutionEngine {
         return;
       }
 
+      // PF-5928 (fork L32 generations): the processor reports that a newer generation took
+      // this run over while this execution's step was running. Only this generation's caller
+      // settles on it; the new owner's caller keeps waiting for the owner's own finish.
+      if (event.type === 'workflow.superseded') {
+        await ack?.();
+        if (event.data?.executionGeneration !== executionGeneration) return;
+        await pubsub.unsubscribe('workflows-finish', finishCb);
+        resolveResult({ superseded: true });
+        return;
+      }
+
       if (['workflow.end', 'workflow.fail', 'workflow.suspend'].includes(event.type)) {
         await ack?.();
         await pubsub.unsubscribe('workflows-finish', finishCb);
@@ -342,6 +353,12 @@ export class EventedExecutionEngine extends ExecutionEngine {
       resultData = await resultPromise;
     } finally {
       releaseTracking();
+    }
+
+    // Same outcome as the default engine's superseded execution (resolveRejectedTerminalWrite):
+    // canceled with no steps, and no lifecycle callbacks — the new owner runs those.
+    if (resultData?.superseded === true) {
+      return { status: 'canceled', steps: {} } as TOutput;
     }
 
     // Extract state from resultData (stored in stepResults.__state)

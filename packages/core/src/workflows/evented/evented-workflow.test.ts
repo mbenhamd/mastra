@@ -1506,6 +1506,31 @@ describe('Workflow (Evented Engine Specific)', () => {
       });
       await mastra.startWorkers();
 
+      // PF-5928 adaptation (fork PF-2010): a completed evented foreach clears its aggregate
+      // suspension envelope from the terminal record, so the per-iteration records are read
+      // from storage just before that completion write instead of from the terminal row.
+      const workflowsStore = await testStorage.getStore('workflows');
+      if (!workflowsStore) throw new Error('Workflows store is unavailable');
+      let iterationRecords: unknown;
+      const updateWorkflowResults = workflowsStore.updateWorkflowResults.bind(workflowsStore);
+      const updateSpy = vi.spyOn(workflowsStore, 'updateWorkflowResults').mockImplementation(async args => {
+        const written = args.result as { status?: string; suspendPayload?: unknown } | undefined;
+        if (
+          args.workflowName === 'evented-foreach-records' &&
+          args.stepId === 'records-double' &&
+          written?.status === 'success' &&
+          written.suspendPayload === undefined
+        ) {
+          const inFlight = await workflowsStore.loadWorkflowSnapshot({
+            workflowName: args.workflowName,
+            runId: args.runId,
+          });
+          iterationRecords = (inFlight?.context?.['records-double'] as any)?.suspendPayload?.__workflow_meta
+            ?.foreachOutput;
+        }
+        return updateWorkflowResults(args);
+      });
+
       try {
         const run = await workflow.createRun();
         const result = await run.start({ inputData: {} });
@@ -1514,23 +1539,28 @@ describe('Workflow (Evented Engine Specific)', () => {
           expect(result.result).toEqual([0, 2, 4, 6, 8]);
         }
 
-        const workflowsStore = await testStorage.getStore('workflows');
-        const record = await workflowsStore?.getWorkflowRunById({
+        const record = await workflowsStore.getWorkflowRunById({
           runId: run.runId,
           workflowName: 'evented-foreach-records',
         });
         const snapshot = typeof record?.snapshot === 'string' ? JSON.parse(record.snapshot) : record?.snapshot;
         const stepResult = snapshot?.context?.['records-double'];
         expect(stepResult?.payload).toEqual(items);
+        expect(stepResult?.suspendPayload).toBeUndefined();
 
-        const foreachOutput = stepResult?.suspendPayload?.__workflow_meta?.foreachOutput;
-        expect(foreachOutput).toHaveLength(items.length);
-        for (const [i, entry] of foreachOutput.entries()) {
+        const entries = Array.isArray(iterationRecords)
+          ? iterationRecords.map((entry, index) => [index, entry] as const)
+          : Object.entries((iterationRecords ?? {}) as Record<string, any>).map(
+              ([index, entry]) => [Number(index), entry] as const,
+            );
+        expect(entries).toHaveLength(items.length);
+        for (const [i, entry] of entries) {
           expect(entry).not.toHaveProperty('payload');
           expect(entry.status).toBe('success');
           expect(entry.output).toBe(i * 2);
         }
       } finally {
+        updateSpy.mockRestore();
         await mastra.stopWorkers();
       }
     });

@@ -4527,6 +4527,63 @@ export class Run<
     }
   }
 
+  /**
+   * PF-5928 adaptation (fork PF-4385 fenced step updates): a handle created before its workflow
+   * was registered with Mastra (e.g. `createRun()` then `__registerInternalWorkflow()`) had no
+   * storage binding, so createRun() admitted no pending row. Fenced step updates never recreate
+   * a missing row, so such a start would be refused as canceled. Bind the engine's Mastra and
+   * admit the pending row createRun() would have written, under this start's lifecycle tuple.
+   * A handle that was storage-bound at creation keeps the tombstone fence unchanged.
+   */
+  async #admitLateBoundPendingRun(lifecycleExecution: {
+    executionGeneration: WorkflowExecutionGeneration;
+    lifecycleResumeAttempt: number;
+    lifecycleStepStates: WorkflowStepLifecycleStateMap;
+  }): Promise<void> {
+    if (this.#mastra) return;
+    const mastra = this.executionEngine.mastra;
+    const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
+    if (!mastra || !workflowsStore) return;
+    this.#mastra = mastra;
+
+    const shouldPersistSnapshot =
+      this.executionEngine.getRunPersistenceOverride(this.runId) ?? this.executionEngine.options.shouldPersistSnapshot;
+    if (!shouldPersistSnapshot({ workflowStatus: 'pending', stepResults: {} })) return;
+    const existing = await workflowsStore.loadWorkflowSnapshot({ workflowName: this.workflowId, runId: this.runId });
+    // A row admitted by another handle is judged by assertLifecycleExecutionAdmission().
+    if (existing) return;
+
+    const initialSnapshot: WorkflowRunState = {
+      runId: this.runId,
+      status: 'pending',
+      parentWorkflow: this.parentWorkflow,
+      value: {},
+      context: {} as WorkflowRunState['context'],
+      activePaths: [],
+      activeStepsPath: {},
+      serializedStepGraph: this.serializedStepGraph,
+      suspendedPaths: {},
+      resumeLabels: {},
+      waitingPaths: {},
+      result: undefined,
+      error: undefined,
+      timestamp: Date.now(),
+    };
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: this.workflowId,
+      runId: this.runId,
+      resourceId: this.resourceId,
+      snapshot: {
+        ...(this.executionEngine.options.pruneSnapshot
+          ? this.executionEngine.options.pruneSnapshot({ snapshot: initialSnapshot, workflowStatus: 'pending' })
+          : initialSnapshot),
+        executionGeneration: lifecycleExecution.executionGeneration,
+        lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+        lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
+      },
+    });
+  }
+
   #getParentWorkflow(parent: NestedWorkflowParent) {
     if (!this.#mastra) {
       return undefined;
@@ -5370,6 +5427,7 @@ export class Run<
         }
         const admittedLifecycleExecution = this.startLifecycleExecution();
         if (!this.transientExecution) {
+          await this.#admitLateBoundPendingRun(admittedLifecycleExecution);
           await this.assertLifecycleExecutionAdmission(admittedLifecycleExecution);
         }
 
