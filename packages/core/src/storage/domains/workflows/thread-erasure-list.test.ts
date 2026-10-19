@@ -179,7 +179,8 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
         { ...runs.pendingLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
         { ...runs.runningLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
         { ...runs.reservedKey, attribution: 'thread', rows: SNAPSHOT_ONLY },
-        { ...runs.split, attribution: 'thread', rows: SNAPSHOT_ONLY },
+        // The first suspended step names another thread: the row records both.
+        { ...runs.split, attribution: 'thread', rows: { ...SNAPSHOT_ONLY, snapshot: 'mixed' } },
         { ...runs.durableMemoryInfo, attribution: 'thread', rows: SNAPSHOT_ONLY },
         { ...runs.durableState, attribution: 'thread', rows: SNAPSHOT_ONLY },
       ],
@@ -495,6 +496,12 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
         output: [null, suspended(THREAD)],
       }),
     );
+    // The caller-owned workflow input is never read as a step.
+    await persist(workflows, { workflowName: 'agentic-loop', runId: 'e-input-shaped' }, {
+      ...createEmptyWorkflowSnapshot('e-input-shaped'),
+      status: 'suspended',
+      context: { input: suspended(THREAD) },
+    } as WorkflowRunState);
     // Another thread only.
     await persist(
       workflows,
@@ -513,7 +520,8 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
         workflowName: 'agentic-loop',
         runId,
         attribution: 'thread',
-        rows: SNAPSHOT_ONLY,
+        // b-foreach-object also keeps another thread's iteration.
+        rows: runId === 'b-foreach-object' ? { ...SNAPSHOT_ONLY, snapshot: 'mixed' } : SNAPSHOT_ONLY,
       })),
       hasMore: false,
     });

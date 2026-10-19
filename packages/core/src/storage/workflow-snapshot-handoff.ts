@@ -390,8 +390,9 @@ const SNAPSHOT_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
   // an array or an index-keyed object) and in a foreach step's iteration results.
   {
     paths: [
-      '@.context.*.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
-      '@.context.*.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
+      // Every step but the caller-owned `context.input`.
+      '@.context.keyvalue() ? (@.key != "input").value.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
+      '@.context.keyvalue() ? (@.key != "input").value.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
     ],
   },
   // A durable-agent run: its input, step outputs and result each carry the
@@ -482,6 +483,14 @@ const threadIdPredicate = (groups: readonly ThreadIdPathGroup[], test: (path: st
 const threadIdMatchPath = (groups: readonly ThreadIdPathGroup[]) => threadIdPredicate(groups, path => `${path} == $t`);
 const anyThreadIdPath = (groups: readonly ThreadIdPathGroup[]) =>
   threadIdPredicate(groups, path => `exists(${path} ? (@.type() == "string"))`);
+const otherThreadIdPath = (groups: readonly ThreadIdPathGroup[]) =>
+  threadIdPredicate(groups, path => `exists(${path} ? (@.type() == "string" && @ != $t))`);
+
+/**
+ * What one row records: the listed thread only (`thread`), the listed thread
+ * and others (`mixed`), only other threads (`other`) or none (`unattributed`).
+ */
+export type WorkflowThreadErasureRowClass = 'thread' | 'mixed' | 'other' | 'unattributed';
 
 /**
  * SQL/JSON path (PostgreSQL `jsonb_path_exists`, lax mode) that is true when
@@ -500,6 +509,18 @@ export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(SNA
  * snapshot it is false for is unattributed.
  */
 export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
+
+/**
+ * SQL/JSON path that is true when a snapshot records, at a location
+ * {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH} reads, a string thread
+ * id other than the one bound to `t`.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH = otherThreadIdPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
+
+/** The {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH} of a network row's input. */
+export const WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_OTHER_THREAD_PATH = otherThreadIdPath([
+  { paths: ['@.context.input.threadId'] },
+]);
 
 /** For a {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS} row: true when its input records the thread id bound to `t`. */
 export const WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath([
@@ -522,6 +543,11 @@ export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH = threadIdMatc
   TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
 );
 
+/** SQL/JSON path that is true when a terminal envelope records a string thread id other than the one bound to `t`. */
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_OTHER_THREAD_PATH = otherThreadIdPath(
+  TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
+);
+
 /** SQL/JSON path that is true when a terminal envelope records any string thread id where the match path reads. */
 export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(
   TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
@@ -534,8 +560,15 @@ function threadErasureMembers(value: unknown, key: string): unknown[] {
   const members: unknown[] = [];
   for (const holder of holders) {
     if (holder === null || typeof holder !== 'object' || Array.isArray(holder)) continue;
-    // `.*` reads every member; `.key` reads one.
-    for (const name of key === '*' ? Object.keys(holder) : [key]) {
+    // `.*` reads every member, `.*!input` every member but `input`
+    // (`.keyvalue() ? (@.key != "input").value`); `.key` reads one.
+    const names =
+      key === '*'
+        ? Object.keys(holder)
+        : key === '*!input'
+          ? Object.keys(holder).filter(name => name !== 'input')
+          : [key];
+    for (const name of names) {
       const descriptor = Object.getOwnPropertyDescriptor(holder, name);
       if (descriptor && descriptor.enumerable && 'value' in descriptor && descriptor.value !== undefined) {
         members.push(descriptor.value);
@@ -593,15 +626,15 @@ export function classifyWorkflowSnapshotThreadErasure(
   snapshot: unknown,
   threadId: string,
   workflowName?: string,
-): 'thread' | 'other' | 'unattributed' {
+): WorkflowThreadErasureRowClass {
   const durable = holds(snapshot, 'context.input.__workflowKind', 'durable-agent');
   const network =
     workflowName !== undefined && WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS.includes(workflowName);
   return classifyThreadErasureValues(
     [
       ...(network ? at(snapshot, 'context.input.threadId') : []),
-      ...at(snapshot, 'context.*.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
-      ...at(snapshot, 'context.*.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
+      ...at(snapshot, 'context.*!input.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
+      ...at(snapshot, 'context.*!input.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
       ...(durable
         ? [
             'context.input.messageListState.memoryInfo.threadId',
@@ -630,7 +663,7 @@ export function classifyWorkflowSnapshotThreadErasure(
 export function classifyWorkflowTerminalEnvelopeThreadErasure(
   envelope: unknown,
   threadId: string,
-): 'thread' | 'other' | 'unattributed' {
+): WorkflowThreadErasureRowClass {
   const durable = holds(envelope, 'workflowName', DURABLE_AGENTIC_LOOP_WORKFLOW);
   return classifyThreadErasureValues(
     [
@@ -645,10 +678,11 @@ export function classifyWorkflowTerminalEnvelopeThreadErasure(
   );
 }
 
-function classifyThreadErasureValues(found: unknown[], threadId: string): 'thread' | 'other' | 'unattributed' {
+function classifyThreadErasureValues(found: unknown[], threadId: string): WorkflowThreadErasureRowClass {
   const values = found.filter((value): value is string => typeof value === 'string');
-  if (values.includes(threadId)) return 'thread';
-  return values.length > 0 ? 'other' : 'unattributed';
+  const others = values.some(value => value !== threadId);
+  if (values.includes(threadId)) return others ? 'mixed' : 'thread';
+  return others ? 'other' : 'unattributed';
 }
 
 /**

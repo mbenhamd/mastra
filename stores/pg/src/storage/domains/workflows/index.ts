@@ -87,6 +87,9 @@ import {
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH,
+  WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_OTHER_THREAD_PATH,
+  WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_OTHER_THREAD_PATH,
   WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT,
   WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
   WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
@@ -6322,6 +6325,9 @@ export class WorkflowsPG extends WorkflowsStorage {
       [...WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS],
       WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
       WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
+      WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH,
+      WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_OTHER_THREAD_PATH,
+      WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_OTHER_THREAD_PATH,
     ];
     let afterParams: [string, string] | undefined;
     if (after) {
@@ -6384,6 +6390,9 @@ export class WorkflowsPG extends WorkflowsStorage {
       const snapshotMatch = (alias: string, json: string) =>
         `(jsonb_path_exists(${json}, $3::jsonpath, ${threadVars})
           OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $10::jsonpath, ${threadVars})))`;
+      const snapshotOtherThread = (alias: string, json: string) =>
+        `(jsonb_path_exists(${json}, $12::jsonpath, ${threadVars})
+          OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $13::jsonpath, ${threadVars})))`;
       const snapshotAnyThread = (alias: string, json: string) =>
         `(jsonb_path_exists(${json}, $4::jsonpath)
           OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $11::jsonpath)))`;
@@ -6412,6 +6421,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            SELECT workflow_name, run_id, 'snapshot' AS kind,
                   ${snapshotMatch('canonical', 'snapshot_json')} AS matched,
                   ${snapshotAnyThread('canonical', 'snapshot_json')} AS any_thread,
+                  ${snapshotOtherThread('canonical', 'snapshot_json')} AS other_thread,
                   CASE WHEN jsonb_typeof(snapshot_json -> 'status') = 'string' THEN snapshot_json ->> 'status' END
                     AS status,
                   "createdAt", "createdAtZ", "updatedAt", "updatedAtZ",
@@ -6431,6 +6441,7 @@ export class WorkflowsPG extends WorkflowsStorage {
            SELECT handoff.workflow_name COLLATE "C", handoff.run_id COLLATE "C", 'handoff',
                   ${snapshotMatch('handoff', 'handoff.snapshot')},
                   ${snapshotAnyThread('handoff', 'handoff.snapshot')},
+                  ${snapshotOtherThread('handoff', 'handoff.snapshot')},
                   NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
            FROM ${this.workflowSnapshotHandoffTableName()} AS handoff
            WHERE handoff.resource_id = $1 ${keyset('handoff')}
@@ -6438,12 +6449,14 @@ export class WorkflowsPG extends WorkflowsStorage {
            SELECT terminal.workflow_name COLLATE "C", terminal.run_id COLLATE "C", 'terminal_snapshot',
                   jsonb_path_exists(terminal.envelope, $5::jsonpath, ${threadVars}),
                   jsonb_path_exists(terminal.envelope, $6::jsonpath),
+                  jsonb_path_exists(terminal.envelope, $14::jsonpath, ${threadVars}),
                   NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
            FROM ${this.terminalSnapshotTableName()} AS terminal
            WHERE terminal.resource_id = $1 ${keyset('terminal')}
          ) AS run_row_matches
          CROSS JOIN LATERAL (
-           SELECT CASE WHEN matched THEN 'thread' WHEN any_thread THEN 'other' ELSE 'unattributed' END
+           SELECT CASE WHEN matched AND other_thread THEN 'mixed' WHEN matched THEN 'thread'
+                       WHEN any_thread THEN 'other' ELSE 'unattributed' END
              AS row_attribution
          ) AS attributed
          GROUP BY workflow_name COLLATE "C", run_id COLLATE "C"
@@ -6474,7 +6487,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
     const rowAttribution = (value: string | null): WorkflowRunThreadErasureRowAttribution => {
       if (value === null) return 'absent';
-      if (value === 'thread' || value === 'other' || value === 'unattributed') return value;
+      if (value === 'thread' || value === 'mixed' || value === 'other' || value === 'unattributed') return value;
       throw new TypeError('Invalid workflow thread erasure row attribution');
     };
     const runs = rows.slice(0, limit).map((row): WorkflowRunThreadErasureEntry => {

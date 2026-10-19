@@ -428,10 +428,11 @@ export interface ListWorkflowRunsByThreadForErasureInput {
 /**
  * What one of the run's rows records, for a row that can hold a copy of its
  * data: `absent` (no such row under the resource), `thread` (it records the
- * listed thread id), `other` (it records only other thread ids) or
+ * listed thread id and no other), `mixed` (it records the listed thread id and
+ * other thread ids too), `other` (it records only other thread ids) or
  * `unattributed` (it records no thread id).
  */
-export type WorkflowRunThreadErasureRowAttribution = 'absent' | 'thread' | 'other' | 'unattributed';
+export type WorkflowRunThreadErasureRowAttribution = 'absent' | 'thread' | 'mixed' | 'other' | 'unattributed';
 
 /**
  * The run's rows that `deleteWorkflowRunClosure` erases and that can hold a
@@ -441,7 +442,8 @@ export type WorkflowRunThreadErasureRowAttribution = 'absent' | 'thread' | 'othe
  * id, so the same run id can start a newer lifetime whose canonical snapshot
  * belongs to another thread. Such a run lists as `thread` with
  * `snapshot: 'other'`. Closure deletion erases every row of the run, so a
- * caller erasing one thread must not delete a run with an `other` row.
+ * caller erasing one thread must not delete a run with an `other` or `mixed`
+ * row without deciding about the other thread's data.
  */
 export interface WorkflowRunThreadErasureRows {
   /** The canonical snapshot. */

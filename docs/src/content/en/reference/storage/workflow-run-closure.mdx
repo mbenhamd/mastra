@@ -121,7 +121,7 @@ Input: `{ resourceId, threadId, after?, limit, includeUnattributed? }`. `limit` 
 
 A row matches only where the framework itself writes a thread id, in any run status:
 
-- an agent loop suspension: `__streamState.messageList.memoryInfo.threadId` anywhere inside a step's `suspendPayload`, including the foreach and nested suspensions kept under `__workflow_meta`, or inside the `suspendPayload` of a foreach step's iteration results, for any step and status;
+- an agent loop suspension: `__streamState.messageList.memoryInfo.threadId` anywhere inside a step's `suspendPayload` (any step but `context.input`, which the caller owns), including the foreach and nested suspensions kept under `__workflow_meta`, or inside the `suspendPayload` of a foreach step's iteration results, for any step and status;
 - a durable agent run (`context.input.__workflowKind` is `durable-agent`): `messageListState.memoryInfo.threadId` and `state.threadId` of its `context.input`, of any step's `output` or `payload`, and of its `result` (or `result.output`, when terminal persistence stored the whole step result). `state.threadId` is set even without a memory backend;
 - an agent network run (`Agent-Network-Outer-Workflow`, `iteration-with-validation`, `agent-loop-main-workflow`): `context.input.threadId`;
 - the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`;
@@ -131,9 +131,9 @@ Application data elsewhere that only looks like thread metadata doesn't match.
 
 Returns: `Promise<ListWorkflowRunsByThreadForErasureResult>`:
 
-- `{ status: 'listed', runs, hasMore, nextCursor? }`: runs are ordered by `(workflowName, runId)` in code-point order. A matching run is `{ workflowName, runId, attribution: 'thread', rows }`, where `rows` is `{ snapshot, handoff, terminalSnapshot }`. Each is `absent` (no such row under the resource), `thread`, `other` (the row records only other threads) or `unattributed`.
+- `{ status: 'listed', runs, hasMore, nextCursor? }`: runs are ordered by `(workflowName, runId)` in code-point order. A matching run is `{ workflowName, runId, attribution: 'thread', rows }`, where `rows` is `{ snapshot, handoff, terminalSnapshot }`. Each is `absent` (no such row under the resource), `thread` (only this thread), `mixed` (this thread and others), `other` (only other threads) or `unattributed`.
 
-A released handoff doesn't fence the run ID, so a newer run can reuse the ID for another thread while the handoff of the earlier run stays. That run lists as `thread` with `snapshot: 'other'`. `deleteWorkflowRunClosure` erases every row of the run, so don't delete a run that has an `other` row when you erase one thread.
+A released handoff doesn't fence the run ID, so a newer run can reuse the ID for another thread while the handoff of the earlier run stays. That run lists as `thread` with `snapshot: 'other'`. `deleteWorkflowRunClosure` erases every row of the run, so don't delete a run that has an `other` or `mixed` row when you erase one thread without deciding about the other thread's data.
 
 - `{ status: 'unsupported' }`: the store can't answer. It never answers an empty page instead.
 

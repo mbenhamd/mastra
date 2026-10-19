@@ -126,6 +126,7 @@ import {
   classifyWorkflowSnapshotThreadErasure,
   classifyWorkflowTerminalEnvelopeThreadErasure,
   isWorkflowSnapshotThreadErasureContentFree,
+  type WorkflowThreadErasureRowClass,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS,
   workflowRunThreadErasureSharedRunIds,
 } from '../../workflow-snapshot-handoff';
@@ -2517,10 +2518,10 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const note = (
       candidate: Candidate,
       row: keyof WorkflowRunThreadErasureRows,
-      attribution: 'thread' | 'other' | 'unattributed',
+      attribution: WorkflowThreadErasureRowClass,
     ) => {
       candidate.rows[row] = attribution;
-      if (attribution === 'thread') candidate.matched = true;
+      if (attribution === 'thread' || attribution === 'mixed') candidate.matched = true;
       if (attribution !== 'unattributed') candidate.anyThread = true;
     };
     // Every row that can hold a copy of the run's data is read, each as a
