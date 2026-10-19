@@ -4,6 +4,15 @@
  * A process that dies while a resumed nested-workflow step is running must be
  * recoverable via restart(): the resumed step re-runs with its original resume
  * data instead of suspending again.
+ *
+ * PF-5928 adaptation (fork PF-2216, the same semantic on both engines): the
+ * fork never records a resumed step as `running` with its resume payload before
+ * it runs, so there is no payload for restart() to replay. A resumed step keeps
+ * its suspended record until it settles. After a crash mid-resume, restart()
+ * fails a nested run without running the resumed step, and a single-step
+ * workflow stays suspended so a new resume() finishes it — exactly as on the
+ * default engine (workflows/nested-resume-restart.test.ts,
+ * workflows/resume-restart-suspend-data.test.ts, nested-resume-pf2216.test.ts).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -115,141 +124,99 @@ async function restartOnFreshHost(runId: string, nestedRunId: string, parentSnap
   }
 }
 
-describe('evented nested workflow restart after crash during resume (issue #25365)', () => {
-  it('records the resume data on the resumed step records', async () => {
+describe('evented nested workflow restart after crash during resume (issue #25365, PF-2216 semantics)', () => {
+  it('keeps the resumed step records suspended and records no resume payload ahead of execution', async () => {
     const { parentSnapshot, nestedSnapshot } = await crashMidResume();
     expect(parentSnapshot.status).toBe('running');
-    expect(parentSnapshot.context.nested).toMatchObject({ status: 'running', resumePayload: false });
+    expect(parentSnapshot.context.nested).toMatchObject({ status: 'suspended' });
+    expect(parentSnapshot.context.nested.resumePayload).toBeUndefined();
     expect(parentSnapshot.context.nested.suspendPayload.__workflow_meta.runId).toBeTruthy();
-    expect(nestedSnapshot.status).toBe('running');
-    expect(nestedSnapshot.context.gate).toMatchObject({ status: 'running', resumePayload: false });
-  });
-
-  it('restarts the resumed nested step with its falsy resume data', async () => {
-    const { runId, nestedRunId, parentSnapshot, nestedSnapshot } = await crashMidResume();
-    const { result, seen, nestedAfter } = await restartOnFreshHost(runId, nestedRunId, parentSnapshot, nestedSnapshot);
-
-    expect(result.status).toBe('success');
-    expect(seen).toEqual([false]);
-    if (result.status === 'success') {
-      expect(result.result).toEqual({ approved: false });
-    }
-    expect(nestedAfter?.status).toBe('success');
+    expect(nestedSnapshot.context.gate).toMatchObject({ status: 'suspended' });
+    expect(nestedSnapshot.context.gate.resumePayload).toBeUndefined();
   });
 
   it.each([
+    ['as the crash left it', undefined],
     ['before it claimed the resume', 'suspended'],
-    ['after it claimed the resume but before the resumed step started', 'running'],
-  ] as const)('resumes the nested run when the process died %s', async (_, nestedStatus) => {
-    const { runId, nestedRunId, parentSnapshot, suspendedNested } = await crashMidResume();
-    const { result, seen, nestedAfter } = await restartOnFreshHost(runId, nestedRunId, parentSnapshot, {
-      ...suspendedNested,
-      status: nestedStatus,
-      // The nested run's start persists a running snapshot with its paths cleared.
-      ...(nestedStatus === 'running' ? { suspendedPaths: {}, activeStepsPath: {} } : {}),
-    });
+    // Not covered here: a nested row `running` with cleared paths (upstream's claim shape). The
+    // fork's evented resume never writes it (the crash above leaves the nested row suspended), and
+    // a restart over that synthetic state currently never settles (PF-5928 open item: the nested
+    // workflow.start goes silent, the same family as the evented recover() hang).
+  ] as const)(
+    'fails the restart without running the resumed nested step when the nested run is %s',
+    async (_, nestedStatus) => {
+      const { runId, nestedRunId, parentSnapshot, nestedSnapshot, suspendedNested } = await crashMidResume();
+      const { result, seen } = await restartOnFreshHost(
+        runId,
+        nestedRunId,
+        parentSnapshot,
+        nestedStatus === undefined
+          ? nestedSnapshot
+          : {
+              ...suspendedNested,
+              status: nestedStatus,
+              ...(nestedStatus === 'running' ? { suspendedPaths: {}, activeStepsPath: {} } : {}),
+            },
+      );
 
-    expect(result.status).toBe('success');
-    expect(seen).toEqual([false]);
-    expect(nestedAfter?.status).toBe('success');
-  });
+      expect(result.status).toBe('failed');
+      expect(seen).toEqual([]);
+    },
+  );
 
-  it('routes a data-less resume to the parked nested run after its resumePayload key was dropped', async () => {
-    const { runId, nestedRunId, parentSnapshot, suspendedNested } = await crashMidResume();
-    // A resume without resumeData stores `resumePayload: undefined`, which JSON-serializing stores drop.
-    delete parentSnapshot.context.nested.resumePayload;
-    expect(parentSnapshot.context.nested).toMatchObject({ status: 'running' });
-    expect(parentSnapshot.context.nested.resumedAt).toBeDefined();
-
-    const { result, seen, nestedAfter } = await restartOnFreshHost(runId, nestedRunId, parentSnapshot, suspendedNested);
-
-    // The gate re-suspends on undefined data; the point is restart reaches the nested resume instead of failing.
-    expect(result.status).toBe('suspended');
-    expect(seen).toEqual([]);
-    expect(nestedAfter?.status).toBe('suspended');
-  });
-
-  it('resumes the step the caller resumed when parallel nested steps are suspended', async () => {
-    const buildParallel = (onResume: (id: string, data: any) => Promise<void>) => {
-      const mk = (id: string) =>
-        createStep({
-          id,
-          inputSchema: z.object({}),
-          outputSchema: z.object({ v: z.string() }),
-          resumeSchema: z.string(),
-          execute: async ({ resumeData, suspend }) => {
-            if (resumeData === undefined) return suspend({});
-            await onResume(id, resumeData);
-            return { v: resumeData };
-          },
-        });
-      const nested = createWorkflow({ id: 'nested', inputSchema: z.object({}), outputSchema: z.any() })
-        .parallel([mk('a'), mk('b')])
-        .commit();
+  it('keeps a single-step workflow suspended through a crash mid-resume so a new resume() finishes it', async () => {
+    const buildSingle = (onResume: (data: any) => Promise<void>) => {
+      const ask = createStep({
+        id: 'ask',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ answer: z.string() }),
+        resumeSchema: z.object({ answer: z.string() }),
+        execute: async ({ resumeData, suspend }) => {
+          if (resumeData === undefined) return suspend({});
+          await onResume(resumeData);
+          return { answer: resumeData.answer };
+        },
+      });
       const parent = createWorkflow({ id: 'parent', inputSchema: z.object({}), outputSchema: z.any() })
-        .then(nested)
+        .then(ask)
         .commit();
-      return { parent, nested } as unknown as ReturnType<typeof build>;
+      return { parent, nested: parent } as unknown as ReturnType<typeof build>;
     };
-
-    // Crash after the parent claimed the resume, before the nested run did.
     const storage = new MockStore();
-    let markClaimed!: () => void;
-    const claimed = new Promise<void>(r => (markClaimed = r));
-    const p = buildParallel(async () => {
-      await new Promise(() => {});
+    let markRunning!: () => void;
+    const running = new Promise<void>(r => (markRunning = r));
+    const p1 = buildSingle(async () => {
+      markRunning();
+      await new Promise(() => {}); // the process "dies" inside the resumed step
     });
-    const mastra = await makeHost(storage, p);
-    const run = await p.parent.createRun();
+    const mastra1 = await makeHost(storage, p1);
+    const run = await p1.parent.createRun();
     expect((await run.start({ inputData: {} })).status).toBe('suspended');
+    void run.resume({ step: 'ask', resumeData: { answer: 'blue' } });
+    await running;
     const store = (await storage.getStore('workflows'))!;
-    const nestedRunId = (
-      (await store.loadWorkflowSnapshot({ workflowName: 'parent', runId: run.runId }))?.context as any
-    ).nested.metadata.nestedRunId as string;
-    const suspendedNested = JSON.parse(
-      JSON.stringify(await store.loadWorkflowSnapshot({ workflowName: 'nested', runId: nestedRunId })),
-    );
-    const poll = setInterval(() => {
-      store
-        .loadWorkflowSnapshot({ workflowName: 'parent', runId: run.runId })
-        .then(s => {
-          if ((s?.context as any)?.nested?.status === 'running') markClaimed();
-        })
-        .catch(() => {});
-    }, 5);
-    void run.resume({ step: ['nested', 'b'], resumeData: 'forB' });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        claimed,
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('parent never claimed the resume')), 30_000);
-        }),
-      ]);
-    } finally {
-      clearInterval(poll);
-      clearTimeout(timer);
-    }
-    const parentSnapshot = JSON.parse(
+    const crashed = JSON.parse(
       JSON.stringify(await store.loadWorkflowSnapshot({ workflowName: 'parent', runId: run.runId })),
     );
-    await mastra.stopWorkers();
+    await mastra1.stopWorkers();
+    expect(crashed.context.ask).toMatchObject({ status: 'suspended' });
 
     const storage2 = new MockStore();
     const store2 = (await storage2.getStore('workflows'))!;
-    await store2.persistWorkflowSnapshot({ workflowName: 'parent', runId: run.runId, snapshot: parentSnapshot });
-    await store2.persistWorkflowSnapshot({ workflowName: 'nested', runId: nestedRunId, snapshot: suspendedNested });
+    await store2.persistWorkflowSnapshot({ workflowName: 'parent', runId: run.runId, snapshot: crashed });
     const seen: any[] = [];
-    const p2 = buildParallel(async (id, data) => {
-      seen.push([id, data]);
+    const p2 = buildSingle(async data => {
+      seen.push(data);
     });
     const mastra2 = await makeHost(storage2, p2);
     try {
-      const result = await (await p2.parent.createRun({ runId: run.runId })).restart();
-      expect(seen).toEqual([['b', 'forB']]);
-      expect(result.status).toBe('suspended');
-      const nestedAfter = await store2.loadWorkflowSnapshot({ workflowName: 'nested', runId: nestedRunId });
-      expect((nestedAfter?.context as any).a.status).toBe('suspended');
+      const run2 = await p2.parent.createRun({ runId: run.runId });
+      const restarted = await run2.restart();
+      expect(restarted.status).toBe('suspended');
+      expect(seen).toEqual([]);
+      const resumed = await run2.resume({ step: 'ask', resumeData: { answer: 'blue' } });
+      expect(resumed.status).toBe('success');
+      expect(seen).toEqual([{ answer: 'blue' }]);
     } finally {
       await mastra2.stopWorkers();
     }

@@ -208,7 +208,13 @@ describe('T23 stopWhen (plain, durable, evented)', () => {
       expect(requests, `${engine}: modelCalls`).toHaveLength(1);
       expect(commits.get(engine), `${engine}: commits`).toBe(1);
       const wireError = engine === 'plain' ? ['error'] : [];
-      expect(turn.chunkTypes, `${engine}: chunks`).toEqual(['start', 'step-start', 'tool-call', 'tool-result', ...wireError]);
+      expect(turn.chunkTypes, `${engine}: chunks`).toEqual([
+        'start',
+        'step-start',
+        'tool-call',
+        'tool-result',
+        ...wireError,
+      ]);
       expect(chunksOfType(turn, 'finish'), `${engine}: finish`).toBe(0);
       expect(errorMessages(turn), `${engine}: error chunk on the wire (plain only, PF-6047)`).toEqual(
         engine === 'plain' ? ['T23 stopWhen failure'] : [],

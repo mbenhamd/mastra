@@ -2918,34 +2918,11 @@ export class WorkflowEventProcessor extends EventProcessor {
         if (this.#isStaleResultWrite(runningWrite, { workflowId, runId, stepId: leafId })) {
           return;
         }
-      } else if ((resumeSteps?.length ?? 0) > 0 && resumeSteps?.[0] === leafId && step.type !== 'foreach') {
-        // Upstream #25365: mark the resumed step running and keep its resume data next to the
-        // suspendPayload, so restart() after a crash mid-resume re-enters the step with the same
-        // resume data instead of re-suspending it (consumed by the isResumedRunningRecord restart
-        // branch). Foreach is excluded: its aggregate record stays 'suspended' until step-end
-        // collects the iterations. Only a still-suspended record is claimed, and the write is
-        // fenced to this lifetime like every other evented result write (PF-4387).
-        const resumeSnapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
-        const storedResult = (resumeSnapshot?.context as any)?.[leafId];
-        if (storedResult?.status === 'suspended') {
-          const resumeWrite = await workflowsStore.updateWorkflowResults({
-            workflowName: workflowId,
-            runId,
-            stepId: leafId,
-            result: {
-              ...storedResult,
-              status: 'running',
-              resumePayload: resumeData,
-              resumedAt: Date.now(),
-            },
-            requestContext: getPersistedRequestContext(requestContext),
-            executionGeneration: lifecycleExecution.executionGeneration,
-          });
-          if (this.#isStaleResultWrite(resumeWrite, { workflowId, runId, stepId: leafId })) {
-            return;
-          }
-        }
       }
+      // Upstream #25365/#25630 also mark a resumed step `running` with its resume data before it
+      // runs, so restart() can replay it. Not adopted (fork PF-2216, same semantic as the default
+      // engine): the resumed step keeps its suspended record until it settles, and no resume
+      // payload is recorded ahead of execution.
       // `expectedStatus` makes this a compare-and-set: the row is 'running' on
       // the normal path (written by processWorkflowStart for both start and
       // resume), and if a concurrent sibling already committed a suspension
