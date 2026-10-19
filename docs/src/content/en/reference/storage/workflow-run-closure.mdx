@@ -125,7 +125,7 @@ A row matches only where the framework itself writes a thread id, in any run sta
 - a durable agent run (`context.input.__workflowKind` is `durable-agent`): `messageListState.memoryInfo.threadId` and `state.threadId` of its `context.input`, of any step's `output` or `payload`, and of its `result` (or `result.output`, when terminal persistence stored the whole step result). `state.threadId` is set even without a memory backend;
 - an agent network run (`Agent-Network-Outer-Workflow`, `iteration-with-validation`, `agent-loop-main-workflow`): `context.input.threadId`;
 - the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`;
-- in a terminal envelope of a `durable-agentic-loop` run: `terminalResult.output.messageListState.memoryInfo.threadId` and `terminalResult.output.state.threadId`. An envelope's `requestContextPatch` can't carry a thread, because the envelope refuses infrastructure-owned keys. So the terminal envelope of a run that isn't a durable agent run records no thread, and once its canonical snapshot is gone the listing can't find it; `listWorkflowRunClosuresByResource` still does.
+- in a terminal envelope of a `durable-agentic-loop` run: `terminalResult.output.messageListState.memoryInfo.threadId` and `terminalResult.output.state.threadId`. An envelope's `requestContextPatch` can't carry a thread, because the envelope refuses infrastructure-owned keys. As a result, the terminal envelope of a run that isn't a durable agent run records no thread, and once its canonical snapshot is gone the listing can't find it. `listWorkflowRunClosuresByResource` still does.
 
 Application data elsewhere that only looks like thread metadata doesn't match.
 
@@ -160,6 +160,6 @@ The intended rule for unattributed runs:
 
 The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1`, `closureCancelVersion: 1` and `threadErasureListVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
 
-`listWorkflowRunsByThreadForErasure` reads every row of the resource after the cursor on each page and then pages the matches, so a page costs time in proportion to the resource's runs. A snapshot stored as a JSON string is read as the object it encodes; one that doesn't parse fails the listing.
+`listWorkflowRunsByThreadForErasure` reads every row of the resource after the cursor on each page and then pages the matches, so a page costs time in proportion to the resource's runs. A snapshot stored as a JSON string is read as the object it encodes. One that doesn't parse fails the listing.
 
 On PostgreSQL, the listing uses resource indexes on the snapshot, handoff and terminal snapshot tables, and the reuse fence uses the `handoff_claim_generation_hwm` column of `mastra_workflow_parent_revisions`. `init()` creates them. With an externally managed schema (`disableInit`), apply the statements from `exportSchemas()` before deploying. The `@mastra/pg` changelog lists them.
