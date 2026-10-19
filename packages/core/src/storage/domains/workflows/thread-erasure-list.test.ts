@@ -420,6 +420,15 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
         } as any,
       }),
     ).resolves.toMatchObject({ status: 'persisted' });
+    // Terminal persistence stores the whole step result as the canonical `result`;
+    // with an input that records no thread, the canonical row is attributed by `result.output`.
+    const resultOnly = { workflowName: 'durable-agentic-loop', runId: 'durable-result-output' };
+    await persist(workflows, resultOnly, {
+      ...createEmptyWorkflowSnapshot(resultOnly.runId),
+      status: 'success',
+      context: { input: { __workflowKind: 'durable-agent', messageListState: { memoryInfo: null }, state: {} } } as any,
+      result: { status: 'success', output: { messageListState: { memoryInfo: null }, state } },
+    } as WorkflowRunState);
     // The canonical snapshot is deleted; the retained envelope still holds the thread's data.
     await workflows.deleteWorkflowRunById(run);
 
@@ -428,6 +437,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     ).resolves.toEqual({
       status: 'listed',
       runs: [
+        { ...resultOnly, attribution: 'thread', rows: SNAPSHOT_ONLY },
         { ...run, attribution: 'thread', rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' } },
       ],
       hasMore: false,

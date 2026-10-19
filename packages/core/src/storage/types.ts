@@ -511,7 +511,8 @@ export type WorkflowRunThreadErasureEntry =
  * - a durable-agent run (`context.input.__workflowKind` is `durable-agent`):
  *   `messageListState.memoryInfo.threadId` and `state.threadId` (set even
  *   without a memory backend) of its `context.input`, of any
- *   `context.<step>.output`, and of its `result`;
+ *   `context.<step>.output`, and of its `result` (or `result.output`, when
+ *   terminal persistence stored the whole step result);
  * - the serialized request context of a started run:
  *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
  *

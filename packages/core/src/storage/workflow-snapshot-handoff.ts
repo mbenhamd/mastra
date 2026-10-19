@@ -397,6 +397,9 @@ const SNAPSHOT_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
       '@.context.*.output.state.threadId',
       '@.result.messageListState.memoryInfo.threadId',
       '@.result.state.threadId',
+      // persistWorkflowTerminalState stores the whole step result as `result`.
+      '@.result.output.messageListState.memoryInfo.threadId',
+      '@.result.output.state.threadId',
     ],
   },
   // The request context persisted with every started run.
@@ -510,6 +513,8 @@ export function classifyWorkflowSnapshotThreadErasure(
             'context.*.output.state.threadId',
             'result.messageListState.memoryInfo.threadId',
             'result.state.threadId',
+            'result.output.messageListState.memoryInfo.threadId',
+            'result.output.state.threadId',
           ].flatMap(path => at(snapshot, path))
         : []),
       ...at(snapshot, 'requestContext.MastraMemory.thread.id'),
