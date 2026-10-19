@@ -2925,7 +2925,16 @@ export class DurableAgent<
     const writeTerminalState = async () => {
       wrote = true;
       if (error) await reportError(error);
-      if (finished) await this.deleteTerminalRunSnapshots(runId);
+      if (!finished) return;
+      try {
+        await this.deleteTerminalRunSnapshots(runId);
+      } catch (deleteError) {
+        // Fork (PF-1875): terminal cleanup is best-effort. Storage adapters
+        // fail closed inside deleteTerminalRunSnapshots(), but an override or
+        // adapter that throws must not settle the segment as failed or surface
+        // its storage error as a second ERROR event on the run's stream.
+        this.logger.warn(`Failed to delete terminal workflow snapshots for run ${runId}`, { runId, error: deleteError });
+      }
     };
 
     if (!fence) return writeTerminalState();
@@ -6392,10 +6401,11 @@ export class DurableAgent<
       // another execution's signal.
       this.#coordinateRegistryCleanup(runId, registryEntry);
       // PF-5928 (#27357): this recovery now holds the run's claim. A local entry left by an
-      // earlier execution of the run whose fence is lost (abandoned/superseded) or is no
-      // longer this process's active fence for the run is not a live owner: evict it so
-      // recovery does not collide with its own crashed execution. An entry without a fence,
-      // or whose fence is still the active one, still collides.
+      // earlier execution of the run whose fence is lost (abandoned/superseded), or that never
+      // settled and is no longer this process's active fence for the run, is not a live owner:
+      // evict it so recovery does not collide with its own crashed execution. An entry without
+      // a fence, whose fence is still the active one, or whose execution settled (for example
+      // parked on a suspension) still collides.
       const lostEntry = getGlobalRunRegistryEntry(runId);
       const lostFence = lostEntry?.executionFence;
       if (
@@ -6403,7 +6413,7 @@ export class DurableAgent<
         lostEntry !== registryEntry &&
         lostFence !== undefined &&
         lostFence !== executionFence &&
-        (lostFence.isLost() || ExecutionFence.getLocalActive(runId) !== lostFence)
+        (lostFence.isLost() || (!lostFence.isSettled() && ExecutionFence.getLocalActive(runId) !== lostFence))
       ) {
         evictLostRunRegistryEntry(runId, lostEntry);
       }

@@ -9,6 +9,7 @@ import { InMemoryStore } from '../../../storage';
 import type { WorkflowFinishCallbackResult } from '../../../workflows/types';
 import { Agent } from '../../agent';
 import { EventedAgent } from '../evented-agent';
+import { getExecutionClaim } from '../execution-fence';
 import { getGlobalRunRegistryEntry, globalRunRegistry } from '../run-registry';
 
 function createTextModel(text: string) {
@@ -66,7 +67,7 @@ describe('EventedAgent requestContext forwarding', () => {
     const requestContext = new RequestContext();
     requestContext.set('tenantId', 'tenant-123');
 
-    const { cleanup } = await eventedAgent.stream('Hello', {
+    const { runId, cleanup } = await eventedAgent.stream('Hello', {
       requestContext,
       memory: { thread: 'thread-123', resource: 'resource-123' },
     });
@@ -80,20 +81,37 @@ describe('EventedAgent requestContext forwarding', () => {
       expect(startAsync).toHaveBeenCalledWith(
         expect.objectContaining({
           inputData: expect.any(Object),
-          requestContext,
+          requestContext: expect.any(RequestContext),
         }),
       );
+      // PF-5928 adaptation (upstream #26418): the forwarded context is the run's
+      // own copy, carrying the caller's entries plus the execution claim, so
+      // the caller's context is never mutated.
+      const forwarded = (startAsync.mock.calls[0] as unknown as [{ requestContext: RequestContext }])[0]
+        .requestContext;
+      expect(forwarded.get('tenantId')).toBe('tenant-123');
+      expect(getExecutionClaim(forwarded, runId)).toMatchObject({ executionId: expect.any(String) });
+      expect(getExecutionClaim(requestContext, runId)).toBeUndefined();
       expect(emitError).not.toHaveBeenCalled();
     } finally {
       cleanup();
     }
   });
 
-  it('deletes terminal snapshots from the native workflow lifecycle but preserves suspended runs', async () => {
-    const startAsync = vi.fn(async () => ({ status: 'success' }));
-    const createRun = vi.fn(async () => ({ start: startAsync }));
-    const deleteTerminalRunSnapshots = vi.fn(async () => undefined);
-    const emitError = vi.fn(async () => undefined);
+  it('deletes terminal snapshots once the segment settles a terminal status but preserves suspended runs', async () => {
+    // PF-5928 adaptation (upstream #26418/#26420): terminal writes are the
+    // segment's settlement, made only while its execution fence still owns
+    // the run, instead of the fork's workflow onFinish hook (which held no
+    // fence). The hook keeps pin bookkeeping only. Suspended runs keep their
+    // snapshots, and a failing delete never suppresses the ERROR event.
+    const statuses: Record<string, { status: string; error?: { message: string } }> = {
+      'evented-suspended-run': { status: 'suspended' },
+      'evented-success-run': { status: 'success' },
+      'evented-failed-run': { status: 'failed', error: { message: 'Workflow execution failed' } },
+    };
+    const createRun = vi.fn(async ({ runId }: { runId: string }) => ({ start: vi.fn(async () => statuses[runId]) }));
+    const deleteTerminalRunSnapshots = vi.fn(async (_runId: string) => undefined);
+    const emitError = vi.fn(async (_runId: string, _error: Error) => undefined);
     const pubsub = new EventEmitterPubSub();
     pubsubs.push(pubsub);
     const baseAgent = new Agent({
@@ -120,19 +138,40 @@ describe('EventedAgent requestContext forwarding', () => {
       }
     })({ agent: baseAgent, pubsub });
 
-    const { runId, cleanup } = await eventedAgent.stream('Finish', { runId: 'evented-terminal-run' });
+    const suspended = await eventedAgent.stream('Suspend', { runId: 'evented-suspended-run' });
     try {
-      await vi.waitFor(() => expect(startAsync).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(createRun).toHaveBeenCalledTimes(1));
+      await eventedAgent.finish({ runId: suspended.runId, status: 'suspended' });
+      // The lifecycle hook alone never deletes, even for a terminal status.
+      await eventedAgent.finish({ runId: suspended.runId, status: 'success' });
+      await new Promise(resolve => setTimeout(resolve, 20));
       expect(deleteTerminalRunSnapshots).not.toHaveBeenCalled();
-      await eventedAgent.finish({ runId, status: 'suspended' });
-      expect(deleteTerminalRunSnapshots).not.toHaveBeenCalled();
-      await eventedAgent.finish({ runId, status: 'success' });
-      expect(deleteTerminalRunSnapshots).toHaveBeenCalledWith(runId);
-      deleteTerminalRunSnapshots.mockRejectedValueOnce(new Error('storage unavailable'));
-      await eventedAgent.finish({ runId, status: 'failed' });
-      expect(emitError).toHaveBeenCalledWith(runId, expect.objectContaining({ message: 'Workflow execution failed' }));
     } finally {
-      cleanup();
+      suspended.cleanup();
+    }
+
+    const succeeded = await eventedAgent.stream('Finish', { runId: 'evented-success-run' });
+    try {
+      await vi.waitFor(() => expect(deleteTerminalRunSnapshots).toHaveBeenCalledWith(succeeded.runId));
+      expect(deleteTerminalRunSnapshots).toHaveBeenCalledTimes(1);
+      expect(emitError).not.toHaveBeenCalled();
+    } finally {
+      succeeded.cleanup();
+    }
+
+    deleteTerminalRunSnapshots.mockRejectedValueOnce(new Error('storage unavailable'));
+    const failed = await eventedAgent.stream('Fail', { runId: 'evented-failed-run' });
+    try {
+      await vi.waitFor(() =>
+        expect(emitError).toHaveBeenCalledWith(
+          failed.runId,
+          expect.objectContaining({ message: 'Workflow execution failed' }),
+        ),
+      );
+      await vi.waitFor(() => expect(deleteTerminalRunSnapshots).toHaveBeenCalledWith(failed.runId));
+      expect(emitError).toHaveBeenCalledTimes(1);
+    } finally {
+      failed.cleanup();
     }
   });
 

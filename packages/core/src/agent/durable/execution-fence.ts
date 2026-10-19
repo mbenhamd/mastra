@@ -622,6 +622,16 @@ export class ExecutionFence implements RunFenceScope {
     return this.#lossError !== undefined;
   }
 
+  /**
+   * Fork (PF-5928): whether this execution has begun settling. A settled
+   * execution left its run in a state it owns (for example parked on a
+   * suspension), so its registry binding is still live even though it is no
+   * longer this process's active fence for the run.
+   */
+  isSettled(): boolean {
+    return this.#settlement !== undefined;
+  }
+
   /** Throw the loss error once this execution lost the run. Checks local state only. */
   throwIfLost(): void {
     if (this.#lossError) throw this.#lossError;
