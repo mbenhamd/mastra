@@ -126,6 +126,8 @@ import {
   classifyWorkflowSnapshotThreadErasure,
   classifyWorkflowTerminalEnvelopeThreadErasure,
   isWorkflowSnapshotThreadErasureContentFree,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS,
+  workflowRunThreadErasureSharedRunIds,
 } from '../../workflow-snapshot-handoff';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
@@ -2554,11 +2556,23 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         classifyWorkflowTerminalEnvelopeThreadErasure(cloneRunData(record.envelope), threadId),
       );
     }
+    // The resource's canonical snapshots by run id, for `sharesRunIdWith`.
+    const workflowNamesByRunId = new Map<string, string[]>();
+    for (const run of this.db.workflows.values()) {
+      if (run.resourceId !== resourceId) continue;
+      const names = workflowNamesByRunId.get(run.run_id) ?? [];
+      names.push(run.workflow_name);
+      workflowNamesByRunId.set(run.run_id, names);
+    }
+    const loopInfo = (workflowName: string, runId: string) => ({
+      loopInternal: WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS.includes(workflowName),
+      sharesRunIdWith: workflowRunThreadErasureSharedRunIds(workflowName, workflowNamesByRunId.get(runId) ?? []),
+    });
     const matches: WorkflowRunThreadErasureEntry[] = [];
     for (const candidate of candidates.values()) {
       const { workflowName, runId, rows } = candidate;
       if (candidate.matched) {
-        matches.push({ workflowName, runId, attribution: 'thread', rows });
+        matches.push({ workflowName, runId, attribution: 'thread', rows, ...loopInfo(workflowName, runId) });
       } else if (includeUnattributed && !candidate.anyThread && candidate.canonical) {
         const { snapshot, createdAt, updatedAt } = candidate.canonical;
         const statusField =
@@ -2571,6 +2585,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
           runId,
           attribution: 'unattributed',
           rows,
+          ...loopInfo(workflowName, runId),
           ...(typeof status === 'string' ? { status } : {}),
           createdAt,
           updatedAt,

@@ -426,6 +426,40 @@ const TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
 ];
 
 /**
+ * The framework's own agent-loop workflows. A thread erasure entry reports
+ * `loopInternal: true` only for these names (literals, so storage does not
+ * import the loop modules; a test pins them to their source constants):
+ * - `agentic-loop`: `AGENTIC_LOOP_WORKFLOW_ID` (loop/loop-builder.ts), the
+ *   agent loop (loop/workflows/agentic-loop/index.ts);
+ * - `executionWorkflow`: `AGENTIC_EXECUTION_WORKFLOW_ID` (loop/loop-builder.ts),
+ *   the loop's nested per-iteration run, which shares the parent's run id;
+ * - `durable-agentic-loop` and `durable-agentic-execution`:
+ *   `DurableStepIds.AGENTIC_LOOP` / `DurableStepIds.AGENTIC_EXECUTION`
+ *   (agent/durable/constants.ts), the durable agent's loop and iteration
+ *   workflows (agent/durable/workflows/durable-loop-builder.ts).
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS: readonly string[] = Object.freeze([
+  'agentic-loop',
+  'executionWorkflow',
+  'durable-agentic-loop',
+  'durable-agentic-execution',
+]);
+
+/** The most workflow names a thread erasure entry lists in `sharesRunIdWith`. */
+export const WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT = 16;
+
+/**
+ * The other workflow names that hold a canonical snapshot of the same run id,
+ * in code-point order and capped at {@link WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT}.
+ */
+export function workflowRunThreadErasureSharedRunIds(workflowName: string, workflowNames: Iterable<string>): string[] {
+  return [...new Set(workflowNames)]
+    .filter(name => name !== workflowName)
+    .sort(compareWorkflowSnapshotHandoffText)
+    .slice(0, WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT);
+}
+
+/**
  * The agent network's workflows (`loop/network`), which persist only when
  * suspended and record the conversation thread in their input
  * (`context.input.threadId`). A snapshot row's workflow name is a column,

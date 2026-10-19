@@ -146,6 +146,16 @@ The `pending` snapshot that `createRun` stores before a run starts records no th
 
 A nested run's `pending` snapshot whose `context.input` holds the parent step's payload isn't content-free. An unattributed run may belong to another thread's turn that's still starting, so don't erase it as the thread's run without other evidence, such as its age. The listing itself never changes anything.
 
+Every entry also carries:
+
+- `loopInternal`: `true` only for the framework's own agent loop workflows (`agentic-loop`, its nested `executionWorkflow`, `durable-agentic-loop` and `durable-agentic-execution`, exported as `WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS`). User workflows are `false`.
+- `sharesRunIdWith`: the other workflow names of the resource whose canonical snapshot uses the same run ID, in code-point order, at most 16. An `agentic-loop` parent and its `executionWorkflow` child list each other.
+
+The intended rule for unattributed runs:
+
+- A `loopInternal` run that is `pending`, in the same resource and older than the longest turn lease plus a margin is left over from a crashed turn. Erase it with `deleteWorkflowRunClosure` whatever `contentFree` says. The `executionWorkflow` child of a crashed turn keeps the previous iteration's output, so it isn't content-free.
+- Erase any other unattributed run only when it's `pending`, `contentFree`, in the same resource and older than that lease plus a margin.
+
 ## Availability
 
 The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1`, `closureCancelVersion: 1` and `threadErasureListVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.

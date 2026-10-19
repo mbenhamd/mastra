@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { DurableStepIds } from '../../../agent/durable/constants';
+import { AGENTIC_EXECUTION_WORKFLOW_ID, AGENTIC_LOOP_WORKFLOW_ID } from '../../../loop/loop-builder';
 import type { WorkflowRunState } from '../../../workflows';
 import { createWorkflowTerminalGraphFingerprint } from '../../../workflows/terminal-continuation';
 import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
+import { WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS } from '../../workflow-snapshot-handoff';
 import { InMemoryDB } from '../inmemory-db';
 import { WorkflowsInMemory } from './inmemory';
 
@@ -101,6 +104,17 @@ async function persist(workflows: WorkflowsInMemory, run: Run, snapshot: Workflo
 }
 
 describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
+  it('names the loop workflows by their source constants', () => {
+    expect([...WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS].sort()).toEqual(
+      [
+        AGENTIC_LOOP_WORKFLOW_ID,
+        AGENTIC_EXECUTION_WORKFLOW_ID,
+        DurableStepIds.AGENTIC_LOOP,
+        DurableStepIds.AGENTIC_EXECUTION,
+      ].sort(),
+    );
+  });
+
   it('advertises the capability', () => {
     const { workflows } = setup();
     expect(workflows.getWorkflowSnapshotHandoffCapabilities().threadErasureListVersion).toBe(1);
@@ -159,7 +173,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       threadId: THREAD,
       limit: 100,
     });
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       status: 'listed',
       runs: [
         { ...runs.pendingLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
@@ -174,7 +188,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     // The other resource's run is listed only under its own resource.
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: OTHER_RESOURCE, threadId: THREAD, limit: 100 }),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       status: 'listed',
       runs: [{ workflowName: 'agentic-loop', runId: 'h-cross', attribution: 'thread', rows: SNAPSHOT_ONLY }],
       hasMore: false,
@@ -244,7 +258,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       ['e-context', 'unattributed'],
       ['e2-date', 'unattributed'],
     ]);
-    expect(result.runs[0]).toEqual({
+    expect(result.runs[0]).toMatchObject({
       workflowName: 'agentic-loop',
       runId: 'a-bare',
       attribution: 'unattributed',
@@ -430,7 +444,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
 
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: RESOURCE, threadId: THREAD, limit: 10 }),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       status: 'listed',
       runs: [
         { ...resultOnly, attribution: 'thread', rows: SNAPSHOT_ONLY },
@@ -493,7 +507,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
 
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: RESOURCE, threadId: THREAD, limit: 10 }),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       status: 'listed',
       runs: ['a-foreach-array', 'b-foreach-object', 'c-foreach-output'].map(runId => ({
         workflowName: 'agentic-loop',
@@ -615,6 +629,77 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       ['e-string-root', 'thread', null, null],
       // A non-object root is never content-free and has no status.
       ['f-array-root', 'unattributed', false, null],
+    ]);
+  });
+
+  it('marks the framework loop rows of a crashed turn and the run ids they share', async () => {
+    const { workflows } = setup();
+    const turn = 'turn-1';
+    const userTurn = 'turn-2';
+    // A crashed non-durable turn: the agentic-loop parent's createRun shell and
+    // its nested executionWorkflow child under the same run id, whose input is
+    // the pruned output of the previous iteration (no thread id anywhere).
+    const priorIteration = {
+      messageId: 'm1',
+      messages: { all: [], user: [], nonUser: [] },
+      output: {
+        text: 'Here is the summary you asked for.',
+        toolResults: [{ toolCallId: 'call-1', toolName: 'search', result: { hits: 3 } }],
+        steps: [],
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      },
+      metadata: {},
+      stepResult: { reason: 'tool-calls', warnings: [], isContinued: true },
+    };
+    const child = (runId: string) =>
+      ({
+        ...createEmptyWorkflowSnapshot(runId),
+        status: 'pending',
+        context: { input: priorIteration },
+      }) as WorkflowRunState;
+    await persist(workflows, { workflowName: 'agentic-loop', runId: turn }, createEmptyWorkflowSnapshot(turn));
+    await persist(workflows, { workflowName: 'executionWorkflow', runId: turn }, child(turn));
+    // A user workflow with the same shape is not loop-internal.
+    await persist(workflows, { workflowName: 'research-workflow', runId: userTurn }, child(userTurn));
+
+    const result = await workflows.listWorkflowRunsByThreadForErasure({
+      resourceId: RESOURCE,
+      threadId: THREAD,
+      limit: 10,
+      includeUnattributed: true,
+    });
+    expect(result.status).toBe('listed');
+    if (result.status !== 'listed') return;
+    expect(
+      result.runs.map(run => ({
+        workflowName: run.workflowName,
+        attribution: run.attribution,
+        loopInternal: run.loopInternal,
+        sharesRunIdWith: run.sharesRunIdWith,
+        contentFree: run.attribution === 'unattributed' ? run.contentFree : undefined,
+      })),
+    ).toEqual([
+      {
+        workflowName: 'agentic-loop',
+        attribution: 'unattributed',
+        loopInternal: true,
+        sharesRunIdWith: ['executionWorkflow'],
+        contentFree: true,
+      },
+      {
+        workflowName: 'executionWorkflow',
+        attribution: 'unattributed',
+        loopInternal: true,
+        sharesRunIdWith: ['agentic-loop'],
+        contentFree: false,
+      },
+      {
+        workflowName: 'research-workflow',
+        attribution: 'unattributed',
+        loopInternal: false,
+        sharesRunIdWith: [],
+        contentFree: false,
+      },
     ]);
   });
 

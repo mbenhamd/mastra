@@ -452,8 +452,28 @@ export interface WorkflowRunThreadErasureRows {
   terminalSnapshot: WorkflowRunThreadErasureRowAttribution;
 }
 
+/**
+ * Fields every thread erasure entry carries about the run's place in the
+ * framework's agent loops. Informational only: the listing applies no policy.
+ */
+export interface WorkflowRunThreadErasureLoopInfo {
+  /**
+   * True only when `workflowName` is one of the framework's own agent-loop
+   * workflows (`WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS`). Every row
+   * of the entry belongs to that workflow. User workflows are false.
+   */
+  loopInternal: boolean;
+  /**
+   * The other workflow names of the same resource whose canonical snapshot
+   * uses the same `runId` (an agentic-loop parent and its `executionWorkflow`
+   * child share one), in code-point order, at most
+   * `WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT` names.
+   */
+  sharesRunIdWith: string[];
+}
+
 /** A run with at least one row (canonical snapshot, handoff snapshot or terminal envelope) that records the thread id. */
-export interface WorkflowRunThreadErasureThreadEntry {
+export interface WorkflowRunThreadErasureThreadEntry extends WorkflowRunThreadErasureLoopInfo {
   workflowName: string;
   runId: string;
   attribution: 'thread';
@@ -462,12 +482,18 @@ export interface WorkflowRunThreadErasureThreadEntry {
 
 /**
  * A run of the resource with a canonical snapshot, none of whose rows records
- * any thread id (listed only with `includeUnattributed`). The listing never erases it; the fields
- * below let a caller decide, from the same read, whether its own policy lets
- * it erase the run (for example: `pending`, `contentFree`, older than the
- * longest turn lease, and erased through `deleteWorkflowRunClosure`).
+ * any thread id (listed only with `includeUnattributed`). The listing never
+ * erases it; the fields below let a caller decide, from the same read,
+ * whether its own policy lets it erase the run. The intended rules:
+ * - a `loopInternal` run that is `pending`, in the same resource and older
+ *   than the longest turn lease plus a margin is the leftover of a crashed
+ *   turn (for example the `agentic-loop` parent and its `executionWorkflow`
+ *   child listed in each other's `sharesRunIdWith`) and can be erased through
+ *   `deleteWorkflowRunClosure` whatever `contentFree` says;
+ * - any other run is erased only when it is `pending`, `contentFree`, in the
+ *   same resource and older than that lease plus margin.
  */
-export interface WorkflowRunThreadErasureUnattributedEntry {
+export interface WorkflowRunThreadErasureUnattributedEntry extends WorkflowRunThreadErasureLoopInfo {
   workflowName: string;
   runId: string;
   attribution: 'unattributed';

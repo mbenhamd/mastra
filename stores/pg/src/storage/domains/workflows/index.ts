@@ -86,6 +86,8 @@ import {
   WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS,
+  WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT,
   WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
   WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
   createEmptyWorkflowSnapshot,
@@ -6346,6 +6348,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       updatedAt: Date | string | null;
       updatedAtZ: Date | string | null;
       snapshot_content_free: boolean;
+      shares_run_id_with: string[];
     }>;
     try {
       const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
@@ -6390,8 +6393,12 @@ export class WorkflowsPG extends WorkflowsStorage {
       // row's thread match is one jsonb_path_exists with the thread id bound
       // as a jsonpath variable (never interpolated). Each branch reads its
       // table's resource index; the run is attributed by all of its rows.
+      // The page's runs, then (in the same statement, so the same snapshot of
+      // the data) the other workflow names holding a canonical snapshot of
+      // each run id under the resource, from one resource-index scan.
       rows = await this.#db.client.any(
-        `SELECT workflow_name COLLATE "C" AS workflow_name, run_id COLLATE "C" AS run_id,
+        `WITH page AS (
+         SELECT workflow_name COLLATE "C" AS workflow_name, run_id COLLATE "C" AS run_id,
                 bool_or(matched) AS matched,
                 bool_or(any_thread) AS any_thread,
                 max(row_attribution) FILTER (WHERE kind = 'snapshot') AS snapshot_row,
@@ -6443,7 +6450,21 @@ export class WorkflowsPG extends WorkflowsStorage {
          HAVING bool_or(matched)
              OR ($7::boolean AND bool_or(kind = 'snapshot') AND NOT bool_or(any_thread))
          ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
-         LIMIT ${limitParam}`,
+         LIMIT ${limitParam}
+         ), siblings AS (
+           SELECT sibling.run_id COLLATE "C" AS run_id, sibling.workflow_name COLLATE "C" AS workflow_name
+           FROM ${this.workflowSnapshotTableName()} AS sibling
+           WHERE sibling."resourceId" = $1 AND sibling.run_id IN (SELECT page.run_id FROM page)
+         )
+         SELECT page.*,
+                ARRAY(
+                  SELECT siblings.workflow_name FROM siblings
+                  WHERE siblings.run_id = page.run_id AND siblings.workflow_name <> page.workflow_name
+                  ORDER BY siblings.workflow_name COLLATE "C"
+                  LIMIT ${WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT}
+                ) AS shares_run_id_with
+         FROM page
+         ORDER BY page.workflow_name COLLATE "C", page.run_id COLLATE "C"`,
         values,
       );
     } catch (error) {
@@ -6462,14 +6483,25 @@ export class WorkflowsPG extends WorkflowsStorage {
         handoff: rowAttribution(row.handoff_row),
         terminalSnapshot: rowAttribution(row.terminal_snapshot_row),
       };
+      const loopInfo = {
+        loopInternal: WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS.includes(row.workflow_name),
+        sharesRunIdWith: [...row.shares_run_id_with],
+      };
       if (row.matched) {
-        return { workflowName: row.workflow_name, runId: row.run_id, attribution: 'thread', rows: recorded };
+        return {
+          workflowName: row.workflow_name,
+          runId: row.run_id,
+          attribution: 'thread',
+          rows: recorded,
+          ...loopInfo,
+        };
       }
       return {
         workflowName: row.workflow_name,
         runId: row.run_id,
         attribution: 'unattributed',
         rows: recorded,
+        ...loopInfo,
         ...(row.status === null ? {} : { status: row.status }),
         createdAt: new Date((row.createdAtZ || row.createdAt) as Date | string),
         updatedAt: new Date((row.updatedAtZ || row.updatedAt) as Date | string),

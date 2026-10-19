@@ -150,7 +150,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
 
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: resource, threadId: THREAD, limit: 100 }),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       status: 'listed',
       runs: [
         { ...runs.pendingLoopStart, attribution: 'thread', rows: SNAPSHOT_ONLY },
@@ -164,7 +164,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     });
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: otherResource, threadId: THREAD, limit: 100 }),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       status: 'listed',
       runs: [{ workflowName: LOOP, runId: 'h-cross', attribution: 'thread', rows: SNAPSHOT_ONLY }],
       hasMore: false,
@@ -393,7 +393,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
 
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: resource, threadId: THREAD, limit: 10 }),
-    ).resolves.toEqual({
+    ).resolves.toMatchObject({
       status: 'listed',
       runs: ['a-foreach-array', 'b-foreach-object', 'c-foreach-output'].map(runId => ({
         workflowName: LOOP,
@@ -512,6 +512,77 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
       ['e-string-root', 'thread', null, null],
       // A non-object root is never content-free and has no status.
       ['f-array-root', 'unattributed', false, null],
+    ]);
+  });
+
+  it('marks the framework loop rows of a crashed turn and the run ids they share', async () => {
+    const resource = newResource();
+    const turn = `turn-${randomUUID()}`;
+    const userTurn = `turn-${randomUUID()}`;
+    // A crashed non-durable turn: the agentic-loop parent's createRun shell and
+    // its nested executionWorkflow child under the same run id, whose input is
+    // the pruned output of the previous iteration (no thread id anywhere).
+    const priorIteration = {
+      messageId: 'm1',
+      messages: { all: [], user: [], nonUser: [] },
+      output: {
+        text: 'Here is the summary you asked for.',
+        toolResults: [{ toolCallId: 'call-1', toolName: 'search', result: { hits: 3 } }],
+        steps: [],
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      },
+      metadata: {},
+      stepResult: { reason: 'tool-calls', warnings: [], isContinued: true },
+    };
+    const child = (runId: string) =>
+      ({
+        ...createEmptyWorkflowSnapshot(runId),
+        status: 'pending',
+        context: { input: priorIteration },
+      }) as WorkflowRunState;
+    await persist(resource, { workflowName: 'agentic-loop', runId: turn }, createEmptyWorkflowSnapshot(turn));
+    await persist(resource, { workflowName: 'executionWorkflow', runId: turn }, child(turn));
+    // A user workflow with the same shape is not loop-internal.
+    await persist(resource, { workflowName: 'research-workflow', runId: userTurn }, child(userTurn));
+
+    const result = await workflows.listWorkflowRunsByThreadForErasure({
+      resourceId: resource,
+      threadId: THREAD,
+      limit: 10,
+      includeUnattributed: true,
+    });
+    expect(result.status).toBe('listed');
+    if (result.status !== 'listed') return;
+    expect(
+      result.runs.map(run => ({
+        workflowName: run.workflowName,
+        attribution: run.attribution,
+        loopInternal: run.loopInternal,
+        sharesRunIdWith: run.sharesRunIdWith,
+        contentFree: run.attribution === 'unattributed' ? run.contentFree : undefined,
+      })),
+    ).toEqual([
+      {
+        workflowName: 'agentic-loop',
+        attribution: 'unattributed',
+        loopInternal: true,
+        sharesRunIdWith: ['executionWorkflow'],
+        contentFree: true,
+      },
+      {
+        workflowName: 'executionWorkflow',
+        attribution: 'unattributed',
+        loopInternal: true,
+        sharesRunIdWith: ['agentic-loop'],
+        contentFree: false,
+      },
+      {
+        workflowName: 'research-workflow',
+        attribution: 'unattributed',
+        loopInternal: false,
+        sharesRunIdWith: [],
+        contentFree: false,
+      },
     ]);
   });
 
