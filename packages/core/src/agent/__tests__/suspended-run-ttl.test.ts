@@ -470,9 +470,7 @@ describe('suspended run in-memory TTL', () => {
         await vi.waitFor(() =>
           expect(runtime.getActiveThreadRunId({ threadId: 'thread-1', resourceId: RESOURCE_ID }, pubsub)).toBe('run-1'),
         );
-        // PapersFlow fork: a delivery to a remote active run reports the signal's own admission
-        // run id; the forwarded signal-enqueued event below is what targets run-1.
-        await expect(sendToThread(agent)).resolves.toMatchObject({ action: 'deliver' });
+        await expect(sendToThread(agent)).resolves.toEqual({ action: 'deliver', runId: 'run-1' });
         await watcher.waitFor('signal-enqueued', 'run-1');
         expect(stream).not.toHaveBeenCalled();
       } finally {

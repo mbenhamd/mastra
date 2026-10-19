@@ -10517,9 +10517,15 @@ export class AgentThreadStreamRuntime {
           // id so early follow-ups still attach to the run that is starting — but only when
           // the reservation belongs to this agent or the caller explicitly opted in
           // (an unrelated agent's idle wake must not silently join a foreign reservation).
+          // A run another instance registered for this same agent is not a foreign
+          // reservation: it already made its model requests (upstream #27389 forwards to it).
+          const registeredRemoteSameAgent =
+            state.threadKeysByRunId.get(activeRunId) !== key &&
+            state.remoteAgentIdsByRunId.get(activeRunId) === agent.id;
           if (
             !target.ifIdle ||
             reservedAgentId === agent.id ||
+            registeredRemoteSameAgent ||
             Boolean((target.ifIdle as { _attachToReservedRun?: unknown })._attachToReservedRun)
           ) {
             runId = activeRunId;
