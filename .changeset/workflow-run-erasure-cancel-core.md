@@ -7,7 +7,7 @@ Added `cancelWorkflowRunForErasure` to workflow storage. It settles a run that w
 ```ts
 if (workflows.getWorkflowSnapshotHandoffCapabilities().closureCancelVersion === 1) {
   const result = await workflows.cancelWorkflowRunForErasure({ workflowName, runId, expectedResourceId: resourceId });
-  // 'cancelled': erase the closure next. 'journaled' | 'active' | 'fenced': leave it to its owner and retry later.
+  // 'cancelled' | 'settled': erase the closure next. 'journaled' | 'active' | 'fenced': leave it to its owner and retry later.
 }
 ```
 
@@ -22,4 +22,4 @@ if (workflows.getWorkflowSnapshotHandoffCapabilities().closureCancelVersion === 
   - `cancelled`;
   - `unsupported`, from adapters without the capability.
 - **Capability.** Adapters report `closureCancelVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. The in-memory store supports it, and the base class answers `unsupported`.
-- **In-memory erasure fence.** After `cancelled` or `settled`, a write that would reopen the run throws `WorkflowStaleSnapshotPersistError`. `persistWorkflowStepUpdate` returns `finalized` instead. Writes with the same status still work, and deleting the closure frees the run ID for reuse.
+- **In-memory erasure fence.** After `cancelled` or `settled`, a write that would reopen the run throws `WorkflowStaleSnapshotPersistError`. `persistWorkflowStepUpdate` returns `finalized` instead. Writes with the same status still work, except `bindWorkflowNestedRunOwnership`, which always returns `missing_run`, so no new nested child starts. Deleting the closure frees the run ID for reuse.
