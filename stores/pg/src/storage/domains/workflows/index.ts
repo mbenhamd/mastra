@@ -6322,6 +6322,15 @@ export class WorkflowsPG extends WorkflowsStorage {
     try {
       const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
       const snapshotJson = this.workflowSnapshotJsonbExpression(snapshotColumnType, 'snapshot.snapshot');
+      // A legacy snapshot table may predate the timezone-aware mirror columns.
+      const [hasCreatedAtZ, hasUpdatedAtZ] = await Promise.all([
+        this.#db.hasColumn(TABLE_WORKFLOW_SNAPSHOT, 'createdAtZ'),
+        this.#db.hasColumn(TABLE_WORKFLOW_SNAPSHOT, 'updatedAtZ'),
+      ]);
+      const timestampZ = (column: 'createdAtZ' | 'updatedAtZ') =>
+        (column === 'createdAtZ' ? hasCreatedAtZ : hasUpdatedAtZ)
+          ? `snapshot."${column}"`
+          : `NULL::timestamptz AS "${column}"`;
       const emptyOrNull = (expression: string) =>
         `(${expression} IS NULL OR ${expression} = 'null'::jsonb OR ${expression} = '{}'::jsonb)`;
       // A row's thread match is one jsonb_path_exists over the whole snapshot,
@@ -6338,7 +6347,7 @@ export class WorkflowsPG extends WorkflowsStorage {
                       AND ${emptyOrNull(`snapshot_json -> 'context' -> 'input'`)}))) AS content_free
          FROM (
            SELECT snapshot.workflow_name COLLATE "C" AS workflow_name, snapshot.run_id COLLATE "C" AS run_id,
-                  snapshot."createdAt", snapshot."createdAtZ", snapshot."updatedAt", snapshot."updatedAtZ",
+                  snapshot."createdAt", ${timestampZ('createdAtZ')}, snapshot."updatedAt", ${timestampZ('updatedAtZ')},
                   snapshot_json, snapshot_json ->> 'status' AS status,
                   jsonb_path_exists(snapshot_json, $3::jsonpath, jsonb_build_object('t', $2::text)) AS matched
            FROM ${this.workflowSnapshotTableName()} AS snapshot
