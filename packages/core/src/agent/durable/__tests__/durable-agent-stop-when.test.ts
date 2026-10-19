@@ -116,12 +116,25 @@ function createStepTool(onCommit: () => void) {
   });
 }
 
+// PF-5928 adaptation (fork plain-loop failure contract; PF-6047): a failed plain-loop run ends
+// with an `error` chunk on the wire and a clean close, which Harness relies on to classify the
+// run as failed (harness/v1/session.ts `_handleRunTerminal`: "its stream emitted an `error`
+// chunk ... marks the output failed"). Durable and evented reject the stream instead (upstream
+// #26921). Both report the same error; only the wire shape differs.
+const THROWING_STOP_WHEN_REASON =
+  'PF-6047: the plain loop surfaces a failed run as an error chunk and a clean close; wrapped engines reject the stream (#26921).';
+const THROWING_STOP_WHEN_DIFFERENCES = {
+  durable: { reason: THROWING_STOP_WHEN_REASON, ignore: ['chunks', 'chunkTypes', 'chunkPayloads'] },
+  evented: { reason: THROWING_STOP_WHEN_REASON, ignore: ['chunks', 'chunkTypes', 'chunkPayloads'] },
+} satisfies Parameters<typeof expectEngineParity>[0]['differences'];
+
 /** Runs one T23 variant across the three engines, recording commits and predicate calls per engine. */
 async function runT23(variant: Variant) {
   const commits = new Map<ParityEngine, number>();
   const calls = new Map<ParityEngine, Array<{ name: string; steps: number }>>();
 
   const results = await expectEngineParity({
+    ...(variant === 'throws' ? { differences: THROWING_STOP_WHEN_DIFFERENCES } : {}),
     model: script,
     buildAgent: ({ engine, model }) => {
       commits.set(engine, 0);
@@ -194,9 +207,12 @@ describe('T23 stopWhen (plain, durable, evented)', () => {
       expect(calls.get(engine)!.length, `${engine}: the throwing predicate was consulted`).toBeGreaterThanOrEqual(1);
       expect(requests, `${engine}: modelCalls`).toHaveLength(1);
       expect(commits.get(engine), `${engine}: commits`).toBe(1);
-      expect(turn.chunkTypes, `${engine}: chunks`).toEqual(['start', 'step-start', 'tool-call', 'tool-result']);
+      const wireError = engine === 'plain' ? ['error'] : [];
+      expect(turn.chunkTypes, `${engine}: chunks`).toEqual(['start', 'step-start', 'tool-call', 'tool-result', ...wireError]);
       expect(chunksOfType(turn, 'finish'), `${engine}: finish`).toBe(0);
-      expect(errorMessages(turn), `${engine}: no error chunk on the wire`).toEqual([]);
+      expect(errorMessages(turn), `${engine}: error chunk on the wire (plain only, PF-6047)`).toEqual(
+        engine === 'plain' ? ['T23 stopWhen failure'] : [],
+      );
       expect(turn.finishChunk.payloadKeys, `${engine}: finishReason`).toEqual([]);
       expect(turn.error, `${engine}: threw`).toEqual({ name: 'Error', message: 'T23 stopWhen failure' });
       expect((turn.chunkPayloads[3] as { result?: unknown }).result, `${engine}: tool result`).toEqual({ done: 1 });

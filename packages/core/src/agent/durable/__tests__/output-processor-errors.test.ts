@@ -114,16 +114,22 @@ describe('durable output processor errors', () => {
 
     const output = await agent.stream('Say hello');
     let streamError: unknown;
+    const chunks: Array<{ type: string; payload?: any }> = [];
     try {
-      for await (const _chunk of output.fullStream) {
-        // drain
+      for await (const chunk of output.fullStream) {
+        chunks.push(chunk as { type: string; payload?: any });
       }
     } catch (error) {
       streamError = error;
     }
 
-    expect(streamError).toBeInstanceOf(Error);
-    expect((streamError as Error).message).toContain('threw on step-finish');
+    // PF-5928 adaptation (fork plain-loop failure contract; PF-6047): the plain loop surfaces the
+    // failed run as an `error` chunk and closes the stream, which Harness relies on to classify
+    // the run as failed; upstream rejects `fullStream` instead. The output promises reject with
+    // the processor's error either way.
+    expect(streamError).toBeUndefined();
+    const errorChunk = chunks.find(chunk => chunk.type === 'error');
+    expect(String(errorChunk?.payload?.error?.message ?? errorChunk?.payload?.error)).toContain('threw on step-finish');
     await expect(output.text).rejects.toThrow('threw on step-finish');
     await expect(output.finishReason).rejects.toThrow('threw on step-finish');
   });
