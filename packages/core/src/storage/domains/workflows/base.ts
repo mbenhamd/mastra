@@ -65,6 +65,8 @@ import type {
   ListWorkflowSnapshotHandoffsResult,
   DeleteWorkflowRunClosureInput,
   DeleteWorkflowRunClosureResult,
+  CancelWorkflowRunForErasureInput,
+  CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
   WorkflowExecutionState,
@@ -142,6 +144,17 @@ export abstract class WorkflowsStorage extends StorageDomain {
    * `closureDeleteVersion: 1`.
    */
   async deleteWorkflowRunClosure(_input: DeleteWorkflowRunClosureInput): Promise<DeleteWorkflowRunClosureResult> {
+    return { status: 'unsupported' };
+  }
+
+  /**
+   * Overwrites an unsettled run's snapshot with an empty `canceled` one,
+   * atomically refusing a journaled run or one a nested child still needs.
+   * Adapters implementing this advertise `closureCancelVersion: 1`.
+   */
+  async cancelWorkflowRunForErasure(
+    _input: CancelWorkflowRunForErasureInput,
+  ): Promise<CancelWorkflowRunForErasureResult> {
     return { status: 'unsupported' };
   }
 

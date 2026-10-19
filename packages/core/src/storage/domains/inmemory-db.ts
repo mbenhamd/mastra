@@ -86,6 +86,12 @@ export interface WorkflowTerminalParentRevisionState {
    * A later claim of the erased run starts above it.
    */
   handoffClaimGenerationHwm?: number;
+  /**
+   * The `canceled` latch came from `cancelWorkflowRunForErasure`: snapshot
+   * writes that disagree with it are refused, as the PostgreSQL store's
+   * parent revision bump refuses them. Cleared with the latch.
+   */
+  erasureCancelled?: true;
 }
 
 class WorkflowTerminalDestinationReceiptMap extends Map<string, WorkflowTerminalDestinationReceiptRecord> {

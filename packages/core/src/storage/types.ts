@@ -126,6 +126,12 @@ export interface WorkflowSnapshotHandoffCapabilities {
    * `listWorkflowRunClosuresByResource`, backed by resource indexes.
    */
   closureDeleteVersion?: 1;
+  /**
+   * Atomic erasure cancel: `cancelWorkflowRunForErasure`, which overwrites an
+   * unsettled snapshot with an empty `canceled` one only when no journal and
+   * no pending nested dependent still needs it.
+   */
+  closureCancelVersion?: 1;
 }
 
 /** The canonical native snapshot state a handoff claim must compare under the parent lock. */
@@ -303,6 +309,58 @@ export type DeleteWorkflowRunClosureResult =
       removed: { snapshot: boolean; handoff: boolean; terminalRows: number };
     }
   | { status: 'missing' | 'resource_mismatch' | 'fenced' | 'active' | 'unsupported' };
+
+/**
+ * Settles a run that will never settle on its own (an erased account's agent
+ * loop suspended on a question, a run whose execution stopped) by overwriting
+ * its unsettled snapshot in place with an empty `canceled` snapshot under the
+ * same resource. The row stays, so `deleteWorkflowRunClosure` can then erase
+ * the closure. Every check and the write happen in one atomic step, under the
+ * same locks as `deleteWorkflowRunClosure`, so no journal or nested child can
+ * appear between them.
+ *
+ * Caller contract: the store has no executor lease or liveness check. A
+ * `running` run with no journal, no unreleased handoff and no pending nested
+ * dependent is cancelled even if an executor in another process is still
+ * running it; that executor's next generation-guarded persist then fails as
+ * stale and its work is discarded. `active` means a settlement or a nested
+ * dependent is in flight, not that an executor is running. Call this only for
+ * runs that will never settle on their own: their owner is gone and no
+ * executor can be admitted for them.
+ */
+export interface CancelWorkflowRunForErasureInput {
+  workflowName: string;
+  runId: string;
+  expectedResourceId: string;
+}
+
+/**
+ * Checked in this order. The run's snapshot changes only when the result is
+ * `cancelled`; a `settled` result on the in-memory store also arms the
+ * late-write fence that the PostgreSQL parent revision latch enforces, so a
+ * queued write cannot reopen the run before its closure is deleted:
+ * - `missing`: storage holds no snapshot for the run (nothing to anchor).
+ * - `resource_mismatch`: the snapshot, the handoff or the terminal snapshot
+ *   records another resource, or the snapshot records none.
+ * - `fenced`: an unreleased handoff fences the run's snapshot writes (the
+ *   same fence `persistWorkflowSnapshot` enforces). Retry after its release.
+ * - `journaled`: the run has a terminalization journal row (any phase). Its
+ *   owner settles the run; it is never overwritten.
+ * - `active`: a nested child run (linked by a parent effect or recovery
+ *   ancestry, whatever its resource) has not completed its terminal journal,
+ *   or a terminal status is latched on the run's parent revision that its
+ *   snapshot does not show yet. Retry later. (The in-memory store, which lets
+ *   an ordinary write reopen a settled run, cancels such a reopened run when
+ *   no journal or pending child remains.)
+ * - `settled`: the snapshot status is already settled; nothing to overwrite
+ *   (its later writes are refused as for `cancelled`).
+ * - `cancelled`: the snapshot is now an empty `canceled` snapshot, and the
+ *   parent revision moved as for any snapshot write.
+ * - `unsupported`: the adapter does not implement `closureCancelVersion: 1`.
+ */
+export type CancelWorkflowRunForErasureResult =
+  | { status: 'cancelled' }
+  | { status: 'missing' | 'resource_mismatch' | 'fenced' | 'journaled' | 'active' | 'settled' | 'unsupported' };
 
 /** Keyset position in `listWorkflowRunClosuresByResource`, ordered by code point. */
 export interface WorkflowRunClosureCursor {

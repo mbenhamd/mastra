@@ -1,6 +1,6 @@
 ---
 title: 'Reference: Workflow run closure | Storage'
-description: 'Find and erase everything storage keeps for a settled workflow run, by resource, on the in-memory and PostgreSQL workflow stores.'
+description: 'Find, settle and erase everything storage keeps for a workflow run, by resource, on the in-memory and PostgreSQL workflow stores.'
 packages:
   - '@mastra/core'
   - '@mastra/pg'
@@ -66,6 +66,42 @@ The run's content-free parent revision is kept as the run-id reuse fence, with t
 - A delayed `releaseWorkflowSnapshotHandoff` answers `missing` while the run has no handoff. Once the same run id is used again, its next handoff claim starts above the erased claims, so the delayed release answers `conflict`.
 - A delayed terminal recovery-ancestry write answers `missing_run` until the run id is used again.
 
+## `cancelWorkflowRunForErasure(input)`
+
+Settles a run that will never settle on its own, so its closure can be erased. For example, an erased account's agent loop may be suspended on a question, or a run's execution may have stopped. It overwrites the unsettled snapshot in place with an empty `canceled` snapshot under the same resource. The row stays, and a later `deleteWorkflowRunClosure` erases the closure.
+
+Input: `{ workflowName, runId, expectedResourceId }`.
+
+Returns: `Promise<CancelWorkflowRunForErasureResult>`. All checks and the write happen in one atomic step, under the same locks as `deleteWorkflowRunClosure`. A journal or nested child can't appear between a check and the write. The checks run in this order. Snapshot content changes only when the result is `cancelled`:
+
+- `missing`: storage holds no snapshot for the run.
+- `resource_mismatch`: the snapshot, handoff or terminal snapshot records another resource, or the snapshot records none.
+- `fenced`: an unreleased handoff, pending or completed, fences the run's snapshot writes. This is the same fence `persistWorkflowSnapshot` enforces.
+- `journaled`: the run has a terminalization journal, in any phase. Its owner settles the run, so the run is never overwritten.
+- `active`: retry later. Either a nested child run hasn't completed its terminal journal, or the run's parent revision latched a terminal status that its snapshot doesn't show yet. The nested child can be linked by a parent effect or by recovery ancestry, whatever its resource.
+- `settled`: the snapshot status is already settled and remains unchanged.
+- `cancelled`: the snapshot is now an empty `canceled` snapshot. The parent revision moved, and latched `canceled`, as for any snapshot write.
+- `unsupported`: the store doesn't implement the erasure cancel.
+
+A nested child admitted after the cancel finds its parent terminal and is refused.
+
+:::warning
+
+The store has no executor lease or liveness check. It cancels a `running` run that lacks a journal, an unreleased handoff and a pending nested child, even while an executor in another process still runs it. That executor's next generation-guarded persist then fails as stale, and its work is discarded. An `active` result reports a settlement or a nested child in flight. It says nothing about running executors. Call `cancelWorkflowRunForErasure` only for runs that will never settle on their own, whose owner is gone and for which no executor can be admitted.
+
+:::
+
+In the in-memory store, both `cancelled` and `settled` protect the selected run from writes that would reopen it. A `settled` selection keeps the stored snapshot and records its checked status as data. Later writes to the run are stored as plain data:
+
+- `persistWorkflowSnapshot`, `updateWorkflowState`, `updateWorkflowResults`, and resume admission, rollback and finalization throw `WorkflowStaleSnapshotPersistError` when the new status disagrees with the run's terminal status. Writes with the same status still succeed.
+- `bindWorkflowNestedRunOwnership` always returns `{ status: 'missing_run' }`, whatever status the snapshot would keep, so no new nested child starts on the run. The PostgreSQL store also returns `missing_run` for a run with a latched terminal status.
+- `persistWorkflowStepUpdate` doesn't throw. It returns `{ status: 'finalized', disposition }`, as it does for any terminal run.
+- An already settled run keeps its snapshot content.
+- Closure deletion removes this protection before the same run ID is used again.
+- Runs not selected for erasure keep their existing write behavior.
+
+The in-memory store also lets an ordinary write reopen a settled run, which the PostgreSQL store refuses. The erasure cancel treats such a reopened run, with no journal and no pending nested child, as unsettled and cancels it.
+
 ## `listWorkflowRunClosuresByResource(input)`
 
 Pages the runs that hold rows recorded under a resource.
@@ -79,6 +115,6 @@ Returns: `Promise<ListWorkflowRunClosuresByResourceResult>`:
 
 ## Availability
 
-The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
+The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1` and `closureCancelVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
 
 On PostgreSQL, the listing uses resource indexes on the snapshot, handoff and terminal snapshot tables, and the reuse fence uses the `handoff_claim_generation_hwm` column of `mastra_workflow_parent_revisions`. `init()` creates them. With an externally managed schema (`disableInit`), apply the statements from `exportSchemas()` before deploying. The `@mastra/pg` changelog lists them.

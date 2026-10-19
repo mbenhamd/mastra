@@ -79,6 +79,7 @@ import {
   validateWorkflowSnapshotHandoffLimit,
   validateWorkflowRunClosureIdentity,
   captureWorkflowRunClosureListInput,
+  createEmptyWorkflowSnapshot,
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
@@ -154,6 +155,8 @@ import type {
   ListWorkflowSnapshotHandoffsResult,
   DeleteWorkflowRunClosureInput,
   DeleteWorkflowRunClosureResult,
+  CancelWorkflowRunForErasureInput,
+  CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
   WorkflowRunClosureEntry,
@@ -466,7 +469,13 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1, closureDeleteVersion: 1 };
+    return {
+      handoffVersion: 1,
+      recoveryVersion: 1,
+      releaseVersion: 1,
+      closureDeleteVersion: 1,
+      closureCancelVersion: 1,
+    };
   }
 
   private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
@@ -5282,6 +5291,10 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (!revisionLock) {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
+        // A terminal parent (latched, as an erasure cancel latches `canceled`)
+        // admits no new nested child: the closure delete could not see a
+        // transient child bound now.
+        if (revisionLock.terminalStatus !== null) return { status: 'missing_run' };
         const revision = revisionLock.generation;
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
         const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
@@ -6084,6 +6097,96 @@ export class WorkflowsPG extends WorkflowsStorage {
       });
     } catch (error) {
       throw this.snapshotHandoffError('DELETE_WORKFLOW_RUN_CLOSURE', workflowName, runId, error);
+    }
+  }
+
+  async cancelWorkflowRunForErasure(
+    input: CancelWorkflowRunForErasureInput,
+  ): Promise<CancelWorkflowRunForErasureResult> {
+    const { workflowName, runId, expectedResourceId } = input;
+    validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    const identity = [workflowName, runId];
+    try {
+      return await this.#db.client.tx(async t => {
+        // The locks deleteWorkflowRunClosure takes, in its order: the terminal
+        // journal's advisory lock (journal writers take it before their row
+        // locks), the parent revision, the handoff row, the run snapshot, the
+        // journal row. A journal or a nested child admitted after these checks
+        // waits for this transaction.
+        await t.none(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [JSON.stringify(identity)]);
+        // First snapshot creation does not take the advisory lock. Linearize
+        // missing here, before reading revision evidence, without adding a lock.
+        const snapshotExists = await t.oneOrNone<{ present: boolean }>(
+          `SELECT TRUE AS present FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2`,
+          identity,
+        );
+        if (!snapshotExists) return { status: 'missing' };
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        const handoff = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
+        const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
+        const snapshot = await t.oneOrNone<{ resource_id: string | null; status: string | null }>(
+          `SELECT "resourceId" AS resource_id,
+                  ${this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot')} AS status
+           FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        if (!snapshot) return { status: 'missing' };
+        const journal = await t.oneOrNone<{ present: boolean }>(
+          `SELECT TRUE AS present FROM ${this.terminalizationTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const terminalSnapshot = await t.oneOrNone<{ resource_id: string | null }>(
+          `SELECT resource_id FROM ${this.terminalSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+
+        const owners = [
+          snapshot.resource_id,
+          handoff ? (handoff.resourceId ?? null) : undefined,
+          terminalSnapshot?.resource_id,
+        ].filter(owner => owner !== undefined);
+        if (owners.some(owner => owner !== expectedResourceId)) return { status: 'resource_mismatch' };
+        // The fence persistWorkflowSnapshot enforces: any unreleased handoff.
+        if (handoff && handoff.releasedAt === undefined) return { status: 'fenced' };
+        // A journal's owner settles the run; it is never overwritten here.
+        if (journal) return { status: 'journaled' };
+        // A nested child that has not completed its terminal journal still
+        // applies its result to this run's snapshot.
+        if (await this.hasPendingTerminalDependents(t, workflowName, runId)) return { status: 'active' };
+        // Missing revision evidence is corruption whatever the status: the
+        // closure delete a `settled` answer leads to would refuse it too.
+        if (!revision) throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        if (isSettledWorkflowRunStatus(snapshot.status)) return { status: 'settled' };
+        // A latched terminal status the snapshot does not show yet: its
+        // settlement is in flight.
+        if (revision.terminalStatus !== null) return { status: 'active' };
+
+        // The snapshot write persistWorkflowSnapshot makes, without changing
+        // the row's resource, then the same parent revision bump (which
+        // latches the `canceled` terminal status).
+        const canceled: WorkflowRunState = { ...createEmptyWorkflowSnapshot(runId), status: 'canceled' };
+        const now = new Date();
+        await t.none(
+          `UPDATE ${this.workflowSnapshotTableName()}
+           SET snapshot = $3, "updatedAt" = $4, "updatedAtZ" = $5
+           WHERE workflow_name = $1 AND run_id = $2`,
+          [
+            workflowName,
+            runId,
+            snapshotColumnType === 'jsonb' ? toPgJson(canceled) : sanitizeJsonForPg(JSON.stringify(canceled)),
+            now,
+            now,
+          ],
+        );
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
+        return { status: 'cancelled' };
+      });
+    } catch (error) {
+      throw this.snapshotHandoffError('CANCEL_WORKFLOW_RUN_FOR_ERASURE', workflowName, runId, error);
     }
   }
 
