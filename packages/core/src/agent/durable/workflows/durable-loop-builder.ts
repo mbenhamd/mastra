@@ -754,13 +754,16 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
           await emitStepFinish(true);
           return true;
         }
-        // The parked step completed before the run-level abort was observed. Emit its own outcome
-        // before recording the abort on loop state so consumers keep the completed step boundary.
-        await emitStepFinish(state.lastStepResult?.isContinued === true);
+        // Fork (PF-2246, abort wins): record the abort on loop state first, then publish the parked
+        // step's deferred step-finish carrying it, so every engine ends an aborted run with one
+        // step-finish (reason 'abort', not continued) and a FINISH whose finishReason is 'abort'.
+        // Upstream (#26348) published the step's own 'tool-calls' outcome and then a separate
+        // abort chunk with finishReason 'aborted'; the plain loop and Doxa use the fork shape.
         if (state.lastStepResult) {
           state.lastStepResult.reason = isTotalTimeout ? 'error' : 'abort';
           state.lastStepResult.isContinued = false;
         }
+        await emitStepFinish(false);
         // A terminal tool result or deferred step-finish chunk can no longer
         // be committed after an abort; drop both so the finalization step
         // cannot publish a post-abort answer.

@@ -280,7 +280,9 @@ describe('MODEL_GENERATION span output tool calls (#24291)', () => {
 
       expect(endGenerationCalls).toHaveLength(1);
       expect(endGenerationCalls[0]).toMatchObject({
-        attributes: { finishReason: 'aborted', usageIncomplete: true },
+        // PF-5928 adaptation (fork PF-2246): an abort that wins after a tool settles finishes
+        // through the normal path with reason 'abort' (upstream: 'aborted').
+        attributes: { finishReason: 'abort', usageIncomplete: true },
         usage: { outputTokens: 5, reasoningTokens: 2 },
       });
     } finally {

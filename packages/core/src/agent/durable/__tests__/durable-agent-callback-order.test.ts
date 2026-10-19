@@ -349,23 +349,20 @@ const CALLBACK_CONTRACTS: Record<ParityEngine, EngineCallbackContract> = {
 };
 
 /** The public stream produced for the `abort` shape. */
-const PLAIN_ABORT_PUBLIC_CHUNK_TYPES = [
-  'start',
-  'step-start',
-  'tool-call',
-  'tool-result',
-  'step-finish',
-  'abort',
-  'finish',
-];
+// PF-5928 adaptation (fork PF-2246, abort wins): an abort that wins at a step boundary
+// ends with one step-finish and a FINISH whose reason is 'abort'; no engine publishes a
+// separate abort chunk (upstream #26348 adds one). The plain loop reports that finish
+// through onFinish, while durable/evented report it through onAbort: a fork parity gap
+// tracked as PF-6047, not changed in the sync.
+const PLAIN_ABORT_PUBLIC_CHUNK_TYPES = ['start', 'step-start', 'tool-call', 'tool-result', 'step-finish', 'finish'];
 
 const ABORT_CONTRACTS: Record<ParityEngine, EngineCallbackContract> = {
   plain: {
-    callbacks: ['onStepFinish', 'onAbort'],
+    callbacks: ['onStepFinish', 'onFinish'],
     onChunk: ['tool-call', 'tool-result'],
     payloadKeys: [
       { name: 'onStepFinish', keys: PLAIN_STEP_FINISH_KEYS },
-      { name: 'onAbort', keys: ON_ABORT_KEYS },
+      { name: 'onFinish', keys: PLAIN_FINISH_KEYS },
     ],
     requests: 1,
   },
@@ -471,12 +468,13 @@ describe('T36 callback order parity', () => {
       expect(snapshot, `${engine}: turn settled after the abort`).toBeDefined();
       expect(state.threw, `${engine}: stream did not throw`).toBeUndefined();
 
-      // harness: `onAbort once and no onFinish`.
+      // harness: `onAbort once and no onFinish` (plain: onFinish once and no onAbort, PF-6047).
+      const [abortCallback, otherCallback] = engine === 'plain' ? ['onFinish', 'onAbort'] : ['onAbort', 'onFinish'];
       expect(
-        state.names.filter(name => name === 'onAbort'),
-        `${engine}: onAbort once`,
-      ).toEqual(['onAbort']);
-      expect(state.names, `${engine}: no onFinish`).not.toContain('onFinish');
+        state.names.filter(name => name === abortCallback),
+        `${engine}: ${abortCallback} once`,
+      ).toEqual([abortCallback]);
+      expect(state.names, `${engine}: no ${otherCallback}`).not.toContain(otherCallback);
 
       // harness: `parked tool observed the abort`.
       expect(state.released, `${engine}: parked tool observed the abort`).toContain(true);
@@ -500,7 +498,7 @@ describe('T36 callback order parity', () => {
     expect(results.plain!.turns.at(-1)!.chunkTypes, 'plain: public chunk types').toEqual(
       PLAIN_ABORT_PUBLIC_CHUNK_TYPES,
     );
-    expect(results.plain!.turns.at(-1)!.finishReason, 'plain: finish reason').toBe('aborted');
+    expect(results.plain!.turns.at(-1)!.finishReason, 'plain: finish reason').toBe('abort');
     expect(results.plain!.turns.at(-1)!.finishChunk?.reason, 'plain: finish chunk reason').toBe('abort');
     expect(results.plain!.turns.at(-1)!.toolResults, 'plain: tool results').toHaveLength(1);
   });

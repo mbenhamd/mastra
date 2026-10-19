@@ -191,10 +191,15 @@ describe('T14 abort parity', () => {
         const snapshot = state.snapshot;
         expect(snapshot, `${engine}: turn settled after the abort`).toBeDefined();
         expect(state.accepted, `${engine}: abort accepted`).toBe(true);
-        expect(chunksOfType(snapshot!, 'abort'), `${engine}: abort chunk`).toBe(1);
+        // PF-5928 adaptation (fork PF-2246): no engine publishes a separate abort chunk; the
+        // FINISH reason carries the abort. Plain reports it through onFinish, durable/evented
+        // through onAbort (PF-6047 parity gap).
+        expect(chunksOfType(snapshot!, 'abort'), `${engine}: abort chunk`).toBe(0);
         expect(chunksOfType(snapshot!, 'error'), `${engine}: no error chunk`).toBe(0);
         expect(chunksOfType(snapshot!, 'finish'), `${engine}: finish chunk`).toBe(1);
-        expect(state.callbacks, `${engine}: onAbort fired and onFinish did not`).toEqual(['onAbort']);
+        expect(state.callbacks, `${engine}: abort callback fired once`).toEqual([
+          engine === 'plain' ? 'onFinish' : 'onAbort',
+        ]);
         expect(state.toolLog, `${engine}: step 3 never started`).toEqual([1, BLOCK_AT]);
         // Two calls happen before the abort (step 1, then step 2 parked), so a
         // run that made a call after the abort would report more.
@@ -202,10 +207,10 @@ describe('T14 abort parity', () => {
       }
 
       expectPlainT14Reference(results.plain!);
+      // Fork PF-2246: the parked step's own iteration reports the abort as final.
       expect(states.get('plain')!.iterations).toEqual([
         { iteration: 1, finishReason: 'tool-calls', isFinal: false },
-        { iteration: 2, finishReason: 'tool-calls', isFinal: false },
-        { iteration: 3, finishReason: 'abort', isFinal: true },
+        { iteration: 2, finishReason: 'abort', isFinal: true },
       ]);
     });
   }
@@ -229,10 +234,9 @@ function expectPlainT14Reference(result: EngineRunResult): void {
     'tool-call',
     'tool-result',
     'step-finish',
-    'abort',
     'finish',
   ]);
-  expect(snapshot.finishReason).toBe('aborted');
+  expect(snapshot.finishReason).toBe('abort');
   expect(snapshot.finishChunk?.reason).toBe('abort');
   expect(snapshot.toolResults).toHaveLength(2);
 }

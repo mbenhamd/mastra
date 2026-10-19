@@ -1087,7 +1087,10 @@ describe('createDurableAgentStream', () => {
     cleanup();
   });
 
-  it('emits an abort chunk and calls only onAbort for an aborted FINISH event', async () => {
+  // PF-5928 adaptation (fork PF-2246): an aborted FINISH carries the abort in its reason; the
+  // adapter publishes no separate abort chunk and finishReason stays 'abort' (upstream #26348:
+  // an abort chunk and 'aborted').
+  it('calls only onAbort for an aborted FINISH event without a separate abort chunk', async () => {
     const { createDurableAgentStream, emitFinishEvent } = await import('../stream-adapter');
 
     const runId = 'test-finish-abort';
@@ -1113,9 +1116,8 @@ describe('createDurableAgentStream', () => {
     const chunks: any[] = [];
     for await (const chunk of output.fullStream) chunks.push(chunk);
 
-    expect(chunks.map(chunk => chunk.type)).toEqual(['abort', 'finish']);
-    await expect(output.text).resolves.toBe('');
-    expect(await output.finishReason).toBe('aborted');
+    expect(chunks.map(chunk => chunk.type)).toEqual(['finish']);
+    expect(await output.finishReason).toBe('abort');
     expect(onAbort).toHaveBeenCalledTimes(1);
     expect(onFinish).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();

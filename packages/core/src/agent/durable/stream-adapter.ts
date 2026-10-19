@@ -451,6 +451,11 @@ export function createDurableAgentStream<OUTPUT = undefined>(
   // Track the last error message seen in an 'error' chunk, so we can
   // surface it in onError when the FINISH event arrives with reason 'error'.
   let lastErrorMessage: string | undefined;
+  // Fork (PF-2246): whether a step's model stream is still in flight (a step started and has
+  // published neither a tool result nor its step-finish). An abort that interrupts it surfaces an
+  // abort chunk, as on the plain loop; an abort that wins after the model phase settled (at the
+  // tool/step boundary) finishes with reason 'abort' only.
+  let modelStreamInFlight = false;
   let lastErrorStack: string | undefined;
   let lastErrorName: string | undefined;
   let lastErrorCause: unknown;
@@ -748,6 +753,11 @@ export function createDurableAgentStream<OUTPUT = undefined>(
             lastErrorName = typeof errPayload?.error?.name === 'string' ? errPayload.error.name : undefined;
             lastErrorCause = errPayload?.error ?? errPayload;
           }
+          const chunkType = (chunk as { type?: unknown }).type;
+          if (chunkType === 'step-start') modelStreamInFlight = true;
+          else if (chunkType === 'step-finish' || chunkType === 'tool-result' || chunkType === 'tool-error') {
+            modelStreamInFlight = false;
+          }
           if (safeEnqueue(controller, chunk as ChunkType<OUTPUT>)) {
             // Deliver onChunk in order: a callback for a later chunk never runs
             // ahead of an earlier one still awaiting (upstream), and only chunks
@@ -763,6 +773,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
           // Step start - enqueue if it's a chunk type
           const chunk = streamEvent.data as ChunkType<OUTPUT>;
           if (chunk && 'type' in chunk) {
+            if (chunk.type === 'step-start') modelStreamInFlight = true;
             safeEnqueue(controller, chunk);
           }
           break;
@@ -851,7 +862,11 @@ export function createDurableAgentStream<OUTPUT = undefined>(
           }
           const finishReason = data.stepResult?.reason;
 
-          if (finishReason === 'abort') {
+          // Fork (PF-2246): an abort that wins at a step boundary finishes with reason 'abort' and no
+          // separate abort chunk, matching the plain loop. An abort that interrupted a model stream
+          // still in flight (for example a streaming reply) publishes the abort chunk first, as the
+          // plain loop does and as upstream (#26348) does for every abort.
+          if (finishReason === 'abort' && modelStreamInFlight) {
             safeEnqueue(controller, {
               type: 'abort',
               runId,
