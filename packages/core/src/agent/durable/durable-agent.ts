@@ -4862,13 +4862,31 @@ export class DurableAgent<
     // cleanup must not tear down a newer resume() segment of the same run).
     // The topic stays when the run's latest execution here lost the run:
     // whoever took it over, in any process, writes to it.
-    // `explicit`: the caller's own cleanup() of this handle. Only a deferred
-    // (auto-cleanup timer) teardown defers to a newer segment that owns the
-    // run (upstream); an explicit cleanup releases the execution this handle
-    // started, whatever segment last ran it (fork binding-scoped cleanup).
+    // A handle releases the bound run while its own segment owns it. Once a
+    // later resume() segment of the same execution has taken the run over, this
+    // stale handle must never tear the run down while that segment executes
+    // (PF-5928; the class of bug the fork's lifecycle generations prevent).
     const releaseOwnedRunState = (explicit = false) => {
-      if (this.#segmentOwner.get(runId) !== segment && !explicit) return;
-      if (this.#segmentOwner.get(runId) === segment) this.#segmentOwner.delete(runId);
+      const owner = this.#segmentOwner.get(runId);
+      if (owner !== segment) {
+        // Stale handle. A deferred teardown always defers to the owning segment.
+        // The caller's explicit cleanup() may still release the execution this
+        // handle started (resumeStream()/approveToolCall() hand back no cleanup of
+        // their own), but only after the owning segment's execution has settled
+        // and only if no newer segment took the run over meanwhile -- never while
+        // a resumed segment is executing.
+        if (!explicit || owner === undefined || !runtimeBindingId) return;
+        const ownerExecution = getBoundRunRegistryEntry(runId, runtimeBindingId)?.workflowExecution;
+        void Promise.resolve(ownerExecution)
+          .catch(() => {})
+          .finally(() => {
+            if (this.#segmentOwner.get(runId) !== owner) return;
+            this.#segmentOwner.delete(runId);
+            this.#cleanupBoundRun(runId, runtimeBindingId, { keepTopic: registryEntry.executionFence?.isLost() });
+          });
+        return;
+      }
+      this.#segmentOwner.delete(runId);
       if (runtimeBindingId) {
         this.#cleanupBoundRun(runId, runtimeBindingId, { keepTopic: registryEntry.executionFence?.isLost() });
       }
