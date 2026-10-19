@@ -2488,18 +2488,25 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     const matches: WorkflowRunThreadErasureEntry[] = [];
     for (const run of this.db.workflows.values()) {
       if (run.resourceId !== resourceId) continue;
-      if (after && compareWorkflowRunClosureCursors({ workflowName: run.workflow_name, runId: run.run_id }, after) <= 0) {
+      if (
+        after &&
+        compareWorkflowRunClosureCursors({ workflowName: run.workflow_name, runId: run.run_id }, after) <= 0
+      ) {
         continue;
       }
       // Read a detached copy, as the snapshot would be read back from a
       // database, so a live object graph is never walked in place.
-      const snapshot: unknown = cloneRunData(typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot);
+      const snapshot: unknown = cloneRunData(
+        typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot,
+      );
       const attribution = classifyWorkflowSnapshotThreadErasure(snapshot, threadId);
       if (attribution === 'thread') {
         matches.push({ workflowName: run.workflow_name, runId: run.run_id, attribution: 'thread' });
       } else if (attribution === 'unattributed' && includeUnattributed) {
         const statusField =
-          snapshot !== null && typeof snapshot === 'object' ? Object.getOwnPropertyDescriptor(snapshot, 'status') : undefined;
+          snapshot !== null && typeof snapshot === 'object'
+            ? Object.getOwnPropertyDescriptor(snapshot, 'status')
+            : undefined;
         const status = statusField && 'value' in statusField ? statusField.value : undefined;
         matches.push({
           workflowName: run.workflow_name,

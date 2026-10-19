@@ -4515,7 +4515,9 @@ export class WorkflowsPG extends WorkflowsStorage {
     if (snapshotColumnType === 'json' || snapshotColumnType === 'text') {
       return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb`;
     }
-    throw new TypeError(`Workflow snapshot read does not support snapshot column type ${snapshotColumnType || 'missing'}`);
+    throw new TypeError(
+      `Workflow snapshot read does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
   }
 
   private sanitizedWorkflowSnapshotStatusExpression(columnReference: string): string {
