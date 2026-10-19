@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { TABLE_WORKFLOW_SNAPSHOT, createEmptyWorkflowSnapshot } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { Pool } from 'pg';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { PostgresStore, WorkflowsPG } from '../../index';
 import { connectionString } from '../../test-utils';
 
@@ -11,6 +11,14 @@ const SNAPSHOT_ONLY = { snapshot: true, handoff: false, terminalSnapshot: false 
 const OTHER_THREAD = 'thread-other';
 
 type Run = { workflowName: string; runId: string };
+
+// Every test uses its own workflow names, so fixed run ids never collide with
+// rows another test (or an earlier run against the same database) left behind.
+const uniqueWorkflowNames = () => {
+  const suffix = randomUUID();
+  return { loop: `agentic-loop-${suffix}`, durable: `durable-agentic-loop-${suffix}` };
+};
+let { loop: LOOP, durable: DURABLE } = uniqueWorkflowNames();
 
 const suspendedLoopStep = (threadId: string, resourceId: string) => ({
   status: 'suspended',
@@ -92,6 +100,10 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     await store?.close();
   });
 
+  beforeEach(() => {
+    ({ loop: LOOP, durable: DURABLE } = uniqueWorkflowNames());
+  });
+
   const newResource = () => `workspace-${randomUUID()}:user-1`;
   const persist = (resourceId: string, run: Run, snapshot: WorkflowRunState) =>
     workflows.persistWorkflowSnapshot({ ...run, resourceId, snapshot });
@@ -105,12 +117,12 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     const otherResource = newResource();
     const snapshots = fixtures(resource);
     const runs = {
-      pendingLoopStart: { workflowName: 'agentic-loop', runId: 'a-pending' },
-      runningLoopStart: { workflowName: 'agentic-loop', runId: 'b-running' },
-      reservedKey: { workflowName: 'agentic-loop', runId: 'c-reserved' },
-      split: { workflowName: 'agentic-loop', runId: 'd-split' },
-      durableMemoryInfo: { workflowName: 'durable-agentic-loop', runId: 'e-memory-info' },
-      durableState: { workflowName: 'durable-agentic-loop', runId: 'f-state' },
+      pendingLoopStart: { workflowName: LOOP, runId: 'a-pending' },
+      runningLoopStart: { workflowName: LOOP, runId: 'b-running' },
+      reservedKey: { workflowName: LOOP, runId: 'c-reserved' },
+      split: { workflowName: LOOP, runId: 'd-split' },
+      durableMemoryInfo: { workflowName: DURABLE, runId: 'e-memory-info' },
+      durableState: { workflowName: DURABLE, runId: 'f-state' },
     };
     await persist(resource, runs.pendingLoopStart, snapshots.loopStart(runs.pendingLoopStart.runId, 'pending', THREAD));
     await persist(resource, runs.runningLoopStart, snapshots.loopStart(runs.runningLoopStart.runId, 'running', THREAD));
@@ -118,13 +130,13 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     await persist(resource, runs.split, snapshots.splitSuspended(runs.split.runId));
     await persist(resource, runs.durableMemoryInfo, snapshots.durableInput(runs.durableMemoryInfo.runId, 'memoryInfo'));
     await persist(resource, runs.durableState, snapshots.durableInput(runs.durableState.runId, 'state'));
-    await persist(resource, { workflowName: 'agentic-loop', runId: 'g-other' }, snapshots.otherThread('g-other'));
+    await persist(resource, { workflowName: LOOP, runId: 'g-other' }, snapshots.otherThread('g-other'));
     await persist(
       otherResource,
-      { workflowName: 'agentic-loop', runId: 'h-cross' },
+      { workflowName: LOOP, runId: 'h-cross' },
       snapshots.loopStart('h-cross', 'running', THREAD),
     );
-    await persist(resource, { workflowName: 'agentic-loop', runId: 'i-bare' }, snapshots.createRunPending('i-bare'));
+    await persist(resource, { workflowName: LOOP, runId: 'i-bare' }, snapshots.createRunPending('i-bare'));
 
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: resource, threadId: THREAD, limit: 100 }),
@@ -144,7 +156,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: otherResource, threadId: THREAD, limit: 100 }),
     ).resolves.toEqual({
       status: 'listed',
-      runs: [{ workflowName: 'agentic-loop', runId: 'h-cross', attribution: 'thread', rows: SNAPSHOT_ONLY }],
+      runs: [{ workflowName: LOOP, runId: 'h-cross', attribution: 'thread', rows: SNAPSHOT_ONLY }],
       hasMore: false,
     });
 
@@ -160,37 +172,29 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     const createdAt = new Date('2026-10-01T00:00:00.000Z');
     const updatedAt = new Date('2026-10-01T00:05:00.000Z');
     await workflows.persistWorkflowSnapshot({
-      workflowName: 'agentic-loop',
+      workflowName: LOOP,
       runId: 'a-bare',
       resourceId: resource,
       snapshot: snapshots.createRunPending('a-bare'),
       createdAt,
       updatedAt,
     });
+    await persist(resource, { workflowName: LOOP, runId: 'b-nested' }, snapshots.nestedCreateRunPending('b-nested'));
     await persist(
       resource,
-      { workflowName: 'agentic-loop', runId: 'b-nested' },
-      snapshots.nestedCreateRunPending('b-nested'),
-    );
-    await persist(
-      resource,
-      { workflowName: 'agentic-loop', runId: 'c-thread' },
+      { workflowName: LOOP, runId: 'c-thread' },
       snapshots.loopStart('c-thread', 'running', THREAD),
     );
-    await persist(resource, { workflowName: 'agentic-loop', runId: 'd-other' }, snapshots.otherThread('d-other'));
+    await persist(resource, { workflowName: LOOP, runId: 'd-other' }, snapshots.otherThread('d-other'));
     await persist(
       resource,
-      { workflowName: 'agentic-loop', runId: 'e-context' },
+      { workflowName: LOOP, runId: 'e-context' },
       {
         ...snapshots.createRunPending('e-context'),
         requestContext: { locale: 'en' },
       },
     );
-    await persist(
-      newResource(),
-      { workflowName: 'agentic-loop', runId: 'f-cross' },
-      snapshots.createRunPending('f-cross'),
-    );
+    await persist(newResource(), { workflowName: LOOP, runId: 'f-cross' }, snapshots.createRunPending('f-cross'));
 
     const result = await workflows.listWorkflowRunsByThreadForErasure({
       resourceId: resource,
@@ -217,7 +221,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
   it('finds the thread in a retained handoff snapshot and a terminal envelope', async () => {
     const resource = newResource();
     const snapshots = fixtures(resource);
-    const released = { workflowName: 'agentic-loop', runId: 'a-released' };
+    const released = { workflowName: LOOP, runId: 'a-released' };
     await persist(resource, released, {
       ...snapshots.loopStart(released.runId, 'running', THREAD),
       status: 'success',
@@ -250,7 +254,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
         `INSERT INTO mastra_workflow_terminal_snapshots_v2
            (workflow_name, run_id, version, resource_id, terminal_status, envelope_hash, record_hash, envelope, created_at)
          VALUES ($1, $2, 1, $3, 'success', $4, $4, $5::jsonb, 1)`,
-        ['agentic-loop', runId, resource, `sha256:${'0'.repeat(64)}`, JSON.stringify(envelope)],
+        [LOOP, runId, resource, `sha256:${'0'.repeat(64)}`, JSON.stringify(envelope)],
       );
     await terminal('b-envelope', {
       terminalResult: {},
@@ -259,15 +263,11 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     });
     await persist(
       resource,
-      { workflowName: 'agentic-loop', runId: 'c-bare-terminal' },
+      { workflowName: LOOP, runId: 'c-bare-terminal' },
       snapshots.createRunPending('c-bare-terminal'),
     );
     await terminal('c-bare-terminal', { terminalResult: { text: 'result' }, finalState: {}, requestContextPatch: {} });
-    await persist(
-      resource,
-      { workflowName: 'agentic-loop', runId: 'd-bare-other' },
-      snapshots.createRunPending('d-bare-other'),
-    );
+    await persist(resource, { workflowName: LOOP, runId: 'd-bare-other' }, snapshots.createRunPending('d-bare-other'));
     await terminal('d-bare-other', {
       terminalResult: { messageList: { memoryInfo: { threadId: OTHER_THREAD } } },
       finalState: {},
@@ -286,13 +286,13 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
       runs: [
         { ...released, attribution: 'thread', rows: { snapshot: false, handoff: true, terminalSnapshot: false } },
         {
-          workflowName: 'agentic-loop',
+          workflowName: LOOP,
           runId: 'b-envelope',
           attribution: 'thread',
           rows: { snapshot: false, handoff: false, terminalSnapshot: true },
         },
         {
-          workflowName: 'agentic-loop',
+          workflowName: LOOP,
           runId: 'c-bare-terminal',
           attribution: 'unattributed',
           rows: { snapshot: true, handoff: false, terminalSnapshot: true },
@@ -315,9 +315,9 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     const resource = newResource();
     const snapshots = fixtures(resource);
     for (const runId of ['b', 'a', 'Z', 'c', 'é']) {
-      await persist(resource, { workflowName: 'agentic-loop', runId }, snapshots.loopStart(runId, 'running', THREAD));
+      await persist(resource, { workflowName: LOOP, runId }, snapshots.loopStart(runId, 'running', THREAD));
     }
-    await persist(resource, { workflowName: 'agentic-loop', runId: 'b2' }, snapshots.otherThread('b2'));
+    await persist(resource, { workflowName: LOOP, runId: 'b2' }, snapshots.otherThread('b2'));
 
     const seen: string[] = [];
     let after: Run | undefined;
@@ -345,16 +345,8 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
   it('binds the thread id as a jsonpath variable', async () => {
     const resource = newResource();
     const quoted = `thread "quoted" \\ $t || true`;
-    await persist(
-      resource,
-      { workflowName: 'agentic-loop', runId: 'a' },
-      fixtures(resource).loopStart('a', 'running', quoted),
-    );
-    await persist(
-      resource,
-      { workflowName: 'agentic-loop', runId: 'b' },
-      fixtures(resource).loopStart('b', 'running', THREAD),
-    );
+    await persist(resource, { workflowName: LOOP, runId: 'a' }, fixtures(resource).loopStart('a', 'running', quoted));
+    await persist(resource, { workflowName: LOOP, runId: 'b' }, fixtures(resource).loopStart('b', 'running', THREAD));
     await expect(
       workflows.listWorkflowRunsByThreadForErasure({ resourceId: resource, threadId: quoted, limit: 10 }),
     ).resolves.toMatchObject({ runs: [{ runId: 'a', attribution: 'thread', rows: SNAPSHOT_ONLY }], hasMore: false });
@@ -402,7 +394,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure (legacy text snapshot c
         await client.query(
           `INSERT INTO ${testSchema}.${TABLE_WORKFLOW_SNAPSHOT} ("workflow_name", "run_id", "resourceId", "snapshot")
            VALUES ($1, $2, $3, $4)`,
-          ['agentic-loop', runId, resource, typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot)],
+          [LOOP, runId, resource, typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot)],
         );
       }
     } finally {
