@@ -119,13 +119,14 @@ Pages a resource's runs that hold a copy of a thread's data, in any run status. 
 
 Input: `{ resourceId, threadId, after?, limit, includeUnattributed? }`. `limit` is required and between 1 and 100. `after` is the `nextCursor` of the previous page.
 
-A snapshot (canonical or handoff) matches when one of these places records the thread id:
+A row matches when the thread id appears in one of the places the framework writes it, at any depth and in any run status:
 
-- any `memoryInfo.threadId`, at any depth, such as an agent loop step's `suspendPayload.__streamState.messageList.memoryInfo` (any step, any status) or the durable loop's `context.input.messageListState.memoryInfo`;
-- the durable loop's `context.input.state.threadId`;
-- the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`.
+- `__streamState.messageList.memoryInfo.threadId`: the agent loop's serialized stream state, such as a step's `suspendPayload.__streamState` (any step, any status);
+- `messageListState.memoryInfo.threadId`: the durable loop's serialized MessageList, in its input, step outputs and result;
+- `state.threadId` next to a `messageListState`: the durable loop's state, set even without a memory backend;
+- in a snapshot, the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`. In a terminal envelope, the same keys in `requestContextPatch`.
 
-A terminal envelope matches on any `memoryInfo.threadId` or on its `requestContextPatch` (`MastraMemory.thread.id`, `mastra__threadId`).
+Application data that only looks like thread metadata, such as a step output `{ memoryInfo: { threadId } }`, doesn't match.
 
 Returns: `Promise<ListWorkflowRunsByThreadForErasureResult>`:
 

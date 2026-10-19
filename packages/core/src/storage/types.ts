@@ -491,17 +491,20 @@ export type WorkflowRunThreadErasureEntry =
  * Lists the resource's runs with a row that records the thread id: the
  * canonical snapshot, the handoff snapshot (kept after a `deleteRun` release
  * removes the canonical row) or the terminal recovery envelope. A snapshot
- * records it in any place it can carry one, in any run status:
- * - any `memoryInfo.threadId`, at any depth (agentic-loop suspend payloads
- *   `context.<step>.suspendPayload.__streamState.messageList.memoryInfo`,
- *   whatever step and status, and the durable-loop input
- *   `context.input.messageListState.memoryInfo`);
- * - the durable-loop input state `context.input.state.threadId`;
- * - the serialized request context of a started run:
- *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
+ * records it in any framework-owned place, at any depth and in any run status:
+ * - `__streamState.messageList.memoryInfo.threadId`: the agentic loop's
+ *   serialized stream state, e.g. `context.<step>.suspendPayload.__streamState`
+ *   (whatever step and status);
+ * - `messageListState.memoryInfo.threadId`: the durable loop's serialized
+ *   MessageList (its input, step outputs and result);
+ * - `state.threadId` of an object that also has `messageListState`: the
+ *   durable loop's state, set even without a memory backend;
+ * - for a snapshot, the serialized request context of a started run:
+ *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`;
+ *   for a terminal envelope, its `requestContextPatch` (same two keys).
  *
- * A terminal envelope records it as any `memoryInfo.threadId` or in its
- * `requestContextPatch` (`MastraMemory.thread.id`, `mastra__threadId`).
+ * Application data that merely looks like thread metadata (a step output
+ * `{ memoryInfo: { threadId } }`) attributes nothing.
  *
  * Unlike the `threadId` filter of `listWorkflowRuns`, which reads one scalar
  * (the first suspended step's thread, else the durable input thread), this

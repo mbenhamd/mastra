@@ -131,6 +131,15 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     await persist(resource, runs.durableMemoryInfo, snapshots.durableInput(runs.durableMemoryInfo.runId, 'memoryInfo'));
     await persist(resource, runs.durableState, snapshots.durableInput(runs.durableState.runId, 'state'));
     await persist(resource, { workflowName: LOOP, runId: 'g-other' }, snapshots.otherThread('g-other'));
+    // Application data shaped like thread metadata, in another thread's run, attributes nothing.
+    await persist(resource, { workflowName: LOOP, runId: 'g2-app-data' }, {
+      ...snapshots.otherThread('g2-app-data'),
+      context: {
+        input: {},
+        'tool-a': { status: 'success', output: { memoryInfo: { threadId: THREAD }, state: { threadId: THREAD } } },
+        'tool-b': snapshots.otherThread('x').context['tool-a'],
+      },
+    } as WorkflowRunState);
     await persist(
       otherResource,
       { workflowName: LOOP, runId: 'h-cross' },
@@ -261,6 +270,12 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
       finalState: {},
       requestContextPatch: { mastra__threadId: THREAD },
     });
+    // A durable run without a memory backend records its thread only in its SerializableDurableState.
+    await terminal('b2-durable-state', {
+      terminalResult: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+      finalState: {},
+      requestContextPatch: {},
+    });
     await persist(
       resource,
       { workflowName: LOOP, runId: 'c-bare-terminal' },
@@ -269,7 +284,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     await terminal('c-bare-terminal', { terminalResult: { text: 'result' }, finalState: {}, requestContextPatch: {} });
     await persist(resource, { workflowName: LOOP, runId: 'd-bare-other' }, snapshots.createRunPending('d-bare-other'));
     await terminal('d-bare-other', {
-      terminalResult: { messageList: { memoryInfo: { threadId: OTHER_THREAD } } },
+      terminalResult: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
       finalState: {},
       requestContextPatch: {},
     });
@@ -288,6 +303,12 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
         {
           workflowName: LOOP,
           runId: 'b-envelope',
+          attribution: 'thread',
+          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+        },
+        {
+          workflowName: LOOP,
+          runId: 'b2-durable-state',
           attribution: 'thread',
           rows: { snapshot: false, handoff: false, terminalSnapshot: true },
         },

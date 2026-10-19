@@ -12,6 +12,6 @@ if (workflows.getWorkflowSnapshotHandoffCapabilities().threadErasureListVersion 
 ```
 
 - **Which rows.** The canonical snapshot, the handoff snapshot (kept after a `deleteRun` release) and the terminal recovery envelope. Each entry's `rows` says which of them the run has.
-- **Where it looks.** Any `memoryInfo.threadId` at any depth (agent loop suspend payloads in any step, the durable loop's `messageListState`), the durable loop's `context.input.state.threadId`, and the request context of a started run (`MastraMemory.thread.id` and `mastra__threadId`).
+- **Where it looks.** Only where the framework writes a thread id, at any depth: the agent loop's `__streamState.messageList.memoryInfo`, the durable loop's `messageListState.memoryInfo` and its `state.threadId`, and the request context of a started run (`MastraMemory.thread.id`, `mastra__threadId`). Application data that only looks like thread metadata doesn't match.
 - **Unattributed runs.** The `pending` snapshot `createRun` stores before a run starts records no thread. With `includeUnattributed: true`, the listing also returns the resource's runs that record no thread id in any row, with their `status`, the store's `createdAt` and `updatedAt`, and `contentFree`. `contentFree` is true when the run has no handoff or terminal row, its `context` is empty or holds only an empty `input`, and its request context is empty. The listing never erases anything.
 - **Capability.** Adapters report `threadErasureListVersion: 1`. The in-memory store supports it, and the base class answers `unsupported`.

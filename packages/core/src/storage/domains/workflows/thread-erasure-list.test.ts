@@ -135,6 +135,15 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     // Not listed: another thread, the thread under another resource, and
     // (without includeUnattributed) a snapshot with no thread at all.
     await persist(workflows, { workflowName: 'agentic-loop', runId: 'g-other' }, snapshots.otherThread('g-other'));
+    // Application data shaped like thread metadata, in another thread's run, attributes nothing.
+    await persist(workflows, { workflowName: 'agentic-loop', runId: 'g2-app-data' }, {
+      ...snapshots.otherThread('g2-app-data'),
+      context: {
+        input: {},
+        'tool-a': { status: 'success', output: { memoryInfo: { threadId: THREAD }, state: { threadId: THREAD } } },
+        'tool-b': snapshots.otherThread('x').context['tool-a'],
+      },
+    } as WorkflowRunState);
     await persist(
       workflows,
       { workflowName: 'agentic-loop', runId: 'h-cross' },
@@ -293,6 +302,12 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
         createdAt: 1,
       });
     terminal('b-envelope', { terminalResult: {}, finalState: {}, requestContextPatch: { mastra__threadId: THREAD } });
+    // A durable run without a memory backend records its thread only in its SerializableDurableState.
+    terminal('b2-durable-state', {
+      terminalResult: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+      finalState: {},
+      requestContextPatch: {},
+    });
     // A content-free canonical snapshot whose terminal envelope holds data (no thread): not content-free.
     await persist(
       workflows,
@@ -307,7 +322,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       snapshots.createRunPending('d-bare-other'),
     );
     terminal('d-bare-other', {
-      terminalResult: { messageList: { memoryInfo: { threadId: OTHER_THREAD } } },
+      terminalResult: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
       finalState: {},
       requestContextPatch: {},
     });
@@ -326,6 +341,12 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
         {
           workflowName: 'agentic-loop',
           runId: 'b-envelope',
+          attribution: 'thread',
+          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+        },
+        {
+          workflowName: 'agentic-loop',
+          runId: 'b2-durable-state',
           attribution: 'thread',
           rows: { snapshot: false, handoff: false, terminalSnapshot: true },
         },

@@ -374,49 +374,71 @@ export function captureWorkflowRunThreadErasureListInput(input: {
 }
 
 /**
- * SQL/JSON path (PostgreSQL `jsonb_path_exists`, lax mode) that is true when
- * a snapshot records the thread id bound to the `t` variable anywhere a
- * snapshot can carry one:
- * - `memoryInfo.threadId` at any depth: a serialized MessageList, e.g. the
- *   agentic-loop suspend payload
- *   `context.<step>.suspendPayload.__streamState.messageList.memoryInfo`
- *   (whatever step, whatever status) and the durable-loop input
- *   `context.input.messageListState.memoryInfo`;
- * - the durable-loop input state `context.input.state.threadId`;
- * - the request context persisted with every started run:
- *   `requestContext.MastraMemory.thread.id` (set by the agent's memory
- *   preparation) and the reserved `requestContext.mastra__threadId`.
+ * Thread-id places owned by the framework's own serializations, at any depth.
+ * Each is anchored on a framework key, so an ordinary application object in a
+ * step result (say `{ memoryInfo: { threadId } }`) never attributes a run:
+ * - `__streamState.messageList.memoryInfo.threadId`: the agentic loop's
+ *   serialized stream state, e.g. a suspend payload
+ *   `context.<step>.suspendPayload.__streamState` (any step, any status);
+ * - `messageListState.memoryInfo.threadId`: the durable loop's serialized
+ *   MessageList, in its input, step outputs and result;
+ * - `state.threadId` of an object that also has `messageListState`: the
+ *   durable loop's `SerializableDurableState`, set even without a memory
+ *   backend (input, step outputs and result carry both fields).
  */
-export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH =
-  '$ ? (@.**.memoryInfo.threadId == $t || @.context.input.state.threadId == $t || ' +
-  '@.requestContext.MastraMemory.thread.id == $t || @.requestContext."mastra__threadId" == $t)';
+const FRAMEWORK_THREAD_ID_PATHS = [
+  '@.**.__streamState.messageList.memoryInfo.threadId',
+  '@.**.messageListState.memoryInfo.threadId',
+  '@.** ? (exists(@.messageListState)).state.threadId',
+] as const;
+
+const threadIdMatchPath = (paths: readonly string[]) => `$ ? (${paths.map(path => `${path} == $t`).join(' || ')})`;
+const anyThreadIdPath = (paths: readonly string[]) =>
+  `$ ? (${paths.map(path => `exists(${path} ? (@.type() == "string"))`).join(' || ')})`;
+
+const SNAPSHOT_THREAD_ID_PATHS = [
+  ...FRAMEWORK_THREAD_ID_PATHS,
+  '@.requestContext.MastraMemory.thread.id',
+  '@.requestContext."mastra__threadId"',
+] as const;
+
+const TERMINAL_ENVELOPE_THREAD_ID_PATHS = [
+  ...FRAMEWORK_THREAD_ID_PATHS,
+  '@.requestContextPatch.MastraMemory.thread.id',
+  '@.requestContextPatch."mastra__threadId"',
+] as const;
+
+/**
+ * SQL/JSON path (PostgreSQL `jsonb_path_exists`, lax mode) that is true when
+ * a snapshot (canonical or handoff) records the thread id bound to the `t`
+ * variable: any framework-owned place (see `FRAMEWORK_THREAD_ID_PATHS`), or
+ * the request context persisted with every started run,
+ * `requestContext.MastraMemory.thread.id` (set by the agent's memory
+ * preparation) and the reserved `requestContext.mastra__threadId`.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(SNAPSHOT_THREAD_ID_PATHS);
 
 /**
  * SQL/JSON path that is true when a snapshot records any string thread id in
  * one of the places {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH} reads.
  * A snapshot it is false for is unattributed.
  */
-export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH =
-  '$ ? (exists(@.**.memoryInfo.threadId ? (@.type() == "string")) || ' +
-  'exists(@.context.input.state.threadId ? (@.type() == "string")) || ' +
-  'exists(@.requestContext.MastraMemory.thread.id ? (@.type() == "string")) || ' +
-  'exists(@.requestContext."mastra__threadId" ? (@.type() == "string")))';
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(SNAPSHOT_THREAD_ID_PATHS);
 
 /**
  * SQL/JSON path that is true when a terminal recovery envelope records the
- * thread id bound to `t`: any `memoryInfo.threadId` (in its result or final
- * state) or its request-context patch (`MastraMemory.thread.id`,
+ * thread id bound to `t`: any framework-owned place in its result or final
+ * state, or its request-context patch (`MastraMemory.thread.id`,
  * `mastra__threadId`).
  */
-export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH =
-  '$ ? (@.**.memoryInfo.threadId == $t || @.requestContextPatch.MastraMemory.thread.id == $t || ' +
-  '@.requestContextPatch."mastra__threadId" == $t)';
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(
+  TERMINAL_ENVELOPE_THREAD_ID_PATHS,
+);
 
 /** SQL/JSON path that is true when a terminal envelope records any string thread id where the match path reads. */
-export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH =
-  '$ ? (exists(@.**.memoryInfo.threadId ? (@.type() == "string")) || ' +
-  'exists(@.requestContextPatch.MastraMemory.thread.id ? (@.type() == "string")) || ' +
-  'exists(@.requestContextPatch."mastra__threadId" ? (@.type() == "string")))';
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(
+  TERMINAL_ENVELOPE_THREAD_ID_PATHS,
+);
 
 /** Own enumerable data fields of a JSON-like object, as a JSON copy would keep them. Accessors are not run. */
 function threadErasureMembers(value: unknown, key: string): unknown[] {
@@ -460,6 +482,25 @@ function threadErasureDescendants(value: unknown): unknown[] {
   return out;
 }
 
+/** Values at the framework-owned thread-id places, mirroring `FRAMEWORK_THREAD_ID_PATHS`. */
+function frameworkThreadIds(value: unknown): unknown[] {
+  const descendants = threadErasureDescendants(value);
+  return [
+    ...threadErasureMemberPath(descendants, ['__streamState', 'messageList', 'memoryInfo', 'threadId']),
+    ...threadErasureMemberPath(descendants, ['messageListState', 'memoryInfo', 'threadId']),
+    ...threadErasureMemberPath(
+      // `exists(@.messageListState)`: the field is present with any JSON value,
+      // null included. A lax filter applies to each element of an array, so
+      // only objects are tested (array elements are descendants themselves).
+      descendants.filter(
+        item =>
+          !Array.isArray(item) && threadErasureMembers(item, 'messageListState').some(member => member !== undefined),
+      ),
+      ['state', 'threadId'],
+    ),
+  ];
+}
+
 /**
  * Classifies a plain-data snapshot for a thread erasure listing with the same
  * places as {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH}: `thread` when
@@ -473,8 +514,7 @@ export function classifyWorkflowSnapshotThreadErasure(
 ): 'thread' | 'other' | 'unattributed' {
   return classifyThreadErasureValues(
     [
-      ...threadErasureMemberPath(threadErasureDescendants(snapshot), ['memoryInfo', 'threadId']),
-      ...threadErasureMemberPath([snapshot], ['context', 'input', 'state', 'threadId']),
+      ...frameworkThreadIds(snapshot),
       ...threadErasureMemberPath([snapshot], ['requestContext', 'MastraMemory', 'thread', 'id']),
       ...threadErasureMemberPath([snapshot], ['requestContext', 'mastra__threadId']),
     ],
@@ -492,7 +532,7 @@ export function classifyWorkflowTerminalEnvelopeThreadErasure(
 ): 'thread' | 'other' | 'unattributed' {
   return classifyThreadErasureValues(
     [
-      ...threadErasureMemberPath(threadErasureDescendants(envelope), ['memoryInfo', 'threadId']),
+      ...frameworkThreadIds(envelope),
       ...threadErasureMemberPath([envelope], ['requestContextPatch', 'MastraMemory', 'thread', 'id']),
       ...threadErasureMemberPath([envelope], ['requestContextPatch', 'mastra__threadId']),
     ],
