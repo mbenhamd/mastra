@@ -126,6 +126,17 @@ export interface WorkflowSnapshotHandoffCapabilities {
    * `listWorkflowRunClosuresByResource`, backed by resource indexes.
    */
   closureDeleteVersion?: 1;
+  /**
+   * Atomic erasure cancel: `cancelWorkflowRunForErasure`, which overwrites an
+   * unsettled snapshot with an empty `canceled` one only when no journal and
+   * no pending nested dependent still needs it.
+   */
+  closureCancelVersion?: 1;
+  /**
+   * Erasure-complete thread listing: `listWorkflowRunsByThreadForErasure`,
+   * which matches every place a snapshot records a thread id, in any status.
+   */
+  threadErasureListVersion?: 1;
 }
 
 /** The canonical native snapshot state a handoff claim must compare under the parent lock. */
@@ -304,6 +315,58 @@ export type DeleteWorkflowRunClosureResult =
     }
   | { status: 'missing' | 'resource_mismatch' | 'fenced' | 'active' | 'unsupported' };
 
+/**
+ * Settles a run that will never settle on its own (an erased account's agent
+ * loop suspended on a question, a run whose execution stopped) by overwriting
+ * its unsettled snapshot in place with an empty `canceled` snapshot under the
+ * same resource. The row stays, so `deleteWorkflowRunClosure` can then erase
+ * the closure. Every check and the write happen in one atomic step, under the
+ * same locks as `deleteWorkflowRunClosure`, so no journal or nested child can
+ * appear between them.
+ *
+ * Caller contract: the store has no executor lease or liveness check. A
+ * `running` run with no journal, no unreleased handoff and no pending nested
+ * dependent is cancelled even if an executor in another process is still
+ * running it; that executor's next generation-guarded persist then fails as
+ * stale and its work is discarded. `active` means a settlement or a nested
+ * dependent is in flight, not that an executor is running. Call this only for
+ * runs that will never settle on their own: their owner is gone and no
+ * executor can be admitted for them.
+ */
+export interface CancelWorkflowRunForErasureInput {
+  workflowName: string;
+  runId: string;
+  expectedResourceId: string;
+}
+
+/**
+ * Checked in this order. The run's snapshot changes only when the result is
+ * `cancelled`; a `settled` result on the in-memory store also arms the
+ * late-write fence that the PostgreSQL parent revision latch enforces, so a
+ * queued write cannot reopen the run before its closure is deleted:
+ * - `missing`: storage holds no snapshot for the run (nothing to anchor).
+ * - `resource_mismatch`: the snapshot, the handoff or the terminal snapshot
+ *   records another resource, or the snapshot records none.
+ * - `fenced`: an unreleased handoff fences the run's snapshot writes (the
+ *   same fence `persistWorkflowSnapshot` enforces). Retry after its release.
+ * - `journaled`: the run has a terminalization journal row (any phase). Its
+ *   owner settles the run; it is never overwritten.
+ * - `active`: a nested child run (linked by a parent effect or recovery
+ *   ancestry, whatever its resource) has not completed its terminal journal,
+ *   or a terminal status is latched on the run's parent revision that its
+ *   snapshot does not show yet. Retry later. (The in-memory store, which lets
+ *   an ordinary write reopen a settled run, cancels such a reopened run when
+ *   no journal or pending child remains.)
+ * - `settled`: the snapshot status is already settled; nothing to overwrite
+ *   (its later writes are refused as for `cancelled`).
+ * - `cancelled`: the snapshot is now an empty `canceled` snapshot, and the
+ *   parent revision moved as for any snapshot write.
+ * - `unsupported`: the adapter does not implement `closureCancelVersion: 1`.
+ */
+export type CancelWorkflowRunForErasureResult =
+  | { status: 'cancelled' }
+  | { status: 'missing' | 'resource_mismatch' | 'fenced' | 'journaled' | 'active' | 'settled' | 'unsupported' };
+
 /** Keyset position in `listWorkflowRunClosuresByResource`, ordered by code point. */
 export interface WorkflowRunClosureCursor {
   workflowName: string;
@@ -342,6 +405,178 @@ export type ListWorkflowRunClosuresByResourceResult =
   | {
       status: 'listed';
       closures: WorkflowRunClosureEntry[];
+      hasMore: boolean;
+      nextCursor?: WorkflowRunClosureCursor;
+    }
+  | { status: 'unsupported' };
+
+export interface ListWorkflowRunsByThreadForErasureInput {
+  resourceId: string;
+  threadId: string;
+  after?: WorkflowRunClosureCursor;
+  /** Between 1 and 100. */
+  limit: number;
+  /**
+   * Also list the resource's snapshots that record no thread id anywhere
+   * (for example the `pending` snapshot `createRun` persists before the run
+   * starts). They cannot be attributed to any thread, so a caller must not
+   * erase them as the thread's runs without other evidence.
+   */
+  includeUnattributed?: boolean;
+}
+
+/**
+ * What one of the run's rows records, for a row that can hold a copy of its
+ * data: `absent` (no such row under the resource), `thread` (it records the
+ * listed thread id and no other), `mixed` (it records the listed thread id and
+ * other thread ids too), `other` (it records only other thread ids) or
+ * `unattributed` (it records no thread id).
+ */
+export type WorkflowRunThreadErasureRowAttribution = 'absent' | 'thread' | 'mixed' | 'other' | 'unattributed';
+
+/**
+ * The run's rows that `deleteWorkflowRunClosure` erases and that can hold a
+ * copy of its data, each with what it records.
+ *
+ * A released handoff kept after a `deleteRun` release does not fence the run
+ * id, so the same run id can start a newer lifetime whose canonical snapshot
+ * belongs to another thread. Such a run lists as `thread` with
+ * `snapshot: 'other'`. Closure deletion erases every row of the run, so a
+ * caller erasing one thread must not delete a run with an `other` or `mixed`
+ * row without deciding about the other thread's data.
+ */
+export interface WorkflowRunThreadErasureRows {
+  /** The canonical snapshot. */
+  snapshot: WorkflowRunThreadErasureRowAttribution;
+  /** The handoff row and its snapshot, released or not. */
+  handoff: WorkflowRunThreadErasureRowAttribution;
+  /** The retained terminal recovery envelope. */
+  terminalSnapshot: WorkflowRunThreadErasureRowAttribution;
+}
+
+/**
+ * Fields every thread erasure entry carries about the run's place in the
+ * framework's agent loops. Informational only: the listing applies no policy.
+ */
+export interface WorkflowRunThreadErasureLoopInfo {
+  /**
+   * True only when `workflowName` is one of the framework's own agent-loop
+   * workflows (`WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS`). Every row
+   * of the entry belongs to that workflow. User workflows are false.
+   */
+  loopInternal: boolean;
+  /**
+   * The other workflow names of the same resource whose canonical snapshot
+   * uses the same `runId` (an agentic-loop parent and its `executionWorkflow`
+   * child share one), in code-point order, at most
+   * `WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT` names.
+   */
+  sharesRunIdWith: string[];
+}
+
+/** A run with at least one row (canonical snapshot, handoff snapshot or terminal envelope) that records the thread id. */
+export interface WorkflowRunThreadErasureThreadEntry extends WorkflowRunThreadErasureLoopInfo {
+  workflowName: string;
+  runId: string;
+  attribution: 'thread';
+  rows: WorkflowRunThreadErasureRows;
+}
+
+/**
+ * A run of the resource with a canonical snapshot, none of whose rows records
+ * any thread id (listed only with `includeUnattributed`). The listing never
+ * erases it; the fields below let a caller decide, from the same read,
+ * whether its own policy lets it erase the run. The intended rules:
+ * - a `loopInternal` run that is `pending`, in the same resource and older
+ *   than the longest turn lease plus a margin is the leftover of a crashed
+ *   turn (for example the `agentic-loop` parent and its `executionWorkflow`
+ *   child listed in each other's `sharesRunIdWith`) and can be erased through
+ *   `deleteWorkflowRunClosure` whatever `contentFree` says;
+ * - any other run is erased only when it is `pending`, `contentFree`, in the
+ *   same resource and older than that lease plus margin.
+ */
+export interface WorkflowRunThreadErasureUnattributedEntry extends WorkflowRunThreadErasureLoopInfo {
+  workflowName: string;
+  runId: string;
+  attribution: 'unattributed';
+  rows: WorkflowRunThreadErasureRows;
+  /** The canonical snapshot's `status` when it is a string (`undefined` otherwise). */
+  status?: string;
+  /** The store's row timestamps (not the snapshot's own `timestamp`). */
+  createdAt: Date;
+  updatedAt: Date;
+  /**
+   * True only when the run holds nothing but the shell `createRun` persists
+   * before a run starts, exactly:
+   * - `rows.handoff` and `rows.terminalSnapshot` are `absent`;
+   * - the canonical snapshot is a JSON object (a non-object snapshot is never
+   *   content-free) whose keys are all in
+   *   `WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS`;
+   * - `value`, `requestContext` and `lifecycleStepStates` are absent, `null`
+   *   or `{}`, and `result` and `error` are absent or `null`;
+   * - `context` is absent, `null` or `{}`, or its only key is `input` and that
+   *   input is `null` or `{}` (a plain empty object; a class instance such as
+   *   a `Date` is content).
+   *
+   * A nested run's `pending` snapshot whose `context.input` holds the parent
+   * step's payload (for example the conversation messages) is not
+   * content-free, even without a thread id.
+   */
+  contentFree: boolean;
+}
+
+/** One run of a thread erasure listing. */
+export type WorkflowRunThreadErasureEntry =
+  | WorkflowRunThreadErasureThreadEntry
+  | WorkflowRunThreadErasureUnattributedEntry;
+
+/**
+ * Lists the resource's runs with a row that records the thread id: the
+ * canonical snapshot, the handoff snapshot (kept after a `deleteRun` release
+ * removes the canonical row) or the terminal recovery envelope. A snapshot
+ * records it, in any run status, only at the locations the framework writes:
+ * - an agentic-loop suspension: `__streamState.messageList.memoryInfo.threadId`
+ *   anywhere inside a step's `suspendPayload` (including the iteration and
+ *   nested suspensions engines keep under `__workflow_meta`) or inside the
+ *   `suspendPayload` of a foreach step's iteration results (any step, any status);
+ * - a durable-agent run (`context.input.__workflowKind` is `durable-agent`):
+ *   `messageListState.memoryInfo.threadId` and `state.threadId` (set even
+ *   without a memory backend) of its `context.input`, of any step's `output`
+ *   or `payload`, and of its `result` (or `result.output`, when terminal
+ *   persistence stored the whole step result);
+ * - an agent-network run (`WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS`):
+ *   `context.input.threadId`;
+ * - the serialized request context of a started run:
+ *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
+ *
+ * A terminal envelope of a `durable-agentic-loop` run records it in
+ * `terminalResult.output.messageListState.memoryInfo.threadId` or
+ * `terminalResult.output.state.threadId` (the envelope keeps the child's step
+ * result). Its `requestContextPatch` cannot carry a thread: the envelope
+ * refuses infrastructure-owned keys. So a terminal-only row of any other run
+ * records no thread and is not listed (`listWorkflowRunClosuresByResource`
+ * still finds it).
+ *
+ * Application data shaped like thread metadata elsewhere attributes nothing.
+ *
+ * A snapshot stored as a JSON string is read as the object it encodes; one
+ * that does not parse fails the listing rather than being skipped.
+ *
+ * Each page reads every row of the resource after the cursor (in the
+ * resource indexes' order) and pages the matches, so its cost grows with the
+ * resource's runs, not with the page size.
+ *
+ * Unlike the `threadId` filter of `listWorkflowRuns`, which reads one scalar
+ * (the first suspended step's thread, else the durable input thread), this
+ * listing does not miss a `running` durable-loop snapshot, a suspension
+ * kept outside the first suspended step, or a snapshot whose first suspended
+ * step names another thread. `unsupported` means the
+ * adapter cannot answer; it never answers an empty page in that case.
+ */
+export type ListWorkflowRunsByThreadForErasureResult =
+  | {
+      status: 'listed';
+      runs: WorkflowRunThreadErasureEntry[];
       hasMore: boolean;
       nextCursor?: WorkflowRunClosureCursor;
     }

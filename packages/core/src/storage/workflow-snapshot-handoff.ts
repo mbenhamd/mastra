@@ -340,6 +340,430 @@ export function captureWorkflowRunClosureListInput(input: {
   return Object.freeze({ resourceId, limit, ...(after ? { after: Object.freeze(after) } : {}) });
 }
 
+/**
+ * Reads a thread erasure listing's input exactly once and validates that
+ * copy, as {@link captureWorkflowRunClosureListInput} does for the resource,
+ * cursor and limit. Adapters use only the returned copy.
+ */
+export function captureWorkflowRunThreadErasureListInput(input: {
+  resourceId: string;
+  threadId: string;
+  after?: { workflowName: string; runId: string };
+  limit: number;
+  includeUnattributed?: boolean;
+}): {
+  resourceId: string;
+  threadId: string;
+  after?: { workflowName: string; runId: string };
+  limit: number;
+  includeUnattributed: boolean;
+} {
+  const threadId: unknown = input.threadId;
+  const includeUnattributed: unknown = input.includeUnattributed;
+  const closureInput = captureWorkflowRunClosureListInput(input);
+  if (typeof threadId !== 'string' || threadId.length === 0) {
+    throw new TypeError('Workflow run thread erasure threadId must be a non-empty string');
+  }
+  if (hasUnsafeIdentityChar(threadId)) {
+    throw new TypeError('Workflow run thread erasure threadId must be well-formed UTF-16 with no NUL characters');
+  }
+  if (includeUnattributed !== undefined && typeof includeUnattributed !== 'boolean') {
+    throw new TypeError('Workflow run thread erasure includeUnattributed must be a boolean');
+  }
+  return Object.freeze({ ...closureInput, threadId, includeUnattributed: includeUnattributed === true });
+}
+
+/**
+ * The locations where the framework itself writes a thread id, each anchored
+ * on a known structure so application data shaped like thread metadata never
+ * attributes a run. A group's `guard` must hold for its paths to count.
+ */
+type ThreadIdPathGroup = { guard?: string; paths: readonly string[] };
+
+/** The durable agent's workflow (`DurableStepIds.AGENTIC_LOOP`). */
+const DURABLE_AGENTIC_LOOP_WORKFLOW = 'durable-agentic-loop';
+
+const SNAPSHOT_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
+  // The agentic loop's suspension: tool-call-step stores streamState.serialize()
+  // in the suspend payload. Engines keep iteration and nested suspensions inside
+  // the step's suspend payload (`__workflow_meta.foreachOutput[i].suspendPayload`,
+  // an array or an index-keyed object) and in a foreach step's iteration results.
+  {
+    paths: [
+      // Every step but the caller-owned `context.input`.
+      '@.context.keyvalue() ? (@.key != "input").value.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
+      '@.context.keyvalue() ? (@.key != "input").value.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
+    ],
+  },
+  // A durable-agent run: its input, step outputs and result each carry the
+  // serialized MessageList and the SerializableDurableState.
+  {
+    guard: '@.context.input.__workflowKind == "durable-agent"',
+    paths: [
+      '@.context.input.messageListState.memoryInfo.threadId',
+      '@.context.input.state.threadId',
+      '@.context.*.output.messageListState.memoryInfo.threadId',
+      '@.context.*.output.state.threadId',
+      // Running and suspended steps keep their input as `payload`.
+      '@.context.*.payload.messageListState.memoryInfo.threadId',
+      '@.context.*.payload.state.threadId',
+      '@.result.messageListState.memoryInfo.threadId',
+      '@.result.state.threadId',
+      // persistWorkflowTerminalState stores the whole step result as `result`.
+      '@.result.output.messageListState.memoryInfo.threadId',
+      '@.result.output.state.threadId',
+    ],
+  },
+  // The request context persisted with every started run.
+  { paths: ['@.requestContext.MastraMemory.thread.id', '@.requestContext."mastra__threadId"'] },
+];
+
+const TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
+  {
+    guard: `@.workflowName == "${DURABLE_AGENTIC_LOOP_WORKFLOW}"`,
+    // terminalResult is the child's step result; the loop output is its `output`.
+    paths: ['@.terminalResult.output.messageListState.memoryInfo.threadId', '@.terminalResult.output.state.threadId'],
+  },
+];
+
+/**
+ * The framework's own agent-loop workflows. A thread erasure entry reports
+ * `loopInternal: true` only for these names (literals, so storage does not
+ * import the loop modules; a test pins them to their source constants):
+ * - `agentic-loop`: `AGENTIC_LOOP_WORKFLOW_ID` (loop/loop-builder.ts), the
+ *   agent loop (loop/workflows/agentic-loop/index.ts);
+ * - `executionWorkflow`: `AGENTIC_EXECUTION_WORKFLOW_ID` (loop/loop-builder.ts),
+ *   the loop's nested per-iteration run, which shares the parent's run id;
+ * - `durable-agentic-loop` and `durable-agentic-execution`:
+ *   `DurableStepIds.AGENTIC_LOOP` / `DurableStepIds.AGENTIC_EXECUTION`
+ *   (agent/durable/constants.ts), the durable agent's loop and iteration
+ *   workflows (agent/durable/workflows/durable-loop-builder.ts).
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS: readonly string[] = Object.freeze([
+  'agentic-loop',
+  'executionWorkflow',
+  'durable-agentic-loop',
+  'durable-agentic-execution',
+]);
+
+/** The most workflow names a thread erasure entry lists in `sharesRunIdWith`. */
+export const WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT = 16;
+
+/**
+ * The other workflow names that hold a canonical snapshot of the same run id,
+ * in code-point order and capped at {@link WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT}.
+ */
+export function workflowRunThreadErasureSharedRunIds(workflowName: string, workflowNames: Iterable<string>): string[] {
+  return [...new Set(workflowNames)]
+    .filter(name => name !== workflowName)
+    .sort(compareWorkflowSnapshotHandoffText)
+    .slice(0, WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT);
+}
+
+/**
+ * The agent network's workflows (`loop/network`), which persist only when
+ * suspended and record the conversation thread in their input
+ * (`context.input.threadId`). A snapshot row's workflow name is a column,
+ * so adapters apply {@link WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH}
+ * only to rows of these workflows.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS: readonly string[] = Object.freeze([
+  'Agent-Network-Outer-Workflow',
+  'iteration-with-validation',
+  'agent-loop-main-workflow',
+]);
+
+const threadIdPredicate = (groups: readonly ThreadIdPathGroup[], test: (path: string) => string) =>
+  `$ ? (${groups
+    .map(group => {
+      const paths = group.paths.map(test).join(' || ');
+      return group.guard ? `(${group.guard} && (${paths}))` : paths;
+    })
+    .join(' || ')})`;
+const threadIdMatchPath = (groups: readonly ThreadIdPathGroup[]) => threadIdPredicate(groups, path => `${path} == $t`);
+const anyThreadIdPath = (groups: readonly ThreadIdPathGroup[]) =>
+  threadIdPredicate(groups, path => `exists(${path} ? (@.type() == "string"))`);
+const otherThreadIdPath = (groups: readonly ThreadIdPathGroup[]) =>
+  threadIdPredicate(groups, path => `exists(${path} ? (@.type() == "string" && @ != $t))`);
+
+/**
+ * What one row records: the listed thread only (`thread`), the listed thread
+ * and others (`mixed`), only other threads (`other`) or none (`unattributed`).
+ */
+export type WorkflowThreadErasureRowClass = 'thread' | 'mixed' | 'other' | 'unattributed';
+
+/**
+ * SQL/JSON path (PostgreSQL `jsonb_path_exists`, lax mode) that is true when
+ * a snapshot (canonical or handoff) records the thread id bound to the `t`
+ * variable at a framework-owned location: an agentic-loop suspension's
+ * `__streamState`, a durable-agent run's MessageList or durable state (input,
+ * step outputs, result), or the request context persisted with every started
+ * run (`requestContext.MastraMemory.thread.id`, `requestContext.mastra__threadId`).
+ * `== $t` only holds for a string equal to the bound string.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
+
+/**
+ * SQL/JSON path that is true when a snapshot records any string thread id at
+ * a location {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH} reads. A
+ * snapshot it is false for is unattributed.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
+
+/**
+ * SQL/JSON path that is true when a snapshot records, at a location
+ * {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH} reads, a string thread
+ * id other than the one bound to `t`.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH = otherThreadIdPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
+
+/** The {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH} of a network row's input. */
+export const WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_OTHER_THREAD_PATH = otherThreadIdPath([
+  { paths: ['@.context.input.threadId'] },
+]);
+
+/** For a {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS} row: true when its input records the thread id bound to `t`. */
+export const WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath([
+  { paths: ['@.context.input.threadId'] },
+]);
+
+/** For a {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS} row: true when its input records any string thread id. */
+export const WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath([
+  { paths: ['@.context.input.threadId'] },
+]);
+
+/**
+ * SQL/JSON path that is true when a terminal recovery envelope records the
+ * thread id bound to `t`: for a durable-agent run, the MessageList or durable
+ * state of its step result's `output`. (The envelope's `requestContextPatch`
+ * cannot carry a thread: `materializeWorkflowTerminalRecoveryEnvelope`
+ * refuses infrastructure-owned keys such as `MastraMemory` and `mastra__*`.)
+ */
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(
+  TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
+);
+
+/** SQL/JSON path that is true when a terminal envelope records a string thread id other than the one bound to `t`. */
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_OTHER_THREAD_PATH = otherThreadIdPath(
+  TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
+);
+
+/** SQL/JSON path that is true when a terminal envelope records any string thread id where the match path reads. */
+export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(
+  TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
+);
+
+/** Own enumerable data fields of a JSON-like object, as a JSON copy would keep them. Accessors are not run. */
+function threadErasureMembers(value: unknown, key: string): unknown[] {
+  // Lax mode: a member accessor applied to an array applies to its elements.
+  const holders = Array.isArray(value) ? value : [value];
+  const members: unknown[] = [];
+  for (const holder of holders) {
+    if (holder === null || typeof holder !== 'object' || Array.isArray(holder)) continue;
+    // `.*` reads every member, `.*!input` every member but `input`
+    // (`.keyvalue() ? (@.key != "input").value`); `.key` reads one.
+    const names =
+      key === '*'
+        ? Object.keys(holder)
+        : key === '*!input'
+          ? Object.keys(holder).filter(name => name !== 'input')
+          : [key];
+    for (const name of names) {
+      const descriptor = Object.getOwnPropertyDescriptor(holder, name);
+      if (descriptor && descriptor.enumerable && 'value' in descriptor && descriptor.value !== undefined) {
+        members.push(descriptor.value);
+      }
+    }
+  }
+  return members;
+}
+
+function threadErasureMemberPath(roots: unknown[], keys: readonly string[]): unknown[] {
+  let items = roots;
+  for (const key of keys) {
+    // `.**` reads the item itself and every value nested in it, at any level.
+    items =
+      key === '**' ? items.flatMap(threadErasureDescendants) : items.flatMap(item => threadErasureMembers(item, key));
+  }
+  // Lax mode: comparison operands that are arrays are unwrapped.
+  return items.flatMap(item => (Array.isArray(item) ? item : [item]));
+}
+
+/** The value and every value nested in it (the `.**` accessor), each container once. */
+function threadErasureDescendants(value: unknown): unknown[] {
+  const seen = new Set<object>();
+  const out: unknown[] = [];
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (item !== null && typeof item === 'object') {
+      if (seen.has(item)) continue;
+      seen.add(item);
+      for (const member of threadErasureMembers(item, '*')) stack.push(member);
+      if (Array.isArray(item)) for (const entry of item) stack.push(entry);
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+/** Values at a dotted member path (`*` for every member), mirroring a lax SQL/JSON accessor chain. */
+const at = (root: unknown, path: string): unknown[] => threadErasureMemberPath([root], path.split('.'));
+
+/** Lax `==` against a string: true when any item is that string. */
+const holds = (root: unknown, path: string, value: string): boolean => at(root, path).includes(value);
+
+/**
+ * Classifies a plain-data snapshot for a thread erasure listing at the same
+ * locations as {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH}: `thread`
+ * when it records the thread id, `other` when it records only other thread
+ * ids, `unattributed` when it records none. Pass the row's workflow name so
+ * agent-network rows are also read at
+ * {@link WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH}. Storage adapters
+ * without SQL/JSON path support (the in-memory store) use this on a detached copy.
+ */
+export function classifyWorkflowSnapshotThreadErasure(
+  snapshot: unknown,
+  threadId: string,
+  workflowName?: string,
+): WorkflowThreadErasureRowClass {
+  const durable = holds(snapshot, 'context.input.__workflowKind', 'durable-agent');
+  const network =
+    workflowName !== undefined && WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS.includes(workflowName);
+  return classifyThreadErasureValues(
+    [
+      ...(network ? at(snapshot, 'context.input.threadId') : []),
+      ...at(snapshot, 'context.*!input.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
+      ...at(snapshot, 'context.*!input.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
+      ...(durable
+        ? [
+            'context.input.messageListState.memoryInfo.threadId',
+            'context.input.state.threadId',
+            'context.*.output.messageListState.memoryInfo.threadId',
+            'context.*.output.state.threadId',
+            'context.*.payload.messageListState.memoryInfo.threadId',
+            'context.*.payload.state.threadId',
+            'result.messageListState.memoryInfo.threadId',
+            'result.state.threadId',
+            'result.output.messageListState.memoryInfo.threadId',
+            'result.output.state.threadId',
+          ].flatMap(path => at(snapshot, path))
+        : []),
+      ...at(snapshot, 'requestContext.MastraMemory.thread.id'),
+      ...at(snapshot, 'requestContext.mastra__threadId'),
+    ],
+    threadId,
+  );
+}
+
+/**
+ * Classifies a plain-data terminal recovery envelope at the same locations as
+ * {@link WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH}.
+ */
+export function classifyWorkflowTerminalEnvelopeThreadErasure(
+  envelope: unknown,
+  threadId: string,
+): WorkflowThreadErasureRowClass {
+  const durable = holds(envelope, 'workflowName', DURABLE_AGENTIC_LOOP_WORKFLOW);
+  return classifyThreadErasureValues(
+    [
+      ...(durable
+        ? [
+            ...at(envelope, 'terminalResult.output.messageListState.memoryInfo.threadId'),
+            ...at(envelope, 'terminalResult.output.state.threadId'),
+          ]
+        : []),
+    ],
+    threadId,
+  );
+}
+
+function classifyThreadErasureValues(found: unknown[], threadId: string): WorkflowThreadErasureRowClass {
+  const values = found.filter((value): value is string => typeof value === 'string');
+  const others = values.some(value => value !== threadId);
+  if (values.includes(threadId)) return others ? 'mixed' : 'thread';
+  return others ? 'other' : 'unattributed';
+}
+
+/**
+ * The keys a content-free snapshot may hold: the shell `createRun` persists
+ * before a run starts. Structural keys may hold any value; the others must be
+ * empty (see {@link isWorkflowSnapshotThreadErasureContentFree}).
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS = Object.freeze({
+  /** Run bookkeeping and the static step graph; never run data. */
+  structural: Object.freeze([
+    'runId',
+    'executionGeneration',
+    'lifecycleResumeAttempt',
+    'status',
+    'activePaths',
+    'activeStepsPath',
+    'stepExecutionPath',
+    'serializedStepGraph',
+    'suspendedPaths',
+    'resumeLabels',
+    'waitingPaths',
+    'timestamp',
+  ]),
+  /** Must be absent, `null` or `{}`. */
+  emptyObject: Object.freeze(['value', 'requestContext', 'lifecycleStepStates']),
+  /** Must be absent or `null`. */
+  nullOnly: Object.freeze(['result', 'error']),
+  /** Absent, `null` or `{}`, or only an `input` that is `null` or `{}`. */
+  context: 'context',
+} as const);
+
+/**
+ * The `contentFree` rule of an unattributed thread erasure entry: the
+ * snapshot is a JSON object holding only the keys of
+ * {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS}, with `value`,
+ * `requestContext` and `lifecycleStepStates` absent, `null` or `{}`; `result`
+ * and `error` absent or `null`; and `context` absent, `null` or `{}`, or only
+ * an `input` that is `null` or `{}`. Any other shape, any other key, or a
+ * non-object snapshot is not content-free. `{}` means a plain object with no
+ * fields; a class instance with no own fields (a `Date`) counts as content,
+ * as its JSON form does. Accessors are not run (an accessor counts as content).
+ */
+export function isWorkflowSnapshotThreadErasureContentFree(snapshot: unknown): boolean {
+  if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
+  const field = (holder: object, key: string): { present: boolean; value?: unknown; accessor?: boolean } => {
+    const descriptor = Object.getOwnPropertyDescriptor(holder, key);
+    if (!descriptor || !descriptor.enumerable) return { present: false };
+    if (!('value' in descriptor)) return { present: true, accessor: true };
+    return descriptor.value === undefined ? { present: false } : { present: true, value: descriptor.value };
+  };
+  // Only a plain object can be empty: a class instance (a Date, a URL, a
+  // Buffer) has no own keys but serializes to content, so it counts as content.
+  const isPlainObject = (value: unknown): value is object => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+    const prototype: unknown = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  };
+  if (!isPlainObject(snapshot)) return false;
+  const presentKeys = (holder: object) => Object.keys(holder).filter(key => field(holder, key).present);
+  const isEmptyObject = (value: unknown): boolean => isPlainObject(value) && presentKeys(value).length === 0;
+  const nullOrEmpty = (entry: { present: boolean; value?: unknown; accessor?: boolean }): boolean =>
+    !entry.present || (!entry.accessor && (entry.value === null || isEmptyObject(entry.value)));
+  const { structural, emptyObject, nullOnly, context: contextKey } = WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS;
+  const allowed = new Set<string>([...structural, ...emptyObject, ...nullOnly, contextKey]);
+  const keys = presentKeys(snapshot);
+  if (keys.some(key => !allowed.has(key))) return false;
+  // A structural accessor is still never run, but counts as content.
+  if (structural.some(key => field(snapshot, key).accessor)) return false;
+  if (!emptyObject.every(key => nullOrEmpty(field(snapshot, key)))) return false;
+  for (const key of nullOnly) {
+    const entry = field(snapshot, key);
+    if (entry.present && (entry.accessor || entry.value !== null)) return false;
+  }
+  const context = field(snapshot, contextKey);
+  if (nullOrEmpty(context)) return true;
+  if (context.accessor || !isPlainObject(context.value)) return false;
+  const contextValue = context.value;
+  const contextKeys = presentKeys(contextValue);
+  return contextKeys.length === 1 && contextKeys[0] === 'input' && nullOrEmpty(field(contextValue, 'input'));
+}
+
 /** Orders closure cursors by code point, matching PostgreSQL's `COLLATE "C"` keyset. */
 export function compareWorkflowRunClosureCursors(
   left: { workflowName: string; runId: string },

@@ -95,8 +95,14 @@ import type {
   ListWorkflowSnapshotHandoffsResult,
   DeleteWorkflowRunClosureInput,
   DeleteWorkflowRunClosureResult,
+  CancelWorkflowRunForErasureInput,
+  CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
+  ListWorkflowRunsByThreadForErasureInput,
+  ListWorkflowRunsByThreadForErasureResult,
+  WorkflowRunThreadErasureEntry,
+  WorkflowRunThreadErasureRows,
   WorkflowRunClosureEntry,
   WorkflowExecutionState,
   UpdateWorkflowResultsResult,
@@ -125,6 +131,13 @@ import {
   isSettledWorkflowRunStatus,
   validateWorkflowRunClosureIdentity,
   captureWorkflowRunClosureListInput,
+  captureWorkflowRunThreadErasureListInput,
+  classifyWorkflowSnapshotThreadErasure,
+  classifyWorkflowTerminalEnvelopeThreadErasure,
+  isWorkflowSnapshotThreadErasureContentFree,
+  type WorkflowThreadErasureRowClass,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS,
+  workflowRunThreadErasureSharedRunIds,
 } from '../../workflow-snapshot-handoff';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
@@ -208,6 +221,171 @@ import {
 /** @internal Exported for testing only. */
 export function cloneRunData<T>(value: T): T {
   return deepCloneForRun(value, new Map()) as T;
+}
+
+/**
+ * A structural copy that never invokes a caller accessor: data properties are copied
+ * recursively, accessors are copied as accessors. An accessor read on the copy
+ * then mutates the copy, never the stored row.
+ */
+function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  const known = seen.get(value);
+  if (known !== undefined) return known;
+  // Collections are copied entry by entry through the same memo, so their
+  // entries are detached too and references shared with the rest of the
+  // payload stay shared.
+  if (value instanceof Map) {
+    const map = new Map<unknown, unknown>();
+    seen.set(value, map);
+    for (const [key, entry] of value) map.set(detachedErasureCopy(key, seen), detachedErasureCopy(entry, seen));
+    return map;
+  }
+  if (value instanceof Set) {
+    const set = new Set<unknown>();
+    seen.set(value, set);
+    for (const entry of value) set.add(detachedErasureCopy(entry, seen));
+    return set;
+  }
+  // An error keeps its prototype; its own fields are detached through the
+  // same memo (a `cause` shared with the payload stays shared). V8's lazy
+  // `stack` accessor is recognized by identity, read on the error itself,
+  // and kept as data.
+  if (value instanceof Error) {
+    const error: object = Object.create(Object.getPrototypeOf(value));
+    seen.set(value, error);
+    // Every own key, symbols included (an SDK error's brand is one).
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (const name of Reflect.ownKeys(descriptors)) {
+      const descriptor = descriptors[name as keyof typeof descriptors] as PropertyDescriptor;
+      if (!('value' in descriptor) && descriptor.get && descriptor.get !== NATIVE_ERROR_STACK_GET) {
+        // A caller accessor is copied as an accessor and read later, on the copy.
+        Object.defineProperty(error, name, { ...descriptor, configurable: true });
+        continue;
+      }
+      let field: unknown;
+      try {
+        // V8's recognized lazy `stack` accessor needs the real error to read.
+        field = 'value' in descriptor ? descriptor.value : (value as unknown as Record<PropertyKey, unknown>)[name];
+      } catch {
+        continue;
+      }
+      Object.defineProperty(error, name, {
+        value: detachedErasureCopy(field, seen),
+        writable: true,
+        enumerable: descriptor.enumerable ?? false,
+        configurable: true,
+      });
+    }
+    return error;
+  }
+  // Other built-ins keep their payload in internal slots that a prototype
+  // shell would lose: copy them with cloneRunData, as an ordinary persist
+  // does, so an accessor run on the detached copy can only change the copy.
+  if (
+    value instanceof Date ||
+    value instanceof RegExp ||
+    value instanceof URL ||
+    value instanceof ArrayBuffer ||
+    ArrayBuffer.isView(value)
+  ) {
+    const copy = cloneRunData(value);
+    seen.set(value, copy);
+    return copy;
+  }
+  const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, copy);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  // Every own key, symbols included, through the same memo.
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = (descriptors as Record<PropertyKey, PropertyDescriptor>)[key]!;
+    if ('value' in descriptor) descriptor.value = detachedErasureCopy(descriptor.value, seen);
+  }
+  Object.defineProperties(copy, descriptors);
+  return copy;
+}
+
+/** Reads a field once on a detached copy; an accessor that throws yields `undefined`. */
+function readErasureField(owner: object, name: string): unknown {
+  try {
+    return (owner as Record<string, unknown>)[name];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A run selected for erasure is stored and checked as plain data. Its
+ * top-level fields, own or inherited, are read once on a detached copy with
+ * `status` first and pinned, so no caller accessor runs inside a fenced
+ * check-then-write and a later read sees the value that was checked. The
+ * fields are then copied with cloneRunData, so every payload keeps what an
+ * ordinary persist keeps (binary data, dates, maps, errors with their stack,
+ * fields set to `undefined`).
+ */
+function plainErasureSnapshot<T>(value: T): T {
+  const copy = detachedErasureCopy(value);
+  if (copy === null || typeof copy !== 'object' || Array.isArray(copy)) return cloneRunData(copy) as T;
+  const record = copy as Record<string, unknown>;
+  const status = readErasureField(record, 'status');
+  try {
+    Object.defineProperty(record, 'status', { value: status, writable: true, enumerable: true, configurable: true });
+  } catch {
+    // A non-configurable own accessor stays; `status` below is still the value read.
+  }
+  // Then each other top-level field once, including one the status accessor
+  // introduced; an accessor that throws leaves its field out. Own fields keep
+  // their enumerability (non-enumerable own data included, symbols too);
+  // inherited enumerable fields become own enumerable ones. Fields are
+  // defined, never assigned, so a `__proto__` key stays a field.
+  const fields: Record<string, unknown> = {};
+  const names = new Map<PropertyKey, boolean>();
+  const own = Object.getOwnPropertyDescriptors(record);
+  for (const name of Reflect.ownKeys(own)) {
+    const descriptor = (own as Record<PropertyKey, PropertyDescriptor>)[name]!;
+    if (descriptor.enumerable || 'value' in descriptor) names.set(name, descriptor.enumerable ?? false);
+  }
+  for (
+    let level: object | null = Object.getPrototypeOf(record);
+    level && level !== Object.prototype;
+    level = Object.getPrototypeOf(level)
+  ) {
+    // Every inherited enumerable key, symbols included.
+    const inherited = Object.getOwnPropertyDescriptors(level);
+    for (const name of Reflect.ownKeys(inherited)) {
+      const descriptor = (inherited as Record<PropertyKey, PropertyDescriptor>)[name]!;
+      if (descriptor.enumerable && !names.has(name)) names.set(name, true);
+    }
+  }
+  names.delete('status');
+  for (const [name, enumerable] of names) {
+    let field: unknown;
+    try {
+      field = (record as Record<PropertyKey, unknown>)[name];
+    } catch {
+      continue;
+    }
+    Object.defineProperty(fields, name, { value: field, writable: true, enumerable, configurable: true });
+  }
+  // Non-enumerable own accessors are kept as accessors and never run, as
+  // cloneRunData keeps them on an ordinary persist.
+  const accessors = Object.getOwnPropertyDescriptors(record);
+  for (const name of Reflect.ownKeys(accessors)) {
+    const descriptor = (accessors as Record<PropertyKey, PropertyDescriptor>)[name]!;
+    if (name === 'status' || descriptor.enumerable || 'value' in descriptor) continue;
+    Object.defineProperty(fields, name, { ...descriptor, configurable: true });
+  }
+  Object.defineProperty(fields, 'status', { value: status, writable: true, enumerable: true, configurable: true });
+  // One clone memo for the whole snapshot, so references shared between
+  // fields (symbol-keyed ones included) stay shared.
+  const memo = new Map<object, unknown>();
+  const plain = deepCloneForRun(fields, memo) as Record<PropertyKey, unknown>;
+  for (const key of Object.getOwnPropertySymbols(fields)) {
+    if (Object.prototype.hasOwnProperty.call(plain, key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(fields, key)!;
+    Object.defineProperty(plain, key, { ...descriptor, value: deepCloneForRun(descriptor.value, memo) });
+  }
+  return plain as T;
 }
 
 // JSON.stringify serializes an enumerable getter's return value as a fresh
@@ -556,7 +734,14 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1, closureDeleteVersion: 1 };
+    return {
+      handoffVersion: 1,
+      recoveryVersion: 1,
+      releaseVersion: 1,
+      closureDeleteVersion: 1,
+      closureCancelVersion: 1,
+      threadErasureListVersion: 1,
+    };
   }
 
   private getWorkflowSnapshotHandoff(workflowName: string, runId: string): WorkflowSnapshotHandoffRecord | undefined {
@@ -633,11 +818,24 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // toJSON/getters, so no caller code may run between the check and the
       // map write. The clone preserves prototypes, so `resourceId` can reach
       // an inherited getter — capture it before the check as well.
-      const storedSnapshot = updatedSnapshot ? cloneRunData(updatedSnapshot) : undefined;
+      // The erasure fence: a resume admission, rollback, finalization or step
+      // update that would give a cancelled or settled-selected run another
+      // status is refused before anything is written; such a run's snapshot
+      // is stored as plain data, so the checked status is the stored one.
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      const storedSnapshot = updatedSnapshot
+        ? revision?.erasureCancelled
+          ? plainErasureSnapshot(updatedSnapshot)
+          : cloneRunData(updatedSnapshot)
+        : undefined;
       const storedResourceId = storedSnapshot?.resourceId;
+      const fencedStatus = revision?.erasureCancelled && storedSnapshot ? storedSnapshot.status : undefined;
       if (this.db.workflows.get(key) !== existing) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      if (revision?.erasureCancelled && storedSnapshot && fencedStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
       if (storedSnapshot && existing) {
         this.setWorkflowRunRecord(workflowName, runId, {
@@ -882,12 +1080,23 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // A run whose kept parent revision outlived its snapshot was deleted or
     // had its closure erased; a late writer must not recreate terminal rows
     // for it. A child that has never been persisted has no revision yet.
-    if (this.db.workflowTerminalParentRevisions.has(key) && !this.db.workflows.has(key)) {
+    const childRun = this.db.workflows.get(key);
+    const childGeneration = this.db.workflowTerminalParentRevisions.get(key)?.generation;
+    if (childGeneration !== undefined && !childRun) {
       return { status: 'missing_run' };
     }
+    // What each parent looked like when checked: re-verified right before the
+    // commit, since reading a parent's graph can run caller code (a getter)
+    // that cancels or rewrites the parent in between.
+    const checkedParents: { key: string; run: StorageWorkflowRun | undefined; generation: number | undefined }[] = [];
     for (const frame of desired.ancestry) {
       const parentKey = this.getWorkflowKey(frame.parentWorkflowName, frame.parentRunId);
       const parentRevision = this.db.workflowTerminalParentRevisions.get(parentKey);
+      checkedParents.push({
+        key: parentKey,
+        run: this.db.workflows.get(parentKey),
+        generation: parentRevision?.generation,
+      });
       if (parentRevision?.terminalStatus) {
         throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
       }
@@ -927,8 +1136,28 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         return { status: 'ancestry_conflict' };
       }
     }
-    this.db.workflowTerminalRecoveryAncestries.set(key, copyWorkflowTerminalRecoveryAncestryRecord(desired));
-    return { status: 'persisted', record: copyWorkflowTerminalRecoveryAncestryRecord(desired) };
+    const storedRecord = copyWorkflowTerminalRecoveryAncestryRecord(desired);
+    const returnedRecord = copyWorkflowTerminalRecoveryAncestryRecord(desired);
+    for (const checked of checkedParents) {
+      const revision = this.db.workflowTerminalParentRevisions.get(checked.key);
+      if (
+        this.db.workflows.get(checked.key) !== checked.run ||
+        revision?.generation !== checked.generation ||
+        revision?.terminalStatus
+      ) {
+        throw new TypeError('Workflow terminal recovery ancestry parent evidence is unavailable');
+      }
+    }
+    // A parent getter can erase and reuse the child identity too. Do not
+    // attach this old admission to a different lifetime under the same key.
+    if (
+      this.db.workflows.get(key) !== childRun ||
+      this.db.workflowTerminalParentRevisions.get(key)?.generation !== childGeneration
+    ) {
+      return { status: 'missing_run' };
+    }
+    this.db.workflowTerminalRecoveryAncestries.set(key, storedRecord);
+    return { status: 'persisted', record: returnedRecord };
   }
 
   async getWorkflowTerminalRecoveryAncestry(
@@ -1036,16 +1265,26 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   private bumpParentRevision(key: string): void {
-    const existing = this.db.workflowTerminalParentRevisions.get(key);
-    const generation = (existing?.generation ?? 0) + 1;
-    if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
-    const snapshot = this.db.workflows.get(key)?.snapshot;
-    const status = snapshot && typeof snapshot !== 'string' ? snapshot.status : undefined;
-    this.db.workflowTerminalParentRevisions.set(key, {
-      ...existing,
-      generation,
-      terminalStatus: existing?.terminalStatus ?? (isTerminalParentStatus(status) ? status : null),
-    });
+    for (let attempt = 1; ; attempt++) {
+      const run = this.db.workflows.get(key);
+      const snapshot = run?.snapshot;
+      const status = snapshot && typeof snapshot !== 'string' ? snapshot.status : undefined;
+      if (this.db.workflows.get(key) !== run) {
+        throwIfWorkflowReentrantAttemptsExhausted(attempt);
+        continue;
+      }
+      // A status getter can cancel or replace this row. Advance the latest
+      // revision only after the status and row lifetime have been checked.
+      const existing = this.db.workflowTerminalParentRevisions.get(key);
+      const generation = (existing?.generation ?? 0) + 1;
+      if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
+      this.db.workflowTerminalParentRevisions.set(key, {
+        ...existing,
+        generation,
+        terminalStatus: existing?.terminalStatus ?? (isTerminalParentStatus(status) ? status : null),
+      });
+      return;
+    }
   }
 
   private latchParentTerminalStatus(key: string, terminalStatus: TerminalParentStatus): void {
@@ -2105,9 +2344,10 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // The erased lifetime's terminal latch must not carry over: a reused run
     // id starts running again. The generation still moves forward.
     const kept = this.db.workflowTerminalParentRevisions.get(key);
-    if (kept && kept.terminalStatus !== null) {
+    if (kept && (kept.terminalStatus !== null || kept.erasureCancelled)) {
+      const { erasureCancelled: _erasureCancelled, ...unlatched } = kept;
       this.db.workflowTerminalParentRevisions.set(key, {
-        ...kept,
+        ...unlatched,
         generation: snapshotDeleted ? kept.generation : kept.generation + 1,
         terminalStatus: null,
       });
@@ -2116,6 +2356,104 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       status: 'deleted',
       removed: { snapshot: snapshotDeleted, handoff: handoff !== undefined, terminalRows },
     };
+  }
+
+  async cancelWorkflowRunForErasure(
+    input: CancelWorkflowRunForErasureInput,
+  ): Promise<CancelWorkflowRunForErasureResult> {
+    const { workflowName, runId, expectedResourceId } = input;
+    validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    const key = this.getWorkflowKey(workflowName, runId);
+    // As in deleteWorkflowRunClosure: read the stored status first and restart
+    // if a reentrant getter changed the run. From the captures below to the
+    // write no caller code runs, so no other call interleaves.
+    let run: StorageWorkflowRun | undefined;
+    let runStatus: unknown;
+    let canonical: WorkflowRunState | undefined;
+    for (let attempt = 1; ; attempt++) {
+      run = this.db.workflows.get(key);
+      const snapshot = run ? (typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot) : undefined;
+      // Read the status from plain data made on a detached copy: an accessor
+      // then runs once on the copy, never on the stored row, so a refusal
+      // leaves the run unchanged and a selected run keeps the checked value.
+      canonical = snapshot && typeof snapshot === 'object' ? plainErasureSnapshot(snapshot) : undefined;
+      runStatus = canonical?.status;
+      if (this.db.workflows.get(key) === run) break;
+      throwIfWorkflowReentrantAttemptsExhausted(attempt);
+    }
+    if (!run) return { status: 'missing' };
+    const handoff = this.db.workflowSnapshotHandoffs.get(key);
+    const terminalSnapshot = this.db.workflowTerminalSnapshots.get(key);
+    const owners = [run, handoff, terminalSnapshot].filter(row => row !== undefined);
+    if (owners.some(row => row.resourceId !== expectedResourceId)) return { status: 'resource_mismatch' };
+    // The fence persistWorkflowSnapshot enforces: any unreleased handoff.
+    if (handoff && handoff.releasedAt === undefined) return { status: 'fenced' };
+    if (this.db.workflowTerminalizations.has(key)) return { status: 'journaled' };
+    if (this.hasPendingTerminalDependents(workflowName, runId)) return { status: 'active' };
+    if (isSettledWorkflowRunStatus(runStatus)) {
+      // Erasure also selects already-settled runs. Keep their payload, but
+      // arm the late-write fence the PostgreSQL latch enforces, so a queued
+      // write cannot reopen them before closure deletion: the revision exists
+      // and is latched to the checked status before it is marked.
+      if (!isTerminalParentStatus(runStatus)) return { status: 'settled' };
+      const existing = this.db.workflowTerminalParentRevisions.get(key);
+      // A latch that disagrees with the settled status, with no journal and
+      // no pending child left: an ordinary write reopened the run and it
+      // settled again differently (this store allows that, PostgreSQL does
+      // not). The checked status is the run's settlement, so the latch moves.
+      const generation =
+        existing === undefined ? 1 : existing.generation + (existing.terminalStatus === runStatus ? 0 : 1);
+      if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
+      // Pin the checked status as data on the stored snapshot, so the closure
+      // delete reads the settled status this answer latches. Nothing else in
+      // the stored snapshot changes (its fields, accessors and shared
+      // references stay as an ordinary persist left them); only a snapshot
+      // whose status cannot be redefined is replaced by the checked copy. The
+      // row wrapper is replaced either way, so a write that read the row
+      // before this selection restarts and meets the fence.
+      let selectedSnapshot = run.snapshot;
+      if (selectedSnapshot !== null && typeof selectedSnapshot === 'object') {
+        try {
+          Object.defineProperty(selectedSnapshot, 'status', {
+            value: runStatus,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+        } catch {
+          if (canonical) selectedSnapshot = canonical;
+        }
+      }
+      this.setWorkflowRunRecord(workflowName, runId, { ...run, snapshot: selectedSnapshot });
+      this.db.workflowTerminalParentRevisions.set(key, {
+        ...existing,
+        generation,
+        terminalStatus: runStatus,
+        erasureCancelled: true,
+      });
+      return { status: 'settled' };
+    }
+    // A latched terminal status with an unsettled snapshot, no journal and no
+    // pending dependent: in this store an ordinary write reopened the run
+    // after it settled (the latch outlives such a write here, unlike in the
+    // PostgreSQL store, which refuses the reopen). Nothing is left to settle
+    // it, so it is cancelled like any other unsettled run, and the latch moves
+    // to `canceled`.
+    this.setWorkflowRunRecord(workflowName, runId, {
+      ...run,
+      snapshot: { ...createEmptyWorkflowSnapshot(runId), status: 'canceled' },
+      updatedAt: new Date(),
+    });
+    this.bumpParentRevision(key);
+    const latched = this.db.workflowTerminalParentRevisions.get(key);
+    if (latched) {
+      this.db.workflowTerminalParentRevisions.set(key, {
+        ...latched,
+        terminalStatus: 'canceled',
+        erasureCancelled: true,
+      });
+    }
+    return { status: 'cancelled' };
   }
 
   async listWorkflowRunClosuresByResource(
@@ -2155,6 +2493,129 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     return {
       status: 'listed',
       closures,
+      hasMore,
+      ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
+    };
+  }
+
+  async listWorkflowRunsByThreadForErasure(
+    input: ListWorkflowRunsByThreadForErasureInput,
+  ): Promise<ListWorkflowRunsByThreadForErasureResult> {
+    const { resourceId, threadId, after, limit, includeUnattributed } = captureWorkflowRunThreadErasureListInput(input);
+    type Candidate = {
+      workflowName: string;
+      runId: string;
+      rows: WorkflowRunThreadErasureRows;
+      matched: boolean;
+      anyThread: boolean;
+      canonical?: { snapshot: unknown; createdAt: Date; updatedAt: Date };
+    };
+    const candidates = new Map<string, Candidate>();
+    const candidateFor = (workflowName: string, runId: string): Candidate | undefined => {
+      if (after && compareWorkflowRunClosureCursors({ workflowName, runId }, after) <= 0) return undefined;
+      const key = this.getWorkflowKey(workflowName, runId);
+      let candidate = candidates.get(key);
+      if (!candidate) {
+        candidate = {
+          workflowName,
+          runId,
+          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'absent' },
+          matched: false,
+          anyThread: false,
+        };
+        candidates.set(key, candidate);
+      }
+      return candidate;
+    };
+    const note = (
+      candidate: Candidate,
+      row: keyof WorkflowRunThreadErasureRows,
+      attribution: WorkflowThreadErasureRowClass,
+    ) => {
+      candidate.rows[row] = attribution;
+      if (attribution === 'thread' || attribution === 'mixed') candidate.matched = true;
+      if (attribution !== 'unattributed') candidate.anyThread = true;
+    };
+    // Every row that can hold a copy of the run's data is read, each as a
+    // detached copy (as a database would read it back), so a live object
+    // graph is never walked in place.
+    for (const run of this.db.workflows.values()) {
+      if (run.resourceId !== resourceId) continue;
+      const candidate = candidateFor(run.workflow_name, run.run_id);
+      if (!candidate) continue;
+      const snapshot: unknown = cloneRunData(
+        typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot,
+      );
+      candidate.canonical = { snapshot, createdAt: new Date(run.createdAt), updatedAt: new Date(run.updatedAt) };
+      note(candidate, 'snapshot', classifyWorkflowSnapshotThreadErasure(snapshot, threadId, run.workflow_name));
+    }
+    for (const record of this.db.workflowSnapshotHandoffs.values()) {
+      if (record.resourceId !== resourceId) continue;
+      const candidate = candidateFor(record.workflowName, record.runId);
+      if (!candidate) continue;
+      note(
+        candidate,
+        'handoff',
+        classifyWorkflowSnapshotThreadErasure(cloneRunData(record.snapshot), threadId, record.workflowName),
+      );
+    }
+    for (const record of this.db.workflowTerminalSnapshots.values()) {
+      if (record.resourceId !== resourceId) continue;
+      const candidate = candidateFor(record.workflowName, record.runId);
+      if (!candidate) continue;
+      note(
+        candidate,
+        'terminalSnapshot',
+        classifyWorkflowTerminalEnvelopeThreadErasure(cloneRunData(record.envelope), threadId),
+      );
+    }
+    // The resource's canonical snapshots by run id, for `sharesRunIdWith`.
+    const workflowNamesByRunId = new Map<string, string[]>();
+    for (const run of this.db.workflows.values()) {
+      if (run.resourceId !== resourceId) continue;
+      const names = workflowNamesByRunId.get(run.run_id) ?? [];
+      names.push(run.workflow_name);
+      workflowNamesByRunId.set(run.run_id, names);
+    }
+    const loopInfo = (workflowName: string, runId: string) => ({
+      loopInternal: WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS.includes(workflowName),
+      sharesRunIdWith: workflowRunThreadErasureSharedRunIds(workflowName, workflowNamesByRunId.get(runId) ?? []),
+    });
+    const matches: WorkflowRunThreadErasureEntry[] = [];
+    for (const candidate of candidates.values()) {
+      const { workflowName, runId, rows } = candidate;
+      if (candidate.matched) {
+        matches.push({ workflowName, runId, attribution: 'thread', rows, ...loopInfo(workflowName, runId) });
+      } else if (includeUnattributed && !candidate.anyThread && candidate.canonical) {
+        const { snapshot, createdAt, updatedAt } = candidate.canonical;
+        const statusField =
+          snapshot !== null && typeof snapshot === 'object'
+            ? Object.getOwnPropertyDescriptor(snapshot, 'status')
+            : undefined;
+        const status = statusField && 'value' in statusField ? statusField.value : undefined;
+        matches.push({
+          workflowName,
+          runId,
+          attribution: 'unattributed',
+          rows,
+          ...loopInfo(workflowName, runId),
+          ...(typeof status === 'string' ? { status } : {}),
+          createdAt,
+          updatedAt,
+          contentFree:
+            rows.handoff === 'absent' &&
+            rows.terminalSnapshot === 'absent' &&
+            isWorkflowSnapshotThreadErasureContentFree(snapshot),
+        });
+      }
+    }
+    matches.sort(compareWorkflowRunClosureCursors);
+    const runs = matches.slice(0, limit);
+    const hasMore = matches.length > limit;
+    const last = runs.at(-1);
+    return {
+      status: 'listed',
+      runs,
       hasMore,
       ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
     };
@@ -2200,27 +2661,31 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // Cloning the stored snapshot can invoke caller toJSON/getters that
       // reenter these maps. Re-read the source row before writing and restart
       // if a reentrant write changed it mid-computation.
+      // A run selected for erasure admits no new nested child: the closure
+      // delete could not see a transient child bound now.
+      if (this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled) return { status: 'missing_run' };
       const snapshot = cloneRunData(typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot);
       const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
       if (ownership.status === 'ownership_conflict') return ownership;
-      if (ownership.status === 'already_bound') {
-        return { status: 'already_bound', stepResults: cloneRunData(ownership.snapshot.context) };
-      }
-      const storedSnapshot = cloneRunData(ownership.snapshot);
+      // Every copy is made before the checks below: cloning can run caller
+      // code that reenters the store, even to select this run for erasure.
+      const storedSnapshot = ownership.status === 'bound' ? cloneRunData(ownership.snapshot) : undefined;
+      const stepResults = cloneRunData((storedSnapshot ?? ownership.snapshot).context);
       if (this.db.workflows.get(key) !== run) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
       }
+      // Both results, `already_bound` included, are rechecked against the
+      // erasure fence: a selection made while cloning refuses the bind too.
+      if (this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled) return { status: 'missing_run' };
+      if (!storedSnapshot) return { status: 'already_bound', stepResults };
       this.setWorkflowRunRecord(operation.workflowName, operation.runId, {
         ...run,
         snapshot: storedSnapshot,
         updatedAt: new Date(),
       });
       this.bumpParentRevision(key);
-      return {
-        status: 'bound',
-        stepResults: cloneRunData(storedSnapshot.context),
-      };
+      return { status: 'bound', stepResults };
     }
   }
 
@@ -2563,10 +3028,18 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // Clone before the final source check so no caller code runs between
       // the check and the map write; restart if a reentrant write changed the
       // source row so the CAS merge never overwrites a newer record.
-      const storedSnapshot = cloneRunData(working);
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      // A run selected for erasure is checked and stored as plain data, so no
+      // retained accessor runs between the check and the map write.
+      const storedSnapshot = revision?.erasureCancelled ? plainErasureSnapshot(working) : cloneRunData(working);
+      const returnedContext = revision?.erasureCancelled ? cloneRunData(storedSnapshot.context) : undefined;
+      const snapshotStatus = revision?.erasureCancelled ? storedSnapshot.status : undefined;
       if (this.db.workflows.get(key) !== run) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
 
       this.setWorkflowRunRecord(workflowName, runId, {
@@ -2575,7 +3048,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       });
       this.bumpParentRevision(key);
 
-      return cloneRunData(storedSnapshot.context);
+      return revision?.erasureCancelled ? returnedContext! : cloneRunData(storedSnapshot.context);
     }
   }
 
@@ -2676,12 +3149,21 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         nextSnapshot.value = cloneRunData(canonicalFinalState) as WorkflowRunState['value'];
         nextSnapshot.timestamp = finalTimestamp;
       }
-      const storedSnapshot = cloneRunData(nextSnapshot);
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      const storedSnapshot = revision?.erasureCancelled
+        ? plainErasureSnapshot(nextSnapshot)
+        : cloneRunData(nextSnapshot);
+      const snapshotStatus = revision?.erasureCancelled ? storedSnapshot.status : undefined;
       // Caller code above may reenter this map; restart if the source row
       // changed so the CAS merge never overwrites a newer record.
       if (this.db.workflows.get(key) !== run) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      // A late state update must respect the same erasure-only terminal
+      // fence as a snapshot persist, without reopening the canceled row.
+      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
       this.setWorkflowRunRecord(workflowName, runId, {
         ...run,
@@ -2729,17 +3211,29 @@ export class WorkflowsInMemory extends WorkflowsStorage {
             : typeof existing.snapshot === 'string'
               ? (JSON.parse(existing.snapshot) as WorkflowRunState)
               : existing.snapshot;
-        if (storedSnapshot?.executionGeneration !== expectedExecutionGeneration) {
+        const guardedSnapshot = this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled
+          ? plainErasureSnapshot(storedSnapshot)
+          : storedSnapshot;
+        if (guardedSnapshot?.executionGeneration !== expectedExecutionGeneration) {
           throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
         }
       }
-      // Cloning the caller snapshot can invoke toJSON/getters that reenter
-      // this map; restart if a reentrant write changed the row so a persisted
+      // Cloning the caller snapshot and reading an inherited status getter
+      // can reenter this map; restart if either changed the row so a persisted
       // snapshot never silently overwrites a newer record.
-      const clonedSnapshot = cloneRunData(snapshot);
+      const revision = this.db.workflowTerminalParentRevisions.get(key);
+      const clonedSnapshot = revision?.erasureCancelled ? plainErasureSnapshot(snapshot) : cloneRunData(snapshot);
+      const snapshotStatus = revision?.erasureCancelled ? clonedSnapshot?.status : undefined;
       if (this.db.workflows.get(key) !== existing) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
+      }
+      // An erasure cancel's `canceled` latch refuses a snapshot whose status
+      // disagrees, before anything is written, as the PostgreSQL store's
+      // parent revision bump refuses it: a queued engine write cannot reopen
+      // a cancelled run.
+      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
+        throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
       const data: StorageWorkflowRun = {
         workflow_name: workflowName,
@@ -2787,13 +3281,18 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     workflowName: string;
     runId: string;
   }): Promise<WorkflowExecutionState | null> {
-    const stored = this.db.workflows.get(this.getWorkflowKey(workflowName, runId));
+    const key = this.getWorkflowKey(workflowName, runId);
+    const stored = this.db.workflows.get(key);
     if (!stored) return null;
 
-    // In-memory workflow rows already hold the snapshot object. Read only the
-    // authority fields so lifecycle checks do not clone the full state.
-    const snapshot = typeof stored.snapshot === 'string' ? JSON.parse(stored.snapshot) : stored.snapshot;
-    if (!snapshot) return null;
+    const storedSnapshot = typeof stored.snapshot === 'string' ? JSON.parse(stored.snapshot) : stored.snapshot;
+    if (!storedSnapshot) return null;
+    // Ordinary lifecycle reads avoid cloning the full state. For an erased
+    // lifetime, retained authority getters must receive a clone so they cannot
+    // mutate the live canceled snapshot.
+    const snapshot = this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled
+      ? plainErasureSnapshot(storedSnapshot)
+      : storedSnapshot;
     return {
       status: snapshot.status,
       ...(snapshot.executionGeneration === undefined ? {} : { executionGeneration: snapshot.executionGeneration }),

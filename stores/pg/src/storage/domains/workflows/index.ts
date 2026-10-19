@@ -81,6 +81,21 @@ import {
   validateWorkflowSnapshotHandoffLimit,
   validateWorkflowRunClosureIdentity,
   captureWorkflowRunClosureListInput,
+  captureWorkflowRunThreadErasureListInput,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH,
+  WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH,
+  WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH,
+  WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_OTHER_THREAD_PATH,
+  WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_OTHER_THREAD_PATH,
+  WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT,
+  WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
+  WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
+  createEmptyWorkflowSnapshot,
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
@@ -164,9 +179,15 @@ import type {
   ListWorkflowSnapshotHandoffsResult,
   DeleteWorkflowRunClosureInput,
   DeleteWorkflowRunClosureResult,
+  CancelWorkflowRunForErasureInput,
+  CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
+  ListWorkflowRunsByThreadForErasureInput,
+  ListWorkflowRunsByThreadForErasureResult,
   WorkflowRunClosureEntry,
+  WorkflowRunThreadErasureEntry,
+  WorkflowRunThreadErasureRowAttribution,
   WorkflowTerminalRecoveryAncestryRecord,
   TABLE_NAMES,
   PruneOptions,
@@ -509,7 +530,14 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
-    return { handoffVersion: 1, recoveryVersion: 1, releaseVersion: 1, closureDeleteVersion: 1 };
+    return {
+      handoffVersion: 1,
+      recoveryVersion: 1,
+      releaseVersion: 1,
+      closureDeleteVersion: 1,
+      closureCancelVersion: 1,
+      threadErasureListVersion: 1,
+    };
   }
 
   private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
@@ -4544,6 +4572,23 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
   }
 
+  /**
+   * The snapshot as jsonb, for any supported column type. Legacy json/text
+   * columns go through the same escape sanitizing as the status reads, so a
+   * stored `\u0000` or unpaired surrogate cannot fail the cast.
+   */
+  private workflowSnapshotJsonbExpression(snapshotColumnType: string, columnReference: string): string {
+    if (snapshotColumnType === 'jsonb') {
+      return columnReference;
+    }
+    if (snapshotColumnType === 'json' || snapshotColumnType === 'text') {
+      return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb`;
+    }
+    throw new TypeError(
+      `Workflow snapshot read does not support snapshot column type ${snapshotColumnType || 'missing'}`,
+    );
+  }
+
   private sanitizedWorkflowSnapshotStatusExpression(columnReference: string): string {
     return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'status'`;
   }
@@ -5348,6 +5393,10 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (!revisionLock) {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
+        // A terminal parent (latched, as an erasure cancel latches `canceled`)
+        // admits no new nested child: the closure delete could not see a
+        // transient child bound now.
+        if (revisionLock.terminalStatus !== null) return { status: 'missing_run' };
         const revision = revisionLock.generation;
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
         const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
@@ -6153,6 +6202,96 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
+  async cancelWorkflowRunForErasure(
+    input: CancelWorkflowRunForErasureInput,
+  ): Promise<CancelWorkflowRunForErasureResult> {
+    const { workflowName, runId, expectedResourceId } = input;
+    validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    const identity = [workflowName, runId];
+    try {
+      return await this.#db.client.tx(async t => {
+        // The locks deleteWorkflowRunClosure takes, in its order: the terminal
+        // journal's advisory lock (journal writers take it before their row
+        // locks), the parent revision, the handoff row, the run snapshot, the
+        // journal row. A journal or a nested child admitted after these checks
+        // waits for this transaction.
+        await t.none(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [JSON.stringify(identity)]);
+        // First snapshot creation does not take the advisory lock. Linearize
+        // missing here, before reading revision evidence, without adding a lock.
+        const snapshotExists = await t.oneOrNone<{ present: boolean }>(
+          `SELECT TRUE AS present FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2`,
+          identity,
+        );
+        if (!snapshotExists) return { status: 'missing' };
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        const handoff = await this.lockWorkflowSnapshotHandoff(t, workflowName, runId);
+        const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(t);
+        const snapshot = await t.oneOrNone<{ resource_id: string | null; status: string | null }>(
+          `SELECT "resourceId" AS resource_id,
+                  ${this.workflowSnapshotStatusExpression(snapshotColumnType, 'snapshot')} AS status
+           FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        if (!snapshot) return { status: 'missing' };
+        const journal = await t.oneOrNone<{ present: boolean }>(
+          `SELECT TRUE AS present FROM ${this.terminalizationTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+        const terminalSnapshot = await t.oneOrNone<{ resource_id: string | null }>(
+          `SELECT resource_id FROM ${this.terminalSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          identity,
+        );
+
+        const owners = [
+          snapshot.resource_id,
+          handoff ? (handoff.resourceId ?? null) : undefined,
+          terminalSnapshot?.resource_id,
+        ].filter(owner => owner !== undefined);
+        if (owners.some(owner => owner !== expectedResourceId)) return { status: 'resource_mismatch' };
+        // The fence persistWorkflowSnapshot enforces: any unreleased handoff.
+        if (handoff && handoff.releasedAt === undefined) return { status: 'fenced' };
+        // A journal's owner settles the run; it is never overwritten here.
+        if (journal) return { status: 'journaled' };
+        // A nested child that has not completed its terminal journal still
+        // applies its result to this run's snapshot.
+        if (await this.hasPendingTerminalDependents(t, workflowName, runId)) return { status: 'active' };
+        // Missing revision evidence is corruption whatever the status: the
+        // closure delete a `settled` answer leads to would refuse it too.
+        if (!revision) throw new TypeError('Workflow snapshot is missing parent revision evidence');
+        if (isSettledWorkflowRunStatus(snapshot.status)) return { status: 'settled' };
+        // A latched terminal status the snapshot does not show yet: its
+        // settlement is in flight.
+        if (revision.terminalStatus !== null) return { status: 'active' };
+
+        // The snapshot write persistWorkflowSnapshot makes, without changing
+        // the row's resource, then the same parent revision bump (which
+        // latches the `canceled` terminal status).
+        const canceled: WorkflowRunState = { ...createEmptyWorkflowSnapshot(runId), status: 'canceled' };
+        const now = new Date();
+        await t.none(
+          `UPDATE ${this.workflowSnapshotTableName()}
+           SET snapshot = $3, "updatedAt" = $4, "updatedAtZ" = $5
+           WHERE workflow_name = $1 AND run_id = $2`,
+          [
+            workflowName,
+            runId,
+            snapshotColumnType === 'jsonb' ? toPgJson(canceled) : sanitizeJsonForPg(JSON.stringify(canceled)),
+            now,
+            now,
+          ],
+        );
+        await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
+        return { status: 'cancelled' };
+      });
+    } catch (error) {
+      throw this.snapshotHandoffError('CANCEL_WORKFLOW_RUN_FOR_ERASURE', workflowName, runId, error);
+    }
+  }
+
   async listWorkflowRunClosuresByResource(
     input: ListWorkflowRunClosuresByResourceInput,
   ): Promise<ListWorkflowRunClosuresByResourceResult> {
@@ -6344,6 +6483,236 @@ export class WorkflowsPG extends WorkflowsStorage {
     } catch (error) {
       throw this.#ownershipError('GET_RUN_OWNERSHIP', runId, error);
     }
+  }
+
+  async listWorkflowRunsByThreadForErasure(
+    input: ListWorkflowRunsByThreadForErasureInput,
+  ): Promise<ListWorkflowRunsByThreadForErasureResult> {
+    const { resourceId, threadId, after, limit, includeUnattributed } = captureWorkflowRunThreadErasureListInput(input);
+    const contentFreeShape = WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS;
+    const contentFreeKeys = [
+      ...contentFreeShape.structural,
+      ...contentFreeShape.emptyObject,
+      ...contentFreeShape.nullOnly,
+      contentFreeShape.context,
+    ];
+    const values: unknown[] = [
+      resourceId,
+      threadId,
+      WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH,
+      WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH,
+      WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH,
+      WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH,
+      includeUnattributed,
+      contentFreeKeys,
+      [...WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS],
+      WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
+      WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
+      WORKFLOW_SNAPSHOT_THREAD_ERASURE_OTHER_THREAD_PATH,
+      WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_OTHER_THREAD_PATH,
+      WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_OTHER_THREAD_PATH,
+    ];
+    let afterParams: [string, string] | undefined;
+    if (after) {
+      values.push(after.workflowName, after.runId);
+      afterParams = [`$${values.length - 1}`, `$${values.length}`];
+    }
+    const keyset = (alias: string) =>
+      afterParams
+        ? `AND (${alias}.workflow_name COLLATE "C", ${alias}.run_id COLLATE "C") > (${afterParams[0]}, ${afterParams[1]})`
+        : '';
+    values.push(limit + 1);
+    const limitParam = `$${values.length}`;
+    let rows: Array<{
+      workflow_name: string;
+      run_id: string;
+      matched: boolean;
+      any_thread: boolean;
+      snapshot_row: string | null;
+      handoff_row: string | null;
+      terminal_snapshot_row: string | null;
+      status: string | null;
+      createdAt: Date | string | null;
+      createdAtZ: Date | string | null;
+      updatedAt: Date | string | null;
+      updatedAtZ: Date | string | null;
+      snapshot_content_free: boolean;
+      shares_run_id_with: string[];
+    }>;
+    try {
+      const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
+      const snapshotJson = this.workflowSnapshotJsonbExpression(snapshotColumnType, 'snapshot.snapshot');
+      // A legacy snapshot table may predate the timezone-aware mirror columns.
+      const [hasCreatedAtZ, hasUpdatedAtZ] = await Promise.all([
+        this.#db.hasColumn(TABLE_WORKFLOW_SNAPSHOT, 'createdAtZ'),
+        this.#db.hasColumn(TABLE_WORKFLOW_SNAPSHOT, 'updatedAtZ'),
+      ]);
+      const timestampZ = (column: 'createdAtZ' | 'updatedAtZ') =>
+        (column === 'createdAtZ' ? hasCreatedAtZ : hasUpdatedAtZ)
+          ? `snapshot."${column}"`
+          : `NULL::timestamptz AS "${column}"`;
+      const emptyOrNull = (expression: string) =>
+        `(${expression} IS NULL OR ${expression} = 'null'::jsonb OR ${expression} = '{}'::jsonb)`;
+      const threadVars = `jsonb_build_object('t', $2::text)`;
+      const nullOnly = (expression: string) => `(${expression} IS NULL OR ${expression} = 'null'::jsonb)`;
+      const field = (key: string) => `snapshot_json -> '${key}'`;
+      // The createRun shell only: a JSON object with allowlisted keys whose
+      // run-data keys are empty. Any other root or key is content.
+      const contentFree = `CASE WHEN jsonb_typeof(snapshot_json) = 'object' THEN (
+          NOT EXISTS (
+            SELECT 1 FROM jsonb_object_keys(snapshot_json) AS present(key) WHERE NOT (present.key = ANY($8::text[]))
+          )
+          AND ${contentFreeShape.emptyObject.map(key => emptyOrNull(field(key))).join(' AND ')}
+          AND ${contentFreeShape.nullOnly.map(key => nullOnly(field(key))).join(' AND ')}
+          AND (${emptyOrNull(field('context'))}
+            OR (jsonb_typeof(${field('context')}) = 'object'
+              AND (${field('context')}) - 'input' = '{}'::jsonb
+              AND ${emptyOrNull(`${field('context')} -> 'input'`)}))
+        ) ELSE FALSE END`;
+      // Agent-network rows also record the thread in their input.
+      const snapshotMatch = (alias: string, json: string) =>
+        `(jsonb_path_exists(${json}, $3::jsonpath, ${threadVars})
+          OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $10::jsonpath, ${threadVars})))`;
+      const snapshotOtherThread = (alias: string, json: string) =>
+        `(jsonb_path_exists(${json}, $12::jsonpath, ${threadVars})
+          OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $13::jsonpath, ${threadVars})))`;
+      const snapshotAnyThread = (alias: string, json: string) =>
+        `(jsonb_path_exists(${json}, $4::jsonpath)
+          OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $11::jsonpath)))`;
+      // Every row that can hold a copy of the run's data is read: the
+      // canonical snapshot, the handoff snapshot (kept, released or not, after
+      // the canonical row is deleted) and the terminal recovery envelope. Each
+      // row's thread match is one jsonb_path_exists with the thread id bound
+      // as a jsonpath variable (never interpolated). Each branch reads its
+      // table's resource index; the run is attributed by all of its rows.
+      // The page's runs, then (in the same statement, so the same snapshot of
+      // the data) the other workflow names holding a canonical snapshot of
+      // each run id under the resource, from one resource-index scan.
+      rows = await this.#db.client.any(
+        `WITH page AS (
+         SELECT workflow_name COLLATE "C" AS workflow_name, run_id COLLATE "C" AS run_id,
+                bool_or(matched) AS matched,
+                bool_or(any_thread) AS any_thread,
+                max(row_attribution) FILTER (WHERE kind = 'snapshot') AS snapshot_row,
+                max(row_attribution) FILTER (WHERE kind = 'handoff') AS handoff_row,
+                max(row_attribution) FILTER (WHERE kind = 'terminal_snapshot') AS terminal_snapshot_row,
+                max(status) AS status,
+                max("createdAt") AS "createdAt", max("createdAtZ") AS "createdAtZ",
+                max("updatedAt") AS "updatedAt", max("updatedAtZ") AS "updatedAtZ",
+                bool_or(snapshot_content_free) AS snapshot_content_free
+         FROM (
+           SELECT workflow_name, run_id, 'snapshot' AS kind,
+                  ${snapshotMatch('canonical', 'snapshot_json')} AS matched,
+                  ${snapshotAnyThread('canonical', 'snapshot_json')} AS any_thread,
+                  ${snapshotOtherThread('canonical', 'snapshot_json')} AS other_thread,
+                  CASE WHEN jsonb_typeof(snapshot_json -> 'status') = 'string' THEN snapshot_json ->> 'status' END
+                    AS status,
+                  "createdAt", "createdAtZ", "updatedAt", "updatedAtZ",
+                  ${contentFree} AS snapshot_content_free
+           FROM (
+             SELECT snapshot.workflow_name COLLATE "C" AS workflow_name, snapshot.run_id COLLATE "C" AS run_id,
+                    snapshot."createdAt", ${timestampZ('createdAtZ')}, snapshot."updatedAt", ${timestampZ('updatedAtZ')},
+                    -- A snapshot stored as a JSON string is read back as the
+                    -- object it encodes, as the store's own reads JSON.parse it.
+                    CASE WHEN jsonb_typeof(raw.snapshot_raw) = 'string' THEN (raw.snapshot_raw #>> '{}')::jsonb
+                         ELSE raw.snapshot_raw END AS snapshot_json
+             FROM ${this.workflowSnapshotTableName()} AS snapshot
+             CROSS JOIN LATERAL (SELECT ${snapshotJson} AS snapshot_raw) AS raw
+             WHERE snapshot."resourceId" = $1 ${keyset('snapshot')}
+           ) AS canonical
+           UNION ALL
+           SELECT handoff.workflow_name COLLATE "C", handoff.run_id COLLATE "C", 'handoff',
+                  ${snapshotMatch('handoff', 'handoff.snapshot')},
+                  ${snapshotAnyThread('handoff', 'handoff.snapshot')},
+                  ${snapshotOtherThread('handoff', 'handoff.snapshot')},
+                  NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
+           FROM ${this.workflowSnapshotHandoffTableName()} AS handoff
+           WHERE handoff.resource_id = $1 ${keyset('handoff')}
+           UNION ALL
+           SELECT terminal.workflow_name COLLATE "C", terminal.run_id COLLATE "C", 'terminal_snapshot',
+                  jsonb_path_exists(terminal.envelope, $5::jsonpath, ${threadVars}),
+                  jsonb_path_exists(terminal.envelope, $6::jsonpath),
+                  jsonb_path_exists(terminal.envelope, $14::jsonpath, ${threadVars}),
+                  NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
+           FROM ${this.terminalSnapshotTableName()} AS terminal
+           WHERE terminal.resource_id = $1 ${keyset('terminal')}
+         ) AS run_row_matches
+         CROSS JOIN LATERAL (
+           SELECT CASE WHEN matched AND other_thread THEN 'mixed' WHEN matched THEN 'thread'
+                       WHEN any_thread THEN 'other' ELSE 'unattributed' END
+             AS row_attribution
+         ) AS attributed
+         GROUP BY workflow_name COLLATE "C", run_id COLLATE "C"
+         HAVING bool_or(matched)
+             OR ($7::boolean AND bool_or(kind = 'snapshot') AND NOT bool_or(any_thread))
+         ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
+         LIMIT ${limitParam}
+         ), siblings AS (
+           SELECT sibling.run_id COLLATE "C" AS run_id, sibling.workflow_name COLLATE "C" AS workflow_name
+           FROM ${this.workflowSnapshotTableName()} AS sibling
+           WHERE sibling."resourceId" = $1 AND sibling.run_id IN (SELECT page.run_id FROM page)
+         )
+         SELECT page.*,
+                ARRAY(
+                  SELECT siblings.workflow_name FROM siblings
+                  WHERE siblings.run_id = page.run_id AND siblings.workflow_name <> page.workflow_name
+                  ORDER BY siblings.workflow_name COLLATE "C"
+                  LIMIT ${WORKFLOW_RUN_THREAD_ERASURE_SHARED_RUN_ID_LIMIT}
+                ) AS shares_run_id_with
+         FROM page
+         ORDER BY page.workflow_name COLLATE "C", page.run_id COLLATE "C"`,
+        values,
+      );
+    } catch (error) {
+      throw this.snapshotHandoffError('LIST_WORKFLOW_RUNS_BY_THREAD_FOR_ERASURE', undefined, undefined, error, {
+        write: false,
+      });
+    }
+    const rowAttribution = (value: string | null): WorkflowRunThreadErasureRowAttribution => {
+      if (value === null) return 'absent';
+      if (value === 'thread' || value === 'mixed' || value === 'other' || value === 'unattributed') return value;
+      throw new TypeError('Invalid workflow thread erasure row attribution');
+    };
+    const runs = rows.slice(0, limit).map((row): WorkflowRunThreadErasureEntry => {
+      const recorded = {
+        snapshot: rowAttribution(row.snapshot_row),
+        handoff: rowAttribution(row.handoff_row),
+        terminalSnapshot: rowAttribution(row.terminal_snapshot_row),
+      };
+      const loopInfo = {
+        loopInternal: WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS.includes(row.workflow_name),
+        sharesRunIdWith: [...row.shares_run_id_with],
+      };
+      if (row.matched) {
+        return {
+          workflowName: row.workflow_name,
+          runId: row.run_id,
+          attribution: 'thread',
+          rows: recorded,
+          ...loopInfo,
+        };
+      }
+      return {
+        workflowName: row.workflow_name,
+        runId: row.run_id,
+        attribution: 'unattributed',
+        rows: recorded,
+        ...loopInfo,
+        ...(row.status === null ? {} : { status: row.status }),
+        createdAt: new Date((row.createdAtZ || row.createdAt) as Date | string),
+        updatedAt: new Date((row.updatedAtZ || row.updatedAt) as Date | string),
+        contentFree:
+          row.snapshot_content_free === true && recorded.handoff === 'absent' && recorded.terminalSnapshot === 'absent',
+      };
+    });
+    const hasMore = rows.length > limit;
+    const last = runs.at(-1);
+    return {
+      status: 'listed',
+      runs,
+      hasMore,
+      ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
+    };
   }
 
   async updateWorkflowResults({
