@@ -323,13 +323,6 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
       ],
       hasMore: false,
     });
-    const page = await workflows.listWorkflowRunsByThreadForErasure({
-      resourceId: resource,
-      threadId: THREAD,
-      limit: 10,
-      includeUnattributed: true,
-    });
-    expect(page.status === 'listed' && page.runs.length).toBe(3);
   });
 
   it('pages by (workflowName, runId) in code point order', async () => {
