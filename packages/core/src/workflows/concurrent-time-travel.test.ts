@@ -217,7 +217,9 @@ describe('concurrent time travel', () => {
     const storage = new MockStore();
     const workflowsStore = storage.stores.workflows as any;
     vi.spyOn(workflowsStore, 'supportsConcurrentUpdates').mockReturnValue(false);
-    vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(() => {
+    // Declared capability, as the D1/KV/DO, ClickHouse and LanceDB adapters do.
+    workflowsStore.supportsWorkflowStateUpdate = () => false;
+    const updateSpy = vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(() => {
       throw new Error('updateWorkflowState is not implemented for Cloudflare D1 storage.');
     });
 
@@ -226,6 +228,7 @@ describe('concurrent time travel', () => {
 
     expect(result.status).toBe('suspended');
     expect(harness.getWorkExecutions()).toBe(1);
+    expect(updateSpy).not.toHaveBeenCalled();
   });
 
   it('releases the claim when the engine fails before executing anything', async () => {

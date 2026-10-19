@@ -82,6 +82,14 @@ export class WorkflowsStorageD1 extends WorkflowsStorage {
     return false;
   }
 
+  /**
+   * PapersFlow fork: this adapter does not implement `updateWorkflowState`, so lifecycle
+   * claims (restart/timeTravel) install the claimed generation through the snapshot.
+   */
+  supportsWorkflowStateUpdate(): boolean {
+    return false;
+  }
+
   async init(): Promise<void> {
     await this.#db.createTable({ tableName: TABLE_WORKFLOW_SNAPSHOT, schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT] });
     await this.#db.createTable({

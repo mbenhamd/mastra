@@ -38,11 +38,11 @@ export async function claimWorkflowRestart({
 
   const concurrentCas = workflowsStore.supportsConcurrentUpdates();
   if (!concurrentCas) {
-    // No compare-and-set: install the fresh generation unconditionally. Stores such as
-    // Cloudflare D1/KV/DO, ClickHouse and LanceDB do not implement `updateWorkflowState`
-    // at all; on those the claim writes the adopted lineage through the snapshot instead,
-    // so restart()/timeTravel() keep working there (upstream #27313 skips the claim).
-    try {
+    // No compare-and-set: install the fresh generation unconditionally. Adapters that
+    // declare they do not implement `updateWorkflowState` (Cloudflare D1/KV/DO, ClickHouse,
+    // LanceDB) get the adopted lineage through the snapshot instead, so restart()/timeTravel()
+    // keep working there (upstream #27313 skips the claim).
+    if (supportsWorkflowStateUpdate(workflowsStore)) {
       await workflowsStore.updateWorkflowState({
         workflowName: workflowId,
         runId,
@@ -53,8 +53,7 @@ export async function claimWorkflowRestart({
           lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
         },
       });
-    } catch (error) {
-      if (!isUpdateWorkflowStateUnsupported(error)) throw error;
+    } else {
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflowId,
         runId,
@@ -105,9 +104,15 @@ export async function claimWorkflowRestart({
   });
 }
 
-/** Adapters that cannot read-modify-write report `updateWorkflowState is not implemented ...`. */
-function isUpdateWorkflowStateUnsupported(error: unknown): boolean {
-  return error instanceof Error && /updateWorkflowState is not implemented/.test(error.message);
+/**
+ * Whether the adapter implements `updateWorkflowState`. Adapters without it (Cloudflare
+ * D1/KV/DO, ClickHouse, LanceDB) declare `supportsWorkflowStateUpdate(): false`; an
+ * adapter that does not declare the capability is assumed to implement the method, and
+ * any error it throws still propagates.
+ */
+function supportsWorkflowStateUpdate(workflowsStore: WorkflowsStorage): boolean {
+  const declared = (workflowsStore as { supportsWorkflowStateUpdate?: () => boolean }).supportsWorkflowStateUpdate;
+  return typeof declared === 'function' ? declared.call(workflowsStore) !== false : true;
 }
 
 /**
