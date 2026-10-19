@@ -272,9 +272,10 @@ describe('Agent objective methods', () => {
       }),
     ).resolves.toMatchObject({ status: 'paused', pausedReason: 'waiting for user review' });
 
-    await expect(
-      agent.updateObjectiveOptions({ threadId: THREAD, resourceId: RESOURCE, status: 'active' }),
-    ).resolves.toMatchObject({ status: 'active', pausedReason: undefined });
+    // Upstream clears the cause by dropping the key; either form leaves no pause reason.
+    const resumed = await agent.updateObjectiveOptions({ threadId: THREAD, resourceId: RESOURCE, status: 'active' });
+    expect(resumed).toMatchObject({ status: 'active' });
+    expect(resumed?.pausedReason).toBeUndefined();
   });
 
   it('updateObjectiveOptions persists the pause cause and clears it when the goal leaves paused', async () => {
