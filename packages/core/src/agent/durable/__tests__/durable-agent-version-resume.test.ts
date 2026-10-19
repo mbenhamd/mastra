@@ -205,7 +205,8 @@ describe('durable agent version pinning across suspend/resume', () => {
     // Before, the pinned fork's resume() found the marker still held by this
     // call, failed with AGENT_RESUME_ALREADY_CLAIMED, and the run fell back to
     // the current definition.
-    const result = await durableAgent.resume(runId, { approved: true }, { toolCallId: 'call-1' });
+    // PapersFlow fork: a cold resume must prove the run's thread/resource owner (coldOwner).
+    const result = await durableAgent.resume(runId, { approved: true }, { ...coldOwner, toolCallId: 'call-1' });
 
     expect(resolveSpy).toHaveBeenCalledTimes(1);
     const fork = (await resolveSpy.mock.results[0]!.value) as DurableAgent;

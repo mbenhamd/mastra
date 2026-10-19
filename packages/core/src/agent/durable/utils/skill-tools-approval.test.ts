@@ -57,7 +57,12 @@ describe('approval-exempt (skill) tools', () => {
     const wrapped = { ...tool };
     if (isApprovalExempt(tool)) markApprovalExempt(wrapped);
     await expect(verdict(wrapped, true)).resolves.toBe(false);
-    await expect(verdict({ ...tool }, true)).resolves.toBe(true);
+    // PapersFlow fork: the marker is an enumerable symbol, so a plain spread copy of an exempt
+    // tool (durable private preparation, tool-hook wrap) stays exempt too; upstream's
+    // non-enumerable marker is dropped by the spread.
+    await expect(verdict({ ...tool }, true)).resolves.toBe(false);
+    // A tool that was never marked stays gated.
+    await expect(verdict({ ...buildTool({ exempt: false }) }, true)).resolves.toBe(true);
   });
 
   it('non-exempt tools with requireApproval: false are still gated by the global flag', async () => {

@@ -74,7 +74,11 @@ const APPROVAL_EXEMPT = Symbol.for('mastra.tool.approvalExempt');
  * tool-call concurrency or eager execution the way a `requireApproval` function would.
  */
 export function markApprovalExempt(tool: object): void {
-  Object.defineProperty(tool, APPROVAL_EXEMPT, { value: true, enumerable: false });
+  // PapersFlow fork: enumerable (still a symbol, so invisible to Object.keys, JSON and provider
+  // serialization) so the marker survives the fork's `{ ...tool }` copies (durable private
+  // preparation, tool-hook wrap/unwrap), like the fork's processor-loaded tool provenance marker.
+  // Upstream #27296 uses a non-enumerable marker and re-applies it after each spread.
+  Object.defineProperty(tool, APPROVAL_EXEMPT, { value: true, enumerable: true });
 }
 
 export function isApprovalExempt(tool: unknown): boolean {

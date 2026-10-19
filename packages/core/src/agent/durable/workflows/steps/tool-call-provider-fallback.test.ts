@@ -63,10 +63,12 @@ afterEach(() => {
 
 describe('durable tool-call provider-tool fallback', () => {
   it.each([
-    { label: 'a value', expectedResult: { snippet: 'result' } },
-    { label: 'undefined', expectedResult: undefined },
-  ])('resolves a provider-defined tool by its model-facing name when it returns $label', async ({ expectedResult }) => {
-    const executeMock = vi.fn().mockResolvedValue(expectedResult);
+    { label: 'a value', returned: { snippet: 'result' }, expectedResult: { snippet: 'result' } },
+    // Upstream #27392 (adopted): a tool that ran and returned nothing is recorded as `null`,
+    // so the loop does not read it as an unexecuted client call.
+    { label: 'undefined', returned: undefined, expectedResult: null },
+  ])('resolves a provider-defined tool by its model-facing name when it returns $label', async ({ returned, expectedResult }) => {
+    const executeMock = vi.fn().mockResolvedValue(returned);
     // Provider-defined tool: JS key `webSearch`, model-facing id `openai.web_search`
     // The LLM emits `web_search`, which doesn't match the JS key.
     globalRunRegistry.set(RUN_ID, {
@@ -222,12 +224,13 @@ describe('durable tool-call provider-tool fallback', () => {
   });
 
   it.each([
-    { label: 'a value', expectedResult: { snippet: 'web-result' } },
-    { label: 'undefined', expectedResult: undefined },
+    { label: 'a value', returned: { snippet: 'web-result' }, expectedResult: { snippet: 'web-result' } },
+    // Upstream #27392 (adopted): a void result is recorded as `null`.
+    { label: 'undefined', returned: undefined, expectedResult: null },
   ])(
     'falls back to a Mastra-wide provider tool when run registry and resolveTool miss and it returns $label',
-    async ({ expectedResult }) => {
-      const executeMock = vi.fn().mockResolvedValue(expectedResult);
+    async ({ returned, expectedResult }) => {
+      const executeMock = vi.fn().mockResolvedValue(returned);
       const mastraTools = {
         webSearch: {
           type: 'provider-defined',

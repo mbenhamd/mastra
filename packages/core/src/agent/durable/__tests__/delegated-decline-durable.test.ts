@@ -189,6 +189,34 @@ describe('durable delegated approval decline (#26994)', () => {
     expect(text).toBe(SUPERVISOR_ANSWER);
   };
 
+  // PapersFlow fork: the upstream case below runs cross-process, which PF-1875 refuses; this
+  // warm-process variant pins the fork port of #27374 (a delegated decline reaches the sub-agent).
+  it('forwards a declined delegated approval on the same process', async () => {
+    const storage = new InMemoryStore();
+    const memoryStorage = new InMemoryStore();
+    const memory = { thread: 'durable-decline-warm-thread', resource: 'durable-decline-warm-resource' };
+    const toolExecutions = { count: 0 };
+    const captured: Captured = { subAgentPrompts: [], supervisorPrompts: [] };
+
+    const mockMemory = new MockMemory({ storage: memoryStorage });
+    const durableAgent = createDurableAgent({ agent: buildSupervisor(mockMemory, toolExecutions, captured), pubsub });
+    new Mastra({ agents: { durableAgent }, storage, logger: false });
+
+    const result = await durableAgent.stream('Get the secret', { memory, maxSteps: 5 });
+    await readUntilApproval(result.fullStream);
+    await waitForSuspended(storage, result.runId);
+    const entry = await getApprovalEntry(mockMemory, memory);
+    expect(entry.delegatedRunId).toBeDefined();
+
+    const resumed = await durableAgent.declineToolCall({
+      runId: entry.runId,
+      toolCallId: entry.toolCallId,
+      reason: DECLINE_REASON,
+      memory,
+    });
+    assertForwardedDecline(await drain(resumed.fullStream), toolExecutions, captured);
+  }, 30000);
+
   it('forwards a declined delegated approval on a fresh process over the same storage', async () => {
     const storage = new InMemoryStore();
     const memoryStorage = new InMemoryStore();
@@ -216,13 +244,21 @@ describe('durable delegated approval decline (#26994)', () => {
       });
       new Mastra({ agents: { durableAgent: durableAgent2 }, storage, logger: false });
 
-      const resumed = await durableAgent2.declineToolCall({
-        runId: entry.runId,
-        toolCallId: entry.toolCallId,
-        reason: DECLINE_REASON,
-        memory,
+      // PF-1875 (PF-5928 decision, option a): the fork refuses memory-backed cold recovery
+      // because request-local processor state is not persisted, so a fresh process cannot
+      // forward the decline; the warm-process case covers the forwarding (#26994).
+      await expect(
+        durableAgent2.declineToolCall({
+          runId: entry.runId,
+          toolCallId: entry.toolCallId,
+          reason: DECLINE_REASON,
+          memory,
+        }),
+      ).rejects.toMatchObject({
+        id: 'DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE',
+        message: expect.stringContaining('because request-local processor state was not persisted'),
       });
-      assertForwardedDecline(await drain(resumed.fullStream), toolExecutions, captured);
+      expect(toolExecutions.count).toBe(0);
     } finally {
       await pubsub2.close();
     }
