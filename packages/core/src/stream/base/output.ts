@@ -3332,6 +3332,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     if (!hasToolStep && !this.#wasSuspended && this.#options.resolveFinalPromises) {
       return this.#bufferedSteps.map(step => step.text).join('') + this.#bufferedByStep.text;
     }
+    // A step a processor tripwire rejected keeps its empty step text, and the run's
+    // text must not disclose the rejected reply either (#26048, #24443): read the
+    // text from the steps, as durable does, once any step was rejected.
+    if (!hasToolStep && !this.#wasSuspended && this.#bufferedSteps.some(step => step.tripwire !== undefined)) {
+      return this.#bufferedSteps.map(step => step.text).join('');
+    }
     return hasToolStep && !this.#wasSuspended && lastStep ? lastStep.text : this.#bufferedText.join('');
   }
 

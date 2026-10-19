@@ -70,13 +70,42 @@ export function pinGlobalRunRegistryEntry(runId: string): RunRegistryEntry | und
 }
 
 /** Release an exact active segment and restore its TTL entry when it remains resumable. */
-export function unpinGlobalRunRegistryEntry(runId: string, runtimeBindingId: string | undefined): void {
+export function unpinGlobalRunRegistryEntry(
+  runId: string,
+  runtimeBindingId: string | undefined,
+  /**
+   * The entry this segment pinned. A recovery reuses the run's persisted binding, so
+   * a crashed execution's late `finally` must not unpin the recovered entry (PF-5928).
+   */
+  expectedEntry?: RunRegistryEntry,
+): void {
   const pinned = pinnedRunRegistry.get(runId);
   if (!pinned || pinned.entry.runtimeBindingId !== runtimeBindingId) return;
+  if (expectedEntry !== undefined && pinned.entry !== expectedEntry) return;
   pinned.count -= 1;
   if (pinned.count > 0) return;
   pinnedRunRegistry.delete(runId);
   if (!globalRunRegistry.has(runId)) globalRunRegistry.set(runId, pinned.entry);
+}
+
+/**
+ * Evict the runtime binding of an execution that lost the run (its execution fence
+ * was abandoned or superseded), so a recovery of the same run in this process does
+ * not collide with its own crashed execution (PF-5928, #27357). Only this exact entry
+ * is removed; its late finalizers are identity-gated and cannot touch a successor.
+ */
+export function evictLostRunRegistryEntry(runId: string, entry: RunRegistryEntry): boolean {
+  if (!entry.executionFence?.isLost()) return false;
+  let evicted = false;
+  if (pinnedRunRegistry.get(runId)?.entry === entry) {
+    pinnedRunRegistry.delete(runId);
+    evicted = true;
+  }
+  if (globalRunRegistry.has(runId) && globalRunRegistry.get(runId) === entry) {
+    globalRunRegistry.delete(runId);
+    evicted = true;
+  }
+  return evicted;
 }
 
 /** Remove a pin during explicit terminal/consumer cleanup. */
@@ -334,12 +363,22 @@ export function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistry
   globalRunRegistry.set(runId, entry);
 }
 
-/** Delete only the entry owned by the caller; stale cleanup must not delete a newer binding. */
-export function deleteBoundRunRegistryEntry(runId: string, runtimeBindingId: string): boolean {
+/**
+ * Delete only the entry owned by the caller; stale cleanup must not delete a newer binding.
+ * `expectedEntry` additionally gates on entry identity: a recovery reuses the run's persisted
+ * binding, so a lost execution's late cleanup must not delete the recovered entry (PF-5928).
+ */
+export function deleteBoundRunRegistryEntry(
+  runId: string,
+  runtimeBindingId: string,
+  expectedEntry?: RunRegistryEntry,
+): boolean {
   const pinned = pinnedRunRegistry.get(runId);
   const cached = globalRunRegistry.get(runId);
-  const pinnedMatches = pinned?.entry.runtimeBindingId === runtimeBindingId;
-  const cachedMatches = cached?.runtimeBindingId === runtimeBindingId;
+  const pinnedMatches =
+    pinned?.entry.runtimeBindingId === runtimeBindingId && (expectedEntry === undefined || pinned.entry === expectedEntry);
+  const cachedMatches =
+    cached?.runtimeBindingId === runtimeBindingId && (expectedEntry === undefined || cached === expectedEntry);
   if (!pinnedMatches && !cachedMatches) return false;
 
   // Terminal cleanup can race the active segment's `finally`. Remove the

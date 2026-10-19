@@ -108,6 +108,7 @@ import { recordRunSavedMessages } from './run-message-refs';
 import {
   clearPinnedRunRegistryEntry,
   deleteBoundRunRegistryEntry,
+  evictLostRunRegistryEntry,
   endRunSpansWithError,
   ExtendedRunRegistry,
   getBoundRunRegistryEntry,
@@ -2588,7 +2589,7 @@ export class DurableAgent<
         }),
       );
     } finally {
-      unpinGlobalRunRegistryEntry(runId, workflowInput.runtimeBindingId);
+      unpinGlobalRunRegistryEntry(runId, workflowInput.runtimeBindingId, pinnedEntry);
     }
     await this.settleExecution(runId, executionFence, {
       status: result?.status,
@@ -4882,13 +4883,19 @@ export class DurableAgent<
           .finally(() => {
             if (this.#segmentOwner.get(runId) !== owner) return;
             this.#segmentOwner.delete(runId);
-            this.#cleanupBoundRun(runId, runtimeBindingId, { keepTopic: registryEntry.executionFence?.isLost() });
+            this.#cleanupBoundRun(runId, runtimeBindingId, {
+              keepTopic: registryEntry.executionFence?.isLost(),
+              expectedEntry: registryEntry,
+            });
           });
         return;
       }
       this.#segmentOwner.delete(runId);
       if (runtimeBindingId) {
-        this.#cleanupBoundRun(runId, runtimeBindingId, { keepTopic: registryEntry.executionFence?.isLost() });
+        this.#cleanupBoundRun(runId, runtimeBindingId, {
+          keepTopic: registryEntry.executionFence?.isLost(),
+          expectedEntry: registryEntry,
+        });
       }
     };
 
@@ -6014,7 +6021,7 @@ export class DurableAgent<
               await stopGoalActivity({ agentId: this.id, runId });
             }
           } finally {
-            unpinGlobalRunRegistryEntry(runId, activeEntry.runtimeBindingId);
+            unpinGlobalRunRegistryEntry(runId, activeEntry.runtimeBindingId, activeEntry);
           }
           // Terminal writes (failed/tripwire ERROR, snapshot cleanup) happen
           // only while this segment still owns the run.
@@ -6384,6 +6391,11 @@ export class DurableAgent<
       // owns this run ID. Reusing a run ID must never clear or terminate
       // another execution's signal.
       this.#coordinateRegistryCleanup(runId, registryEntry);
+      // PF-5928 (#27357): a local entry left by an execution of this run that already lost it
+      // (abandoned or superseded fence) is not a live owner; evict it so recovery does not
+      // collide with its own crashed execution. A live owner still collides.
+      const lostEntry = getGlobalRunRegistryEntry(runId);
+      if (lostEntry && lostEntry !== registryEntry) evictLostRunRegistryEntry(runId, lostEntry);
       this.#assertNoRegistryCollision(runId);
     } catch (error) {
       const settlement = await executionFence.settle(async () => {});
@@ -7805,9 +7817,16 @@ export class DurableAgent<
    * `keepTopic` leaves the run's topics in place when this execution lost the
    * run (#23734): whoever took it over, in any process, still writes to them.
    */
-  #cleanupBoundRun(runId: string, runtimeBindingId: string, { keepTopic = false }: { keepTopic?: boolean } = {}): void {
+  #cleanupBoundRun(
+    runId: string,
+    runtimeBindingId: string,
+    { keepTopic = false, expectedEntry }: { keepTopic?: boolean; expectedEntry?: RunRegistryEntry } = {},
+  ): void {
+    // A lost execution's late cleanup must not remove a successor that reused the binding.
+    const current = getGlobalRunRegistryEntry(runId);
+    if (expectedEntry !== undefined && current !== undefined && current !== expectedEntry) return;
     const cleanedLocal = this.#runRegistry.cleanupBound(runId, runtimeBindingId);
-    const cleanedGlobal = deleteBoundRunRegistryEntry(runId, runtimeBindingId);
+    const cleanedGlobal = deleteBoundRunRegistryEntry(runId, runtimeBindingId, expectedEntry);
     if ((cleanedLocal || cleanedGlobal) && !keepTopic) this.#clearPubsubTopic(runId, runtimeBindingId);
   }
 
