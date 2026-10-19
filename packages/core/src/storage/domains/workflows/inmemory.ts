@@ -2532,13 +2532,17 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot,
       );
       candidate.canonical = { snapshot, createdAt: new Date(run.createdAt), updatedAt: new Date(run.updatedAt) };
-      note(candidate, 'snapshot', classifyWorkflowSnapshotThreadErasure(snapshot, threadId));
+      note(candidate, 'snapshot', classifyWorkflowSnapshotThreadErasure(snapshot, threadId, run.workflow_name));
     }
     for (const record of this.db.workflowSnapshotHandoffs.values()) {
       if (record.resourceId !== resourceId) continue;
       const candidate = candidateFor(record.workflowName, record.runId);
       if (!candidate) continue;
-      note(candidate, 'handoff', classifyWorkflowSnapshotThreadErasure(cloneRunData(record.snapshot), threadId));
+      note(
+        candidate,
+        'handoff',
+        classifyWorkflowSnapshotThreadErasure(cloneRunData(record.snapshot), threadId, record.workflowName),
+      );
     }
     for (const record of this.db.workflowTerminalSnapshots.values()) {
       if (record.resourceId !== resourceId) continue;

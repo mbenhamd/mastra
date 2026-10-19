@@ -84,6 +84,10 @@ import {
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH,
   WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH,
   WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS,
+  WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
+  WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
   createEmptyWorkflowSnapshot,
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
@@ -6297,6 +6301,13 @@ export class WorkflowsPG extends WorkflowsStorage {
     input: ListWorkflowRunsByThreadForErasureInput,
   ): Promise<ListWorkflowRunsByThreadForErasureResult> {
     const { resourceId, threadId, after, limit, includeUnattributed } = captureWorkflowRunThreadErasureListInput(input);
+    const contentFreeShape = WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS;
+    const contentFreeKeys = [
+      ...contentFreeShape.structural,
+      ...contentFreeShape.emptyObject,
+      ...contentFreeShape.nullOnly,
+      contentFreeShape.context,
+    ];
     const values: unknown[] = [
       resourceId,
       threadId,
@@ -6305,6 +6316,10 @@ export class WorkflowsPG extends WorkflowsStorage {
       WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH,
       WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH,
       includeUnattributed,
+      contentFreeKeys,
+      [...WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS],
+      WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
+      WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
     ];
     let afterParams: [string, string] | undefined;
     if (after) {
@@ -6347,6 +6362,28 @@ export class WorkflowsPG extends WorkflowsStorage {
       const emptyOrNull = (expression: string) =>
         `(${expression} IS NULL OR ${expression} = 'null'::jsonb OR ${expression} = '{}'::jsonb)`;
       const threadVars = `jsonb_build_object('t', $2::text)`;
+      const nullOnly = (expression: string) => `(${expression} IS NULL OR ${expression} = 'null'::jsonb)`;
+      const field = (key: string) => `snapshot_json -> '${key}'`;
+      // The createRun shell only: a JSON object with allowlisted keys whose
+      // run-data keys are empty. Any other root or key is content.
+      const contentFree = `CASE WHEN jsonb_typeof(snapshot_json) = 'object' THEN (
+          NOT EXISTS (
+            SELECT 1 FROM jsonb_object_keys(snapshot_json) AS present(key) WHERE NOT (present.key = ANY($8::text[]))
+          )
+          AND ${contentFreeShape.emptyObject.map(key => emptyOrNull(field(key))).join(' AND ')}
+          AND ${contentFreeShape.nullOnly.map(key => nullOnly(field(key))).join(' AND ')}
+          AND (${emptyOrNull(field('context'))}
+            OR (jsonb_typeof(${field('context')}) = 'object'
+              AND (${field('context')}) - 'input' = '{}'::jsonb
+              AND ${emptyOrNull(`${field('context')} -> 'input'`)}))
+        ) ELSE FALSE END`;
+      // Agent-network rows also record the thread in their input.
+      const snapshotMatch = (alias: string, json: string) =>
+        `(jsonb_path_exists(${json}, $3::jsonpath, ${threadVars})
+          OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $10::jsonpath, ${threadVars})))`;
+      const snapshotAnyThread = (alias: string, json: string) =>
+        `(jsonb_path_exists(${json}, $4::jsonpath)
+          OR (${alias}.workflow_name = ANY($9::text[]) AND jsonb_path_exists(${json}, $11::jsonpath)))`;
       // Every row that can hold a copy of the run's data is read: the
       // canonical snapshot, the handoff snapshot (kept, released or not, after
       // the canonical row is deleted) and the terminal recovery envelope. Each
@@ -6366,26 +6403,27 @@ export class WorkflowsPG extends WorkflowsStorage {
                 bool_or(snapshot_content_free) AS snapshot_content_free
          FROM (
            SELECT workflow_name, run_id, 'snapshot' AS kind,
-                  jsonb_path_exists(snapshot_json, $3::jsonpath, ${threadVars}) AS matched,
-                  jsonb_path_exists(snapshot_json, $4::jsonpath) AS any_thread,
-                  snapshot_json ->> 'status' AS status,
+                  ${snapshotMatch('canonical', 'snapshot_json')} AS matched,
+                  ${snapshotAnyThread('canonical', 'snapshot_json')} AS any_thread,
+                  CASE WHEN jsonb_typeof(snapshot_json -> 'status') = 'string' THEN snapshot_json ->> 'status' END
+                    AS status,
                   "createdAt", "createdAtZ", "updatedAt", "updatedAtZ",
-                  (${emptyOrNull(`snapshot_json -> 'requestContext'`)}
-                    AND (${emptyOrNull(`snapshot_json -> 'context'`)}
-                      OR (jsonb_typeof(snapshot_json -> 'context') = 'object'
-                        AND (snapshot_json -> 'context') - 'input' = '{}'::jsonb
-                        AND ${emptyOrNull(`snapshot_json -> 'context' -> 'input'`)}))) AS snapshot_content_free
+                  ${contentFree} AS snapshot_content_free
            FROM (
              SELECT snapshot.workflow_name COLLATE "C" AS workflow_name, snapshot.run_id COLLATE "C" AS run_id,
                     snapshot."createdAt", ${timestampZ('createdAtZ')}, snapshot."updatedAt", ${timestampZ('updatedAtZ')},
-                    ${snapshotJson} AS snapshot_json
+                    -- A snapshot stored as a JSON string is read back as the
+                    -- object it encodes, as the store's own reads JSON.parse it.
+                    CASE WHEN jsonb_typeof(raw.snapshot_raw) = 'string' THEN (raw.snapshot_raw #>> '{}')::jsonb
+                         ELSE raw.snapshot_raw END AS snapshot_json
              FROM ${this.workflowSnapshotTableName()} AS snapshot
+             CROSS JOIN LATERAL (SELECT ${snapshotJson} AS snapshot_raw) AS raw
              WHERE snapshot."resourceId" = $1 ${keyset('snapshot')}
            ) AS canonical
            UNION ALL
            SELECT handoff.workflow_name COLLATE "C", handoff.run_id COLLATE "C", 'handoff',
-                  jsonb_path_exists(handoff.snapshot, $3::jsonpath, ${threadVars}),
-                  jsonb_path_exists(handoff.snapshot, $4::jsonpath),
+                  ${snapshotMatch('handoff', 'handoff.snapshot')},
+                  ${snapshotAnyThread('handoff', 'handoff.snapshot')},
                   NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
            FROM ${this.workflowSnapshotHandoffTableName()} AS handoff
            WHERE handoff.resource_id = $1 ${keyset('handoff')}

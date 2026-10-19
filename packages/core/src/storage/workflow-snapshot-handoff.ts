@@ -403,6 +403,9 @@ const SNAPSHOT_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
       '@.context.input.state.threadId',
       '@.context.*.output.messageListState.memoryInfo.threadId',
       '@.context.*.output.state.threadId',
+      // Running and suspended steps keep their input as `payload`.
+      '@.context.*.payload.messageListState.memoryInfo.threadId',
+      '@.context.*.payload.state.threadId',
       '@.result.messageListState.memoryInfo.threadId',
       '@.result.state.threadId',
       // persistWorkflowTerminalState stores the whole step result as `result`.
@@ -420,8 +423,20 @@ const TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
     // terminalResult is the child's step result; the loop output is its `output`.
     paths: ['@.terminalResult.output.messageListState.memoryInfo.threadId', '@.terminalResult.output.state.threadId'],
   },
-  { paths: ['@.requestContextPatch.MastraMemory.thread.id', '@.requestContextPatch."mastra__threadId"'] },
 ];
+
+/**
+ * The agent network's workflows (`loop/network`), which persist only when
+ * suspended and record the conversation thread in their input
+ * (`context.input.threadId`). A snapshot row's workflow name is a column,
+ * so adapters apply {@link WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH}
+ * only to rows of these workflows.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS: readonly string[] = Object.freeze([
+  'Agent-Network-Outer-Workflow',
+  'iteration-with-validation',
+  'agent-loop-main-workflow',
+]);
 
 const threadIdPredicate = (groups: readonly ThreadIdPathGroup[], test: (path: string) => string) =>
   `$ ? (${groups
@@ -452,11 +467,22 @@ export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(SNA
  */
 export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
 
+/** For a {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS} row: true when its input records the thread id bound to `t`. */
+export const WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath([
+  { paths: ['@.context.input.threadId'] },
+]);
+
+/** For a {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS} row: true when its input records any string thread id. */
+export const WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath([
+  { paths: ['@.context.input.threadId'] },
+]);
+
 /**
  * SQL/JSON path that is true when a terminal recovery envelope records the
- * thread id bound to `t`: its request-context patch (`MastraMemory.thread.id`,
- * `mastra__threadId`) or, for a durable-agent run, the MessageList or durable
- * state of its step result's `output`.
+ * thread id bound to `t`: for a durable-agent run, the MessageList or durable
+ * state of its step result's `output`. (The envelope's `requestContextPatch`
+ * cannot carry a thread: `materializeWorkflowTerminalRecoveryEnvelope`
+ * refuses infrastructure-owned keys such as `MastraMemory` and `mastra__*`.)
  */
 export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(
   TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
@@ -524,16 +550,22 @@ const holds = (root: unknown, path: string, value: string): boolean => at(root, 
  * Classifies a plain-data snapshot for a thread erasure listing at the same
  * locations as {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH}: `thread`
  * when it records the thread id, `other` when it records only other thread
- * ids, `unattributed` when it records none. Storage adapters without SQL/JSON
- * path support (the in-memory store) use this on a detached copy.
+ * ids, `unattributed` when it records none. Pass the row's workflow name so
+ * agent-network rows are also read at
+ * {@link WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH}. Storage adapters
+ * without SQL/JSON path support (the in-memory store) use this on a detached copy.
  */
 export function classifyWorkflowSnapshotThreadErasure(
   snapshot: unknown,
   threadId: string,
+  workflowName?: string,
 ): 'thread' | 'other' | 'unattributed' {
   const durable = holds(snapshot, 'context.input.__workflowKind', 'durable-agent');
+  const network =
+    workflowName !== undefined && WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS.includes(workflowName);
   return classifyThreadErasureValues(
     [
+      ...(network ? at(snapshot, 'context.input.threadId') : []),
       ...at(snapshot, 'context.*.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
       ...at(snapshot, 'context.*.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
       ...(durable
@@ -542,6 +574,8 @@ export function classifyWorkflowSnapshotThreadErasure(
             'context.input.state.threadId',
             'context.*.output.messageListState.memoryInfo.threadId',
             'context.*.output.state.threadId',
+            'context.*.payload.messageListState.memoryInfo.threadId',
+            'context.*.payload.state.threadId',
             'result.messageListState.memoryInfo.threadId',
             'result.state.threadId',
             'result.output.messageListState.memoryInfo.threadId',
@@ -572,8 +606,6 @@ export function classifyWorkflowTerminalEnvelopeThreadErasure(
             ...at(envelope, 'terminalResult.output.state.threadId'),
           ]
         : []),
-      ...at(envelope, 'requestContextPatch.MastraMemory.thread.id'),
-      ...at(envelope, 'requestContextPatch.mastra__threadId'),
     ],
     threadId,
   );
@@ -586,12 +618,44 @@ function classifyThreadErasureValues(found: unknown[], threadId: string): 'threa
 }
 
 /**
- * The `contentFree` rule of an unattributed thread erasure entry, over a
- * plain-data snapshot: `context` absent, `null` or `{}`, or only an `input`
- * that is `null` or `{}`; and `requestContext` absent, `null` or `{}`.
- * `{}` means a plain object with no fields; a class instance with no own
- * fields (a `Date`) counts as content, as its JSON form does. Accessors are
- * not run (an accessor field counts as content).
+ * The keys a content-free snapshot may hold: the shell `createRun` persists
+ * before a run starts. Structural keys may hold any value; the others must be
+ * empty (see {@link isWorkflowSnapshotThreadErasureContentFree}).
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS = Object.freeze({
+  /** Run bookkeeping and the static step graph; never run data. */
+  structural: Object.freeze([
+    'runId',
+    'executionGeneration',
+    'lifecycleResumeAttempt',
+    'status',
+    'activePaths',
+    'activeStepsPath',
+    'stepExecutionPath',
+    'serializedStepGraph',
+    'suspendedPaths',
+    'resumeLabels',
+    'waitingPaths',
+    'timestamp',
+  ]),
+  /** Must be absent, `null` or `{}`. */
+  emptyObject: Object.freeze(['value', 'requestContext', 'lifecycleStepStates']),
+  /** Must be absent or `null`. */
+  nullOnly: Object.freeze(['result', 'error']),
+  /** Absent, `null` or `{}`, or only an `input` that is `null` or `{}`. */
+  context: 'context',
+} as const);
+
+/**
+ * The `contentFree` rule of an unattributed thread erasure entry: the
+ * snapshot is a JSON object holding only the keys of
+ * {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS}, with `value`,
+ * `requestContext` and `lifecycleStepStates` absent, `null` or `{}`; `result`
+ * and `error` absent or `null`; and `context` absent, `null` or `{}`, or only
+ * an `input` that is `null` or `{}`. Any other shape, any other key, or a
+ * non-object snapshot is not content-free. `{}` means a plain object with no
+ * fields; a class instance with no own fields (a `Date`) counts as content,
+ * as its JSON form does. Accessors are not run (an accessor counts as content).
  */
 export function isWorkflowSnapshotThreadErasureContentFree(snapshot: unknown): boolean {
   if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
@@ -608,17 +672,28 @@ export function isWorkflowSnapshotThreadErasureContentFree(snapshot: unknown): b
     const prototype: unknown = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
   };
-  const isEmptyObject = (value: unknown): boolean =>
-    isPlainObject(value) && Object.keys(value).every(key => field(value, key).present === false);
+  if (!isPlainObject(snapshot)) return false;
+  const presentKeys = (holder: object) => Object.keys(holder).filter(key => field(holder, key).present);
+  const isEmptyObject = (value: unknown): boolean => isPlainObject(value) && presentKeys(value).length === 0;
   const nullOrEmpty = (entry: { present: boolean; value?: unknown; accessor?: boolean }): boolean =>
     !entry.present || (!entry.accessor && (entry.value === null || isEmptyObject(entry.value)));
-  if (!nullOrEmpty(field(snapshot, 'requestContext'))) return false;
-  const context = field(snapshot, 'context');
+  const { structural, emptyObject, nullOnly, context: contextKey } = WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS;
+  const allowed = new Set<string>([...structural, ...emptyObject, ...nullOnly, contextKey]);
+  const keys = presentKeys(snapshot);
+  if (keys.some(key => !allowed.has(key))) return false;
+  // A structural accessor is still never run, but counts as content.
+  if (structural.some(key => field(snapshot, key).accessor)) return false;
+  if (!emptyObject.every(key => nullOrEmpty(field(snapshot, key)))) return false;
+  for (const key of nullOnly) {
+    const entry = field(snapshot, key);
+    if (entry.present && (entry.accessor || entry.value !== null)) return false;
+  }
+  const context = field(snapshot, contextKey);
   if (nullOrEmpty(context)) return true;
   if (context.accessor || !isPlainObject(context.value)) return false;
   const contextValue = context.value;
-  const keys = Object.keys(contextValue).filter(key => field(contextValue, key).present);
-  return keys.length === 1 && keys[0] === 'input' && nullOrEmpty(field(contextValue, 'input'));
+  const contextKeys = presentKeys(contextValue);
+  return contextKeys.length === 1 && contextKeys[0] === 'input' && nullOrEmpty(field(contextValue, 'input'));
 }
 
 /** Orders closure cursors by code point, matching PostgreSQL's `COLLATE "C"` keyset. */

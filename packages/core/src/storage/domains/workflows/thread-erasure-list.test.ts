@@ -309,6 +309,8 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
         envelope: envelope as any,
         createdAt: 1,
       });
+    // An envelope's requestContextPatch cannot carry a thread (the envelope
+    // materializer refuses infrastructure keys): this row attributes nothing.
     terminal('b-envelope', { terminalResult: {}, finalState: {}, requestContextPatch: { mastra__threadId: THREAD } });
     // A durable run without a memory backend records its thread only in its SerializableDurableState.
     terminal('b2-durable-state', {
@@ -357,12 +359,6 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
           ...released,
           attribution: 'thread',
           rows: { snapshot: 'other', handoff: 'thread', terminalSnapshot: 'absent' },
-        },
-        {
-          workflowName: 'agentic-loop',
-          runId: 'b-envelope',
-          attribution: 'thread',
-          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' },
         },
         {
           workflowName: 'agentic-loop',
@@ -507,6 +503,119 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       })),
       hasMore: false,
     });
+  });
+
+  it('reads network inputs and durable step payloads, only at their framework locations', async () => {
+    const { workflows } = setup();
+    const suspendedWithInput = (runId: string, input: Record<string, unknown>) =>
+      ({ ...createEmptyWorkflowSnapshot(runId), status: 'suspended', context: { input } }) as WorkflowRunState;
+    // The agent network records the thread in its workflow input.
+    await persist(
+      workflows,
+      { workflowName: 'agent-loop-main-workflow', runId: 'a-network' },
+      suspendedWithInput('a-network', {
+        task: 'research',
+        threadId: THREAD,
+        threadResourceId: RESOURCE,
+      }),
+    );
+    // The same input shape in any other workflow is application data.
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'b-not-network' },
+      suspendedWithInput('b-not-network', {
+        threadId: THREAD,
+      }),
+    );
+    // A durable run's running step keeps its input as `payload`.
+    await persist(workflows, { workflowName: 'durable-agentic-loop', runId: 'c-durable-payload' }, {
+      ...createEmptyWorkflowSnapshot('c-durable-payload'),
+      status: 'running',
+      context: {
+        input: { __workflowKind: 'durable-agent', messageListState: { memoryInfo: null }, state: {} },
+        'llm-execution': {
+          status: 'running',
+          payload: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+        },
+      },
+    } as WorkflowRunState);
+
+    const result = await workflows.listWorkflowRunsByThreadForErasure({
+      resourceId: RESOURCE,
+      threadId: THREAD,
+      limit: 10,
+      includeUnattributed: true,
+    });
+    expect(
+      result.status === 'listed' && result.runs.map(run => [run.workflowName, run.runId, run.attribution]),
+    ).toEqual([
+      ['agent-loop-main-workflow', 'a-network', 'thread'],
+      ['agentic-loop', 'b-not-network', 'unattributed'],
+      ['durable-agentic-loop', 'c-durable-payload', 'thread'],
+    ]);
+  });
+
+  it('counts only the createRun shell as content-free, and only object snapshots', async () => {
+    const { db, workflows } = setup();
+    const shell = (runId: string) => ({ ...createEmptyWorkflowSnapshot(runId), status: 'pending' }) as WorkflowRunState;
+    await persist(workflows, { workflowName: 'agentic-loop', runId: 'a-shell' }, shell('a-shell'));
+    await persist(workflows, { workflowName: 'agentic-loop', runId: 'b-result' }, {
+      ...shell('b-result'),
+      result: { text: 'secret' },
+    } as WorkflowRunState);
+    await persist(workflows, { workflowName: 'agentic-loop', runId: 'c-value' }, {
+      ...shell('c-value'),
+      value: { draft: 'secret' },
+    } as WorkflowRunState);
+    await persist(workflows, { workflowName: 'agentic-loop', runId: 'd-extra-key' }, {
+      ...shell('d-extra-key'),
+      lifecycleOutbox: [{ kind: 'event' }],
+    } as unknown as WorkflowRunState);
+    // Rows stored as a string and as an array, as a raw store could hold them.
+    const raw = (runId: string, snapshot: unknown) =>
+      db.workflows.set(JSON.stringify(['agentic-loop', runId]), {
+        workflow_name: 'agentic-loop',
+        run_id: runId,
+        resourceId: RESOURCE,
+        snapshot: snapshot as any,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    raw(
+      'e-string-root',
+      JSON.stringify({
+        status: 'pending',
+        context: { input: { messages: ['secret'] } },
+        requestContext: { mastra__threadId: THREAD },
+      }),
+    );
+    raw('f-array-root', [{ status: 'pending' }]);
+
+    const result = await workflows.listWorkflowRunsByThreadForErasure({
+      resourceId: RESOURCE,
+      threadId: THREAD,
+      limit: 10,
+      includeUnattributed: true,
+    });
+    expect(result.status).toBe('listed');
+    if (result.status !== 'listed') return;
+    expect(
+      result.runs.map(run => [
+        run.runId,
+        run.attribution,
+        run.attribution === 'unattributed' ? run.contentFree : null,
+        run.attribution === 'unattributed' ? (run.status ?? null) : null,
+      ]),
+    ).toEqual([
+      ['a-shell', 'unattributed', true, 'pending'],
+      ['b-result', 'unattributed', false, 'pending'],
+      ['c-value', 'unattributed', false, 'pending'],
+      ['d-extra-key', 'unattributed', false, 'pending'],
+      // A snapshot stored as a JSON string is read as the object it encodes.
+      ['e-string-root', 'thread', null, null],
+      // A non-object root is never content-free and has no status.
+      ['f-array-root', 'unattributed', false, null],
+    ]);
   });
 
   it('pages by (workflowName, runId) in code point order', async () => {

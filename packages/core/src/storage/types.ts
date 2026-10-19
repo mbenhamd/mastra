@@ -472,26 +472,27 @@ export interface WorkflowRunThreadErasureUnattributedEntry {
   runId: string;
   attribution: 'unattributed';
   rows: WorkflowRunThreadErasureRows;
-  /** The canonical snapshot's `status` as stored (`undefined` when it records none). */
+  /** The canonical snapshot's `status` when it is a string (`undefined` otherwise). */
   status?: string;
   /** The store's row timestamps (not the snapshot's own `timestamp`). */
   createdAt: Date;
   updatedAt: Date;
   /**
-   * True only when the run holds no data beyond its canonical snapshot's
-   * shell, exactly:
-   * - the run has no handoff row and no terminal snapshot row under the
-   *   resource (`rows.handoff` and `rows.terminalSnapshot` are `absent`);
-   * - the canonical snapshot's `context` is absent, `null` or `{}`, or its only
-   *   key is `input` and that input is `null` or `{}` (a plain empty object; a
-   *   class instance such as a `Date` is content); and
-   * - its `requestContext` is absent, `null` or `{}`.
+   * True only when the run holds nothing but the shell `createRun` persists
+   * before a run starts, exactly:
+   * - `rows.handoff` and `rows.terminalSnapshot` are `absent`;
+   * - the canonical snapshot is a JSON object (a non-object snapshot is never
+   *   content-free) whose keys are all in
+   *   `WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS`;
+   * - `value`, `requestContext` and `lifecycleStepStates` are absent, `null`
+   *   or `{}`, and `result` and `error` are absent or `null`;
+   * - `context` is absent, `null` or `{}`, or its only key is `input` and that
+   *   input is `null` or `{}` (a plain empty object; a class instance such as
+   *   a `Date` is content).
    *
-   * This is the `pending` snapshot `createRun` persists for a top-level run
-   * (`context: {}`, no `requestContext`). A nested run's `pending` snapshot
-   * whose `context.input` holds the parent step's payload (for example the
-   * conversation messages) is not content-free, even without a thread id.
-   * Other snapshot fields (`value`, `result`, `error`, ...) are not inspected.
+   * A nested run's `pending` snapshot whose `context.input` holds the parent
+   * step's payload (for example the conversation messages) is not
+   * content-free, even without a thread id.
    */
   contentFree: boolean;
 }
@@ -512,22 +513,34 @@ export type WorkflowRunThreadErasureEntry =
  *   `suspendPayload` of a foreach step's iteration results (any step, any status);
  * - a durable-agent run (`context.input.__workflowKind` is `durable-agent`):
  *   `messageListState.memoryInfo.threadId` and `state.threadId` (set even
- *   without a memory backend) of its `context.input`, of any
- *   `context.<step>.output`, and of its `result` (or `result.output`, when
- *   terminal persistence stored the whole step result);
+ *   without a memory backend) of its `context.input`, of any step's `output`
+ *   or `payload`, and of its `result` (or `result.output`, when terminal
+ *   persistence stored the whole step result);
+ * - an agent-network run (`WORKFLOW_SNAPSHOT_THREAD_ERASURE_NETWORK_WORKFLOWS`):
+ *   `context.input.threadId`;
  * - the serialized request context of a started run:
  *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
  *
- * A terminal envelope records it in its `requestContextPatch` (same two keys)
- * or, for a `durable-agentic-loop` run, in `terminalResult.output.messageListState.memoryInfo.threadId`
- * or `terminalResult.output.state.threadId` (the envelope keeps the child's step result).
+ * A terminal envelope of a `durable-agentic-loop` run records it in
+ * `terminalResult.output.messageListState.memoryInfo.threadId` or
+ * `terminalResult.output.state.threadId` (the envelope keeps the child's step
+ * result). Its `requestContextPatch` cannot carry a thread: the envelope
+ * refuses infrastructure-owned keys.
  *
  * Application data shaped like thread metadata elsewhere attributes nothing.
  *
+ * A snapshot stored as a JSON string is read as the object it encodes; one
+ * that does not parse fails the listing rather than being skipped.
+ *
+ * Each page reads every row of the resource after the cursor (in the
+ * resource indexes' order) and pages the matches, so its cost grows with the
+ * resource's runs, not with the page size.
+ *
  * Unlike the `threadId` filter of `listWorkflowRuns`, which reads one scalar
  * (the first suspended step's thread, else the durable input thread), this
- * listing does not miss a `pending` or `running` loop snapshot, or a snapshot
- * whose first suspended step names another thread. `unsupported` means the
+ * listing does not miss a `running` durable-loop snapshot, a suspension
+ * kept outside the first suspended step, or a snapshot whose first suspended
+ * step names another thread. `unsupported` means the
  * adapter cannot answer; it never answers an empty page in that case.
  */
 export type ListWorkflowRunsByThreadForErasureResult =

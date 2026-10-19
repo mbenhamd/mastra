@@ -122,9 +122,10 @@ Input: `{ resourceId, threadId, after?, limit, includeUnattributed? }`. `limit` 
 A row matches only where the framework itself writes a thread id, in any run status:
 
 - an agent loop suspension: `__streamState.messageList.memoryInfo.threadId` anywhere inside a step's `suspendPayload`, including the foreach and nested suspensions kept under `__workflow_meta`, or inside the `suspendPayload` of a foreach step's iteration results, for any step and status;
-- a durable agent run (`context.input.__workflowKind` is `durable-agent`): `messageListState.memoryInfo.threadId` and `state.threadId` of its `context.input`, of any step's `output`, and of its `result` (or `result.output`, when terminal persistence stored the whole step result). `state.threadId` is set even without a memory backend;
+- a durable agent run (`context.input.__workflowKind` is `durable-agent`): `messageListState.memoryInfo.threadId` and `state.threadId` of its `context.input`, of any step's `output` or `payload`, and of its `result` (or `result.output`, when terminal persistence stored the whole step result). `state.threadId` is set even without a memory backend;
+- an agent network run (`Agent-Network-Outer-Workflow`, `iteration-with-validation`, `agent-loop-main-workflow`): `context.input.threadId`;
 - the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`;
-- in a terminal envelope: the same two keys in `requestContextPatch` and, for a `durable-agentic-loop` run, `terminalResult.output.messageListState.memoryInfo.threadId` and `terminalResult.output.state.threadId`.
+- in a terminal envelope of a `durable-agentic-loop` run: `terminalResult.output.messageListState.memoryInfo.threadId` and `terminalResult.output.state.threadId`. An envelope's `requestContextPatch` can't carry a thread, because the envelope refuses infrastructure-owned keys.
 
 Application data elsewhere that only looks like thread metadata doesn't match.
 
@@ -136,16 +137,19 @@ A released handoff doesn't fence the run ID, so a newer run can reuse the ID for
 
 - `{ status: 'unsupported' }`: the store can't answer. It never answers an empty page instead.
 
-The `pending` snapshot that `createRun` stores before a run starts records no thread. With `includeUnattributed: true`, the listing also returns the resource's runs that have a canonical snapshot and record no thread id in any row, as `{ workflowName, runId, attribution: 'unattributed', rows, status?, createdAt, updatedAt, contentFree }`. `status`, `createdAt` and `updatedAt` come from the canonical snapshot row. `contentFree` is true only when all of these hold:
+The `pending` snapshot that `createRun` stores before a run starts records no thread. With `includeUnattributed: true`, the listing also returns the resource's runs that have a canonical snapshot and record no thread id in any row, as `{ workflowName, runId, attribution: 'unattributed', rows, status?, createdAt, updatedAt, contentFree }`. `status`, `createdAt` and `updatedAt` come from the canonical snapshot row. `contentFree` is true only for the shell `createRun` stores before a run starts:
 
 - `rows.handoff` and `rows.terminalSnapshot` are `absent`;
-- `context` is absent, `null` or `{}`, or its only key is `input` and that input is `null` or `{}`;
-- `requestContext` is absent, `null` or `{}`.
+- the snapshot is a JSON object whose keys are all among the shell's keys (`WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS`);
+- `value`, `requestContext` and `lifecycleStepStates` are absent, `null` or `{}`, and `result` and `error` are absent or `null`;
+- `context` is absent, `null` or `{}`, or its only key is `input` and that input is `null` or `{}`.
 
 A nested run's `pending` snapshot whose `context.input` holds the parent step's payload isn't content-free. An unattributed run may belong to another thread's turn that's still starting, so don't erase it as the thread's run without other evidence, such as its age. The listing itself never changes anything.
 
 ## Availability
 
 The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1`, `closureCancelVersion: 1` and `threadErasureListVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
+
+`listWorkflowRunsByThreadForErasure` reads every row of the resource after the cursor on each page and then pages the matches, so a page costs time in proportion to the resource's runs. A snapshot stored as a JSON string is read as the object it encodes; one that doesn't parse fails the listing.
 
 On PostgreSQL, the listing uses resource indexes on the snapshot, handoff and terminal snapshot tables, and the reuse fence uses the `handoff_claim_generation_hwm` column of `mastra_workflow_parent_revisions`. `init()` creates them. With an externally managed schema (`disableInit`), apply the statements from `exportSchemas()` before deploying. The `@mastra/pg` changelog lists them.

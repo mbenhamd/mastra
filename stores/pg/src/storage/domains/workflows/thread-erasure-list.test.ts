@@ -272,6 +272,8 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
          VALUES ($1, $2, 1, $3, 'success', $4, $4, $5::jsonb, 1)`,
         [LOOP, runId, resource, `sha256:${'0'.repeat(64)}`, JSON.stringify(envelope)],
       );
+    // An envelope's requestContextPatch cannot carry a thread (the envelope
+    // materializer refuses infrastructure keys): this row attributes nothing.
     await terminal('b-envelope', {
       terminalResult: {},
       finalState: {},
@@ -318,12 +320,6 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
           ...released,
           attribution: 'thread',
           rows: { snapshot: 'other', handoff: 'thread', terminalSnapshot: 'absent' },
-        },
-        {
-          workflowName: LOOP,
-          runId: 'b-envelope',
-          attribution: 'thread',
-          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' },
         },
         {
           workflowName: LOOP,
@@ -409,6 +405,116 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     });
   });
 
+  it('reads network inputs and durable step payloads, only at their framework locations', async () => {
+    const resource = newResource();
+    const suspendedWithInput = (runId: string, input: Record<string, unknown>) =>
+      ({ ...createEmptyWorkflowSnapshot(runId), status: 'suspended', context: { input } }) as WorkflowRunState;
+    // The agent network records the thread in its workflow input.
+    await persist(
+      resource,
+      { workflowName: 'agent-loop-main-workflow', runId: 'a-network' },
+      suspendedWithInput('a-network', {
+        task: 'research',
+        threadId: THREAD,
+        threadResourceId: resource,
+      }),
+    );
+    // The same input shape in any other workflow is application data.
+    await persist(
+      resource,
+      { workflowName: LOOP, runId: 'b-not-network' },
+      suspendedWithInput('b-not-network', {
+        threadId: THREAD,
+      }),
+    );
+    // A durable run's running step keeps its input as `payload`.
+    await persist(resource, { workflowName: 'durable-agentic-loop', runId: 'c-durable-payload' }, {
+      ...createEmptyWorkflowSnapshot('c-durable-payload'),
+      status: 'running',
+      context: {
+        input: { __workflowKind: 'durable-agent', messageListState: { memoryInfo: null }, state: {} },
+        'llm-execution': {
+          status: 'running',
+          payload: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
+        },
+      },
+    } as WorkflowRunState);
+
+    const result = await workflows.listWorkflowRunsByThreadForErasure({
+      resourceId: resource,
+      threadId: THREAD,
+      limit: 10,
+      includeUnattributed: true,
+    });
+    expect(
+      result.status === 'listed' && result.runs.map(run => [run.workflowName, run.runId, run.attribution]),
+    ).toEqual([
+      ['agent-loop-main-workflow', 'a-network', 'thread'],
+      [LOOP, 'b-not-network', 'unattributed'],
+      ['durable-agentic-loop', 'c-durable-payload', 'thread'],
+    ]);
+  });
+
+  it('counts only the createRun shell as content-free, and only object snapshots', async () => {
+    const resource = newResource();
+    const shell = (runId: string) => ({ ...createEmptyWorkflowSnapshot(runId), status: 'pending' }) as WorkflowRunState;
+    await persist(resource, { workflowName: LOOP, runId: 'a-shell' }, shell('a-shell'));
+    await persist(resource, { workflowName: LOOP, runId: 'b-result' }, {
+      ...shell('b-result'),
+      result: { text: 'secret' },
+    } as WorkflowRunState);
+    await persist(resource, { workflowName: LOOP, runId: 'c-value' }, {
+      ...shell('c-value'),
+      value: { draft: 'secret' },
+    } as WorkflowRunState);
+    await persist(resource, { workflowName: LOOP, runId: 'd-extra-key' }, {
+      ...shell('d-extra-key'),
+      lifecycleOutbox: [{ kind: 'event' }],
+    } as unknown as WorkflowRunState);
+    // Rows stored as a JSON string and as an array, as legacy writers could leave them.
+    const raw = (runId: string, snapshot: unknown) =>
+      store.db.none(
+        `INSERT INTO mastra_workflow_snapshot (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt")
+         VALUES ($1, $2, $3, $4::jsonb, NOW(), NOW())`,
+        [LOOP, runId, resource, JSON.stringify(snapshot)],
+      );
+    await raw(
+      'e-string-root',
+      JSON.stringify({
+        status: 'pending',
+        context: { input: { messages: ['secret'] } },
+        requestContext: { mastra__threadId: THREAD },
+      }),
+    );
+    await raw('f-array-root', [{ status: 'pending' }]);
+
+    const result = await workflows.listWorkflowRunsByThreadForErasure({
+      resourceId: resource,
+      threadId: THREAD,
+      limit: 10,
+      includeUnattributed: true,
+    });
+    expect(result.status).toBe('listed');
+    if (result.status !== 'listed') return;
+    expect(
+      result.runs.map(run => [
+        run.runId,
+        run.attribution,
+        run.attribution === 'unattributed' ? run.contentFree : null,
+        run.attribution === 'unattributed' ? (run.status ?? null) : null,
+      ]),
+    ).toEqual([
+      ['a-shell', 'unattributed', true, 'pending'],
+      ['b-result', 'unattributed', false, 'pending'],
+      ['c-value', 'unattributed', false, 'pending'],
+      ['d-extra-key', 'unattributed', false, 'pending'],
+      // A snapshot stored as a JSON string is read as the object it encodes.
+      ['e-string-root', 'thread', null, null],
+      // A non-object root is never content-free and has no status.
+      ['f-array-root', 'unattributed', false, null],
+    ]);
+  });
+
   it('pages by (workflowName, runId) in code point order', async () => {
     const resource = newResource();
     const snapshots = fixtures(resource);
@@ -451,87 +557,94 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
   });
 });
 
-describe('WorkflowsPG.listWorkflowRunsByThreadForErasure (legacy text snapshot column)', () => {
-  const testSchema = `thread_erasure_legacy_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  const resource = 'workspace-legacy:user-1';
-  let adminPool: Pool;
-  let legacyStore: PostgresStore;
-  let workflows: WorkflowsPG;
+describe.each(['TEXT', 'JSON'])(
+  'WorkflowsPG.listWorkflowRunsByThreadForErasure (legacy %s snapshot column)',
+  columnType => {
+    const testSchema = `thread_erasure_legacy_${columnType.toLowerCase()}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const resource = 'workspace-legacy:user-1';
+    let adminPool: Pool;
+    let legacyStore: PostgresStore;
+    let workflows: WorkflowsPG;
 
-  beforeAll(async () => {
-    adminPool = new Pool({ connectionString });
-    const snapshots = fixtures(resource);
-    const client = await adminPool.connect();
-    try {
-      await client.query(`CREATE SCHEMA ${testSchema}`);
-      await client.query(`
+    beforeAll(async () => {
+      adminPool = new Pool({ connectionString });
+      const snapshots = fixtures(resource);
+      const client = await adminPool.connect();
+      try {
+        await client.query(`CREATE SCHEMA ${testSchema}`);
+        await client.query(`
         CREATE TABLE ${testSchema}.${TABLE_WORKFLOW_SNAPSHOT} (
           "workflow_name" TEXT NOT NULL,
           "run_id" TEXT NOT NULL,
           "resourceId" TEXT,
-          "snapshot" TEXT NOT NULL,
+          "snapshot" ${columnType} NOT NULL,
           "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
           "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW(),
           PRIMARY KEY ("workflow_name", "run_id")
         )
       `);
-      const rows: Array<[string, WorkflowRunState | string]> = [
-        ['a-split', snapshots.splitSuspended('a-split')],
-        ['b-bare', snapshots.createRunPending('b-bare')],
-        ['c-other', snapshots.otherThread('c-other')],
-        // A legacy row holding an escape jsonb rejects; the read sanitizes it.
-        [
-          'd-escape',
-          JSON.stringify(snapshots.loopStart('d-escape', 'running', THREAD)).replace(
-            '"messageId":"m1"',
-            '"messageId":"m1\\u0000"',
-          ),
-        ],
-      ];
-      for (const [runId, snapshot] of rows) {
-        await client.query(
-          `INSERT INTO ${testSchema}.${TABLE_WORKFLOW_SNAPSHOT} ("workflow_name", "run_id", "resourceId", "snapshot")
+        const rows: Array<[string, WorkflowRunState | string]> = [
+          ['a-split', snapshots.splitSuspended('a-split')],
+          ['b-bare', snapshots.createRunPending('b-bare')],
+          ['c-other', snapshots.otherThread('c-other')],
+          // A legacy row holding an escape jsonb rejects; the read sanitizes it.
+          [
+            'd-escape',
+            JSON.stringify(snapshots.loopStart('d-escape', 'running', THREAD)).replace(
+              '"messageId":"m1"',
+              '"messageId":"m1\\u0000"',
+            ),
+          ],
+        ];
+        for (const [runId, snapshot] of rows) {
+          await client.query(
+            `INSERT INTO ${testSchema}.${TABLE_WORKFLOW_SNAPSHOT} ("workflow_name", "run_id", "resourceId", "snapshot")
            VALUES ($1, $2, $3, $4)`,
-          [LOOP, runId, resource, typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot)],
-        );
+            [LOOP, runId, resource, typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot)],
+          );
+        }
+      } finally {
+        client.release();
       }
-    } finally {
-      client.release();
-    }
-    legacyStore = new PostgresStore({
-      id: `workflow-thread-erasure-legacy-${randomUUID()}`,
-      connectionString,
-      schemaName: testSchema,
-    });
-    await legacyStore.init();
-    workflows = (await legacyStore.getStore('workflows'))!;
-  }, 60000);
+      legacyStore = new PostgresStore({
+        id: `workflow-thread-erasure-legacy-${randomUUID()}`,
+        connectionString,
+        schemaName: testSchema,
+      });
+      await legacyStore.init();
+      workflows = (await legacyStore.getStore('workflows'))!;
+    }, 60000);
 
-  afterAll(async () => {
-    await legacyStore?.close();
-    const client = await adminPool.connect();
-    try {
-      await client.query(`DROP SCHEMA IF EXISTS ${testSchema} CASCADE`);
-    } finally {
-      client.release();
-      await adminPool.end();
-    }
-  }, 30000);
+    afterAll(async () => {
+      await legacyStore?.close();
+      const client = await adminPool.connect();
+      try {
+        await client.query(`DROP SCHEMA IF EXISTS ${testSchema} CASCADE`);
+      } finally {
+        client.release();
+        await adminPool.end();
+      }
+    }, 30000);
 
-  it('matches through the sanitized jsonb read', async () => {
-    const result = await workflows.listWorkflowRunsByThreadForErasure({
-      resourceId: resource,
-      threadId: THREAD,
-      limit: 10,
-      includeUnattributed: true,
+    it('matches through the sanitized jsonb read', async () => {
+      const result = await workflows.listWorkflowRunsByThreadForErasure({
+        resourceId: resource,
+        threadId: THREAD,
+        limit: 10,
+        includeUnattributed: true,
+      });
+      expect(result.status).toBe('listed');
+      if (result.status !== 'listed') return;
+      expect(result.runs.map(run => [run.runId, run.attribution])).toEqual([
+        ['a-split', 'thread'],
+        ['b-bare', 'unattributed'],
+        ['d-escape', 'thread'],
+      ]);
+      expect(result.runs[1]).toMatchObject({ status: 'pending', contentFree: true });
+      // The table has no timezone mirror columns: the timestamps come from "createdAt"/"updatedAt".
+      const bare = result.runs[1] as { createdAt: Date; updatedAt: Date };
+      expect(Number.isNaN(bare.createdAt.getTime())).toBe(false);
+      expect(Number.isNaN(bare.updatedAt.getTime())).toBe(false);
     });
-    expect(result.status).toBe('listed');
-    if (result.status !== 'listed') return;
-    expect(result.runs.map(run => [run.runId, run.attribution])).toEqual([
-      ['a-split', 'thread'],
-      ['b-bare', 'unattributed'],
-      ['d-escape', 'thread'],
-    ]);
-    expect(result.runs[1]).toMatchObject({ status: 'pending', contentFree: true });
-  });
-});
+  },
+);
