@@ -181,7 +181,7 @@ await durableAgent.resume(
 )
 ```
 
-The durable state stores only a monotonic "policy required" marker. If a worker lacks the resolver, or the resolver throws or returns an invalid decision, tool execution is denied. The resolver is called again after an approval or in-tool suspension resume, including a resume with an `undefined` payload, so a policy change takes effect before the side effect.
+The durable state stores only a monotonic "policy required" marker. If a worker lacks the resolver, or the resolver throws or returns an invalid decision, tool execution is denied. The resolver is called again after an approval or in-tool suspension resume, including a resume with an `undefined` payload; a policy change takes effect before the side effect.
 
 When a live `RequestContext` policy and `resolveToolPermission` are both available, Mastra evaluates both. The strictest result wins: `deny` takes precedence over `ask`, and `ask` takes precedence over `allow`. A throw or invalid result from either evaluator is a denial.
 
