@@ -111,6 +111,28 @@ async function setup({
       timestamp: Date.now(),
     },
   });
+  if (loop) {
+    // PapersFlow fork: the next loop iteration is persisted on the parent row first; a missing
+    // parent row reads as a deleted run (`{}` write) and stops the loop fail-closed (#26901 guard).
+    await store.persistWorkflowSnapshot({
+      workflowName: 'parent',
+      runId: 'parent-run',
+      snapshot: {
+        runId: 'parent-run',
+        status: 'running',
+        executionGeneration: 'parent-generation',
+        value: {},
+        context: {},
+        activePaths: [],
+        activeStepsPath: {},
+        suspendedPaths: {},
+        resumeLabels: {},
+        serializedStepGraph: [],
+        waitingPaths: {},
+        timestamp: Date.now(),
+      } as any,
+    });
+  }
   const row = () => store.getWorkflowRunById({ runId: args.runId, workflowName: args.workflowId });
   const original = await row();
   const events: { topic: string; event: Event }[] = [];

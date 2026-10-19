@@ -1199,8 +1199,11 @@ describe('DurableAgent streaming execution', () => {
       cleanup();
     });
 
-    it('should stream text response and invoke onChunk callback', async () => {
-      const mockModel = createTextStreamModel('Hello, world!');
+    // The aimock text-streaming scenario cannot pass onChunk to durable engines yet (#27408),
+    // so durable onChunk delivery is pinned here. (Repaired auto-merge mix: the fork title/model
+    // line had been kept over upstream's #27433 body.)
+    it('should deliver every text-delta to onChunk in order', async () => {
+      const mockModel = createMultiChunkStreamModel(['Hello', ', ', 'world', '!']);
       const chunks: any[] = [];
 
       const baseAgent = new Agent({
