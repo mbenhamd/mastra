@@ -4981,7 +4981,8 @@ export class WorkflowEventProcessor extends EventProcessor {
               return;
             }
 
-            const suspendTracingContext = workflow.__getResumeTracingContext() ?? this.resolveSuspendTracingContext(runId);
+            const suspendTracingContext =
+              workflow.__getResumeTracingContext() ?? this.resolveSuspendTracingContext(runId);
             const suspendedState = await workflowsStore?.updateWorkflowState({
               workflowName: workflowId,
               runId,
@@ -5105,24 +5106,10 @@ export class WorkflowEventProcessor extends EventProcessor {
       // surfaced to users.
       const storedResult = branchStateDelta ? { ...prevResult, __stateDelta: branchStateDelta } : prevResult;
 
-      // This merge write bypasses the workflow's `pruneSnapshot` hook, so prune
-      // the completed step's result here and persist it in the same atomic
-      // write (COR-1431): a separate post-merge full-row write could erase a
-      // concurrent step's result. Parallel branches are pruned once instead, by
-      // `aggregateBranchResults`.
-      const persistedResult = isParallelBranch
-        ? storedResult
-        : this.pruneStepResultForPersist({
-            workflow,
-            runId,
-            state: currentState,
-            stepId,
-            storedResult,
-            stepResults,
-            executionPath,
-            activeStepsPath,
-          });
-
+      // Upstream COR-1431 also prunes the completed step's result here through the
+      // workflow's `pruneSnapshot` hook. Not adopted: the fork reads the stored step
+      // result back (for example the agentic loop's iteration output), and a pruned
+      // result fails those runs ("resolved an iteration ... without iteration output").
       // Record the workflow state in the same write as a sequential step's result, so a
       // restart after this point resumes with the state this step produced. Branches of a
       // parallel/conditional entry skip it: their full state would clobber sibling updates;
@@ -5134,6 +5121,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         result: storedResult,
         requestContext: getPersistedRequestContext(requestContext),
         executionGeneration: lifecycleExecution.executionGeneration,
+        ...(isParallelBranch ? {} : { state: currentState }),
       });
       // A stale-lifetime rejection is NOT the missing-record fallback: the run
       // this handler serves moved to a different execution lifetime, so stop

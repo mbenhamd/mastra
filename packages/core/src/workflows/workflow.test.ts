@@ -490,7 +490,8 @@ describe('Workflow (Default Engine Specifics)', () => {
       const workflowsStore = await storage.getStore('workflows');
       const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot');
 
-      await expect(run.startAsync({ inputData: {} })).resolves.toEqual({ runId: run.runId });
+      // PF-5928 adaptation: the fork's startAsync() also returns the background `execution` promise.
+      await expect(run.startAsync({ inputData: {} })).resolves.toMatchObject({ runId: run.runId });
       await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
 
       expect(persistSnapshot.mock.calls.some(([args]) => (args.snapshot as any).status === 'waiting')).toBe(false);

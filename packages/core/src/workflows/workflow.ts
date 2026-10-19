@@ -88,11 +88,17 @@ import {
   workflowCancelRequestFor,
 } from './cancel-request';
 import type { WorkflowCancelRequestInput, WorkflowCancelRequestOutcome } from './cancel-request';
-import { PROCESSOR_EXECUTION_SYMBOL, PUBSUB_SYMBOL, TRANSIENT_EXECUTION_SYMBOL, WORKFLOW_CANCELLED_SYMBOL } from './constants';
+import {
+  PROCESSOR_EXECUTION_SYMBOL,
+  PUBSUB_SYMBOL,
+  TRANSIENT_EXECUTION_SYMBOL,
+  WORKFLOW_CANCELLED_SYMBOL,
+} from './constants';
 import { DefaultExecutionEngine } from './default';
 import { getAdmittedJsonSchema } from './dynamic/admitted-schema-source';
 import type { ClassifierStepOutput } from './entry-executors';
 import type { ExecutionEngine, ExecutionGraph } from './execution-engine';
+import { getPersistedRequestContext } from './evented/helpers';
 import {
   workflowRunNotSuspendedError,
   workflowRunStillRunningError,
@@ -1528,7 +1534,12 @@ export function createStepFromProcessor<TProcessorId extends string>(
                     attributes: { hookDurationMs: readHookDurationMs() },
                   });
                 }
-                endOutputStreamSpanAtStepEnd(processorRuntimeState, processor.id, part as ChunkType, (streamParts ?? []).length);
+                endOutputStreamSpanAtStepEnd(
+                  processorRuntimeState,
+                  processor.id,
+                  part as ChunkType,
+                  (streamParts ?? []).length,
+                );
               } catch (error) {
                 // End the invocation's span with error. Shared state decides
                 // whether that ended span should be retained.
@@ -5282,41 +5293,41 @@ export class Run<
 
   protected async _start(
     {
-    inputData,
-    initialState,
-    requestContext,
-    outputWriter,
-    tracingOptions,
-    format,
-    outputOptions,
-    perStep,
-    actor,
-    ...rest
+      inputData,
+      initialState,
+      requestContext,
+      outputWriter,
+      tracingOptions,
+      format,
+      outputOptions,
+      perStep,
+      actor,
+      ...rest
     }: (TInput extends unknown
-    ? {
-        inputData?: TInput;
-      }
-    : {
-        inputData: TInput;
-      }) &
-    (TState extends unknown
       ? {
-          initialState?: TState;
+          inputData?: TInput;
         }
       : {
-          initialState: TState;
-        }) & {
-      requestContext?: RequestContext<TRequestContext>;
-      outputWriter?: OutputWriter;
-      tracingOptions?: TracingOptions;
-      format?: 'legacy' | 'vnext' | undefined;
-      outputOptions?: {
-        includeState?: boolean;
-        includeResumeLabels?: boolean;
-      };
-      perStep?: boolean;
-      actor?: ActorSignal;
-    } & Partial<ObservabilityContext>,
+          inputData: TInput;
+        }) &
+      (TState extends unknown
+        ? {
+            initialState?: TState;
+          }
+        : {
+            initialState: TState;
+          }) & {
+        requestContext?: RequestContext<TRequestContext>;
+        outputWriter?: OutputWriter;
+        tracingOptions?: TracingOptions;
+        format?: 'legacy' | 'vnext' | undefined;
+        outputOptions?: {
+          includeState?: boolean;
+          includeResumeLabels?: boolean;
+        };
+        perStep?: boolean;
+        actor?: ActorSignal;
+      } & Partial<ObservabilityContext>,
     onDispatched?: () => void,
   ): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
     try {
@@ -5398,9 +5409,53 @@ export class Run<
         throw error;
       });
 
-      // Upstream #24673: startAsync() resolves once startup validation, admission and onStart
-      // have succeeded and the run is handed to the engine. The fork's admitted `pending`
-      // lineage snapshot is the durable record, so no separate `waiting` snapshot is written.
+      // Upstream #24673: startAsync() resolves only once dispatch is durable. The admitted
+      // `pending` row carries no input (createRun writes `context: {}` for a top-level run), so a
+      // crash after startAsync() resolved would leave nothing to restart from. Record the
+      // dispatch as a `waiting` snapshot with the input, the persisted request context (no auth
+      // token) and this execution's lifecycle tuple, so restart() replays the first entry.
+      if (onDispatched && !this.transientExecution) {
+        const shouldPersistSnapshot =
+          this.executionEngine.getRunPersistenceOverride(this.runId) ??
+          this.executionEngine.options.shouldPersistSnapshot;
+        if (shouldPersistSnapshot({ workflowStatus: 'waiting', stepResults: {} })) {
+          const workflowsStore = await this.mastra?.getStorage()?.getStore('workflows');
+          const dispatchSnapshot: WorkflowRunState = {
+            runId: this.runId,
+            status: 'waiting',
+            parentWorkflow: this.parentWorkflow,
+            value: initialStateToUse as Record<string, any>,
+            context: inputDataToUse !== undefined ? ({ input: inputDataToUse } as any) : ({} as any),
+            requestContext: getPersistedRequestContext((requestContext ?? new RequestContext()).toJSON()),
+            activePaths: [0],
+            activeStepsPath: {},
+            serializedStepGraph: this.serializedStepGraph,
+            suspendedPaths: {},
+            resumeLabels: {},
+            waitingPaths: {},
+            timestamp: Date.now(),
+          };
+          try {
+            await workflowsStore?.persistWorkflowSnapshot({
+              workflowName: this.workflowId,
+              runId: this.runId,
+              resourceId: this.resourceId,
+              snapshot: {
+                ...(this.executionEngine.options.pruneSnapshot
+                  ? this.executionEngine.options.pruneSnapshot({
+                      snapshot: dispatchSnapshot,
+                      workflowStatus: 'waiting',
+                    })
+                  : dispatchSnapshot),
+                ...lifecycleExecution,
+              },
+            });
+          } catch (error) {
+            workflowSpan?.error({ error: error as Error });
+            throw error;
+          }
+        }
+      }
       onDispatched?.();
 
       const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
@@ -6763,6 +6818,7 @@ export class Run<
         actor,
         abortController: this.abortController,
         outputWriter,
+        outputOptions,
         workflowSpan,
         commitTerminalStatus: status =>
           this.commitTerminalStatus(
@@ -6952,41 +7008,44 @@ export class Run<
       } catch (releaseError) {
         this.#mastra
           ?.getLogger()
-          ?.warn(`[Workflow ${this.workflowId}] Failed to release time travel claim for run ${this.runId}`, releaseError);
+          ?.warn(
+            `[Workflow ${this.workflowId}] Failed to release time travel claim for run ${this.runId}`,
+            releaseError,
+          );
       }
     };
 
     let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
     try {
       result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
-      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-        workflowId: this.workflowId,
-        runId: this.runId,
-        parentWorkflow: this.parentWorkflow,
-        ...lifecycleExecution,
-        resourceId: this.resourceId,
-        disableScorers: this.disableScorers,
-        graph: this.executionGraph,
-        timeTravel: timeTravelData,
-        serializedStepGraph: this.serializedStepGraph,
-        pubsub: this.pubsub,
-        retryConfig: this.retryConfig,
-        requestContext: requestContextToUse as RequestContext,
-        actor,
-        abortController: this.abortController,
-        outputWriter,
-        workflowSpan,
-        outputOptions,
-        perStep,
-        commitTerminalStatus: status =>
-          this.commitTerminalStatus(
-            lifecycleExecution.executionGeneration,
-            status,
-            lifecycleExecution.lifecycleResumeAttempt,
-          ),
-        isCancellationAdmitted: this.isCancellationAdmitted,
-      }),
-    );
+        this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+          workflowId: this.workflowId,
+          runId: this.runId,
+          parentWorkflow: this.parentWorkflow,
+          ...lifecycleExecution,
+          resourceId: this.resourceId,
+          disableScorers: this.disableScorers,
+          graph: this.executionGraph,
+          timeTravel: timeTravelData,
+          serializedStepGraph: this.serializedStepGraph,
+          pubsub: this.pubsub,
+          retryConfig: this.retryConfig,
+          requestContext: requestContextToUse as RequestContext,
+          actor,
+          abortController: this.abortController,
+          outputWriter,
+          workflowSpan,
+          outputOptions,
+          perStep,
+          commitTerminalStatus: status =>
+            this.commitTerminalStatus(
+              lifecycleExecution.executionGeneration,
+              status,
+              lifecycleExecution.lifecycleResumeAttempt,
+            ),
+          isCancellationAdmitted: this.isCancellationAdmitted,
+        }),
+      );
     } catch (error) {
       await releaseTimeTravelClaimIfUnused();
       throw error;
