@@ -182,7 +182,7 @@ describeForAllEngines('Support agent refund approvals', engine => {
     },
     { label: 'a plain approval passes no resume data to the tool', resumeData: { approved: true }, expected: [undefined] },
     {
-      // Fork parity gap (flagged on PF-5928): durable engines forward an allowlisted decision
+      // Fork parity gap (PF-6047, not fixed in the sync): durable engines forward an allowlisted decision
       // field to the tool, the loop engines treat `{ approved, reason }` as a bare decision.
       label: 'an allowlisted decision field follows the engine decision rules',
       resumeData: { approved: true, reason: 'goodwill' },
@@ -272,6 +272,7 @@ describeForAllEngines('Support agent refund approvals', engine => {
     });
     await done;
 
+    // PF-6047 (durable/loop parity gap, not fixed in the sync): see the allowlisted case above.
     expect(seenResumeData).toEqual(
       engine === 'durable' || engine === 'evented' ? [{ approved: true, reason: 'goodwill' }] : [undefined],
     );
@@ -321,7 +322,7 @@ describeForAllEngines('Support agent refund approvals', engine => {
       // PapersFlow fork: an authenticated durable approval resume executes on its persisted
       // decision and does not re-run the approval policy (live permission checks still apply).
       // Pre-existing on fork e268d40 (durable-agent-require-tool-approval-fn "warm-resumed
-      // policy" fails there too); flagged on PF-5928 as a durable/loop parity gap.
+      // policy" fails there too); tracked as PF-6047 (durable/loop parity gap, not fixed in the sync).
       expect(policy).not.toHaveBeenCalled();
       return;
     }

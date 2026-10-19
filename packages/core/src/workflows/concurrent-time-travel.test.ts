@@ -189,16 +189,35 @@ describe('concurrent time travel', () => {
     expect(harness.getWorkExecutions()).toBe(2);
   });
 
-  // PapersFlow fork: the generation claim installs the new lifecycle generation even on stores
-  // that cannot compare-and-set (fork restart-claim.test.ts "claims unconditionally when the store
-  // cannot compare-and-set"), so a store without updateWorkflowState cannot time travel. Upstream's
-  // skip-the-claim behaviour is not adopted (decision pending on PF-5928).
-  it.skip('still time travels on stores that cannot claim, without calling updateWorkflowState', async () => {
+  // PapersFlow fork: on stores that cannot compare-and-set, time travel takes the fork's
+  // unconditional generation claim (restart-claim.test.ts "claims unconditionally when the store
+  // cannot compare-and-set") instead of upstream's skipped claim (#27313), and still succeeds.
+  it('still time travels on stores that cannot claim, claiming unconditionally', async () => {
     const harness = createHarness({ suspendAtEnd: true });
     const storage = new MockStore();
     const workflowsStore = storage.stores.workflows as any;
     vi.spyOn(workflowsStore, 'supportsConcurrentUpdates').mockReturnValue(false);
-    const updateSpy = vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(() => {
+    const updateSpy = vi.spyOn(workflowsStore, 'updateWorkflowState');
+
+    const { run } = await startRun(harness, storage);
+    const result = await run.timeTravel({ step: 'work', inputData: {} });
+
+    expect(result.status).toBe('suspended');
+    expect(harness.getWorkExecutions()).toBe(1);
+    const claim = updateSpy.mock.calls.map(([args]: any[]) => args.opts).find((opts: any) => typeof opts.executionGeneration === 'string');
+    expect(claim).toBeDefined();
+    expect(claim).not.toHaveProperty('expectedStatus');
+    expect(claim).not.toHaveProperty('expectedExecutionGeneration');
+  });
+
+  // PapersFlow fork: an adapter without updateWorkflowState at all (Cloudflare D1/KV/DO,
+  // ClickHouse, LanceDB) installs the claimed generation through its snapshot instead.
+  it('still time travels on stores that do not implement updateWorkflowState', async () => {
+    const harness = createHarness({ suspendAtEnd: true });
+    const storage = new MockStore();
+    const workflowsStore = storage.stores.workflows as any;
+    vi.spyOn(workflowsStore, 'supportsConcurrentUpdates').mockReturnValue(false);
+    vi.spyOn(workflowsStore, 'updateWorkflowState').mockImplementation(() => {
       throw new Error('updateWorkflowState is not implemented for Cloudflare D1 storage.');
     });
 
@@ -207,7 +226,6 @@ describe('concurrent time travel', () => {
 
     expect(result.status).toBe('suspended');
     expect(harness.getWorkExecutions()).toBe(1);
-    expect(updateSpy).not.toHaveBeenCalled();
   });
 
   it('releases the claim when the engine fails before executing anything', async () => {
