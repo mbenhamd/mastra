@@ -340,6 +340,163 @@ export function captureWorkflowRunClosureListInput(input: {
   return Object.freeze({ resourceId, limit, ...(after ? { after: Object.freeze(after) } : {}) });
 }
 
+/**
+ * Reads a thread erasure listing's input exactly once and validates that
+ * copy, as {@link captureWorkflowRunClosureListInput} does for the resource,
+ * cursor and limit. Adapters use only the returned copy.
+ */
+export function captureWorkflowRunThreadErasureListInput(input: {
+  resourceId: string;
+  threadId: string;
+  after?: { workflowName: string; runId: string };
+  limit: number;
+  includeUnattributed?: boolean;
+}): {
+  resourceId: string;
+  threadId: string;
+  after?: { workflowName: string; runId: string };
+  limit: number;
+  includeUnattributed: boolean;
+} {
+  const threadId: unknown = input.threadId;
+  const includeUnattributed: unknown = input.includeUnattributed;
+  const closureInput = captureWorkflowRunClosureListInput(input);
+  if (typeof threadId !== 'string' || threadId.length === 0) {
+    throw new TypeError('Workflow run thread erasure threadId must be a non-empty string');
+  }
+  if (hasUnsafeIdentityChar(threadId)) {
+    throw new TypeError('Workflow run thread erasure threadId must be well-formed UTF-16 with no NUL characters');
+  }
+  if (includeUnattributed !== undefined && typeof includeUnattributed !== 'boolean') {
+    throw new TypeError('Workflow run thread erasure includeUnattributed must be a boolean');
+  }
+  return Object.freeze({ ...closureInput, threadId, includeUnattributed: includeUnattributed === true });
+}
+
+/**
+ * SQL/JSON path (PostgreSQL `jsonb_path_exists`, lax mode) that is true when
+ * a snapshot records the thread id bound to the `t` variable anywhere a
+ * snapshot can carry one:
+ * - `memoryInfo.threadId` at any depth: a serialized MessageList, e.g. the
+ *   agentic-loop suspend payload
+ *   `context.<step>.suspendPayload.__streamState.messageList.memoryInfo`
+ *   (whatever step, whatever status) and the durable-loop input
+ *   `context.input.messageListState.memoryInfo`;
+ * - the durable-loop input state `context.input.state.threadId`;
+ * - the request context persisted with every started run:
+ *   `requestContext.MastraMemory.thread.id` (set by the agent's memory
+ *   preparation) and the reserved `requestContext.mastra__threadId`.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH =
+  '$ ? (@.**.memoryInfo.threadId == $t || @.context.input.state.threadId == $t || ' +
+  '@.requestContext.MastraMemory.thread.id == $t || @.requestContext."mastra__threadId" == $t)';
+
+/**
+ * SQL/JSON path that is true when a snapshot records any string thread id in
+ * one of the places {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH} reads.
+ * A snapshot it is false for is unattributed.
+ */
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH =
+  '$ ? (exists(@.**.memoryInfo.threadId ? (@.type() == "string")) || ' +
+  'exists(@.context.input.state.threadId ? (@.type() == "string")) || ' +
+  'exists(@.requestContext.MastraMemory.thread.id ? (@.type() == "string")) || ' +
+  'exists(@.requestContext."mastra__threadId" ? (@.type() == "string")))';
+
+/** Own enumerable data fields of a JSON-like object, as a JSON copy would keep them. Accessors are not run. */
+function threadErasureMembers(value: unknown, key: string): unknown[] {
+  // Lax mode: a member accessor applied to an array applies to its elements.
+  const holders = Array.isArray(value) ? value : [value];
+  const members: unknown[] = [];
+  for (const holder of holders) {
+    if (holder === null || typeof holder !== 'object' || Array.isArray(holder)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(holder, key);
+    if (descriptor && descriptor.enumerable && 'value' in descriptor) members.push(descriptor.value);
+  }
+  return members;
+}
+
+function threadErasureMemberPath(roots: unknown[], keys: readonly string[]): unknown[] {
+  let items = roots;
+  for (const key of keys) items = items.flatMap(item => threadErasureMembers(item, key));
+  // Lax mode: comparison operands that are arrays are unwrapped.
+  return items.flatMap(item => (Array.isArray(item) ? item : [item]));
+}
+
+/** Every object or array reachable from the value (the `.**` accessor), each once. */
+function threadErasureDescendants(value: unknown): unknown[] {
+  const seen = new Set<object>();
+  const out: unknown[] = [];
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (item === null || typeof item !== 'object' || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+    if (Array.isArray(item)) {
+      for (const entry of item) stack.push(entry);
+      continue;
+    }
+    for (const key of Object.keys(item)) {
+      const descriptor = Object.getOwnPropertyDescriptor(item, key);
+      if (descriptor && 'value' in descriptor) stack.push(descriptor.value);
+    }
+  }
+  return out;
+}
+
+/**
+ * Classifies a plain-data snapshot for a thread erasure listing with the same
+ * places as {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH}: `thread` when
+ * it records the thread id, `other` when it records only other thread ids,
+ * `unattributed` when it records none. Storage adapters without SQL/JSON path
+ * support (the in-memory store) use this on a detached copy of the snapshot.
+ */
+export function classifyWorkflowSnapshotThreadErasure(
+  snapshot: unknown,
+  threadId: string,
+): 'thread' | 'other' | 'unattributed' {
+  const values = [
+    ...threadErasureMemberPath(threadErasureDescendants(snapshot), ['memoryInfo', 'threadId']),
+    ...threadErasureMemberPath([snapshot], ['context', 'input', 'state', 'threadId']),
+    ...threadErasureMemberPath([snapshot], ['requestContext', 'MastraMemory', 'thread', 'id']),
+    ...threadErasureMemberPath([snapshot], ['requestContext', 'mastra__threadId']),
+  ].filter((value): value is string => typeof value === 'string');
+  if (values.includes(threadId)) return 'thread';
+  return values.length > 0 ? 'other' : 'unattributed';
+}
+
+/**
+ * The `contentFree` rule of an unattributed thread erasure entry, over a
+ * plain-data snapshot: `context` absent, `null` or `{}`, or only an `input`
+ * that is `null` or `{}`; and `requestContext` absent, `null` or `{}`.
+ * Accessors are not run (an accessor field counts as content).
+ */
+export function isWorkflowSnapshotThreadErasureContentFree(snapshot: unknown): boolean {
+  if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
+  const field = (holder: object, key: string): { present: boolean; value?: unknown; accessor?: boolean } => {
+    const descriptor = Object.getOwnPropertyDescriptor(holder, key);
+    if (!descriptor || !descriptor.enumerable) return { present: false };
+    if (!('value' in descriptor)) return { present: true, accessor: true };
+    return descriptor.value === undefined ? { present: false } : { present: true, value: descriptor.value };
+  };
+  const isEmptyObject = (value: unknown): boolean =>
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).every(key => field(value, key).present === false);
+  const nullOrEmpty = (entry: { present: boolean; value?: unknown; accessor?: boolean }): boolean =>
+    !entry.present || (!entry.accessor && (entry.value === null || isEmptyObject(entry.value)));
+  if (!nullOrEmpty(field(snapshot, 'requestContext'))) return false;
+  const context = field(snapshot, 'context');
+  if (nullOrEmpty(context)) return true;
+  if (context.accessor || context.value === null || typeof context.value !== 'object' || Array.isArray(context.value)) {
+    return false;
+  }
+  const contextValue = context.value as object;
+  const keys = Object.keys(contextValue).filter(key => field(contextValue, key).present);
+  return keys.length === 1 && keys[0] === 'input' && nullOrEmpty(field(contextValue, 'input'));
+}
+
 /** Orders closure cursors by code point, matching PostgreSQL's `COLLATE "C"` keyset. */
 export function compareWorkflowRunClosureCursors(
   left: { workflowName: string; runId: string },

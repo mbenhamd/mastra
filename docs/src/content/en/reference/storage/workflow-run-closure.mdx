@@ -113,8 +113,32 @@ Returns: `Promise<ListWorkflowRunClosuresByResourceResult>`:
 - `{ status: 'listed', closures, hasMore, nextCursor? }`: each entry is `{ workflowName, runId, snapshot, terminalSnapshot, handoff? }`. The flags say which rows matched the resource, and `handoff` is `{ status, released }`. Released handoffs are included, so a delivered handoff whose snapshot was already deleted is still found. Runs are ordered by `(workflowName, runId)` in code-point order.
 - `{ status: 'unsupported' }`: the store can't list closures. It never answers an empty page instead.
 
+## `listWorkflowRunsByThreadForErasure(input)`
+
+Pages a resource's runs whose snapshot records a thread id, in any run status. Use it to erase a thread or a session inside a resource that stays. The `threadId` filter of `listWorkflowRuns` reads a single value, so it misses an agent loop snapshot that is still `pending` or `running`, and a run whose first suspended step names another thread.
+
+Input: `{ resourceId, threadId, after?, limit, includeUnattributed? }`. `limit` is required and between 1 and 100. `after` is the `nextCursor` of the previous page.
+
+A snapshot matches when the thread id appears in one of these places:
+
+- any `memoryInfo.threadId`, at any depth, such as an agent loop step's `suspendPayload.__streamState.messageList.memoryInfo` (any step, any status) or the durable loop's `context.input.messageListState.memoryInfo`;
+- the durable loop's `context.input.state.threadId`;
+- the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`.
+
+Returns: `Promise<ListWorkflowRunsByThreadForErasureResult>`:
+
+- `{ status: 'listed', runs, hasMore, nextCursor? }`: runs are ordered by `(workflowName, runId)` in code-point order. A matching run is `{ workflowName, runId, attribution: 'thread' }`.
+- `{ status: 'unsupported' }`: the store can't answer. It never answers an empty page instead.
+
+The `pending` snapshot that `createRun` stores before a run starts records no thread. With `includeUnattributed: true`, the listing also returns the resource's snapshots that record no thread id anywhere, as `{ workflowName, runId, attribution: 'unattributed', status?, createdAt, updatedAt, contentFree }`. `createdAt` and `updatedAt` are the store's row timestamps. `contentFree` is true only when both hold:
+
+- `context` is absent, `null` or `{}`, or its only key is `input` and that input is `null` or `{}`;
+- `requestContext` is absent, `null` or `{}`.
+
+A nested run's `pending` snapshot whose `context.input` holds the parent step's payload isn't content-free. An unattributed run may belong to another thread's turn that is still starting, so don't erase it as the thread's run without other evidence, such as its age. The listing itself never changes anything.
+
 ## Availability
 
-The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1` and `closureCancelVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
+The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1`, `closureCancelVersion: 1` and `threadErasureListVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
 
 On PostgreSQL, the listing uses resource indexes on the snapshot, handoff and terminal snapshot tables, and the reuse fence uses the `handoff_claim_generation_hwm` column of `mastra_workflow_parent_revisions`. `init()` creates them. With an externally managed schema (`disableInit`), apply the statements from `exportSchemas()` before deploying. The `@mastra/pg` changelog lists them.

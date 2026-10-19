@@ -79,6 +79,9 @@ import {
   validateWorkflowSnapshotHandoffLimit,
   validateWorkflowRunClosureIdentity,
   captureWorkflowRunClosureListInput,
+  captureWorkflowRunThreadErasureListInput,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH,
+  WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH,
   createEmptyWorkflowSnapshot,
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
@@ -159,7 +162,10 @@ import type {
   CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
+  ListWorkflowRunsByThreadForErasureInput,
+  ListWorkflowRunsByThreadForErasureResult,
   WorkflowRunClosureEntry,
+  WorkflowRunThreadErasureEntry,
   WorkflowTerminalRecoveryAncestryRecord,
   TABLE_NAMES,
   PruneOptions,
@@ -475,6 +481,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       releaseVersion: 1,
       closureDeleteVersion: 1,
       closureCancelVersion: 1,
+      threadErasureListVersion: 1,
     };
   }
 
@@ -4496,6 +4503,21 @@ export class WorkflowsPG extends WorkflowsStorage {
     );
   }
 
+  /**
+   * The snapshot as jsonb, for any supported column type. Legacy json/text
+   * columns go through the same escape sanitizing as the status reads, so a
+   * stored `\u0000` or unpaired surrogate cannot fail the cast.
+   */
+  private workflowSnapshotJsonbExpression(snapshotColumnType: string, columnReference: string): string {
+    if (snapshotColumnType === 'jsonb') {
+      return columnReference;
+    }
+    if (snapshotColumnType === 'json' || snapshotColumnType === 'text') {
+      return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb`;
+    }
+    throw new TypeError(`Workflow snapshot read does not support snapshot column type ${snapshotColumnType || 'missing'}`);
+  }
+
   private sanitizedWorkflowSnapshotStatusExpression(columnReference: string): string {
     return `regexp_replace((${columnReference}::json)::text, '${PG_UNSAFE_JSON_UNICODE_ESCAPE_PATTERN}', E'\\\\1\\\\2', 'g')::jsonb->>'status'`;
   }
@@ -6261,6 +6283,95 @@ export class WorkflowsPG extends WorkflowsStorage {
     return {
       status: 'listed',
       closures,
+      hasMore,
+      ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
+    };
+  }
+
+  async listWorkflowRunsByThreadForErasure(
+    input: ListWorkflowRunsByThreadForErasureInput,
+  ): Promise<ListWorkflowRunsByThreadForErasureResult> {
+    const { resourceId, threadId, after, limit, includeUnattributed } = captureWorkflowRunThreadErasureListInput(input);
+    const values: unknown[] = [
+      resourceId,
+      threadId,
+      WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH,
+      WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH,
+      includeUnattributed,
+    ];
+    let keyset = '';
+    if (after) {
+      values.push(after.workflowName, after.runId);
+      keyset = `AND (workflow_name COLLATE "C", run_id COLLATE "C") > ($${values.length - 1}, $${values.length})`;
+    }
+    values.push(limit + 1);
+    const limitParam = `$${values.length}`;
+    let rows: Array<{
+      workflow_name: string;
+      run_id: string;
+      matched: boolean;
+      status: string | null;
+      createdAt: Date | string | null;
+      createdAtZ: Date | string | null;
+      updatedAt: Date | string | null;
+      updatedAtZ: Date | string | null;
+      content_free: boolean;
+    }>;
+    try {
+      const snapshotColumnType = await this.resolveWorkflowSnapshotColumnType(this.#db.client);
+      const snapshotJson = this.workflowSnapshotJsonbExpression(snapshotColumnType, 'snapshot.snapshot');
+      const emptyOrNull = (expression: string) =>
+        `(${expression} IS NULL OR ${expression} = 'null'::jsonb OR ${expression} = '{}'::jsonb)`;
+      // A row's thread match is one jsonb_path_exists over the whole snapshot,
+      // with the thread id bound as a jsonpath variable (never interpolated).
+      // Rows are read in the closure index's ("resourceId", workflow_name,
+      // run_id) order, so a page stops after limit + 1 matches.
+      rows = await this.#db.client.any(
+        `SELECT workflow_name, run_id, matched, status, "createdAt", "createdAtZ", "updatedAt", "updatedAtZ",
+                (NOT matched
+                  AND ${emptyOrNull(`snapshot_json -> 'requestContext'`)}
+                  AND (${emptyOrNull(`snapshot_json -> 'context'`)}
+                    OR (jsonb_typeof(snapshot_json -> 'context') = 'object'
+                      AND (snapshot_json -> 'context') - 'input' = '{}'::jsonb
+                      AND ${emptyOrNull(`snapshot_json -> 'context' -> 'input'`)}))) AS content_free
+         FROM (
+           SELECT snapshot.workflow_name COLLATE "C" AS workflow_name, snapshot.run_id COLLATE "C" AS run_id,
+                  snapshot."createdAt", snapshot."createdAtZ", snapshot."updatedAt", snapshot."updatedAtZ",
+                  snapshot_json, snapshot_json ->> 'status' AS status,
+                  jsonb_path_exists(snapshot_json, $3::jsonpath, jsonb_build_object('t', $2::text)) AS matched
+           FROM ${this.workflowSnapshotTableName()} AS snapshot
+           CROSS JOIN LATERAL (SELECT ${snapshotJson} AS snapshot_json) AS parsed
+           WHERE snapshot."resourceId" = $1 ${keyset}
+         ) AS candidates
+         WHERE matched OR ($5::boolean AND NOT jsonb_path_exists(snapshot_json, $4::jsonpath))
+         ORDER BY workflow_name COLLATE "C", run_id COLLATE "C"
+         LIMIT ${limitParam}`,
+        values,
+      );
+    } catch (error) {
+      throw this.snapshotHandoffError('LIST_WORKFLOW_RUNS_BY_THREAD_FOR_ERASURE', undefined, undefined, error, {
+        write: false,
+      });
+    }
+    const runs = rows.slice(0, limit).map((row): WorkflowRunThreadErasureEntry => {
+      if (row.matched) {
+        return { workflowName: row.workflow_name, runId: row.run_id, attribution: 'thread' };
+      }
+      return {
+        workflowName: row.workflow_name,
+        runId: row.run_id,
+        attribution: 'unattributed',
+        ...(row.status === null ? {} : { status: row.status }),
+        createdAt: new Date((row.createdAtZ || row.createdAt) as Date | string),
+        updatedAt: new Date((row.updatedAtZ || row.updatedAt) as Date | string),
+        contentFree: row.content_free === true,
+      };
+    });
+    const hasMore = rows.length > limit;
+    const last = runs.at(-1);
+    return {
+      status: 'listed',
+      runs,
       hasMore,
       ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
     };

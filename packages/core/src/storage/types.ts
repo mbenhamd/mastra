@@ -132,6 +132,11 @@ export interface WorkflowSnapshotHandoffCapabilities {
    * no pending nested dependent still needs it.
    */
   closureCancelVersion?: 1;
+  /**
+   * Erasure-complete thread listing: `listWorkflowRunsByThreadForErasure`,
+   * which matches every place a snapshot records a thread id, in any status.
+   */
+  threadErasureListVersion?: 1;
 }
 
 /** The canonical native snapshot state a handoff claim must compare under the parent lock. */
@@ -400,6 +405,90 @@ export type ListWorkflowRunClosuresByResourceResult =
   | {
       status: 'listed';
       closures: WorkflowRunClosureEntry[];
+      hasMore: boolean;
+      nextCursor?: WorkflowRunClosureCursor;
+    }
+  | { status: 'unsupported' };
+
+export interface ListWorkflowRunsByThreadForErasureInput {
+  resourceId: string;
+  threadId: string;
+  after?: WorkflowRunClosureCursor;
+  /** Between 1 and 100. */
+  limit: number;
+  /**
+   * Also list the resource's snapshots that record no thread id anywhere
+   * (for example the `pending` snapshot `createRun` persists before the run
+   * starts). They cannot be attributed to any thread, so a caller must not
+   * erase them as the thread's runs without other evidence.
+   */
+  includeUnattributed?: boolean;
+}
+
+/** A run whose snapshot records the thread id. */
+export interface WorkflowRunThreadErasureThreadEntry {
+  workflowName: string;
+  runId: string;
+  attribution: 'thread';
+}
+
+/**
+ * A run of the resource whose snapshot records no thread id at all (listed
+ * only with `includeUnattributed`). The listing never erases it; the fields
+ * below let a caller decide, from the same read, whether its own policy lets
+ * it erase the run (for example: `pending`, `contentFree`, older than the
+ * longest turn lease, and erased through `deleteWorkflowRunClosure`).
+ */
+export interface WorkflowRunThreadErasureUnattributedEntry {
+  workflowName: string;
+  runId: string;
+  attribution: 'unattributed';
+  /** The snapshot's `status` as stored (`undefined` when it records none). */
+  status?: string;
+  /** The store's row timestamps (not the snapshot's own `timestamp`). */
+  createdAt: Date;
+  updatedAt: Date;
+  /**
+   * True only when the snapshot carries no run data, exactly:
+   * - `context` is absent, `null` or `{}`, or its only key is `input` and that
+   *   input is `null` or `{}`; and
+   * - `requestContext` is absent, `null` or `{}`.
+   *
+   * This is the `pending` snapshot `createRun` persists for a top-level run
+   * (`context: {}`, no `requestContext`). A nested run's `pending` snapshot
+   * whose `context.input` holds the parent step's payload (for example the
+   * conversation messages) is not content-free, even without a thread id.
+   * Other snapshot fields (`value`, `result`, `error`, ...) are not inspected.
+   */
+  contentFree: boolean;
+}
+
+/** One run of a thread erasure listing. */
+export type WorkflowRunThreadErasureEntry =
+  | WorkflowRunThreadErasureThreadEntry
+  | WorkflowRunThreadErasureUnattributedEntry;
+
+/**
+ * Lists the resource's canonical snapshots that record the thread id in any
+ * place a snapshot can carry one, in any run status:
+ * - any `memoryInfo.threadId`, at any depth (agentic-loop suspend payloads
+ *   `context.<step>.suspendPayload.__streamState.messageList.memoryInfo`,
+ *   whatever step and status, and the durable-loop input
+ *   `context.input.messageListState.memoryInfo`);
+ * - the durable-loop input state `context.input.state.threadId`;
+ * - the serialized request context of a started run:
+ *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
+ *
+ * Unlike the `threadId` filter of `listWorkflowRuns`, which reads one scalar
+ * (the first suspended step's thread, else the durable input thread), this
+ * listing does not miss a `pending` or `running` loop snapshot, or a snapshot
+ * whose first suspended step names another thread. `unsupported` means the
+ * adapter cannot answer; it never answers an empty page in that case.
+ */
+export type ListWorkflowRunsByThreadForErasureResult =
+  | {
+      status: 'listed';
+      runs: WorkflowRunThreadErasureEntry[];
       hasMore: boolean;
       nextCursor?: WorkflowRunClosureCursor;
     }

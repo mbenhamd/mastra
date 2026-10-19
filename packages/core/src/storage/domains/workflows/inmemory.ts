@@ -90,6 +90,9 @@ import type {
   CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
+  ListWorkflowRunsByThreadForErasureInput,
+  ListWorkflowRunsByThreadForErasureResult,
+  WorkflowRunThreadErasureEntry,
   WorkflowRunClosureEntry,
   WorkflowExecutionState,
   UpdateWorkflowResultsResult,
@@ -118,6 +121,9 @@ import {
   isSettledWorkflowRunStatus,
   validateWorkflowRunClosureIdentity,
   captureWorkflowRunClosureListInput,
+  captureWorkflowRunThreadErasureListInput,
+  classifyWorkflowSnapshotThreadErasure,
+  isWorkflowSnapshotThreadErasureContentFree,
 } from '../../workflow-snapshot-handoff';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
@@ -712,6 +718,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       releaseVersion: 1,
       closureDeleteVersion: 1,
       closureCancelVersion: 1,
+      threadErasureListVersion: 1,
     };
   }
 
@@ -2461,6 +2468,49 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     return {
       status: 'listed',
       closures,
+      hasMore,
+      ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
+    };
+  }
+
+  async listWorkflowRunsByThreadForErasure(
+    input: ListWorkflowRunsByThreadForErasureInput,
+  ): Promise<ListWorkflowRunsByThreadForErasureResult> {
+    const { resourceId, threadId, after, limit, includeUnattributed } = captureWorkflowRunThreadErasureListInput(input);
+    const matches: WorkflowRunThreadErasureEntry[] = [];
+    for (const run of this.db.workflows.values()) {
+      if (run.resourceId !== resourceId) continue;
+      if (after && compareWorkflowRunClosureCursors({ workflowName: run.workflow_name, runId: run.run_id }, after) <= 0) {
+        continue;
+      }
+      // Read a detached copy, as the snapshot would be read back from a
+      // database, so a live object graph is never walked in place.
+      const snapshot: unknown = cloneRunData(typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot);
+      const attribution = classifyWorkflowSnapshotThreadErasure(snapshot, threadId);
+      if (attribution === 'thread') {
+        matches.push({ workflowName: run.workflow_name, runId: run.run_id, attribution: 'thread' });
+      } else if (attribution === 'unattributed' && includeUnattributed) {
+        const statusField =
+          snapshot !== null && typeof snapshot === 'object' ? Object.getOwnPropertyDescriptor(snapshot, 'status') : undefined;
+        const status = statusField && 'value' in statusField ? statusField.value : undefined;
+        matches.push({
+          workflowName: run.workflow_name,
+          runId: run.run_id,
+          attribution: 'unattributed',
+          ...(typeof status === 'string' ? { status } : {}),
+          createdAt: new Date(run.createdAt),
+          updatedAt: new Date(run.updatedAt),
+          contentFree: isWorkflowSnapshotThreadErasureContentFree(snapshot),
+        });
+      }
+    }
+    matches.sort(compareWorkflowRunClosureCursors);
+    const runs = matches.slice(0, limit);
+    const hasMore = matches.length > limit;
+    const last = runs.at(-1);
+    return {
+      status: 'listed',
+      runs,
       hasMore,
       ...(hasMore && last ? { nextCursor: { workflowName: last.workflowName, runId: last.runId } } : {}),
     };
