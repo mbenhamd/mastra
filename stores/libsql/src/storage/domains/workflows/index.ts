@@ -128,6 +128,7 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
     resourceId: string | undefined,
     mutate: (snapshot: WorkflowRunState | undefined) => T & { snapshot?: WorkflowRunState },
     operation: string,
+    fenceCheck?: RunFenceCheck,
   ): Promise<T> {
     return this.executeWithRetry(
       () =>
@@ -139,6 +140,9 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
           // statement across local and remote clients, and a changed predecessor
           // retries the complete read/transform/write operation.
           for (let attempt = 0; attempt < MAX_RESUME_CAS_ATTEMPTS; attempt++) {
+            // Checked on every attempt, behind the client write lock: a claim that commits
+            // between attempts makes the next attempt refuse the write.
+            if (fenceCheck) await assertRunFence(this.#client, fenceCheck);
             const row = await this.#client.execute({
               sql: `SELECT json(snapshot) as snapshot, resourceId FROM ${TABLE_WORKFLOW_SNAPSHOT} WHERE workflow_name = ? AND run_id = ?`,
               args: [workflowName, runId],
@@ -247,6 +251,9 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
       input.resourceId,
       snapshot => persistWorkflowStepUpdateRecord(snapshot, input, value => this.materializeResumeSnapshot(value)),
       'persistWorkflowStepUpdate',
+      // Fork fence fix (PF-5928): a stale execution's late step write is refused like every
+      // other fenced workflow write.
+      this.#runFenceCheck(undefined, input.runId, 'persistWorkflowStepUpdate'),
     );
   }
 

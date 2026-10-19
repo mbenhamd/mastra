@@ -701,6 +701,54 @@ describe('storage-backed ExecutionFence', () => {
     expect(await fence.settle(async () => {})).toBe('superseded');
   });
 
+  // PF-5928 fork fence fix: the fork's fenced step update (persistWorkflowStepUpdate) is a
+  // workflows write too. Upstream RunFence (#26418/#26420) checks every other workflows write; a
+  // stale execution's late step update must be refused the same way, leaving the run's active
+  // step record for the execution that took the run over.
+  it('refuses a superseded execution\'s step update and keeps the active step record', async () => {
+    const { workflowsStore } = await stores();
+    const executionGeneration = 'wfeg:step-update-fence';
+    const snapshot = (activeStepsPath: Record<string, number[]>) =>
+      ({
+        runId: 'run-1',
+        status: 'running',
+        value: {},
+        context: { input: {} },
+        activePaths: [0],
+        activeStepsPath,
+        serializedStepGraph: [],
+        suspendedPaths: {},
+        resumeLabels: {},
+        waitingPaths: {},
+        timestamp: Date.now(),
+        executionGeneration,
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
+      }) as any;
+    await workflowsStore.persistWorkflowSnapshot({
+      workflowName: 'wf',
+      runId: 'run-1',
+      snapshot: snapshot({ step: [0] }),
+    });
+    const stale = await storageClaim(workflowsStore, 'run-1');
+    await workflowsStore.claimRunOwnership({ runId: 'run-1', ownerId: 'recovered', leaseMs: 60_000, force: true });
+
+    await expect(
+      stale.run(() =>
+        workflowsStore.persistWorkflowStepUpdate({
+          workflowName: 'wf',
+          runId: 'run-1',
+          expectedExecutionGeneration: executionGeneration,
+          expectedLifecycleResumeAttempt: 0,
+          snapshot: snapshot({}),
+        }),
+      ),
+    ).rejects.toSatisfy(isRunFenceConflictError);
+    const persisted = await workflowsStore.loadWorkflowSnapshot({ workflowName: 'wf', runId: 'run-1' });
+    expect(persisted?.activeStepsPath).toEqual({ step: [0] });
+    expect(await stale.settle(async () => {})).toBe('superseded');
+  });
+
   it('abandon moves the run past the execution and releases it: stale writes fail, recovery claims it at once', async () => {
     const { workflowsStore, memoryStore } = await stores();
     const abandoned = await storageClaim(workflowsStore, 'run-1');

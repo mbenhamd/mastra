@@ -812,6 +812,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       lifecycleEvents,
       snapshot,
     };
+    // Fork fence fix (PF-5928): a stale execution's late step write is refused like every other
+    // fenced workflow write.
+    this.assertFence(undefined, runId, 'persistWorkflowStepUpdate');
     const key = this.getWorkflowKey(workflowName, runId);
     for (let attempt = 1; ; attempt++) {
       const existing = this.db.workflows.get(key);

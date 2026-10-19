@@ -758,8 +758,12 @@ export class WorkflowsPG extends WorkflowsStorage {
       lifecycleEvents,
       snapshot,
     };
+    const fence = resolveRunFence(this, undefined, runId);
     try {
       return await this.#db.client.tx(async t => {
+        // Fork fence fix (PF-5928): step updates are workflow writes too; a stale execution's
+        // late step write must be refused like every other fenced workflow write.
+        if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, 'persistWorkflowStepUpdate');
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
         await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string; resourceId?: string | null }>(
