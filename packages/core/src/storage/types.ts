@@ -426,16 +426,30 @@ export interface ListWorkflowRunsByThreadForErasureInput {
 }
 
 /**
- * Which of the run's rows that can hold a copy of its data are recorded under
- * the resource (the same rows `deleteWorkflowRunClosure` erases).
+ * What one of the run's rows records, for a row that can hold a copy of its
+ * data: `absent` (no such row under the resource), `thread` (it records the
+ * listed thread id), `other` (it records only other thread ids) or
+ * `unattributed` (it records no thread id).
+ */
+export type WorkflowRunThreadErasureRowAttribution = 'absent' | 'thread' | 'other' | 'unattributed';
+
+/**
+ * The run's rows that `deleteWorkflowRunClosure` erases and that can hold a
+ * copy of its data, each with what it records.
+ *
+ * A released handoff kept after a `deleteRun` release does not fence the run
+ * id, so the same run id can start a newer lifetime whose canonical snapshot
+ * belongs to another thread. Such a run lists as `thread` with
+ * `snapshot: 'other'`. Closure deletion erases every row of the run, so a
+ * caller erasing one thread must not delete a run with an `other` row.
  */
 export interface WorkflowRunThreadErasureRows {
   /** The canonical snapshot. */
-  snapshot: boolean;
+  snapshot: WorkflowRunThreadErasureRowAttribution;
   /** The handoff row and its snapshot, released or not. */
-  handoff: boolean;
+  handoff: WorkflowRunThreadErasureRowAttribution;
   /** The retained terminal recovery envelope. */
-  terminalSnapshot: boolean;
+  terminalSnapshot: WorkflowRunThreadErasureRowAttribution;
 }
 
 /** A run with at least one row (canonical snapshot, handoff snapshot or terminal envelope) that records the thread id. */
@@ -467,7 +481,7 @@ export interface WorkflowRunThreadErasureUnattributedEntry {
    * True only when the run holds no data beyond its canonical snapshot's
    * shell, exactly:
    * - the run has no handoff row and no terminal snapshot row under the
-   *   resource (`rows.handoff` and `rows.terminalSnapshot` are false);
+   *   resource (`rows.handoff` and `rows.terminalSnapshot` are `absent`);
    * - the canonical snapshot's `context` is absent, `null` or `{}`, or its only
    *   key is `input` and that input is `null` or `{}` (a plain empty object; a
    *   class instance such as a `Date` is content); and
@@ -491,20 +505,21 @@ export type WorkflowRunThreadErasureEntry =
  * Lists the resource's runs with a row that records the thread id: the
  * canonical snapshot, the handoff snapshot (kept after a `deleteRun` release
  * removes the canonical row) or the terminal recovery envelope. A snapshot
- * records it in any framework-owned place, at any depth and in any run status:
- * - `__streamState.messageList.memoryInfo.threadId`: the agentic loop's
- *   serialized stream state, e.g. `context.<step>.suspendPayload.__streamState`
+ * records it, in any run status, only at the locations the framework writes:
+ * - an agentic-loop suspension: `context.<step>.suspendPayload.__streamState.messageList.memoryInfo.threadId`
  *   (whatever step and status);
- * - `messageListState.memoryInfo.threadId`: the durable loop's serialized
- *   MessageList (its input, step outputs and result);
- * - `state.threadId` of an object that also has `messageListState`: the
- *   durable loop's state, set even without a memory backend;
- * - for a snapshot, the serialized request context of a started run:
- *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`;
- *   for a terminal envelope, its `requestContextPatch` (same two keys).
+ * - a durable-agent run (`context.input.__workflowKind` is `durable-agent`):
+ *   `messageListState.memoryInfo.threadId` and `state.threadId` (set even
+ *   without a memory backend) of its `context.input`, of any
+ *   `context.<step>.output`, and of its `result`;
+ * - the serialized request context of a started run:
+ *   `requestContext.MastraMemory.thread.id` and `requestContext.mastra__threadId`.
  *
- * Application data that merely looks like thread metadata (a step output
- * `{ memoryInfo: { threadId } }`) attributes nothing.
+ * A terminal envelope records it in its `requestContextPatch` (same two keys)
+ * or, for a `durable-agentic-loop` run, in `terminalResult.messageListState.memoryInfo.threadId`
+ * or `terminalResult.state.threadId`.
+ *
+ * Application data shaped like thread metadata elsewhere attributes nothing.
  *
  * Unlike the `threadId` filter of `listWorkflowRuns`, which reads one scalar
  * (the first suspended step's thread, else the durable input thread), this

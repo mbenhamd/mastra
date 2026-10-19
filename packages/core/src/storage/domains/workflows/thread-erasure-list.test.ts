@@ -7,7 +7,8 @@ import { WorkflowsInMemory } from './inmemory';
 const RESOURCE = 'workspace-1:user-1';
 const OTHER_RESOURCE = 'workspace-1:user-2';
 const THREAD = 'thread-target';
-const SNAPSHOT_ONLY = { snapshot: true, handoff: false, terminalSnapshot: false };
+const SNAPSHOT_ONLY = { snapshot: 'thread', handoff: 'absent', terminalSnapshot: 'absent' };
+const UNATTRIBUTED_SNAPSHOT_ONLY = { snapshot: 'unattributed', handoff: 'absent', terminalSnapshot: 'absent' };
 const OTHER_THREAD = 'thread-other';
 
 function setup() {
@@ -246,7 +247,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       workflowName: 'agentic-loop',
       runId: 'a-bare',
       attribution: 'unattributed',
-      rows: SNAPSHOT_ONLY,
+      rows: UNATTRIBUTED_SNAPSHOT_ONLY,
       status: 'pending',
       createdAt,
       updatedAt,
@@ -287,6 +288,12 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       workflows.releaseWorkflowSnapshotHandoff({ ...released, expectedClaimGeneration: 1, deleteRun: true }),
     ).resolves.toMatchObject({ status: 'released' });
     await expect(workflows.loadWorkflowSnapshot(released)).resolves.toBeNull();
+    // The released handoff no longer fences the run id: a newer lifetime of
+    // another thread reuses it, and its canonical snapshot lists as `other`.
+    await persist(workflows, released, {
+      ...snapshots.loopStart(released.runId, 'running', OTHER_THREAD),
+      status: 'success',
+    } as WorkflowRunState);
 
     // Terminal recovery envelopes, stored as the terminalization journal stores them.
     const terminal = (runId: string, envelope: Record<string, unknown>) =>
@@ -304,6 +311,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     terminal('b-envelope', { terminalResult: {}, finalState: {}, requestContextPatch: { mastra__threadId: THREAD } });
     // A durable run without a memory backend records its thread only in its SerializableDurableState.
     terminal('b2-durable-state', {
+      workflowName: 'durable-agentic-loop',
       terminalResult: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
       finalState: {},
       requestContextPatch: {},
@@ -322,6 +330,7 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
       snapshots.createRunPending('d-bare-other'),
     );
     terminal('d-bare-other', {
+      workflowName: 'durable-agentic-loop',
       terminalResult: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
       finalState: {},
       requestContextPatch: {},
@@ -337,24 +346,28 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     ).resolves.toMatchObject({
       status: 'listed',
       runs: [
-        { ...released, attribution: 'thread', rows: { snapshot: false, handoff: true, terminalSnapshot: false } },
+        {
+          ...released,
+          attribution: 'thread',
+          rows: { snapshot: 'other', handoff: 'thread', terminalSnapshot: 'absent' },
+        },
         {
           workflowName: 'agentic-loop',
           runId: 'b-envelope',
           attribution: 'thread',
-          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' },
         },
         {
           workflowName: 'agentic-loop',
           runId: 'b2-durable-state',
           attribution: 'thread',
-          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' },
         },
         {
           workflowName: 'agentic-loop',
           runId: 'c-bare-terminal',
           attribution: 'unattributed',
-          rows: { snapshot: true, handoff: false, terminalSnapshot: true },
+          rows: { snapshot: 'unattributed', handoff: 'absent', terminalSnapshot: 'unattributed' },
           status: 'pending',
           contentFree: false,
         },

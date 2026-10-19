@@ -7,7 +7,8 @@ import { PostgresStore, WorkflowsPG } from '../../index';
 import { connectionString } from '../../test-utils';
 
 const THREAD = 'thread-target';
-const SNAPSHOT_ONLY = { snapshot: true, handoff: false, terminalSnapshot: false };
+const SNAPSHOT_ONLY = { snapshot: 'thread', handoff: 'absent', terminalSnapshot: 'absent' };
+const UNATTRIBUTED_SNAPSHOT_ONLY = { snapshot: 'unattributed', handoff: 'absent', terminalSnapshot: 'absent' };
 const OTHER_THREAD = 'thread-other';
 
 type Run = { workflowName: string; runId: string };
@@ -256,6 +257,12 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
       workflows.releaseWorkflowSnapshotHandoff({ ...released, expectedClaimGeneration: 1, deleteRun: true }),
     ).resolves.toMatchObject({ status: 'released' });
     await expect(workflows.loadWorkflowSnapshot(released)).resolves.toBeNull();
+    // The released handoff no longer fences the run id: a newer lifetime of
+    // another thread reuses it, and its canonical snapshot lists as `other`.
+    await persist(resource, released, {
+      ...snapshots.loopStart(released.runId, 'running', OTHER_THREAD),
+      status: 'success',
+    } as WorkflowRunState);
 
     // Terminal recovery envelopes, inserted as rows (the listing only reads them).
     const terminal = (runId: string, envelope: Record<string, unknown>) =>
@@ -272,6 +279,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     });
     // A durable run without a memory backend records its thread only in its SerializableDurableState.
     await terminal('b2-durable-state', {
+      workflowName: 'durable-agentic-loop',
       terminalResult: { messageListState: { memoryInfo: null }, state: { threadId: THREAD } },
       finalState: {},
       requestContextPatch: {},
@@ -284,6 +292,7 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     await terminal('c-bare-terminal', { terminalResult: { text: 'result' }, finalState: {}, requestContextPatch: {} });
     await persist(resource, { workflowName: LOOP, runId: 'd-bare-other' }, snapshots.createRunPending('d-bare-other'));
     await terminal('d-bare-other', {
+      workflowName: 'durable-agentic-loop',
       terminalResult: { messageListState: { memoryInfo: { threadId: OTHER_THREAD } }, state: {} },
       finalState: {},
       requestContextPatch: {},
@@ -299,24 +308,28 @@ describe('WorkflowsPG.listWorkflowRunsByThreadForErasure', () => {
     ).resolves.toMatchObject({
       status: 'listed',
       runs: [
-        { ...released, attribution: 'thread', rows: { snapshot: false, handoff: true, terminalSnapshot: false } },
+        {
+          ...released,
+          attribution: 'thread',
+          rows: { snapshot: 'other', handoff: 'thread', terminalSnapshot: 'absent' },
+        },
         {
           workflowName: LOOP,
           runId: 'b-envelope',
           attribution: 'thread',
-          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' },
         },
         {
           workflowName: LOOP,
           runId: 'b2-durable-state',
           attribution: 'thread',
-          rows: { snapshot: false, handoff: false, terminalSnapshot: true },
+          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'thread' },
         },
         {
           workflowName: LOOP,
           runId: 'c-bare-terminal',
           attribution: 'unattributed',
-          rows: { snapshot: true, handoff: false, terminalSnapshot: true },
+          rows: { snapshot: 'unattributed', handoff: 'absent', terminalSnapshot: 'unattributed' },
           status: 'pending',
           contentFree: false,
         },

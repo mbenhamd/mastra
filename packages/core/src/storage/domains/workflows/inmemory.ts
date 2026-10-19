@@ -2504,7 +2504,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         candidate = {
           workflowName,
           runId,
-          rows: { snapshot: false, handoff: false, terminalSnapshot: false },
+          rows: { snapshot: 'absent', handoff: 'absent', terminalSnapshot: 'absent' },
           matched: false,
           anyThread: false,
         };
@@ -2512,7 +2512,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       }
       return candidate;
     };
-    const note = (candidate: Candidate, attribution: 'thread' | 'other' | 'unattributed') => {
+    const note = (
+      candidate: Candidate,
+      row: keyof WorkflowRunThreadErasureRows,
+      attribution: 'thread' | 'other' | 'unattributed',
+    ) => {
+      candidate.rows[row] = attribution;
       if (attribution === 'thread') candidate.matched = true;
       if (attribution !== 'unattributed') candidate.anyThread = true;
     };
@@ -2526,23 +2531,24 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       const snapshot: unknown = cloneRunData(
         typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot,
       );
-      candidate.rows.snapshot = true;
       candidate.canonical = { snapshot, createdAt: new Date(run.createdAt), updatedAt: new Date(run.updatedAt) };
-      note(candidate, classifyWorkflowSnapshotThreadErasure(snapshot, threadId));
+      note(candidate, 'snapshot', classifyWorkflowSnapshotThreadErasure(snapshot, threadId));
     }
     for (const record of this.db.workflowSnapshotHandoffs.values()) {
       if (record.resourceId !== resourceId) continue;
       const candidate = candidateFor(record.workflowName, record.runId);
       if (!candidate) continue;
-      candidate.rows.handoff = true;
-      note(candidate, classifyWorkflowSnapshotThreadErasure(cloneRunData(record.snapshot), threadId));
+      note(candidate, 'handoff', classifyWorkflowSnapshotThreadErasure(cloneRunData(record.snapshot), threadId));
     }
     for (const record of this.db.workflowTerminalSnapshots.values()) {
       if (record.resourceId !== resourceId) continue;
       const candidate = candidateFor(record.workflowName, record.runId);
       if (!candidate) continue;
-      candidate.rows.terminalSnapshot = true;
-      note(candidate, classifyWorkflowTerminalEnvelopeThreadErasure(cloneRunData(record.envelope), threadId));
+      note(
+        candidate,
+        'terminalSnapshot',
+        classifyWorkflowTerminalEnvelopeThreadErasure(cloneRunData(record.envelope), threadId),
+      );
     }
     const matches: WorkflowRunThreadErasureEntry[] = [];
     for (const candidate of candidates.values()) {
@@ -2564,7 +2570,10 @@ export class WorkflowsInMemory extends WorkflowsStorage {
           ...(typeof status === 'string' ? { status } : {}),
           createdAt,
           updatedAt,
-          contentFree: !rows.handoff && !rows.terminalSnapshot && isWorkflowSnapshotThreadErasureContentFree(snapshot),
+          contentFree:
+            rows.handoff === 'absent' &&
+            rows.terminalSnapshot === 'absent' &&
+            isWorkflowSnapshotThreadErasureContentFree(snapshot),
         });
       }
     }

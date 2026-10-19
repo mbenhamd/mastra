@@ -374,70 +374,85 @@ export function captureWorkflowRunThreadErasureListInput(input: {
 }
 
 /**
- * Thread-id places owned by the framework's own serializations, at any depth.
- * Each is anchored on a framework key, so an ordinary application object in a
- * step result (say `{ memoryInfo: { threadId } }`) never attributes a run:
- * - `__streamState.messageList.memoryInfo.threadId`: the agentic loop's
- *   serialized stream state, e.g. a suspend payload
- *   `context.<step>.suspendPayload.__streamState` (any step, any status);
- * - `messageListState.memoryInfo.threadId`: the durable loop's serialized
- *   MessageList, in its input, step outputs and result;
- * - `state.threadId` of an object that also has `messageListState`: the
- *   durable loop's `SerializableDurableState`, set even without a memory
- *   backend (input, step outputs and result carry both fields).
+ * The locations where the framework itself writes a thread id, each anchored
+ * on a known structure so application data shaped like thread metadata never
+ * attributes a run. A group's `guard` must hold for its paths to count.
  */
-const FRAMEWORK_THREAD_ID_PATHS = [
-  '@.**.__streamState.messageList.memoryInfo.threadId',
-  '@.**.messageListState.memoryInfo.threadId',
-  '@.** ? (exists(@.messageListState)).state.threadId',
-] as const;
+type ThreadIdPathGroup = { guard?: string; paths: readonly string[] };
 
-const threadIdMatchPath = (paths: readonly string[]) => `$ ? (${paths.map(path => `${path} == $t`).join(' || ')})`;
-const anyThreadIdPath = (paths: readonly string[]) =>
-  `$ ? (${paths.map(path => `exists(${path} ? (@.type() == "string"))`).join(' || ')})`;
+/** The durable agent's workflow (`DurableStepIds.AGENTIC_LOOP`). */
+const DURABLE_AGENTIC_LOOP_WORKFLOW = 'durable-agentic-loop';
 
-const SNAPSHOT_THREAD_ID_PATHS = [
-  ...FRAMEWORK_THREAD_ID_PATHS,
-  '@.requestContext.MastraMemory.thread.id',
-  '@.requestContext."mastra__threadId"',
-] as const;
+const SNAPSHOT_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
+  // The agentic loop's suspension: tool-call-step stores streamState.serialize().
+  { paths: ['@.context.*.suspendPayload.__streamState.messageList.memoryInfo.threadId'] },
+  // A durable-agent run: its input, step outputs and result each carry the
+  // serialized MessageList and the SerializableDurableState.
+  {
+    guard: '@.context.input.__workflowKind == "durable-agent"',
+    paths: [
+      '@.context.input.messageListState.memoryInfo.threadId',
+      '@.context.input.state.threadId',
+      '@.context.*.output.messageListState.memoryInfo.threadId',
+      '@.context.*.output.state.threadId',
+      '@.result.messageListState.memoryInfo.threadId',
+      '@.result.state.threadId',
+    ],
+  },
+  // The request context persisted with every started run.
+  { paths: ['@.requestContext.MastraMemory.thread.id', '@.requestContext."mastra__threadId"'] },
+];
 
-const TERMINAL_ENVELOPE_THREAD_ID_PATHS = [
-  ...FRAMEWORK_THREAD_ID_PATHS,
-  '@.requestContextPatch.MastraMemory.thread.id',
-  '@.requestContextPatch."mastra__threadId"',
-] as const;
+const TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
+  {
+    guard: `@.workflowName == "${DURABLE_AGENTIC_LOOP_WORKFLOW}"`,
+    paths: ['@.terminalResult.messageListState.memoryInfo.threadId', '@.terminalResult.state.threadId'],
+  },
+  { paths: ['@.requestContextPatch.MastraMemory.thread.id', '@.requestContextPatch."mastra__threadId"'] },
+];
+
+const threadIdPredicate = (groups: readonly ThreadIdPathGroup[], test: (path: string) => string) =>
+  `$ ? (${groups
+    .map(group => {
+      const paths = group.paths.map(test).join(' || ');
+      return group.guard ? `(${group.guard} && (${paths}))` : paths;
+    })
+    .join(' || ')})`;
+const threadIdMatchPath = (groups: readonly ThreadIdPathGroup[]) => threadIdPredicate(groups, path => `${path} == $t`);
+const anyThreadIdPath = (groups: readonly ThreadIdPathGroup[]) =>
+  threadIdPredicate(groups, path => `exists(${path} ? (@.type() == "string"))`);
 
 /**
  * SQL/JSON path (PostgreSQL `jsonb_path_exists`, lax mode) that is true when
  * a snapshot (canonical or handoff) records the thread id bound to the `t`
- * variable: any framework-owned place (see `FRAMEWORK_THREAD_ID_PATHS`), or
- * the request context persisted with every started run,
- * `requestContext.MastraMemory.thread.id` (set by the agent's memory
- * preparation) and the reserved `requestContext.mastra__threadId`.
+ * variable at a framework-owned location: an agentic-loop suspension's
+ * `__streamState`, a durable-agent run's MessageList or durable state (input,
+ * step outputs, result), or the request context persisted with every started
+ * run (`requestContext.MastraMemory.thread.id`, `requestContext.mastra__threadId`).
+ * `== $t` only holds for a string equal to the bound string.
  */
-export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(SNAPSHOT_THREAD_ID_PATHS);
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
 
 /**
- * SQL/JSON path that is true when a snapshot records any string thread id in
- * one of the places {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH} reads.
- * A snapshot it is false for is unattributed.
+ * SQL/JSON path that is true when a snapshot records any string thread id at
+ * a location {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH} reads. A
+ * snapshot it is false for is unattributed.
  */
-export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(SNAPSHOT_THREAD_ID_PATHS);
+export const WORKFLOW_SNAPSHOT_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(SNAPSHOT_THREAD_ID_PATH_GROUPS);
 
 /**
  * SQL/JSON path that is true when a terminal recovery envelope records the
- * thread id bound to `t`: any framework-owned place in its result or final
- * state, or its request-context patch (`MastraMemory.thread.id`,
- * `mastra__threadId`).
+ * thread id bound to `t`: its request-context patch (`MastraMemory.thread.id`,
+ * `mastra__threadId`) or, for a durable-agent run, its result's MessageList
+ * or durable state.
  */
 export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH = threadIdMatchPath(
-  TERMINAL_ENVELOPE_THREAD_ID_PATHS,
+  TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
 );
 
 /** SQL/JSON path that is true when a terminal envelope records any string thread id where the match path reads. */
 export const WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_ANY_THREAD_PATH = anyThreadIdPath(
-  TERMINAL_ENVELOPE_THREAD_ID_PATHS,
+  TERMINAL_ENVELOPE_THREAD_ID_PATH_GROUPS,
 );
 
 /** Own enumerable data fields of a JSON-like object, as a JSON copy would keep them. Accessors are not run. */
@@ -447,8 +462,13 @@ function threadErasureMembers(value: unknown, key: string): unknown[] {
   const members: unknown[] = [];
   for (const holder of holders) {
     if (holder === null || typeof holder !== 'object' || Array.isArray(holder)) continue;
-    const descriptor = Object.getOwnPropertyDescriptor(holder, key);
-    if (descriptor && descriptor.enumerable && 'value' in descriptor) members.push(descriptor.value);
+    // `.*` reads every member; `.key` reads one.
+    for (const name of key === '*' ? Object.keys(holder) : [key]) {
+      const descriptor = Object.getOwnPropertyDescriptor(holder, name);
+      if (descriptor && descriptor.enumerable && 'value' in descriptor && descriptor.value !== undefined) {
+        members.push(descriptor.value);
+      }
+    }
   }
   return members;
 }
@@ -460,81 +480,63 @@ function threadErasureMemberPath(roots: unknown[], keys: readonly string[]): unk
   return items.flatMap(item => (Array.isArray(item) ? item : [item]));
 }
 
-/** Every object or array reachable from the value (the `.**` accessor), each once. */
-function threadErasureDescendants(value: unknown): unknown[] {
-  const seen = new Set<object>();
-  const out: unknown[] = [];
-  const stack: unknown[] = [value];
-  while (stack.length > 0) {
-    const item = stack.pop();
-    if (item === null || typeof item !== 'object' || seen.has(item)) continue;
-    seen.add(item);
-    out.push(item);
-    if (Array.isArray(item)) {
-      for (const entry of item) stack.push(entry);
-      continue;
-    }
-    for (const key of Object.keys(item)) {
-      const descriptor = Object.getOwnPropertyDescriptor(item, key);
-      if (descriptor && 'value' in descriptor) stack.push(descriptor.value);
-    }
-  }
-  return out;
-}
+/** Values at a dotted member path (`*` for every member), mirroring a lax SQL/JSON accessor chain. */
+const at = (root: unknown, path: string): unknown[] => threadErasureMemberPath([root], path.split('.'));
 
-/** Values at the framework-owned thread-id places, mirroring `FRAMEWORK_THREAD_ID_PATHS`. */
-function frameworkThreadIds(value: unknown): unknown[] {
-  const descendants = threadErasureDescendants(value);
-  return [
-    ...threadErasureMemberPath(descendants, ['__streamState', 'messageList', 'memoryInfo', 'threadId']),
-    ...threadErasureMemberPath(descendants, ['messageListState', 'memoryInfo', 'threadId']),
-    ...threadErasureMemberPath(
-      // `exists(@.messageListState)`: the field is present with any JSON value,
-      // null included. A lax filter applies to each element of an array, so
-      // only objects are tested (array elements are descendants themselves).
-      descendants.filter(
-        item =>
-          !Array.isArray(item) && threadErasureMembers(item, 'messageListState').some(member => member !== undefined),
-      ),
-      ['state', 'threadId'],
-    ),
-  ];
-}
+/** Lax `==` against a string: true when any item is that string. */
+const holds = (root: unknown, path: string, value: string): boolean => at(root, path).includes(value);
 
 /**
- * Classifies a plain-data snapshot for a thread erasure listing with the same
- * places as {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH}: `thread` when
- * it records the thread id, `other` when it records only other thread ids,
- * `unattributed` when it records none. Storage adapters without SQL/JSON path
- * support (the in-memory store) use this on a detached copy of the snapshot.
+ * Classifies a plain-data snapshot for a thread erasure listing at the same
+ * locations as {@link WORKFLOW_SNAPSHOT_THREAD_ERASURE_MATCH_PATH}: `thread`
+ * when it records the thread id, `other` when it records only other thread
+ * ids, `unattributed` when it records none. Storage adapters without SQL/JSON
+ * path support (the in-memory store) use this on a detached copy.
  */
 export function classifyWorkflowSnapshotThreadErasure(
   snapshot: unknown,
   threadId: string,
 ): 'thread' | 'other' | 'unattributed' {
+  const durable = holds(snapshot, 'context.input.__workflowKind', 'durable-agent');
   return classifyThreadErasureValues(
     [
-      ...frameworkThreadIds(snapshot),
-      ...threadErasureMemberPath([snapshot], ['requestContext', 'MastraMemory', 'thread', 'id']),
-      ...threadErasureMemberPath([snapshot], ['requestContext', 'mastra__threadId']),
+      ...at(snapshot, 'context.*.suspendPayload.__streamState.messageList.memoryInfo.threadId'),
+      ...(durable
+        ? [
+            'context.input.messageListState.memoryInfo.threadId',
+            'context.input.state.threadId',
+            'context.*.output.messageListState.memoryInfo.threadId',
+            'context.*.output.state.threadId',
+            'result.messageListState.memoryInfo.threadId',
+            'result.state.threadId',
+          ].flatMap(path => at(snapshot, path))
+        : []),
+      ...at(snapshot, 'requestContext.MastraMemory.thread.id'),
+      ...at(snapshot, 'requestContext.mastra__threadId'),
     ],
     threadId,
   );
 }
 
 /**
- * Classifies a plain-data terminal recovery envelope with the same places as
+ * Classifies a plain-data terminal recovery envelope at the same locations as
  * {@link WORKFLOW_TERMINAL_ENVELOPE_THREAD_ERASURE_MATCH_PATH}.
  */
 export function classifyWorkflowTerminalEnvelopeThreadErasure(
   envelope: unknown,
   threadId: string,
 ): 'thread' | 'other' | 'unattributed' {
+  const durable = holds(envelope, 'workflowName', DURABLE_AGENTIC_LOOP_WORKFLOW);
   return classifyThreadErasureValues(
     [
-      ...frameworkThreadIds(envelope),
-      ...threadErasureMemberPath([envelope], ['requestContextPatch', 'MastraMemory', 'thread', 'id']),
-      ...threadErasureMemberPath([envelope], ['requestContextPatch', 'mastra__threadId']),
+      ...(durable
+        ? [
+            ...at(envelope, 'terminalResult.messageListState.memoryInfo.threadId'),
+            ...at(envelope, 'terminalResult.state.threadId'),
+          ]
+        : []),
+      ...at(envelope, 'requestContextPatch.MastraMemory.thread.id'),
+      ...at(envelope, 'requestContextPatch.mastra__threadId'),
     ],
     threadId,
   );

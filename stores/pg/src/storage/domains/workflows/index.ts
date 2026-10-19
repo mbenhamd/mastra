@@ -168,6 +168,7 @@ import type {
   ListWorkflowRunsByThreadForErasureResult,
   WorkflowRunClosureEntry,
   WorkflowRunThreadErasureEntry,
+  WorkflowRunThreadErasureRowAttribution,
   WorkflowTerminalRecoveryAncestryRecord,
   TABLE_NAMES,
   PruneOptions,
@@ -6321,9 +6322,9 @@ export class WorkflowsPG extends WorkflowsStorage {
       run_id: string;
       matched: boolean;
       any_thread: boolean;
-      has_snapshot: boolean;
-      has_handoff: boolean;
-      has_terminal_snapshot: boolean;
+      snapshot_row: string | null;
+      handoff_row: string | null;
+      terminal_snapshot_row: string | null;
       status: string | null;
       createdAt: Date | string | null;
       createdAtZ: Date | string | null;
@@ -6356,9 +6357,9 @@ export class WorkflowsPG extends WorkflowsStorage {
         `SELECT workflow_name COLLATE "C" AS workflow_name, run_id COLLATE "C" AS run_id,
                 bool_or(matched) AS matched,
                 bool_or(any_thread) AS any_thread,
-                bool_or(kind = 'snapshot') AS has_snapshot,
-                bool_or(kind = 'handoff') AS has_handoff,
-                bool_or(kind = 'terminal_snapshot') AS has_terminal_snapshot,
+                max(row_attribution) FILTER (WHERE kind = 'snapshot') AS snapshot_row,
+                max(row_attribution) FILTER (WHERE kind = 'handoff') AS handoff_row,
+                max(row_attribution) FILTER (WHERE kind = 'terminal_snapshot') AS terminal_snapshot_row,
                 max(status) AS status,
                 max("createdAt") AS "createdAt", max("createdAtZ") AS "createdAtZ",
                 max("updatedAt") AS "updatedAt", max("updatedAtZ") AS "updatedAtZ",
@@ -6395,7 +6396,11 @@ export class WorkflowsPG extends WorkflowsStorage {
                   NULL::text, NULL::timestamp, NULL::timestamptz, NULL::timestamp, NULL::timestamptz, FALSE
            FROM ${this.terminalSnapshotTableName()} AS terminal
            WHERE terminal.resource_id = $1 ${keyset('terminal')}
-         ) AS run_rows
+         ) AS run_row_matches
+         CROSS JOIN LATERAL (
+           SELECT CASE WHEN matched THEN 'thread' WHEN any_thread THEN 'other' ELSE 'unattributed' END
+             AS row_attribution
+         ) AS attributed
          GROUP BY workflow_name COLLATE "C", run_id COLLATE "C"
          HAVING bool_or(matched)
              OR ($7::boolean AND bool_or(kind = 'snapshot') AND NOT bool_or(any_thread))
@@ -6408,11 +6413,16 @@ export class WorkflowsPG extends WorkflowsStorage {
         write: false,
       });
     }
+    const rowAttribution = (value: string | null): WorkflowRunThreadErasureRowAttribution => {
+      if (value === null) return 'absent';
+      if (value === 'thread' || value === 'other' || value === 'unattributed') return value;
+      throw new TypeError('Invalid workflow thread erasure row attribution');
+    };
     const runs = rows.slice(0, limit).map((row): WorkflowRunThreadErasureEntry => {
       const recorded = {
-        snapshot: row.has_snapshot === true,
-        handoff: row.has_handoff === true,
-        terminalSnapshot: row.has_terminal_snapshot === true,
+        snapshot: rowAttribution(row.snapshot_row),
+        handoff: rowAttribution(row.handoff_row),
+        terminalSnapshot: rowAttribution(row.terminal_snapshot_row),
       };
       if (row.matched) {
         return { workflowName: row.workflow_name, runId: row.run_id, attribution: 'thread', rows: recorded };
@@ -6425,7 +6435,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         ...(row.status === null ? {} : { status: row.status }),
         createdAt: new Date((row.createdAtZ || row.createdAt) as Date | string),
         updatedAt: new Date((row.updatedAtZ || row.updatedAt) as Date | string),
-        contentFree: row.snapshot_content_free === true && !recorded.handoff && !recorded.terminalSnapshot,
+        contentFree:
+          row.snapshot_content_free === true && recorded.handoff === 'absent' && recorded.terminalSnapshot === 'absent',
       };
     });
     const hasMore = rows.length > limit;
