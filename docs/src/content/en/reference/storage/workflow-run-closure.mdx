@@ -115,11 +115,11 @@ Returns: `Promise<ListWorkflowRunClosuresByResourceResult>`:
 
 ## `listWorkflowRunsByThreadForErasure(input)`
 
-Pages a resource's runs that hold a copy of a thread's data, in any run status. It reads every row `deleteWorkflowRunClosure` erases that can hold such a copy: the canonical snapshot, the handoff snapshot (kept after a `deleteRun` release removes the canonical snapshot) and the terminal recovery envelope. Use it to erase a thread or a session inside a resource that stays. The `threadId` filter of `listWorkflowRuns` reads a single value, so it misses an agent loop snapshot that is still `pending` or `running`, and a run whose first suspended step names another thread.
+Pages a resource's runs that hold a copy of a thread's data, in any run status. It reads every row `deleteWorkflowRunClosure` erases that can hold such a copy: the canonical snapshot, the handoff snapshot (kept after a `deleteRun` release removes the canonical snapshot) and the terminal recovery envelope. Use it to erase a thread or a session inside a resource that stays. The `threadId` filter of `listWorkflowRuns` reads a single value, so it misses an agent loop snapshot that's still `pending` or `running`, and a run whose first suspended step names another thread.
 
 Input: `{ resourceId, threadId, after?, limit, includeUnattributed? }`. `limit` is required and between 1 and 100. `after` is the `nextCursor` of the previous page.
 
-A snapshot (canonical or handoff) matches when the thread id appears in one of these places:
+A snapshot (canonical or handoff) matches when one of these places records the thread id:
 
 - any `memoryInfo.threadId`, at any depth, such as an agent loop step's `suspendPayload.__streamState.messageList.memoryInfo` (any step, any status) or the durable loop's `context.input.messageListState.memoryInfo`;
 - the durable loop's `context.input.state.threadId`;
@@ -138,7 +138,7 @@ The `pending` snapshot that `createRun` stores before a run starts records no th
 - `context` is absent, `null` or `{}`, or its only key is `input` and that input is `null` or `{}`;
 - `requestContext` is absent, `null` or `{}`.
 
-A nested run's `pending` snapshot whose `context.input` holds the parent step's payload isn't content-free. An unattributed run may belong to another thread's turn that is still starting, so don't erase it as the thread's run without other evidence, such as its age. The listing itself never changes anything.
+A nested run's `pending` snapshot whose `context.input` holds the parent step's payload isn't content-free. An unattributed run may belong to another thread's turn that's still starting, so don't erase it as the thread's run without other evidence, such as its age. The listing itself never changes anything.
 
 ## Availability
 
