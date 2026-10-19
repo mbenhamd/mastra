@@ -6919,7 +6919,46 @@ export class Run<
     this.adoptLifecycleExecution(lifecycleExecution);
     this.workflowRunSpan = workflowSpan;
 
-    const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+    // Upstream #27313: if the engine fails before it persisted anything, give the run
+    // back so a retry can claim it. Fork: the generation stays adopted (lineage is
+    // never reversed); only the status returns, compare-and-set against the exact
+    // generation and resume attempt this call installed, and only while every
+    // execution path and step result is as it was at claim time.
+    const releaseTimeTravelClaimIfUnused = async () => {
+      if (!workflowsStore?.supportsConcurrentUpdates()) return;
+      try {
+        const current = await workflowsStore.loadWorkflowSnapshot({ workflowName: this.workflowId, runId: this.runId });
+        const claimedStepIds = Object.keys(snapshot.context);
+        const currentStepIds = Object.keys(current?.context ?? {});
+        const engineNeverStarted =
+          current?.status === 'running' &&
+          current.executionGeneration === lifecycleExecution.executionGeneration &&
+          currentStepIds.length === claimedStepIds.length &&
+          claimedStepIds.every(stepId => current.context[stepId]?.status === snapshot.context[stepId]?.status) &&
+          JSON.stringify(current.activePaths ?? []) === JSON.stringify(snapshot.activePaths ?? []) &&
+          JSON.stringify(current.activeStepsPath ?? {}) === JSON.stringify(snapshot.activeStepsPath ?? {}) &&
+          JSON.stringify(current.suspendedPaths ?? {}) === JSON.stringify(snapshot.suspendedPaths ?? {});
+        if (!engineNeverStarted) return;
+        await workflowsStore.updateWorkflowState({
+          workflowName: this.workflowId,
+          runId: this.runId,
+          opts: {
+            status: snapshot.status,
+            expectedStatus: 'running',
+            expectedExecutionGeneration: lifecycleExecution.executionGeneration,
+            expectedLifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+          },
+        });
+      } catch (releaseError) {
+        this.#mastra
+          ?.getLogger()
+          ?.warn(`[Workflow ${this.workflowId}] Failed to release time travel claim for run ${this.runId}`, releaseError);
+      }
+    };
+
+    let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
+    try {
+      result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
       this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
@@ -6948,6 +6987,10 @@ export class Run<
         isCancellationAdmitted: this.isCancellationAdmitted,
       }),
     );
+    } catch (error) {
+      await releaseTimeTravelClaimIfUnused();
+      throw error;
+    }
 
     if (
       result.status !== 'suspended' &&

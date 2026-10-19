@@ -91,7 +91,9 @@ describe('evented concurrent time travel', () => {
       expect(fulfilled).toHaveLength(1);
       expect(rejected).toHaveLength(1);
       expect((fulfilled[0] as PromiseFulfilledResult<any>).value.status).toBe('suspended');
-      expect((rejected[0] as PromiseRejectedResult).reason.id).toBe('WORKFLOW_TIME_TRAVEL_ALREADY_CLAIMED');
+      // PapersFlow fork: time travel claims a fresh lifecycle generation; the loser reports the
+      // fork's generation-claim id.
+      expect((rejected[0] as PromiseRejectedResult).reason.id).toBe('WORKFLOW_RESTART_NOT_CLAIMED');
       expect(workExecute).toHaveBeenCalledTimes(1);
     } finally {
       await mastra.stopWorkers();

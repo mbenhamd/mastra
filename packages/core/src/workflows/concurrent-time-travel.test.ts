@@ -149,9 +149,11 @@ describe('concurrent time travel', () => {
     const results = await raceTimeTravel(harness, run.runId, true);
 
     expect(harness.getWorkExecutions()).toBe(1);
-    expect(expectOneWinner(results, 'WORKFLOW_TIME_TRAVEL_ALREADY_CLAIMED').status).toBe('suspended');
+    // PapersFlow fork: time travel claims a fresh lifecycle generation (claimWorkflowRestart)
+    // instead of upstream's status claim, so the loser reports WORKFLOW_RESTART_NOT_CLAIMED.
+    expect(expectOneWinner(results, 'WORKFLOW_RESTART_NOT_CLAIMED').status).toBe('suspended');
     expect((results.find(r => r.status === 'rejected') as PromiseRejectedResult).reason.message).toContain(
-      'already claimed by another caller',
+      'another generation owns it now',
     );
   });
 
@@ -163,7 +165,8 @@ describe('concurrent time travel', () => {
     const results = await raceTimeTravel(harness, run.runId, true);
 
     expect(harness.getWorkExecutions()).toBe(1);
-    expect(expectOneWinner(results, 'WORKFLOW_TIME_TRAVEL_ALREADY_CLAIMED').status).toBe('success');
+    // PapersFlow fork: generation claim loser id.
+    expect(expectOneWinner(results, 'WORKFLOW_RESTART_NOT_CLAIMED').status).toBe('success');
   });
 
   it('rejects a timeTravel() issued while an earlier one is still executing', async () => {
@@ -173,7 +176,8 @@ describe('concurrent time travel', () => {
     const results = await raceTimeTravel(harness, run.runId, false);
 
     expect(harness.getWorkExecutions()).toBe(1);
-    expect(expectOneWinner(results, 'WORKFLOW_TIME_TRAVEL_RUN_RUNNING').status).toBe('suspended');
+    // PapersFlow fork: the still-running refusal is the fork lifecycle id.
+    expect(expectOneWinner(results, 'WORKFLOW_RUN_STILL_RUNNING').status).toBe('suspended');
   });
 
   it('allows a second timeTravel() once the first one has finished', async () => {
@@ -185,7 +189,11 @@ describe('concurrent time travel', () => {
     expect(harness.getWorkExecutions()).toBe(2);
   });
 
-  it('still time travels on stores that cannot claim, without calling updateWorkflowState', async () => {
+  // PapersFlow fork: the generation claim installs the new lifecycle generation even on stores
+  // that cannot compare-and-set (fork restart-claim.test.ts "claims unconditionally when the store
+  // cannot compare-and-set"), so a store without updateWorkflowState cannot time travel. Upstream's
+  // skip-the-claim behaviour is not adopted (decision pending on PF-5928).
+  it.skip('still time travels on stores that cannot claim, without calling updateWorkflowState', async () => {
     const harness = createHarness({ suspendAtEnd: true });
     const storage = new MockStore();
     const workflowsStore = storage.stores.workflows as any;
