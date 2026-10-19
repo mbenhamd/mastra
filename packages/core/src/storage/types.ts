@@ -553,7 +553,9 @@ export type WorkflowRunThreadErasureEntry =
  * `terminalResult.output.messageListState.memoryInfo.threadId` or
  * `terminalResult.output.state.threadId` (the envelope keeps the child's step
  * result). Its `requestContextPatch` cannot carry a thread: the envelope
- * refuses infrastructure-owned keys.
+ * refuses infrastructure-owned keys. So a terminal-only row of any other run
+ * records no thread and is not listed (`listWorkflowRunClosuresByResource`
+ * still finds it).
  *
  * Application data shaped like thread metadata elsewhere attributes nothing.
  *
