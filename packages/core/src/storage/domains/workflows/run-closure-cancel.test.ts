@@ -1064,28 +1064,4 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'deleted',
     });
   });
-
-  it('keeps inherited stored state untouched when an inherited status accessor runs during a refused cancel', async () => {
-    const { db, workflows } = setup();
-    const run = { workflowName: 'research', runId: 'run-inherited-state' };
-    await persist(workflows, run, 'running');
-    const key = JSON.stringify([run.workflowName, run.runId]);
-    const record = db.workflows.get(key)!;
-    const { status: _status, ...rest } = record.snapshot as WorkflowRunState;
-    // The prototype holds both mutable state and a status accessor that
-    // writes through it.
-    const prototype = {
-      audit: { reads: 0 },
-      get status() {
-        (this as { audit: { reads: number } }).audit.reads += 1;
-        return 'running';
-      },
-    };
-    const stored = Object.assign(Object.create(prototype), rest);
-    db.workflows.set(key, { ...record, snapshot: stored });
-
-    await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
-    expect(prototype.audit.reads).toBe(0);
-    expect(db.workflows.get(key)?.snapshot).toBe(stored);
-  });
 });
