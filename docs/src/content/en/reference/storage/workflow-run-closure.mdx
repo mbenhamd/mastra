@@ -93,7 +93,8 @@ The store has no executor lease or liveness check. It cancels a `running` run th
 
 In the in-memory store, both `cancelled` and `settled` protect the selected run from writes that would reopen it. A `settled` selection keeps the stored snapshot and records its checked status as data. Later writes to the run are stored as plain data:
 
-- `persistWorkflowSnapshot`, `updateWorkflowState`, `updateWorkflowResults`, `bindWorkflowNestedRunOwnership`, and resume admission, rollback and finalization throw `WorkflowStaleSnapshotPersistError` when the new status disagrees with the run's terminal status. Writes with the same status still succeed.
+- `persistWorkflowSnapshot`, `updateWorkflowState`, `updateWorkflowResults`, and resume admission, rollback and finalization throw `WorkflowStaleSnapshotPersistError` when the new status disagrees with the run's terminal status. Writes with the same status still succeed.
+- `bindWorkflowNestedRunOwnership` always returns `{ status: 'missing_run' }`, whatever status the snapshot would keep, so no new nested child starts on the run. The PostgreSQL store also returns `missing_run` for a run with a latched terminal status.
 - `persistWorkflowStepUpdate` doesn't throw. It returns `{ status: 'finalized', disposition }`, as it does for any terminal run.
 - An already settled run keeps its snapshot content.
 - Closure deletion removes this protection before the same run ID is used again.

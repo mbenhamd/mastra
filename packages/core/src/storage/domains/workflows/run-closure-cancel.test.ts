@@ -1025,4 +1025,67 @@ describe('WorkflowsInMemory erasure cancel', () => {
       status: 'deleted',
     });
   });
+
+  it('refuses an already bound nested ownership when cloning the run selects it for erasure', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-bind-reentrant' };
+    await persist(workflows, run, 'suspended');
+    const bind = () =>
+      workflows.bindWorkflowNestedRunOwnership({
+        ...run,
+        stepId: NESTED_STEP,
+        nestedRunId: 'run-bind-reentrant-child',
+        result: { status: 'running', payload: {} },
+        requestContext: {},
+      });
+    await expect(bind()).resolves.toMatchObject({ status: 'bound' });
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    let selection: Promise<unknown> | undefined;
+    let fired = false;
+    // An accessor on the stored snapshot, run while the bind clones it,
+    // selects the run for erasure before the bind answers.
+    const stored = Object.defineProperty({ ...(record.snapshot as WorkflowRunState) }, 'audit', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        if (!fired) {
+          fired = true;
+          selection = cancel(workflows, run);
+        }
+        return 'read';
+      },
+    });
+    db.workflows.set(key, { ...record, snapshot: stored });
+
+    await expect(bind()).resolves.toEqual({ status: 'missing_run' });
+    await expect(selection).resolves.toEqual({ status: 'cancelled' });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
+
+  it('keeps inherited stored state untouched when an inherited status accessor runs during a refused cancel', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-inherited-state' };
+    await persist(workflows, run, 'running');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const { status: _status, ...rest } = record.snapshot as WorkflowRunState;
+    // The prototype holds both mutable state and a status accessor that
+    // writes through it.
+    const prototype = {
+      audit: { reads: 0 },
+      get status() {
+        (this as { audit: { reads: number } }).audit.reads += 1;
+        return 'running';
+      },
+    };
+    const stored = Object.assign(Object.create(prototype), rest);
+    db.workflows.set(key, { ...record, snapshot: stored });
+
+    await expect(cancel(workflows, run, 'workspace-2:user-1')).resolves.toEqual({ status: 'resource_mismatch' });
+    expect(prototype.audit.reads).toBe(0);
+    expect(db.workflows.get(key)?.snapshot).toBe(stored);
+  });
 });

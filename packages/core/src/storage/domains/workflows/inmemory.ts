@@ -257,6 +257,7 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
         configurable: true,
       });
     }
+    shadowInheritedErasureState(value, error, seen);
     return error;
   }
   // Other built-ins keep their payload in internal slots that a prototype
@@ -282,7 +283,49 @@ function detachedErasureCopy(value: unknown, seen = new Map<object, unknown>()):
     if ('value' in descriptor) descriptor.value = detachedErasureCopy(descriptor.value, seen);
   }
   Object.defineProperties(copy, descriptors);
+  shadowInheritedErasureState(value, copy, seen);
   return copy;
+}
+
+/**
+ * Own properties a detached copy holds only to shadow inherited mutable
+ * state, with the value each was given. They are not fields of the snapshot:
+ * plainErasureSnapshot removes every shadow still holding that value.
+ */
+const erasureShadows = new WeakMap<object, Map<PropertyKey, unknown>>();
+
+/**
+ * The copy keeps the source's prototype (so `instanceof` and methods hold),
+ * but an accessor run on the copy may reach object data the prototype chain
+ * holds through `this`. Each such inherited object, nearest level first, is
+ * detached through the same memo and defined on the copy as an own shadow,
+ * so the accessor then changes the copy and never the stored prototype.
+ */
+function shadowInheritedErasureState(source: object, copy: object, seen: Map<object, unknown>): void {
+  const reached = new Set<PropertyKey>(Reflect.ownKeys(copy));
+  for (
+    let level: object | null = Object.getPrototypeOf(source);
+    level && level !== Object.prototype && level !== Array.prototype && level !== Error.prototype;
+    level = Object.getPrototypeOf(level)
+  ) {
+    const inherited = Object.getOwnPropertyDescriptors(level);
+    for (const key of Reflect.ownKeys(inherited)) {
+      if (reached.has(key)) continue;
+      reached.add(key);
+      const descriptor = (inherited as Record<PropertyKey, PropertyDescriptor>)[key]!;
+      if (!('value' in descriptor) || descriptor.value === null || typeof descriptor.value !== 'object') continue;
+      const shadow = detachedErasureCopy(descriptor.value, seen);
+      Object.defineProperty(copy, key, {
+        value: shadow,
+        writable: descriptor.writable ?? false,
+        enumerable: descriptor.enumerable ?? false,
+        configurable: true,
+      });
+      let shadows = erasureShadows.get(copy);
+      if (!shadows) erasureShadows.set(copy, (shadows = new Map()));
+      shadows.set(key, shadow);
+    }
+  }
 }
 
 /** Reads a field once on a detached copy; an accessor that throws yields `undefined`. */
@@ -304,7 +347,8 @@ function readErasureField(owner: object, name: string): unknown {
  * fields set to `undefined`).
  */
 function plainErasureSnapshot<T>(value: T): T {
-  const copy = detachedErasureCopy(value);
+  const detached = new Map<object, unknown>();
+  const copy = detachedErasureCopy(value, detached);
   if (copy === null || typeof copy !== 'object' || Array.isArray(copy)) return cloneRunData(copy) as T;
   const record = copy as Record<string, unknown>;
   const status = readErasureField(record, 'status');
@@ -321,8 +365,11 @@ function plainErasureSnapshot<T>(value: T): T {
   const fields: Record<string, unknown> = {};
   const names = new Map<PropertyKey, boolean>();
   const own = Object.getOwnPropertyDescriptors(record);
+  const shadows = erasureShadows.get(record);
   for (const name of Reflect.ownKeys(own)) {
     const descriptor = (own as Record<PropertyKey, PropertyDescriptor>)[name]!;
+    // A shadow of inherited state counts only as the inherited field would.
+    if (shadows?.has(name) && !descriptor.enumerable) continue;
     if (descriptor.enumerable || 'value' in descriptor) names.set(name, descriptor.enumerable ?? false);
   }
   for (
@@ -356,6 +403,17 @@ function plainErasureSnapshot<T>(value: T): T {
     if (Object.prototype.hasOwnProperty.call(plain, key)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(fields, key)!;
     Object.defineProperty(plain, key, { ...descriptor, value: deepCloneForRun(descriptor.value, memo) });
+  }
+  // A nested value's inherited state stays inherited: a shadow still holding
+  // the value it was given leaves the stored copy (one an accessor replaced
+  // is kept, as an own field the accessor wrote).
+  for (const nested of detached.values()) {
+    const shadows = nested !== null && typeof nested === 'object' ? erasureShadows.get(nested) : undefined;
+    const stored = shadows ? memo.get(nested as object) : undefined;
+    if (!shadows || stored === null || typeof stored !== 'object') continue;
+    for (const [key, shadow] of shadows) {
+      if (Object.getOwnPropertyDescriptor(nested, key)?.value === shadow) Reflect.deleteProperty(stored, key);
+    }
   }
   return plain as T;
 }
@@ -2511,35 +2569,25 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       const snapshot = cloneRunData(typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot);
       const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
       if (ownership.status === 'ownership_conflict') return ownership;
-      if (ownership.status === 'already_bound') {
-        return { status: 'already_bound', stepResults: cloneRunData(ownership.snapshot.context) };
-      }
-      // The erasure fence updateWorkflowResults applies: a run selected for
-      // erasure is checked and stored as plain data, and a status that
-      // disagrees with its latch is refused before anything is written.
-      const revision = this.db.workflowTerminalParentRevisions.get(key);
-      const storedSnapshot = revision?.erasureCancelled
-        ? plainErasureSnapshot(ownership.snapshot)
-        : cloneRunData(ownership.snapshot);
-      const returnedContext = revision?.erasureCancelled ? cloneRunData(storedSnapshot.context) : undefined;
-      const snapshotStatus = revision?.erasureCancelled ? storedSnapshot.status : undefined;
+      // Every copy is made before the checks below: cloning can run caller
+      // code that reenters the store, even to select this run for erasure.
+      const storedSnapshot = ownership.status === 'bound' ? cloneRunData(ownership.snapshot) : undefined;
+      const stepResults = cloneRunData((storedSnapshot ?? ownership.snapshot).context);
       if (this.db.workflows.get(key) !== run) {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
       }
-      if (revision?.erasureCancelled && snapshotStatus !== revision.terminalStatus) {
-        throw new WorkflowStaleSnapshotPersistError({ workflowName: operation.workflowName, runId: operation.runId });
-      }
+      // Both results, `already_bound` included, are rechecked against the
+      // erasure fence: a selection made while cloning refuses the bind too.
+      if (this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled) return { status: 'missing_run' };
+      if (!storedSnapshot) return { status: 'already_bound', stepResults };
       this.setWorkflowRunRecord(operation.workflowName, operation.runId, {
         ...run,
         snapshot: storedSnapshot,
         updatedAt: new Date(),
       });
       this.bumpParentRevision(key);
-      return {
-        status: 'bound',
-        stepResults: revision?.erasureCancelled ? returnedContext! : cloneRunData(storedSnapshot.context),
-      };
+      return { status: 'bound', stepResults };
     }
   }
 
