@@ -62,6 +62,7 @@ import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { enforceChannelToolFence, readChannelToolFence } from '../../../channel-tool-fence';
 import { AGENT_RESPONSE_RECOVERY_STEP } from '../../../merge-execution-options';
+import type { MastraDBMessage } from '../../../message-list';
 import { isDownloadAssetsError } from '../../../message-list/prompt/download-assets';
 import { createSignal } from '../../../signals';
 import {
@@ -907,7 +908,9 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             const modelSpan = inputModelSpanData
               ? runTracingSafely(
                   () =>
-                    observability?.rebuildSpan(withCarriedClock(inputModelSpanData)) as AIModelGenerationSpan | undefined,
+                    observability?.rebuildSpan(withCarriedClock(inputModelSpanData)) as
+                      | AIModelGenerationSpan
+                      | undefined,
                 )
               : undefined;
 
@@ -2000,7 +2003,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                         request = r || {};
                         rawResponse = rr || {};
                         runTracingSafely(() =>
-                          modelSpanTracker?.updateStep?.({ request, inputMessages, warnings, messageId: currentMessageId }),
+                          modelSpanTracker?.updateStep?.({
+                            request,
+                            inputMessages,
+                            warnings,
+                            messageId: currentMessageId,
+                          }),
                         );
                       },
                     }),
@@ -3075,6 +3083,32 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             const responseMessageIdsBeforeCurrentStep = new Set(
               messageList.get.response.db().map(message => message.id),
             );
+            // Since upstream #26586 one assistant message carries the whole turn, so the current
+            // response already holds earlier iterations' text. Record it per message: this step's
+            // text is the text after the last earlier text part that survived processing (matched by
+            // value, in order, so a processor that clones, removes, or inserts before earlier parts
+            // keeps the attribution: text inserted ahead of earlier narration belongs to that region).
+            const responseTextsBeforeCurrentStep = new Map(
+              messageList.get.response
+                .db()
+                .map(message => [
+                  message.id,
+                  (message.content?.parts ?? []).flatMap(part => (part.type === 'text' ? [part.text] : [])),
+                ]),
+            );
+            const textWrittenByCurrentStep = (message: MastraDBMessage): string[] => {
+              const earlier = responseTextsBeforeCurrentStep.get(message.id) ?? [];
+              const texts = (message.content?.parts ?? []).flatMap(part => (part.type === 'text' ? [part.text] : []));
+              let next = 0;
+              let lastEarlierIndex = -1;
+              texts.forEach((text, index) => {
+                const matchAt = earlier.indexOf(text, next);
+                if (matchAt === -1) return;
+                next = matchAt + 1;
+                lastEarlierIndex = index;
+              });
+              return texts.slice(lastEarlierIndex + 1);
+            };
             materializeStreamedMessages();
 
             // 13. Determine if we should continue (has tool calls). A
@@ -3191,12 +3225,13 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // The raw delta accumulator predates processOutputStep. Successful
             // processors may rewrite or remove the current response without a
             // tripwire, so durable iteration/final output must use the same
-            // processed MessageList view as the regular agentic loop. Durable
-            // execution rotates the response id on every iteration. Accept
-            // that id or a processor-created replacement id, while excluding
-            // all response ids that predate this model step. A processor that
-            // removes the current response yields no text, and so does a
-            // tripwire-rejected response rolled back above (PF-5399/PF-5415).
+            // processed MessageList view as the regular agentic loop. Accept
+            // the current response id or a processor-created replacement id,
+            // while excluding all response ids that predate this model step. A
+            // processor that removes the current response yields no text, and
+            // so does a tripwire-rejected response rolled back above
+            // (PF-5399/PF-5415). Only the parts this step added to a response
+            // that predates it count (one message per turn since #26586).
             const callerVisibleStepText =
               effectiveOutputProcessors.length === 0
                 ? textDeltas.join('')
@@ -3206,9 +3241,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                       message =>
                         message.id === currentMessageId || !responseMessageIdsBeforeCurrentStep.has(message.id),
                     )
-                    .flatMap(message => message.content?.parts ?? [])
-                    .filter(part => part.type === 'text')
-                    .map(part => part.text)
+                    .flatMap(textWrittenByCurrentStep)
                     .join('');
 
             const stepTripwire = processOutputStepTripwire

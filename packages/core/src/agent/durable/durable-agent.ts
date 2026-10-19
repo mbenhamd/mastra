@@ -2108,7 +2108,8 @@ export class DurableAgent<
       : resolvedOptions;
     // Preserve the marker when the until-idle wrapper spreads these options.
     Object.defineProperty(scopedOptions, RESOLVED_EXECUTION_OPTIONS, { value: true, enumerable: true });
-    if (defaultOptions) this.#resolvedDefaultsByOptions.set(scopedOptions, defaultOptions as AgentExecutionOptions<TOutput>);
+    if (defaultOptions)
+      this.#resolvedDefaultsByOptions.set(scopedOptions, defaultOptions as AgentExecutionOptions<TOutput>);
     return scopedOptions;
   }
 
@@ -2933,7 +2934,10 @@ export class DurableAgent<
         // fail closed inside deleteTerminalRunSnapshots(), but an override or
         // adapter that throws must not settle the segment as failed or surface
         // its storage error as a second ERROR event on the run's stream.
-        this.logger.warn(`Failed to delete terminal workflow snapshots for run ${runId}`, { runId, error: deleteError });
+        this.logger.warn(`Failed to delete terminal workflow snapshots for run ${runId}`, {
+          runId,
+          error: deleteError,
+        });
       }
     };
 
@@ -2975,7 +2979,9 @@ export class DurableAgent<
     if (options.localOnly && runId && !this.#runRegistry.get(runId)) {
       return super.abortThreadStream(options);
     }
-    const registryEntry = runId ? (this.#runRegistry.get(runId) ?? getRunRegistryEntry(runId, this.#mastra)) : undefined;
+    const registryEntry = runId
+      ? (this.#runRegistry.get(runId) ?? getRunRegistryEntry(runId, this.#mastra))
+      : undefined;
     if (registryEntry && registryEntry.agentId !== this.id) return false;
     const controller = registryEntry?.abortController;
     const runtimeBindingId = registryEntry?.runtimeBindingId;
@@ -5142,9 +5148,9 @@ export class DurableAgent<
       await this.requestRemoteAbort(runId, runtimeBindingId);
       // A run parked on a suspension has no steps left to stop; release it so
       // it is no longer listed as suspended.
-      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) {
-        agentThreadStreamRuntime.abortRun(runId, this.getPubSub());
-      }
+      // Upstream #26583: abort through the agent so the parked run's snapshot rows are dropped
+      // too (an aborted suspension can never be resumed, #25903).
+      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) super.abortRunStream(runId);
     };
 
     return {
@@ -6114,9 +6120,9 @@ export class DurableAgent<
       await this.requestRemoteAbort(runId, runtimeBindingId);
       // A run parked on a suspension has no steps left to stop; release it so
       // it is no longer listed as suspended.
-      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) {
-        agentThreadStreamRuntime.abortRun(runId, this.getPubSub());
-      }
+      // Upstream #26583: abort through the agent so the parked run's snapshot rows are dropped
+      // too (an aborted suspension can never be resumed, #25903).
+      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) super.abortRunStream(runId);
     };
 
     return {
@@ -6567,9 +6573,9 @@ export class DurableAgent<
       await this.requestRemoteAbort(runId, runtimeBindingId);
       // A run parked on a suspension has no steps left to stop; release it so
       // it is no longer listed as suspended.
-      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) {
-        agentThreadStreamRuntime.abortRun(runId, this.getPubSub());
-      }
+      // Upstream #26583: abort through the agent so the parked run's snapshot rows are dropped
+      // too (an aborted suspension can never be resumed, #25903).
+      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) super.abortRunStream(runId);
     };
 
     const result: DurableAgentStreamResult<TOutput> & { [RECOVERY_WORKFLOW_EXECUTION]: Promise<void> } = {
@@ -6725,12 +6731,9 @@ export class DurableAgent<
         durableAgentName: this.name,
       });
       preparation.workflowInput.runtimeResolution = 'registry-required';
-      await this.#coverMemory(
-        executionFence,
-        preparation.registryEntry.requestContext ?? claimRequestContext,
-        false,
-        { value: preparation.registryEntry.memory },
-      );
+      await this.#coverMemory(executionFence, preparation.registryEntry.requestContext ?? claimRequestContext, false, {
+        value: preparation.registryEntry.memory,
+      });
     } catch (error) {
       // The run never started: drop its owner record rather than leave it behind.
       await executionFence?.settle(async () => {});

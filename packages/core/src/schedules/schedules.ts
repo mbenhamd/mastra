@@ -3,6 +3,7 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { Mastra } from '../mastra';
 import type { Schedule, ScheduleStatus, SchedulesStorage } from '../storage/domains/schedules/base';
 import { slugify } from '../utils/slugify';
+import { createWorkflowExecutionGeneration } from '../workflows/lifecycle-events';
 import { computeNextFire, computeNextFireAt, validateCron } from '../workflows/scheduler/cron';
 import type { ScheduledWorkflowTrigger } from '../workflows/scheduler/types';
 import type { ScheduleIfActive, ScheduleIfIdle } from './types';
@@ -727,6 +728,11 @@ export class Schedules {
       data: {
         workflowId,
         runId: claimId,
+        // Fork lifecycle (L32): the dispatcher admits a start only with an execution
+        // generation; mint one as the scheduler's fire path does.
+        executionGeneration: createWorkflowExecutionGeneration(),
+        lifecycleResumeAttempt: 0,
+        lifecycleStepStates: {},
         prevResult: { status: 'success', output: inputData ?? {} },
         requestContext: requestContext ?? {},
         initialState: initialState ?? {},

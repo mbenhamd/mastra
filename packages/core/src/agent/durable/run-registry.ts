@@ -54,7 +54,9 @@ export const globalRunRegistry = new TTLCache<string, RunRegistryEntry>({
  * missing runId schedules an expiration for a key that has no value.
  */
 export function getGlobalRunRegistryEntry(runId: string): RunRegistryEntry | undefined {
-  return pinnedRunRegistry.get(runId)?.entry ?? (globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined);
+  return (
+    pinnedRunRegistry.get(runId)?.entry ?? (globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined)
+  );
 }
 
 /** Keep an active workflow segment immune to TTL/capacity eviction. */
@@ -179,7 +181,7 @@ let activityHeartbeat: ReturnType<typeof setInterval> | undefined;
 function runActivityHeartbeat(): void {
   // The read is the point: `updateAgeOnGet` refreshes the sliding TTL.
   for (const runId of activeRuns.keys()) {
-    globalRunRegistry.get(runId);
+    if (globalRunRegistry.has(runId)) globalRunRegistry.get(runId);
   }
 }
 
@@ -374,9 +376,11 @@ export function deleteBoundRunRegistryEntry(
   expectedEntry?: RunRegistryEntry,
 ): boolean {
   const pinned = pinnedRunRegistry.get(runId);
-  const cached = globalRunRegistry.get(runId);
+  // Guarded read (upstream #26315 bug class): `get` on the TTL cache refreshes and can recreate the key.
+  const cached = globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined;
   const pinnedMatches =
-    pinned?.entry.runtimeBindingId === runtimeBindingId && (expectedEntry === undefined || pinned.entry === expectedEntry);
+    pinned?.entry.runtimeBindingId === runtimeBindingId &&
+    (expectedEntry === undefined || pinned.entry === expectedEntry);
   const cachedMatches =
     cached?.runtimeBindingId === runtimeBindingId && (expectedEntry === undefined || cached === expectedEntry);
   if (!pinnedMatches && !cachedMatches) return false;
