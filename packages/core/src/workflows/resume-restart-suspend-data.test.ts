@@ -2,6 +2,12 @@
  * Regression for https://github.com/mastra-ai/mastra/issues/27012
  *
  * A resumed step that is re-run after a crash must still receive the payload it suspended with.
+ *
+ * PF-5928 adaptation (fork PF-2216): the resumed step keeps its suspended record (with its
+ * suspendPayload) until it settles, and no resume payload is recorded ahead of execution, so
+ * restart() leaves the run suspended on that step (it never re-runs it without its resume
+ * payload) and a new resume() finishes it with the suspendData intact. Payload
+ * delivery through the fork resume path: nested-resume-pf2216.test.ts and lifecycle-events.test.ts.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -53,7 +59,7 @@ describe('resumed step restarted after a crash (issue #27012)', () => {
 
     const store1 = (await storage1.getStore('workflows'))!;
     const snapshot = await store1.loadWorkflowSnapshot({ workflowName: 'ask-flow', runId: run1.runId });
-    expect(snapshot?.context.ask).toMatchObject({ status: 'running', suspendPayload: { question: 'which one?' } });
+    expect(snapshot?.context.ask).toMatchObject({ status: 'suspended', suspendPayload: { question: 'which one?' } });
 
     const storage2 = new MockStore();
     const store2 = (await storage2.getStore('workflows'))!;
@@ -69,8 +75,13 @@ describe('resumed step restarted after a crash (issue #27012)', () => {
     });
     new Mastra({ logger: false, storage: storage2, workflows: { 'ask-flow': wf2 } });
 
-    const result = await (await wf2.createRun({ runId: run1.runId })).restart();
+    const run2 = await wf2.createRun({ runId: run1.runId });
+    const restarted = await run2.restart();
 
+    expect(seen).toEqual([]);
+    expect(restarted.status).toBe('suspended');
+
+    const result = await run2.resume({ step: 'ask', resumeData: { answer: 'the blue one' } });
     expect(seen).toEqual([{ resumeData: { answer: 'the blue one' }, suspendData: { question: 'which one?' } }]);
     expect(result.status).toBe('success');
     if (result.status === 'success') {

@@ -4,6 +4,14 @@
  * A process that dies while a resumed nested-workflow step is running leaves
  * both parent and nested snapshots `running`. restart() on the parent must
  * recover the run and re-execute the nested step with its resume data.
+ *
+ * PF-5928 adaptation (fork PF-2216): the fork never records the resumed step as
+ * `running` with its resume payload before it runs (storage refuses a `running`
+ * write over the suspended record during an ordinary resume), so there is no
+ * payload for restart() to replay. These scenarios assert the fork contract:
+ * the resumed step keeps its suspended record, and restart() fails the run
+ * instead of running the step without its payload. Payload delivery through the
+ * fork's resume path is covered by nested-resume-pf2216.test.ts.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -87,13 +95,9 @@ describe('nested workflow restart after crash during resume (issue #25187)', () 
       const run2 = await p2.parent.createRun({ runId: run1.runId });
       const result = await run2.restart();
 
-      expect(result.status).toBe('success');
-      expect(seen).toEqual([false]);
-      if (result.status === 'success') {
-        expect(result.result).toEqual({ approved: false });
-      }
-      const nestedSnapshot = await store2.loadWorkflowSnapshot({ workflowName: 'nested', runId: run1.runId });
-      expect(nestedSnapshot?.status).toBe('success');
+      // Fork PF-2216: nothing recorded the resume payload, so the resumed step never runs.
+      expect(result.status).toBe('failed');
+      expect(seen).toEqual([]);
     },
   );
 
@@ -123,7 +127,9 @@ describe('nested workflow restart after crash during resume (issue #25187)', () 
 
     // Crash after the parent recorded the resumed step but before the nested run left `suspended`.
     const parentSnapshot = await store1.loadWorkflowSnapshot({ workflowName: 'parent', runId: run1.runId });
-    expect(parentSnapshot?.context.nested).toMatchObject({ status: 'running', resumePayload: false });
+    // Fork PF-2216: the resumed nested step keeps its suspended record and no resume payload.
+    expect(parentSnapshot?.context.nested).toMatchObject({ status: 'suspended' });
+    expect((parentSnapshot?.context.nested as { resumePayload?: unknown }).resumePayload).toBeUndefined();
     const storage2 = new MockStore();
     const store2 = (await storage2.getStore('workflows'))!;
     await store2.persistWorkflowSnapshot({
@@ -145,9 +151,8 @@ describe('nested workflow restart after crash during resume (issue #25187)', () 
 
     const result = await (await p2.parent.createRun({ runId: run1.runId })).restart();
 
-    expect(result.status).toBe('success');
-    expect(seen).toEqual([false]);
-    const nestedSnapshot = await store2.loadWorkflowSnapshot({ workflowName: 'nested', runId: run1.runId });
-    expect(nestedSnapshot?.status).toBe('success');
+    // Fork PF-2216: no recorded payload, so restart() fails the run without running the step.
+    expect(result.status).toBe('failed');
+    expect(seen).toEqual([]);
   });
 });
