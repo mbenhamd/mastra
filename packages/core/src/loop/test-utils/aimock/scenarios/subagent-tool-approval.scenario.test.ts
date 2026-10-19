@@ -195,9 +195,18 @@ describeForAllEngines(
 
       const label = `resumed chunks: ${types.join(', ')}`;
       expect(entry.delegatedRunId).toBeUndefined();
-      const denied = chunks.find(c => c.type === 'tool-output-denied');
-      expect((denied?.payload as any)?.toolName, label).toBe('agent-subAgent');
-      expect((denied?.payload as any)?.approval, label).toMatchObject({ approved: false, reason: DECLINE_REASON });
+      if (engine === 'normal') {
+        // PapersFlow fork: the loop engine's public stream contract reports a declined
+        // approval as a `tool-result` carrying the decline reason (persisted as
+        // `output-denied`), not a `tool-output-denied` chunk (fork processDeniedApproval).
+        const denial = chunks.find(c => c.type === 'tool-result');
+        expect((denial?.payload as any)?.toolName, label).toBe('agent-subAgent');
+        expect((denial?.payload as any)?.result, label).toBe(DECLINE_REASON);
+      } else {
+        const denied = chunks.find(c => c.type === 'tool-output-denied');
+        expect((denied?.payload as any)?.toolName, label).toBe('agent-subAgent');
+        expect((denied?.payload as any)?.approval, label).toMatchObject({ approved: false, reason: DECLINE_REASON });
+      }
       expect(subagentRequests(mock)).toHaveLength(0);
       expect(executions.count).toBe(0);
     });
