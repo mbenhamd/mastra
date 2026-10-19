@@ -69,6 +69,8 @@ import type {
   CancelWorkflowRunForErasureResult,
   ListWorkflowRunClosuresByResourceInput,
   ListWorkflowRunClosuresByResourceResult,
+  ListWorkflowRunsByThreadForErasureInput,
+  ListWorkflowRunsByThreadForErasureResult,
   WorkflowExecutionState,
 } from '../../types';
 import { StorageDomain } from '../base';
@@ -162,6 +164,17 @@ export abstract class WorkflowsStorage extends StorageDomain {
   async listWorkflowRunClosuresByResource(
     _input: ListWorkflowRunClosuresByResourceInput,
   ): Promise<ListWorkflowRunClosuresByResourceResult> {
+    return { status: 'unsupported' };
+  }
+
+  /**
+   * Pages the resource's runs whose snapshot records the thread id anywhere
+   * it can appear, in any status. Adapters implementing this advertise
+   * `threadErasureListVersion: 1`; others answer `unsupported`.
+   */
+  async listWorkflowRunsByThreadForErasure(
+    _input: ListWorkflowRunsByThreadForErasureInput,
+  ): Promise<ListWorkflowRunsByThreadForErasureResult> {
     return { status: 'unsupported' };
   }
 

@@ -113,8 +113,53 @@ Returns: `Promise<ListWorkflowRunClosuresByResourceResult>`:
 - `{ status: 'listed', closures, hasMore, nextCursor? }`: each entry is `{ workflowName, runId, snapshot, terminalSnapshot, handoff? }`. The flags say which rows matched the resource, and `handoff` is `{ status, released }`. Released handoffs are included, so a delivered handoff whose snapshot was already deleted is still found. Runs are ordered by `(workflowName, runId)` in code-point order.
 - `{ status: 'unsupported' }`: the store can't list closures. It never answers an empty page instead.
 
+## `listWorkflowRunsByThreadForErasure(input)`
+
+Pages a resource's runs that hold a copy of a thread's data, in any run status. It reads every row `deleteWorkflowRunClosure` erases that can hold such a copy: the canonical snapshot, the handoff snapshot (kept after a `deleteRun` release removes the canonical snapshot) and the terminal recovery envelope. Use it to erase a thread or a session inside a resource that stays. The `threadId` filter of `listWorkflowRuns` reads a single value, so it misses an agent loop snapshot that's still `pending` or `running`, and a run whose first suspended step names another thread.
+
+Input: `{ resourceId, threadId, after?, limit, includeUnattributed? }`. `limit` is required and between 1 and 100. `after` is the `nextCursor` of the previous page.
+
+A row matches only where the framework itself writes a thread id, in any run status:
+
+- an agent loop suspension: `__streamState.messageList.memoryInfo.threadId` anywhere inside a step's `suspendPayload` (any step but `context.input`, which the caller owns), including the foreach and nested suspensions kept under `__workflow_meta`, or inside the `suspendPayload` of a foreach step's iteration results, for any step and status;
+- a durable agent run (`context.input.__workflowKind` is `durable-agent`): `messageListState.memoryInfo.threadId` and `state.threadId` of its `context.input`, of any step's `output` or `payload`, and of its `result` (or `result.output`, when terminal persistence stored the whole step result). `state.threadId` is set even without a memory backend;
+- an agent network run (`Agent-Network-Outer-Workflow`, `iteration-with-validation`, `agent-loop-main-workflow`): `context.input.threadId`;
+- the request context stored with every started run: `requestContext.MastraMemory.thread.id` or `requestContext.mastra__threadId`;
+- in a terminal envelope of a `durable-agentic-loop` run: `terminalResult.output.messageListState.memoryInfo.threadId` and `terminalResult.output.state.threadId`. An envelope's `requestContextPatch` can't carry a thread, because the envelope refuses infrastructure-owned keys. So the terminal envelope of a run that isn't a durable agent run records no thread, and once its canonical snapshot is gone the listing can't find it; `listWorkflowRunClosuresByResource` still does.
+
+Application data elsewhere that only looks like thread metadata doesn't match.
+
+Returns: `Promise<ListWorkflowRunsByThreadForErasureResult>`:
+
+- `{ status: 'listed', runs, hasMore, nextCursor? }`: runs are ordered by `(workflowName, runId)` in code-point order. A matching run is `{ workflowName, runId, attribution: 'thread', rows }`, where `rows` is `{ snapshot, handoff, terminalSnapshot }`. Each is `absent` (no such row under the resource), `thread` (only this thread), `mixed` (this thread and others), `other` (only other threads) or `unattributed`.
+
+A released handoff doesn't fence the run ID, so a newer run can reuse the ID for another thread while the handoff of the earlier run stays. That run lists as `thread` with `snapshot: 'other'`. `deleteWorkflowRunClosure` erases every row of the run, so don't delete a run that has an `other` or `mixed` row when you erase one thread without deciding about the other thread's data.
+
+- `{ status: 'unsupported' }`: the store can't answer. It never answers an empty page instead.
+
+The `pending` snapshot that `createRun` stores before a run starts records no thread. With `includeUnattributed: true`, the listing also returns the resource's runs that have a canonical snapshot and record no thread id in any row, as `{ workflowName, runId, attribution: 'unattributed', rows, status?, createdAt, updatedAt, contentFree }`. `status`, `createdAt` and `updatedAt` come from the canonical snapshot row. `contentFree` is true only for the shell `createRun` stores before a run starts:
+
+- `rows.handoff` and `rows.terminalSnapshot` are `absent`;
+- the snapshot is a JSON object whose keys are all among the shell's keys (`WORKFLOW_SNAPSHOT_THREAD_ERASURE_CONTENT_FREE_KEYS`);
+- `value`, `requestContext` and `lifecycleStepStates` are absent, `null` or `{}`, and `result` and `error` are absent or `null`;
+- `context` is absent, `null` or `{}`, or its only key is `input` and that input is `null` or `{}`.
+
+A nested run's `pending` snapshot whose `context.input` holds the parent step's payload isn't content-free. An unattributed run may belong to another thread's turn that's still starting, so don't erase it as the thread's run without other evidence, such as its age. The listing itself never changes anything.
+
+Every entry also carries:
+
+- `loopInternal`: `true` only for the framework's own agent loop workflows (`agentic-loop`, its nested `executionWorkflow`, `durable-agentic-loop` and `durable-agentic-execution`, exported as `WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS`). User workflows are `false`.
+- `sharesRunIdWith`: the other workflow names of the resource whose canonical snapshot uses the same run ID, in code-point order, at most 16. An `agentic-loop` parent and its `executionWorkflow` child list each other.
+
+The intended rule for unattributed runs:
+
+- A `loopInternal` run that's `pending`, in the same resource and older than the longest turn lease plus a margin is left over from a crashed turn. Erase it with `deleteWorkflowRunClosure` whatever `contentFree` says. The `executionWorkflow` child of a crashed turn keeps the previous iteration's output, so it isn't content-free.
+- Erase any other unattributed run only when it's `pending`, `contentFree`, in the same resource and older than that lease plus a margin.
+
 ## Availability
 
-The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1` and `closureCancelVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
+The in-memory store and `@mastra/pg` report `closureDeleteVersion: 1`, `closureCancelVersion: 1` and `threadErasureListVersion: 1` from `getWorkflowSnapshotHandoffCapabilities()`. Other stores answer `unsupported`. The input and result types are exported from `@mastra/core/storage`.
+
+`listWorkflowRunsByThreadForErasure` reads every row of the resource after the cursor on each page and then pages the matches, so a page costs time in proportion to the resource's runs. A snapshot stored as a JSON string is read as the object it encodes; one that doesn't parse fails the listing.
 
 On PostgreSQL, the listing uses resource indexes on the snapshot, handoff and terminal snapshot tables, and the reuse fence uses the `handoff_claim_generation_hwm` column of `mastra_workflow_parent_revisions`. `init()` creates them. With an externally managed schema (`disableInit`), apply the statements from `exportSchemas()` before deploying. The `@mastra/pg` changelog lists them.
