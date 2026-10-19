@@ -117,6 +117,18 @@ async function watchThread(pubsub: EventEmitterPubSub, threadId: string) {
 
 type ThreadWatcher = Awaited<ReturnType<typeof watchThread>>;
 
+/**
+ * PapersFlow fork: thread lease owners are process-attempt-unique tokens
+ * (`mastra-thread-owner:[runId, sourceId, uuid]`), not bare run ids, so tests release
+ * the lease by its current owner and stand in for another instance with its own token.
+ */
+async function releaseHeldLease(pubsub: EventEmitterPubSub, key: string) {
+  const owner = await pubsub.getLeaseOwner(key);
+  if (owner !== undefined) await pubsub.releaseLease(key, owner);
+}
+const foreignLeaseToken = (runId: string) =>
+  `mastra-thread-owner:${JSON.stringify([runId, 'other-instance', 'other-attempt'])}`;
+
 /** Let anything the sweep publishes reach its subscribers before asserting it did not. */
 const flushPublishes = () => new Promise(resolve => setTimeout(resolve, 0));
 
@@ -336,8 +348,8 @@ describe('suspended run in-memory TTL', () => {
       await sweepAfter(SUSPENDED_RUN_TTL_MS + 1);
       const { agent, stream, run } = createWakeableAgent('run-2');
 
-      // Stand-in for the abandoned lease expiring on its own.
-      await pubsub.releaseLease(threadKey(RESOURCE_ID, 'thread-1'), 'run-1');
+      // Stand-in for the abandoned lease expiring on its own (fork: release by its token).
+      await releaseHeldLease(pubsub, threadKey(RESOURCE_ID, 'thread-1'));
 
       const accepted = await sendToThread(agent);
       expect(accepted).toMatchObject({ action: 'wake' });
@@ -440,18 +452,27 @@ describe('suspended run in-memory TTL', () => {
         pubsub,
       );
       try {
-        // Another instance resumed run-1 under the kept lease after the sweep and announced it.
+        // Another instance resumed run-1 after the sweep and announced it. Fork: that instance
+        // holds the thread lease under its own attempt token for run-1.
         vi.useFakeTimers({ shouldAdvanceTime: true, now: sweptAt + 1_000 });
-        await pubsub.acquireLease(threadKey(RESOURCE_ID, 'thread-1'), 'run-1', 15_000);
+        await releaseHeldLease(pubsub, threadKey(RESOURCE_ID, 'thread-1'));
+        await pubsub.acquireLease(threadKey(RESOURCE_ID, 'thread-1'), foreignLeaseToken('run-1'), 15_000);
         await pubsub.publish(threadTopic(RESOURCE_ID, 'thread-1'), {
           type: registration.type,
           runId: registration.runId,
-          data: { ...registration.data, sourceId: 'other-instance', streamId: 'run-1-resumed' },
+          data: {
+            ...registration.data,
+            sourceId: 'other-instance',
+            streamId: 'run-1-resumed',
+            leaseOwner: foreignLeaseToken('run-1'),
+          },
         });
         await vi.waitFor(() =>
           expect(runtime.getActiveThreadRunId({ threadId: 'thread-1', resourceId: RESOURCE_ID }, pubsub)).toBe('run-1'),
         );
-        await expect(sendToThread(agent)).resolves.toEqual({ action: 'deliver', runId: 'run-1' });
+        // PapersFlow fork: a delivery to a remote active run reports the signal's own admission
+        // run id; the forwarded signal-enqueued event below is what targets run-1.
+        await expect(sendToThread(agent)).resolves.toMatchObject({ action: 'deliver' });
         await watcher.waitFor('signal-enqueued', 'run-1');
         expect(stream).not.toHaveBeenCalled();
       } finally {
@@ -463,9 +484,10 @@ describe('suspended run in-memory TTL', () => {
       const watcher = await watchThread(pubsub, 'thread-1');
       await registerSuspendedRun('run-1', 'thread-1', watcher);
       await sweepAfter(SUSPENDED_RUN_TTL_MS + 1);
-      // Another instance owns the thread under a run this one never swept.
-      await pubsub.releaseLease(threadKey(RESOURCE_ID, 'thread-1'), 'run-1');
-      await pubsub.acquireLease(threadKey(RESOURCE_ID, 'thread-1'), 'remote-run', 15_000);
+      // Another instance owns the thread under a run this one never swept (fork: release the
+      // swept run's token; the remote owner holds its own token).
+      await releaseHeldLease(pubsub, threadKey(RESOURCE_ID, 'thread-1'));
+      await pubsub.acquireLease(threadKey(RESOURCE_ID, 'thread-1'), foreignLeaseToken('remote-run'), 15_000);
       const { agent, stream } = createWakeableAgent('run-2');
 
       await expect(sendToThread(agent)).resolves.toEqual({ action: 'deliver', runId: 'remote-run' });
