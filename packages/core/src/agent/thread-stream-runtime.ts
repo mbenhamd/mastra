@@ -19,6 +19,11 @@ import { readPositiveIntEnv } from '../utils';
 import type { Agent } from './agent';
 import type { AgentExecutionOptions } from './agent.types';
 import type { MessageListInput } from './message-list';
+import {
+  getLogicalMessageId,
+  LOGICAL_MESSAGE_ID_METADATA_KEY,
+  normalizeLogicalMessageInputIdentity,
+} from './message-list/logical-message-identity';
 import type { MastraDBMessage } from './message-list/types';
 import { createRecentRequests } from './recent-requests';
 import { AGENT_LEASE_RENEW_INTERVAL_MS, AGENT_LEASE_TTL_MS } from './run-ownership';
@@ -1035,6 +1040,52 @@ function getIdleSignalDiscardHandler(ifIdle: unknown): (() => void) | undefined 
   return typeof handler === 'function' ? () => handler() : undefined;
 }
 
+/**
+ * PF-5928 option A (PM decision): a signal carrying fork PF-4229 lineage is
+ * deduplicated only by the fork's admission model (caller signal id + payload
+ * tombstones, Harness durable admission). Upstream #24774's in-memory
+ * `(agent, thread, sourcePeerId, messageId)` ledger must neither read nor write
+ * for it. Lineage is the reserved `metadata.logicalMessageId` key the Harness
+ * stamps on every lineaged signal (it survives pubsub serialization with the
+ * signal) or a `logicalMessageIdentity` on the run's stream options.
+ *
+ * - `'none'`: no lineage claimed; upstream dedup applies unchanged.
+ * - `'valid'`: validated lineage; upstream dedup is bypassed.
+ * - `'invalid'`: a lineage key is present but malformed. Treated as lineaged
+ *   (never folded into the upstream ledger) and refused at admission, so a
+ *   misclassified signal can never silently lose its lineage.
+ *
+ * Retire when upstream supports the fork's identity, payload-conflict and
+ * retention semantics (see PF-5928 logical-identity decision).
+ */
+type ForkSignalLineage = 'none' | 'valid' | 'invalid';
+
+function forkSignalLineage(signal: AgentSignal, streamOptions?: unknown): ForkSignalLineage {
+  const metadata = signal.metadata as unknown;
+  const metadataClaimsLineage =
+    typeof metadata === 'object' &&
+    metadata !== null &&
+    !Array.isArray(metadata) &&
+    Object.hasOwn(metadata, LOGICAL_MESSAGE_ID_METADATA_KEY);
+  const streamIdentity = (streamOptions as { logicalMessageIdentity?: unknown } | undefined)?.logicalMessageIdentity;
+  if (!metadataClaimsLineage && streamIdentity === undefined) return 'none';
+  if (metadataClaimsLineage && getLogicalMessageId(metadata) === undefined) return 'invalid';
+  if (streamIdentity !== undefined) {
+    try {
+      normalizeLogicalMessageInputIdentity(streamIdentity);
+    } catch {
+      return 'invalid';
+    }
+  }
+  return 'valid';
+}
+
+function forkSignalLineageError(): TypeError {
+  return new TypeError(
+    `Agent signal metadata.${LOGICAL_MESSAGE_ID_METADATA_KEY} or logicalMessageIdentity is malformed; a lineaged signal must carry a valid logical message id`,
+  );
+}
+
 function hasFullLogicalMessageIdentity(ifIdle: unknown): boolean {
   const identity = (ifIdle as { streamOptions?: { logicalMessageIdentity?: unknown } } | undefined)?.streamOptions
     ?.logicalMessageIdentity;
@@ -1935,7 +1986,15 @@ export class AgentThreadStreamRuntime {
    * no message identity (for example a plain `sendSignal`), which are never
    * deduplicated — unlike the transport `requestId`, which the sender regenerates.
    */
-  #idleMessageIdentity(agentId: string, key: string, signal: CreatedAgentSignal): string | undefined {
+  #idleMessageIdentity(
+    agentId: string,
+    key: string,
+    signal: CreatedAgentSignal,
+    streamOptions?: unknown,
+  ): string | undefined {
+    // PF-5928 option A: fork-lineage signals bypass the upstream ledger for reads and writes.
+    // This is the single source of the ledger key, so every read/write site inherits it.
+    if (forkSignalLineage(signal, streamOptions) !== 'none') return undefined;
     const messageId = signal.attributes?.messageId;
     const sourcePeerId = signal.attributes?.sourcePeerId;
     if (typeof messageId !== 'string' || messageId === '') return undefined;
@@ -1948,7 +2007,7 @@ export class AgentThreadStreamRuntime {
    * told the original outcome instead of waiting on a run that will never start.
    */
   #markIdleMessageCancelled(state: AgentThreadRuntimeState, key: string, pending: PendingIdleSignal<any>): void {
-    const identity = this.#idleMessageIdentity(pending.agent.id, key, pending.signal);
+    const identity = this.#idleMessageIdentity(pending.agent.id, key, pending.signal, pending.streamOptions);
     if (!identity) return;
     const acceptedMessage = state.acceptedIdleMessagesByIdentity.get(identity);
     if (!acceptedMessage || acceptedMessage.runId !== pending.runId) return;
@@ -2594,7 +2653,11 @@ export class AgentThreadStreamRuntime {
       return { activeRunId, activeRecord, activeRunIsBlocking, error };
     };
 
-    const messageIdentity = this.#idleMessageIdentity(owner.agent.id, key, signal);
+    if (forkSignalLineage(signal, incomingStreamOptions) === 'invalid') {
+      // Fail closed before any reservation: a malformed lineage is never admitted.
+      return { runId, error: forkSignalLineageError().message, preAdmission: true };
+    }
+    const messageIdentity = this.#idleMessageIdentity(owner.agent.id, key, signal, incomingStreamOptions);
     let admissionSettled = false;
     // Records this attempt's real admission outcome for the logical message and
     // resolves a duplicate that raced in behind the reservation on it. `keep`
@@ -7608,7 +7671,12 @@ export class AgentThreadStreamRuntime {
     // example the accepted record was evicted by newer messages before the retry
     // arrived). The accepted record is authoritative, so drop the superseded copy
     // rather than start a second run for the same logical message.
-    const drainedIdentity = this.#idleMessageIdentity(pendingIdle.agent.id, key, pendingIdle.signal);
+    const drainedIdentity = this.#idleMessageIdentity(
+      pendingIdle.agent.id,
+      key,
+      pendingIdle.signal,
+      pendingIdle.streamOptions,
+    );
     if (drainedIdentity) {
       const acceptedMessage = state.acceptedIdleMessagesByIdentity.get(drainedIdentity);
       if (acceptedMessage && acceptedMessage.runId !== pendingIdle.runId) {
@@ -10222,6 +10290,11 @@ export class AgentThreadStreamRuntime {
     target: QueueAgentSignalOptions<OUTPUT>,
     pubsub?: PubSub,
   ): QueueAgentSignalResult<OUTPUT> {
+    // PF-5928 option A: queued signals reach the drain without sendSignal, so refuse a
+    // malformed fork lineage here too.
+    if (forkSignalLineage(signalInput, (target as { streamOptions?: unknown }).streamOptions) === 'invalid') {
+      throw forkSignalLineageError();
+    }
     const state = this.#getState(pubsub);
     const acceptedAt = new Date();
     let key: string | undefined;
@@ -10379,6 +10452,10 @@ export class AgentThreadStreamRuntime {
     inputTarget: SendAgentSignalOptions<OUTPUT>,
     pubsub?: PubSub,
   ): SendAgentSignalResult<OUTPUT> {
+    // PF-5928 option A: refuse a malformed fork lineage at the public admission entry.
+    if (forkSignalLineage(signalInput, inputTarget.ifIdle?.streamOptions) === 'invalid') {
+      throw forkSignalLineageError();
+    }
     const target = withThreadTargetScopes(inputTarget, agent.getMastraInstance?.());
     const state = this.#getState(pubsub);
     const callerSignalId = signalInput.id;

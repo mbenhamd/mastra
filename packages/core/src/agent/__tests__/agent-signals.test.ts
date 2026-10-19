@@ -22450,3 +22450,239 @@ describe('Agent signals', () => {
     });
   });
 });
+
+// PF-5928 option A (PM decision, PF-4229 vs upstream #24774): a signal carrying fork
+// lineage (reserved `metadata.logicalMessageId`) is deduplicated only by the fork's
+// signal-id/payload admission. Upstream's in-memory (agent, thread, sourcePeerId,
+// messageId) ledger neither reads nor writes for it; non-lineaged peer signals keep
+// upstream's dedup unchanged. Every case runs through real claimed-owner admission.
+describe('fork lineage bypasses the upstream logical-message ledger (PF-5928 option A)', () => {
+  async function setup(name: string, pubsub: ControlledLeasePubSub = new ControlledLeasePubSub()) {
+    const ownerRuntime = agentThreadStreamRuntime;
+    const senderRuntime = new AgentThreadStreamRuntime();
+    const { model, releaseFirst, getStreamCount } = createBlockingFirstTextStreamModel(
+      `${name} first response`,
+      `${name} later response`,
+    );
+    const ownerAgent = new Agent({ id: `${name}-owner`, name: `${name} owner`, instructions: 'Test', model, pubsub });
+    const senderAgent = new Agent({
+      id: `${name}-sender`,
+      name: `${name} sender`,
+      instructions: 'Test',
+      model: createTextStreamModel('sender response'),
+      pubsub,
+    });
+    const target = { resourceId: `${name}-user`, threadId: `${name}-thread` };
+    const subscription = await ownerRuntime.subscribeToThread(ownerAgent, target, pubsub);
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+    const claim = await ownerRuntime.claimThreadOwnership(ownerAgent, target, pubsub);
+    const send = (signal: Record<string, unknown>) =>
+      senderRuntime.sendSignal(
+        senderAgent,
+        { type: 'user-message', ...signal } as any,
+        { ...target, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
+        pubsub,
+      );
+    const attributes = { messageId: `${name}-message`, sourcePeerId: `${name}-peer` };
+    return {
+      pubsub,
+      send,
+      senderAgent,
+      target,
+      attributes,
+      releaseFirst,
+      getStreamCount,
+      nextRun: () => readNextRunWithParts(iterator),
+      cleanup: () => {
+        releaseFirst();
+        claim.unsubscribe();
+        subscription.unsubscribe();
+      },
+    };
+  }
+
+  const lineaged = (id: string, logicalMessageId: string, attributes: Record<string, string>, contents = 'run once') => ({
+    id,
+    contents,
+    attributes,
+    metadata: { logicalMessageId },
+  });
+
+  async function completeFirstRun(f: Awaited<ReturnType<typeof setup>>) {
+    const run = f.nextRun();
+    await waitForCondition(() => f.getStreamCount() === 1);
+    f.releaseFirst();
+    await run;
+  }
+
+  it('(a) concurrent retries of one fork identity with a lost acknowledgement execute once', async () => {
+    const pubsub = new DroppingAcceptanceReplyPubSub();
+    const f = await setup('lineage-concurrent', pubsub);
+    pubsub.droppedAcceptanceReplies = 1;
+    try {
+      const signal = lineaged('lineage-concurrent-signal', 'lineage-concurrent-input', f.attributes);
+      const first = f.send(signal);
+      const retries = [f.send(signal), f.send(signal)];
+      await waitForCondition(() => f.getStreamCount() === 1);
+      for (const retry of retries) expect(retry.runId).toBe(first.runId);
+      f.releaseFirst();
+      await f.nextRun();
+      await pubsub.flush();
+      expect(f.getStreamCount()).toBe(1);
+      void first.accepted.catch(() => {});
+      for (const retry of retries) void retry.accepted.catch(() => {});
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it('(b) an identical fork identity and payload returns the admitted run', async () => {
+    const f = await setup('lineage-identical');
+    try {
+      const signal = lineaged('lineage-identical-signal', 'lineage-identical-input', f.attributes);
+      const first = f.send(signal);
+      const firstAccepted = await first.accepted;
+      await completeFirstRun(f);
+      const retry = f.send(signal);
+      await expect(retry.accepted).resolves.toMatchObject({
+        action: 'deliver',
+        runId: (firstAccepted as { runId: string }).runId,
+      });
+      await f.pubsub.flush();
+      expect(f.getStreamCount()).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it('(c) a changed payload under the same fork identity is refused before execution', async () => {
+    const f = await setup('lineage-conflict');
+    try {
+      const first = f.send(lineaged('lineage-conflict-signal', 'lineage-conflict-input', f.attributes, 'original'));
+      await first.accepted;
+      await completeFirstRun(f);
+      expect(() =>
+        f.send(lineaged('lineage-conflict-signal', 'lineage-conflict-input', f.attributes, 'changed payload')),
+      ).toThrow(/different payload/);
+      await f.pubsub.flush();
+      expect(f.getStreamCount()).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it('(d) distinct fork identities that share an upstream tuple stay distinct', async () => {
+    const f = await setup('lineage-distinct');
+    try {
+      const first = await f.send(lineaged('lineage-distinct-a', 'lineage-distinct-input-a', f.attributes)).accepted;
+      await completeFirstRun(f);
+      const secondRun = f.nextRun();
+      const second = await f.send(lineaged('lineage-distinct-b', 'lineage-distinct-input-b', f.attributes)).accepted;
+      expect(second).toMatchObject({ action: 'deliver' });
+      expect((second as { runId: string }).runId).not.toBe((first as { runId: string }).runId);
+      await expect(secondRun).resolves.toMatchObject({ value: { text: 'lineage-distinct later response' } });
+      expect(f.getStreamCount()).toBe(2);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it('(e) expiry follows the fork admission window, not the upstream ledger', async () => {
+    const f = await setup('lineage-expiry');
+    const realNow = Date.now.bind(Date);
+    try {
+      const signal = lineaged('lineage-expiry-signal', 'lineage-expiry-input', f.attributes);
+      const first = await f.send(signal).accepted;
+      await completeFirstRun(f);
+      // Boundary 1: just inside the fork admission window (5 min) the retry is the same admission.
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 5 * 60 * 1000 - 1000);
+      const inside = f.send(signal);
+      nowSpy.mockRestore();
+      await expect(inside.accepted).resolves.toMatchObject({ runId: (first as { runId: string }).runId });
+      await f.pubsub.flush();
+      expect(f.getStreamCount()).toBe(1);
+      // Boundary 2: once the fork's admission state is gone (past its window, here a restarted
+      // sender with no retained admission), the fork admits the retry as new work. The owner's
+      // upstream ledger still holds the tuple and never expires by time; it must not resolve the
+      // lineaged retry to the old run.
+      const restartedSender = new AgentThreadStreamRuntime();
+      const nextRun = f.nextRun();
+      const laterSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 5 * 60 * 1000 + 1000);
+      const outside = restartedSender.sendSignal(
+        f.senderAgent,
+        { type: 'user-message', ...signal } as any,
+        { ...f.target, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
+        f.pubsub,
+      );
+      laterSpy.mockRestore();
+      const outsideAccepted = await outside.accepted;
+      expect((outsideAccepted as { runId?: string }).runId).not.toBe((first as { runId: string }).runId);
+      await nextRun;
+      expect(f.getStreamCount()).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+      f.cleanup();
+    }
+  });
+
+  it('(f) non-lineaged duplicates keep upstream tuple dedup', async () => {
+    const f = await setup('lineage-upstream');
+    try {
+      const first = await f.send({ contents: 'peer message', attributes: f.attributes }).accepted;
+      await completeFirstRun(f);
+      // A retried peer message mints no stable signal id; only the tuple identifies it.
+      const retry = f.send({ contents: 'peer message', attributes: f.attributes });
+      await expect(retry.accepted).resolves.toMatchObject({
+        action: 'deliver',
+        runId: (first as { runId: string }).runId,
+      });
+      await f.pubsub.flush();
+      expect(f.getStreamCount()).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it('(g) the guard runs before the upstream ledger is read or written', async () => {
+    const f = await setup('lineage-order');
+    try {
+      // Read: an upstream entry for the tuple exists; a lineaged signal must not resolve to it.
+      const peer = await f.send({ contents: 'peer message', attributes: f.attributes }).accepted;
+      await completeFirstRun(f);
+      const lineagedRun = f.nextRun();
+      const fork = await f.send(lineaged('lineage-order-fork', 'lineage-order-input', f.attributes)).accepted;
+      expect((fork as { runId: string }).runId).not.toBe((peer as { runId: string }).runId);
+      await lineagedRun;
+      expect(f.getStreamCount()).toBe(2);
+    } finally {
+      f.cleanup();
+    }
+    const g = await setup('lineage-order-write');
+    try {
+      // Write: a lineaged admission must leave no upstream entry for a later peer retry to match.
+      const fork = await g.send(lineaged('lineage-order-write-fork', 'lineage-order-write-input', g.attributes))
+        .accepted;
+      await completeFirstRun(g);
+      const peerRun = g.nextRun();
+      const peer = await g.send({ contents: 'peer message', attributes: g.attributes }).accepted;
+      expect((peer as { runId: string }).runId).not.toBe((fork as { runId: string }).runId);
+      await peerRun;
+      expect(g.getStreamCount()).toBe(2);
+    } finally {
+      g.cleanup();
+    }
+  });
+
+  it('refuses a malformed fork lineage at admission', async () => {
+    const f = await setup('lineage-malformed');
+    try {
+      expect(() =>
+        f.send({ id: 'lineage-malformed-signal', contents: 'x', attributes: f.attributes, metadata: { logicalMessageId: '' } }),
+      ).toThrow(/logicalMessageId/);
+      await f.pubsub.flush();
+      expect(f.getStreamCount()).toBe(0);
+    } finally {
+      f.cleanup();
+    }
+  });
+});
