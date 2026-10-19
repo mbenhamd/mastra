@@ -307,6 +307,21 @@ function plainErasureSnapshot<T>(value: T): T {
   const copy = detachedErasureCopy(value);
   if (copy === null || typeof copy !== 'object' || Array.isArray(copy)) return cloneRunData(copy) as T;
   const record = copy as Record<string, unknown>;
+  // Data fields come from a second, untouched copy: accessors run only on
+  // `record`, so whatever an accessor changes there never reaches a data
+  // field that is kept.
+  const pristine = detachedErasureCopy(value) as object;
+  const dataDescriptor = (name: PropertyKey): PropertyDescriptor | undefined => {
+    for (
+      let level: object | null = pristine;
+      level && level !== Object.prototype;
+      level = Object.getPrototypeOf(level)
+    ) {
+      const descriptor = Object.getOwnPropertyDescriptor(level, name);
+      if (descriptor) return 'value' in descriptor ? descriptor : undefined;
+    }
+    return undefined;
+  };
   const status = readErasureField(record, 'status');
   try {
     Object.defineProperty(record, 'status', { value: status, writable: true, enumerable: true, configurable: true });
@@ -340,10 +355,15 @@ function plainErasureSnapshot<T>(value: T): T {
   names.delete('status');
   for (const [name, enumerable] of names) {
     let field: unknown;
-    try {
-      field = (record as Record<PropertyKey, unknown>)[name];
-    } catch {
-      continue;
+    const data = dataDescriptor(name);
+    if (data) {
+      field = data.value;
+    } else {
+      try {
+        field = (record as Record<PropertyKey, unknown>)[name];
+      } catch {
+        continue;
+      }
     }
     Object.defineProperty(fields, name, { value: field, writable: true, enumerable, configurable: true });
   }
@@ -2487,6 +2507,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       // Cloning the stored snapshot can invoke caller toJSON/getters that
       // reenter these maps. Re-read the source row before writing and restart
       // if a reentrant write changed it mid-computation.
+      // A run selected for erasure admits no new nested child: the closure
+      // delete could not see a transient child bound now.
+      if (this.db.workflowTerminalParentRevisions.get(key)?.erasureCancelled) return { status: 'missing_run' };
       const snapshot = cloneRunData(typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot);
       const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);
       if (ownership.status === 'ownership_conflict') return ownership;

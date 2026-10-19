@@ -229,6 +229,24 @@ describe('WorkflowsPG erasure cancel', () => {
     await expect(workflows.loadWorkflowSnapshot(run)).resolves.toMatchObject({ status: 'success' });
   });
 
+  it('refuses a nested ownership bind on a cancelled run, so no transient child starts', async () => {
+    const run = newRun();
+    await persist(run, 'suspended');
+    await expect(cancel(run)).resolves.toEqual({ status: 'cancelled' });
+    await expect(
+      workflows.bindWorkflowNestedRunOwnership({
+        ...run,
+        stepId: NESTED_STEP,
+        nestedRunId: randomUUID(),
+        result: { status: 'running', payload: {} },
+        requestContext: {},
+      } as never),
+    ).resolves.toEqual({ status: 'missing_run' });
+    await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: resource })).resolves.toMatchObject({
+      status: 'deleted',
+    });
+  });
+
   it('refuses a parent a nested child still needs, and the child whose journal is claimed, without changes', async () => {
     const parent = newRun();
     await persist(parent, 'running');

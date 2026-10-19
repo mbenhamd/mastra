@@ -5291,6 +5291,10 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (!revisionLock) {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
+        // A terminal parent (latched, as an erasure cancel latches `canceled`)
+        // admits no new nested child: the closure delete could not see a
+        // transient child bound now.
+        if (revisionLock.terminalStatus !== null) return { status: 'missing_run' };
         const revision = revisionLock.generation;
         const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
         const ownership = bindWorkflowNestedRunOwnershipRecord(snapshot, operation);

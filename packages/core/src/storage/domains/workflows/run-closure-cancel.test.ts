@@ -461,7 +461,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(db.workflowTerminalParentRevisions.get(key)).toEqual(revisionBefore);
   });
 
-  it('refuses a nested ownership bind that would reopen a cancelled run through a context accessor', async () => {
+  it('refuses any nested ownership bind on a run selected for erasure, so no transient child starts', async () => {
     const { db, workflows } = setup();
     const run = { workflowName: 'research', runId: 'run-bind-accessor' };
     await persist(workflows, run, 'suspended');
@@ -487,7 +487,7 @@ describe('WorkflowsInMemory erasure cancel', () => {
         result: { status: 'running', payload: {} },
         requestContext: {},
       }),
-    ).rejects.toBeInstanceOf(WorkflowStaleSnapshotPersistError);
+    ).resolves.toEqual({ status: 'missing_run' });
     expect(db.workflowTerminalParentRevisions.get(key)).toMatchObject({ terminalStatus: 'canceled' });
     await expect(workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE })).resolves.toMatchObject({
       status: 'deleted',
@@ -930,5 +930,37 @@ describe('WorkflowsInMemory erasure cancel', () => {
       scores: Map<unknown, number>;
     };
     expect(result.scores.get(result[pick])).toBe(3);
+  });
+
+  it('never stores the side effect of an inherited accessor when a settled run is selected for erasure', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-inherited-side-effect' };
+    await persist(workflows, run, 'success');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const snapshot = record.snapshot as WorkflowRunState;
+    // An inherited enumerable accessor that counts its reads into the context.
+    const counting = {
+      get reads() {
+        const context = (this as unknown as { context: { reads?: number } }).context;
+        context.reads = (context.reads ?? 0) + 1;
+        return context.reads;
+      },
+    };
+    Object.defineProperty(counting, 'reads', {
+      ...Object.getOwnPropertyDescriptor(counting, 'reads')!,
+      enumerable: true,
+    });
+    db.workflows.set(key, {
+      ...record,
+      snapshot: Object.create(
+        counting,
+        Object.getOwnPropertyDescriptors({ ...snapshot, context: { ...snapshot.context } }),
+      ),
+    });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const after = db.workflows.get(key)!.snapshot as WorkflowRunState & { context: { reads?: number } };
+    expect(after.context.reads).toBeUndefined();
   });
 });
