@@ -384,8 +384,16 @@ type ThreadIdPathGroup = { guard?: string; paths: readonly string[] };
 const DURABLE_AGENTIC_LOOP_WORKFLOW = 'durable-agentic-loop';
 
 const SNAPSHOT_THREAD_ID_PATH_GROUPS: readonly ThreadIdPathGroup[] = [
-  // The agentic loop's suspension: tool-call-step stores streamState.serialize().
-  { paths: ['@.context.*.suspendPayload.__streamState.messageList.memoryInfo.threadId'] },
+  // The agentic loop's suspension: tool-call-step stores streamState.serialize()
+  // in the suspend payload. Engines keep iteration and nested suspensions inside
+  // the step's suspend payload (`__workflow_meta.foreachOutput[i].suspendPayload`,
+  // an array or an index-keyed object) and in a foreach step's iteration results.
+  {
+    paths: [
+      '@.context.*.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
+      '@.context.*.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId',
+    ],
+  },
   // A durable-agent run: its input, step outputs and result each carry the
   // serialized MessageList and the SerializableDurableState.
   {
@@ -479,9 +487,31 @@ function threadErasureMembers(value: unknown, key: string): unknown[] {
 
 function threadErasureMemberPath(roots: unknown[], keys: readonly string[]): unknown[] {
   let items = roots;
-  for (const key of keys) items = items.flatMap(item => threadErasureMembers(item, key));
+  for (const key of keys) {
+    // `.**` reads the item itself and every value nested in it, at any level.
+    items =
+      key === '**' ? items.flatMap(threadErasureDescendants) : items.flatMap(item => threadErasureMembers(item, key));
+  }
   // Lax mode: comparison operands that are arrays are unwrapped.
   return items.flatMap(item => (Array.isArray(item) ? item : [item]));
+}
+
+/** The value and every value nested in it (the `.**` accessor), each container once. */
+function threadErasureDescendants(value: unknown): unknown[] {
+  const seen = new Set<object>();
+  const out: unknown[] = [];
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (item !== null && typeof item === 'object') {
+      if (seen.has(item)) continue;
+      seen.add(item);
+      for (const member of threadErasureMembers(item, '*')) stack.push(member);
+      if (Array.isArray(item)) for (const entry of item) stack.push(entry);
+    }
+    out.push(item);
+  }
+  return out;
 }
 
 /** Values at a dotted member path (`*` for every member), mirroring a lax SQL/JSON accessor chain. */
@@ -504,7 +534,8 @@ export function classifyWorkflowSnapshotThreadErasure(
   const durable = holds(snapshot, 'context.input.__workflowKind', 'durable-agent');
   return classifyThreadErasureValues(
     [
-      ...at(snapshot, 'context.*.suspendPayload.__streamState.messageList.memoryInfo.threadId'),
+      ...at(snapshot, 'context.*.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
+      ...at(snapshot, 'context.*.output.suspendPayload.**.__streamState.messageList.memoryInfo.threadId'),
       ...(durable
         ? [
             'context.input.messageListState.memoryInfo.threadId',

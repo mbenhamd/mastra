@@ -444,6 +444,71 @@ describe('WorkflowsInMemory.listWorkflowRunsByThreadForErasure', () => {
     });
   });
 
+  it('finds suspensions engines keep inside a step suspend payload or foreach results', async () => {
+    const { workflows } = setup();
+    const suspended = (threadId: string) => ({
+      status: 'suspended',
+      suspendPayload: { __streamState: { messageList: { memoryInfo: { threadId } } } },
+    });
+    const withStep = (runId: string, step: Record<string, unknown>) =>
+      ({
+        ...createEmptyWorkflowSnapshot(runId),
+        status: 'suspended',
+        context: { input: {}, tools: step },
+      }) as WorkflowRunState;
+    // The default engine keeps foreach iterations as an array.
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'a-foreach-array' },
+      withStep('a-foreach-array', {
+        status: 'suspended',
+        suspendPayload: { __workflow_meta: { foreachOutput: [{ status: 'success' }, suspended(THREAD)] } },
+      }),
+    );
+    // The evented engine keys them by index; the first suspended iteration names another thread.
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'b-foreach-object' },
+      withStep('b-foreach-object', {
+        status: 'suspended',
+        suspendPayload: {
+          __workflow_meta: { foreachOutput: { '0': suspended(OTHER_THREAD), '1': suspended(THREAD) } },
+        },
+      }),
+    );
+    // A foreach step's iteration results.
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'c-foreach-output' },
+      withStep('c-foreach-output', {
+        status: 'suspended',
+        output: [null, suspended(THREAD)],
+      }),
+    );
+    // Another thread only.
+    await persist(
+      workflows,
+      { workflowName: 'agentic-loop', runId: 'd-foreach-other' },
+      withStep('d-foreach-other', {
+        status: 'suspended',
+        suspendPayload: { __workflow_meta: { foreachOutput: [suspended(OTHER_THREAD)] } },
+      }),
+    );
+
+    await expect(
+      workflows.listWorkflowRunsByThreadForErasure({ resourceId: RESOURCE, threadId: THREAD, limit: 10 }),
+    ).resolves.toEqual({
+      status: 'listed',
+      runs: ['a-foreach-array', 'b-foreach-object', 'c-foreach-output'].map(runId => ({
+        workflowName: 'agentic-loop',
+        runId,
+        attribution: 'thread',
+        rows: SNAPSHOT_ONLY,
+      })),
+      hasMore: false,
+    });
+  });
+
   it('pages by (workflowName, runId) in code point order', async () => {
     const { workflows } = setup();
     const ids = ['b', 'a', 'Z', 'c', 'é'];

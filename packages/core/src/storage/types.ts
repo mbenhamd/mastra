@@ -506,8 +506,10 @@ export type WorkflowRunThreadErasureEntry =
  * canonical snapshot, the handoff snapshot (kept after a `deleteRun` release
  * removes the canonical row) or the terminal recovery envelope. A snapshot
  * records it, in any run status, only at the locations the framework writes:
- * - an agentic-loop suspension: `context.<step>.suspendPayload.__streamState.messageList.memoryInfo.threadId`
- *   (whatever step and status);
+ * - an agentic-loop suspension: `__streamState.messageList.memoryInfo.threadId`
+ *   anywhere inside a step's `suspendPayload` (including the iteration and
+ *   nested suspensions engines keep under `__workflow_meta`) or inside the
+ *   `suspendPayload` of a foreach step's iteration results (any step, any status);
  * - a durable-agent run (`context.input.__workflowKind` is `durable-agent`):
  *   `messageListState.memoryInfo.threadId` and `state.threadId` (set even
  *   without a memory backend) of its `context.input`, of any
