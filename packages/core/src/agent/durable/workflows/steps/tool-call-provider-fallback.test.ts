@@ -67,42 +67,45 @@ describe('durable tool-call provider-tool fallback', () => {
     // Upstream #27392 (adopted): a tool that ran and returned nothing is recorded as `null`,
     // so the loop does not read it as an unexecuted client call.
     { label: 'undefined', returned: undefined, expectedResult: null },
-  ])('resolves a provider-defined tool by its model-facing name when it returns $label', async ({ returned, expectedResult }) => {
-    const executeMock = vi.fn().mockResolvedValue(returned);
-    // Provider-defined tool: JS key `webSearch`, model-facing id `openai.web_search`
-    // The LLM emits `web_search`, which doesn't match the JS key.
-    globalRunRegistry.set(RUN_ID, {
-      runtimeBindingId: RUNTIME_BINDING_ID,
-      tools: {
-        webSearch: {
-          type: 'provider-defined',
-          id: 'openai.web_search',
-          execute: executeMock,
+  ])(
+    'resolves a provider-defined tool by its model-facing name when it returns $label',
+    async ({ returned, expectedResult }) => {
+      const executeMock = vi.fn().mockResolvedValue(returned);
+      // Provider-defined tool: JS key `webSearch`, model-facing id `openai.web_search`
+      // The LLM emits `web_search`, which doesn't match the JS key.
+      globalRunRegistry.set(RUN_ID, {
+        runtimeBindingId: RUNTIME_BINDING_ID,
+        tools: {
+          webSearch: {
+            type: 'provider-defined',
+            id: 'openai.web_search',
+            execute: executeMock,
+          },
         },
-      },
-      model: {} as any,
-    } as any);
+        model: {} as any,
+      } as any);
 
-    const step = createDurableToolCallStep();
-    const result = await (step as any).execute({
-      inputData: {
-        toolCallId: 'call-1',
-        toolName: 'web_search',
-        args: { query: 'mastra' },
-      },
-      mastra: { getLogger: () => undefined },
-      suspend: vi.fn(),
-      resumeData: undefined,
-      requestContext: new Map(),
-      getInitData: () => makeInitData(),
-      [PUBSUB_SYMBOL]: mockPubsub(),
-    });
+      const step = createDurableToolCallStep();
+      const result = await (step as any).execute({
+        inputData: {
+          toolCallId: 'call-1',
+          toolName: 'web_search',
+          args: { query: 'mastra' },
+        },
+        mastra: { getLogger: () => undefined },
+        suspend: vi.fn(),
+        resumeData: undefined,
+        requestContext: new Map(),
+        getInitData: () => makeInitData(),
+        [PUBSUB_SYMBOL]: mockPubsub(),
+      });
 
-    expect(executeMock).toHaveBeenCalledTimes(1);
-    expect(result.error).toBeUndefined();
-    expect(result.result).toEqual(expectedResult);
-    expect(result.serverExecuted).toBe(true);
-  });
+      expect(executeMock).toHaveBeenCalledTimes(1);
+      expect(result.error).toBeUndefined();
+      expect(result.result).toEqual(expectedResult);
+      expect(result.serverExecuted).toBe(true);
+    },
+  );
 
   it('falls back to resolveTool() when a recovered registry entry has no per-step snapshot', async () => {
     const executeMock = vi.fn().mockResolvedValue({ ok: true });

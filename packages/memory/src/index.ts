@@ -3838,9 +3838,7 @@ Notes:
 
       const exhausted = resultPages.every(page => page.length < candidateTopK);
       if (bestByGroup.size >= topK || exhausted || candidateTopK >= maxCandidateTopK) {
-        const results = [...bestByGroup.values()]
-          .sort((a, b) => b.score - a.score)
-          .slice(0, topK);
+        const results = [...bestByGroup.values()].sort((a, b) => b.score - a.score).slice(0, topK);
         return { results };
       }
 

@@ -22501,7 +22501,12 @@ describe('fork lineage bypasses the upstream logical-message ledger (PF-5928 opt
     };
   }
 
-  const lineaged = (id: string, logicalMessageId: string, attributes: Record<string, string>, contents = 'run once') => ({
+  const lineaged = (
+    id: string,
+    logicalMessageId: string,
+    attributes: Record<string, string>,
+    contents = 'run once',
+  ) => ({
     id,
     contents,
     attributes,
@@ -22677,7 +22682,12 @@ describe('fork lineage bypasses the upstream logical-message ledger (PF-5928 opt
     const f = await setup('lineage-malformed');
     try {
       expect(() =>
-        f.send({ id: 'lineage-malformed-signal', contents: 'x', attributes: f.attributes, metadata: { logicalMessageId: '' } }),
+        f.send({
+          id: 'lineage-malformed-signal',
+          contents: 'x',
+          attributes: f.attributes,
+          metadata: { logicalMessageId: '' },
+        }),
       ).toThrow(/logicalMessageId/);
       await f.pubsub.flush();
       expect(f.getStreamCount()).toBe(0);

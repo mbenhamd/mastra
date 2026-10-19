@@ -204,7 +204,9 @@ describe('concurrent time travel', () => {
 
     expect(result.status).toBe('suspended');
     expect(harness.getWorkExecutions()).toBe(1);
-    const claim = updateSpy.mock.calls.map(([args]: any[]) => args.opts).find((opts: any) => typeof opts.executionGeneration === 'string');
+    const claim = updateSpy.mock.calls
+      .map(([args]: any[]) => args.opts)
+      .find((opts: any) => typeof opts.executionGeneration === 'string');
     expect(claim).toBeDefined();
     expect(claim).not.toHaveProperty('expectedStatus');
     expect(claim).not.toHaveProperty('expectedExecutionGeneration');

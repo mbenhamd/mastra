@@ -458,7 +458,10 @@ export function persistWorkflowStepUpdateRecord(
   // gone (deleted, erased, or released after an abort): that would resurrect
   // it as resumable. Mirrors persistWorkflowSnapshot's expectedExecutionGeneration
   // guard (PF-4385 tombstone).
-  if (!existing && (input.expectedResumeOperationHash !== undefined || input.expectedExecutionGeneration !== undefined)) {
+  if (
+    !existing &&
+    (input.expectedResumeOperationHash !== undefined || input.expectedExecutionGeneration !== undefined)
+  ) {
     return { status: 'missing_run' };
   }
   if (!existing) {

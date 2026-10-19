@@ -405,7 +405,12 @@ export async function runDurableFinishSideEffects({
       // fence (#26418) guards both persistence paths.
       const flushOptions = { beforePersist: assertOwned };
       await (terminalEnvelope
-        ? saveQueueManager.flushMessagesStrict(messageList, durableState.threadId, durableState.memoryConfig, flushOptions)
+        ? saveQueueManager.flushMessagesStrict(
+            messageList,
+            durableState.threadId,
+            durableState.memoryConfig,
+            flushOptions,
+          )
         : saveQueueManager.flushMessages(messageList, durableState.threadId, durableState.memoryConfig, flushOptions));
     } catch (error) {
       if (isExecutionFenceError(error)) throw error;

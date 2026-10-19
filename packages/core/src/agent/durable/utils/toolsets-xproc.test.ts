@@ -51,7 +51,9 @@ async function rebuild(mastra: Mastra, toolsets: Record<string, Record<string, u
   // from a fresh instance so test overrides of getToolsForExecution apply only
   // to the rebuild itself.
   const toolsMetadata = serializeToolsMetadata(
-    await setup().getAgentById('toolsets-agent').getToolsForExecution({ runId: RUN_ID } as any),
+    await setup()
+      .getAgentById('toolsets-agent')
+      .getToolsForExecution({ runId: RUN_ID } as any),
   );
   return rebuildRunToolsFromMastra({
     mastra,
@@ -101,7 +103,9 @@ describe('cross-process toolsets', () => {
     const mastra = setup();
     // Fork (PF): the worker's rebuilt surface must match the prepared binding.
     const toolsMetadata = serializeToolsMetadata(
-      await setup().getAgentById('toolsets-agent').getToolsForExecution({ runId: RUN_ID } as any),
+      await setup()
+        .getAgentById('toolsets-agent')
+        .getToolsForExecution({ runId: RUN_ID } as any),
     );
     const resolve = (toolsets: Record<string, Record<string, unknown>> | undefined) =>
       resolveRuntimeDependencies({

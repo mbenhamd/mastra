@@ -526,17 +526,17 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         const resumedChunk = await transformChunk(
           {
             type: 'tool-call-resumed',
-          runId,
-          from: ChunkFrom.AGENT,
-          payload: {
-            // Auto-resume re-calls the tool under a new id; ack the id the client saw suspended.
-            toolCallId: entry.toolCallId ?? inputData.toolCallId,
-            toolName: entry.toolName ?? inputData.toolName,
-            kind,
-            args: entry.args,
-            ...(kind === 'suspension' ? { suspendPayload: entry.suspendPayload } : {}),
-            resumeSchema: entry.resumeSchema,
-          },
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: {
+              // Auto-resume re-calls the tool under a new id; ack the id the client saw suspended.
+              toolCallId: entry.toolCallId ?? inputData.toolCallId,
+              toolName: entry.toolName ?? inputData.toolName,
+              kind,
+              args: entry.args,
+              ...(kind === 'suspension' ? { suspendPayload: entry.suspendPayload } : {}),
+              resumeSchema: entry.resumeSchema,
+            },
             ...(entry.metadata ? { metadata: entry.metadata } : {}),
           },
           // Fork: the resumed ack carries the cleared entry's args (and suspend

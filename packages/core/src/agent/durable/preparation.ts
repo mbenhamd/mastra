@@ -915,7 +915,9 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     if (typeof hasConfiguredErrorProcessors !== 'boolean') {
       // Fail closed: an Agent without the merged processor contract would make
       // durable recovery treat configured error processors as absent.
-      throw new Error('DurableAgent requires Agent.__resolveExecutionProcessors to report hasConfiguredErrorProcessors.');
+      throw new Error(
+        'DurableAgent requires Agent.__resolveExecutionProcessors to report hasConfiguredErrorProcessors.',
+      );
     }
 
     // Open AGENT_RUN here so processor_run spans (and their MEMORY_OPERATION

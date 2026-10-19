@@ -989,7 +989,11 @@ describe('handleChatStream v6 native approve() resume flow', () => {
       version: 'v6',
       params: {
         messages: [
-          { id: 'msg-1', role: 'assistant', parts: [response('busy-run', 'busy-call'), response('new-run', 'new-call')] },
+          {
+            id: 'msg-1',
+            role: 'assistant',
+            parts: [response('busy-run', 'busy-call'), response('new-run', 'new-call')],
+          },
         ],
       } as any,
     });

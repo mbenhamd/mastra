@@ -1483,7 +1483,12 @@ function createStepFromProcessor<TProcessorId extends string>(
                   // below still uses mutableState.
                   delete mutableState[hookDurationKey];
                 }
-                endOutputStreamSpanAtStepEnd(processorRuntimeState, processor.id, part as ChunkType, (streamParts ?? []).length);
+                endOutputStreamSpanAtStepEnd(
+                  processorRuntimeState,
+                  processor.id,
+                  part as ChunkType,
+                  (streamParts ?? []).length,
+                );
               } catch (error) {
                 // End span with error and clean up state
                 if (error instanceof TripWire) {

@@ -344,7 +344,15 @@ describe('Harness.attachments', () => {
     // A real PNG signature: the prompt conversion now validates inline image
     // content (upstream) and replaces unrecognisable bytes with a placeholder.
     const pngBytes = new Uint8Array([
-      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new TextEncoder().encode('PNGDATA'),
+      0x89,
+      0x50,
+      0x4e,
+      0x47,
+      0x0d,
+      0x0a,
+      0x1a,
+      0x0a,
+      ...new TextEncoder().encode('PNGDATA'),
     ]);
     const result = await harness.attachments.upload({
       sessionId: session.id,

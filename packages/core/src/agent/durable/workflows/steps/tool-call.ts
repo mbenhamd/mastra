@@ -1320,7 +1320,10 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       // approval grant.
       const isResumableTool = toolName?.startsWith('agent-') || toolName?.startsWith('workflow-');
       const delegatedDeclineIdentity: ResolvedSuspendedToolIdentity | undefined =
-        hasValidApprovalDecision && approvalDecision.approved === false && isToolExecutionApprovalResume && isResumableTool
+        hasValidApprovalDecision &&
+        approvalDecision.approved === false &&
+        isToolExecutionApprovalResume &&
+        isResumableTool
           ? resolveFrameworkSuspendedToolIdentity({
               toolCallId,
               toolName,
@@ -1329,7 +1332,8 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               messages: messageList?.get.all.db() ?? [],
             })
           : undefined;
-      const isDelegatedDeclineResume = delegatedDeclineIdentity?.type === 'approval' && !!delegatedDeclineIdentity.runId;
+      const isDelegatedDeclineResume =
+        delegatedDeclineIdentity?.type === 'approval' && !!delegatedDeclineIdentity.runId;
 
       if (hasValidApprovalDecision && approvalDecision.approved === false && !isDelegatedDeclineResume) {
         // Remove pending-approval metadata since we're resuming with a decision.
@@ -1718,16 +1722,16 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       // suspension and resume, or when the approval was requested from inside tool execution.
       const approvalGrant =
         hasValidApprovalDecision && !isDelegatedDeclineResume
-        ? ({
-            approval: {
-              id: metadataToolCallId,
-              approved: true as const,
-              ...(approvalDecision.reason !== undefined ? { reason: approvalDecision.reason } : {}),
-            },
-          } as const)
-        : persistedApprovalGrant
-          ? ({ approval: persistedApprovalGrant } as const)
-          : undefined;
+          ? ({
+              approval: {
+                id: metadataToolCallId,
+                approved: true as const,
+                ...(approvalDecision.reason !== undefined ? { reason: approvalDecision.reason } : {}),
+              },
+            } as const)
+          : persistedApprovalGrant
+            ? ({ approval: persistedApprovalGrant } as const)
+            : undefined;
 
       // Suspension provenance comes from the authenticated persisted/workflow
       // envelope, not from payload presence: `resume()` / `resume(undefined)`

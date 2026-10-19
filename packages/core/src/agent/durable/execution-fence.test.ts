@@ -705,7 +705,7 @@ describe('storage-backed ExecutionFence', () => {
   // workflows write too. Upstream RunFence (#26418/#26420) checks every other workflows write; a
   // stale execution's late step update must be refused the same way, leaving the run's active
   // step record for the execution that took the run over.
-  it('refuses a superseded execution\'s step update and keeps the active step record', async () => {
+  it("refuses a superseded execution's step update and keeps the active step record", async () => {
     const { workflowsStore } = await stores();
     const executionGeneration = 'wfeg:step-update-fence';
     const snapshot = (activeStepsPath: Record<string, number[]>) =>

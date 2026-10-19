@@ -980,9 +980,7 @@ describe('DurableAgent.recover(runId)', () => {
 
     await expect(workflowExecution).rejects.toMatchObject({ id: EXECUTION_SUPERSEDED_ERROR_ID });
     // The run was not finished by an execution that could not prove ownership.
-    expect(
-      await workflows.getWorkflowRunById({ runId, workflowName: DurableStepIds.AGENTIC_LOOP }),
-    ).not.toBeNull();
+    expect(await workflows.getWorkflowRunById({ runId, workflowName: DurableStepIds.AGENTIC_LOOP })).not.toBeNull();
     recovered.cleanup();
   });
 

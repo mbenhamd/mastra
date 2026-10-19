@@ -57,12 +57,7 @@ import type {
   OperationAdmissionTombstone,
   SessionRecord,
 } from './harness/types';
-import type {
-  KnowledgeActivityEvent,
-  KnowledgeRecord,
-  KnowledgeNode,
-  KnowledgeSemanticOutboxEntry,
-} from './knowledge';
+import type { KnowledgeActivityEvent, KnowledgeRecord, KnowledgeNode, KnowledgeSemanticOutboxEntry } from './knowledge';
 import type { MCPClientVersion } from './mcp-clients';
 import type { MCPServerVersion } from './mcp-servers';
 import type { TraceEntry } from './observability';

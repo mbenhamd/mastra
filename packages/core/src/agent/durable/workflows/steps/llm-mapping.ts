@@ -121,7 +121,12 @@ export function createDurableLLMMappingStep() {
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       if (pubsub) {
         try {
-          await ensureRemoteAbortListener(pubsub, _runId, durableInitData.runtimeBindingId, mastra as Mastra | undefined);
+          await ensureRemoteAbortListener(
+            pubsub,
+            _runId,
+            durableInitData.runtimeBindingId,
+            mastra as Mastra | undefined,
+          );
         } catch (error) {
           (mastra as Mastra | undefined)?.getLogger?.()?.warn?.('Failed to subscribe to cross-process abort requests', {
             runId: _runId,

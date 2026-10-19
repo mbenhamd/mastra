@@ -301,7 +301,13 @@ describe('processWorkflowForEach concurrency resolution', () => {
     const events = await kickOffForeach({
       concurrency: 1,
       items: [1, 2],
-      currentOutput: [{ status: 'suspended', suspendedAt: 1, suspendPayload: { approval: true, __workflow_meta: { path: ['body'] } } }],
+      currentOutput: [
+        {
+          status: 'suspended',
+          suspendedAt: 1,
+          suspendPayload: { approval: true, __workflow_meta: { path: ['body'] } },
+        },
+      ],
     });
 
     expect(events).toHaveLength(1);
@@ -331,7 +337,9 @@ describe('processWorkflowForEach concurrency resolution', () => {
       data: {
         prevResult: {
           status: 'suspended',
-          suspendPayload: { __workflow_meta: { marker: 'kept', foreachIndex: 1, foreachOutput: { 1: suspendedIteration } } },
+          suspendPayload: {
+            __workflow_meta: { marker: 'kept', foreachIndex: 1, foreachOutput: { 1: suspendedIteration } },
+          },
         },
       },
     });
@@ -356,7 +364,11 @@ describe('processWorkflowForEach concurrency resolution', () => {
       concurrency: 2,
       items: [1, 2, 3],
       currentOutput: [
-        { status: 'suspended', suspendedAt: 1, suspendPayload: { approval: true, __workflow_meta: { path: ['body'] } } },
+        {
+          status: 'suspended',
+          suspendedAt: 1,
+          suspendPayload: { approval: true, __workflow_meta: { path: ['body'] } },
+        },
         { status: 'success', output: 'second' },
       ],
     });

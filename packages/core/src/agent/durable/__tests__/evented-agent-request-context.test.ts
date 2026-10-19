@@ -87,8 +87,7 @@ describe('EventedAgent requestContext forwarding', () => {
       // PF-5928 adaptation (upstream #26418): the forwarded context is the run's
       // own copy, carrying the caller's entries plus the execution claim, so
       // the caller's context is never mutated.
-      const forwarded = (startAsync.mock.calls[0] as unknown as [{ requestContext: RequestContext }])[0]
-        .requestContext;
+      const forwarded = (startAsync.mock.calls[0] as unknown as [{ requestContext: RequestContext }])[0].requestContext;
       expect(forwarded.get('tenantId')).toBe('tenant-123');
       expect(getExecutionClaim(forwarded, runId)).toMatchObject({ executionId: expect.any(String) });
       expect(getExecutionClaim(requestContext, runId)).toBeUndefined();

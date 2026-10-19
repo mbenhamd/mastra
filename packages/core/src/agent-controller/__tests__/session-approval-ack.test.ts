@@ -22,7 +22,9 @@ describe('SessionApproval.respond result', () => {
       reason: 'stale_tool_call',
     });
 
-    expect(approval.respond({ decision: 'approve', toolCallId: 'current', runId: 'run-1' })).toEqual({ accepted: true });
+    expect(approval.respond({ decision: 'approve', toolCallId: 'current', runId: 'run-1' })).toEqual({
+      accepted: true,
+    });
     await expect(decision).resolves.toMatchObject({ decision: 'approve' });
 
     expect(approval.respond({ decision: 'approve', toolCallId: 'current', runId: 'run-1' })).toEqual({

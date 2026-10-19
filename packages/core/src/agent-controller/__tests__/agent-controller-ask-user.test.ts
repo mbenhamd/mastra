@@ -472,13 +472,25 @@ describe('AgentController: ask_user native suspension', () => {
           const sibling = { ...address, toolCallId: 'owned-sibling' };
           // Approval-capable calls are serialized by the loop, even with concurrency > 1.
           expect(session.approval.isArmed(sibling)).toBe(false);
-          expect(await session.respondToToolApproval({ decision: 'approve', toolCallId: second.toolCallId, runId: second.runId })).toEqual({
+          expect(
+            await session.respondToToolApproval({
+              decision: 'approve',
+              toolCallId: second.toolCallId,
+              runId: second.runId,
+            }),
+          ).toEqual({
             accepted: true,
           });
           await vi.waitFor(() => expect(session.suspensions.has(second)).toBe(true));
           await session.respondToToolSuspension({ address: second, resumeData: 'second' });
           await vi.waitFor(() => expect(session.approval.isArmed(sibling)).toBe(true));
-          expect(await session.respondToToolApproval({ decision: 'approve', toolCallId: sibling.toolCallId, runId: sibling.runId })).toEqual({
+          expect(
+            await session.respondToToolApproval({
+              decision: 'approve',
+              toolCallId: sibling.toolCallId,
+              runId: sibling.runId,
+            }),
+          ).toEqual({
             accepted: true,
           });
           await vi.waitFor(() => expect(session.suspensions.has(sibling)).toBe(true));
@@ -511,7 +523,13 @@ describe('AgentController: ask_user native suspension', () => {
           const dispatch = vi
             .spyOn(fixture.source, 'sendToolApproval')
             .mockRejectedValueOnce(new Error('unknown dispatch outcome'));
-          expect(await session.respondToToolApproval({ decision: 'approve', toolCallId: second.toolCallId, runId: second.runId })).toEqual({
+          expect(
+            await session.respondToToolApproval({
+              decision: 'approve',
+              toolCallId: second.toolCallId,
+              runId: second.runId,
+            }),
+          ).toEqual({
             accepted: true,
           });
           await detached.promise;
@@ -519,7 +537,11 @@ describe('AgentController: ask_user native suspension', () => {
           expect(session.approval.isArmed(second)).toBe(false);
           expect(events.filter(event => event.type === 'tool_approval_required')).toHaveLength(1);
           expect(
-            await session.respondToToolApproval({ decision: 'approve', toolCallId: second.toolCallId, runId: second.runId }),
+            await session.respondToToolApproval({
+              decision: 'approve',
+              toolCallId: second.toolCallId,
+              runId: second.runId,
+            }),
           ).toMatchObject({ accepted: false });
           expect(dispatch).toHaveBeenCalledOnce();
           expect(observations).toHaveLength(1);
@@ -536,7 +558,13 @@ describe('AgentController: ask_user native suspension', () => {
               recovery === 'warm-approval-setup-failure' ? 'subscribeToThread' : 'buildToolsets',
             )
             .mockRejectedValueOnce(new Error('source approval setup unavailable'));
-          expect(await session.respondToToolApproval({ decision: 'approve', toolCallId: second.toolCallId, runId: second.runId })).toEqual({
+          expect(
+            await session.respondToToolApproval({
+              decision: 'approve',
+              toolCallId: second.toolCallId,
+              runId: second.runId,
+            }),
+          ).toEqual({
             accepted: true,
           });
           await vi.waitFor(() =>
@@ -850,7 +878,11 @@ describe('AgentController: ask_user native suspension', () => {
       secondEvents.push(event);
       if (event.type === 'tool_approval_required') {
         queueMicrotask(() => {
-          void secondSession.respondToToolApproval({ decision: 'approve', toolCallId: event.toolCallId, runId: event.runId });
+          void secondSession.respondToToolApproval({
+            decision: 'approve',
+            toolCallId: event.toolCallId,
+            runId: event.runId,
+          });
         });
       }
     });

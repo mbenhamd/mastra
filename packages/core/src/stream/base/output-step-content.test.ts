@@ -186,11 +186,7 @@ describe('PF-5399 public step content', () => {
     const out = await agent.stream('go');
     await out.consumeStream();
 
-    expect(await stepContents(out)).toEqual([
-      ['tool-call:c1', 'tool-result:c1'],
-      [],
-      ['text:recovered'],
-    ]);
+    expect(await stepContents(out)).toEqual([['tool-call:c1', 'tool-result:c1'], [], ['text:recovered']]);
   });
 
   it.each([

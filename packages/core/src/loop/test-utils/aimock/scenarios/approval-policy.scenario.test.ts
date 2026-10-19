@@ -180,7 +180,11 @@ describeForAllEngines('Support agent refund approvals', engine => {
       resumeData: { approved: true, note: 'goodwill' },
       expected: [],
     },
-    { label: 'a plain approval passes no resume data to the tool', resumeData: { approved: true }, expected: [undefined] },
+    {
+      label: 'a plain approval passes no resume data to the tool',
+      resumeData: { approved: true },
+      expected: [undefined],
+    },
     {
       // Fork parity gap (PF-6047, not fixed in the sync): durable engines forward an allowlisted decision
       // field to the tool, the loop engines treat `{ approved, reason }` as a bare decision.

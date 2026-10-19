@@ -2010,7 +2010,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                               0,
                               self.messageList.get.response.db().findIndex(message => message.id === stepMessage.id),
                             )
-                            .filter(message => message.role === 'assistant' && !message.content?.metadata?.completionResult),
+                            .filter(
+                              message => message.role === 'assistant' && !message.content?.metadata?.completionResult,
+                            ),
                           self.#bufferedSteps.slice(0, -1),
                         )
                       : undefined;

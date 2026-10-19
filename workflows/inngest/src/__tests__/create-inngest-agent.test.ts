@@ -1212,7 +1212,10 @@ describe('InngestAgent parity surface', () => {
       });
     }
 
-    async function publishStepAndFinish(durableAgent: ReturnType<typeof makeIsolatedAgent>['durableAgent'], runId: string) {
+    async function publishStepAndFinish(
+      durableAgent: ReturnType<typeof makeIsolatedAgent>['durableAgent'],
+      runId: string,
+    ) {
       await publishStreamEvent(durableAgent, runId, {
         type: AgentStreamEventTypes.STEP_FINISH,
         data: { stepResult: { reason: 'stop' } },
@@ -1339,14 +1342,11 @@ describe('InngestAgent parity surface', () => {
     it('resolves resume() defaultOptions against the snapshot once it is persisted', async () => {
       const fired: string[] = [];
       const runId = 'default-callbacks-resume-late-snapshot-run';
-      const harness = makeAgentWithDynamicDefaults(
-        'default-callbacks-resume-late-snapshot',
-        ({ requestContext }) => ({
-          onFinish: () => {
-            fired.push(`onFinish:${requestContext.get('tenant')}`);
-          },
-        }),
-      );
+      const harness = makeAgentWithDynamicDefaults('default-callbacks-resume-late-snapshot', ({ requestContext }) => ({
+        onFinish: () => {
+          fired.push(`onFinish:${requestContext.get('tenant')}`);
+        },
+      }));
       const { durableAgent } = harness;
       await setSuspendedSnapshot(harness, runId, { requestContext: { tenant: 'acme' } });
       // The suspension reaches the caller before the suspended snapshot is persisted.
@@ -3441,7 +3441,10 @@ describe('InngestAgent parity surface', () => {
   describe('structuredOutput (issue #25148)', () => {
     const citySchema = z.object({ city: z.string(), country: z.string() });
 
-    async function publishJsonTextRun(durableAgent: ReturnType<typeof makeIsolatedAgent>['durableAgent'], runId: string) {
+    async function publishJsonTextRun(
+      durableAgent: ReturnType<typeof makeIsolatedAgent>['durableAgent'],
+      runId: string,
+    ) {
       const json = JSON.stringify({ city: 'Paris', country: 'France' });
       const chunks = [
         { type: 'text-start', payload: { id: 'text-1' } },

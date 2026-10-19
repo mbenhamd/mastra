@@ -146,12 +146,7 @@ import { normalizeToolPayloadTransformPolicy } from '../tools/payload-transform'
 import type { ToolToConvert } from '../tools/tool-builder/builder';
 import { unwrapToolsFromHooks, wrapToolsWithHooks } from '../tools/tool-hooks';
 import { isMastraTool, isProviderTool, markApprovalExempt } from '../tools/toolchecks';
-import type {
-  CoreTool,
-  McpMetadata,
-  ToolHooks,
-  ToolPayloadTransformPolicy,
-} from '../tools/types';
+import type { CoreTool, McpMetadata, ToolHooks, ToolPayloadTransformPolicy } from '../tools/types';
 import { validateToolInput } from '../tools/validation';
 import type { DynamicArgument } from '../types';
 import { makeCoreTool, createMastraProxy, ensureToolProperties, deepMerge } from '../utils';

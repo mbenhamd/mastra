@@ -566,11 +566,15 @@ describe('DurableAgent in-execution tool suspension', () => {
 
     let durationAtApproval = 0;
     await vi.waitFor(async () => {
-      durationAtApproval = (await durableAgent.getObjective({ threadId: memory.thread, resourceId: memory.resource }))?.activeDurationMs ?? 0;
+      durationAtApproval =
+        (await durableAgent.getObjective({ threadId: memory.thread, resourceId: memory.resource }))?.activeDurationMs ??
+        0;
       expect(durationAtApproval).toBeGreaterThan(0);
     });
     await delay(20);
-    expect((await durableAgent.getObjective({ threadId: memory.thread, resourceId: memory.resource }))?.activeDurationMs).toBe(durationAtApproval);
+    expect(
+      (await durableAgent.getObjective({ threadId: memory.thread, resourceId: memory.resource }))?.activeDurationMs,
+    ).toBe(durationAtApproval);
   });
 
   it('should resume tool execution after suspension with resume data', async () => {

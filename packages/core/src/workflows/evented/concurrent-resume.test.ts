@@ -218,7 +218,6 @@ describe('evented public resume claim', () => {
   });
 });
 
-
 function createApprovalWorkflow() {
   const storage = new MockStore();
   const pubsub = new EventEmitterPubSub();

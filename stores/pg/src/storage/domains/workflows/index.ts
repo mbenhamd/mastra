@@ -5145,7 +5145,10 @@ export class WorkflowsPG extends WorkflowsStorage {
     if (snapshotType !== 'jsonb') return;
     if (!hasStatusIndex) {
       try {
-        await this.#db.createIndexFromStatement(indexName, workflowSnapshotStatusIndexSQL(indexName, this.#schema, true));
+        await this.#db.createIndexFromStatement(
+          indexName,
+          workflowSnapshotStatusIndexSQL(indexName, this.#schema, true),
+        );
       } catch (error) {
         if (this.#db.isExternalSchemaMode()) throw error;
         this.logger?.warn?.(`Failed to create index ${indexName}:`, error);

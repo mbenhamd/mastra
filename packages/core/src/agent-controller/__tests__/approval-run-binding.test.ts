@@ -253,7 +253,9 @@ describe('tool approvals resolve against the run that raised them', () => {
       // settle this call afterwards.
       void controller
         .setResourceId(session, { resourceId: 'resource-b' })
-        .then(() => session.respondToToolApproval({ decision: 'approve', toolCallId: event.toolCallId, runId: event.runId }));
+        .then(() =>
+          session.respondToToolApproval({ decision: 'approve', toolCallId: event.toolCallId, runId: event.runId }),
+        );
     });
 
     await processSubscribedChunks(session, [{ type: 'start', runId: 'run-a' }, toolCallApprovalChunk(), finishChunk()]);
@@ -292,7 +294,9 @@ describe('tool approvals resolve against the run that raised them', () => {
       // parked, but only the agent holding this run's snapshot can reclaim it.
       void session.mode
         .switch({ modeId: 'plan' })
-        .then(() => session.respondToToolApproval({ decision: 'approve', toolCallId: event.toolCallId, runId: event.runId }));
+        .then(() =>
+          session.respondToToolApproval({ decision: 'approve', toolCallId: event.toolCallId, runId: event.runId }),
+        );
     });
 
     await processSubscribedChunks(session, [{ type: 'start', runId: 'run-a' }, toolCallApprovalChunk(), finishChunk()]);
@@ -470,7 +474,12 @@ describe('prompt-derived authority is scoped to the gate owner', () => {
     session.thread.set({ threadId: 'thread-b' });
 
     // ...while a gate owned by thread A is parked, and the answer arrives here.
-    void session.approval.arm({ toolName: 'execute_command', toolCallId: 'call-a', threadId: 'thread-a', runId: 'run-a' });
+    void session.approval.arm({
+      toolName: 'execute_command',
+      toolCallId: 'call-a',
+      threadId: 'thread-a',
+      runId: 'run-a',
+    });
     session.respondToToolApproval({ decision: 'always_allow_category', toolCallId: 'call-a', runId: 'run-a' });
 
     // The grant belongs to the gate's thread...

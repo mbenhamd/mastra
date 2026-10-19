@@ -18,7 +18,12 @@ import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
 import { ToolStream } from '../../tools/stream';
 import type { DynamicArgument } from '../../types';
 import { WorkflowCancelRequestedError } from '../cancel-request';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL, WORKFLOW_CANCELLED_SYMBOL } from '../constants';
+import {
+  PUBSUB_SYMBOL,
+  STREAM_FORMAT_SYMBOL,
+  TRANSIENT_EXECUTION_SYMBOL,
+  WORKFLOW_CANCELLED_SYMBOL,
+} from '../constants';
 import type { DefaultExecutionEngine } from '../default';
 import {
   getOrCreateWorkflowStepLifecycleState,
@@ -695,7 +700,8 @@ export async function executeStep(
             ? {
                 steps: resume?.steps?.slice(1) || [],
                 resumePayload: resume?.resumePayload,
-                runId: (nestedIterationSuspendPayload ?? priorSuspendedStepResult.suspendPayload)?.__workflow_meta?.runId,
+                runId: (nestedIterationSuspendPayload ?? priorSuspendedStepResult.suspendPayload)?.__workflow_meta
+                  ?.runId,
                 label: resume?.label,
                 forEachIndex: resume?.forEachIndex,
               }

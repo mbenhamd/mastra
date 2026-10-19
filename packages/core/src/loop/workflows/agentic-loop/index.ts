@@ -83,7 +83,8 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
   // parent when this invocation actually resumed beneath it; an explicit caller
   // tracing context can start a different lineage.
   const currentSpan = rest.tracingContext?.currentSpan;
-  const agentSpan = currentSpan?.type === SpanType.AGENT_RUN ? currentSpan : currentSpan?.findParent(SpanType.AGENT_RUN);
+  const agentSpan =
+    currentSpan?.type === SpanType.AGENT_RUN ? currentSpan : currentSpan?.findParent(SpanType.AGENT_RUN);
   let resumeTracingContext: WorkflowStateTracingContext | undefined;
   if (agentSpan) {
     const previousContext = rest.resumeContext?.snapshot?.tracingContext;

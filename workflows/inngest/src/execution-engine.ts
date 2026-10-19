@@ -993,7 +993,10 @@ export class InngestExecutionEngine extends DefaultExecutionEngine {
         runId = runId! || globalThis.crypto.randomUUID();
         // Upstream types this as a compact NestedWorkflowResult; the fork keeps the
         // full WorkflowResult here, whose failed `error` is a plain Error.
-        const error: Error = getErrorFromUnknown(e, { serializeStack: true, fallbackMessage: 'Nested workflow failed' });
+        const error: Error = getErrorFromUnknown(e, {
+          serializeStack: true,
+          fallbackMessage: 'Nested workflow failed',
+        });
         result = {
           status: 'failed',
           error,

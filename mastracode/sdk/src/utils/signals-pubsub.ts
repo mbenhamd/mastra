@@ -329,12 +329,7 @@ class SignalsPubSub extends PubSub {
     return resourceId !== undefined && resourceId !== this.#resourceId;
   }
 
-  async #publishTo(
-    topic: string,
-    dir: string,
-    event: PublishEvent,
-    options?: { localOnly?: boolean },
-  ): Promise<void> {
+  async #publishTo(topic: string, dir: string, event: PublishEvent, options?: { localOnly?: boolean }): Promise<void> {
     if (!this.#isRefCounted(topic)) {
       const socket = await this.#getOrCreate(topic, dir);
       await socket.publish(topic, event, options);
