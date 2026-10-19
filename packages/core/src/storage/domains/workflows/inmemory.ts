@@ -307,21 +307,6 @@ function plainErasureSnapshot<T>(value: T): T {
   const copy = detachedErasureCopy(value);
   if (copy === null || typeof copy !== 'object' || Array.isArray(copy)) return cloneRunData(copy) as T;
   const record = copy as Record<string, unknown>;
-  // Data fields come from a second, untouched copy: accessors run only on
-  // `record`, so whatever an accessor changes there never reaches a data
-  // field that is kept.
-  const pristine = detachedErasureCopy(value) as object;
-  const dataDescriptor = (name: PropertyKey): PropertyDescriptor | undefined => {
-    for (
-      let level: object | null = pristine;
-      level && level !== Object.prototype;
-      level = Object.getPrototypeOf(level)
-    ) {
-      const descriptor = Object.getOwnPropertyDescriptor(level, name);
-      if (descriptor) return 'value' in descriptor ? descriptor : undefined;
-    }
-    return undefined;
-  };
   const status = readErasureField(record, 'status');
   try {
     Object.defineProperty(record, 'status', { value: status, writable: true, enumerable: true, configurable: true });
@@ -355,15 +340,10 @@ function plainErasureSnapshot<T>(value: T): T {
   names.delete('status');
   for (const [name, enumerable] of names) {
     let field: unknown;
-    const data = dataDescriptor(name);
-    if (data) {
-      field = data.value;
-    } else {
-      try {
-        field = (record as Record<PropertyKey, unknown>)[name];
-      } catch {
-        continue;
-      }
+    try {
+      field = (record as Record<PropertyKey, unknown>)[name];
+    } catch {
+      continue;
     }
     Object.defineProperty(fields, name, { value: field, writable: true, enumerable, configurable: true });
   }
@@ -2392,9 +2372,24 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       const generation =
         existing === undefined ? 1 : existing.generation + (existing.terminalStatus === runStatus ? 0 : 1);
       if (!Number.isSafeInteger(generation)) throw new TypeError('Workflow parent revision exhausted');
-      // Store the checked plain data, so the closure delete reads the
-      // settled status this answer latched.
-      if (canonical) this.setWorkflowRunRecord(workflowName, runId, { ...run, snapshot: canonical });
+      // Pin the checked status as data on the stored snapshot, so the closure
+      // delete reads the settled status this answer latches. Nothing else in
+      // the stored snapshot changes (its fields, accessors and shared
+      // references stay as an ordinary persist left them); only a snapshot
+      // whose status cannot be redefined is replaced by the checked copy.
+      const storedSnapshot = run.snapshot;
+      if (storedSnapshot !== null && typeof storedSnapshot === 'object') {
+        try {
+          Object.defineProperty(storedSnapshot, 'status', {
+            value: runStatus,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+        } catch {
+          if (canonical) this.setWorkflowRunRecord(workflowName, runId, { ...run, snapshot: canonical });
+        }
+      }
       this.db.workflowTerminalParentRevisions.set(key, {
         ...existing,
         generation,

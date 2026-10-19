@@ -91,7 +91,7 @@ The store has no executor lease or liveness check. It cancels a `running` run th
 
 :::
 
-In the in-memory store, both `cancelled` and `settled` protect the selected run from writes that would reopen it, and the run is stored as plain data from then on:
+In the in-memory store, both `cancelled` and `settled` protect the selected run from writes that would reopen it. A `settled` selection keeps the stored snapshot and records its checked status as data. Later writes to the run are stored as plain data:
 
 - `persistWorkflowSnapshot`, `updateWorkflowState`, `updateWorkflowResults`, `bindWorkflowNestedRunOwnership`, and resume admission, rollback and finalization throw `WorkflowStaleSnapshotPersistError` when the new status disagrees with the run's terminal status. Writes with the same status still succeed.
 - `persistWorkflowStepUpdate` doesn't throw. It returns `{ status: 'finalized', disposition }`, as it does for any terminal run.

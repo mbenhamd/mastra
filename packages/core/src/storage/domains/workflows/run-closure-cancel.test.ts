@@ -706,10 +706,8 @@ describe('WorkflowsInMemory erasure cancel', () => {
     expect(Object.getOwnPropertyDescriptor(before, '__proto__')?.value).toEqual({ note: 'kept as data' });
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const stored = (await workflows.loadWorkflowSnapshot(run))!;
-    expect.soft(Object.getOwnPropertyDescriptor(stored, inheritedNote)).toMatchObject({
-      value: 'kept inherited symbol',
-      enumerable: true,
-    });
+    // The selection leaves the stored snapshot as the ordinary persist left it.
+    expect(Reflect.get(stored, inheritedNote)).toBe('kept inherited symbol');
     expect.soft(Object.getOwnPropertyDescriptor(stored, 'retainedNote')).toMatchObject({
       value: 'kept non-enumerable',
       enumerable: false,
@@ -862,8 +860,10 @@ describe('WorkflowsInMemory erasure cancel', () => {
       enumerable: false,
     });
     expect(Object.getOwnPropertyDescriptor(after, '__proto__')?.value).toEqual({ kept: true });
-    expect(Object.getPrototypeOf(after)).toBe(Object.prototype);
+    // The stored snapshot itself is kept; only its status is pinned as data.
+    expect(after).toBe(withInherited);
     expect((after as Record<symbol, unknown>)[marker]).toBe('inherited');
+    expect(Object.getOwnPropertyDescriptor(after, 'status')).toMatchObject({ value: 'success', writable: true });
   });
 
   it('never runs a stored error accessor on the stored error during a refused cancel', async () => {
@@ -962,5 +962,37 @@ describe('WorkflowsInMemory erasure cancel', () => {
     await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
     const after = db.workflows.get(key)!.snapshot as WorkflowRunState & { context: { reads?: number } };
     expect(after.context.reads).toBeUndefined();
+  });
+
+  it('keeps references an inherited accessor returns when a settled run is selected for erasure', async () => {
+    const { db, workflows } = setup();
+    const run = { workflowName: 'research', runId: 'run-accessor-alias' };
+    await persist(workflows, run, 'success');
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    const record = db.workflows.get(key)!;
+    const snapshot = record.snapshot as WorkflowRunState;
+    const selected = { output: { id: 'paper-1' } };
+    const scores = new Map([[selected.output, 3]]);
+    const reader = {
+      get picked() {
+        return (this as unknown as { context: { selected: typeof selected } }).context.selected.output;
+      },
+    };
+    Object.defineProperty(reader, 'picked', {
+      ...Object.getOwnPropertyDescriptor(reader, 'picked')!,
+      enumerable: true,
+    });
+    const stored = Object.create(
+      reader,
+      Object.getOwnPropertyDescriptors({ ...snapshot, context: { ...snapshot.context, selected, scores } }),
+    );
+    db.workflows.set(key, { ...record, snapshot: stored });
+
+    await expect(cancel(workflows, run)).resolves.toEqual({ status: 'settled' });
+    const after = db.workflows.get(key)!.snapshot as unknown as {
+      picked: object;
+      context: { scores: Map<object, number> };
+    };
+    expect(after.context.scores.get(after.picked)).toBe(3);
   });
 });
