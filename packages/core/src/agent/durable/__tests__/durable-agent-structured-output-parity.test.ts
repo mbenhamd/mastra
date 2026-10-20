@@ -96,54 +96,37 @@ const STRUCTURED: Record<Variant, PublicStructuredOutputOptions<any>> = {
 };
 
 /**
- * COR-1390 (chunk order/content) — two `output`-envelope differences on the object-emitting variants:
- *
- * 1. Order: plain emits the `object-result` chunk before `step-finish`/`finish`; durable and evented
- *    emit it after. The harness records the chunk `types` but pairs only the contract, so it never
- *    sees this; the helper's ordered `chunkTypes` comparison does.
- * 2. Content: plain's `step-finish` payload carries the parsed object at `output.object`; durable and
- *    evented omit it. That is the same "slim `output`" structuring the helper already declares for the
- *    `step-finish` chunk (`KNOWN_CHUNK_DIFFERENCES`), which lists `output.text`/`output.steps`/
- *    `output.toolCalls` but not `output.object`. The helper is frozen for this branch, so the path is
- *    stripped here rather than added to the shared list.
- *
- * Move `object-result` to the tail of plain's chunk arrays and drop `output.object` from its chunk
- * payloads so plain matches what the wrapped engines emit. Both edits are the difference, so the
- * declaration fails once either is fixed.
+ * COR-1390 (chunk order) on the object-emitting variants: plain emits the `object-result` chunk
+ * before `step-finish`; durable and evented emit it after `step-finish`, before `finish`. The
+ * harness records the chunk `types` but pairs only the contract, so it never sees this; the
+ * helper's ordered `chunkTypes` comparison does. Upstream also declared a content difference
+ * (`output.object` on step-finish) that does not reproduce on the fork (PF-5928).
  */
 function toWrappedChunkShape(turn: ParitySnapshot): ParitySnapshot {
   const index = turn.chunkTypes.indexOf('object-result');
-
-  const stripObject = (payload: unknown): unknown => {
-    if (typeof payload !== 'object' || payload === null) return payload;
-    const record = payload as Record<string, unknown>;
-    const output = record.output;
-    if (typeof output !== 'object' || output === null || !('object' in (output as object))) return payload;
-    const { object: _object, ...rest } = output as Record<string, unknown>;
-    return { ...record, output: rest };
-  };
-
-  const chunkPayloads = turn.chunkPayloads.map(stripObject);
-  if (index < 0) return { ...turn, chunkPayloads };
-
+  if (index < 0) return turn;
+  // PF-5928 adaptation: on the fork the wrapped engines emit `object-result` right after
+  // `step-finish` and before `finish` (not after `finish`), and their chunk payloads match plain's
+  // (upstream's `output.object` strip no longer reproduces), so only that one move remains.
   const move = <T>(items: T[]): T[] => {
     const copy = items.slice();
     const [item] = copy.splice(index, 1);
-    copy.push(item as T);
+    const finishAt = turn.chunkTypes.filter((_, at) => at !== index).indexOf('finish');
+    copy.splice(finishAt < 0 ? copy.length : finishAt, 0, item as T);
     return copy;
   };
   return {
     ...turn,
     chunks: move(turn.chunks),
     chunkTypes: move(turn.chunkTypes),
-    chunkPayloads: move(chunkPayloads),
+    chunkPayloads: move(turn.chunkPayloads),
   };
 }
 
 /** Only the object-emitting variants need the reshape; `warn` streams no `object-result`. */
 const OBJECT_RESULT_ORDER: EngineDifference = {
   reason:
-    'COR-1390: plain emits the object-result chunk before step-finish/finish and carries the parsed object in the step-finish output; durable and evented emit object-result after and omit the object.',
+    'COR-1390: plain emits the object-result chunk before step-finish; durable and evented emit it after step-finish, before finish.',
   expect: plain => ({ ...plain, turns: plain.turns.map(toWrappedChunkShape) }),
 };
 

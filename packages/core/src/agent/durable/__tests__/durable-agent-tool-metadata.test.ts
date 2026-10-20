@@ -203,10 +203,9 @@ function runT34(variant: Variant) {
   const spec = SPECS[variant];
   return expectEngineParity({
     engines: ENGINES,
-    // The declared difference only exists for the variants that put metadata on the result.
-    ...(spec.resultMetadata
-      ? { differences: { durable: RESULT_METADATA_DIFFERENCE, evented: RESULT_METADATA_DIFFERENCE } }
-      : {}),
+    // PF-5928 adaptation: upstream declares COR-1390 (durable/evented drop the tool-result
+    // providerMetadata). The fork's shared tool-result commit core (L15, PF-5286) carries it on
+    // every engine, so the harness reports the declaration as stale. Expect exact parity.
     model: {
       respond: request => (toolResultCount(request) === 0 ? toolCallTape(spec) : textOnlyTape('done')),
     },
@@ -259,11 +258,9 @@ describe('T34 tool metadata (plain, durable, evented)', () => {
           expect(transcriptOutputSeenByModel(observation.requests[1])).toEqual({ n: 1, secret: 'transcript-redacted' });
         }
 
-        // COR-1390: the difference declared above, pinned per engine.
+        // PF-5928 adaptation: every engine keeps the tool-result providerMetadata (see above).
         if (spec.resultMetadata) {
-          const metadata = payloadOfType(turn, 'tool-result').providerMetadata;
-          if (engine === 'plain') expect(metadata).toEqual(spec.resultMetadata);
-          else expect(metadata).toBeUndefined();
+          expect(payloadOfType(turn, 'tool-result').providerMetadata).toEqual(spec.resultMetadata);
         }
       }
     });

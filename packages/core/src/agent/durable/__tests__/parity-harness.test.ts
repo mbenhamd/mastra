@@ -780,38 +780,38 @@ describe('expectEngineParity', () => {
    * payload does not carry the parsed object. Declaring both as the expectation
    * keeps every parsed value itself compared.
    */
+  // PF-5928 adaptation: on the fork the wrapped engines emit `object-result` right after
+  // `step-finish`, before `finish`, and keep their chunk payloads equal to plain's (upstream's
+  // `output.object` strip on step-finish no longer reproduces), so only that one move remains.
   function declareWrappedObjectChunks(plain: EngineObservation): EngineObservation {
     return {
       requests: plain.requests,
       turns: plain.turns.map(turn => {
         const objectIndex = turn.chunkTypes.indexOf('object-result');
         if (objectIndex < 0) return turn;
-        const move = <T>(list: T[]): T[] => [
-          ...list.slice(0, objectIndex),
-          ...list.slice(objectIndex + 1),
-          list[objectIndex]!,
-        ];
-        const chunkTypes = move(turn.chunkTypes);
-        const chunkPayloads = move(turn.chunkPayloads);
-        const stepFinish = chunkTypes.indexOf('step-finish');
-        const payload = chunkPayloads[stepFinish] as { output?: Record<string, unknown> } | undefined;
-        if (payload?.output && 'object' in payload.output) {
-          const output = { ...payload.output };
-          delete output.object;
-          chunkPayloads[stepFinish] = { ...payload, output };
-        }
-        return { ...turn, chunks: move(turn.chunks), chunkTypes, chunkPayloads };
+        const move = <T>(list: T[]): T[] => {
+          const rest = [...list.slice(0, objectIndex), ...list.slice(objectIndex + 1)];
+          const finishAt = turn.chunkTypes.filter((_, at) => at !== objectIndex).indexOf('finish');
+          rest.splice(finishAt < 0 ? rest.length : finishAt, 0, list[objectIndex]!);
+          return rest;
+        };
+        return {
+          ...turn,
+          chunks: move(turn.chunks),
+          chunkTypes: move(turn.chunkTypes),
+          chunkPayloads: move(turn.chunkPayloads),
+        };
       }),
     };
   }
 
   const DECLARE_OBJECT_CHUNKS = {
     durable: {
-      reason: 'COR-1390: wrapped engines emit object-result last and omit the parsed object from step-finish',
+      reason: 'COR-1390: wrapped engines emit object-result after step-finish, before finish',
       expect: declareWrappedObjectChunks,
     },
     evented: {
-      reason: 'COR-1390: wrapped engines emit object-result last and omit the parsed object from step-finish',
+      reason: 'COR-1390: wrapped engines emit object-result after step-finish, before finish',
       expect: declareWrappedObjectChunks,
     },
   };
@@ -850,7 +850,9 @@ describe('expectEngineParity', () => {
     // The order difference the declaration above covers is real, on both sides.
     const plainTypes = results.plain!.turns[0]!.chunkTypes;
     expect(plainTypes.indexOf('object-result')).toBeLessThan(plainTypes.indexOf('step-finish'));
-    expect(results.durable!.turns[0]!.chunkTypes.at(-1)).toBe('object-result');
+    const durableTypes = results.durable!.turns[0]!.chunkTypes;
+    expect(durableTypes.indexOf('object-result')).toBeGreaterThan(durableTypes.indexOf('step-finish'));
+    expect(durableTypes.indexOf('object-result')).toBeLessThan(durableTypes.indexOf('finish'));
   });
 
   it('fails when engines parse different objects', async () => {
