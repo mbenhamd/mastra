@@ -246,13 +246,55 @@ const closedFailedStepDifference: EngineDifference = {
   expect: withFailedStepClosed,
 };
 
+/**
+ * PF-5928 adaptation (fork PF-2935, a parity gap already present on the fork base; tracked under
+ * PF-6047): plain keeps the serving `fallbackModelIndex` on the step-finish and finish payloads
+ * across iterations, where upstream resets it; durable and evented never set it.
+ */
+function withoutFallbackModelIndex(observation: EngineObservation): EngineObservation {
+  const strip = (payload: unknown) => {
+    if (!payload || typeof payload !== 'object' || !('fallbackModelIndex' in payload)) return payload;
+    const { fallbackModelIndex: _plainOnly, ...rest } = payload as Record<string, unknown>;
+    return rest;
+  };
+  return {
+    ...observation,
+    turns: observation.turns.map(turn => ({
+      ...turn,
+      chunkPayloads: turn.chunkPayloads.map(strip),
+      ...(turn.finishChunk
+        ? {
+            finishChunk: {
+              ...turn.finishChunk,
+              payload: strip(turn.finishChunk.payload),
+              ...('payloadKeys' in turn.finishChunk
+                ? {
+                    payloadKeys: (turn.finishChunk as { payloadKeys: string[] }).payloadKeys.filter(
+                      key => key !== 'fallbackModelIndex',
+                    ),
+                  }
+                : {}),
+            } as typeof turn.finishChunk,
+          }
+        : {}),
+    })),
+  };
+}
+
 function heldDifferences(variant: HeldVariant): Partial<Record<Exclude<ParityEngine, 'plain'>, EngineDifference>> {
-  const difference =
+  const base =
     variant === 'retry' || variant === 'call-time'
       ? extraStepStartDifference(3)
       : variant === 'fallback'
         ? extraStepStartDifference(2)
         : closedFailedStepDifference;
+  const difference: EngineDifference =
+    variant === 'fallback'
+      ? {
+          reason: `${base.reason} PF-2935: plain-only fallbackModelIndex on step-finish/finish.`,
+          expect: plain => withoutFallbackModelIndex(base.expect(plain)),
+        }
+      : base;
   return { durable: difference, evented: difference };
 }
 
