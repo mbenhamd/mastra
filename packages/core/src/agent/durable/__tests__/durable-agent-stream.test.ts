@@ -21,7 +21,7 @@ import { clearToolSurfaceFence, readToolSurfaceFence, stampToolSurfaceFence } fr
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import { createEventedAgent } from '../create-evented-agent';
-import { globalRunRegistry } from '../run-registry';
+import { clearPinnedRunRegistryEntry, globalRunRegistry } from '../run-registry';
 import type { AgentStreamEvent } from '../types';
 import { resolveRuntimeDependencies } from '../utils/resolve-runtime';
 import { baseDurableAgenticInputSchema } from '../workflows/shared/schemas';
@@ -398,10 +398,12 @@ describe('DurableAgent streaming execution', () => {
       const originalEntry = globalRunRegistry.get(result.runId)!;
 
       await processorStarted;
-      // Explicit cleanup releases the active pin. A later caller can then
-      // reuse the identifier while this stale processor callback is still
-      // suspended, which the post-await fence must reject.
+      // A later caller reuses the identifier while this stale processor callback is still
+      // suspended, which the post-await fence must reject. PF-5928 adaptation: explicit cleanup
+      // of a running stream now defers until the execution settles (upstream), so it no longer
+      // releases the active pin here; drop the pin directly to model the rebind.
       result.cleanup();
+      clearPinnedRunRegistryEntry(result.runId);
       globalRunRegistry.set(result.runId, {
         ...originalEntry,
         runtimeBindingId: 'newer-runtime-binding',
@@ -416,6 +418,7 @@ describe('DurableAgent streaming execution', () => {
 
     it('should pass the post-processor registry signal and call-time headers to the provider', async () => {
       let freshAbortSignal: AbortSignal | undefined;
+      let freshController: AbortController | undefined;
       const doStream = vi.fn(async (_options: unknown) => ({
         stream: convertArrayToReadableStream([
           { type: 'stream-start', warnings: [] },
@@ -438,6 +441,7 @@ describe('DurableAgent streaming execution', () => {
               const entry = [...globalRunRegistry.values()].find(candidate => candidate.agentId === baseAgent.id);
               if (!entry) throw new Error('active run entry not found');
               const controller = new AbortController();
+              freshController = controller;
               freshAbortSignal = controller.signal;
               entry.abortController = controller;
               entry.abortSignal = controller.signal;
@@ -456,7 +460,13 @@ describe('DurableAgent streaming execution', () => {
         abortSignal?: AbortSignal;
         headers?: Record<string, string>;
       };
-      expect(providerOptions.abortSignal).toBe(freshAbortSignal);
+      // PF-5928 adaptation (upstream #25878): the provider signal composes the run signal with the
+      // stream's interruption signal, so it is no longer the registry signal by identity. The fork
+      // assertion is that the fresh post-processor controller is the one that reaches the provider.
+      expect(freshAbortSignal).toBeDefined();
+      expect(providerOptions.abortSignal?.aborted).toBe(false);
+      freshController!.abort(new Error('post-processor abort'));
+      expect(providerOptions.abortSignal?.aborted).toBe(true);
       expect(providerOptions.headers).toMatchObject({ 'x-post-processor': 'fresh' });
       result.cleanup();
     });
