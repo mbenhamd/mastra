@@ -1097,6 +1097,10 @@ export const TABLE_SCHEMAS: Record<TABLE_NAMES, Record<string, StorageColumn>> =
     created_at: { type: 'bigint', nullable: false },
     updated_at: { type: 'bigint', nullable: false },
     completed_at: { type: 'bigint', nullable: true },
+    // The byte owner's declared storage namespace, bound to a PUT before any
+    // byte write. NULL on rows written before the binding existed; those rows
+    // are unqualified and never cancelled or reconciled.
+    storage_namespace: { type: 'text', nullable: true },
   },
   [TABLE_HARNESS_MESSAGE_RESULTS]: {
     id: { type: 'text', nullable: false, primaryKey: true },
