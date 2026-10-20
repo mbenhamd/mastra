@@ -12,7 +12,7 @@ import { EventEmitterPubSub } from '../../events';
 import { Mastra } from '../../mastra';
 import { createRunScope } from '../../mastra/run-scope';
 import { MockMemory } from '../../memory/mock';
-import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '../../request-context';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage';
 import { Agent } from '../agent';
 import { DurableStepIds } from '../durable/constants';
@@ -2127,6 +2127,10 @@ describe('DurableAgent FGA checks', () => {
     const requestContext = new RequestContext();
     requestContext.set('user', { id: 'user-1' });
     requestContext.set('organizationId', 'org-1');
+    // PF-5928 adaptation (fork L24 FGA fail-closed): with FGA on, a DurableAgent run must carry a
+    // verified thread and resource identity, or it is refused before the memory:read check.
+    requestContext.set(MASTRA_THREAD_ID_KEY, 'thread-1');
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, 'resource-1');
 
     try {
       await expect(
@@ -2181,20 +2185,17 @@ describe('DurableAgent FGA checks', () => {
     requestContext.set('organizationId', 'org-1');
     requestContext.set('user', user);
     const initialActor = { actorKind: 'system' as const, agentId: 'initial-system-agent' };
-    const { runId } = await durableAgent.prepare('test', {
-      requestContext,
-      actor: initialActor,
-    });
-    // Like a real suspension, persist the suspended row so the next resume finds it.
-    const resumeWorkflow = vi.fn(async (_params: any) => {
-      const workflowsStore = await mastra.getStorage()?.getStore('workflows');
-      await workflowsStore?.persistWorkflowSnapshot({
-        workflowName: DurableStepIds.AGENTIC_LOOP,
-        runId,
-        snapshot: { runId, status: 'suspended', context: {} } as any,
-      });
-      return { status: 'suspended' };
-    });
+    // PF-5928 adaptation (fork PF-1875 over upstream #27379): every durable resume validates the
+    // persisted agentic-loop row as the ownership authority, and a second resume of a run whose
+    // segment already ran needs that row (#27379). Upstream's hand-written bare `suspended` row has
+    // no durable workflow input, so the fork refuses it as not owned. Each resume therefore targets
+    // its own prepared run: the assertion about per-call actors is unchanged.
+    const runIds: string[] = [];
+    for (const _run of [0, 1, 2]) {
+      const runContext = new RequestContext(requestContext.entries());
+      runIds.push((await durableAgent.prepare('test', { requestContext: runContext, actor: initialActor })).runId);
+    }
+    const resumeWorkflow = vi.fn(async (_params: any) => ({ status: 'suspended' }));
     vi.spyOn(durableAgent, 'getWorkflow').mockReturnValue({
       createRun: vi.fn().mockResolvedValue({ resume: resumeWorkflow }),
     } as any);
@@ -2202,18 +2203,20 @@ describe('DurableAgent FGA checks', () => {
 
     try {
       // Fork contract: preparation itself enforces agents:execute fail-closed,
-      // so prepare() already authorized the initial actor once. Each resume()
+      // so each prepare() already authorized the initial actor once. Each resume()
       // below then authorizes exactly once with its own per-call actor.
-      expect(requireActor).toHaveBeenNthCalledWith(
-        1,
-        initialActor,
-        expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
-      );
+      for (const call of [1, 2, 3]) {
+        expect(requireActor).toHaveBeenNthCalledWith(
+          call,
+          initialActor,
+          expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
+        );
+      }
       const explicitActor = { actorKind: 'system' as const, agentId: 'resume-system-agent' };
-      results.push(await durableAgent.resume(runId, { approved: true }, { actor: explicitActor }));
+      results.push(await durableAgent.resume(runIds[0], { approved: true }, { actor: explicitActor }));
       await vi.waitFor(() => expect(resumeWorkflow).toHaveBeenCalledTimes(1));
       expect(requireActor).toHaveBeenNthCalledWith(
-        2,
+        4,
         explicitActor,
         expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
       );
@@ -2223,31 +2226,34 @@ describe('DurableAgent FGA checks', () => {
 
       const freshDefaultActor = { actorKind: 'system' as const, agentId: 'fresh-default-agent' };
       defaultActor = freshDefaultActor;
-      results.push(await durableAgent.resume(runId, { approved: true }));
+      results.push(await durableAgent.resume(runIds[1], { approved: true }));
       await vi.waitFor(() => expect(resumeWorkflow).toHaveBeenCalledTimes(2));
       expect(requireActor).toHaveBeenNthCalledWith(
-        3,
+        5,
         freshDefaultActor,
         expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
       );
       expect(resumeWorkflow.mock.calls[1]?.[0].actor).toEqual(freshDefaultActor);
 
       defaultActor = undefined;
-      results.push(await durableAgent.resume(runId, { approved: true }));
+      results.push(await durableAgent.resume(runIds[2], { approved: true }));
       await vi.waitFor(() => expect(resumeWorkflow).toHaveBeenCalledTimes(3));
-      expect(requireActor).toHaveBeenCalledTimes(3);
-      expect(requireUser).toHaveBeenCalledWith(
-        user,
-        expect.objectContaining({
-          resource: { type: 'agent', id: 'test-agent' },
-          context: expect.objectContaining({ requestContext }),
-        }),
-      );
+      expect(requireActor).toHaveBeenCalledTimes(5);
+      // The third run's own request context (the boundary snapshot carries the run's durable
+      // execution mark too) authorizes the user.
+      const userCall = requireUser.mock.calls.at(-1)!;
+      expect(userCall[0]).toEqual(user);
+      expect(userCall[1]).toMatchObject({ resource: { type: 'agent', id: 'test-agent' } });
+      expect(userCall[1].context.metadata.runId).toBe(runIds[2]);
+      expect(userCall[1].context.requestContext.get('user')).toEqual(user);
+      expect(userCall[1].context.requestContext.get('organizationId')).toBe('org-1');
       expect(resumeWorkflow.mock.calls[2]?.[0].actor).toBeUndefined();
     } finally {
       results.forEach(result => result.cleanup());
-      durableAgent.runRegistry.cleanup(runId);
-      globalRunRegistry.delete(runId);
+      for (const runId of runIds) {
+        durableAgent.runRegistry.cleanup(runId);
+        globalRunRegistry.delete(runId);
+      }
       await mastra.stopWorkers?.();
       await pubsub.close();
     }
@@ -2490,10 +2496,11 @@ describe('DurableAgent FGA checks', () => {
 
     try {
       await (durableAgent as any)[method]({ runId: 'run-1', toolCallId: 'tool-call-1' });
+      // PF-5928 adaptation (upstream): resumeGenerate now takes `(resumeData, { runId, ... })`,
+      // matching Agent.resumeGenerate; the positional runId form is deprecated.
       expect(resumeGenerate).toHaveBeenCalledWith(
-        'run-1',
         { approved },
-        expect.objectContaining({ toolCallId: 'tool-call-1' }),
+        expect.objectContaining({ runId: 'run-1', toolCallId: 'tool-call-1' }),
       );
     } finally {
       await pubsub.close();
