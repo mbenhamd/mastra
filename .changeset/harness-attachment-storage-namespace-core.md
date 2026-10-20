@@ -15,7 +15,7 @@ class R2AttachmentOwner implements HarnessAttachmentByteOwner {
 }
 ```
 
-A native store could only ask the owner configured now, so an uncertain upload could be fenced and reported clean in another bucket while its bytes stayed where they were written.
+A native store could only ask the owner configured now, so an unfinished upload could be reported clean in another bucket while its bytes stayed where they were written.
 
 **After**
 
