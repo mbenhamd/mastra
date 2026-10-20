@@ -183,17 +183,22 @@ describe('approving a durable agent whose memory is chosen from the request cont
     expect(run.prompts).toHaveLength(1);
   });
 
-  it('resumes in a fresh process when the memory function returns nothing without the request context', async () => {
+  // PF-5928 adaptation (fork PF-1875 cold-resume fail-closed, like the siblings in this file): the
+  // rebuilt request context carries only the persisted entries, so the tenant-scoped memory function
+  // returns nothing and the fresh process refuses the approval instead of resuming without memory
+  // (upstream warns and resumes). Nothing runs after the refusal.
+  it('refuses a fresh-process approval when the memory function returns nothing without the request context', async () => {
     const run = await setup('tenant-only');
     const durableAgent = startProcess(run.stores, 'tenant-only', run.prompts);
 
-    const resumed = await durableAgent.approveToolCall({
-      runId: run.runId,
-      toolCallId: run.toolCallId,
-      memory: memoryOption,
-    });
-
-    await expectResumedAgainstTenantMemory(run, resumed);
+    await expect(
+      durableAgent.approveToolCall({
+        runId: run.runId,
+        toolCallId: run.toolCallId,
+        memory: memoryOption,
+      }),
+    ).rejects.toThrow('Function-based memory returned empty value');
+    expect(run.prompts).toHaveLength(1);
   });
 
   it('resumes with the recalled conversation when approved in a fresh process with a request context that chose other memory', async () => {
