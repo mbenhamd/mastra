@@ -830,6 +830,11 @@ type AgentThreadRuntimeState = {
   reservationWaitersByRunId: Map<string, Array<() => void>>;
   resumeTailsByRunId: Map<string, Promise<void>>;
   abortedRunIds: Set<string>;
+  /**
+   * Aborted-run tombstones created while the run was parked on (or entering) a suspension. Stop on
+   * a parked run is the decision on it, so these never admit a later resume (PF-5928).
+   */
+  parkedAbortRunIds: Set<string>;
   abortedRunCleanupTimersByRunId: Map<string, ReturnType<typeof setTimeout>>;
   rejectedRunErrorsByRunId: Map<string, RejectedRunErrorRecord>;
   acceptedCallerSignals: Map<string, CachedCallerSignal>;
@@ -1134,6 +1139,7 @@ function createRuntimeState(): AgentThreadRuntimeState {
     reservationWaitersByRunId: new Map(),
     resumeTailsByRunId: new Map(),
     abortedRunIds: new Set(),
+    parkedAbortRunIds: new Set(),
     abortedRunCleanupTimersByRunId: new Map(),
     rejectedRunErrorsByRunId: new Map(),
     acceptedCallerSignals: new Map(),
@@ -4002,6 +4008,7 @@ export class AgentThreadStreamRuntime {
     }
     if (!preparedRun) {
       state.abortedRunIds.add(runId);
+      if (this.#isParkedRun(state, runId)) state.parkedAbortRunIds.add(runId);
       // A run parked on a tool suspension (a question to the user, a pending
       // generation) has no prepared run left to abort, and its completion
       // watcher returned when it suspended, so nothing else frees its thread.
@@ -4642,6 +4649,7 @@ export class AgentThreadStreamRuntime {
       state.abortedRunCleanupTimersByRunId.delete(runId);
     }
     state.abortedRunIds.delete(runId);
+    state.parkedAbortRunIds.delete(runId);
   }
 
   /**
@@ -4649,12 +4657,15 @@ export class AgentThreadStreamRuntime {
    * and the resume claim (upstream #26688) admits exactly one caller. The aborted-run tombstone
    * (PF-513) exists to refuse the aborted attempt itself, so once that attempt has settled (no
    * preparation, no live record here) it must not refuse the resume: a tool call that parked
-   * after its run was aborted stays resumable (upstream #26871). Called before the resume
-   * prepares, because preparation aborts a tombstoned run id.
+   * after its run was aborted stays resumable (upstream #26871). A run aborted while it was
+   * parked keeps its tombstone: Stop on a parked run is the decision, so an approval sent after
+   * it never runs the tool. Called before the resume prepares, because preparation aborts a
+   * tombstoned run id.
    */
   admitParkedRunResume(runId: string, pubsub?: PubSub): void {
     const state = this.#getState(pubsub);
     if (!state.abortedRunIds.has(runId) || state.preparedRunsById.has(runId)) return;
+    if (state.parkedAbortRunIds.has(runId)) return;
     const record = state.threadRunsById.get(runId);
     if (record && !this.#isParkedRun(state, runId)) return;
     this.#forgetAbortedRun(state, runId);
@@ -4665,6 +4676,7 @@ export class AgentThreadStreamRuntime {
 
     const cleanupTimer = setTimeout(() => {
       state.abortedRunIds.delete(runId);
+      state.parkedAbortRunIds.delete(runId);
       state.abortedRunCleanupTimersByRunId.delete(runId);
     }, ABORTED_RUN_TOMBSTONE_TTL_MS);
     (cleanupTimer as { unref?: () => void }).unref?.();
@@ -9647,7 +9659,10 @@ export class AgentThreadStreamRuntime {
         } else {
           forgetAcceptedOwner(eventStreamId);
         }
-        if (data.streamId !== undefined && currentStreamId !== undefined && data.streamId !== currentStreamId) {
+        // A legacy (streamId-less) terminal is compared through the segment it resolved to, so a
+        // delayed terminal of an older segment never mutates a newer same-run segment (PF-5928).
+        const terminalStreamId = data.streamId ?? (eventStreamId !== data.runId ? eventStreamId : undefined);
+        if (terminalStreamId !== undefined && currentStreamId !== undefined && terminalStreamId !== currentStreamId) {
           rememberTerminalRemoteStream(eventStreamId);
           removeEagerAbortListener(eventStreamId);
           return;

@@ -7291,8 +7291,10 @@ export class WorkflowsPG extends WorkflowsStorage {
   }: DeleteWorkflowRunIfGenerationInput): Promise<DeleteWorkflowRunIfGenerationResult> {
     try {
       return await this.#db.client.tx(async t => {
-        // Same lock order as deleteWorkflowRunById; the row lock holds the
+        // Same RunFence and lock order as deleteWorkflowRunById; the row lock holds the
         // generation compare and the delete together against a claim.
+        const fence = resolveRunFence(this, undefined, runId);
+        if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, 'deleteWorkflowRunIfGeneration');
         const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         const row = await t.oneOrNone<{ snapshot: unknown }>(
           `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
@@ -7311,7 +7313,11 @@ export class WorkflowsPG extends WorkflowsStorage {
           : { status: 'missing' as const };
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+      if (
+        error instanceof WorkflowSnapshotHandoffFenceError ||
+        isWorkflowSnapshotHandoffSchemaError(error) ||
+        isRunFenceConflictError(error)
+      )
         throw error;
       throw new MastraError(
         {

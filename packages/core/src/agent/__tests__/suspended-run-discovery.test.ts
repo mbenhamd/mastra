@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { z } from 'zod/v4';
 import type { IFGAProvider } from '../../auth/ee/interfaces/fga';
 import { Mastra } from '../../mastra';
+import { MockMemory } from '../../memory/mock';
 import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { getSnapshotMemoryInfo, InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
@@ -2737,6 +2738,69 @@ describe('aborting a suspended run (#25903)', () => {
       });
     }, 30000);
   });
+
+  // PF-5928: Stop on an approval-parked run is the decision on it. A tool call that parked AFTER an
+  // abort stays resumable (#26871), but an approval sent after a parked run was aborted never runs
+  // the tool, even when the abort's best-effort snapshot deletion fails.
+  it('an approval sent after a parked run was aborted never runs the tool', async () => {
+    let executions = 0;
+    const tool = createTool({
+      id: 'Find user tool',
+      description: 'Returns the name and email of a user',
+      inputSchema: z.object({ name: z.string() }),
+      requireApproval: true,
+      execute: async input => {
+        executions++;
+        return mockFindUser(input);
+      },
+    });
+    let modelCalls = 0;
+    const model = createMockModel();
+    const doStream = model.doStream.bind(model);
+    (model as any).doStream = async (options: any) => {
+      modelCalls++;
+      return doStream(options);
+    };
+    const storage = new InMemoryStore();
+    const agent = new Agent({
+      id: 'abort-then-approve-agent',
+      name: 'Abort Then Approve Agent',
+      instructions: 'You find users.',
+      model,
+      tools: { findUserTool: tool },
+      memory: new MockMemory({ storage }),
+    });
+    new Mastra({ agents: { agent }, logger: false, storage });
+    const workflowsStore: any = await storage.getStore('workflows');
+    vi.spyOn(workflowsStore, 'deleteWorkflowRunById').mockRejectedValue(new Error('storage unavailable'));
+    const threadId = 'abort-then-approve-thread';
+    const memory = { thread: threadId, resource: 'abort-resource' };
+    const output = await agent.stream('Find the user with name - Dero Israel', { memory });
+    let toolCallId: string | undefined;
+    for await (const chunk of output.fullStream) {
+      if (chunk.type === 'tool-call-approval') toolCallId = chunk.payload.toolCallId;
+    }
+    expect(toolCallId).toBeDefined();
+    await vi.waitFor(async () => {
+      expect((await agent.listSuspendedRuns({ threadId })).runs.length).toBeGreaterThan(0);
+    });
+    const callsAtStop = modelCalls;
+
+    agent.abortRunStream(output.runId);
+    const approval = await agent.approveToolCall({ runId: output.runId, toolCallId, memory }).then(
+      async resumed => {
+        for await (const _chunk of resumed.fullStream) {
+          // drain
+        }
+        return 'resumed';
+      },
+      () => 'refused',
+    );
+
+    expect(approval).toBe('refused');
+    expect(executions).toBe(0);
+    expect(modelCalls).toBe(callsAtStop);
+  }, 30000);
 
   it("DurableAgent stream result's abort() removes the suspended run", async () => {
     const { durableAgent, result } = await suspendDurable('durable-abort-result');

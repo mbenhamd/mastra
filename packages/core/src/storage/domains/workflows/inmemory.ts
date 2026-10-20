@@ -1010,6 +1010,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     runId,
     expectedExecutionGeneration,
   }: DeleteWorkflowRunIfGenerationInput): Promise<DeleteWorkflowRunIfGenerationResult> {
+    // The ambient RunFence still applies, as on deleteWorkflowRunById: a superseded owner's
+    // cleanup is refused even while the row keeps the same execution generation.
+    this.assertFence(undefined, runId, 'deleteWorkflowRunIfGeneration');
     // Read, compare and delete without yielding, so no claim can land between them.
     const key = this.getWorkflowKey(workflowName, runId);
     const run = this.db.workflows.get(key);

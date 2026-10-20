@@ -802,10 +802,12 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
     snapshot,
   }: CreateWorkflowSnapshotIfAbsentInput): Promise<CreateWorkflowSnapshotIfAbsentResult> {
     const now = new Date().toISOString();
+    // Same RunFence as persistWorkflowSnapshot: a stale owner can never recreate the row.
+    const check = this.#runFenceCheck(undefined, runId, 'createWorkflowSnapshotIfAbsent');
     const inserted = await this.executeWithRetry(
       () =>
-        withClientWriteLock(this.#client, () =>
-          this.#client.execute({
+        withRunFence(this.#client, check, writer =>
+          writer.execute({
             sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
                   VALUES (?, ?, ?, jsonb(?), ?, ?)
                   ON CONFLICT(workflow_name, run_id) DO NOTHING`,
@@ -822,11 +824,14 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
     runId,
     expectedExecutionGeneration,
   }: DeleteWorkflowRunIfGenerationInput): Promise<DeleteWorkflowRunIfGenerationResult> {
+    // Same RunFence as deleteWorkflowRunById: a superseded owner's cleanup is refused even while
+    // the row keeps the same execution generation.
+    const check = this.#runFenceCheck(undefined, runId, 'deleteWorkflowRunIfGeneration');
     return this.executeWithRetry(async () => {
       try {
         // One statement: the generation compare and the delete cannot be split by a claim.
-        const deleted = await withClientWriteLock(this.#client, () =>
-          this.#client.execute({
+        const deleted = await withRunFence(this.#client, check, writer =>
+          writer.execute({
             sql: `DELETE FROM ${TABLE_WORKFLOW_SNAPSHOT} WHERE workflow_name = ? AND run_id = ?
                   AND (json_type(snapshot, '$.executionGeneration') IS NULL
                        OR json_extract(snapshot, '$.executionGeneration') = ?)`,
@@ -840,6 +845,7 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
         });
         return { status: remaining.rows.length > 0 ? ('stale' as const) : ('missing' as const) };
       } catch (error) {
+        if (isRunFenceConflictError(error)) throw error;
         throw new MastraError(
           {
             id: createStorageErrorId('LIBSQL', 'DELETE_WORKFLOW_RUN_IF_GENERATION', 'FAILED'),

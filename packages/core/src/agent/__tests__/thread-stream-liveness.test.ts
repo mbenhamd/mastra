@@ -64,6 +64,59 @@ describe('thread stream remote-run liveness', () => {
     await consumed;
   });
 
+  // PF-5928: a legacy (streamId-less) terminal resolves to the segment it belongs to; a delayed one
+  // from an older segment must not mark the run suspended while a newer segment owns it.
+  it('ignores a delayed legacy suspension from an older segment once a newer segment owns the run', async () => {
+    vi.useFakeTimers();
+    const harness = createHarness('liveness-older-legacy-suspension');
+    const { runtime, pubsub, emit } = setupRuntime(harness);
+    const key = [harness.resourceId, harness.threadId].join(AGENT_THREAD_KEY_SEPARATOR);
+    pubsub.owners.set(key, harness.runId);
+
+    const subscription = await runtime.subscribeToThread(
+      harness.agent,
+      { threadId: harness.threadId, resourceId: harness.resourceId },
+      pubsub,
+    );
+    const collected: any[] = [];
+    const consumed = (async () => {
+      for await (const part of subscription.stream) collected.push(part);
+    })();
+
+    await emit({ type: 'run-registered', runId: harness.runId, streamId: harness.streamId, streamSeq: 1 });
+    const newerOwner = `mastra-thread-owner:${JSON.stringify([harness.runId, 'newer', 'attempt-2'])}`;
+    const newerStreamId = `${harness.streamId}-newer`;
+    pubsub.owners.set(key, newerOwner);
+    await emit({
+      type: 'run-registered',
+      runId: harness.runId,
+      streamId: newerStreamId,
+      streamSeq: 2,
+      leaseOwner: newerOwner,
+    });
+    const newerPart = (part: unknown) =>
+      emit({
+        type: 'stream-part',
+        runId: harness.runId,
+        streamId: newerStreamId,
+        leaseOwner: newerOwner,
+        sourceId: 'newer',
+        part,
+      });
+    await newerPart({ type: 'start', payload: {} });
+    // The older segment's suspension boundary arrives late, without a streamId.
+    await emit({ type: 'run-suspended', runId: harness.runId });
+    await flush();
+
+    expect(runtime.isRunParked(harness.runId, pubsub)).toBe(false);
+    await newerPart({ type: 'text-delta', payload: { text: 'still live' } });
+    await flush();
+    expect(collected.map(part => part.type)).toEqual(['start', 'text-delta']);
+
+    subscription.unsubscribe();
+    await consumed;
+  });
+
   it('delivers a recovered segment of the same run after its crashed segment never ended (#25891)', async () => {
     vi.useFakeTimers();
     const harness = createHarness('liveness-recovered');

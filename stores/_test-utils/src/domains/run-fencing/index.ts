@@ -395,6 +395,50 @@ export function createRunFencingTests({ storage }: RunFencingTestOptions) {
         expect((await workflows.loadWorkflowSnapshot({ workflowName, runId }))?.value).toEqual({ writer: 'b2' });
       });
 
+      // PF-5928: the atomic conditional delete and create-if-absent keep the RunFence that
+      // deleteWorkflowRunById and persistWorkflowSnapshot enforce, even when the row still carries
+      // the superseded owner's execution generation.
+      it('fences the generation-conditional delete and create-if-absent inside a run fence scope', async ctx => {
+        if (!(await workflows.supportsRunFencing())) return ctx.skip();
+        const capabilities = workflows.getWorkflowResumeCapabilities();
+        if (capabilities.generationDeleteVersion !== 1 && capabilities.createIfAbsentVersion !== 1) return ctx.skip();
+        const runId = `run-${randomUUID()}`;
+        const fenceA = await claimed(runId, 'owner-a');
+        const fenceB = await claimed(runId, 'owner-b', true);
+        const snapshot = { ...snapshotWithValue(runId, 'b'), executionGeneration: 'wfeg:shared' } as WorkflowRunState;
+        await workflows.persistWorkflowSnapshot({ workflowName, runId, snapshot, fence: fenceB });
+
+        const scopeA = recordingScope((store, targetRunId) =>
+          store === workflows && targetRunId === runId ? fenceA : undefined,
+        );
+        if (capabilities.generationDeleteVersion === 1) {
+          await inRunFenceScope(scopeA, () =>
+            expectFenceConflict(
+              workflows.deleteWorkflowRunIfGeneration({
+                workflowName,
+                runId,
+                expectedExecutionGeneration: 'wfeg:shared',
+              }),
+            ),
+          );
+          expect((await workflows.loadWorkflowSnapshot({ workflowName, runId }))?.value).toEqual({ writer: 'b' });
+        }
+
+        await workflows.deleteWorkflowRunById({ workflowName, runId, fence: fenceB });
+        if (capabilities.createIfAbsentVersion === 1) {
+          await inRunFenceScope(scopeA, () =>
+            expectFenceConflict(
+              workflows.createWorkflowSnapshotIfAbsent({
+                workflowName,
+                runId,
+                snapshot: { ...snapshotWithValue(runId, 'stale'), status: 'pending' } as WorkflowRunState,
+              }),
+            ),
+          );
+          expect(await workflows.loadWorkflowSnapshot({ workflowName, runId })).toBeNull();
+        }
+      });
+
       it('leaves writes without a fence unchanged', async ctx => {
         if (!(await workflows.supportsRunFencing())) return ctx.skip();
         const runId = `run-${randomUUID()}`;

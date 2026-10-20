@@ -554,13 +554,17 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
       // cleanup may race
     }
     if (workflowExecution) {
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
         workflowExecution.then(
           () => undefined,
           () => undefined,
         ),
-        new Promise(resolve => setTimeout(resolve, 5_000)),
+        new Promise(resolve => {
+          settleTimer = setTimeout(resolve, 5_000);
+        }),
       ]);
+      clearTimeout(settleTimer);
     }
   }
 
