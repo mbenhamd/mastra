@@ -4020,9 +4020,12 @@ export class AgentThreadStreamRuntime {
       // Only an actually parked run is released by the parked finalizer; a
       // registered run that is neither parked nor inside its suspension window
       // (e.g. registered directly without a prepared entry) still needs its
-      // ordinary registered-record lifecycle abort below.
-      if (!inSuspensionWindow && this.#isParkedRun(state, runId)) {
-        return this.#releaseParkedRun(state, pubsub, runId);
+      // ordinary registered-record lifecycle abort below. So does a parked
+      // approval suspension whose watcher has not yet handed finalization over
+      // (a durable run's output stays open while it waits): #releaseParkedRun
+      // refuses it, and the record lifecycle below aborts it instead (#26583).
+      if (!inSuspensionWindow && this.#isParkedRun(state, runId) && this.#releaseParkedRun(state, pubsub, runId)) {
+        return true;
       }
     }
 
