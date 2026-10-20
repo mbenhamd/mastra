@@ -238,9 +238,9 @@ describe('InMemoryHarnessAttachmentByteOwner', () => {
     await expect(
       replacement.cancel({ ...cancelInput, storageNamespace: replacement.storageNamespace, blobRef: stored.blobRef }),
     ).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
-    await expect(
-      original.cancel({ ...cancelInput, blobRef: stored.blobRef + '-other' }),
-    ).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
+    await expect(original.cancel({ ...cancelInput, blobRef: stored.blobRef + '-other' })).rejects.toBeInstanceOf(
+      HarnessAttachmentByteOwnerConflictError,
+    );
     await expect(
       original.load(makeLoadInput({ blobRef: stored.blobRef, maxBytes: payload.byteLength })),
     ).resolves.not.toBeNull();

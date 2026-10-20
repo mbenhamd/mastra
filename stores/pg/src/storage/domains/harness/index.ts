@@ -5009,15 +5009,7 @@ export class HarnessPG extends HarnessStorage {
       sql: `UPDATE ${TABLE_HARNESS_ATTACHMENT_OPERATIONS}
             SET claim_expires_at = ?, next_attempt_at = ?, updated_at = ?, last_error = ?
             WHERE id = ? AND claim_id = ? AND status = ?`,
-      args: [
-        now + 1_000,
-        now + 1_000,
-        now,
-        JSON.stringify({ code }),
-        operationId,
-        claimId,
-        'claimed',
-      ],
+      args: [now + 1_000, now + 1_000, now, JSON.stringify({ code }), operationId, claimId, 'claimed'],
     });
   }
 

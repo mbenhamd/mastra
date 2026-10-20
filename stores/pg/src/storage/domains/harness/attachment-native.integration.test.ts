@@ -1774,15 +1774,23 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
       id: string;
       status: string;
       blob_ref: string | null;
-      storage_namespace: string | null;
       session_incarnation: string;
       last_error: { code?: string } | null;
     }>(
-      `SELECT id, status, blob_ref, storage_namespace, session_incarnation, last_error
+      `SELECT id, status, blob_ref, session_incarnation, last_error
        FROM "${schemaName}"."mastra_harness_attachment_operations"
        WHERE kind = 'put' AND session_id = $1 AND attachment_id = $2`,
       [sessionId, attachmentId],
     );
+  }
+
+  async function boundNamespace(store: PostgresStore, sessionId: string, attachmentId: string) {
+    const row = await store.db.one<{ storage_namespace: string | null }>(
+      `SELECT storage_namespace FROM "${schemaName}"."mastra_harness_attachment_operations"
+       WHERE kind = 'put' AND session_id = $1 AND attachment_id = $2`,
+      [sessionId, attachmentId],
+    );
+    return row.storage_namespace;
   }
 
   async function loadFrom(
@@ -1823,9 +1831,8 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
         HarnessStorageAttachmentPendingError,
       );
       const uncertain = await putOperation(first, sessionId, 'uncertain');
-      expect(uncertain).toMatchObject({ status: 'unknown', storage_namespace: bucketA.storageNamespace });
+      expect(uncertain.status).toBe('unknown');
       expect(uncertain.blob_ref).toBe(variant === 'with_ref' ? bucketA.storedRefs[0] : null);
-      expect(bucketA.saves[0]?.storageNamespace).toBe(bucketA.storageNamespace);
 
       // Restart with another valid namespace. A retry writes nothing there,
       // and cleanup stays pending: the new namespace is neither fenced nor
@@ -1864,6 +1871,9 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
         loadFrom(bucketA, bucketA.storedRefs[0]!, sessionId, 'uncertain', uncertain.session_incarnation, text),
       ).resolves.toBeNull();
       await expect(recovered.stores.harness!.deleteSession({ sessionId })).resolves.toBeUndefined();
+      // The binding was durable before the first byte write.
+      expect(bucketA.saves[0]?.storageNamespace).toBe(bucketA.storageNamespace);
+      await expect(boundNamespace(recovered, sessionId, 'uncertain')).resolves.toBe(bucketA.storageNamespace);
     });
   }
 
@@ -1878,8 +1888,7 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
     const delayed = bucketA.delayNextSave();
     const lateSave = first.stores.harness!.saveAttachment(saveInput(sessionId, 'delayed', text));
     await delayed.started;
-    const reserved = await putOperation(first, sessionId, 'delayed');
-    expect(reserved).toMatchObject({ status: 'pending', storage_namespace: bucketA.storageNamespace });
+    await expect(putOperation(first, sessionId, 'delayed')).resolves.toMatchObject({ status: 'pending' });
 
     // The process that issued the PUT is gone; a replacement on another
     // namespace must not settle it.
@@ -1902,9 +1911,7 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
     await expect(lateSave).rejects.toBeInstanceOf(HarnessStorageAttachmentPendingError);
     expect(bucketA.storedRefs).toHaveLength(0);
     await expect(putOperation(recovered, sessionId, 'delayed')).resolves.toMatchObject({ status: 'cleaned' });
-    await expect(
-      recovered.stores.harness!.loadAttachment({ sessionId, attachmentId: 'delayed' }),
-    ).resolves.toBeNull();
+    await expect(recovered.stores.harness!.loadAttachment({ sessionId, attachmentId: 'delayed' })).resolves.toBeNull();
   });
 
   it('refuses an operation row that has no recorded namespace', async () => {
@@ -1937,9 +1944,9 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
     ).resolves.toEqual({ processed: 1, pending: 1 });
     await expect(putOperation(store, sessionId, 'legacy')).resolves.toMatchObject({
       status: 'claimed',
-      storage_namespace: null,
       last_error: { code: 'storage_namespace_unqualified' },
     });
+    await expect(boundNamespace(store, sessionId, 'legacy')).resolves.toBeNull();
     expect(bucketA.cancels).toHaveLength(0);
     await expect(
       loadFrom(bucketA, bucketA.storedRefs[0]!, sessionId, 'legacy', legacy.session_incarnation, text),
