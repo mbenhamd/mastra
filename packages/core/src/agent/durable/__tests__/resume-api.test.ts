@@ -739,20 +739,23 @@ describe('Resume API', () => {
     });
 
     it.each([
+      // PF-5928 adaptation (fork PF-1703, listed under PF-6047): custom resumeData for an
+      // approval-gated call may only carry the approval decision fields (reason, message,
+      // editedArgs), so these merges use an allowlisted `message` instead of upstream's free `note`.
       {
         name: 'merges an approval into custom data for an approval suspension',
         approved: true,
-        resumeData: { note: 'hello' },
+        resumeData: { message: 'hello' },
         requiresApproval: true,
-        expectedResumeData: { approved: true, note: 'hello' },
+        expectedResumeData: { approved: true, message: 'hello' },
       },
       {
         name: 'keeps the decline decision authoritative when merging context into custom data',
         approved: false,
         declineContext: { reason: 'not allowed', approved: true } as { reason: string },
-        resumeData: { note: 'hello' },
+        resumeData: { message: 'hello' },
         requiresApproval: true,
-        expectedResumeData: { approved: false, reason: 'not allowed', note: 'hello' },
+        expectedResumeData: { approved: false, reason: 'not allowed', message: 'hello' },
       },
       {
         name: 'leaves custom data unchanged for an ordinary tool suspension',
