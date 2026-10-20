@@ -37,7 +37,6 @@ import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import {
   type CapturedRequest,
-  type EngineDifference,
   type EngineParityResults,
   type EngineRunResult,
   type ModelTape,
@@ -86,29 +85,6 @@ const VARIANT_TITLES: Record<Variant, string> = {
   transform: 'a tool-level transcript transform keeps the public result raw',
   'provider-metadata': "the model's tool-call providerMetadata reaches the tool-call chunk",
   'to-model-output': 'toModelOutput rewrites only the copy the model sees',
-};
-
-/**
- * COR-1390: durable and evented drop `providerMetadata` from the `tool-result`
- * chunk payload. The tool-call chunk carries the same metadata on all three
- * engines, so only the result chunk is declared here.
- */
-const RESULT_METADATA_DIFFERENCE: EngineDifference = {
-  reason:
-    'COR-1390: the `providerMetadata` plain puts on the `tool-result` chunk payload is dropped on durable and ' +
-    'evented; the tool-call chunk carries the same metadata on all three engines.',
-  expect: plain => ({
-    ...plain,
-    turns: plain.turns.map(turn => {
-      const index = turn.chunkTypes.indexOf('tool-result');
-      if (index === -1) return turn;
-      const chunkPayloads = [...turn.chunkPayloads];
-      const payload = { ...(chunkPayloads[index] as Record<string, unknown>) };
-      delete payload.providerMetadata;
-      chunkPayloads[index] = payload;
-      return { ...turn, chunkPayloads };
-    }),
-  }),
 };
 
 function toolResultCount(request: CapturedRequest): number {
