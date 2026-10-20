@@ -111,7 +111,17 @@ export interface HarnessAttachmentByteOwner {
    */
   readonly storageNamespace: string;
   save(input: HarnessAttachmentByteOwnerSaveInput): Promise<HarnessAttachmentByteOwnerSaveResult>;
+  /**
+   * Reads a stored object. A `blobRef` this owner would not derive for the
+   * input scope in its own `storageNamespace` must throw a conflict error. It
+   * must never read as `null`, which callers treat as a missing object.
+   */
   load(input: HarnessAttachmentByteOwnerLoadInput): Promise<Uint8Array | null>;
+  /**
+   * Removes a stored object. A `blobRef` this owner would not derive for the
+   * input scope in its own `storageNamespace` must throw a conflict error. It
+   * must never return `already_absent`, which settles cleanup.
+   */
   delete(input: HarnessAttachmentByteOwnerDeleteInput): Promise<HarnessAttachmentByteOwnerDeleteResult>;
   /**
    * Fences an upload operation before removing its deterministic object. A
@@ -177,9 +187,9 @@ export type InMemoryHarnessAttachmentObject = {
 export type InMemoryHarnessAttachmentByteOwnerOptions = Readonly<{
   providerId?: string;
   /**
-   * Overrides the declared storage namespace. It defaults to an identity
-   * derived from `providerId`, so two owners with different provider ids are
-   * independent namespaces.
+   * Overrides the declared storage namespace, which prefixes every derived
+   * reference. It defaults to an identity derived from `providerId`, so two
+   * owners with different provider ids are independent namespaces.
    */
   storageNamespace?: string;
   /** A deterministic store injection used by corruption contract tests. */
@@ -210,11 +220,12 @@ type NormalizedLoadInput = {
  * operation id, which lets a retry of the same durable operation be idempotent
  * while a new incarnation receives a different object identity. A successful
  * delete retires that reference for this adapter lifetime, preventing an
- * attachment from reusing an old object key after hard-delete.
+ * attachment from reusing an old object key after hard-delete. Every reference
+ * is derived under `storageNamespace`, so load, delete and cancel reject a
+ * reference from any other namespace as a conflict.
  */
 export class InMemoryHarnessAttachmentByteOwner implements HarnessAttachmentByteOwner {
   readonly storageNamespace: string;
-  readonly #providerId: string;
   readonly #objects: Map<string, InMemoryHarnessAttachmentObject>;
   readonly #retiredBlobRefs = new Set<string>();
   readonly #cancelledOperations = new Set<string>();
@@ -224,7 +235,6 @@ export class InMemoryHarnessAttachmentByteOwner implements HarnessAttachmentByte
     // The id is URI-encoded into every derived blob reference, so it must
     // satisfy the same encoded-component bound as the owner scope fields.
     assertScopeComponent(providerId, 'providerId');
-    this.#providerId = providerId;
     const storageNamespace = options.storageNamespace ?? 'memory://' + encodeSegment(providerId);
     assertHarnessAttachmentStorageNamespace(storageNamespace);
     this.storageNamespace = storageNamespace;
@@ -357,8 +367,7 @@ export class InMemoryHarnessAttachmentByteOwner implements HarnessAttachmentByte
 
   #blobRef(owner: HarnessAttachmentOwnerScope): string {
     return [
-      'memory://',
-      encodeSegment(this.#providerId),
+      this.storageNamespace,
       '/harness-attachments/',
       encodeSegment(owner.harnessName),
       '/',

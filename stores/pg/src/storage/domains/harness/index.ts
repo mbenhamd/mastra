@@ -4520,6 +4520,11 @@ export class HarnessPG extends HarnessStorage {
     const limit = Number.isSafeInteger(requestedLimit) ? Math.max(1, Math.min(100, requestedLimit)) : 25;
     const namespace = this.#resolveHarnessName(options.harnessName);
     const now = options.now ?? Date.now();
+    // PUTs bound to another storage namespace, or to none, are never selected:
+    // this owner may not settle them, and selecting them oldest-first would
+    // spend the whole limit on rows that can only be refused. They still
+    // count as pending below and keep fencing session deletion.
+    const ownerNamespace = this.#attachmentByteOwner?.storageNamespace;
     let processed = 0;
     for (;;) {
       if (processed >= limit) break;
@@ -4533,6 +4538,7 @@ export class HarnessPG extends HarnessStorage {
                   OR (status = ? AND claim_expires_at <= ?)
                 )
                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                AND (kind <> ? OR storage_namespace = ?)
               ORDER BY created_at ASC, id ASC
               LIMIT 1`,
         args: [
@@ -4548,6 +4554,8 @@ export class HarnessPG extends HarnessStorage {
           'claimed',
           now,
           now,
+          'put',
+          typeof ownerNamespace === 'string' ? ownerNamespace : null,
         ],
       });
       const operationId = candidate.rows[0]?.id;
@@ -5005,11 +5013,14 @@ export class HarnessPG extends HarnessStorage {
     code: 'cancel_unknown' | 'storage_namespace_unqualified' | 'storage_namespace_mismatch' = 'cancel_unknown',
   ): Promise<void> {
     const now = Date.now();
+    // A namespace refusal cannot resolve until another owner is configured,
+    // so it backs off for the abandonment window instead of re-driving.
+    const delay = code === 'cancel_unknown' ? 1_000 : HARNESS_ATTACHMENT_PUT_ABANDONMENT_DELAY_MS;
     await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_ATTACHMENT_OPERATIONS}
             SET claim_expires_at = ?, next_attempt_at = ?, updated_at = ?, last_error = ?
             WHERE id = ? AND claim_id = ? AND status = ?`,
-      args: [now + 1_000, now + 1_000, now, JSON.stringify({ code }), operationId, claimId, 'claimed'],
+      args: [now + delay, now + delay, now, JSON.stringify({ code }), operationId, claimId, 'claimed'],
     });
   }
 
@@ -5020,7 +5031,9 @@ export class HarnessPG extends HarnessStorage {
     const { claimId } = claim;
     const owner = this.#requireAttachmentByteOwner(claim.operation.sessionId, claim.operation.attachmentId);
     // Every byte-owner call below, cancel or load, must address the namespace
-    // the PUT was bound to. Refuse before any owner I/O otherwise.
+    // the PUT was bound to. The sweep does not select other rows, so this
+    // guards a row whose binding no longer matches by the time it is claimed:
+    // refuse before any owner I/O.
     const boundNamespace = claim.operation.storageNamespace;
     if (boundNamespace === undefined) {
       await this.#deferAttachmentCancelClaim(operationId, claimId, 'storage_namespace_unqualified');

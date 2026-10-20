@@ -251,6 +251,29 @@ describe('InMemoryHarnessAttachmentByteOwner', () => {
     await expect(original.save(input)).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
   });
 
+  it('rejects a reference from another namespace on load and delete instead of reading it as absent', async () => {
+    const original = new InMemoryHarnessAttachmentByteOwner({ storageNamespace: 'r2://endpoint-a/bucket' });
+    // Same provider id, different namespace: references must still differ.
+    const replacement = new InMemoryHarnessAttachmentByteOwner({ storageNamespace: 'r2://endpoint-b/bucket' });
+    const input = makeSaveInput({ storageNamespace: original.storageNamespace });
+    const stored = await original.save(input);
+    if (stored.outcome === 'unknown') throw new Error('in-memory owner must resolve a save outcome');
+    expect(stored.blobRef.startsWith(original.storageNamespace + '/')).toBe(true);
+
+    await expect(replacement.load(makeLoadInput({ blobRef: stored.blobRef }))).rejects.toBeInstanceOf(
+      HarnessAttachmentByteOwnerConflictError,
+    );
+    await expect(
+      replacement.delete({
+        blobRef: stored.blobRef,
+        owner: input.owner,
+        expectedBytes: input.expectedBytes,
+        expectedSha256: input.expectedSha256,
+      }),
+    ).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
+    await expect(original.load(makeLoadInput({ blobRef: stored.blobRef }))).resolves.not.toBeNull();
+  });
+
   it('rejects an unusable declared storage namespace', () => {
     expect(() => new InMemoryHarnessAttachmentByteOwner({ storageNamespace: '' })).toThrow(
       HarnessAttachmentByteOwnerInvalidInputError,
