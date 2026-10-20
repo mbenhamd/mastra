@@ -151,7 +151,14 @@ async function measureRun(engine: 'default' | 'evented', toolIterations: number)
   // Every mutating path re-serializes the whole snapshot (libsql rewrites the
   // whole `snapshot` column), so wrapping only `persistWorkflowSnapshot` would
   // badly undercount evented; wrap all three and record the row size after each.
-  for (const method of ['persistWorkflowSnapshot', 'updateWorkflowResults', 'updateWorkflowState'] as const) {
+  // PF-5928 adaptation (fork PF-4389/PF-2056): the default engine writes running checkpoints
+  // through the fenced persistWorkflowStepUpdate, so it is wrapped too.
+  for (const method of [
+    'persistWorkflowSnapshot',
+    'persistWorkflowStepUpdate',
+    'updateWorkflowResults',
+    'updateWorkflowState',
+  ] as const) {
     const original = workflowsStore[method].bind(workflowsStore);
     workflowsStore[method] = async (args: any) => {
       const result = await original(args);

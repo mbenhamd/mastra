@@ -87,11 +87,15 @@ describe('durable agent running snapshots (issue #26462)', () => {
 
     const workflowsStore: any = await mastra.getStorage()!.getStore('workflows');
     const runningSnapshots: string[] = [];
-    const originalPersist = workflowsStore.persistWorkflowSnapshot.bind(workflowsStore);
-    vi.spyOn(workflowsStore, 'persistWorkflowSnapshot').mockImplementation(async (args: any) => {
-      if (args.snapshot?.status === 'running') runningSnapshots.push(JSON.stringify(args.snapshot));
-      return originalPersist(args);
-    });
+    // PF-5928 adaptation (fork PF-4389/PF-2056): running checkpoints are written through the fenced
+    // persistWorkflowStepUpdate, so inspect its snapshot too.
+    for (const method of ['persistWorkflowSnapshot', 'persistWorkflowStepUpdate'] as const) {
+      const original = workflowsStore[method].bind(workflowsStore);
+      vi.spyOn(workflowsStore, method).mockImplementation(async (args: any) => {
+        if (args.snapshot?.status === 'running') runningSnapshots.push(JSON.stringify(args.snapshot));
+        return original(args);
+      });
+    }
     // Terminal cleanup deletes the run's snapshot rows only after every engine
     // persist for the run, so it marks the point where no more writes can come.
     const deletedRunIds = new Set<string>();
