@@ -117,19 +117,31 @@ describe("toolCallConcurrency strategy: 'called' across resume (#24581)", () => 
     }
     expect(suspended).toHaveLength(3);
 
-    const resumed = await agent.resumeStream({ answer: 'yes' }, { runId: stream.runId, toolCallConcurrency });
-    const resuspended: string[] = [];
-    for await (const chunk of resumed.fullStream) {
-      if (chunk.type === 'tool-call-suspended') resuspended.push(chunk.payload.toolCallId);
-    }
-    expect(resuspended).toHaveLength(1);
-    expect(tracker.resumed).toBe(2);
-    expect(tracker.peak).toBe(2);
+    // PF-5928 adaptation (fork PF-1875, coordinator waiver): a resume of a run with several
+    // suspended calls must name the exact toolCallId, so upstream's id-less batch resume (and its
+    // `peak === 2` sibling concurrency) is refused. Concurrent batch resume is a known difference;
+    // each sibling is resumed by its toolCallId to completion instead.
+    await expect(
+      agent.resumeStream({ answer: 'yes' }, { runId: stream.runId, toolCallConcurrency }),
+    ).rejects.toMatchObject({ id: 'AGENT_RESUME_AMBIGUOUS_TOOL_CALL' });
+    expect(tracker.resumed).toBe(0);
 
-    const resumedAgain = await agent.resumeStream({ answer: 'yes' }, { runId: stream.runId, toolCallConcurrency });
-    for await (const _ of resumedAgain.fullStream) {
-      /* drain */
-    }
+    const resumeCall = async (toolCallId: string) => {
+      const resumed = await agent.resumeStream(
+        { answer: 'yes' },
+        { runId: stream.runId, toolCallId, toolCallConcurrency },
+      );
+      const resuspended: string[] = [];
+      for await (const chunk of resumed.fullStream) {
+        if (chunk.type === 'tool-call-suspended') resuspended.push(chunk.payload.toolCallId);
+      }
+      return resuspended;
+    };
+    // ask-1 asks a follow-up question once, then completes on its second resume.
+    expect(await resumeCall('call-0')).toContain('call-0');
+    expect(await resumeCall('call-0')).not.toContain('call-0');
+    await resumeCall('call-1');
+    await resumeCall('call-2');
 
     expect(tracker.resumed).toBe(3);
   });
