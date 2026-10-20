@@ -7,6 +7,8 @@ const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/u;
 const MAX_SCOPE_COMPONENT_LENGTH = 512;
 const MAX_OPERATION_ID_LENGTH = 256;
 const MAX_MIME_TYPE_LENGTH = 256;
+const MAX_STORAGE_NAMESPACE_LENGTH = 1024;
+const MAX_BLOB_REF_LENGTH = MAX_SCOPE_COMPONENT_LENGTH * 8;
 
 /** Native Harness attachment read/write cap used by adapters without a tighter limit. */
 export const DEFAULT_HARNESS_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024;
@@ -28,6 +30,11 @@ export type HarnessAttachmentOwnerScope = Readonly<{
 export type HarnessAttachmentByteOwnerSaveInput = Readonly<{
   owner: HarnessAttachmentOwnerScope;
   operationId: string;
+  /**
+   * The storage namespace the native ledger bound to this operation before
+   * the write. The owner must refuse to write into any other namespace.
+   */
+  storageNamespace: string;
   data: Uint8Array;
   expectedBytes: number;
   expectedSha256: string;
@@ -72,6 +79,18 @@ export type HarnessAttachmentByteOwnerCancelInput = Readonly<{
   operationId: string;
   expectedBytes: number;
   expectedSha256: string;
+  /**
+   * The storage namespace the native ledger durably bound to the operation
+   * before any byte write. An owner whose own namespace differs must refuse
+   * the cancellation instead of fencing or reporting another namespace.
+   */
+  storageNamespace: string;
+  /**
+   * The reference the native ledger recorded for the operation, when the PUT
+   * returned one. Absent for a crash-left operation whose PUT never reported a
+   * reference. An owner must refuse a reference it would not derive itself.
+   */
+  blobRef?: string;
 }>;
 
 export type HarnessAttachmentByteOwnerCancelResult = HarnessAttachmentByteOwnerDeleteResult;
@@ -82,14 +101,35 @@ export type HarnessAttachmentByteOwnerCancelResult = HarnessAttachmentByteOwnerD
  * durable fence and passes the resulting identity to this boundary.
  */
 export interface HarnessAttachmentByteOwner {
+  /**
+   * A stable, non-secret identity of the physical byte namespace this owner
+   * writes to, for example an endpoint plus bucket identity. It must stay the
+   * same across process restarts for the same namespace and differ between
+   * independent namespaces. The native ledger binds it to every upload
+   * operation before bytes are written, and refuses to cancel or reconcile
+   * an operation through an owner that declares a different namespace.
+   */
+  readonly storageNamespace: string;
   save(input: HarnessAttachmentByteOwnerSaveInput): Promise<HarnessAttachmentByteOwnerSaveResult>;
+  /**
+   * Reads a stored object. A `blobRef` this owner would not derive for the
+   * input scope in its own `storageNamespace` must throw a conflict error. It
+   * must never read as `null`, which callers treat as a missing object.
+   */
   load(input: HarnessAttachmentByteOwnerLoadInput): Promise<Uint8Array | null>;
+  /**
+   * Removes a stored object. A `blobRef` this owner would not derive for the
+   * input scope in its own `storageNamespace` must throw a conflict error. It
+   * must never return `already_absent`, which settles cleanup.
+   */
   delete(input: HarnessAttachmentByteOwnerDeleteInput): Promise<HarnessAttachmentByteOwnerDeleteResult>;
   /**
    * Fences an upload operation before removing its deterministic object. A
-   * native reconciler uses this when a PUT has no committed metadata row; the
+   * native reconciler uses this when a PUT has no committed metadata row. The
    * owner must reject a later save for the same scope and operation id before
-   * it can publish bytes.
+   * it can publish bytes. It must throw, or return `unknown`, when the input's
+   * `storageNamespace` is not its own or its `blobRef` is not the reference it
+   * derives: `already_absent` is only valid for the bound namespace.
    */
   cancel(input: HarnessAttachmentByteOwnerCancelInput): Promise<HarnessAttachmentByteOwnerCancelResult>;
 }
@@ -146,6 +186,12 @@ export type InMemoryHarnessAttachmentObject = {
 
 export type InMemoryHarnessAttachmentByteOwnerOptions = Readonly<{
   providerId?: string;
+  /**
+   * Overrides the declared storage namespace, which prefixes every derived
+   * reference. It defaults to an identity derived from `providerId`, so two
+   * owners with different provider ids are independent namespaces.
+   */
+  storageNamespace?: string;
   /** A deterministic store injection used by corruption contract tests. */
   objects?: Map<string, InMemoryHarnessAttachmentObject>;
 }>;
@@ -153,6 +199,7 @@ export type InMemoryHarnessAttachmentByteOwnerOptions = Readonly<{
 type NormalizedSaveInput = {
   owner: HarnessAttachmentOwnerScope;
   operationId: string;
+  storageNamespace: string;
   data: Uint8Array;
   expectedBytes: number;
   expectedSha256: string;
@@ -173,10 +220,12 @@ type NormalizedLoadInput = {
  * operation id, which lets a retry of the same durable operation be idempotent
  * while a new incarnation receives a different object identity. A successful
  * delete retires that reference for this adapter lifetime, preventing an
- * attachment from reusing an old object key after hard-delete.
+ * attachment from reusing an old object key after hard-delete. Every reference
+ * is derived under `storageNamespace`, so load, delete and cancel reject a
+ * reference from any other namespace as a conflict.
  */
 export class InMemoryHarnessAttachmentByteOwner implements HarnessAttachmentByteOwner {
-  readonly #providerId: string;
+  readonly storageNamespace: string;
   readonly #objects: Map<string, InMemoryHarnessAttachmentObject>;
   readonly #retiredBlobRefs = new Set<string>();
   readonly #cancelledOperations = new Set<string>();
@@ -186,12 +235,15 @@ export class InMemoryHarnessAttachmentByteOwner implements HarnessAttachmentByte
     // The id is URI-encoded into every derived blob reference, so it must
     // satisfy the same encoded-component bound as the owner scope fields.
     assertScopeComponent(providerId, 'providerId');
-    this.#providerId = providerId;
+    const storageNamespace = options.storageNamespace ?? 'memory://' + encodeSegment(providerId);
+    assertHarnessAttachmentStorageNamespace(storageNamespace);
+    this.storageNamespace = storageNamespace;
     this.#objects = options.objects ?? new Map();
   }
 
   async save(input: HarnessAttachmentByteOwnerSaveInput): Promise<HarnessAttachmentByteOwnerSaveResult> {
     const normalized = normalizeSaveInput(input);
+    this.#assertOwnNamespace(normalized.storageNamespace);
     const blobRef = this.#blobRef(normalized.owner);
     const operationKey = this.#operationKey(normalized.owner, normalized.operationId);
     if (this.#cancelledOperations.has(operationKey)) {
@@ -276,7 +328,13 @@ export class InMemoryHarnessAttachmentByteOwner implements HarnessAttachmentByte
 
   async cancel(input: HarnessAttachmentByteOwnerCancelInput): Promise<HarnessAttachmentByteOwnerCancelResult> {
     const normalized = normalizeCancelInput(input);
+    // A cancellation bound to another namespace must never fence or report
+    // this one: the uncertain PUT may still exist where it was bound.
+    this.#assertOwnNamespace(normalized.storageNamespace);
     const blobRef = this.#blobRef(normalized.owner);
+    if (normalized.blobRef !== undefined && normalized.blobRef !== blobRef) {
+      throw new HarnessAttachmentByteOwnerConflictError();
+    }
     const operationKey = this.#operationKey(normalized.owner, normalized.operationId);
     if (this.#cancelledOperations.has(operationKey)) {
       return { outcome: 'already_absent' };
@@ -301,10 +359,15 @@ export class InMemoryHarnessAttachmentByteOwner implements HarnessAttachmentByte
     return { outcome: 'already_absent' };
   }
 
+  #assertOwnNamespace(storageNamespace: string): void {
+    if (storageNamespace !== this.storageNamespace) {
+      throw new HarnessAttachmentByteOwnerConflictError();
+    }
+  }
+
   #blobRef(owner: HarnessAttachmentOwnerScope): string {
     return [
-      'memory://',
-      encodeSegment(this.#providerId),
+      this.storageNamespace,
       '/harness-attachments/',
       encodeSegment(owner.harnessName),
       '/',
@@ -325,6 +388,7 @@ function normalizeSaveInput(input: HarnessAttachmentByteOwnerSaveInput): Normali
   assertObject(input, 'input');
   const owner = normalizeOwner(input.owner);
   assertSafeText(input.operationId, 'operationId', MAX_OPERATION_ID_LENGTH);
+  assertSafeText(input.storageNamespace, 'storageNamespace', MAX_STORAGE_NAMESPACE_LENGTH);
   assertSafeText(input.mimeType, 'mimeType', MAX_MIME_TYPE_LENGTH);
   assertByteCount(input.expectedBytes, 'expectedBytes');
   if (!(input.data instanceof Uint8Array)) {
@@ -340,6 +404,7 @@ function normalizeSaveInput(input: HarnessAttachmentByteOwnerSaveInput): Normali
   return {
     owner,
     operationId: input.operationId,
+    storageNamespace: input.storageNamespace,
     data: input.data,
     expectedBytes: input.expectedBytes,
     expectedSha256,
@@ -349,7 +414,7 @@ function normalizeSaveInput(input: HarnessAttachmentByteOwnerSaveInput): Normali
 
 function normalizeLoadInput(input: HarnessAttachmentByteOwnerLoadInput): NormalizedLoadInput {
   assertObject(input, 'input');
-  assertSafeText(input.blobRef, 'blobRef', MAX_SCOPE_COMPONENT_LENGTH * 8);
+  assertSafeText(input.blobRef, 'blobRef', MAX_BLOB_REF_LENGTH);
   const owner = normalizeOwner(input.owner);
   assertByteCount(input.expectedBytes, 'expectedBytes');
   assertByteCount(input.maxBytes, 'maxBytes');
@@ -364,7 +429,7 @@ function normalizeLoadInput(input: HarnessAttachmentByteOwnerLoadInput): Normali
 
 function normalizeDeleteInput(input: HarnessAttachmentByteOwnerDeleteInput): NormalizedLoadInput {
   assertObject(input, 'input');
-  assertSafeText(input.blobRef, 'blobRef', MAX_SCOPE_COMPONENT_LENGTH * 8);
+  assertSafeText(input.blobRef, 'blobRef', MAX_BLOB_REF_LENGTH);
   const owner = normalizeOwner(input.owner);
   assertByteCount(input.expectedBytes, 'expectedBytes');
   return {
@@ -381,17 +446,32 @@ function normalizeCancelInput(input: HarnessAttachmentByteOwnerCancelInput): {
   operationId: string;
   expectedBytes: number;
   expectedSha256: string;
+  storageNamespace: string;
+  blobRef?: string;
 } {
   assertObject(input, 'input');
   const owner = normalizeOwner(input.owner);
   assertSafeText(input.operationId, 'operationId', MAX_OPERATION_ID_LENGTH);
   assertByteCount(input.expectedBytes, 'expectedBytes');
+  assertSafeText(input.storageNamespace, 'storageNamespace', MAX_STORAGE_NAMESPACE_LENGTH);
+  if (input.blobRef !== undefined) assertSafeText(input.blobRef, 'blobRef', MAX_BLOB_REF_LENGTH);
   return {
     owner,
     operationId: input.operationId,
     expectedBytes: input.expectedBytes,
     expectedSha256: normalizeSha256(input.expectedSha256),
+    storageNamespace: input.storageNamespace,
+    blobRef: input.blobRef,
   };
+}
+
+/**
+ * Validates a byte owner's declared storage namespace. Native storage adapters
+ * call this before binding the namespace to a durable upload operation, so an
+ * owner without a usable identity fails before any bytes can be written.
+ */
+export function assertHarnessAttachmentStorageNamespace(value: unknown): asserts value is string {
+  assertSafeText(value, 'storageNamespace', MAX_STORAGE_NAMESPACE_LENGTH);
 }
 
 /**
