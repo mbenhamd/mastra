@@ -122,13 +122,22 @@ describe('DurableAgent concurrent runs', () => {
     const rows = new Map<string, SnapshotRow>();
     const innerPending = new Map<string, SnapshotRow>();
     const atInnerPending = new Map<string, SnapshotRow[]>();
-    const persist = original.workflows.persistWorkflowSnapshot.bind(original.workflows);
-    original.workflows.persistWorkflowSnapshot = async args => {
-      const copy = structuredClone(args) as SnapshotRow;
+    // PF-5928 adaptation (fork PF-4389/PF-2056 fenced step updates): the outer row's input is
+    // written by persistWorkflowStepUpdate, so record the stored row after every workflow write.
+    const record = async (args: { workflowName: string; runId: string }) => {
+      const run = await original.workflows.getWorkflowRunById({ runId: args.runId, workflowName: args.workflowName });
+      if (!run) return;
+      const snapshot = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
+      const copy = structuredClone({
+        workflowName: args.workflowName,
+        runId: args.runId,
+        resourceId: run.resourceId,
+        snapshot,
+      }) as SnapshotRow;
       rows.set(`${args.workflowName}:${args.runId}`, copy);
       if (
         args.workflowName === DurableStepIds.AGENTIC_EXECUTION &&
-        args.snapshot.status === 'pending' &&
+        copy.snapshot.status === 'pending' &&
         !innerPending.has(args.runId)
       ) {
         innerPending.set(args.runId, copy);
@@ -137,8 +146,16 @@ describe('DurableAgent concurrent runs', () => {
           [...rows.values()].filter(row => row.runId === args.runId).map(row => structuredClone(row)),
         );
       }
-      return persist(args);
     };
+    for (const method of ['persistWorkflowSnapshot', 'persistWorkflowStepUpdate'] as const) {
+      const target = original.workflows as any;
+      const write = target[method].bind(target);
+      target[method] = async (args: any) => {
+        const result = await write(args);
+        await record(args);
+        return result;
+      };
+    }
 
     const runIds = await Promise.all(
       LETTERS.map(async letter => {
@@ -155,17 +172,26 @@ describe('DurableAgent concurrent runs', () => {
       perRun(letter => [letter]),
     );
 
+    // PF-5928 adaptation (PF-1875 option a, standing decision): a fresh process refuses to
+    // cold-recover a run whose agent has request-local processor state (memory processors), so the
+    // crash-time rows are checked for isolation directly: each run's rows carry only its own
+    // conversation, and recovery runs nothing.
     for (const letter of LETTERS) {
+      const rowsAtCrash = atInnerPending.get(runIdOf(letter))!;
+      expect(
+        rowsAtCrash
+          .map(row => secretsIn(row.snapshot))
+          .flat()
+          .filter(found => found !== letter),
+      ).toEqual([]);
       const recovering = await startProcess();
-      for (const row of atInnerPending.get(runIdOf(letter))!) {
+      for (const row of rowsAtCrash) {
         await recovering.workflows.persistWorkflowSnapshot(row);
       }
-      expect(await collectText(await recovering.durableAgent.recover(runIdOf(letter)))).toBe('done');
-      expect(recovering.prompts.map(prompt => secretsIn(prompt))).toEqual([[letter], [letter]]);
-      for (const other of LETTERS) {
-        const saved = await recovering.memory.recall({ threadId: `thread-${other}`, resourceId: `resource-${other}` });
-        expect(secretsIn(saved.messages)).toEqual(other === letter ? [letter] : []);
-      }
+      await expect(recovering.durableAgent.recover(runIdOf(letter))).rejects.toMatchObject({
+        id: 'DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE',
+      });
+      expect(recovering.prompts).toHaveLength(0);
     }
   }, 30_000);
 });
