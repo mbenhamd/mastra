@@ -2,6 +2,7 @@ import { describe, it, beforeEach, expect, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { z } from 'zod/v4';
 import type { MessageList } from '../../../agent/message-list';
+import { createToolCallIdentityDigest } from '../../../agent/tool-call-identity';
 import { RequestContext } from '../../../request-context';
 import { createTool } from '../../../tools';
 import { ToolStream } from '../../../tools/stream';
@@ -132,10 +133,25 @@ describe('createToolCallStep beforeApproval hook (#26772)', () => {
     const beforeApproval = vi.fn().mockReturnValue({ proceed: false, output: 'rejected' });
     const step = makeStep({ execute, requireApproval: true, beforeApproval });
 
+    // PF-5928 adaptation (fork L23, PF-1703/PF-4112): a bare `{ approved: true }` is only a resume
+    // when the suspension carries the authoritative approval record for this exact call, which the
+    // fork's approval suspension writes; the fixture includes it.
     const result = await step.execute(
       makeExecuteParams(suspend, {
         resumeData: { approved: true },
-        suspendData: { requireToolApproval: { ...inputData } },
+        suspendData: {
+          requireToolApproval: { ...inputData },
+          toolCallResume: {
+            version: 1,
+            originRunId: 'refund-run',
+            stepId: 'toolCallStep',
+            type: 'approval',
+            approvalSource: 'tool-execution',
+            toolCallId: inputData.toolCallId,
+            toolName: inputData.toolName,
+            identityDigest: createToolCallIdentityDigest(inputData),
+          },
+        },
       }),
     );
 
