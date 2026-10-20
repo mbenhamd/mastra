@@ -65,6 +65,8 @@ import type {
   FinalizeWorkflowResumeResult,
   PersistWorkflowStepUpdateInput,
   PersistWorkflowStepUpdateResult,
+  DeleteWorkflowRunIfGenerationInput,
+  DeleteWorkflowRunIfGenerationResult,
   PersistWorkflowTerminalRecoveryAncestryInput,
   PersistWorkflowTerminalRecoveryAncestryResult,
   GetWorkflowTerminalRecoveryAncestryResult,
@@ -730,7 +732,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
-    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1, retainedCancelRequestVersion: 1 };
+    return {
+      atomicResumeVersion: 1,
+      fencedStepUpdateVersion: 1,
+      retainedCancelRequestVersion: 1,
+      generationDeleteVersion: 1,
+    };
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
@@ -981,6 +988,24 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     return this.applyWorkflowResumeMutation(workflowName, runId, undefined, snapshot =>
       consumeWorkflowResumeResultRecord(snapshot, frozenInput, Date.now(), cloneRunData),
     ) as ConsumeWorkflowResumeResult;
+  }
+
+  async deleteWorkflowRunIfGeneration({
+    workflowName,
+    runId,
+    expectedExecutionGeneration,
+  }: DeleteWorkflowRunIfGenerationInput): Promise<DeleteWorkflowRunIfGenerationResult> {
+    // Read, compare and delete without yielding, so no claim can land between them.
+    const key = this.getWorkflowKey(workflowName, runId);
+    const run = this.db.workflows.get(key);
+    if (!run) return { status: 'missing' };
+    const snapshot = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
+    const currentExecutionGeneration = snapshot?.executionGeneration;
+    if (currentExecutionGeneration !== undefined && currentExecutionGeneration !== expectedExecutionGeneration) {
+      return { status: 'stale' };
+    }
+    if (this.deleteWorkflowRunRecord(workflowName, runId)) this.bumpParentRevision(key);
+    return { status: 'deleted' };
   }
 
   async persistWorkflowStepUpdate(input: PersistWorkflowStepUpdateInput): Promise<PersistWorkflowStepUpdateResult> {

@@ -48,6 +48,7 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
     skipped: 'run-skipped',
     missing: 'run-missing',
     deleted: 'run-deleted-stale-step',
+    generationDelete: 'run-generation-conditional-delete',
   };
   const admissionFor = (runId: string): AdmitWorkflowResumeInput => ({
     workflowName: options.workflowName,
@@ -344,6 +345,33 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
         snapshot: { ...suspendedSnapshot(runIds.skipped, resourceId), status: 'running' },
       }),
     ).resolves.toEqual({ status: 'finalized', disposition: 'skipped' });
+
+    // PF-5928: deferred cleanup deletes only its own generation's row, atomically.
+    if (options.primary.getWorkflowResumeCapabilities().generationDeleteVersion === 1) {
+      const generationDelete = { workflowName: options.workflowName, runId: runIds.generationDelete };
+      await options.primary.persistWorkflowSnapshot({
+        ...generationDelete,
+        resourceId,
+        snapshot: {
+          ...suspendedSnapshot(runIds.generationDelete, resourceId),
+          status: 'running',
+          executionGeneration: 'wfeg:newer',
+        },
+      });
+      await expect(
+        secondary.deleteWorkflowRunIfGeneration({ ...generationDelete, expectedExecutionGeneration: 'wfeg:older' }),
+      ).resolves.toEqual({ status: 'stale' });
+      expect(await options.primary.loadWorkflowSnapshot(generationDelete)).toMatchObject({
+        executionGeneration: 'wfeg:newer',
+      });
+      await expect(
+        secondary.deleteWorkflowRunIfGeneration({ ...generationDelete, expectedExecutionGeneration: 'wfeg:newer' }),
+      ).resolves.toEqual({ status: 'deleted' });
+      expect(await options.primary.loadWorkflowSnapshot(generationDelete)).toBeNull();
+      await expect(
+        secondary.deleteWorkflowRunIfGeneration({ ...generationDelete, expectedExecutionGeneration: 'wfeg:newer' }),
+      ).resolves.toEqual({ status: 'missing' });
+    }
   } finally {
     await Promise.all(
       Object.values(runIds).map(runId =>

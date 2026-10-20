@@ -48,6 +48,8 @@ import type {
   ConsumeWorkflowResumeResultInput,
   PersistWorkflowStepUpdateInput,
   PersistWorkflowStepUpdateResult,
+  DeleteWorkflowRunIfGenerationInput,
+  DeleteWorkflowRunIfGenerationResult,
   FinalizeWorkflowResumeInput,
   FinalizeWorkflowResumeResult,
   RollbackWorkflowResumeInput,
@@ -200,6 +202,13 @@ export abstract class WorkflowsStorage extends StorageDomain {
   }
 
   async consumeWorkflowResumeResult(_input: ConsumeWorkflowResumeResultInput): Promise<ConsumeWorkflowResumeResult> {
+    return { status: 'unsupported' };
+  }
+
+  /** Adapters implementing this advertise `generationDeleteVersion: 1`. */
+  async deleteWorkflowRunIfGeneration(
+    _input: DeleteWorkflowRunIfGenerationInput,
+  ): Promise<DeleteWorkflowRunIfGenerationResult> {
     return { status: 'unsupported' };
   }
 

@@ -16,6 +16,8 @@ import type {
   FinalizeWorkflowResumeResult,
   PersistWorkflowStepUpdateInput,
   PersistWorkflowStepUpdateResult,
+  DeleteWorkflowRunIfGenerationInput,
+  DeleteWorkflowRunIfGenerationResult,
   RollbackWorkflowResumeInput,
   RollbackWorkflowResumeResult,
   WorkflowResumeCapabilities,
@@ -115,7 +117,12 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
   }
 
   getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
-    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1, retainedCancelRequestVersion: 1 };
+    return {
+      atomicResumeVersion: 1,
+      fencedStepUpdateVersion: 1,
+      retainedCancelRequestVersion: 1,
+      generationDeleteVersion: 1,
+    };
   }
 
   private materializeResumeSnapshot(snapshot: WorkflowRunState): WorkflowRunState {
@@ -783,6 +790,42 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
         );
       }
     }, 'deleteWorkflowRunById');
+  }
+
+  async deleteWorkflowRunIfGeneration({
+    workflowName,
+    runId,
+    expectedExecutionGeneration,
+  }: DeleteWorkflowRunIfGenerationInput): Promise<DeleteWorkflowRunIfGenerationResult> {
+    return this.executeWithRetry(async () => {
+      try {
+        // One statement: the generation compare and the delete cannot be split by a claim.
+        const deleted = await withClientWriteLock(this.#client, () =>
+          this.#client.execute({
+            sql: `DELETE FROM ${TABLE_WORKFLOW_SNAPSHOT} WHERE workflow_name = ? AND run_id = ?
+                  AND (json_type(snapshot, '$.executionGeneration') IS NULL
+                       OR json_extract(snapshot, '$.executionGeneration') = ?)`,
+            args: [workflowName, runId, expectedExecutionGeneration],
+          }),
+        );
+        if (deleted.rowsAffected > 0) return { status: 'deleted' as const };
+        const remaining = await this.#client.execute({
+          sql: `SELECT 1 FROM ${TABLE_WORKFLOW_SNAPSHOT} WHERE workflow_name = ? AND run_id = ?`,
+          args: [workflowName, runId],
+        });
+        return { status: remaining.rows.length > 0 ? ('stale' as const) : ('missing' as const) };
+      } catch (error) {
+        throw new MastraError(
+          {
+            id: createStorageErrorId('LIBSQL', 'DELETE_WORKFLOW_RUN_IF_GENERATION', 'FAILED'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.THIRD_PARTY,
+            details: { runId, workflowName },
+          },
+          error,
+        );
+      }
+    }, 'deleteWorkflowRunIfGeneration');
   }
 
   async listWorkflowRuns({

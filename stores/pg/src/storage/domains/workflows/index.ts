@@ -141,6 +141,8 @@ import type {
   FinalizeWorkflowResumeResult,
   PersistWorkflowStepUpdateInput,
   PersistWorkflowStepUpdateResult,
+  DeleteWorkflowRunIfGenerationInput,
+  DeleteWorkflowRunIfGenerationResult,
   PersistWorkflowTerminalRecoveryAncestryInput,
   PersistWorkflowTerminalRecoveryAncestryResult,
   GetWorkflowTerminalRecoveryAncestryResult,
@@ -526,7 +528,12 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   getWorkflowResumeCapabilities(): WorkflowResumeCapabilities {
-    return { atomicResumeVersion: 1, fencedStepUpdateVersion: 1, retainedCancelRequestVersion: 1 };
+    return {
+      atomicResumeVersion: 1,
+      fencedStepUpdateVersion: 1,
+      retainedCancelRequestVersion: 1,
+      generationDeleteVersion: 1,
+    };
   }
 
   getWorkflowSnapshotHandoffCapabilities(): WorkflowSnapshotHandoffCapabilities {
@@ -7239,6 +7246,51 @@ export class WorkflowsPG extends WorkflowsStorage {
     if ((result.rowCount ?? 0) === 0) return false;
     await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
     return true;
+  }
+
+  async deleteWorkflowRunIfGeneration({
+    workflowName,
+    runId,
+    expectedExecutionGeneration,
+  }: DeleteWorkflowRunIfGenerationInput): Promise<DeleteWorkflowRunIfGenerationResult> {
+    try {
+      return await this.#db.client.tx(async t => {
+        // Same lock order as deleteWorkflowRunById; the row lock holds the
+        // generation compare and the delete together against a claim.
+        const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
+        const row = await t.oneOrNone<{ snapshot: unknown }>(
+          `SELECT snapshot FROM ${this.workflowSnapshotTableName()}
+           WHERE workflow_name = $1 AND run_id = $2 FOR UPDATE`,
+          [workflowName, runId],
+        );
+        if (!row) return { status: 'missing' as const };
+        const snapshot = typeof row.snapshot === 'string' ? JSON.parse(row.snapshot) : row.snapshot;
+        const currentExecutionGeneration = (snapshot as { executionGeneration?: unknown } | null)?.executionGeneration;
+        if (currentExecutionGeneration !== undefined && currentExecutionGeneration !== expectedExecutionGeneration) {
+          return { status: 'stale' as const };
+        }
+        await this.assertWorkflowSnapshotHandoffAvailable(t, workflowName, runId);
+        return (await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision))
+          ? { status: 'deleted' as const }
+          : { status: 'missing' as const };
+      });
+    } catch (error) {
+      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+        throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('PG', 'DELETE_WORKFLOW_RUN_IF_GENERATION', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            persistenceFailure: classifyPgPersistenceFailure(error, { write: true }),
+            runId,
+            workflowName,
+          },
+        },
+        error,
+      );
+    }
   }
 
   async deleteWorkflowRunById({

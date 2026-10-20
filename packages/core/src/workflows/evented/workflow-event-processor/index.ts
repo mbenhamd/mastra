@@ -627,9 +627,10 @@ export class WorkflowEventProcessor extends EventProcessor {
    * generation that has since claimed the same runId (fork lifecycle lineage).
    * A row without a recorded generation predates lineage and keeps upstream's
    * #22209 cleanup. Best-effort: a storage failure must not abort completion.
-   * The read and the delete are not one atomic operation (as in
-   * `clearRunTopicUnlessActive`); a claim landing in between is the residual
-   * window, and the newer generation then rewrites its row on its next persist.
+   * A store advertising `generationDeleteVersion: 1` compares and deletes in
+   * one atomic step, so a claim can never land between them. Other stores keep
+   * the read-then-delete fallback, whose residual window is a claim landing in
+   * between (the newer generation then rewrites its row on its next persist).
    */
   private async deleteDeclinedSnapshotIfCurrent(
     workflowsStore: WorkflowsStorage | undefined,
@@ -639,6 +640,23 @@ export class WorkflowEventProcessor extends EventProcessor {
   ): Promise<void> {
     if (!workflowsStore) return;
     try {
+      if (workflowsStore.getWorkflowResumeCapabilities().generationDeleteVersion === 1) {
+        const { status } = await workflowsStore.deleteWorkflowRunIfGeneration({
+          workflowName: workflowId,
+          runId,
+          expectedExecutionGeneration: executionGeneration,
+        });
+        if (status !== 'unsupported') {
+          if (status === 'stale') {
+            this.mastra.getLogger()?.debug?.('Skipped declined snapshot cleanup owned by a newer execution', {
+              workflowId,
+              runId,
+              executionGeneration,
+            });
+          }
+          return;
+        }
+      }
       const snapshot = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
       if (!snapshot) return;
       const currentExecutionGeneration = typeof snapshot === 'string' ? undefined : snapshot.executionGeneration;

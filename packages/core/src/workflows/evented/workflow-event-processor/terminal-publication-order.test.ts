@@ -144,7 +144,9 @@ async function setup({
     if (reject?.(topic, serialized)) throw new Error('LOADING terminal publication');
     events.push({ topic, event: serialized });
   });
-  const deleted = vi.spyOn(store, 'deleteWorkflowRunById');
+  // PF-5928 adaptation: a store advertising `generationDeleteVersion: 1` (MockStore does) takes
+  // the declined-snapshot cleanup through its atomic generation-conditional delete.
+  const deleted = vi.spyOn(store, 'deleteWorkflowRunIfGeneration');
   const endEvent = () => {
     const message = events.find(({ topic, event }) => topic === 'workflows' && event.type === 'workflow.end');
     if (!message) throw new Error('Missing workflow.end handoff');
@@ -423,6 +425,43 @@ describe('evented terminal publication ordering', () => {
         });
         expect(await f.consume()).toEqual({ ok: true });
       }
+      expect((await f.row())?.snapshot).toMatchObject({ executionGeneration: 'generation-newer' });
+    });
+
+    it(`keeps a newer generation's row that claims the run while the ${failure ? 'failure' : 'success'} cleanup decides`, async () => {
+      const f = await setup();
+      const newer = { ...(await f.row())!.snapshot, executionGeneration: 'generation-newer' } as any;
+      const store = f.store as any;
+      let armed = false;
+      const claimNow = async () => {
+        if (!armed) return;
+        armed = false;
+        await store.persistWorkflowSnapshot({ workflowName: f.args.workflowId, runId: f.args.runId, snapshot: newer });
+      };
+      // The claim lands after any generation read and before the delete, whichever API the cleanup uses.
+      const load = store.loadWorkflowSnapshot.bind(store);
+      vi.spyOn(store, 'loadWorkflowSnapshot').mockImplementation(async (args: any) => {
+        const result = await load(args);
+        await claimNow();
+        return result;
+      });
+      const conditionalDelete = Object.getPrototypeOf(store).deleteWorkflowRunIfGeneration?.bind(store);
+      if (conditionalDelete) {
+        f.deleted.mockImplementation(async (args: any) => {
+          await claimNow();
+          return conditionalDelete(args);
+        });
+      }
+      if (failure) {
+        f.args.prevResult = failedResult();
+        armed = true;
+        await f.processor.fail(f.args);
+      } else {
+        await f.processor.end(f.args);
+        armed = true;
+        expect(await f.consume()).toEqual({ ok: true });
+      }
+      expect(armed).toBe(false);
       expect((await f.row())?.snapshot).toMatchObject({ executionGeneration: 'generation-newer' });
     });
 

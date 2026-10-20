@@ -77,7 +77,30 @@ export interface WorkflowResumeCapabilities {
   fencedStepUpdateVersion?: 1;
   /** Atomic cancellation-marker compare-and-set for retained requests. */
   retainedCancelRequestVersion?: 1;
+  /** Atomic generation-conditional snapshot delete ({@link DeleteWorkflowRunIfGenerationInput}). */
+  generationDeleteVersion?: 1;
 }
+
+/**
+ * Deletes a run's snapshot row only while it still belongs to
+ * `expectedExecutionGeneration`, in one atomic step. A row that records no
+ * generation predates lineage and is deleted (upstream #22209 cleanup). Used
+ * by deferred cleanup, which must never remove the row of a newer execution
+ * generation that claimed the same runId after the cleanup read it.
+ */
+export interface DeleteWorkflowRunIfGenerationInput {
+  workflowName: string;
+  runId: string;
+  expectedExecutionGeneration: string;
+}
+
+/**
+ * - `deleted`: the row belonged to the expected (or no) generation and is gone.
+ * - `missing`: no row (an idempotent no-op).
+ * - `stale`: the row belongs to another generation; nothing changed.
+ * - `unsupported`: the adapter does not implement `generationDeleteVersion: 1`.
+ */
+export type DeleteWorkflowRunIfGenerationResult = { status: 'deleted' | 'missing' | 'stale' | 'unsupported' };
 
 export type WorkflowSnapshotHandoffStatus = 'pending' | 'completed';
 
