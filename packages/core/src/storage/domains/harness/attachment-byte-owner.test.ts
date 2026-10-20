@@ -32,6 +32,7 @@ function makeSaveInput(
   return {
     owner: { ...baseOwner },
     operationId: 'upload-1',
+    storageNamespace: 'memory://memory',
     data: payload,
     expectedBytes: payload.byteLength,
     expectedSha256: payloadSha256,
@@ -186,6 +187,7 @@ describe('InMemoryHarnessAttachmentByteOwner', () => {
 
     const cleanOwner = new InMemoryHarnessAttachmentByteOwner();
     const ambiguousOwner: HarnessAttachmentByteOwner = {
+      storageNamespace: cleanOwner.storageNamespace,
       save: async saveInput => {
         const result = await cleanOwner.save(saveInput);
         if (result.outcome === 'unknown') {
@@ -209,9 +211,53 @@ describe('InMemoryHarnessAttachmentByteOwner', () => {
         operationId: input.operationId,
         expectedBytes: input.expectedBytes,
         expectedSha256: input.expectedSha256,
+        storageNamespace: input.storageNamespace,
       }),
     ).resolves.toMatchObject({ outcome: 'deleted' });
     await expect(cleanOwner.save(input)).rejects.toThrow();
+  });
+
+  it('refuses a cancellation bound to another namespace or reference without fencing its own', async () => {
+    const original = new InMemoryHarnessAttachmentByteOwner({ providerId: 'bucket-a' });
+    const replacement = new InMemoryHarnessAttachmentByteOwner({ providerId: 'bucket-b' });
+    expect(original.storageNamespace).not.toBe(replacement.storageNamespace);
+    const input = makeSaveInput({ storageNamespace: original.storageNamespace });
+    const stored = await original.save(input);
+    if (stored.outcome === 'unknown') throw new Error('in-memory owner must resolve a save outcome');
+    await expect(replacement.save(input)).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
+    const cancelInput = {
+      owner: input.owner,
+      operationId: input.operationId,
+      expectedBytes: input.expectedBytes,
+      expectedSha256: input.expectedSha256,
+      storageNamespace: original.storageNamespace,
+    };
+
+    // The replacement namespace never reports cleanup for the original one.
+    await expect(replacement.cancel(cancelInput)).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
+    await expect(
+      replacement.cancel({ ...cancelInput, storageNamespace: replacement.storageNamespace, blobRef: stored.blobRef }),
+    ).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
+    await expect(
+      original.cancel({ ...cancelInput, blobRef: stored.blobRef + '-other' }),
+    ).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
+    await expect(
+      original.load(makeLoadInput({ blobRef: stored.blobRef, maxBytes: payload.byteLength })),
+    ).resolves.not.toBeNull();
+
+    await expect(original.cancel({ ...cancelInput, blobRef: stored.blobRef })).resolves.toMatchObject({
+      outcome: 'deleted',
+    });
+    await expect(original.save(input)).rejects.toBeInstanceOf(HarnessAttachmentByteOwnerConflictError);
+  });
+
+  it('rejects an unusable declared storage namespace', () => {
+    expect(() => new InMemoryHarnessAttachmentByteOwner({ storageNamespace: '' })).toThrow(
+      HarnessAttachmentByteOwnerInvalidInputError,
+    );
+    expect(() => new InMemoryHarnessAttachmentByteOwner({ storageNamespace: 'bucket\u0000a' })).toThrow(
+      HarnessAttachmentByteOwnerInvalidInputError,
+    );
   });
 
   it('rejects a providerId whose encoded form exceeds the scope-component bound', () => {

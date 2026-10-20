@@ -81,6 +81,7 @@ import {
   walkPlanTaskSubtree,
   HarnessAttachmentByteOwnerIntegrityError,
   assertHarnessAttachmentOwnerScope,
+  assertHarnessAttachmentStorageNamespace,
   canonicalHarnessTerminalResult,
   canonicalJson,
   harnessTerminalAdmissionId,
@@ -319,6 +320,8 @@ type PgAttachmentOperation = {
   sha256: string;
   semantic?: AttachmentSemanticMetadata;
   blobRef?: string;
+  /** Undefined on rows written before namespace binding: unqualified. */
+  storageNamespace?: string;
   attempts: number;
   claimId?: string;
   claimExpiresAt?: number;
@@ -1135,6 +1138,14 @@ export class HarnessPG extends HarnessStorage {
       tableName: TABLE_HARNESS_ATTACHMENT_REFERENCES,
       schema: TABLE_SCHEMAS[TABLE_HARNESS_ATTACHMENT_REFERENCES],
       ifNotExists: ['harness_name', 'session_incarnation'],
+    });
+    // Additive and nullable: existing operation rows keep NULL, which marks
+    // them unqualified. They are refused rather than backfilled, because no
+    // durable evidence says which namespace their bytes went to.
+    await this.#db.alterTable({
+      tableName: TABLE_HARNESS_ATTACHMENT_OPERATIONS,
+      schema: TABLE_SCHEMAS[TABLE_HARNESS_ATTACHMENT_OPERATIONS],
+      ifNotExists: ['storage_namespace'],
     });
     // Existing native schemas used a required inline payload. New attachment
     // rows keep bytes external, so the old column must be nullable before the
@@ -3854,6 +3865,7 @@ export class HarnessPG extends HarnessStorage {
       throw new HarnessStorageAttachmentByteOwnerError(sessionId, attachmentId);
     }
     const owner = this.#requireAttachmentByteOwner(sessionId, attachmentId);
+    const storageNamespace = this.#attachmentStorageNamespace(owner, sessionId, attachmentId);
     const semanticJson = JSON.stringify(semantic ?? { kind: 'file' });
     let operation: PgAttachmentOperation;
     let incarnation: string;
@@ -3898,6 +3910,7 @@ export class HarnessPG extends HarnessStorage {
         bytes,
         sha256,
         semanticJson,
+        storageNamespace,
       });
       await reservation.commit();
     } catch (err) {
@@ -3910,6 +3923,7 @@ export class HarnessPG extends HarnessStorage {
       saved = await owner.save({
         owner: { harnessName: namespace, sessionId, attachmentId, incarnation },
         operationId: operation.id,
+        storageNamespace,
         data,
         expectedBytes: bytes,
         expectedSha256: sha256,
@@ -4657,14 +4671,18 @@ export class HarnessPG extends HarnessStorage {
       bytes: number;
       sha256: string;
       semanticJson: string;
+      storageNamespace: string;
     },
   ): Promise<PgAttachmentOperation> {
     const now = Date.now();
+    // The namespace is bound in the same transaction that makes the PUT
+    // durable, before the byte owner is asked to write anything.
     await tx.execute({
       sql: `INSERT INTO ${TABLE_HARNESS_ATTACHMENT_OPERATIONS}
             (id, harness_name, session_id, attachment_id, session_incarnation, kind, status,
-             name, mime_type, source, size_bytes, sha256, semantic_json, attempts, created_at, updated_at, next_attempt_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             name, mime_type, source, size_bytes, sha256, semantic_json, attempts, created_at, updated_at, next_attempt_at,
+             storage_namespace)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (harness_name, session_id, attachment_id, session_incarnation, kind) DO NOTHING`,
       args: [
         randomUUID(),
@@ -4684,6 +4702,7 @@ export class HarnessPG extends HarnessStorage {
         now,
         now,
         now + HARNESS_ATTACHMENT_PUT_ABANDONMENT_DELAY_MS,
+        input.storageNamespace,
       ],
     });
     const operation = await this.#loadAttachmentOperationTx(
@@ -4701,6 +4720,15 @@ export class HarnessPG extends HarnessStorage {
       throw new HarnessStorageAttachmentConflictError(input.sessionId, input.attachmentId);
     }
     if (operation.status === 'claimed') {
+      throw new HarnessStorageAttachmentPendingError(input.sessionId, input.attachmentId);
+    }
+    // A retry through an owner bound to another namespace, or against an
+    // unqualified pre-binding row, must not write bytes: an uncertain earlier
+    // PUT may exist only in the namespace this row was bound to.
+    if (operation.storageNamespace !== input.storageNamespace) {
+      if (operation.status === 'completed') {
+        throw new HarnessStorageAttachmentConflictError(input.sessionId, input.attachmentId);
+      }
       throw new HarnessStorageAttachmentPendingError(input.sessionId, input.attachmentId);
     }
     if (operation.status !== 'completed') {
@@ -4914,7 +4942,10 @@ export class HarnessPG extends HarnessStorage {
     });
   }
 
-  async #cancelAttachmentPutOperation(operation: PgAttachmentOperation, claimId: string): Promise<boolean> {
+  async #cancelAttachmentPutOperation(
+    operation: PgAttachmentOperation & { storageNamespace: string },
+    claimId: string,
+  ): Promise<boolean> {
     const owner = this.#requireAttachmentByteOwner(operation.sessionId, operation.attachmentId);
     let outcome: Awaited<ReturnType<HarnessAttachmentByteOwner['cancel']>>;
     try {
@@ -4928,6 +4959,8 @@ export class HarnessPG extends HarnessStorage {
         operationId: operation.id,
         expectedBytes: operation.sizeBytes,
         expectedSha256: operation.sha256,
+        storageNamespace: operation.storageNamespace,
+        ...(operation.blobRef === undefined ? {} : { blobRef: operation.blobRef }),
       });
     } catch {
       await this.#deferAttachmentCancelClaim(operation.id, claimId);
@@ -4941,13 +4974,36 @@ export class HarnessPG extends HarnessStorage {
     return true;
   }
 
+  /**
+   * Reads and validates the namespace a byte owner declares. An owner without
+   * a usable identity fails before a durable PUT exists.
+   */
+  #attachmentStorageNamespace(owner: HarnessAttachmentByteOwner, sessionId: string, attachmentId: string): string {
+    const storageNamespace: unknown = owner.storageNamespace;
+    try {
+      assertHarnessAttachmentStorageNamespace(storageNamespace);
+    } catch {
+      throw new HarnessStorageAttachmentByteOwnerError(sessionId, attachmentId);
+    }
+    return storageNamespace;
+  }
+
   // An ambiguous cancel must not mark the operation 'unknown': the PUT ledger
   // treats 'unknown' as adoptable, so a retry could complete the row while a
   // delayed cancellation still lands on the derived blob reference and
   // deletes its bytes. Renewing the claim keeps the operation fenced —
   // reservations reject it as in-flight — and lets the sweep re-drive the
   // idempotent cancel until the owner resolves it.
-  async #deferAttachmentCancelClaim(operationId: string, claimId: string): Promise<void> {
+  //
+  // The same deferral refuses an operation whose bound storage namespace is
+  // absent (a row written before the binding existed) or differs from the
+  // configured owner's: the original namespace may still hold an uncertain
+  // PUT, so the row stays pending until an owner for that namespace returns.
+  async #deferAttachmentCancelClaim(
+    operationId: string,
+    claimId: string,
+    code: 'cancel_unknown' | 'storage_namespace_unqualified' | 'storage_namespace_mismatch' = 'cancel_unknown',
+  ): Promise<void> {
     const now = Date.now();
     await this.#client.execute({
       sql: `UPDATE ${TABLE_HARNESS_ATTACHMENT_OPERATIONS}
@@ -4957,7 +5013,7 @@ export class HarnessPG extends HarnessStorage {
         now + 1_000,
         now + 1_000,
         now,
-        JSON.stringify({ code: 'cancel_unknown' }),
+        JSON.stringify({ code }),
         operationId,
         claimId,
         'claimed',
@@ -4969,7 +5025,20 @@ export class HarnessPG extends HarnessStorage {
     const claim = await this.#claimAttachmentOperation(operationId, eligibleAsOf);
     if (claim.state === 'done') return true;
     if (claim.state === 'busy') return false;
-    const { operation, claimId } = claim;
+    const { claimId } = claim;
+    const owner = this.#requireAttachmentByteOwner(claim.operation.sessionId, claim.operation.attachmentId);
+    // Every byte-owner call below, cancel or load, must address the namespace
+    // the PUT was bound to. Refuse before any owner I/O otherwise.
+    const boundNamespace = claim.operation.storageNamespace;
+    if (boundNamespace === undefined) {
+      await this.#deferAttachmentCancelClaim(operationId, claimId, 'storage_namespace_unqualified');
+      return false;
+    }
+    if (boundNamespace !== owner.storageNamespace) {
+      await this.#deferAttachmentCancelClaim(operationId, claimId, 'storage_namespace_mismatch');
+      return false;
+    }
+    const operation = { ...claim.operation, storageNamespace: boundNamespace };
     if (operation.blobRef === undefined) {
       return this.#cancelAttachmentPutOperation(operation, claimId);
     }
@@ -4996,7 +5065,6 @@ export class HarnessPG extends HarnessStorage {
       return this.#cancelAttachmentPutOperation(operation, claimId);
     }
 
-    const owner = this.#requireAttachmentByteOwner(operation.sessionId, operation.attachmentId);
     if (sameSessionIncarnation && attachment.rows.length > 0) {
       const row = attachment.rows[0]!;
       if (
@@ -11990,6 +12058,7 @@ function rowToAttachmentOperation(row: Record<string, unknown>): PgAttachmentOpe
     sha256: String(row.sha256),
     semantic: parseJson(row.semantic_json) as AttachmentSemanticMetadata | undefined,
     blobRef: row.blob_ref == null ? undefined : String(row.blob_ref),
+    storageNamespace: row.storage_namespace == null ? undefined : String(row.storage_namespace),
     attempts: Number(row.attempts),
     claimId: row.claim_id == null ? undefined : String(row.claim_id),
     claimExpiresAt: row.claim_expires_at == null ? undefined : Number(row.claim_expires_at),

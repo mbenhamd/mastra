@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { createSampleSessionRecord } from '@internal/storage-test-utils';
 import {
@@ -57,6 +57,7 @@ function createOwnerGate(): OwnerGate {
 
 class UnknownDeleteOnceOwner implements HarnessAttachmentByteOwner {
   readonly #delegate = new InMemoryHarnessAttachmentByteOwner({ providerId: 'native-integration-test' });
+  readonly storageNamespace = this.#delegate.storageNamespace;
   #saveGates: OwnerGate[] = [];
   #deleteGates: OwnerGate[] = [];
   #cancelStarted: (() => void) | undefined;
@@ -1664,5 +1665,284 @@ describe('HarnessPG native external attachment ownership', () => {
       await offStore.db.none(`DROP SCHEMA IF EXISTS "${offSchema}" CASCADE`).catch(() => {});
       await offStore.close();
     }
+  });
+});
+
+/**
+ * One independent byte namespace, such as one bucket. Owners are kept across
+ * store restarts so a namespace keeps its objects and cancellation fences.
+ */
+class NamespaceByteOwner implements HarnessAttachmentByteOwner {
+  readonly #delegate: InMemoryHarnessAttachmentByteOwner;
+  readonly storageNamespace: string;
+  readonly cancels: HarnessAttachmentByteOwnerCancelInput[] = [];
+  readonly saves: HarnessAttachmentByteOwnerSaveInput[] = [];
+  readonly storedRefs: string[] = [];
+  /** Store the bytes, then lose the response: `unknown` with or without the reference. */
+  uncertainSaveOnce: 'without_ref' | 'with_ref' | undefined;
+  #delayedSave: { started: () => void; released: Promise<void> } | undefined;
+
+  constructor(providerId: string) {
+    this.#delegate = new InMemoryHarnessAttachmentByteOwner({ providerId });
+    this.storageNamespace = this.#delegate.storageNamespace;
+  }
+
+  /** Holds the next PUT before it writes any byte, like a request still in flight. */
+  delayNextSave(): { started: Promise<void>; release: () => void } {
+    let started!: () => void;
+    let release!: () => void;
+    const startedPromise = new Promise<void>(resolve => (started = resolve));
+    this.#delayedSave = { started, released: new Promise<void>(resolve => (release = resolve)) };
+    return { started: startedPromise, release };
+  }
+
+  async save(input: HarnessAttachmentByteOwnerSaveInput): Promise<HarnessAttachmentByteOwnerSaveResult> {
+    this.saves.push(input);
+    const delayed = this.#delayedSave;
+    if (delayed) {
+      this.#delayedSave = undefined;
+      delayed.started();
+      await delayed.released;
+    }
+    const result = await this.#delegate.save(input);
+    if (result.outcome !== 'unknown') this.storedRefs.push(result.blobRef);
+    const uncertain = this.uncertainSaveOnce;
+    if (uncertain !== undefined && result.outcome !== 'unknown') {
+      this.uncertainSaveOnce = undefined;
+      return uncertain === 'with_ref' ? { outcome: 'unknown', blobRef: result.blobRef } : { outcome: 'unknown' };
+    }
+    return result;
+  }
+
+  load(input: HarnessAttachmentByteOwnerLoadInput): Promise<Uint8Array | null> {
+    return this.#delegate.load(input);
+  }
+
+  delete(input: HarnessAttachmentByteOwnerDeleteInput): Promise<HarnessAttachmentByteOwnerDeleteResult> {
+    return this.#delegate.delete(input);
+  }
+
+  cancel(input: HarnessAttachmentByteOwnerCancelInput): Promise<HarnessAttachmentByteOwnerCancelResult> {
+    this.cancels.push(input);
+    return this.#delegate.cancel(input);
+  }
+}
+
+describe('HarnessPG attachment PUT storage-namespace binding', () => {
+  const schemaName = `pf5997_namespace_${randomUUID().replaceAll('-', '_')}`;
+  const openStores: PostgresStore[] = [];
+
+  /** A process start against the shared schema, configured with one namespace. */
+  async function startProcess(owner: NamespaceByteOwner): Promise<PostgresStore> {
+    const store = new PostgresStore({
+      ...TEST_CONFIG,
+      id: `pg-harness-namespace-${openStores.length}`,
+      schemaName,
+      enabledDomains: ['harness'],
+      attachmentByteOwner: owner,
+    });
+    openStores.push(store);
+    await store.init();
+    return store;
+  }
+
+  afterAll(async () => {
+    await openStores[0]?.db.none(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`).catch(() => {});
+    for (const store of openStores) await store.close().catch(() => {});
+  });
+
+  async function createSession(store: PostgresStore, id: string): Promise<void> {
+    await store.stores.harness!.createOrLoadActiveSession(
+      createSampleSessionRecord({ id, resourceId: `${id}-resource`, threadId: `${id}-thread` }),
+      { initialLease: { ownerId: `${id}-owner`, ttlMs: 60_000 } },
+    );
+  }
+
+  function saveInput(sessionId: string, attachmentId: string, text: string) {
+    return {
+      sessionId,
+      attachmentId,
+      name: `${attachmentId}.txt`,
+      mimeType: 'text/plain',
+      source: 'inline' as const,
+      data: new TextEncoder().encode(text),
+    };
+  }
+
+  async function putOperation(store: PostgresStore, sessionId: string, attachmentId: string) {
+    return store.db.one<{
+      id: string;
+      status: string;
+      blob_ref: string | null;
+      storage_namespace: string | null;
+      session_incarnation: string;
+      last_error: { code?: string } | null;
+    }>(
+      `SELECT id, status, blob_ref, storage_namespace, session_incarnation, last_error
+       FROM "${schemaName}"."mastra_harness_attachment_operations"
+       WHERE kind = 'put' AND session_id = $1 AND attachment_id = $2`,
+      [sessionId, attachmentId],
+    );
+  }
+
+  async function loadFrom(
+    owner: NamespaceByteOwner,
+    blobRef: string,
+    sessionId: string,
+    attachmentId: string,
+    incarnation: string,
+    text: string,
+  ): Promise<string | null> {
+    const data = new TextEncoder().encode(text);
+    const bytes = await owner.load({
+      blobRef,
+      owner: { harnessName: 'default', sessionId, attachmentId, incarnation },
+      expectedBytes: data.byteLength,
+      expectedSha256: createHash('sha256').update(data).digest('hex'),
+      maxBytes: 1024,
+    });
+    return bytes === null ? null : new TextDecoder().decode(bytes);
+  }
+
+  // Claim re-acquisition uses the wall clock, so a refused (deferred) claim
+  // must expire in real time before another process can take it.
+  const waitForDeferredClaim = () => new Promise(resolve => setTimeout(resolve, 1_100));
+
+  for (const variant of ['without_ref', 'with_ref'] as const) {
+    it(`keeps an uncertain PUT pending across a namespace change and cleans it in the original (${variant})`, async () => {
+      const bucketA = new NamespaceByteOwner(`bucket-a-${variant}`);
+      const bucketB = new NamespaceByteOwner(`bucket-b-${variant}`);
+      const sessionId = `namespace-restart-${variant}`;
+      const text = `uncertain bytes ${variant}`;
+      const input = saveInput(sessionId, 'uncertain', text);
+
+      const first = await startProcess(bucketA);
+      await createSession(first, sessionId);
+      bucketA.uncertainSaveOnce = variant;
+      await expect(first.stores.harness!.saveAttachment(input)).rejects.toBeInstanceOf(
+        HarnessStorageAttachmentPendingError,
+      );
+      const uncertain = await putOperation(first, sessionId, 'uncertain');
+      expect(uncertain).toMatchObject({ status: 'unknown', storage_namespace: bucketA.storageNamespace });
+      expect(uncertain.blob_ref).toBe(variant === 'with_ref' ? bucketA.storedRefs[0] : null);
+      expect(bucketA.saves[0]?.storageNamespace).toBe(bucketA.storageNamespace);
+
+      // Restart with another valid namespace. A retry writes nothing there,
+      // and cleanup stays pending: the new namespace is neither fenced nor
+      // reported clean, and the original payload is intact.
+      const restarted = await startProcess(bucketB);
+      await expect(restarted.stores.harness!.saveAttachment(input)).rejects.toBeInstanceOf(
+        HarnessStorageAttachmentPendingError,
+      );
+      expect(bucketB.saves).toHaveLength(0);
+      await expect(
+        restarted.stores.harness!.reconcileAttachmentOperations({ limit: 1, now: Date.now() + 2_000 }),
+      ).resolves.toEqual({ processed: 1, pending: 1 });
+      const refused = await putOperation(restarted, sessionId, 'uncertain');
+      expect(refused.status).toBe('claimed');
+      expect(refused.last_error).toEqual({ code: 'storage_namespace_mismatch' });
+      expect(bucketB.cancels).toHaveLength(0);
+      await expect(
+        loadFrom(bucketA, bucketA.storedRefs[0]!, sessionId, 'uncertain', uncertain.session_incarnation, text),
+      ).resolves.toBe(text);
+      await expect(restarted.stores.harness!.deleteSession({ sessionId })).rejects.toBeInstanceOf(
+        HarnessStorageAttachmentPendingError,
+      );
+
+      // The original namespace returns: the bound cancellation reaches it,
+      // carrying the recorded reference when there is one.
+      await waitForDeferredClaim();
+      const recovered = await startProcess(bucketA);
+      await expect(
+        recovered.stores.harness!.reconcileAttachmentOperations({ limit: 1, now: Date.now() + 2_000 }),
+      ).resolves.toEqual({ processed: 1, pending: 0 });
+      expect(bucketA.cancels).toHaveLength(1);
+      expect(bucketA.cancels[0]).toMatchObject({ storageNamespace: bucketA.storageNamespace });
+      expect(bucketA.cancels[0]!.blobRef).toBe(variant === 'with_ref' ? bucketA.storedRefs[0] : undefined);
+      await expect(putOperation(recovered, sessionId, 'uncertain')).resolves.toMatchObject({ status: 'cleaned' });
+      await expect(
+        loadFrom(bucketA, bucketA.storedRefs[0]!, sessionId, 'uncertain', uncertain.session_incarnation, text),
+      ).resolves.toBeNull();
+      await expect(recovered.stores.harness!.deleteSession({ sessionId })).resolves.toBeUndefined();
+    });
+  }
+
+  it('refuses a delayed PUT that lands after the original namespace cancelled it', async () => {
+    const bucketA = new NamespaceByteOwner('bucket-a-delayed');
+    const bucketB = new NamespaceByteOwner('bucket-b-delayed');
+    const sessionId = 'namespace-delayed-put';
+    const text = 'delayed bytes';
+
+    const first = await startProcess(bucketA);
+    await createSession(first, sessionId);
+    const delayed = bucketA.delayNextSave();
+    const lateSave = first.stores.harness!.saveAttachment(saveInput(sessionId, 'delayed', text));
+    await delayed.started;
+    const reserved = await putOperation(first, sessionId, 'delayed');
+    expect(reserved).toMatchObject({ status: 'pending', storage_namespace: bucketA.storageNamespace });
+
+    // The process that issued the PUT is gone; a replacement on another
+    // namespace must not settle it.
+    const restarted = await startProcess(bucketB);
+    await expect(
+      restarted.stores.harness!.reconcileAttachmentOperations({ limit: 1, now: Date.now() + 61_000 }),
+    ).resolves.toEqual({ processed: 1, pending: 1 });
+    expect(bucketB.cancels).toHaveLength(0);
+
+    await waitForDeferredClaim();
+    const recovered = await startProcess(bucketA);
+    await expect(
+      recovered.stores.harness!.reconcileAttachmentOperations({ limit: 1, now: Date.now() + 61_000 }),
+    ).resolves.toEqual({ processed: 1, pending: 0 });
+    expect(bucketA.cancels).toHaveLength(1);
+    expect(bucketA.cancels[0]!.blobRef).toBeUndefined();
+
+    // The delayed PUT reaches the original namespace after its fence.
+    delayed.release();
+    await expect(lateSave).rejects.toBeInstanceOf(HarnessStorageAttachmentPendingError);
+    expect(bucketA.storedRefs).toHaveLength(0);
+    await expect(putOperation(recovered, sessionId, 'delayed')).resolves.toMatchObject({ status: 'cleaned' });
+    await expect(
+      recovered.stores.harness!.loadAttachment({ sessionId, attachmentId: 'delayed' }),
+    ).resolves.toBeNull();
+  });
+
+  it('refuses an operation row that has no recorded namespace', async () => {
+    const bucketA = new NamespaceByteOwner('bucket-a-legacy');
+    const sessionId = 'namespace-legacy-row';
+    const text = 'legacy uncertain bytes';
+    const input = saveInput(sessionId, 'legacy', text);
+
+    const store = await startProcess(bucketA);
+    await createSession(store, sessionId);
+    bucketA.uncertainSaveOnce = 'without_ref';
+    await expect(store.stores.harness!.saveAttachment(input)).rejects.toBeInstanceOf(
+      HarnessStorageAttachmentPendingError,
+    );
+    // A row written before the binding existed carries no namespace.
+    await store.db.none(
+      `UPDATE "${schemaName}"."mastra_harness_attachment_operations"
+       SET storage_namespace = NULL WHERE kind = 'put' AND session_id = $1`,
+      [sessionId],
+    );
+    const legacy = await putOperation(store, sessionId, 'legacy');
+    await expect(store.stores.harness!.saveAttachment(input)).rejects.toBeInstanceOf(
+      HarnessStorageAttachmentPendingError,
+    );
+    expect(bucketA.saves).toHaveLength(1);
+
+    // Even the owner that wrote the bytes may not guess it is the namespace.
+    await expect(
+      store.stores.harness!.reconcileAttachmentOperations({ limit: 1, now: Date.now() + 2_000 }),
+    ).resolves.toEqual({ processed: 1, pending: 1 });
+    await expect(putOperation(store, sessionId, 'legacy')).resolves.toMatchObject({
+      status: 'claimed',
+      storage_namespace: null,
+      last_error: { code: 'storage_namespace_unqualified' },
+    });
+    expect(bucketA.cancels).toHaveLength(0);
+    await expect(
+      loadFrom(bucketA, bucketA.storedRefs[0]!, sessionId, 'legacy', legacy.session_incarnation, text),
+    ).resolves.toBe(text);
   });
 });
