@@ -113,6 +113,7 @@ import {
   endRunSpansWithError,
   ExtendedRunRegistry,
   getBoundRunRegistryEntry,
+  isRunIdReboundFrom,
   getGlobalRunRegistryEntry,
   getRunRegistryEntry,
   globalRunRegistry,
@@ -3022,6 +3023,20 @@ export class DurableAgent<
     );
   }
 
+  /**
+   * A run parked on a suspension has no steps left to stop; release it so it is
+   * no longer listed as suspended. Upstream #26583 aborts through the agent so
+   * the parked run's snapshot rows are dropped too (an aborted suspension can
+   * never be resumed, #25903). A result handle only releases the execution it
+   * captured: once a successor reuses the run id, the stale handle stands down
+   * (PF-5928).
+   */
+  #releaseParkedRunOfBinding(runId: string, runtimeBindingId: string | undefined): void {
+    if (!agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) return;
+    if (isRunIdReboundFrom(runId, runtimeBindingId)) return;
+    super.abortRunStream(runId);
+  }
+
   /** Apply only the controller and binding captured before abort cleanup can mutate registry state. */
   #abortDurableRun(runId: string, controller: AbortController | undefined, runtimeBindingId: string | undefined): void {
     if (controller && !controller.signal.aborted) {
@@ -4899,6 +4914,9 @@ export class DurableAgent<
         // and only if no newer segment took the run over meanwhile -- never while
         // a resumed segment is executing.
         if (!explicit || owner === undefined || !runtimeBindingId) return;
+        // A successor reused the run id: it owns the id now, and this handle's
+        // execution was already released (PF-5928).
+        if (isRunIdReboundFrom(runId, runtimeBindingId)) return;
         const ownerExecution = getBoundRunRegistryEntry(runId, runtimeBindingId)?.workflowExecution;
         void Promise.resolve(ownerExecution)
           .catch(() => {})
@@ -5153,11 +5171,7 @@ export class DurableAgent<
       // Also stop the exact execution captured by this handle. Resolving the
       // binding at abort time could target a later execution that reused runId.
       await this.requestRemoteAbort(runId, runtimeBindingId);
-      // A run parked on a suspension has no steps left to stop; release it so
-      // it is no longer listed as suspended.
-      // Upstream #26583: abort through the agent so the parked run's snapshot rows are dropped
-      // too (an aborted suspension can never be resumed, #25903).
-      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) super.abortRunStream(runId);
+      this.#releaseParkedRunOfBinding(runId, runtimeBindingId);
     };
 
     return {
@@ -6125,11 +6139,7 @@ export class DurableAgent<
         abortController.abort(reason);
       }
       await this.requestRemoteAbort(runId, runtimeBindingId);
-      // A run parked on a suspension has no steps left to stop; release it so
-      // it is no longer listed as suspended.
-      // Upstream #26583: abort through the agent so the parked run's snapshot rows are dropped
-      // too (an aborted suspension can never be resumed, #25903).
-      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) super.abortRunStream(runId);
+      this.#releaseParkedRunOfBinding(runId, runtimeBindingId);
     };
 
     return {
@@ -6578,11 +6588,7 @@ export class DurableAgent<
         abortController.abort(reason);
       }
       await this.requestRemoteAbort(runId, runtimeBindingId);
-      // A run parked on a suspension has no steps left to stop; release it so
-      // it is no longer listed as suspended.
-      // Upstream #26583: abort through the agent so the parked run's snapshot rows are dropped
-      // too (an aborted suspension can never be resumed, #25903).
-      if (agentThreadStreamRuntime.isRunParked(runId, this.getPubSub())) super.abortRunStream(runId);
+      this.#releaseParkedRunOfBinding(runId, runtimeBindingId);
     };
 
     const result: DurableAgentStreamResult<TOutput> & { [RECOVERY_WORKFLOW_EXECUTION]: Promise<void> } = {

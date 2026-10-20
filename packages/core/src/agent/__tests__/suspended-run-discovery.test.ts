@@ -2619,6 +2619,125 @@ describe('aborting a suspended run (#25903)', () => {
     });
   }, 30000);
 
+  describe('stale durable handles after a run id is reused (PF-5928)', () => {
+    /** Odd model calls request the approval-gated tool; even calls answer with text. */
+    function createAlternatingModel() {
+      let calls = 0;
+      return new MockLanguageModelV2({
+        doStream: async () => {
+          calls++;
+          const toolTurn = calls % 2 === 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream(
+              toolTurn
+                ? [
+                    { type: 'stream-start', warnings: [] },
+                    { type: 'response-metadata', id: `id-${calls}`, modelId: 'mock-model-id', timestamp: new Date(0) },
+                    {
+                      type: 'tool-call',
+                      toolCallId: `call-${calls}`,
+                      toolName: 'findUserTool',
+                      input: '{"name":"Dero Israel"}',
+                      providerExecuted: false,
+                    },
+                    {
+                      type: 'finish',
+                      finishReason: 'tool-calls',
+                      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                    },
+                  ]
+                : [
+                    { type: 'stream-start', warnings: [] },
+                    { type: 'response-metadata', id: `id-${calls}`, modelId: 'mock-model-id', timestamp: new Date(0) },
+                    { type: 'text-start', id: 't' },
+                    { type: 'text-delta', id: 't', delta: 'done' },
+                    { type: 'text-end', id: 't' },
+                    {
+                      type: 'finish',
+                      finishReason: 'stop',
+                      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                    },
+                  ],
+            ),
+          };
+        },
+      });
+    }
+
+    async function setup(threadId: string) {
+      const baseAgent = new Agent({
+        id: 'durable-reuse-agent',
+        name: 'Durable Reuse Agent',
+        instructions: 'You find users.',
+        model: createAlternatingModel(),
+        tools: { findUserTool: createFindUserTool() },
+      });
+      const durableAgent: any = createDurableAgent({ agent: baseAgent });
+      const storage = new InMemoryStore();
+      new Mastra({ agents: { durableAgent }, logger: false, storage });
+      const startParked = async () => {
+        const result: any = await durableAgent.stream('Find the user with name - Dero Israel', {
+          runId: 'reused-durable-run',
+          memory: { thread: threadId, resource: 'abort-resource' },
+        });
+        for await (const chunk of result.fullStream) {
+          if (chunk.type === 'tool-call-approval') break;
+        }
+        await vi.waitFor(async () => {
+          expect((await durableAgent.listSuspendedRuns({ threadId })).runs.map((r: any) => r.runId)).toEqual([
+            'reused-durable-run',
+          ]);
+        });
+        return result;
+      };
+      // Run A: park, approve, finish, and release the resumed segment.
+      const first = await startParked();
+      const resumed: any = await durableAgent.resume('reused-durable-run', { approved: true });
+      for await (const _chunk of resumed.fullStream) {
+        // drain to completion
+      }
+      resumed.cleanup();
+      await vi.waitFor(async () => {
+        expect((await durableAgent.listSuspendedRuns({ threadId })).runs).toHaveLength(0);
+      });
+      // Retention erased A's terminal rows, which frees the caller-supplied id.
+      const workflowsStore: any = await storage.getStore('workflows');
+      await Promise.all(
+        [DurableStepIds.AGENTIC_LOOP, DurableStepIds.AGENTIC_EXECUTION].map(workflowName =>
+          workflowsStore.deleteWorkflowRunById({ runId: 'reused-durable-run', workflowName }),
+        ),
+      );
+      // Run B reuses the caller-supplied id and parks on its own approval.
+      const second = await startParked();
+      return { durableAgent, first, second };
+    }
+
+    it("an earlier execution's abort() leaves the successor that reused its run id parked", async () => {
+      const { durableAgent, first } = await setup('durable-reuse-abort');
+      await first.abort();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(
+        (await durableAgent.listSuspendedRuns({ threadId: 'durable-reuse-abort' })).runs.map((r: any) => r.runId),
+      ).toEqual(['reused-durable-run']);
+    }, 30000);
+
+    it("an earlier execution's cleanup() is a harmless no-op after its run id is reused", async () => {
+      const { durableAgent, first, second } = await setup('durable-reuse-cleanup');
+      expect(() => first.cleanup()).not.toThrow();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(
+        (await durableAgent.listSuspendedRuns({ threadId: 'durable-reuse-cleanup' })).runs.map((r: any) => r.runId),
+      ).toEqual(['reused-durable-run']);
+      // The successor's own handle still controls it.
+      await second.abort();
+      await vi.waitFor(async () => {
+        expect((await durableAgent.listSuspendedRuns({ threadId: 'durable-reuse-cleanup' })).runs).toHaveLength(0);
+      });
+    }, 30000);
+  });
+
   it("DurableAgent stream result's abort() removes the suspended run", async () => {
     const { durableAgent, result } = await suspendDurable('durable-abort-result');
     result.abort();

@@ -337,8 +337,26 @@ export function endRunSpansWithError(runId: string, error: Error): void {
  */
 export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: string): RunRegistryEntry | undefined {
   const entry = getGlobalRunRegistryEntry(runId);
-  if (
-    entry &&
+  if (entry && isReboundRunRegistryEntry(entry, runtimeBindingId)) {
+    throw new Error(
+      `Durable run ${runId} no longer matches its registered runtime dependencies. Refusing to execute a rebound run identifier.`,
+    );
+  }
+  return entry;
+}
+
+/**
+ * Whether `runId` is currently registered to an execution other than
+ * `runtimeBindingId`. A stale handle uses this to stand down quietly instead of
+ * throwing (or acting) against a successor that legitimately reused the id.
+ */
+export function isRunIdReboundFrom(runId: string, runtimeBindingId: string | undefined): boolean {
+  const entry = getGlobalRunRegistryEntry(runId);
+  return entry !== undefined && isReboundRunRegistryEntry(entry, runtimeBindingId);
+}
+
+function isReboundRunRegistryEntry(entry: RunRegistryEntry, runtimeBindingId: string | undefined): boolean {
+  return (
     // A legacy placeholder may be created before its persisted binding is
     // loaded. Once a placeholder is stamped, it is fenced exactly like a full
     // runtime entry so a reused run ID cannot adopt another execution's
@@ -349,12 +367,7 @@ export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: strin
       // a process restart, but must never attach to a newly registered run that
       // happens to reuse the same caller-provided ID.
       runtimeBindingId === undefined)
-  ) {
-    throw new Error(
-      `Durable run ${runId} no longer matches its registered runtime dependencies. Refusing to execute a rebound run identifier.`,
-    );
-  }
-  return entry;
+  );
 }
 
 /** Register without replacing another active run that happens to reuse the same ID. */
