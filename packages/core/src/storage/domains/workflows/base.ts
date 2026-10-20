@@ -50,6 +50,8 @@ import type {
   PersistWorkflowStepUpdateResult,
   DeleteWorkflowRunIfGenerationInput,
   DeleteWorkflowRunIfGenerationResult,
+  CreateWorkflowSnapshotIfAbsentInput,
+  CreateWorkflowSnapshotIfAbsentResult,
   FinalizeWorkflowResumeInput,
   FinalizeWorkflowResumeResult,
   RollbackWorkflowResumeInput,
@@ -202,6 +204,13 @@ export abstract class WorkflowsStorage extends StorageDomain {
   }
 
   async consumeWorkflowResumeResult(_input: ConsumeWorkflowResumeResultInput): Promise<ConsumeWorkflowResumeResult> {
+    return { status: 'unsupported' };
+  }
+
+  /** Adapters implementing this advertise `createIfAbsentVersion: 1`. */
+  async createWorkflowSnapshotIfAbsent(
+    _input: CreateWorkflowSnapshotIfAbsentInput,
+  ): Promise<CreateWorkflowSnapshotIfAbsentResult> {
     return { status: 'unsupported' };
   }
 

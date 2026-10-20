@@ -18,6 +18,8 @@ import type {
   PersistWorkflowStepUpdateResult,
   DeleteWorkflowRunIfGenerationInput,
   DeleteWorkflowRunIfGenerationResult,
+  CreateWorkflowSnapshotIfAbsentInput,
+  CreateWorkflowSnapshotIfAbsentResult,
   RollbackWorkflowResumeInput,
   RollbackWorkflowResumeResult,
   WorkflowResumeCapabilities,
@@ -122,6 +124,7 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
       fencedStepUpdateVersion: 1,
       retainedCancelRequestVersion: 1,
       generationDeleteVersion: 1,
+      createIfAbsentVersion: 1,
     };
   }
 
@@ -790,6 +793,28 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
         );
       }
     }, 'deleteWorkflowRunById');
+  }
+
+  async createWorkflowSnapshotIfAbsent({
+    workflowName,
+    runId,
+    resourceId,
+    snapshot,
+  }: CreateWorkflowSnapshotIfAbsentInput): Promise<CreateWorkflowSnapshotIfAbsentResult> {
+    const now = new Date().toISOString();
+    const inserted = await this.executeWithRetry(
+      () =>
+        withClientWriteLock(this.#client, () =>
+          this.#client.execute({
+            sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+                  VALUES (?, ?, ?, jsonb(?), ?, ?)
+                  ON CONFLICT(workflow_name, run_id) DO NOTHING`,
+            args: [workflowName, runId, resourceId ?? null, safeStringify(snapshot), now, now],
+          }),
+        ),
+      'createWorkflowSnapshotIfAbsent',
+    );
+    return { status: inserted.rowsAffected > 0 ? 'created' : 'exists' };
   }
 
   async deleteWorkflowRunIfGeneration({

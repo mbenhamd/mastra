@@ -79,7 +79,24 @@ export interface WorkflowResumeCapabilities {
   retainedCancelRequestVersion?: 1;
   /** Atomic generation-conditional snapshot delete ({@link DeleteWorkflowRunIfGenerationInput}). */
   generationDeleteVersion?: 1;
+  /** Atomic first-snapshot insert ({@link CreateWorkflowSnapshotIfAbsentInput}). */
+  createIfAbsentVersion?: 1;
 }
+
+/**
+ * Writes a run's first snapshot only when storage holds no row for it, in one
+ * atomic step: two creators admitting the same runId cannot both win, and a
+ * late creator never overwrites a row another creator already advanced.
+ */
+export interface CreateWorkflowSnapshotIfAbsentInput {
+  workflowName: string;
+  runId: string;
+  resourceId?: string;
+  snapshot: WorkflowRunState;
+}
+
+/** `exists`: a row was already there and is unchanged. `unsupported`: no `createIfAbsentVersion: 1`. */
+export type CreateWorkflowSnapshotIfAbsentResult = { status: 'created' | 'exists' | 'unsupported' };
 
 /**
  * Deletes a run's snapshot row only while it still belongs to

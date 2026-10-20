@@ -49,6 +49,7 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
     missing: 'run-missing',
     deleted: 'run-deleted-stale-step',
     generationDelete: 'run-generation-conditional-delete',
+    createIfAbsent: 'run-create-if-absent',
   };
   const admissionFor = (runId: string): AdmitWorkflowResumeInput => ({
     workflowName: options.workflowName,
@@ -371,6 +372,30 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
       await expect(
         secondary.deleteWorkflowRunIfGeneration({ ...generationDelete, expectedExecutionGeneration: 'wfeg:newer' }),
       ).resolves.toEqual({ status: 'missing' });
+    }
+
+    // PF-5928: a late creator's first snapshot never overwrites a row another creator wrote.
+    if (options.primary.getWorkflowResumeCapabilities().createIfAbsentVersion === 1) {
+      const createIfAbsent = { workflowName: options.workflowName, runId: runIds.createIfAbsent };
+      const pending = (generation: string) => ({
+        ...suspendedSnapshot(runIds.createIfAbsent, resourceId),
+        status: 'pending' as const,
+        executionGeneration: generation,
+      });
+      await expect(
+        options.primary.createWorkflowSnapshotIfAbsent({
+          ...createIfAbsent,
+          resourceId,
+          snapshot: pending('wfeg:first'),
+        }),
+      ).resolves.toEqual({ status: 'created' });
+      await expect(
+        secondary.createWorkflowSnapshotIfAbsent({ ...createIfAbsent, resourceId, snapshot: pending('wfeg:late') }),
+      ).resolves.toEqual({ status: 'exists' });
+      expect(await options.primary.loadWorkflowSnapshot(createIfAbsent)).toMatchObject({
+        status: 'pending',
+        executionGeneration: 'wfeg:first',
+      });
     }
   } finally {
     await Promise.all(

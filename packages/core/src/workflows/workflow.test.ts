@@ -2153,3 +2153,67 @@ describe('concurrent stream close', () => {
     expect(secondDrain.types).toContain('workflow-finish');
   });
 });
+
+// PF-5928: a handle created before its workflow was registered admits its pending row at
+// start. That admission must never overwrite a row another creator wrote meanwhile.
+describe('late-bound pending admission', () => {
+  it('never overwrites a run another creator admitted and started meanwhile', async () => {
+    let effects = 0;
+    let releaseEffect!: () => void;
+    const effectGate = new Promise<void>(resolve => {
+      releaseEffect = resolve;
+    });
+    const define = () => {
+      const step = createStep({
+        id: 'effect',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: async () => {
+          effects++;
+          await effectGate;
+          return {};
+        },
+      });
+      return createWorkflow({ id: 'late-bound-admission', inputSchema: z.object({}), outputSchema: z.object({}) })
+        .then(step)
+        .commit();
+    };
+    const storage = new MockStore();
+    const runId = 'late-bound-admission-run';
+    const lateWorkflow = define();
+    const late = await lateWorkflow.createRun({ runId });
+    new Mastra({ logger: false, storage }).__registerInternalWorkflow(lateWorkflow, runId);
+    const otherWorkflow = define();
+    new Mastra({ logger: false, storage, workflows: { 'late-bound-admission': otherWorkflow } });
+
+    // The other creator admits and starts the run after the late handle checked for a row
+    // and before it writes one, whichever storage API the admission uses.
+    const store = (await storage.getStore('workflows')) as any;
+    let armed = true;
+    let otherStart: Promise<unknown> | undefined;
+    const admitOther = async () => {
+      if (!armed) return;
+      armed = false;
+      const other = await otherWorkflow.createRun({ runId });
+      otherStart = other.start({ inputData: {} });
+      await vi.waitFor(() => expect(effects).toBe(1));
+    };
+    for (const method of ['persistWorkflowSnapshot', 'createWorkflowSnapshotIfAbsent'] as const) {
+      const original = store[method].bind(store);
+      vi.spyOn(store, method).mockImplementation(async (args: any) => {
+        await admitOther();
+        return original(args);
+      });
+    }
+
+    const lateStart = late.start({ inputData: {} }).then(
+      result => result,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(otherStart).toBeDefined());
+    releaseEffect();
+    expect(await otherStart).toMatchObject({ status: 'success' });
+    expect(await lateStart).toBeInstanceOf(Error);
+    expect(effects).toBe(1);
+  });
+});

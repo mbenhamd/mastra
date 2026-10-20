@@ -143,6 +143,8 @@ import type {
   PersistWorkflowStepUpdateResult,
   DeleteWorkflowRunIfGenerationInput,
   DeleteWorkflowRunIfGenerationResult,
+  CreateWorkflowSnapshotIfAbsentInput,
+  CreateWorkflowSnapshotIfAbsentResult,
   PersistWorkflowTerminalRecoveryAncestryInput,
   PersistWorkflowTerminalRecoveryAncestryResult,
   GetWorkflowTerminalRecoveryAncestryResult,
@@ -533,6 +535,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       fencedStepUpdateVersion: 1,
       retainedCancelRequestVersion: 1,
       generationDeleteVersion: 1,
+      createIfAbsentVersion: 1,
     };
   }
 
@@ -6975,16 +6978,7 @@ export class WorkflowsPG extends WorkflowsStorage {
     }
   }
 
-  async persistWorkflowSnapshot({
-    workflowName,
-    runId,
-    resourceId,
-    snapshot,
-    createdAt,
-    updatedAt,
-    expectedExecutionGeneration,
-    fence: explicitFence,
-  }: {
+  async persistWorkflowSnapshot(args: {
     workflowName: string;
     runId: string;
     resourceId?: string;
@@ -6994,12 +6988,52 @@ export class WorkflowsPG extends WorkflowsStorage {
     expectedExecutionGeneration?: string;
     fence?: RunFence;
   }): Promise<void> {
+    await this.persistWorkflowSnapshotRow(args, false);
+  }
+
+  /**
+   * Inserts a run's first snapshot only when no row exists, in the same
+   * revision-locked transaction every snapshot write takes, so a concurrent
+   * creator's row is never overwritten.
+   */
+  async createWorkflowSnapshotIfAbsent({
+    workflowName,
+    runId,
+    resourceId,
+    snapshot,
+  }: CreateWorkflowSnapshotIfAbsentInput): Promise<CreateWorkflowSnapshotIfAbsentResult> {
+    const created = await this.persistWorkflowSnapshotRow({ workflowName, runId, resourceId, snapshot }, true);
+    return { status: created ? 'created' : 'exists' };
+  }
+
+  private async persistWorkflowSnapshotRow(
+    {
+      workflowName,
+      runId,
+      resourceId,
+      snapshot,
+      createdAt,
+      updatedAt,
+      expectedExecutionGeneration,
+      fence: explicitFence,
+    }: {
+      workflowName: string;
+      runId: string;
+      resourceId?: string;
+      snapshot: WorkflowRunState;
+      createdAt?: Date;
+      updatedAt?: Date;
+      expectedExecutionGeneration?: string;
+      fence?: RunFence;
+    },
+    onlyIfAbsent: boolean,
+  ): Promise<boolean> {
     validateWorkflowSnapshotHandoffIdentity(workflowName, runId, resourceId);
     try {
       const now = new Date();
       const createdAtValue = createdAt ? createdAt : now;
       const updatedAtValue = updatedAt ? updatedAt : now;
-      await this.#db.client.tx(async t => {
+      return await this.#db.client.tx(async t => {
         const fence = resolveRunFence(this, explicitFence, runId);
         if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, 'persistWorkflowSnapshot');
         const revision = await this.lockWorkflowParentRevisionForSnapshotUpsert(t, workflowName, runId);
@@ -7034,6 +7068,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         if (revision.created && existingSnapshot) {
           throw new TypeError('Workflow snapshot is missing parent revision evidence');
         }
+        if (onlyIfAbsent && existingSnapshot) return false;
         await t.none(
           `INSERT INTO ${getTableName({ indexName: TABLE_WORKFLOW_SNAPSHOT, schemaName: getSchemaName(this.#schema) })} AS t                 (workflow_name, run_id, "resourceId", snapshot, "createdAt", "updatedAt", "createdAtZ", "updatedAtZ")
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -7051,6 +7086,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           ],
         );
         await this.bumpWorkflowParentRevision(t, workflowName, runId, revision.generation);
+        return true;
       });
     } catch (error) {
       if (

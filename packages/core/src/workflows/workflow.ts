@@ -4549,9 +4549,17 @@ export class Run<
     const shouldPersistSnapshot =
       this.executionEngine.getRunPersistenceOverride(this.runId) ?? this.executionEngine.options.shouldPersistSnapshot;
     if (!shouldPersistSnapshot({ workflowStatus: 'pending', stepResults: {} })) return;
-    const existing = await workflowsStore.loadWorkflowSnapshot({ workflowName: this.workflowId, runId: this.runId });
     // A row admitted by another handle is judged by assertLifecycleExecutionAdmission().
-    if (existing) return;
+    // Stores with `createIfAbsentVersion: 1` insert atomically, so this admission can never
+    // overwrite a row another creator wrote (and may already be running) after an absence
+    // check; other stores keep the read-then-write fallback and its residual window.
+    const createIfAbsent = workflowsStore.getWorkflowResumeCapabilities().createIfAbsentVersion === 1;
+    if (
+      !createIfAbsent &&
+      (await workflowsStore.loadWorkflowSnapshot({ workflowName: this.workflowId, runId: this.runId }))
+    ) {
+      return;
+    }
 
     const initialSnapshot: WorkflowRunState = {
       runId: this.runId,
@@ -4569,7 +4577,7 @@ export class Run<
       error: undefined,
       timestamp: Date.now(),
     };
-    await workflowsStore.persistWorkflowSnapshot({
+    const admission = {
       workflowName: this.workflowId,
       runId: this.runId,
       resourceId: this.resourceId,
@@ -4581,7 +4589,12 @@ export class Run<
         lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
         lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
       },
-    });
+    };
+    if (createIfAbsent) {
+      await workflowsStore.createWorkflowSnapshotIfAbsent(admission);
+      return;
+    }
+    await workflowsStore.persistWorkflowSnapshot(admission);
   }
 
   #getParentWorkflow(parent: NestedWorkflowParent) {

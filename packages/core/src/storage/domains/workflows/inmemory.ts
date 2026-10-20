@@ -67,6 +67,8 @@ import type {
   PersistWorkflowStepUpdateResult,
   DeleteWorkflowRunIfGenerationInput,
   DeleteWorkflowRunIfGenerationResult,
+  CreateWorkflowSnapshotIfAbsentInput,
+  CreateWorkflowSnapshotIfAbsentResult,
   PersistWorkflowTerminalRecoveryAncestryInput,
   PersistWorkflowTerminalRecoveryAncestryResult,
   GetWorkflowTerminalRecoveryAncestryResult,
@@ -737,6 +739,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       fencedStepUpdateVersion: 1,
       retainedCancelRequestVersion: 1,
       generationDeleteVersion: 1,
+      createIfAbsentVersion: 1,
     };
   }
 
@@ -988,6 +991,18 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     return this.applyWorkflowResumeMutation(workflowName, runId, undefined, snapshot =>
       consumeWorkflowResumeResultRecord(snapshot, frozenInput, Date.now(), cloneRunData),
     ) as ConsumeWorkflowResumeResult;
+  }
+
+  async createWorkflowSnapshotIfAbsent({
+    workflowName,
+    runId,
+    resourceId,
+    snapshot,
+  }: CreateWorkflowSnapshotIfAbsentInput): Promise<CreateWorkflowSnapshotIfAbsentResult> {
+    if (this.db.workflows.has(this.getWorkflowKey(workflowName, runId))) return { status: 'exists' };
+    // persistWorkflowSnapshot writes before its first await, so nothing can insert in between.
+    await this.persistWorkflowSnapshot({ workflowName, runId, resourceId, snapshot });
+    return { status: 'created' };
   }
 
   async deleteWorkflowRunIfGeneration({
