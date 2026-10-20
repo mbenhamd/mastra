@@ -2,12 +2,7 @@ import { it, expect } from 'vitest';
 import { z } from 'zod/v4';
 import type { OutputProcessor, Processor } from '../../../../processors';
 import { createTool } from '../../../../tools';
-import {
-  runLoopScenario,
-  useLoopScenarioAimock,
-  describeForAllEngines,
-  isDurableEngineVariant,
-} from '../aimock-scenario';
+import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 import type { IterationCompleteContext } from '../../../../agent';
 import {
   AGENT_RESPONSE_RECOVERY_CONTINUATION,
@@ -1017,21 +1012,17 @@ describeForAllEngines(
 
       expect(toolExecutions).toBe(1);
       expect(requests).toHaveLength(2);
-      if (isDurableEngineVariant(engine)) {
-        // Durable (and the evented engine, which now runs EventedAgent on the
-        // durable loop builder) terminalizes the tripwire before a second
-        // iteration callback; there is therefore no callback opportunity to
-        // reopen the run.
-        expect(iterations).toHaveLength(1);
-      } else {
-        expect(iterations).toHaveLength(2);
-        expect(iterations[1]).toMatchObject({
-          text: '',
-          isFinal: true,
-          finishReason: 'tripwire',
-        });
-      }
-      expect(await output.finishReason).toBe(isDurableEngineVariant(engine) ? 'other' : 'tripwire');
+      // PF-5928 adaptation: on the fork every engine delivers the final tripwire iteration to
+      // onIterationComplete (the durable loop terminalizes through the same iteration callback as
+      // the plain loop), so upstream's durable-only "no second callback" difference does not
+      // reproduce. The callback declines to reopen a safety stop on every engine.
+      expect(iterations).toHaveLength(2);
+      expect(iterations[1]).toMatchObject({
+        text: '',
+        isFinal: true,
+        finishReason: 'tripwire',
+      });
+      expect(await output.finishReason).toBe('tripwire');
       expect(await output.text).not.toContain('UNEXPECTED_REOPENED_GENERATION');
     });
   },
