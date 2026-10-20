@@ -357,28 +357,6 @@ export function getBoundRunRegistryEntry(runId: string, runtimeBindingId?: strin
   return entry;
 }
 
-/**
- * Runtime bindings whose execution in this process was released (its registry entry deleted).
- * Bounded: only the window in which a still-running workflow's late step could otherwise
- * resurrect the released run matters (PF-5928).
- */
-const RETIRED_BINDINGS_LIMIT = 1024;
-const retiredRuntimeBindings = new Set<string>();
-
-function retireRuntimeBinding(runtimeBindingId: string): void {
-  retiredRuntimeBindings.delete(runtimeBindingId);
-  retiredRuntimeBindings.add(runtimeBindingId);
-  if (retiredRuntimeBindings.size > RETIRED_BINDINGS_LIMIT) {
-    const oldest = retiredRuntimeBindings.values().next().value;
-    if (oldest !== undefined) retiredRuntimeBindings.delete(oldest);
-  }
-}
-
-/** Whether this process released the execution that owned `runtimeBindingId`. @internal */
-export function isRuntimeBindingRetired(runtimeBindingId: string): boolean {
-  return retiredRuntimeBindings.has(runtimeBindingId);
-}
-
 /** Register without replacing another active run that happens to reuse the same ID. */
 export function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistryEntry): void {
   if (getGlobalRunRegistryEntry(runId)) {
@@ -406,7 +384,6 @@ export function deleteBoundRunRegistryEntry(
   const cachedMatches =
     cached?.runtimeBindingId === runtimeBindingId && (expectedEntry === undefined || cached === expectedEntry);
   if (!pinnedMatches && !cachedMatches) return false;
-  retireRuntimeBinding(runtimeBindingId);
 
   // Terminal cleanup can race the active segment's `finally`. Remove the
   // matching pin first so a later unpin cannot restore terminal runtime state

@@ -36,6 +36,7 @@ import type {
   ToolCallChunk,
 } from '../../stream/types';
 import { ChunkFrom } from '../../stream/types';
+import { isApprovalExempt, markApprovalExempt } from '../../tools/toolchecks';
 import type { CoreTool } from '../../tools/types';
 import type { DynamicArgument } from '../../types';
 import { deepMerge } from '../../utils';
@@ -3365,7 +3366,13 @@ export class DurableAgent<
     const registryEntry: RunRegistryEntry = {
       ...preparation.registryEntry,
       tools: Object.fromEntries(
-        Object.entries(preparation.registryEntry.tools).map(([toolId, tool]) => [toolId, { ...tool }]),
+        Object.entries(preparation.registryEntry.tools).map(([toolId, tool]) => {
+          const copy = { ...tool };
+          // Upstream #27296: the approval-exemption marker is non-enumerable, so a framework copy
+          // re-applies it (a user's own spread copy stays gated).
+          if (isApprovalExempt(tool)) markApprovalExempt(copy);
+          return [toolId, copy];
+        }),
       ),
       modelList: preparation.registryEntry.modelList?.map(entry => ({ ...entry })),
       versions: preparation.registryEntry.versions ? structuredClone(preparation.registryEntry.versions) : undefined,

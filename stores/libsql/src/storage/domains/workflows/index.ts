@@ -162,22 +162,50 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
               (retained?.resourceId as string | null | undefined) ?? updatedSnapshot.resourceId ?? resourceId ?? null;
             if (!retained || serializedSnapshot === undefined || serializedSnapshot === null) {
               const now = new Date().toISOString();
-              const inserted = await this.#client.execute({
-                sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+              const inserted = await this.#client.execute(
+                fenceCheck
+                  ? {
+                      sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+                      SELECT ?, ?, ?, jsonb(?), ?, ?
+                      WHERE EXISTS (SELECT 1 FROM ${fenceCheck.claimsTable} WHERE runId = ? AND generation = ? AND ownerId = ?)
+                      ON CONFLICT(workflow_name, run_id) DO NOTHING`,
+                      args: [
+                        workflowName,
+                        runId,
+                        retainedResourceId,
+                        safeStringify(updatedSnapshot),
+                        now,
+                        now,
+                        fenceCheck.fence.runId,
+                        fenceCheck.fence.generation,
+                        fenceCheck.fence.ownerId,
+                      ],
+                    }
+                  : {
+                      sql: `INSERT INTO ${TABLE_WORKFLOW_SNAPSHOT} (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
                       VALUES (?, ?, ?, jsonb(?), ?, ?)
                       ON CONFLICT(workflow_name, run_id) DO NOTHING`,
-                args: [workflowName, runId, retainedResourceId, safeStringify(updatedSnapshot), now, now],
-              });
+                      args: [workflowName, runId, retainedResourceId, safeStringify(updatedSnapshot), now, now],
+                    },
+              );
               if (inserted.rowsAffected === 1) return publicResult as T;
 
               await new Promise(resolve => setTimeout(resolve, Math.min(attempt + 1, 10)));
               continue;
             }
 
+            // The fence is part of the same statement, so a claim another connection commits
+            // between the check above and this write makes the write a no-op (next attempt refuses).
+            const fencePredicate = fenceCheck
+              ? ` AND EXISTS (SELECT 1 FROM ${fenceCheck.claimsTable} WHERE runId = ? AND generation = ? AND ownerId = ?)`
+              : '';
+            const fenceArgs = fenceCheck
+              ? [fenceCheck.fence.runId, fenceCheck.fence.generation, fenceCheck.fence.ownerId]
+              : [];
             const updated = await this.#client.execute({
               sql: `UPDATE ${TABLE_WORKFLOW_SNAPSHOT}
                     SET resourceId = ?, snapshot = jsonb(?), updatedAt = ?
-                    WHERE workflow_name = ? AND run_id = ? AND json(snapshot) = ?`,
+                    WHERE workflow_name = ? AND run_id = ? AND json(snapshot) = ?${fencePredicate}`,
               args: [
                 retainedResourceId,
                 safeStringify(updatedSnapshot),
@@ -185,6 +213,7 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
                 workflowName,
                 runId,
                 String(serializedSnapshot),
+                ...fenceArgs,
               ],
             });
             if (updated.rowsAffected === 1) return publicResult as T;

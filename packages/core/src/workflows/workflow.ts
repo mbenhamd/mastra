@@ -5493,21 +5493,38 @@ export class Run<
             waitingPaths: {},
             timestamp: Date.now(),
           };
+          const snapshotToPersist = {
+            ...(this.executionEngine.options.pruneSnapshot
+              ? this.executionEngine.options.pruneSnapshot({
+                  snapshot: dispatchSnapshot,
+                  workflowStatus: 'waiting',
+                })
+              : dispatchSnapshot),
+            ...lifecycleExecution,
+          };
           try {
-            await workflowsStore?.persistWorkflowSnapshot({
-              workflowName: this.workflowId,
-              runId: this.runId,
-              resourceId: this.resourceId,
-              snapshot: {
-                ...(this.executionEngine.options.pruneSnapshot
-                  ? this.executionEngine.options.pruneSnapshot({
-                      snapshot: dispatchSnapshot,
-                      workflowStatus: 'waiting',
-                    })
-                  : dispatchSnapshot),
-                ...lifecycleExecution,
-              },
-            });
+            if (workflowsStore?.getWorkflowResumeCapabilities()?.fencedStepUpdateVersion === 1) {
+              // Fenced like every other write of this lineage: a cancellation (or a newer
+              // generation) that committed while onStart ran is never overwritten.
+              const dispatched = await workflowsStore.persistWorkflowStepUpdate({
+                workflowName: this.workflowId,
+                runId: this.runId,
+                resourceId: this.resourceId,
+                expectedExecutionGeneration: lifecycleExecution.executionGeneration,
+                expectedLifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+                snapshot: snapshotToPersist,
+              });
+              if (dispatched.status !== 'persisted') {
+                throw new Error(`Workflow run ${this.workflowId}/${this.runId} lifecycle execution admission is stale`);
+              }
+            } else {
+              await workflowsStore?.persistWorkflowSnapshot({
+                workflowName: this.workflowId,
+                runId: this.runId,
+                resourceId: this.resourceId,
+                snapshot: snapshotToPersist,
+              });
+            }
           } catch (error) {
             workflowSpan?.error({ error: error as Error });
             throw error;

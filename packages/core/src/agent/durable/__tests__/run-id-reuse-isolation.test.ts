@@ -11,12 +11,7 @@ import { Agent } from '../../agent';
 import { ensureRemoteAbortListener } from '../abort-transport';
 import { createDurableAgent } from '../create-durable-agent';
 import { createEventedAgent } from '../create-evented-agent';
-import {
-  deleteBoundRunRegistryEntry,
-  getRunRegistryEntry,
-  globalRunRegistry,
-  setRunRegistryEntry,
-} from '../run-registry';
+import { getRunRegistryEntry, globalRunRegistry, setRunRegistryEntry } from '../run-registry';
 import type { RunRegistryEntry } from '../types';
 
 function model(prompts: string[]) {
@@ -149,27 +144,6 @@ describe('ownerless registry entries', () => {
     expect(getRunRegistryEntry(runId, bob)).toBeUndefined();
     await ensureRemoteAbortListener(pubsub, runId, 'abort-placeholder-binding', bob);
     expect(globalRunRegistry.get(runId)?.abortController).toBe(aliceController);
-    globalRunRegistry.delete(runId);
-  });
-
-  // PF-5928: a still-running workflow's late step must not resurrect a run this process already
-  // released (for example after a tripwire closed the stream and cleanup ran), or a later run that
-  // reuses the identifier inherits a stale placeholder. A worker that never ran it still seeds one.
-  it('a late step of a released execution does not seed a remote-abort placeholder', async () => {
-    const runId = 'released-run';
-    const pubsub = new EventEmitterPubSub();
-    const entry = { runtimeBindingId: 'released-binding', tools: {} } as unknown as RunRegistryEntry;
-    expect(setRunRegistryEntry(runId, entry, alice)).toBe(true);
-    expect(deleteBoundRunRegistryEntry(runId, 'released-binding')).toBe(true);
-
-    await ensureRemoteAbortListener(pubsub, runId, 'released-binding', alice);
-    expect(globalRunRegistry.has(runId)).toBe(false);
-
-    await ensureRemoteAbortListener(pubsub, runId, 'fresh-worker-binding', alice);
-    expect(globalRunRegistry.get(runId)).toMatchObject({
-      isPlaceholder: true,
-      runtimeBindingId: 'fresh-worker-binding',
-    });
     globalRunRegistry.delete(runId);
   });
 
