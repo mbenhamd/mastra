@@ -5052,6 +5052,11 @@ export class AgentThreadStreamRuntime {
     if (!suspended && !terminalInFlight) return false;
     const reservedKey = state.threadKeysByRunId.get(runId);
     if (reservedKey !== undefined && reservedKey !== key) return false;
+    // The suspension bookkeeping outlives this clear (below), so a concurrent duplicate resume
+    // would still see the run as suspended. Once an earlier resume has cleared the retained record
+    // and re-reserved or prepared the id, that live attempt owns it: refuse to clear it again, so
+    // the duplicate fails at the reservation instead of tearing the winner down (PF-5928).
+    if (!retainedRecord && (reservedKey !== undefined || state.preparedRunsById.has(runId))) return false;
 
     // Keep the suspension bookkeeping (PF-5928): the same-run re-registration clears only the
     // resumed call (#clearSuspendedToolCall, or the whole run when no call is named), so a
