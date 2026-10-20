@@ -4,7 +4,13 @@
 
 The PostgreSQL Harness store binds the attachment byte owner's `storageNamespace` (see `@mastra/core`) to every upload in the same transaction that reserves it, before the owner writes any bytes. `cancel` receives that namespace and the recorded `blobRef`.
 
-The sweep (`reconcileAttachmentOperations`) only selects uploads bound to the configured owner's namespace. Others stay pending, and a retry of one is refused, until an owner for the original namespace is configured again.
+**Before**
+
+`reconcileAttachmentOperations` cancelled or verified every unsettled upload through whichever owner was configured. After a restart with another bucket, an upload whose bytes were in the old bucket was fenced in the new one and marked `cleaned`. A retry could also write and commit the attachment in the new bucket.
+
+**After**
+
+The sweep only selects uploads bound to the configured owner's namespace. Others stay pending, keep their session from being deleted, and refuse a retry with `HarnessStorageAttachmentPendingError`. That lasts until an owner for the original namespace is configured again. A retry of a completed upload through another namespace returns `HarnessStorageAttachmentConflictError` without writing bytes.
 
 **Upgrading existing data**
 
@@ -18,10 +24,10 @@ With an externally managed schema (`disableInit`), apply that statement before y
 
 Upload rows written before this version have no namespace and are never guessed or backfilled:
 
-- An unsettled upload row stays pending and keeps its session from being deleted. A retry returns `HarnessStorageAttachmentPendingError`.
-- A completed upload row rejects a re-save with `HarnessStorageAttachmentConflictError`, without writing bytes.
+- Before, an unsettled row was reconciled through the configured owner. Now it stays pending and keeps its session from being deleted, and a retry returns `HarnessStorageAttachmentPendingError`.
+- Before, a re-save of a completed row succeeded as `already_stored`. Now it returns `HarnessStorageAttachmentConflictError` without writing bytes.
 
-An operator who has verified where a pending row's bytes went can qualify that one row:
+An operator who has verified where a pending row's bytes went can qualify that one row. The next sweep through an owner for that namespace then settles it:
 
 ```sql
 UPDATE "<schema>"."mastra_harness_attachment_operations"
