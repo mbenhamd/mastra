@@ -199,7 +199,11 @@ describe('EventedAgent - producer (MASTRA_WORKERS=false) + dedicated worker proc
     { brokerRole: 'worker' as const, label: 'worker process owns the broker' },
     { brokerRole: 'producer' as const, label: 'producer process owns the broker' },
   ])(
-    'completes the run when the $label',
+    // PF-5928 adaptation (fork PF-1875, kept by coordinator decision): built-in DurableAgent runs are
+    // `registry-required`, so a dedicated worker with no registry entry for the producer's run
+    // refuses it (no model or tool call anywhere) instead of rebuilding the runtime from Mastra as
+    // upstream does. The topology, broker election and cross-process delivery are still exercised.
+    'refuses the run in a dedicated worker without its runtime registry when the $label',
     async ({ brokerRole }) => {
       const socketPath = join(tempDir, 'pubsub.sock');
 
@@ -221,12 +225,12 @@ describe('EventedAgent - producer (MASTRA_WORKERS=false) + dedicated worker proc
       const producerTools = record(producer, 'tool-called');
 
       producer.send({ type: 'stream' });
-      const done = await waitForMessage(producer, 'stream-done', 15_000);
+      await expect(waitForMessage(producer, 'stream-done', 15_000)).rejects.toThrow(
+        /DurableAgent runtime dependencies are unavailable for run/,
+      );
 
-      expect(done.data).toEqual({ text: 'All done', finishReason: 'stop' });
-      // The loop ran in the worker process, not the producer.
-      expect(workerModels).toEqual(['worker', 'worker']);
-      expect(workerTools).toEqual(['worker']);
+      expect(workerModels).toEqual([]);
+      expect(workerTools).toEqual([]);
       expect(producerModels).toEqual([]);
       expect(producerTools).toEqual([]);
     },
