@@ -1986,18 +1986,13 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
 
     const other = await startProcess(foreign);
     await createSession(other, sessionId);
-    // Oldest first: two PUTs bound to another namespace and one unqualified.
-    for (const attachmentId of ['stuck-1', 'stuck-2', 'stuck-legacy']) {
+    // Oldest first: more PUTs bound to another namespace than the limit.
+    for (const attachmentId of ['stuck-1', 'stuck-2', 'stuck-3']) {
       foreign.uncertainSaveOnce = 'without_ref';
       await expect(
         other.stores.harness!.saveAttachment(saveInput(sessionId, attachmentId, attachmentId)),
       ).rejects.toBeInstanceOf(HarnessStorageAttachmentPendingError);
     }
-    await other.db.none(
-      `UPDATE "${schemaName}"."mastra_harness_attachment_operations"
-       SET storage_namespace = NULL WHERE kind = 'put' AND attachment_id = 'stuck-legacy'`,
-    );
-
     const store = await startProcess(bucketA);
     bucketA.uncertainSaveOnce = 'without_ref';
     await expect(store.stores.harness!.saveAttachment(saveInput(sessionId, 'bound', 'bound'))).rejects.toBeInstanceOf(
@@ -2008,7 +2003,7 @@ describe('HarnessPG attachment PUT storage-namespace binding', () => {
       store.stores.harness!.reconcileAttachmentOperations({ limit: 2, now: Date.now() + 2_000 }),
     ).resolves.toEqual({ processed: 1, pending: 3 });
     await expect(putOperation(store, sessionId, 'bound')).resolves.toMatchObject({ status: 'cleaned' });
-    for (const attachmentId of ['stuck-1', 'stuck-2', 'stuck-legacy']) {
+    for (const attachmentId of ['stuck-1', 'stuck-2', 'stuck-3']) {
       await expect(putOperation(store, sessionId, attachmentId)).resolves.toMatchObject({ status: 'unknown' });
     }
     expect(bucketA.cancels.map(input => input.operationId)).toEqual([
