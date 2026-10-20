@@ -127,6 +127,9 @@ describe('workflowLoopStream', () => {
 
     const processor: Processor = {
       id: 'stasher',
+      // PF-5928 adaptation (fork L20, PF-2236): the runner honours the documented
+      // `processDataParts` default (false), so a processor that stashes `data-*` parts opts in.
+      processDataParts: true,
       name: 'Stasher',
       processOutputStream: async ({ part, state }) => {
         if (part.type === 'data-moderation') {

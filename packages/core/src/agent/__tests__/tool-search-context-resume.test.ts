@@ -99,7 +99,9 @@ describe('ToolSearchProcessor storage: context — resume tool rebuild', () => {
                       toolCallId: 'call-1',
                       toolName: 'load_tool',
                       args: { toolName: 'weather' },
-                      result: { success: true, toolName: 'weather' },
+                      // PF-5928 adaptation (fork L22, PF-2246): only a canonical load_tool result with
+                      // `loaded: string[]` proves a load.
+                      result: { success: true, toolName: 'weather', loaded: ['weather'] },
                     },
                   },
                 ]
@@ -195,7 +197,9 @@ describe('ToolSearchProcessor storage: context — resume tool rebuild', () => {
                   toolCallId: 'call-1',
                   toolName: 'load_tool',
                   args: { toolName: 'weather' },
-                  result: { success: true, toolName: 'weather' },
+                  // PF-5928 adaptation (fork L22, PF-2246): only a canonical load_tool result with
+                  // `loaded: string[]` proves a load.
+                  result: { success: true, toolName: 'weather', loaded: ['weather'] },
                 },
               },
             ],

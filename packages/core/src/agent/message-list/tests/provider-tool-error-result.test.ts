@@ -318,7 +318,10 @@ describe('provider-executed tool results flagged isError (#26526)', () => {
 
     const message = messageList.get.all.db().find(m => m.id === 'assistant-client')!;
     expect((message.content.parts?.[0] as any).toolInvocation.state).toBe('output-error');
-    expect(message.content.toolInvocations?.[0]?.state).toBe('call');
+    // PF-5928 adaptation (fork L15/L23, PF-4112): the legacy mirror keeps the real resolved state,
+    // so the error is mirrored as an error, never read as a result (upstream leaves it as `call`).
+    expect(message.content.toolInvocations?.[0]).toMatchObject({ state: 'output-error', errorText: 'boom' });
+    expect(message.content.toolInvocations?.[0]?.state).not.toBe('result');
   });
 
   it('keeps client-tool errors on the error transcript transform', () => {

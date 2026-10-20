@@ -327,7 +327,8 @@ describe('GoalStateProcessor', () => {
     const storage = new InMemoryStore();
     const mastra = new Mastra({ storage, logger: false });
     const store = await storage.getStore('threadState');
-    await store!.setState({ threadId: THREAD_ID, type: GOAL_STATE_TYPE, value: objective() });
+    // PF-5928 adaptation (fork L27/PF-2026): thread state is resource-scoped, so the seed names its resource.
+    await store!.setState({ resourceId: RESOURCE_ID, threadId: THREAD_ID, type: GOAL_STATE_TYPE, value: objective() });
     const first = new GoalStateProcessor();
     const second = new GoalStateProcessor();
     mastra.addProcessor(first);
