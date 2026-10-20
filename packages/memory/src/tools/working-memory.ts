@@ -48,6 +48,19 @@ export function decodeWorkingMemoryPromptValue(value: unknown): unknown {
  * - Primitive values are overwritten
  * - The returned object is always newly constructed and never aliases `update`
  */
+/**
+ * Parses stored JSON working memory. Invalid or empty data yields `null` (start fresh).
+ */
+export function parseWorkingMemoryJson(raw: unknown): Record<string, unknown> | null {
+  if (!raw) return null;
+  if (typeof raw !== 'string') return raw as Record<string, unknown>;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 export function deepMergeWorkingMemory(
   existing: Record<string, unknown> | null | undefined,
   update: Record<string, unknown> | null | undefined,
@@ -280,23 +293,6 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
       let workingMemory: string;
 
       if (usesMergeSemantics) {
-        // Schema-based: fetch existing, merge, save
-        const existingRaw = await memory.getWorkingMemory({
-          threadId,
-          resourceId,
-          memoryConfig,
-        });
-
-        let existingData: Record<string, unknown> | null = null;
-        if (existingRaw) {
-          try {
-            existingData = typeof existingRaw === 'string' ? JSON.parse(existingRaw) : existingRaw;
-          } catch {
-            // If existing data is not valid JSON, start fresh
-            existingData = null;
-          }
-        }
-
         // Handle case where LLM passes empty object or no memory field
         const memoryInput = workingMemoryInput.memory;
         if (memoryInput === undefined || memoryInput === null) {
@@ -319,9 +315,32 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
           newData = memoryInput;
         }
 
+        const decodedData = decodeWorkingMemoryPromptValue(newData);
+
+        // Merge atomically in storage when possible so concurrent writers can't drop each other's fields
+        if (
+          scope === 'resource' &&
+          typeof memory.supportsAtomicWorkingMemoryMerge === 'function' &&
+          (await memory.supportsAtomicWorkingMemoryMerge())
+        ) {
+          await memory.mergeWorkingMemory({
+            threadId,
+            resourceId,
+            workingMemory: decodedData as Record<string, unknown>,
+            memoryConfig,
+          });
+          return { success: true };
+        }
+
+        // Fallback: fetch existing, merge, save
+        const existingRaw = await memory.getWorkingMemory({
+          threadId,
+          resourceId,
+          memoryConfig,
+        });
         const mergedData = deepMergeWorkingMemory(
-          existingData,
-          decodeWorkingMemoryPromptValue(newData) as Record<string, unknown>,
+          parseWorkingMemoryJson(existingRaw),
+          decodedData as Record<string, unknown>,
         );
         workingMemory = JSON.stringify(mergedData);
       } else {

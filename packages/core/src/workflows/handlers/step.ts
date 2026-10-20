@@ -18,7 +18,12 @@ import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
 import { ToolStream } from '../../tools/stream';
 import type { DynamicArgument } from '../../types';
 import { WorkflowCancelRequestedError } from '../cancel-request';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, TRANSIENT_EXECUTION_SYMBOL } from '../constants';
+import {
+  PUBSUB_SYMBOL,
+  STREAM_FORMAT_SYMBOL,
+  TRANSIENT_EXECUTION_SYMBOL,
+  WORKFLOW_CANCELLED_SYMBOL,
+} from '../constants';
 import type { DefaultExecutionEngine } from '../default';
 import {
   getOrCreateWorkflowStepLifecycleState,
@@ -43,6 +48,7 @@ import type {
 import {
   validateStepInput,
   createDeprecationProxy,
+  defineLazyWriter,
   omitPriorCompletionFields,
   runCountDeprecationMessage,
   validateStepResumeData,
@@ -150,9 +156,14 @@ export async function executeStep(
         states: lifecycleStepStates,
       }).state;
   const stepCallId = lifecycleStepState.stepCallId;
+  const persistedNestedRunId =
+    executionContext.foreachIndex !== undefined
+      ? stepResults[step.id]?.suspendPayload?.__workflow_meta?.foreachOutput?.[executionContext.foreachIndex]?.metadata
+          ?.nestedRunId
+      : stepResults[step.id]?.suspendPayload?.__workflow_meta?.runId;
   const nestedRunId =
     step.component === 'WORKFLOW' && executionContext.foreachIndex !== undefined
-      ? globalThis.crypto.randomUUID()
+      ? (persistedNestedRunId ?? globalThis.crypto.randomUUID())
       : undefined;
 
   const { inputData, validationError: inputValidationError } = await validateStepInput({
@@ -191,6 +202,17 @@ export async function executeStep(
   } else if (isExplicitResume) {
     resumeDataToUse = resume?.resumePayload;
     isResume = true;
+  } else if (
+    restart?.activeStepsPath?.[step.id] &&
+    stepResults[step.id]?.status === 'running' &&
+    ((stepResults[step.id] as { resumePayload?: unknown }).resumePayload !== undefined ||
+      (stepResults[step.id] as { resumedAt?: unknown }).resumedAt !== undefined)
+  ) {
+    // Upstream #27127: a resumed step that was in flight when the process died re-runs with its
+    // original resume data. The fork tracks the resume explicitly, so a resume whose payload was
+    // undefined (recorded by `resumedAt`) is still a resume.
+    resumeDataToUse = (stepResults[step.id] as { resumePayload?: unknown }).resumePayload;
+    isResume = true;
   }
 
   // Capture the result before recording this invocation as running. Resumed
@@ -200,17 +222,23 @@ export async function executeStep(
   const priorSuspendedStepResult = priorStepResult?.status === 'suspended' ? priorStepResult : undefined;
 
   // Extract suspend data if this step was previously suspended
-  let suspendDataToUse = priorSuspendedStepResult?.suspendPayload;
+  // A resumed step re-run after a crash is stored as 'running' but still carries its suspendPayload
+  // (upstream #27127).
+  let suspendDataToUse =
+    priorSuspendedStepResult?.suspendPayload ??
+    (priorStepResult?.status === 'running' && isResume ? priorStepResult.suspendPayload : undefined);
 
   // A suspended foreach step's step-level suspendPayload only carries the FIRST suspended
   // iteration's payload. When resuming a specific iteration, use that iteration's own payload
   // from `__workflow_meta.foreachOutput` so parallel suspensions don't read a sibling's data
   // (e.g. another tool call's suspended run id).
   const foreachIndex = executionContext.foreachIndex;
+  let nestedIterationSuspendPayload: Record<string, any> | undefined;
   if (suspendDataToUse && foreachIndex !== undefined) {
     const iterationResult = suspendDataToUse.__workflow_meta?.foreachOutput?.[foreachIndex];
     if (iterationResult?.status === 'suspended' && iterationResult.suspendPayload) {
       suspendDataToUse = iterationResult.suspendPayload;
+      nestedIterationSuspendPayload = iterationResult.suspendPayload;
     }
   }
 
@@ -227,7 +255,11 @@ export async function executeStep(
     // Drop prior completion/suspend fields so they cannot linger across re-entry
     // (e.g. suspendPayload/suspendedAt after resume, or startedAt > suspendedAt on loops).
     ...omitPriorCompletionFields((stepResults[step.id] ?? {}) as Record<string, unknown>),
-    ...(isResume ? { resumePayload: resumeDataToUse } : { payload: inputData }),
+    ...(isResume ? { resumePayload: resumeDataToUse } : { payload: inputData, resumePayload: undefined }),
+    // Keep the suspend payload while the resumed step runs so a restart after a crash still sees it.
+    ...(isResume && priorStepResult?.suspendPayload !== undefined
+      ? { suspendPayload: priorStepResult.suspendPayload }
+      : {}),
     ...(startTime ? { startedAt: startTime } : {}),
     ...(resumeTime ? { resumedAt: resumeTime } : {}),
     status: 'running',
@@ -281,6 +313,10 @@ export async function executeStep(
       workflowStatus: 'running',
       requestContext,
       phase: 'start',
+      // Upstream #27127 persists the resumed step's start (`recordResumedStepStart`). Not adopted:
+      // fork storage admits only result statuses for an ordinary resume (a `running` write over
+      // the suspended row is `protected_state`, storage/domains/workflows/resume.ts), so the
+      // suspended record stays the durable resume artifact until the resumed step settles.
     });
     // A start write can be acknowledged after another worker cancels the run.
     // Recheck before emitting the start event or entering user step code. A
@@ -434,13 +470,19 @@ export async function executeStep(
         stepResults,
         executionContext,
         requestContext,
+        // Upstream #27149: an explicit resume target (the agent loop's initial
+        // AGENT_RUN) wins over the suspending step's span, so repeated resumes stay
+        // siblings under the initial invocation.
         tracingContext:
-          stepResult.status === 'suspended' && persistenceTracingSpan
-            ? {
-                traceId: persistenceTracingSpan.traceId,
-                spanId: resolveExportedSpanId(persistenceTracingSpan),
-                parentSpanId: persistenceTracingSpan.getParentSpanId(),
-              }
+          stepResult.status === 'suspended'
+            ? (engine.options?.resumeTracingContext ??
+              (persistenceTracingSpan
+                ? {
+                    traceId: persistenceTracingSpan.traceId,
+                    spanId: resolveExportedSpanId(persistenceTracingSpan),
+                    parentSpanId: persistenceTracingSpan.getParentSpanId(),
+                  }
+                : undefined))
             : undefined,
         stepId: step.id,
         stepCallId,
@@ -552,10 +594,39 @@ export async function executeStep(
           : wrapMastra(engine.mastra, { currentSpan: stepSpan })
         : undefined;
 
-      const output = await runStep({
+      let completedNestedOutput: { found: boolean; value?: unknown } = { found: false };
+      if (isNestedWorkflow && persistedNestedRunId && engine.mastra) {
+        const workflowsStore = await engine.mastra.getStorage()?.getStore('workflows');
+        const nestedSnapshot = await workflowsStore?.loadWorkflowSnapshot({
+          workflowName: step.id,
+          runId: persistedNestedRunId,
+        });
+        if (nestedSnapshot?.status === 'success') {
+          completedNestedOutput = { found: true, value: nestedSnapshot.result };
+        }
+      }
+
+      if (completedNestedOutput.found) {
+        if (engine.requiresDurableContextSerialization()) {
+          contextMutations.requestContextUpdate = engine.serializeRequestContext(requestContext);
+        }
+        return {
+          output: completedNestedOutput.value,
+          suspended,
+          bailed,
+          contextMutations,
+          nestedWflowStepPaused: !!perStep,
+          lifecycleStepAttempt: lifecycleStepState.stepAttempt,
+        };
+      }
+
+      const stepParams = {
         runId: nestedRunId ?? runId,
         resourceId,
         workflowId,
+        parentWorkflow: isNestedWorkflow
+          ? { workflowId, runId, stepId: step.id, foreachIndex: executionContext.foreachIndex }
+          : undefined,
         mastra: mastraForStep,
         requestContext,
         actor,
@@ -618,19 +689,23 @@ export async function executeStep(
           bailed = { payload: result };
         },
         abort: () => {
-          abortController?.abort();
+          abortController?.abort(WORKFLOW_CANCELLED_SYMBOL);
         },
         // Only pass resume data if this step was actually suspended before
         // This prevents pending nested workflows from trying to resume instead of start
-        resume: priorSuspendedStepResult
-          ? {
-              steps: resume?.steps?.slice(1) || [],
-              resumePayload: resume?.resumePayload,
-              runId: priorSuspendedStepResult.suspendPayload?.__workflow_meta?.runId,
-              label: resume?.label,
-              forEachIndex: resume?.forEachIndex,
-            }
-          : undefined,
+        // In foreach, stepResults[step.id] is shared by all iterations, so also require that
+        // this iteration itself suspended; otherwise it would claim a sibling's child run.
+        resume:
+          priorSuspendedStepResult && (foreachIndex === undefined || nestedIterationSuspendPayload)
+            ? {
+                steps: resume?.steps?.slice(1) || [],
+                resumePayload: resume?.resumePayload,
+                runId: (nestedIterationSuspendPayload ?? priorSuspendedStepResult.suspendPayload)?.__workflow_meta
+                  ?.runId,
+                label: resume?.label,
+                forEachIndex: resume?.forEachIndex,
+              }
+            : undefined,
         // Only pass restart data if this step is part of activeStepsPath
         // This prevents pending nested workflows from trying to restart instead of start
         restart: !!restart?.activeStepsPath?.[step.id],
@@ -648,21 +723,27 @@ export async function executeStep(
         [TRANSIENT_EXECUTION_SYMBOL]: executionContext.transientExecution,
         engine: engine.getEngineContext(),
         abortSignal: abortController?.signal,
-        writer: new ToolStream(
-          {
-            prefix: 'workflow-step',
-            callId: stepCallId,
-            name: step.id,
-            runId,
-          },
-          outputWriter,
-        ),
         outputWriter,
         // Disable scorers must be explicitly set to false they are on by default
         scorers: disableScorers === false ? undefined : step.scorers,
         validateInputs: engine.options?.validateInputs,
         perStep,
-      });
+      };
+      const output = await runStep(
+        defineLazyWriter(
+          stepParams,
+          () =>
+            new ToolStream(
+              {
+                prefix: 'workflow-step',
+                callId: stepCallId,
+                name: step.id,
+                runId,
+              },
+              outputWriter,
+            ),
+        ),
+      );
 
       // Capture requestContext state after step execution (only for engines that need it)
       if (engine.requiresDurableContextSerialization()) {
@@ -783,13 +864,19 @@ export async function executeStep(
     stepResults,
     executionContext,
     requestContext,
+    // Upstream #27149: an explicit resume target (the agent loop's initial
+    // AGENT_RUN) wins over the suspending step's span, so repeated resumes stay
+    // siblings under the initial invocation.
     tracingContext:
-      stepResultForFence.status === 'suspended' && persistenceTracingSpan
-        ? {
-            traceId: persistenceTracingSpan.traceId,
-            spanId: resolveExportedSpanId(persistenceTracingSpan),
-            parentSpanId: persistenceTracingSpan.getParentSpanId(),
-          }
+      stepResultForFence.status === 'suspended'
+        ? (engine.options?.resumeTracingContext ??
+          (persistenceTracingSpan
+            ? {
+                traceId: persistenceTracingSpan.traceId,
+                spanId: resolveExportedSpanId(persistenceTracingSpan),
+                parentSpanId: persistenceTracingSpan.getParentSpanId(),
+              }
+            : undefined))
         : undefined,
     stepId: step.id,
     stepCallId,

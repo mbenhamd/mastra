@@ -45,6 +45,7 @@ export function createDurableBackgroundTaskCheckStep() {
       const { inputData, getInitData, retryCount } = params;
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       const typedInput = inputData as Record<string, any>;
+      if (typedInput.stepResult?.signalPreempted && !typedInput.stepResult.isContinued) return typedInput;
 
       const initData = getInitData<{
         runId: string;
@@ -71,7 +72,7 @@ export function createDurableBackgroundTaskCheckStep() {
 
       if (pubsub) {
         try {
-          await ensureRemoteAbortListener(pubsub, runId, runtimeBindingId);
+          await ensureRemoteAbortListener(pubsub, runId, runtimeBindingId, params.mastra);
         } catch (error) {
           params.mastra?.getLogger?.()?.warn?.('Failed to subscribe to cross-process abort requests', {
             runId,

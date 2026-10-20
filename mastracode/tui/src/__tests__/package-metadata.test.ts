@@ -26,7 +26,8 @@ describe('mastracode package metadata', () => {
     const pkg = await readPackageJson();
 
     expect(pkg.type).toBe('module');
-    expect(pkg.files).toEqual(['dist']);
+    // The update notice reads this package's CHANGELOG.md from the npm CDN (sdk update-check.ts; upstream #26113).
+    expect(pkg.files).toEqual(['dist', 'CHANGELOG.md']);
     expect(pkg.bin).toEqual({ mastracode: './dist/cli.js' });
     expect(pkg.main).toBe('dist/index.js');
     expect(pkg.types).toBe('dist/index.d.ts');

@@ -1,9 +1,12 @@
 import path from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({
-  execa: vi.fn(),
-  onExit: vi.fn(),
+const { mocks, jscodeshiftOutput } = vi.hoisted(() => ({
+  mocks: {
+    execa: vi.fn(),
+    onExit: vi.fn(),
+  },
+  jscodeshiftOutput: 'Processing 1 files...\nconst result = memory.recall();\nResults:\n1 ok\n',
 }));
 
 vi.mock('execa', () => ({
@@ -22,6 +25,10 @@ describe('transform runner', () => {
     mocks.execa.mockResolvedValue({ stdout: '' });
     mocks.onExit.mockReset();
     mocks.onExit.mockReturnValue(vi.fn());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('runs the declared jscodeshift bin with a shell-free argument array', async () => {
@@ -52,7 +59,7 @@ describe('transform runner', () => {
         '--parser',
         'tsx',
         '--ignore-pattern=**/node_modules/**',
-        '--ignore-pattern=**/.*/**',
+        `--ignore-pattern=${path.join(path.resolve(source), '**/.*/**')}`,
         '--ignore-pattern=**/dist/**',
         '--ignore-pattern=**/build/**',
         '--ignore-pattern=**/*.min.js',
@@ -269,5 +276,122 @@ describe('transform runner', () => {
     expect(args).toContain(String.raw`C:\project\src\**`);
     expect(args).toContain('C:\\');
     expect(args).toContain(String.raw`\\server\share\**`);
+  });
+  it('rejects unknown codemod names', async () => {
+    await expect(transform('v1/does-not-exist', '.', {}, { logStatus: false })).rejects.toThrow(
+      'Unknown codemod "v1/does-not-exist". Available codemods: v1/mastra-core-imports',
+    );
+    expect(mocks.execa).not.toHaveBeenCalled();
+  });
+
+  it('forwards jscodeshift output for individual transforms', async () => {
+    mocks.execa.mockResolvedValueOnce({ stdout: jscodeshiftOutput });
+    const stdoutWriteSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await transform('v1/runtime-context', '.', {}, { logStatus: true });
+
+    expect(stdoutWriteSpy).toHaveBeenCalledWith(jscodeshiftOutput);
+  });
+
+  it.each([
+    ['dry', { dry: true }],
+    ['print', { print: true }],
+    ['verbose', { verbose: true }],
+  ] as const)('forwards jscodeshift output for %s runs without status logging', async (_name, transformOptions) => {
+    mocks.execa.mockResolvedValueOnce({ stdout: jscodeshiftOutput });
+    const stdoutWriteSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await transform('v1/runtime-context', '.', transformOptions, { logStatus: false });
+
+    expect(stdoutWriteSpy).toHaveBeenCalledWith(jscodeshiftOutput);
+  });
+
+  it('keeps routine bundled transforms quiet', async () => {
+    mocks.execa.mockResolvedValueOnce({ stdout: jscodeshiftOutput });
+    const stdoutWriteSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await transform('v1/runtime-context', '.', {}, { logStatus: false });
+
+    expect(stdoutWriteSpy).not.toHaveBeenCalled();
+  });
+
+  it('supports printed output larger than the default 1 MiB child-process buffer', async () => {
+    const largeOutput = 'x'.repeat(2 * 1024 * 1024);
+    mocks.execa.mockImplementationOnce(async (_file: string, _args: string[], options: { maxBuffer?: number }) => {
+      if (largeOutput.length > (options.maxBuffer ?? 1024 * 1024)) {
+        throw Object.assign(new RangeError('stdout maxBuffer length exceeded'), {
+          code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        });
+      }
+      return { stdout: largeOutput };
+    });
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await expect(transform('v1/runtime-context', '.', { print: true }, { logStatus: false })).resolves.toEqual({
+      errors: [],
+      notImplementedErrors: [],
+    });
+  });
+
+  it('anchors the hidden-directory ignore pattern to the target', async () => {
+    const source = '/tmp/.worktrees/project';
+
+    await transform('v1/runtime-context', source, {}, { logStatus: false });
+
+    const childArgs = mocks.execa.mock.calls[0]![1] as string[];
+    expect(childArgs).toContain(`--ignore-pattern=${path.join(path.resolve(source), '**/.*/**')}`);
+    expect(childArgs).not.toContain('--ignore-pattern=**/.*/**');
+  });
+
+  describe('error parsing', () => {
+    const run = async (stdout: string) => {
+      mocks.execa.mockResolvedValueOnce({ stdout });
+      return transform('v1/runtime-context', '.', {}, { logStatus: false });
+    };
+
+    it('reports non-syntax transform failures', async () => {
+      const { errors } = await run(
+        "Processing 1 files...\n ERR /src/boom.ts Transformation error (Cannot read properties of undefined (reading 'x'))\nTypeError: Cannot read properties of undefined (reading 'x')\n    at foo\nResults:\n1 errors\n",
+      );
+      expect(errors).toEqual([
+        {
+          transform: 'v1/runtime-context',
+          filename: '/src/boom.ts',
+          summary: "Cannot read properties of undefined (reading 'x')",
+        },
+      ]);
+    });
+
+    it('reports syntax errors', async () => {
+      const { errors } = await run(
+        ' ERR /src/bad.ts Transformation error (Unexpected token (1:13))\nSyntaxError: Unexpected token (1:13)\n',
+      );
+      expect(errors).toEqual([
+        { transform: 'v1/runtime-context', filename: '/src/bad.ts', summary: 'Unexpected token (1:13)' },
+      ]);
+    });
+
+    it('attributes each error in mixed runs to its own file', async () => {
+      const { errors } = await run(
+        [
+          ' ERR /src/boom.ts Transformation error (boom)',
+          'TypeError: boom',
+          '    at transform',
+          ' ERR /src/bad.ts Transformation error (Unexpected token (1:13))',
+          'SyntaxError: Unexpected token (1:13)',
+          'Results:',
+          '2 errors',
+        ].join('\n'),
+      );
+      expect(errors).toEqual([
+        { transform: 'v1/runtime-context', filename: '/src/boom.ts', summary: 'boom' },
+        { transform: 'v1/runtime-context', filename: '/src/bad.ts', summary: 'Unexpected token (1:13)' },
+      ]);
+    });
+
+    it('returns no errors for successful runs', async () => {
+      const { errors } = await run(jscodeshiftOutput);
+      expect(errors).toEqual([]);
+    });
   });
 });

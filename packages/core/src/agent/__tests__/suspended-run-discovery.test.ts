@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { z } from 'zod/v4';
 import type { IFGAProvider } from '../../auth/ee/interfaces/fga';
 import { Mastra } from '../../mastra';
+import { MockMemory } from '../../memory/mock';
 import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { getSnapshotMemoryInfo, InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
@@ -1910,6 +1911,57 @@ describe.each([
       );
     }, 30000);
 
+    // Fork (PF-1875, kept in PF-5928): sendToolApproval() without custom resumeData only claims approval suspensions
+    // (requiresApproval); a generic suspend() whose resumeSchema happens to look like an
+    // approval is resumed through resumeStream(), never through the approval API.
+    it('does not resume a generic suspension with approval-shaped resume data', async () => {
+      const resumedTool = vi.fn();
+      const storage = new InMemoryStore();
+      const approvalLikeTool = createTool({
+        id: 'approval-like-tool',
+        description: 'Suspends for an approval-shaped response',
+        inputSchema: z.object({}),
+        suspendSchema: z.object({ question: z.string() }),
+        resumeSchema: z.object({ approved: z.boolean() }),
+        execute: async (_input, context) => {
+          if (context?.agent?.resumeData === undefined) {
+            return await context?.agent?.suspend({ question: 'Continue?' });
+          }
+          resumedTool(context.agent.resumeData);
+          return context.agent.resumeData;
+        },
+      });
+      const agent = new Agent({
+        id: 'approval-shaped-suspension-agent',
+        name: 'Approval-shaped Suspension Agent',
+        instructions: 'Suspend before continuing.',
+        model: createMockModel({ toolName: 'approvalLikeTool', toolCallOnFirstCall: true }),
+        tools: { approvalLikeTool },
+      });
+      new Mastra({ agents: { agent }, logger: false, storage });
+
+      const stream = await agent.stream('Continue after approval', {
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      });
+      let toolCallId = '';
+      for await (const chunk of stream.fullStream) {
+        if (chunk.type === 'tool-call-suspended') {
+          toolCallId = chunk.payload.toolCallId;
+        }
+      }
+      expect(toolCallId).toBeTruthy();
+
+      await expect(
+        agent.sendToolApproval({
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          toolCallId,
+          approved: true,
+        }),
+      ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_NO_ACTIVE_THREAD_RUN' });
+      expect(resumedTool).not.toHaveBeenCalled();
+    }, 30000);
+
     it('declines a suspended run after a simulated restart', async () => {
       const storage = new InMemoryStore();
       const { agent } = createSuspendedSetup({ storage });
@@ -2509,4 +2561,263 @@ describe('snapshot path contract for threadId pushdown (#22627)', () => {
     );
     expect(getSnapshotMemoryInfo(snapshot)).toEqual(expect.objectContaining({ threadId: 'durable-thread-1' }));
   }, 60000);
+});
+
+describe('aborting a suspended run (#25903)', () => {
+  it('abortThreadStream removes the approval-suspended run from listSuspendedRuns', async () => {
+    const { agent } = createSuspendedSetup();
+    const { runId } = await suspendRun(agent, 'abort-thread', 'abort-resource');
+    expect((await agent.listSuspendedRuns({ threadId: 'abort-thread' })).runs.map(r => r.runId)).toContain(runId);
+
+    expect(await agent.abortThreadStream({ threadId: 'abort-thread', resourceId: 'abort-resource' })).toBe(true);
+
+    await vi.waitFor(async () => {
+      expect((await agent.listSuspendedRuns({ threadId: 'abort-thread' })).runs).toHaveLength(0);
+    });
+  });
+
+  it('abortRunStream removes the approval-suspended run from listSuspendedRuns', async () => {
+    const { agent } = createSuspendedSetup();
+    const { runId } = await suspendRun(agent, 'abort-run', 'abort-resource');
+
+    await agent.abortRunStream(runId);
+
+    await vi.waitFor(async () => {
+      expect((await agent.listSuspendedRuns({ threadId: 'abort-run' })).runs).toHaveLength(0);
+    });
+  });
+
+  async function suspendDurable(threadId: string) {
+    const baseAgent = new Agent({
+      id: 'durable-abort-agent',
+      name: 'Durable Abort Agent',
+      instructions: 'You find users.',
+      model: createMockModel(),
+      tools: { findUserTool: createFindUserTool() },
+    });
+    const durableAgent: any = createDurableAgent({ agent: baseAgent });
+    new Mastra({ agents: { durableAgent }, logger: false, storage: new InMemoryStore() });
+    const result: any = await durableAgent.stream('Find the user with name - Dero Israel', {
+      requireToolApproval: true,
+      memory: { thread: threadId, resource: 'abort-resource' },
+    });
+    for await (const chunk of result.fullStream) {
+      if (chunk.type === 'tool-call-approval') break;
+    }
+    await vi.waitFor(async () => {
+      expect((await durableAgent.listSuspendedRuns({ threadId })).runs.length).toBeGreaterThan(0);
+    });
+    return { durableAgent, result };
+  }
+
+  it('DurableAgent abortThreadStream removes the suspended run', async () => {
+    const { durableAgent } = await suspendDurable('durable-abort-thread');
+    expect(
+      await durableAgent.abortThreadStream({ threadId: 'durable-abort-thread', resourceId: 'abort-resource' }),
+    ).toBe(true);
+    await vi.waitFor(async () => {
+      expect((await durableAgent.listSuspendedRuns({ threadId: 'durable-abort-thread' })).runs).toHaveLength(0);
+    });
+  }, 30000);
+
+  describe('stale durable handles after a run id is reused (PF-5928)', () => {
+    /** Odd model calls request the approval-gated tool; even calls answer with text. */
+    function createAlternatingModel() {
+      let calls = 0;
+      return new MockLanguageModelV2({
+        doStream: async () => {
+          calls++;
+          const toolTurn = calls % 2 === 1;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream(
+              toolTurn
+                ? [
+                    { type: 'stream-start', warnings: [] },
+                    { type: 'response-metadata', id: `id-${calls}`, modelId: 'mock-model-id', timestamp: new Date(0) },
+                    {
+                      type: 'tool-call',
+                      toolCallId: `call-${calls}`,
+                      toolName: 'findUserTool',
+                      input: '{"name":"Dero Israel"}',
+                      providerExecuted: false,
+                    },
+                    {
+                      type: 'finish',
+                      finishReason: 'tool-calls',
+                      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                    },
+                  ]
+                : [
+                    { type: 'stream-start', warnings: [] },
+                    { type: 'response-metadata', id: `id-${calls}`, modelId: 'mock-model-id', timestamp: new Date(0) },
+                    { type: 'text-start', id: 't' },
+                    { type: 'text-delta', id: 't', delta: 'done' },
+                    { type: 'text-end', id: 't' },
+                    {
+                      type: 'finish',
+                      finishReason: 'stop',
+                      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+                    },
+                  ],
+            ),
+          };
+        },
+      });
+    }
+
+    async function setup(threadId: string) {
+      const baseAgent = new Agent({
+        id: 'durable-reuse-agent',
+        name: 'Durable Reuse Agent',
+        instructions: 'You find users.',
+        model: createAlternatingModel(),
+        tools: { findUserTool: createFindUserTool() },
+      });
+      const durableAgent: any = createDurableAgent({ agent: baseAgent });
+      const storage = new InMemoryStore();
+      new Mastra({ agents: { durableAgent }, logger: false, storage });
+      const startParked = async () => {
+        const result: any = await durableAgent.stream('Find the user with name - Dero Israel', {
+          runId: 'reused-durable-run',
+          memory: { thread: threadId, resource: 'abort-resource' },
+        });
+        for await (const chunk of result.fullStream) {
+          if (chunk.type === 'tool-call-approval') break;
+        }
+        await vi.waitFor(async () => {
+          expect((await durableAgent.listSuspendedRuns({ threadId })).runs.map((r: any) => r.runId)).toEqual([
+            'reused-durable-run',
+          ]);
+        });
+        return result;
+      };
+      // Run A: park, approve, finish, and release the resumed segment.
+      const first = await startParked();
+      const resumed: any = await durableAgent.resume('reused-durable-run', { approved: true });
+      for await (const _chunk of resumed.fullStream) {
+        // drain to completion
+      }
+      resumed.cleanup();
+      await vi.waitFor(async () => {
+        expect((await durableAgent.listSuspendedRuns({ threadId })).runs).toHaveLength(0);
+      });
+      // Retention erased A's terminal rows, which frees the caller-supplied id.
+      const workflowsStore: any = await storage.getStore('workflows');
+      await Promise.all(
+        [DurableStepIds.AGENTIC_LOOP, DurableStepIds.AGENTIC_EXECUTION].map(workflowName =>
+          workflowsStore.deleteWorkflowRunById({ runId: 'reused-durable-run', workflowName }),
+        ),
+      );
+      // Run B reuses the caller-supplied id and parks on its own approval.
+      const second = await startParked();
+      return { durableAgent, first, second };
+    }
+
+    it("an earlier execution's abort() leaves the successor that reused its run id parked", async () => {
+      const { durableAgent, first } = await setup('durable-reuse-abort');
+      await first.abort();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(
+        (await durableAgent.listSuspendedRuns({ threadId: 'durable-reuse-abort' })).runs.map((r: any) => r.runId),
+      ).toEqual(['reused-durable-run']);
+    }, 30000);
+
+    it("an earlier execution's cleanup() is a harmless no-op after its run id is reused", async () => {
+      const { durableAgent, first, second } = await setup('durable-reuse-cleanup');
+      expect(() => first.cleanup()).not.toThrow();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(
+        (await durableAgent.listSuspendedRuns({ threadId: 'durable-reuse-cleanup' })).runs.map((r: any) => r.runId),
+      ).toEqual(['reused-durable-run']);
+      // The successor's own handle still controls it.
+      await second.abort();
+      await vi.waitFor(async () => {
+        expect((await durableAgent.listSuspendedRuns({ threadId: 'durable-reuse-cleanup' })).runs).toHaveLength(0);
+      });
+    }, 30000);
+  });
+
+  // PF-5928: Stop on an approval-parked run is the decision on it. A tool call that parked AFTER an
+  // abort stays resumable (#26871), but an approval sent after a parked run was aborted never runs
+  // the tool, even when the abort's best-effort snapshot deletion fails or Stop is pressed again.
+  it.each([1, 2])(
+    'an approval after a parked abort never runs the tool (%i aborts)',
+    async aborts => {
+      let executions = 0;
+      const tool = createTool({
+        id: 'Find user tool',
+        description: 'Returns the name and email of a user',
+        inputSchema: z.object({ name: z.string() }),
+        requireApproval: true,
+        execute: async input => {
+          executions++;
+          return mockFindUser(input);
+        },
+      });
+      let modelCalls = 0;
+      const model = createMockModel();
+      const doStream = model.doStream.bind(model);
+      (model as any).doStream = async (options: any) => {
+        modelCalls++;
+        return doStream(options);
+      };
+      const storage = new InMemoryStore();
+      const agent = new Agent({
+        id: 'abort-then-approve-agent',
+        name: 'Abort Then Approve Agent',
+        instructions: 'You find users.',
+        model,
+        tools: { findUserTool: tool },
+        memory: new MockMemory({ storage }),
+      });
+      new Mastra({ agents: { agent }, logger: false, storage });
+      const workflowsStore: any = await storage.getStore('workflows');
+      vi.spyOn(workflowsStore, 'deleteWorkflowRunById').mockRejectedValue(new Error('storage unavailable'));
+      const threadId = 'abort-then-approve-thread';
+      const memory = { thread: threadId, resource: 'abort-resource' };
+      const output = await agent.stream('Find the user with name - Dero Israel', { memory });
+      let toolCallId: string | undefined;
+      for await (const chunk of output.fullStream) {
+        if (chunk.type === 'tool-call-approval') toolCallId = chunk.payload.toolCallId;
+      }
+      expect(toolCallId).toBeDefined();
+      await vi.waitFor(async () => {
+        expect((await agent.listSuspendedRuns({ threadId })).runs.length).toBeGreaterThan(0);
+      });
+      const callsAtStop = modelCalls;
+
+      // A Stop on a parked run is final: no tombstone timer may expire it, however late the approval.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        for (let i = 0; i < aborts; i++) agent.abortRunStream(output.runId);
+        vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+      } finally {
+        vi.useRealTimers();
+      }
+      const approval = await agent.approveToolCall({ runId: output.runId, toolCallId, memory }).then(
+        async resumed => {
+          for await (const _chunk of resumed.fullStream) {
+            // drain
+          }
+          return 'resumed';
+        },
+        () => 'refused',
+      );
+
+      expect(approval).toBe('refused');
+      expect(executions).toBe(0);
+      expect(modelCalls).toBe(callsAtStop);
+    },
+    30000,
+  );
+
+  it("DurableAgent stream result's abort() removes the suspended run", async () => {
+    const { durableAgent, result } = await suspendDurable('durable-abort-result');
+    result.abort();
+    await vi.waitFor(async () => {
+      expect((await durableAgent.listSuspendedRuns({ threadId: 'durable-abort-result' })).runs).toHaveLength(0);
+    });
+  }, 30000);
 });

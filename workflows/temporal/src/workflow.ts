@@ -4,6 +4,7 @@ import type { RunWithRawInput, Step, WorkflowConfig } from '@mastra/core/workflo
 import { TRANSIENT_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
 import type { PROCESSOR_EXECUTION_SYMBOL } from '@mastra/core/workflows/_constants';
 import type { Client } from '@temporalio/client';
+import type { ActivityOptions } from '@temporalio/workflow';
 import { TemporalRun } from './run';
 import type { TemporalEngineType } from './types';
 
@@ -11,6 +12,7 @@ export type TemporalWorkflowParams = {
   client: Client;
   taskQueue: string;
   startToCloseTimeout?: string;
+  retry?: ActivityOptions['retry'];
 };
 
 export class TemporalWorkflow<

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MastraFGAPermissions } from '../../../../auth/ee';
 import type { PubSub } from '../../../../events/pubsub';
 import {
   commitToolResult,
@@ -22,6 +23,8 @@ import { createStep } from '../../../../workflows/workflow';
 import { MessageList } from '../../../message-list';
 import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
+import { assertExecutionOwned, isExecutionFenceError } from '../../execution-fence';
+import { authorizeDurableMemory, getDurableMemoryAuthorizationChecks } from '../../memory-fga';
 import { getBoundRunRegistryEntry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
 import type {
@@ -32,6 +35,7 @@ import type {
   SerializableDurableState,
 } from '../../types';
 import { rebuildRunToolsFromMastra, resolveRuntimeDependencies } from '../../utils/resolve-runtime';
+import { readMessageListState, storeMessageListState } from '../shared/message-list-state';
 
 /**
  * Input schema for the durable LLM mapping step.
@@ -50,7 +54,8 @@ const durableLLMMappingInputSchema = z.object({
  * Output schema for the durable LLM mapping step
  */
 const durableLLMMappingOutputSchema = z.object({
-  messageListState: z.any(),
+  // Absent when the run keeps the transcript in workflow state.
+  messageListState: z.any().optional(),
   messageId: z.string(),
   stepResult: z.any(),
   toolResults: z.array(z.any()),
@@ -70,6 +75,7 @@ const durableLLMMappingOutputSchema = z.object({
   modelSpanData: z.any().optional(),
   responseRecoveryConsumed: z.boolean().optional(),
   recoveryToolCeiling: z.array(z.string()).optional(),
+  completionStartTime: z.coerce.date().optional(),
 });
 
 /**
@@ -115,7 +121,12 @@ export function createDurableLLMMappingStep() {
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
       if (pubsub) {
         try {
-          await ensureRemoteAbortListener(pubsub, _runId, durableInitData.runtimeBindingId);
+          await ensureRemoteAbortListener(
+            pubsub,
+            _runId,
+            durableInitData.runtimeBindingId,
+            mastra as Mastra | undefined,
+          );
         } catch (error) {
           (mastra as Mastra | undefined)?.getLogger?.()?.warn?.('Failed to subscribe to cross-process abort requests', {
             runId: _runId,
@@ -130,7 +141,23 @@ export function createDurableLLMMappingStep() {
           threadId: state.threadId,
           resourceId: state.resourceId,
         })
-      ).deserialize(llmOutput.messageListState);
+      ).deserialize(await readMessageListState(params, llmOutput));
+
+      if (llmOutput.stepResult.signalPreempted) {
+        return {
+          ...(await storeMessageListState(params, messageList.serialize())),
+          messageId,
+          stepResult: llmOutput.stepResult,
+          toolResults: [],
+          output: {
+            text: '',
+            toolCalls: [],
+            usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+            steps: [],
+          },
+          state,
+        } satisfies DurableAgenticExecutionOutput;
+      }
 
       // A declined approval has no `result` but is fully resolved: persist it as `output-denied`
       // with the approval decision (rather than as a successful `result`) so it round-trips on
@@ -211,6 +238,13 @@ export function createDurableLLMMappingStep() {
 
       if (toolResults.length > 0) {
         for (const toolResult of toolResults) {
+          if (toolResult.mappingError) {
+            const mappingError = new Error(toolResult.mappingError.message);
+            mappingError.name = toolResult.mappingError.name;
+            mappingError.stack = toolResult.mappingError.stack;
+            throw mappingError;
+          }
+
           // An aborted call was cancelled mid-flight, not completed: recording it
           // would fake-complete the call (`result: undefined` reads as success on
           // resume), so leave the invocation incomplete. Mirrors the non-durable
@@ -291,13 +325,12 @@ export function createDurableLLMMappingStep() {
           }
 
           // Compute toModelOutput for successful tool results (Bug 9 parity).
-          // Start from the existing providerMetadata so it's preserved even when
-          // toModelOutput is absent or fails — otherwise provider-executed tools
-          // or tools without a mapper lose their metadata. Results that already
-          // carry a mapped output from tool-call.ts (`modelOutputComputed`) are
-          // not recomputed: the serialization boundary is why tool-call maps
-          // eagerly, and this step only covers results that crossed the boundary
-          // unmapped (background completion, provider fallback).
+          // Start from the existing providerMetadata so tools without a mapper
+          // preserve their metadata. Results that already carry a mapped output
+          // from tool-call.ts (`modelOutputComputed`) are not recomputed: the
+          // serialization boundary is why tool-call maps eagerly, and this step
+          // only covers results that crossed the boundary unmapped (background
+          // completion, provider fallback).
           let providerMetadata: Record<string, unknown> | undefined = toolResult.providerMetadata as
             | Record<string, unknown>
             | undefined;
@@ -316,12 +349,6 @@ export function createDurableLLMMappingStep() {
               result: toolResult.result,
               existingProviderMetadata: toolResult.providerMetadata as Record<string, unknown> | undefined,
               parentSpan: stepSpan,
-              onMappingError: (err: unknown) => {
-                // toModelOutput errors are non-fatal — the tool result is still usable
-                mastra
-                  ?.getLogger?.()
-                  ?.warn?.(`[DurableAgent] toModelOutput failed for tool "${toolResult.toolName}": ${err}`);
-              },
             });
           }
 
@@ -462,51 +489,30 @@ export function createDurableLLMMappingStep() {
           })
         : undefined;
 
-      // The durable LLM step defers step-finish for tool-calling iterations.
-      // Keep it in workflow state until signal/terminal resolution so every
-      // engine emits tool-result -> terminal-result -> step-finish in order.
+      // 4. Carry the deferred step-finish after tool-result chunks have been
+      // emitted. The loop predicate adds step content and emits it after resolving
+      // continuation policy, avoiding duplicate tool results in persisted snapshots
+      // (#26348). Fork: a terminal result rides in the step-finish payload so the
+      // finalizer's authoritative terminal step-finish can be verified against
+      // its envelope (tool-result -> terminal-result -> step-finish).
       const deferredChunk = llmOutput.deferredStepFinishChunk as any;
-      let deferredStepFinishChunk: unknown;
-      if (deferredChunk) {
-        const stepContent: unknown[] = [];
-        if (llmOutput.text) {
-          stepContent.push({ type: 'text', text: llmOutput.text });
-        }
-        for (const tc of llmOutput.toolCalls ?? []) {
-          stepContent.push({
-            type: 'tool-call',
-            toolCallId: tc.toolCallId,
-            toolName: tc.toolName,
-            args: tc.args,
-          });
-        }
-        for (const tr of toolResults ?? []) {
-          if (isPendingClientCall(tr)) continue;
-          stepContent.push({
-            type: 'tool-result',
-            toolCallId: tr.toolCallId,
-            toolName: tr.toolName,
-            result: tr.error ? tr.error.message : tr.result,
-            ...(tr.error ? { isError: true } : {}),
-          });
-        }
-        deferredStepFinishChunk = {
-          ...deferredChunk,
-          payload: {
-            ...deferredChunk.payload,
-            stepResult: {
-              ...deferredChunk.payload?.stepResult,
-              isContinued,
+      const deferredStepFinishChunk = deferredChunk
+        ? {
+            ...deferredChunk,
+            payload: {
+              ...deferredChunk.payload,
+              stepResult: {
+                ...deferredChunk.payload?.stepResult,
+                isContinued,
+              },
+              ...(terminalToolResult ? { terminalToolResult } : {}),
             },
-            _durableStepContent: stepContent,
-            ...(terminalToolResult ? { terminalToolResult } : {}),
-          },
-        };
-      }
+          }
+        : undefined;
 
-      // 4. Build the output
+      // 5. Build the output
       const output: DurableAgenticExecutionOutput = {
-        messageListState: messageList.serialize(),
+        ...(await storeMessageListState(params, messageList.serialize())),
         messageId,
         stepResult: {
           ...llmOutput.stepResult,
@@ -517,9 +523,9 @@ export function createDurableLLMMappingStep() {
           text: llmOutput.text,
           toolCalls: llmOutput.toolCalls,
           usage: llmOutput.stepResult.totalUsage ?? {
-            inputTokens: 0,
-            outputTokens: 0,
-            totalTokens: 0,
+            inputTokens: undefined,
+            outputTokens: undefined,
+            totalTokens: undefined,
           },
           steps: [], // Steps are accumulated at the loop level
         },
@@ -536,6 +542,7 @@ export function createDurableLLMMappingStep() {
         delegationBailed,
         ...(terminalToolResult ? { terminalToolResult } : {}),
         ...(deferredStepFinishChunk ? { deferredStepFinishChunk } : {}),
+        completionStartTime: llmOutput.completionStartTime,
       };
 
       // Close the MODEL_STEP span for tool-calling iterations: the LLM step defers it so
@@ -572,6 +579,22 @@ export function createDurableLLMMappingStep() {
         state.threadId &&
         state.resourceId
       ) {
+        // Bound read (fork): authorization must use this execution's own entry.
+        const authorizationEntry = getBoundRunRegistryEntry(_runId, durableInitData.runtimeBindingId);
+        const authorizationRequestContext = authorizationEntry?.requestContext ?? requestContext;
+        const authorizeMemory = (permission: Parameters<typeof authorizeDurableMemory>[1]['permission']) =>
+          authorizeDurableMemory(getDurableMemoryAuthorizationChecks(authorizationEntry), {
+            mastra: mastra as Mastra | undefined,
+            user: authorizationRequestContext?.get('user'),
+            threadId: state.threadId!,
+            resourceId: state.resourceId!,
+            agentId: _agentId,
+            requestContext: authorizationRequestContext,
+            permission,
+            actor: (getInitData?.() as DurableAgenticWorkflowInput | undefined)?.options?.actor,
+          });
+        await authorizeMemory(MastraFGAPermissions.MEMORY_WRITE);
+        if (!state.threadExists) await authorizeMemory(MastraFGAPermissions.MEMORY_READ);
         try {
           // Re-read the entry: tool-call may have rebuilt the save queue into it. A connect()
           // worker in another process has none until something rebuilds it.
@@ -583,10 +606,14 @@ export function createDurableLLMMappingStep() {
             const rebuilt = await rebuildRunToolsFromMastra({
               mastra: mastra as Mastra,
               runId: _runId,
+              runtimeBindingId: durableInitData.runtimeBindingId,
               agentId: _agentId,
               state,
               toolsMetadata: durableInitData.toolsMetadata,
-              messageListState: durableInitData.messageListState,
+              // The transcript may ride in workflow state rather than the
+              // iteration input (#26221); the rebuild needs its memoryInfo
+              // (observational-memory source write guard) either way.
+              messageListState: await readMessageListState(params, durableInitData),
               requestContextEntries: durableInitData.requestContextEntries,
               requestContext,
             });
@@ -605,9 +632,13 @@ export function createDurableLLMMappingStep() {
               }
               output.state = { ...output.state, threadExists: true };
             }
-            await saveQueueManager.flushMessages(messageList, state.threadId, state.memoryConfig);
+            await saveQueueManager.flushMessages(messageList, state.threadId, state.memoryConfig, {
+              beforePersist: () =>
+                assertExecutionOwned({ runId: _runId, agentId: _agentId, requestContext, mastra: mastra as Mastra }),
+            });
           }
         } catch (error) {
+          if (isExecutionFenceError(error)) throw error;
           mastra?.getLogger?.()?.warn?.(`[DurableAgent] Failed to save step: ${error}`);
         }
       }

@@ -167,7 +167,8 @@ describe('PF-5399 public step content', () => {
 
   it('keeps the tool step out of an attempt retried after an API error', async () => {
     // The retried attempt adds no StepResult to the loop, so its step-finish carries the tool
-    // step's last; the attempt keeps the partial text it wrote.
+    // step's last. Upstream #26654 drops a failed attempt's partial text when an API error is
+    // retried, so the attempt reports no content (and never the tool step's).
     const agent = new Agent({
       id: 'a',
       name: 'a',
@@ -185,11 +186,7 @@ describe('PF-5399 public step content', () => {
     const out = await agent.stream('go');
     await out.consumeStream();
 
-    expect(await stepContents(out)).toEqual([
-      ['tool-call:c1', 'tool-result:c1'],
-      ['text:FAILED PARTIAL'],
-      ['text:recovered'],
-    ]);
+    expect(await stepContents(out)).toEqual([['tool-call:c1', 'tool-result:c1'], [], ['text:recovered']]);
   });
 
   it.each([
@@ -211,7 +208,8 @@ describe('PF-5399 public step content', () => {
 
     const retried = (await restored.steps).at(-1)!;
     expect(retried.content).not.toContainEqual(toolStep.content[0]);
-    expect(retried.content).toContainEqual(expect.objectContaining({ type: 'text', text: 'FAILED PARTIAL' }));
+    // Upstream #26654: a retried attempt contributes no content.
+    expect(retried.content).toEqual([]);
   });
 
   it('reads the answer after resuming a state saved before the loop step count, past API-error retries', async () => {

@@ -48,6 +48,10 @@ function findNonJsonSafePath(value: unknown, path: string, ancestors: Set<object
   }
 }
 
+export function isJsonSafe(value: unknown): boolean {
+  return findNonJsonSafePath(value, '', new Set()) === undefined;
+}
+
 /**
  * Schema for the serialized durable options carried in workflow input. These
  * options cross step boundaries (and processes) as JSON, so live objects such
@@ -100,13 +104,29 @@ export const durableResponseRecoveryStateSchema = z.object({
 });
 
 /**
+ * Type for accumulated usage. Keys stay present in memory so the value can be
+ * passed to usage consumers, while JSON serialization may omit unknown values.
+ */
+export type AccumulatedUsage = {
+  inputTokens: number | undefined;
+  outputTokens: number | undefined;
+  totalTokens: number | undefined;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  reasoningTokens?: number;
+};
+
+/**
  * Schema for accumulated usage across iterations
  */
 export const accumulatedUsageSchema = z.object({
-  inputTokens: z.number(),
-  outputTokens: z.number(),
-  totalTokens: z.number(),
-});
+  inputTokens: z.number().optional(),
+  outputTokens: z.number().optional(),
+  totalTokens: z.number().optional(),
+  cachedInputTokens: z.number().optional(),
+  cacheCreationInputTokens: z.number().optional(),
+  reasoningTokens: z.number().optional(),
+}) as z.ZodType<AccumulatedUsage>;
 
 /** JSON-safe result emitted when a tool intentionally ends an agent run. */
 export const terminalToolResultSchema = z.object({
@@ -180,7 +200,11 @@ export const baseIterationStateSchema = z.object({
   hasProcessors: z.boolean().optional(),
   runtimeBindings: z.any().optional(),
   runtimeResolution: z.literal('registry-required').optional(),
-  messageListState: z.any(),
+  // Absent when the run keeps the transcript in workflow state.
+  messageListState: z.any().optional(),
+  // Immutable untagged system-message baseline captured before the first
+  // iteration. Each model attempt restores it before input-step processors run.
+  initialUntaggedSystemMessages: z.array(z.any()).optional(),
   toolsMetadata: z.array(z.any()),
   modelConfig: z.any(),
   options: durableOptionsSchema,
@@ -197,6 +221,9 @@ export const baseIterationStateSchema = z.object({
   iterationCount: z.number(),
   accumulatedSteps: z.array(z.any()),
   accumulatedUsage: accumulatedUsageSchema,
+  // Identifies states whose usage accumulator preserves unknown counters. Older
+  // states have no marker and may contain partial totals presented as complete.
+  usageAggregationVersion: z.literal(1).optional(),
   // Last step result for continuation check
   lastStepResult: z.any().optional(),
   // Enabled model-list entry that served the preceding iteration.
@@ -213,14 +240,11 @@ export const baseIterationStateSchema = z.object({
   // Span identity stays stable while content-free generation attributes advance.
   agentSpanData: z.any().optional(),
   modelSpanData: z.any().optional(),
+  // First chunk clock, carried so the final step can end the generation and AGENT_RUN with it
+  completionStartTime: z.coerce.date().optional(),
 });
 
 /**
  * Type for the base iteration state
  */
 export type BaseIterationState = z.infer<typeof baseIterationStateSchema>;
-
-/**
- * Type for accumulated usage
- */
-export type AccumulatedUsage = z.infer<typeof accumulatedUsageSchema>;

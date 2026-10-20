@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MASTRA_AUTH_TOKEN_KEY, RequestContext, isInfrastructureRequestContextKey } from './index';
+import {
+  MASTRA_AUTH_TOKEN_KEY,
+  MASTRA_INHERITED_MEMORY_KEY,
+  MASTRA_THREAD_ID_KEY,
+  RequestContext,
+  isInfrastructureRequestContextKey,
+} from './index';
 
 describe('isInfrastructureRequestContextKey', () => {
   it.each([
@@ -547,7 +553,7 @@ describe('RequestContext', () => {
   });
 
   describe('serializeForSpan', () => {
-    it('redacts the reserved auth token while preserving safe primitives', () => {
+    it('should omit the auth token key while preserving safe primitives', () => {
       const ctx = new RequestContext();
       ctx.set(MASTRA_AUTH_TOKEN_KEY, 'Bearer SECRET_AUTH_TOKEN');
       ctx.set('userId', 'user-123');
@@ -556,13 +562,61 @@ describe('RequestContext', () => {
       ctx.set('none', null);
       ctx.set('missing', undefined);
 
-      expect(ctx.serializeForSpan()).toEqual({
-        [MASTRA_AUTH_TOKEN_KEY]: '[REDACTED]',
+      const result = ctx.serializeForSpan();
+
+      expect(result).toEqual({
         userId: 'user-123',
         attempt: 2,
         enabled: true,
         none: null,
         missing: undefined,
+      });
+      expect(JSON.stringify(result)).not.toContain('SECRET_AUTH_TOKEN');
+    });
+
+    it('should omit reserved mastra__ and __mastra_ keys', () => {
+      class TelegramAdapter {
+        staticBotToken = '123456789:FAKEtelegramTOKEN';
+      }
+      class MastraMemory {
+        connectionString = 'postgres://user:FAKEpassword@db/mastra';
+      }
+      const ctx = new RequestContext();
+      // Plain wrappers around live instances, as core sets them for channel and delegated runs.
+      ctx.set('__mastra_chat_channel_render', { adapter: new TelegramAdapter(), platform: 'telegram' });
+      ctx.set(MASTRA_INHERITED_MEMORY_KEY, { agentId: 'sub-agent', memory: new MastraMemory() });
+      ctx.set(MASTRA_THREAD_ID_KEY, 'thread-1');
+      ctx.set('userId', 'user-123');
+
+      const result = ctx.serializeForSpan();
+
+      expect(result).toEqual({ userId: 'user-123' });
+    });
+
+    it('should keep user keys that only contain a reserved prefix in the middle', () => {
+      const ctx = new RequestContext();
+      ctx.set('my_mastra__key', 'a');
+      ctx.set('x__mastra_y', 'b');
+
+      expect(ctx.serializeForSpan()).toEqual({ my_mastra__key: 'a', x__mastra_y: 'b' });
+    });
+
+    it('should include primitive values as-is', () => {
+      const ctx = new RequestContext();
+      ctx.set('str', 'hello');
+      ctx.set('num', 42);
+      ctx.set('bool', true);
+      ctx.set('nil', null);
+      ctx.set('undef', undefined);
+
+      const result = ctx.serializeForSpan();
+
+      expect(result).toEqual({
+        str: 'hello',
+        num: 42,
+        bool: true,
+        nil: null,
+        undef: undefined,
       });
     });
 

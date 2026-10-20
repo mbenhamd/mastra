@@ -3,7 +3,7 @@
  */
 
 import { TripWire } from '../../agent/trip-wire';
-import { MASTRA_AUTH_ORGANIZATION_KEY } from '../../request-context';
+import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_AUTH_TOKEN_KEY } from '../../request-context';
 import type { StepResult } from '../types';
 import type { Workflow } from '../workflow';
 import type { ParentWorkflow } from './workflow-event-processor';
@@ -42,12 +42,29 @@ export function runExpectsPersistedRow(
   );
 }
 
-/** Keep authenticated selection live in events, but never recover it from a stored context. */
+/**
+ * Keep authenticated selection live in events, but never recover it from a stored context.
+ * The persisted copy also drops the framework bearer token (upstream #26638, `withoutAuthToken`).
+ */
 export function getPersistedRequestContext(requestContext: Record<string, any>): Record<string, any> {
-  if (!requestContext || !Object.hasOwn(requestContext, MASTRA_AUTH_ORGANIZATION_KEY)) return requestContext;
-  const persisted = { ...requestContext };
+  const withoutToken = withoutAuthToken(requestContext);
+  if (!withoutToken || !Object.hasOwn(withoutToken, MASTRA_AUTH_ORGANIZATION_KEY)) return withoutToken;
+  const persisted = { ...withoutToken };
   delete persisted[MASTRA_AUTH_ORGANIZATION_KEY];
   return persisted;
+}
+
+/**
+ * Returns a copy of a serialized request context without the framework-managed
+ * bearer token. The token must never be persisted in durable snapshots (it is
+ * only valid for the live request), matching DefaultExecutionEngine.serializeRequestContext.
+ */
+export function withoutAuthToken<T extends Record<string, any> | undefined>(requestContext: T): T {
+  if (!requestContext || !(MASTRA_AUTH_TOKEN_KEY in requestContext)) {
+    return requestContext;
+  }
+  const { [MASTRA_AUTH_TOKEN_KEY]: _authToken, ...rest } = requestContext;
+  return rest as T;
 }
 
 /**

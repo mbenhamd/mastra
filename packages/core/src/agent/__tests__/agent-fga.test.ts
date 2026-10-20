@@ -11,7 +11,8 @@ import type { IFGAProvider } from '../../auth/ee/interfaces/fga';
 import { EventEmitterPubSub } from '../../events';
 import { Mastra } from '../../mastra';
 import { createRunScope } from '../../mastra/run-scope';
-import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '../../request-context';
+import { MockMemory } from '../../memory/mock';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage';
 import { Agent } from '../agent';
 import { DurableStepIds } from '../durable/constants';
@@ -466,6 +467,112 @@ describe('Agent FGA checks', () => {
         { id: 'default-user', organizationMembershipId: 'default-om' },
         { resourceId: 'caller-resource' },
       );
+    });
+  });
+
+  describe('agent memory', () => {
+    for (const method of ['generate', 'stream'] as const) {
+      it(`denies ${method} before reading memory`, async () => {
+        const fgaProvider = createMockFGAProvider(true);
+        vi.mocked(fgaProvider.require).mockImplementation(async (_user, input) => {
+          if (input.permission === 'memory:read') {
+            throw new FGADeniedError({ id: 'user-1' }, input.resource, input.permission);
+          }
+        });
+        const memory = new MockMemory();
+        const getThreadById = vi.spyOn(memory, 'getThreadById');
+        const agent = new Agent({
+          id: 'test-agent',
+          name: 'test-agent',
+          instructions: 'test',
+          model: createMockModel(),
+          memory,
+        });
+        new Mastra({ agents: { testAgent: agent }, logger: false, server: { fga: fgaProvider } });
+        const requestContext = new RequestContext();
+        requestContext.set('user', { id: 'user-1', organizationMembershipId: 'om-1' });
+
+        await expect(
+          agent[method]('test', {
+            memory: { thread: 'thread-1', resource: 'resource-1' },
+            requestContext: requestContext as any,
+          } as any),
+        ).rejects.toThrow('FGA authorization denied: user user-1 cannot memory:read on thread:thread-1');
+
+        expect(getThreadById).not.toHaveBeenCalled();
+        expect(fgaProvider.require).toHaveBeenCalledWith(
+          { id: 'user-1', organizationMembershipId: 'om-1' },
+          {
+            resource: { type: 'thread', id: 'thread-1' },
+            permission: 'memory:read',
+            context: {
+              requestContext,
+              resourceId: 'resource-1',
+              metadata: {
+                threadId: 'thread-1',
+                resourceId: 'resource-1',
+                agentId: 'test-agent',
+              },
+            },
+          },
+        );
+      });
+    }
+
+    it('denies writes before creating a memory thread', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      vi.mocked(fgaProvider.require).mockImplementation(async (_user, input) => {
+        if (input.permission === 'memory:write') {
+          throw new FGADeniedError({ id: 'user-1' }, input.resource, input.permission);
+        }
+      });
+      const memory = new MockMemory();
+      const createThread = vi.spyOn(memory, 'createThread');
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        memory,
+      });
+      new Mastra({ agents: { testAgent: agent }, logger: false, server: { fga: fgaProvider } });
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1', organizationMembershipId: 'om-1' });
+
+      await expect(
+        agent.generate('test', {
+          memory: { thread: 'thread-1', resource: 'resource-1' },
+          requestContext: requestContext as any,
+        }),
+      ).rejects.toThrow('FGA authorization denied: user user-1 cannot memory:write on thread:thread-1');
+
+      expect(createThread).not.toHaveBeenCalled();
+    });
+
+    it('authorizes each memory permission once per run', async () => {
+      const fgaProvider = createMockFGAProvider(true);
+      const memory = new MockMemory();
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'test-agent',
+        instructions: 'test',
+        model: createMockModel(),
+        memory,
+      });
+      new Mastra({ agents: { testAgent: agent }, logger: false, server: { fga: fgaProvider } });
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1', organizationMembershipId: 'om-1' });
+
+      await agent.generate('test', {
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+        requestContext: requestContext as any,
+      });
+
+      const memoryPermissions = vi
+        .mocked(fgaProvider.require)
+        .mock.calls.map(([, input]) => input.permission)
+        .filter(permission => permission === 'memory:read' || permission === 'memory:write');
+      expect(memoryPermissions).toEqual(['memory:read', 'memory:write']);
     });
   });
 
@@ -1996,6 +2103,57 @@ describe('DurableAgent FGA checks', () => {
     await expectDurableDenial('generate');
   });
 
+  it('denies before durable memory reads when memory:read is denied', async () => {
+    const fgaProvider = createMockFGAProvider(true);
+    vi.mocked(fgaProvider.require).mockImplementation(async (_user, input) => {
+      if (input.permission === 'memory:read') {
+        throw new FGADeniedError({ id: 'user-1' }, input.resource, input.permission);
+      }
+    });
+    const memory = new MockMemory();
+    const getThreadById = vi.spyOn(memory, 'getThreadById');
+    const pubsub = new EventEmitterPubSub();
+    const base = new Agent({
+      id: 'test-agent',
+      name: 'test-agent',
+      instructions: 'test',
+      model: createMockModel(),
+      memory,
+    });
+    const durableAgent = createDurableAgent({ agent: base, pubsub });
+    const mastra = new Mastra({ agents: {}, logger: false, pubsub, server: { fga: fgaProvider } });
+    (durableAgent as any).__registerMastra(mastra);
+
+    const requestContext = new RequestContext();
+    requestContext.set('user', { id: 'user-1' });
+    requestContext.set('organizationId', 'org-1');
+    // PF-5928 adaptation (fork L24 FGA fail-closed): with FGA on, a DurableAgent run must carry a
+    // verified thread and resource identity, or it is refused before the memory:read check.
+    requestContext.set(MASTRA_THREAD_ID_KEY, 'thread-1');
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, 'resource-1');
+
+    try {
+      await expect(
+        durableAgent.generate('test', {
+          memory: { thread: 'thread-1', resource: 'resource-1' },
+          requestContext,
+        }),
+      ).rejects.toThrow('FGA authorization denied: user user-1 cannot memory:read on thread:thread-1');
+      expect(getThreadById).not.toHaveBeenCalled();
+      expect(fgaProvider.require).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'user-1' }),
+        expect.objectContaining({
+          permission: 'memory:read',
+          resource: { type: 'thread', id: 'thread-1' },
+          context: expect.objectContaining({ metadata: expect.objectContaining({ agentId: 'test-agent' }) }),
+        }),
+      );
+    } finally {
+      await mastra.stopWorkers?.();
+      await pubsub.close();
+    }
+  });
+
   it('stream() denies before durable execution when agents:execute is denied', async () => {
     await expectDurableDenial('stream');
   });
@@ -2027,11 +2185,17 @@ describe('DurableAgent FGA checks', () => {
     requestContext.set('organizationId', 'org-1');
     requestContext.set('user', user);
     const initialActor = { actorKind: 'system' as const, agentId: 'initial-system-agent' };
-    const { runId } = await durableAgent.prepare('test', {
-      requestContext,
-      actor: initialActor,
-    });
-    const resumeWorkflow = vi.fn().mockResolvedValue({ status: 'suspended' });
+    // PF-5928 adaptation (fork PF-1875 over upstream #27379): every durable resume validates the
+    // persisted agentic-loop row as the ownership authority, and a second resume of a run whose
+    // segment already ran needs that row (#27379). Upstream's hand-written bare `suspended` row has
+    // no durable workflow input, so the fork refuses it as not owned. Each resume therefore targets
+    // its own prepared run: the assertion about per-call actors is unchanged.
+    const runIds: string[] = [];
+    for (const _run of [0, 1, 2]) {
+      const runContext = new RequestContext(requestContext.entries());
+      runIds.push((await durableAgent.prepare('test', { requestContext: runContext, actor: initialActor })).runId);
+    }
+    const resumeWorkflow = vi.fn(async (_params: any) => ({ status: 'suspended' }));
     vi.spyOn(durableAgent, 'getWorkflow').mockReturnValue({
       createRun: vi.fn().mockResolvedValue({ resume: resumeWorkflow }),
     } as any);
@@ -2039,18 +2203,20 @@ describe('DurableAgent FGA checks', () => {
 
     try {
       // Fork contract: preparation itself enforces agents:execute fail-closed,
-      // so prepare() already authorized the initial actor once. Each resume()
+      // so each prepare() already authorized the initial actor once. Each resume()
       // below then authorizes exactly once with its own per-call actor.
-      expect(requireActor).toHaveBeenNthCalledWith(
-        1,
-        initialActor,
-        expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
-      );
+      for (const call of [1, 2, 3]) {
+        expect(requireActor).toHaveBeenNthCalledWith(
+          call,
+          initialActor,
+          expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
+        );
+      }
       const explicitActor = { actorKind: 'system' as const, agentId: 'resume-system-agent' };
-      results.push(await durableAgent.resume(runId, { approved: true }, { actor: explicitActor }));
+      results.push(await durableAgent.resume(runIds[0], { approved: true }, { actor: explicitActor }));
       await vi.waitFor(() => expect(resumeWorkflow).toHaveBeenCalledTimes(1));
       expect(requireActor).toHaveBeenNthCalledWith(
-        2,
+        4,
         explicitActor,
         expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
       );
@@ -2060,31 +2226,34 @@ describe('DurableAgent FGA checks', () => {
 
       const freshDefaultActor = { actorKind: 'system' as const, agentId: 'fresh-default-agent' };
       defaultActor = freshDefaultActor;
-      results.push(await durableAgent.resume(runId, { approved: true }));
+      results.push(await durableAgent.resume(runIds[1], { approved: true }));
       await vi.waitFor(() => expect(resumeWorkflow).toHaveBeenCalledTimes(2));
       expect(requireActor).toHaveBeenNthCalledWith(
-        3,
+        5,
         freshDefaultActor,
         expect.objectContaining({ resource: { type: 'agent', id: 'test-agent' } }),
       );
       expect(resumeWorkflow.mock.calls[1]?.[0].actor).toEqual(freshDefaultActor);
 
       defaultActor = undefined;
-      results.push(await durableAgent.resume(runId, { approved: true }));
+      results.push(await durableAgent.resume(runIds[2], { approved: true }));
       await vi.waitFor(() => expect(resumeWorkflow).toHaveBeenCalledTimes(3));
-      expect(requireActor).toHaveBeenCalledTimes(3);
-      expect(requireUser).toHaveBeenCalledWith(
-        user,
-        expect.objectContaining({
-          resource: { type: 'agent', id: 'test-agent' },
-          context: expect.objectContaining({ requestContext }),
-        }),
-      );
+      expect(requireActor).toHaveBeenCalledTimes(5);
+      // The third run's own request context (the boundary snapshot carries the run's durable
+      // execution mark too) authorizes the user.
+      const userCall = requireUser.mock.calls.at(-1)!;
+      expect(userCall[0]).toEqual(user);
+      expect(userCall[1]).toMatchObject({ resource: { type: 'agent', id: 'test-agent' } });
+      expect(userCall[1].context.metadata.runId).toBe(runIds[2]);
+      expect(userCall[1].context.requestContext.get('user')).toEqual(user);
+      expect(userCall[1].context.requestContext.get('organizationId')).toBe('org-1');
       expect(resumeWorkflow.mock.calls[2]?.[0].actor).toBeUndefined();
     } finally {
       results.forEach(result => result.cleanup());
-      durableAgent.runRegistry.cleanup(runId);
-      globalRunRegistry.delete(runId);
+      for (const runId of runIds) {
+        durableAgent.runRegistry.cleanup(runId);
+        globalRunRegistry.delete(runId);
+      }
       await mastra.stopWorkers?.();
       await pubsub.close();
     }
@@ -2327,10 +2496,11 @@ describe('DurableAgent FGA checks', () => {
 
     try {
       await (durableAgent as any)[method]({ runId: 'run-1', toolCallId: 'tool-call-1' });
+      // PF-5928 adaptation (upstream): resumeGenerate now takes `(resumeData, { runId, ... })`,
+      // matching Agent.resumeGenerate; the positional runId form is deprecated.
       expect(resumeGenerate).toHaveBeenCalledWith(
-        'run-1',
         { approved },
-        expect.objectContaining({ toolCallId: 'tool-call-1' }),
+        expect.objectContaining({ runId: 'run-1', toolCallId: 'tool-call-1' }),
       );
     } finally {
       await pubsub.close();

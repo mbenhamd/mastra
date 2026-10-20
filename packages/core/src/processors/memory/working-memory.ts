@@ -171,9 +171,15 @@ export class WorkingMemory implements Processor {
         : await loadWorkingMemory();
     }
 
-    // Read-only memory has no bootstrap/update behavior. Avoid paying for a
-    // system instruction when there is no durable context to provide.
-    const isReadOnly = this.options.readOnly || memoryContext.memoryConfig?.readOnly;
+    // Read-only when configured, or when the agent has no updateWorkingMemory
+    // tool (agentManaged: false). Read-only memory has no bootstrap/update
+    // behavior. Avoid paying for a system instruction when there is no durable
+    // context to provide.
+    const workingMemoryConfig = memoryContext.memoryConfig?.workingMemory;
+    const isReadOnly =
+      this.options.readOnly ||
+      memoryContext.memoryConfig?.readOnly ||
+      (typeof workingMemoryConfig === 'object' && workingMemoryConfig.agentManaged === false);
     if (isReadOnly && !workingMemoryData?.trim()) {
       return messageList;
     }

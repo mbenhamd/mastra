@@ -2,12 +2,7 @@ import { it, expect } from 'vitest';
 import { z } from 'zod/v4';
 import type { OutputProcessor, Processor } from '../../../../processors';
 import { createTool } from '../../../../tools';
-import {
-  runLoopScenario,
-  useLoopScenarioAimock,
-  describeForAllEngines,
-  isDurableEngineVariant,
-} from '../aimock-scenario';
+import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 import type { IterationCompleteContext } from '../../../../agent';
 import {
   AGENT_RESPONSE_RECOVERY_CONTINUATION,
@@ -26,9 +21,11 @@ import {
  * 3. The hook can inject feedback that the model sees on the next iteration.
  */
 describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine => {
+  const itFailsOnInngest = engine === 'inngest' ? it.fails : it;
   const getMock = useLoopScenarioAimock();
 
-  it('onIterationComplete receives iteration context with tool calls and results', async () => {
+  // Inngest's agentic loop has no isTaskComplete, goal, or onIterationComplete steps yet.
+  itFailsOnInngest('onIterationComplete receives iteration context with tool calls and results', async () => {
     const iterations: IterationCompleteContext[] = [];
 
     const addTool = createTool({
@@ -92,7 +89,8 @@ describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine =
     expect(text).toContain('sum of 2 and 3 is 5');
   });
 
-  it('onIterationComplete can stop iteration early with continue: false', async () => {
+  // Inngest's agentic loop has no isTaskComplete, goal, or onIterationComplete steps yet.
+  itFailsOnInngest('onIterationComplete can stop iteration early with continue: false', async () => {
     const iterations: IterationCompleteContext[] = [];
 
     const searchTool = createTool({
@@ -142,7 +140,8 @@ describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine =
     expect(text).toBe('Response 1');
   });
 
-  it('onIterationComplete can inject feedback (basic verification)', async () => {
+  // Inngest's agentic loop has no isTaskComplete, goal, or onIterationComplete steps yet.
+  itFailsOnInngest('onIterationComplete can inject feedback (basic verification)', async () => {
     const iterations: IterationCompleteContext[] = [];
     let feedbackInjected = false;
 
@@ -157,6 +156,9 @@ describeForAllEngines('AIMock loop scenario: onIterationComplete hook', engine =
     await runLoopScenario({
       engine,
       llm: getMock(),
+      // Agents now resolve the shared stability error processors, whose retry would change the
+      // request/step counts this case asserts. Opt out to keep its subject under test.
+      errorProcessors: [],
       prompt: 'Search for test',
       tools: { search: searchTool },
       stopWhen: ({ steps }: { steps: number }) => steps >= 2,
@@ -703,7 +705,10 @@ describeForAllEngines(
 
       expect(requests).toHaveLength(3);
       expect(requests[0]?.body?.tools ?? []).toHaveLength(1);
-      expect(requests[1]?.body?.tools ?? []).toHaveLength(0);
+      // Upstream #26232: `toolChoice: 'none'` keeps the definitions but no tool is callable.
+      expect(requests[1]?.body?.tools ?? []).toHaveLength(1);
+      expect(requests[1]?.body?.tool_choice).toBe('none');
+      // The recovery step is bounded by what the previous request let the model call: nothing.
       expect(requests[2]?.body?.tools ?? []).toHaveLength(0);
     });
 
@@ -1007,21 +1012,17 @@ describeForAllEngines(
 
       expect(toolExecutions).toBe(1);
       expect(requests).toHaveLength(2);
-      if (isDurableEngineVariant(engine)) {
-        // Durable (and the evented engine, which now runs EventedAgent on the
-        // durable loop builder) terminalizes the tripwire before a second
-        // iteration callback; there is therefore no callback opportunity to
-        // reopen the run.
-        expect(iterations).toHaveLength(1);
-      } else {
-        expect(iterations).toHaveLength(2);
-        expect(iterations[1]).toMatchObject({
-          text: '',
-          isFinal: true,
-          finishReason: 'tripwire',
-        });
-      }
-      expect(await output.finishReason).toBe(isDurableEngineVariant(engine) ? 'other' : 'tripwire');
+      // PF-5928 adaptation: on the fork every engine delivers the final tripwire iteration to
+      // onIterationComplete (the durable loop terminalizes through the same iteration callback as
+      // the plain loop), so upstream's durable-only "no second callback" difference does not
+      // reproduce. The callback declines to reopen a safety stop on every engine.
+      expect(iterations).toHaveLength(2);
+      expect(iterations[1]).toMatchObject({
+        text: '',
+        isFinal: true,
+        finishReason: 'tripwire',
+      });
+      expect(await output.finishReason).toBe('tripwire');
       expect(await output.text).not.toContain('UNEXPECTED_REOPENED_GENERATION');
     });
   },

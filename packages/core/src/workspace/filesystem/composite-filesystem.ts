@@ -377,7 +377,7 @@ export class CompositeFilesystem<
     if (virtual) return virtual;
 
     const r = this.resolveMount(path);
-    if (!r) throw new Error(`No mount for path: ${path}`);
+    if (!r) throw new FilesystemError(`No mount for path: ${path}`, 'ENOENT', path);
     return r.fs.readdir(r.fsPath, options);
   }
 
@@ -421,7 +421,7 @@ export class CompositeFilesystem<
     }
 
     const r = this.resolveMount(path);
-    if (!r) throw new Error(`No mount for path: ${path}`);
+    if (!r) throw new FilesystemError(`No mount for path: ${path}`, 'ENOENT', path);
 
     // Mount point root always returns directory stat (even if errored)
     if (r.fsPath === '') {

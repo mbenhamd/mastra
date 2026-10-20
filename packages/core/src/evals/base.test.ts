@@ -705,13 +705,31 @@ describe('createScorer', () => {
       });
     });
 
-    it('does not retry a V2 judge request when processor configuration is omitted', async () => {
+    it('retries a transient V2 judge request with the default error processors', async () => {
+      const { model, getCallCount } = createJudgeModel([createProviderError(429, true, 'rate limited')]);
+      const scorer = createScorer({
+        id: 'v2-judge-default-retry-scorer',
+        name: 'v2-judge-default-retry-scorer',
+        description: 'Retries transient V2 judge errors with the shared default error processors',
+        judge: { model, instructions: 'Test instructions' },
+      }).generateScore({
+        description: 'score',
+        createPrompt: () => 'score this',
+      });
+
+      await expect(scorer.run(testData.scoringInput)).rejects.toBeDefined();
+      // The judge is an Agent, so it picks up the shared stability error processors and the default
+      // StreamErrorRetryProcessor retries the transient 429 twice before giving up.
+      expect(getCallCount()).toBe(3);
+    });
+
+    it('does not retry a V2 judge request when the judge opts out of error processors', async () => {
       const { model, getCallCount } = createJudgeModel([createProviderError(429, true, 'rate limited')]);
       const scorer = createScorer({
         id: 'v2-judge-no-retry-scorer',
         name: 'v2-judge-no-retry-scorer',
-        description: 'Leaves V2 judge retries disabled without an error processor',
-        judge: { model, instructions: 'Test instructions' },
+        description: 'Leaves V2 judge retries disabled when the judge opts out',
+        judge: { model, instructions: 'Test instructions', errorProcessorDefaults: false },
       }).generateScore({
         description: 'score',
         createPrompt: () => 'score this',
@@ -1134,6 +1152,10 @@ describe('createScorer', () => {
             instructions: 'Return a score.',
             onStepFinish,
             onFinish,
+            // This case isolates the judge's structured-output fallback path. The shared stability
+            // error processors would retry inside the first stream instead of letting the fallback
+            // run, so opt the judge out to keep that path under test.
+            errorProcessorDefaults: false,
           },
         }).generateScore({
           description: 'score',
@@ -1359,7 +1381,9 @@ describe('createScorer', () => {
       const scorer = createScorer({
         id: 'reason-failure-scorer',
         description: 'Retains a completed score on reason failure',
-        judge: { model, instructions: 'Evaluate the output.' },
+        // A terminal provider rejection is the subject; the shared default error processors are
+        // opted out so their retry does not turn one failed attempt into several.
+        judge: { model, instructions: 'Evaluate the output.', errorProcessorDefaults: false },
       })
         .generateScore({ description: 'score', createPrompt: () => 'score this output' })
         .generateReason({ description: 'reason', createPrompt: () => 'explain this score' });
@@ -1438,7 +1462,9 @@ describe('createScorer', () => {
       const scorer = createScorer({
         id: 'provider-attempt-failure-scorer',
         description: 'Records an attempted judge invocation',
-        judge: { model, instructions: 'Return a score.' },
+        // The shared default error processors would retry inside the first stream and absorb the
+        // fallback this case asserts, so the judge opts out to keep the failure path under test.
+        judge: { model, instructions: 'Return a score.', errorProcessorDefaults: false },
       }).generateScore({ description: 'score', createPrompt: () => 'score this output' });
 
       const error = await scorer.run(testData.scoringInput).catch(error => error);
@@ -1474,7 +1500,10 @@ describe('createScorer', () => {
         const scorer = createScorer({
           id: 'fallback-provider-failure-scorer',
           description: 'Separates attempted fallback invocations from completed model calls',
-          judge: { model, instructions: 'Return a score.' },
+          // This case asserts the structured-output fallback path itself. The shared default error
+          // processors would retry inside the first stream instead of letting the fallback run, so
+          // opt the judge out to keep that path under test.
+          judge: { model, instructions: 'Return a score.', errorProcessorDefaults: false },
         }).generateScore({ description: 'score', createPrompt: () => 'score this output' });
 
         const error = await scorer.run(testData.scoringInput).catch(error => error);
@@ -1506,7 +1535,10 @@ describe('createScorer', () => {
         const scorer = createScorer({
           id: 'fallback-failure-scorer',
           description: 'Retains completed fallback telemetry on failure',
-          judge: { model, instructions: 'Return a score.' },
+          // This case asserts the structured-output fallback path itself. The shared default error
+          // processors would retry inside the first stream instead of letting the fallback run, so
+          // opt the judge out to keep that path under test.
+          judge: { model, instructions: 'Return a score.', errorProcessorDefaults: false },
         }).generateScore({ description: 'score', createPrompt: () => 'score this output' });
 
         const error = await scorer.run(testData.scoringInput).catch(error => error);
@@ -1807,8 +1839,8 @@ describe('createScorer', () => {
         expect.objectContaining({
           input: expect.objectContaining({
             run: expect.objectContaining({
+              // Reserved framework keys (the raw auth token) are omitted outright.
               requestContext: {
-                [MASTRA_AUTH_TOKEN_KEY]: '[REDACTED]',
                 userId: 'user-123',
                 nested: '[object]',
               },
@@ -1831,7 +1863,6 @@ describe('createScorer', () => {
       expect(internalSpanInput).toEqual(
         expect.objectContaining({
           requestContext: {
-            [MASTRA_AUTH_TOKEN_KEY]: '[REDACTED]',
             userId: 'user-123',
             nested: '[object]',
           },
@@ -1894,7 +1925,7 @@ describe('createScorer', () => {
         expect(captured.input?.requestContext).toEqual({ userId: 'u1', locale: 'en' });
       });
 
-      it('redacts the framework auth token even with the wildcard', async () => {
+      it('omits the framework auth token even with the wildcard', async () => {
         const { captured, scorer } = captureScorerRun();
 
         const requestContext = new RequestContext([
@@ -1908,8 +1939,7 @@ describe('createScorer', () => {
           requestContextKeys: ['*'],
         });
 
-        expect(captured.input?.requestContext?.userId).toBe('u1');
-        expect(captured.input?.requestContext?.[MASTRA_AUTH_TOKEN_KEY]).toBe('[REDACTED]');
+        expect(captured.input?.requestContext).toEqual({ userId: 'u1' });
       });
 
       it('bounds and redacts nested values selected by the wildcard', async () => {

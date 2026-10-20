@@ -17,7 +17,7 @@ export class InMemoryChannelsStorage extends ChannelsStorage {
     const existing = this.#installations.get(installation.id);
     this.#installations.set(installation.id, {
       ...installation,
-      ...(existing ? { createdAt: existing.createdAt } : {}),
+      createdAt: existing?.createdAt ?? installation.createdAt,
     });
   }
 

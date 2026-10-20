@@ -110,6 +110,7 @@ describe('durable tool-call context forwarding', () => {
         get: {
           response: { db: () => [message] },
           all: { db: () => [message] },
+          input: { aiV5: { model: () => [] } },
         },
       };
       globalRunRegistry.set(runId, {
@@ -190,6 +191,7 @@ describe('durable tool-call context forwarding', () => {
       get: {
         response: { db: () => [message] },
         all: { db: () => [message] },
+        input: { aiV5: { model: () => [] } },
       },
     };
     globalRunRegistry.set(runId, {

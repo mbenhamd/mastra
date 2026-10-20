@@ -9,6 +9,7 @@ import type { CoreTool } from '../../../tools/types';
 import type { MessageList } from '../../message-list';
 import type { AgentModelManagerConfig } from '../../types';
 import type {
+  SerializableClientTool,
   SerializableToolMetadata,
   SerializableModelConfig,
   SerializableModelListEntry,
@@ -213,6 +214,7 @@ export function serializeDurableState(params: {
   threadExists?: boolean;
   savePerStep?: boolean;
   observationalMemory?: boolean;
+  fixedMemory?: boolean;
 }): SerializableDurableState {
   return {
     memoryConfigured: params.memoryConfigured,
@@ -222,6 +224,7 @@ export function serializeDurableState(params: {
     threadExists: params.threadExists,
     savePerStep: params.savePerStep,
     observationalMemory: params.observationalMemory,
+    fixedMemory: params.fixedMemory,
   };
 }
 
@@ -289,9 +292,57 @@ export function serializeModelSettings(
 }
 
 /**
+ * Snapshot call-time client tools from their converted CoreTools so a worker in
+ * another process can rebuild them. Provider tools (no JSON input schema to
+ * carry) are skipped.
+ */
+export function serializeClientTools(
+  clientTools: Record<string, unknown> | undefined,
+  tools: Record<string, CoreTool>,
+): Record<string, SerializableClientTool> | undefined {
+  if (!clientTools) return undefined;
+  const out: Record<string, SerializableClientTool> = {};
+  for (const name of Object.keys(clientTools)) {
+    const tool = tools[name];
+    if (
+      !tool ||
+      (tool as { type?: string }).type === 'provider-defined' ||
+      (tool as { type?: string }).type === 'provider'
+    ) {
+      continue;
+    }
+    const meta = serializeToolMetadata(name, tool);
+    out[name] = {
+      id: meta.id,
+      description: meta.description,
+      inputSchema: meta.inputSchema,
+      requireApproval: meta.requireApproval,
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Collect the tool names from call-time toolsets so a cross-process worker can
+ * detect that they are unavailable.
+ */
+export function serializeToolsetToolNames(
+  toolsets: Record<string, Record<string, unknown> | undefined> | undefined,
+): string[] | undefined {
+  if (!toolsets) return undefined;
+  const names = new Set<string>();
+  for (const toolset of Object.values(toolsets)) {
+    for (const name of Object.keys(toolset ?? {})) names.add(name);
+  }
+  return names.size > 0 ? [...names] : undefined;
+}
+
+/**
  * Extract serializable options from agent execution options
  */
 export function serializeDurableOptions(options: {
+  clientTools?: SerializableDurableOptions['clientTools'];
+  toolsetToolNames?: string[];
   maxSteps?: number;
   recoveryMaxSteps?: number;
   toolChoice?: any;
@@ -310,6 +361,7 @@ export function serializeDurableOptions(options: {
   includeRawChunks?: boolean;
   returnScorerData?: boolean;
   hasErrorProcessors?: boolean;
+  emptyErrorProcessorOverride?: boolean;
   providerOptions?: SerializableDurableOptions['providerOptions'];
   structuredOutput?: SerializableDurableOptions['structuredOutput'];
   skipBgTaskWait?: boolean;
@@ -342,6 +394,8 @@ export function serializeDurableOptions(options: {
     ...(options.observationalMemorySourceWriteGuard
       ? { observationalMemorySourceWriteGuard: options.observationalMemorySourceWriteGuard }
       : {}),
+    clientTools: options.clientTools,
+    toolsetToolNames: options.toolsetToolNames,
     maxSteps: options.maxSteps,
     recoveryMaxSteps: options.recoveryMaxSteps,
     toolChoice: serializedToolChoice,
@@ -360,6 +414,7 @@ export function serializeDurableOptions(options: {
     includeRawChunks: options.includeRawChunks,
     returnScorerData: options.returnScorerData,
     hasErrorProcessors: options.hasErrorProcessors,
+    emptyErrorProcessorOverride: options.emptyErrorProcessorOverride,
     providerOptions: options.providerOptions,
     structuredOutput: options.structuredOutput,
     skipBgTaskWait: options.skipBgTaskWait,

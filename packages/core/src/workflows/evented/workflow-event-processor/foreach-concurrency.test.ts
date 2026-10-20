@@ -36,11 +36,15 @@ async function kickOffForeach({
   items,
   initData,
   requestContext,
+  currentOutput,
+  currentSuspendPayload,
 }: {
   concurrency: number | ((ctx: ForeachConcurrencyContext) => number);
   items: unknown[];
   initData?: unknown;
   requestContext?: Record<string, unknown>;
+  currentOutput?: unknown[];
+  currentSuspendPayload?: unknown;
 }) {
   const published: any[] = [];
   const pubsub = {
@@ -55,7 +59,20 @@ async function kickOffForeach({
       workflowId: 'wf',
       runId: 'run-1',
       executionPath: [0],
-      stepResults: initData === undefined ? {} : ({ input: initData } as any),
+      stepResults: {
+        ...(initData === undefined ? {} : { input: initData }),
+        ...(currentOutput === undefined
+          ? {}
+          : {
+              body: {
+                status: 'success',
+                output: currentOutput,
+                startedAt: 1,
+                payload: items,
+                suspendPayload: currentSuspendPayload,
+              },
+            }),
+      } as any,
       activeStepsPath: {},
       resumeSteps: [],
       prevResult: { status: 'success', output: items, startedAt: 1, endedAt: 2, payload: {} },
@@ -64,7 +81,7 @@ async function kickOffForeach({
     { pubsub, mastra, step: makeForeachStep(concurrency) },
   );
 
-  return published.filter(e => e.type === 'workflow.step.run');
+  return published;
 }
 
 describe('processWorkflowForEach concurrency resolution', () => {
@@ -276,5 +293,90 @@ describe('processWorkflowForEach concurrency resolution', () => {
     } finally {
       await mastra.shutdown();
     }
+  });
+
+  // Upstream #25639 cases, with suspended iterations written as the fork's engine suspension
+  // envelope (a user output carrying `status` is not a suspension).
+  it('suspends instead of replacing an iteration that still occupies its concurrency slot', async () => {
+    const events = await kickOffForeach({
+      concurrency: 1,
+      items: [1, 2],
+      currentOutput: [
+        {
+          status: 'suspended',
+          suspendedAt: 1,
+          suspendPayload: { approval: true, __workflow_meta: { path: ['body'] } },
+        },
+      ],
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'workflow.step.end',
+      data: { prevResult: { status: 'suspended' } },
+    });
+  });
+
+  it('preserves foreach output metadata when all active iterations are suspended', async () => {
+    const suspendedIteration = {
+      status: 'suspended',
+      suspendedAt: 1,
+      suspendPayload: { approval: true, __workflow_meta: { path: ['body'] } },
+    };
+    const events = await kickOffForeach({
+      concurrency: 1,
+      items: [1, 2, 3],
+      currentOutput: [{ status: 'success', output: 'first' }, suspendedIteration],
+      currentSuspendPayload: { __workflow_meta: { marker: 'kept' } },
+    });
+
+    expect(events).toHaveLength(1);
+    // The fork rebuilds `foreachOutput` from the live suspended iterations; other step metadata is kept.
+    expect(events[0]).toMatchObject({
+      type: 'workflow.step.end',
+      data: {
+        prevResult: {
+          status: 'suspended',
+          suspendPayload: {
+            __workflow_meta: { marker: 'kept', foreachIndex: 1, foreachOutput: { 1: suspendedIteration } },
+          },
+        },
+      },
+    });
+  });
+
+  it('starts the next iteration after a concurrency slot completes', async () => {
+    const events = await kickOffForeach({
+      concurrency: 1,
+      items: [1, 2],
+      currentOutput: [{ status: 'success', output: 'first' }],
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'workflow.step.run',
+      data: { executionPath: [0, 1] },
+    });
+  });
+
+  it('fills a free slot while another iteration remains suspended', async () => {
+    const events = await kickOffForeach({
+      concurrency: 2,
+      items: [1, 2, 3],
+      currentOutput: [
+        {
+          status: 'suspended',
+          suspendedAt: 1,
+          suspendPayload: { approval: true, __workflow_meta: { path: ['body'] } },
+        },
+        { status: 'success', output: 'second' },
+      ],
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'workflow.step.run',
+      data: { executionPath: [0, 2] },
+    });
   });
 });

@@ -35,6 +35,14 @@ export class WorkflowsStorageClickhouse extends WorkflowsStorage {
     return false;
   }
 
+  /**
+   * PapersFlow fork: this adapter does not implement `updateWorkflowState`, so lifecycle
+   * claims (restart/timeTravel) install the claimed generation through the snapshot.
+   */
+  supportsWorkflowStateUpdate(): boolean {
+    return false;
+  }
+
   async init(): Promise<void> {
     const schema = TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT];
     await this.#db.createTable({ tableName: TABLE_WORKFLOW_SNAPSHOT, schema });
@@ -48,6 +56,7 @@ export class WorkflowsStorageClickhouse extends WorkflowsStorage {
       tableName: TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
       schema: TABLE_SCHEMAS[TABLE_WORKFLOW_SNAPSHOT_HANDOFF],
     });
+    await this.#db.ensureSkipIndexes(TABLE_WORKFLOW_SNAPSHOT);
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -336,6 +345,9 @@ export class WorkflowsStorageClickhouse extends WorkflowsStorage {
             `,
         query_params: values,
         format: 'JSONEachRow',
+        // run_id and workflow_name are sort-key columns shared by every version,
+        // so the run_id skip index is safe to use under FINAL.
+        clickhouse_settings: { use_skip_indexes_if_final: 1 },
       });
 
       const resultJson = await result.json();

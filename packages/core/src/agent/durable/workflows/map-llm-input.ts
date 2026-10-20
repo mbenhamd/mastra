@@ -4,9 +4,15 @@ import type { DurableAgenticWorkflowInput } from '../types';
 export type DurableAccumulatedStep = Record<string, unknown>;
 
 export function mapDurableIterationToLLMInput(
-  state: DurableAgenticWorkflowInput & {
+  // Upstream #26221 moved the transcript into workflow state, so iteration
+  // state may carry no messageListState; the llm step reads it from state.
+  state: Omit<DurableAgenticWorkflowInput, 'messageListState'> & {
+    messageListState?: DurableAgenticWorkflowInput['messageListState'];
     iterationCount?: number;
     accumulatedSteps?: DurableAccumulatedStep[];
+    initialUntaggedSystemMessages?: unknown[];
+    lastStepResult?: { signalPreempted?: boolean };
+    completionStartTime?: Date;
   },
 ) {
   return {
@@ -19,6 +25,7 @@ export function mapDurableIterationToLLMInput(
     runtimeBindings: state.runtimeBindings,
     runtimeResolution: state.runtimeResolution,
     messageListState: state.messageListState,
+    initialUntaggedSystemMessages: state.initialUntaggedSystemMessages,
     toolsMetadata: state.toolsMetadata,
     modelConfig: state.modelConfig,
     modelList: state.modelList,
@@ -28,12 +35,14 @@ export function mapDurableIterationToLLMInput(
     state: state.state,
     messageId: state.messageId,
     stepIndex: state.iterationCount ?? state.stepIndex,
+    signalPreempted: state.lastStepResult?.signalPreempted,
     // Processor hooks receive the running step list (#24293) — the
     // llm-execution step reads this for stepNumber/steps parity with the
     // main loop.
     accumulatedSteps: state.accumulatedSteps,
     agentSpanData: state.agentSpanData,
     modelSpanData: state.modelSpanData,
+    completionStartTime: state.completionStartTime,
     requestContextEntries: state.requestContextEntries,
     requiredRequestContextCapabilities: state.requiredRequestContextCapabilities,
   };

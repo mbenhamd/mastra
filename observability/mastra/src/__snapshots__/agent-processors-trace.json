@@ -5,16 +5,22 @@
     "\u2502   \u2514\u2500\u2500 agent_run: \"agent run: 'validator-agent'\"",
     "\u2502       \u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
     "\u2502           \u2514\u2500\u2500 model_step: \"step: 0\"",
+    "\u2502               \u251c\u2500\u2500 processor_run: \"llm request processor: provider-history-compat\"",
+    "\u2502               \u251c\u2500\u2500 processor_run: \"llm request processor: unsupported-file-handler\"",
     "\u2502               \u2514\u2500\u2500 model_inference: \"inference: 0\"",
     "\u2502                   \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\"",
     "\u251c\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
     "\u2502   \u2514\u2500\u2500 model_step: \"step: 0\"",
+    "\u2502       \u251c\u2500\u2500 processor_run: \"llm request processor: provider-history-compat\"",
+    "\u2502       \u251c\u2500\u2500 processor_run: \"llm request processor: unsupported-file-handler\"",
     "\u2502       \u2514\u2500\u2500 model_inference: \"inference: 0\"",
     "\u2502           \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\"",
     "\u2514\u2500\u2500 processor_run: \"output processor: summarizer\"",
     "    \u2514\u2500\u2500 agent_run: \"agent run: 'summarizer-agent'\"",
     "        \u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
     "            \u2514\u2500\u2500 model_step: \"step: 0\"",
+    "                \u251c\u2500\u2500 processor_run: \"llm request processor: provider-history-compat\"",
+    "                \u251c\u2500\u2500 processor_run: \"llm request processor: unsupported-file-handler\"",
     "                \u2514\u2500\u2500 model_inference: \"inference: 0\"",
     "                    \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\""
   ],
@@ -31,7 +37,8 @@
         "entityType": "agent",
         "entityId": "test-agent",
         "attributes": {
-          "instructions": "You are a helpful assistant"
+          "instructions": "You are a helpful assistant",
+          "completionStartTime": "<date>"
         },
         "metadata": {
           "runId": "<runId-1>",
@@ -57,9 +64,9 @@
             "entityType": "input_processor",
             "entityId": "validator",
             "attributes": {
+              "processorPhase": "input",
               "processorExecutor": "legacy",
-              "processorIndex": 0,
-              "processorPhase": "input"
+              "processorIndex": 0
             },
             "metadata": {
               "runId": "<runId-1>",
@@ -108,7 +115,8 @@
                 "entityType": "agent",
                 "entityId": "validator-agent",
                 "attributes": {
-                  "instructions": "You validate input messages"
+                  "instructions": "You validate input messages",
+                  "completionStartTime": "<date>"
                 },
                 "metadata": {
                   "runId": "<runId-2>",
@@ -162,6 +170,7 @@
                       "providerRequestBytesTotal": 239,
                       "providerPreparationMsTotal": "<providerPreparationMsTotal>",
                       "providerMeasurementMsTotal": "<providerMeasurementMsTotal>",
+                      "completionStartTime": "<date>",
                       "providerSucceededInferenceCount": 1,
                       "providerErrorInferenceCount": 0,
                       "providerAbortedInferenceCount": 0,
@@ -169,7 +178,6 @@
                       "finishReason": "stop",
                       "responseId": "<responseId-1>",
                       "responseModel": "mock-model-id",
-                      "completionStartTime": "<date>",
                       "usage": {
                         "inputTokens": 15,
                         "outputTokens": 25,
@@ -226,6 +234,7 @@
                         "attributes": {
                           "stepIndex": 0,
                           "messageId": "<messageId-1>",
+                          "completionStartTime": "<date>",
                           "usage": {
                             "inputTokens": 15,
                             "outputTokens": 25,
@@ -268,6 +277,124 @@
                         {
                           "span": {
                             "id": "<span-6>",
+                            "traceId": "<trace-1>",
+                            "name": "llm request processor: provider-history-compat",
+                            "type": "processor_run",
+                            "completed": true,
+                            "isEvent": false,
+                            "isRootSpan": false,
+                            "parentId": "<span-5>",
+                            "entityType": "input_step_processor",
+                            "entityId": "provider-history-compat",
+                            "attributes": {
+                              "processorPhase": "llm_request",
+                              "processorExecutor": "legacy",
+                              "processorIndex": 0,
+                              "processorMeasurementState": "measured",
+                              "processorMeasurementMs": {
+                                "__any__": "number"
+                              },
+                              "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                              "processorInputMessageCount": 1,
+                              "processorInputMessageBytes": 145,
+                              "processorOutputMessageCount": 1,
+                              "processorOutputMessageBytes": 145,
+                              "processorMessageDeltaBytes": 0,
+                              "processorInputSystemMessageCount": 1,
+                              "processorInputSystemMessageBytes": 59,
+                              "processorOutputSystemMessageCount": 1,
+                              "processorOutputSystemMessageBytes": 59,
+                              "processorSystemMessageDeltaBytes": 0,
+                              "processorTotalDeltaBytes": 0,
+                              "processorInputUserMessageCount": 1,
+                              "processorInputUserMessageBytes": 145,
+                              "processorOutputUserMessageCount": 1,
+                              "processorOutputUserMessageBytes": 145,
+                              "processorUserMessageDeltaBytes": 0,
+                              "processorInputAssistantMessageCount": 0,
+                              "processorInputAssistantMessageBytes": 2,
+                              "processorOutputAssistantMessageCount": 0,
+                              "processorOutputAssistantMessageBytes": 2,
+                              "processorAssistantMessageDeltaBytes": 0,
+                              "processorInputToolMessageCount": 0,
+                              "processorInputToolMessageBytes": 2,
+                              "processorOutputToolMessageCount": 0,
+                              "processorOutputToolMessageBytes": 2,
+                              "processorToolMessageDeltaBytes": 0,
+                              "processorInputOtherMessageCount": 0,
+                              "processorInputOtherMessageBytes": 2,
+                              "processorOutputOtherMessageCount": 0,
+                              "processorOutputOtherMessageBytes": 2,
+                              "processorOtherMessageDeltaBytes": 0
+                            },
+                            "metadata": {
+                              "runId": "<runId-2>",
+                              "environment": "test"
+                            }
+                          }
+                        },
+                        {
+                          "span": {
+                            "id": "<span-7>",
+                            "traceId": "<trace-1>",
+                            "name": "llm request processor: unsupported-file-handler",
+                            "type": "processor_run",
+                            "completed": true,
+                            "isEvent": false,
+                            "isRootSpan": false,
+                            "parentId": "<span-5>",
+                            "entityType": "input_step_processor",
+                            "entityId": "unsupported-file-handler",
+                            "attributes": {
+                              "processorPhase": "llm_request",
+                              "processorExecutor": "legacy",
+                              "processorIndex": 2,
+                              "processorMeasurementState": "measured",
+                              "processorMeasurementMs": {
+                                "__any__": "number"
+                              },
+                              "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                              "processorInputMessageCount": 1,
+                              "processorInputMessageBytes": 145,
+                              "processorOutputMessageCount": 1,
+                              "processorOutputMessageBytes": 145,
+                              "processorMessageDeltaBytes": 0,
+                              "processorInputSystemMessageCount": 1,
+                              "processorInputSystemMessageBytes": 59,
+                              "processorOutputSystemMessageCount": 1,
+                              "processorOutputSystemMessageBytes": 59,
+                              "processorSystemMessageDeltaBytes": 0,
+                              "processorTotalDeltaBytes": 0,
+                              "processorInputUserMessageCount": 1,
+                              "processorInputUserMessageBytes": 145,
+                              "processorOutputUserMessageCount": 1,
+                              "processorOutputUserMessageBytes": 145,
+                              "processorUserMessageDeltaBytes": 0,
+                              "processorInputAssistantMessageCount": 0,
+                              "processorInputAssistantMessageBytes": 2,
+                              "processorOutputAssistantMessageCount": 0,
+                              "processorOutputAssistantMessageBytes": 2,
+                              "processorAssistantMessageDeltaBytes": 0,
+                              "processorInputToolMessageCount": 0,
+                              "processorInputToolMessageBytes": 2,
+                              "processorOutputToolMessageCount": 0,
+                              "processorOutputToolMessageBytes": 2,
+                              "processorToolMessageDeltaBytes": 0,
+                              "processorInputOtherMessageCount": 0,
+                              "processorInputOtherMessageBytes": 2,
+                              "processorOutputOtherMessageCount": 0,
+                              "processorOutputOtherMessageBytes": 2,
+                              "processorOtherMessageDeltaBytes": 0
+                            },
+                            "metadata": {
+                              "runId": "<runId-2>",
+                              "environment": "test"
+                            }
+                          }
+                        },
+                        {
+                          "span": {
+                            "id": "<span-8>",
                             "traceId": "<trace-1>",
                             "name": "inference: 0",
                             "type": "model_inference",
@@ -336,6 +463,16 @@
                               "runId": "<runId-2>",
                               "environment": "test"
                             },
+                            "input": [
+                              {
+                                "role": "system",
+                                "content": "You validate input messages"
+                              },
+                              {
+                                "role": "user",
+                                "content": "Validate:   Hello! How are you?  "
+                              }
+                            ],
                             "output": {
                               "text": "Mock V2 generate response",
                               "toolCalls": []
@@ -344,14 +481,14 @@
                           "children": [
                             {
                               "span": {
-                                "id": "<span-7>",
+                                "id": "<span-9>",
                                 "traceId": "<trace-1>",
                                 "name": "chunk: 'text'",
                                 "type": "model_chunk",
                                 "completed": true,
                                 "isEvent": false,
                                 "isRootSpan": false,
-                                "parentId": "<span-6>",
+                                "parentId": "<span-8>",
                                 "entityType": "agent",
                                 "entityId": "validator-agent",
                                 "attributes": {
@@ -379,7 +516,7 @@
         },
         {
           "span": {
-            "id": "<span-8>",
+            "id": "<span-10>",
             "traceId": "<trace-1>",
             "name": "llm: 'mock-model-id'",
             "type": "model_generation",
@@ -418,6 +555,7 @@
               "providerRequestBytesTotal": 229,
               "providerPreparationMsTotal": "<providerPreparationMsTotal>",
               "providerMeasurementMsTotal": "<providerMeasurementMsTotal>",
+              "completionStartTime": "<date>",
               "providerSucceededInferenceCount": 1,
               "providerErrorInferenceCount": 0,
               "providerAbortedInferenceCount": 0,
@@ -425,7 +563,6 @@
               "finishReason": "stop",
               "responseId": "<responseId-2>",
               "responseModel": "mock-model-id",
-              "completionStartTime": "<date>",
               "usage": {
                 "inputTokens": 15,
                 "outputTokens": 25,
@@ -469,19 +606,20 @@
           "children": [
             {
               "span": {
-                "id": "<span-9>",
+                "id": "<span-11>",
                 "traceId": "<trace-1>",
                 "name": "step: 0",
                 "type": "model_step",
                 "completed": true,
                 "isEvent": false,
                 "isRootSpan": false,
-                "parentId": "<span-8>",
+                "parentId": "<span-10>",
                 "entityType": "agent",
                 "entityId": "test-agent",
                 "attributes": {
                   "stepIndex": 0,
                   "messageId": "<messageId-2>",
+                  "completionStartTime": "<date>",
                   "usage": {
                     "inputTokens": 15,
                     "outputTokens": 25,
@@ -522,14 +660,132 @@
               "children": [
                 {
                   "span": {
-                    "id": "<span-10>",
+                    "id": "<span-12>",
+                    "traceId": "<trace-1>",
+                    "name": "llm request processor: provider-history-compat",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-11>",
+                    "entityType": "input_step_processor",
+                    "entityId": "provider-history-compat",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 1,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 1,
+                      "processorInputMessageBytes": 135,
+                      "processorOutputMessageCount": 1,
+                      "processorOutputMessageBytes": 135,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 59,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 59,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 135,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 135,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 0,
+                      "processorInputAssistantMessageBytes": 2,
+                      "processorOutputAssistantMessageCount": 0,
+                      "processorOutputAssistantMessageBytes": 2,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 0,
+                      "processorInputToolMessageBytes": 2,
+                      "processorOutputToolMessageCount": 0,
+                      "processorOutputToolMessageBytes": 2,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-13>",
+                    "traceId": "<trace-1>",
+                    "name": "llm request processor: unsupported-file-handler",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-11>",
+                    "entityType": "input_step_processor",
+                    "entityId": "unsupported-file-handler",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 3,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 1,
+                      "processorInputMessageBytes": 135,
+                      "processorOutputMessageCount": 1,
+                      "processorOutputMessageBytes": 135,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 59,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 59,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 135,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 135,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 0,
+                      "processorInputAssistantMessageBytes": 2,
+                      "processorOutputAssistantMessageCount": 0,
+                      "processorOutputAssistantMessageBytes": 2,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 0,
+                      "processorInputToolMessageBytes": 2,
+                      "processorOutputToolMessageCount": 0,
+                      "processorOutputToolMessageBytes": 2,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-14>",
                     "traceId": "<trace-1>",
                     "name": "inference: 0",
                     "type": "model_inference",
                     "completed": true,
                     "isEvent": false,
                     "isRootSpan": false,
-                    "parentId": "<span-9>",
+                    "parentId": "<span-11>",
                     "entityType": "agent",
                     "entityId": "test-agent",
                     "attributes": {
@@ -590,6 +846,16 @@
                       "runId": "<runId-1>",
                       "environment": "test"
                     },
+                    "input": [
+                      {
+                        "role": "system",
+                        "content": "You are a helpful assistant"
+                      },
+                      {
+                        "role": "user",
+                        "content": "  Hello! How are you?  "
+                      }
+                    ],
                     "output": {
                       "text": "Mock V2 stream response",
                       "toolCalls": []
@@ -598,14 +864,14 @@
                   "children": [
                     {
                       "span": {
-                        "id": "<span-11>",
+                        "id": "<span-15>",
                         "traceId": "<trace-1>",
                         "name": "chunk: 'text'",
                         "type": "model_chunk",
                         "completed": true,
                         "isEvent": false,
                         "isRootSpan": false,
-                        "parentId": "<span-10>",
+                        "parentId": "<span-14>",
                         "entityType": "agent",
                         "entityId": "test-agent",
                         "attributes": {
@@ -629,7 +895,7 @@
         },
         {
           "span": {
-            "id": "<span-12>",
+            "id": "<span-16>",
             "traceId": "<trace-1>",
             "name": "output processor: summarizer",
             "type": "processor_run",
@@ -640,9 +906,9 @@
             "entityType": "output_processor",
             "entityId": "summarizer",
             "attributes": {
+              "processorPhase": "outputResult",
               "processorExecutor": "legacy",
-              "processorIndex": 0,
-              "processorPhase": "outputResult"
+              "processorIndex": 0
             },
             "metadata": {
               "runId": "<runId-1>",
@@ -684,18 +950,19 @@
           "children": [
             {
               "span": {
-                "id": "<span-13>",
+                "id": "<span-17>",
                 "traceId": "<trace-1>",
                 "name": "agent run: 'summarizer-agent'",
                 "type": "agent_run",
                 "completed": true,
                 "isEvent": false,
                 "isRootSpan": false,
-                "parentId": "<span-12>",
+                "parentId": "<span-16>",
                 "entityType": "agent",
                 "entityId": "summarizer-agent",
                 "attributes": {
-                  "instructions": "You summarize text concisely"
+                  "instructions": "You summarize text concisely",
+                  "completionStartTime": "<date>"
                 },
                 "metadata": {
                   "runId": "<runId-3>",
@@ -710,14 +977,14 @@
               "children": [
                 {
                   "span": {
-                    "id": "<span-14>",
+                    "id": "<span-18>",
                     "traceId": "<trace-1>",
                     "name": "llm: 'mock-model-id'",
                     "type": "model_generation",
                     "completed": true,
                     "isEvent": false,
                     "isRootSpan": false,
-                    "parentId": "<span-13>",
+                    "parentId": "<span-17>",
                     "entityType": "agent",
                     "entityId": "summarizer-agent",
                     "attributes": {
@@ -749,6 +1016,7 @@
                       "providerRequestBytesTotal": 241,
                       "providerPreparationMsTotal": "<providerPreparationMsTotal>",
                       "providerMeasurementMsTotal": "<providerMeasurementMsTotal>",
+                      "completionStartTime": "<date>",
                       "providerSucceededInferenceCount": 1,
                       "providerErrorInferenceCount": 0,
                       "providerAbortedInferenceCount": 0,
@@ -756,7 +1024,6 @@
                       "finishReason": "stop",
                       "responseId": "<responseId-3>",
                       "responseModel": "mock-model-id",
-                      "completionStartTime": "<date>",
                       "usage": {
                         "inputTokens": 15,
                         "outputTokens": 25,
@@ -800,19 +1067,20 @@
                   "children": [
                     {
                       "span": {
-                        "id": "<span-15>",
+                        "id": "<span-19>",
                         "traceId": "<trace-1>",
                         "name": "step: 0",
                         "type": "model_step",
                         "completed": true,
                         "isEvent": false,
                         "isRootSpan": false,
-                        "parentId": "<span-14>",
+                        "parentId": "<span-18>",
                         "entityType": "agent",
                         "entityId": "summarizer-agent",
                         "attributes": {
                           "stepIndex": 0,
                           "messageId": "<messageId-3>",
+                          "completionStartTime": "<date>",
                           "usage": {
                             "inputTokens": 15,
                             "outputTokens": 25,
@@ -854,14 +1122,132 @@
                       "children": [
                         {
                           "span": {
-                            "id": "<span-16>",
+                            "id": "<span-20>",
+                            "traceId": "<trace-1>",
+                            "name": "llm request processor: provider-history-compat",
+                            "type": "processor_run",
+                            "completed": true,
+                            "isEvent": false,
+                            "isRootSpan": false,
+                            "parentId": "<span-19>",
+                            "entityType": "input_step_processor",
+                            "entityId": "provider-history-compat",
+                            "attributes": {
+                              "processorPhase": "llm_request",
+                              "processorExecutor": "legacy",
+                              "processorIndex": 0,
+                              "processorMeasurementState": "measured",
+                              "processorMeasurementMs": {
+                                "__any__": "number"
+                              },
+                              "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                              "processorInputMessageCount": 1,
+                              "processorInputMessageBytes": 146,
+                              "processorOutputMessageCount": 1,
+                              "processorOutputMessageBytes": 146,
+                              "processorMessageDeltaBytes": 0,
+                              "processorInputSystemMessageCount": 1,
+                              "processorInputSystemMessageBytes": 60,
+                              "processorOutputSystemMessageCount": 1,
+                              "processorOutputSystemMessageBytes": 60,
+                              "processorSystemMessageDeltaBytes": 0,
+                              "processorTotalDeltaBytes": 0,
+                              "processorInputUserMessageCount": 1,
+                              "processorInputUserMessageBytes": 146,
+                              "processorOutputUserMessageCount": 1,
+                              "processorOutputUserMessageBytes": 146,
+                              "processorUserMessageDeltaBytes": 0,
+                              "processorInputAssistantMessageCount": 0,
+                              "processorInputAssistantMessageBytes": 2,
+                              "processorOutputAssistantMessageCount": 0,
+                              "processorOutputAssistantMessageBytes": 2,
+                              "processorAssistantMessageDeltaBytes": 0,
+                              "processorInputToolMessageCount": 0,
+                              "processorInputToolMessageBytes": 2,
+                              "processorOutputToolMessageCount": 0,
+                              "processorOutputToolMessageBytes": 2,
+                              "processorToolMessageDeltaBytes": 0,
+                              "processorInputOtherMessageCount": 0,
+                              "processorInputOtherMessageBytes": 2,
+                              "processorOutputOtherMessageCount": 0,
+                              "processorOutputOtherMessageBytes": 2,
+                              "processorOtherMessageDeltaBytes": 0
+                            },
+                            "metadata": {
+                              "runId": "<runId-3>",
+                              "environment": "test"
+                            }
+                          }
+                        },
+                        {
+                          "span": {
+                            "id": "<span-21>",
+                            "traceId": "<trace-1>",
+                            "name": "llm request processor: unsupported-file-handler",
+                            "type": "processor_run",
+                            "completed": true,
+                            "isEvent": false,
+                            "isRootSpan": false,
+                            "parentId": "<span-19>",
+                            "entityType": "input_step_processor",
+                            "entityId": "unsupported-file-handler",
+                            "attributes": {
+                              "processorPhase": "llm_request",
+                              "processorExecutor": "legacy",
+                              "processorIndex": 2,
+                              "processorMeasurementState": "measured",
+                              "processorMeasurementMs": {
+                                "__any__": "number"
+                              },
+                              "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                              "processorInputMessageCount": 1,
+                              "processorInputMessageBytes": 146,
+                              "processorOutputMessageCount": 1,
+                              "processorOutputMessageBytes": 146,
+                              "processorMessageDeltaBytes": 0,
+                              "processorInputSystemMessageCount": 1,
+                              "processorInputSystemMessageBytes": 60,
+                              "processorOutputSystemMessageCount": 1,
+                              "processorOutputSystemMessageBytes": 60,
+                              "processorSystemMessageDeltaBytes": 0,
+                              "processorTotalDeltaBytes": 0,
+                              "processorInputUserMessageCount": 1,
+                              "processorInputUserMessageBytes": 146,
+                              "processorOutputUserMessageCount": 1,
+                              "processorOutputUserMessageBytes": 146,
+                              "processorUserMessageDeltaBytes": 0,
+                              "processorInputAssistantMessageCount": 0,
+                              "processorInputAssistantMessageBytes": 2,
+                              "processorOutputAssistantMessageCount": 0,
+                              "processorOutputAssistantMessageBytes": 2,
+                              "processorAssistantMessageDeltaBytes": 0,
+                              "processorInputToolMessageCount": 0,
+                              "processorInputToolMessageBytes": 2,
+                              "processorOutputToolMessageCount": 0,
+                              "processorOutputToolMessageBytes": 2,
+                              "processorToolMessageDeltaBytes": 0,
+                              "processorInputOtherMessageCount": 0,
+                              "processorInputOtherMessageBytes": 2,
+                              "processorOutputOtherMessageCount": 0,
+                              "processorOutputOtherMessageBytes": 2,
+                              "processorOtherMessageDeltaBytes": 0
+                            },
+                            "metadata": {
+                              "runId": "<runId-3>",
+                              "environment": "test"
+                            }
+                          }
+                        },
+                        {
+                          "span": {
+                            "id": "<span-22>",
                             "traceId": "<trace-1>",
                             "name": "inference: 0",
                             "type": "model_inference",
                             "completed": true,
                             "isEvent": false,
                             "isRootSpan": false,
-                            "parentId": "<span-15>",
+                            "parentId": "<span-19>",
                             "entityType": "agent",
                             "entityId": "summarizer-agent",
                             "attributes": {
@@ -923,6 +1309,16 @@
                               "runId": "<runId-3>",
                               "environment": "test"
                             },
+                            "input": [
+                              {
+                                "role": "system",
+                                "content": "You summarize text concisely"
+                              },
+                              {
+                                "role": "user",
+                                "content": "Summarize: Mock V2 stream response"
+                              }
+                            ],
                             "output": {
                               "text": "Mock V2 generate response",
                               "toolCalls": []
@@ -931,14 +1327,14 @@
                           "children": [
                             {
                               "span": {
-                                "id": "<span-17>",
+                                "id": "<span-23>",
                                 "traceId": "<trace-1>",
                                 "name": "chunk: 'text'",
                                 "type": "model_chunk",
                                 "completed": true,
                                 "isEvent": false,
                                 "isRootSpan": false,
-                                "parentId": "<span-16>",
+                                "parentId": "<span-22>",
                                 "entityType": "agent",
                                 "entityId": "summarizer-agent",
                                 "attributes": {

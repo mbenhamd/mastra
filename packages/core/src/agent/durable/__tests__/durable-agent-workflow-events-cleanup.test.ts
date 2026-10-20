@@ -53,10 +53,12 @@ describe('DurableAgent workflow.events.v2 topic cleanup (#20786)', () => {
     // #clearPubsubTopic calls — not the inner EventEmitterPubSub alone.
     const clearTopic = vi.spyOn(durableAgent.pubsub, 'clearTopic');
 
-    const { runId, cleanup } = await durableAgent.stream('hi');
+    const { runId, cleanup, output } = await durableAgent.stream('hi');
     const runtimeBindingId = globalRunRegistry.get(runId)?.runtimeBindingId;
     expect(runtimeBindingId).toEqual(expect.any(String));
-    // cleanup() is what #clearPubsubTopic is wired through; no need to drain.
+    // cleanup() waits for a running output's terminal event (#25974), so let
+    // the run settle first; cleanup() is what #clearPubsubTopic is wired through.
+    await output.consumeStream();
     cleanup();
 
     expect(clearTopic).toHaveBeenCalledWith(AGENT_STREAM_TOPIC(runId));

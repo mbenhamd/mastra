@@ -10,6 +10,7 @@ import {
   outputProcessorsSupportToolResult,
 } from '../../../processors/runner';
 import { DefaultStepResult } from '../../../stream/aisdk/v5/output-helpers';
+import { safeEnqueue } from '../../../stream/base';
 import type { ChunkType, ProviderMetadata } from '../../../stream/types';
 import { ChunkFrom } from '../../../stream/types';
 import {
@@ -108,7 +109,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
       );
 
       const enqueueTripwire = (r?: string, opts?: { retry?: boolean; metadata?: unknown }, pid?: string) => {
-        rest.controller.enqueue({
+        safeEnqueue(rest.controller, {
           type: 'tripwire',
           payload: {
             reason: r || 'Output processor blocked content',
@@ -127,7 +128,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
       }
 
       if (processed) {
-        rest.controller.enqueue(processed as ChunkType<OUTPUT>);
+        safeEnqueue(rest.controller, processed as ChunkType<OUTPUT>);
       }
 
       // Emit any parts a processor stashed for reprocessing (e.g. the non-text
@@ -148,14 +149,14 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           return processed ? (processed as ChunkType<OUTPUT>) : null;
         }
         if (r.part != null) {
-          rest.controller.enqueue(r.part as ChunkType<OUTPUT>);
+          safeEnqueue(rest.controller, r.part as ChunkType<OUTPUT>);
         }
       }
 
       return processed ? (processed as ChunkType<OUTPUT>) : null;
     } else {
       // No processor runner, just enqueue the chunk directly
-      rest.controller.enqueue(chunk);
+      safeEnqueue(rest.controller, chunk);
       return chunk;
     }
   }
@@ -219,7 +220,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
    * step result. Mirrors the tripwire emission in processAndEnqueueChunk.
    */
   function emitTripwireChunk(tripwire: TripWire): void {
-    rest.controller.enqueue({
+    safeEnqueue(rest.controller, {
       type: 'tripwire',
       payload: {
         reason: tripwire.message || 'Tool result blocked by processor',
@@ -239,6 +240,22 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
       // runs, so terminal eligibility must never live in a shared closure.
       const terminalResolutionState = { toolResultBlocked: false };
       const initialResult = getStepResult(llmExecutionStep);
+      // A processToolResult abort is terminal for the run: stop processing the
+      // remaining tool results and end the loop instead of calling the model again.
+      const bailOnToolResultTripwire = (tripwire: TripWire) => {
+        emitTripwireChunk(tripwire);
+        initialResult.stepResult.reason = 'tripwire';
+        initialResult.stepResult.isContinued = false;
+        refreshLatestStepResult();
+        return bail({
+          ...initialResult,
+          messages: {
+            all: rest.messageList.get.all.aiV5.model(),
+            user: rest.messageList.get.input.aiV5.model(),
+            nonUser: rest.messageList.get.response.aiV5.model(),
+          },
+        });
+      };
 
       /**
        * llm-execution-step creates the latest StepResult before local tools run.
@@ -310,10 +327,6 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           result: toolCall.result,
           existingProviderMetadata: toolCall.providerMetadata,
           parentSpan: observabilityContext?.tracingContext?.currentSpan,
-          // No `onMappingError`: on the default engine a toModelOutput failure
-          // rethrows and fails the run — the released contract. The durable
-          // engine supplies a warn-and-continue handler instead (redelivery
-          // would re-run the mapper on every attempt).
         });
       }
 
@@ -728,8 +741,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
             });
             if (!toolResultProcessing.ok) {
               terminalResolutionState.toolResultBlocked = true;
-              emitTripwireChunk(toolResultProcessing.tripwire);
-              continue;
+              return bailOnToolResultTripwire(toolResultProcessing.tripwire);
             }
 
             // Classify the final recorded result (after processToolResult) with the
@@ -877,8 +889,7 @@ export function createLLMMappingStep<Tools extends ToolSet = ToolSet, OUTPUT = u
           });
           if (!toolResultProcessing.ok) {
             terminalResolutionState.toolResultBlocked = true;
-            emitTripwireChunk(toolResultProcessing.tripwire);
-            continue;
+            return bailOnToolResultTripwire(toolResultProcessing.tripwire);
           }
 
           // Classify the final recorded result (after processToolResult) with the

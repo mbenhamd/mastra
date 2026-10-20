@@ -17,7 +17,14 @@ type InputShared_Auxiliary_21 =
       [key: string]: InputShared_Auxiliary_21;
     };
 
-type InputShared_Auxiliary_205 =
+type InputShared_Auxiliary_116 = {
+  workflowId: string;
+  runId: string;
+  executionPath: number[];
+  parentWorkflow?: InputShared_Auxiliary_116 | undefined;
+};
+
+type InputShared_Auxiliary_208 =
   | {
       op: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte';
       left:
@@ -56,42 +63,51 @@ type InputShared_Auxiliary_205 =
       value: string;
     }
   | {
+      op: 'matches' | 'notMatches';
+      left: {
+        path: string;
+      };
+      right: {
+        literal: string;
+      };
+    }
+  | {
       op: 'and' | 'or';
-      args: InputShared_Auxiliary_205[];
+      args: InputShared_Auxiliary_208[];
     }
   | {
       op: 'not';
-      arg: InputShared_Auxiliary_205;
+      arg: InputShared_Auxiliary_208;
     }
   | {
       spans:
         | {
-            some: InputShared_Auxiliary_224;
+            some: InputShared_Auxiliary_231;
           }
         | {
-            none: InputShared_Auxiliary_224;
+            none: InputShared_Auxiliary_231;
           };
     }
   | {
       scores:
         | {
-            some: InputShared_Auxiliary_224;
+            some: InputShared_Auxiliary_231;
           }
         | {
-            none: InputShared_Auxiliary_224;
+            none: InputShared_Auxiliary_231;
           };
     }
   | {
       feedback:
         | {
-            some: InputShared_Auxiliary_224;
+            some: InputShared_Auxiliary_231;
           }
         | {
-            none: InputShared_Auxiliary_224;
+            none: InputShared_Auxiliary_231;
           };
     };
 
-type InputShared_Auxiliary_224 =
+type InputShared_Auxiliary_231 =
   | {
       op: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte';
       left:
@@ -130,54 +146,63 @@ type InputShared_Auxiliary_224 =
       value: string;
     }
   | {
+      op: 'matches' | 'notMatches';
+      left: {
+        path: string;
+      };
+      right: {
+        literal: string;
+      };
+    }
+  | {
       op: 'and' | 'or';
-      args: InputShared_Auxiliary_224[];
+      args: InputShared_Auxiliary_231[];
     }
   | {
       op: 'not';
-      arg: InputShared_Auxiliary_224;
+      arg: InputShared_Auxiliary_231;
     };
 
-type InputShared_Auxiliary_252 =
+type InputShared_Auxiliary_265 =
   | {
       op: 'and' | 'or';
-      args: InputShared_Auxiliary_252[];
+      args: InputShared_Auxiliary_265[];
     }
   | {
       op: 'not';
-      arg: InputShared_Auxiliary_252;
+      arg: InputShared_Auxiliary_265;
     }
   | {
       traces:
         | {
-            some: InputShared_Auxiliary_205;
+            some: InputShared_Auxiliary_208;
           }
         | {
-            none: InputShared_Auxiliary_205;
+            none: InputShared_Auxiliary_208;
           };
     };
 
-type InputShared_Auxiliary_383 =
+type InputShared_Auxiliary_400 =
   | string
   | number
   | boolean
   | null
-  | InputShared_Auxiliary_383[]
+  | InputShared_Auxiliary_400[]
   | {
-      [key: string]: InputShared_Auxiliary_383;
+      [key: string]: InputShared_Auxiliary_400;
     };
 
-type InputShared_Auxiliary_680 =
+type InputShared_Auxiliary_705 =
   | null
   | string
   | number
   | boolean
-  | InputShared_Auxiliary_680[]
+  | InputShared_Auxiliary_705[]
   | {
-      [key: string]: InputShared_Auxiliary_680;
+      [key: string]: InputShared_Auxiliary_705;
     };
 
-type InputShared_Auxiliary_714 =
+type InputShared_Auxiliary_739 =
   | {
       op: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte';
       left:
@@ -222,47 +247,47 @@ type InputShared_Auxiliary_714 =
     }
   | {
       op: 'and' | 'or';
-      args: InputShared_Auxiliary_714[];
+      args: InputShared_Auxiliary_739[];
     }
   | {
       op: 'not';
-      arg: InputShared_Auxiliary_714;
+      arg: InputShared_Auxiliary_739;
     };
 
-type InputShared_Auxiliary_788 = {
+type InputShared_Auxiliary_813 = {
   id?: string | undefined;
   name: string;
   type: 'file' | 'folder';
   content?: string | undefined;
-  children?: InputShared_Auxiliary_788[] | undefined;
+  children?: InputShared_Auxiliary_813[] | undefined;
 };
 
-type Shared_Auxiliary_565 =
+type Shared_Auxiliary_579 =
   | string
   | number
   | boolean
   | null
-  | Shared_Auxiliary_565[]
+  | Shared_Auxiliary_579[]
   | {
-      [key: string]: Shared_Auxiliary_565;
+      [key: string]: Shared_Auxiliary_579;
     };
 
-type Shared_Auxiliary_747 =
+type Shared_Auxiliary_761 =
   | null
   | string
   | number
   | boolean
-  | Shared_Auxiliary_747[]
+  | Shared_Auxiliary_761[]
   | {
-      [key: string]: Shared_Auxiliary_747;
+      [key: string]: Shared_Auxiliary_761;
     };
 
-type Shared_Auxiliary_829 = {
+type Shared_Auxiliary_843 = {
   id?: string | undefined;
   name: string;
   type: 'file' | 'folder';
   content?: string | undefined;
-  children?: Shared_Auxiliary_829[] | undefined;
+  children?: Shared_Auxiliary_843[] | undefined;
 };
 
 type InputShared_Type_0 = {
@@ -306,6 +331,7 @@ type InputShared_Type_2 = {
   requestContextKeys?: string[] | undefined;
   traceId?: string | undefined;
   parentSpanId?: string | undefined;
+  nestUnderParent?: boolean | undefined;
   tags?: string[] | undefined;
   hideInput?: boolean | undefined;
   hideOutput?: boolean | undefined;
@@ -809,6 +835,8 @@ type InputShared_Type_20 = {
   tags?: string[] | undefined;
   /** Filter by one or more trace IDs */
   traceIds?: string[] | undefined;
+  /** Filter by one or more experiment IDs */
+  experimentIds?: string[] | undefined;
   /** Filter by metric name(s) */
   name?: string[] | undefined;
   /** Filter by execution source */
@@ -982,7 +1010,7 @@ type InputShared_Type_32 = {
   schemaId?: string | undefined;
   metadata?:
     | {
-        [key: string]: InputShared_Auxiliary_383;
+        [key: string]: InputShared_Auxiliary_400;
       }
     | undefined;
   object?: unknown | undefined;
@@ -1003,7 +1031,7 @@ type InputShared_Type_33 = {
   schemaId?: string | undefined;
   metadata?:
     | {
-        [key: string]: InputShared_Auxiliary_383;
+        [key: string]: InputShared_Auxiliary_400;
       }
     | undefined;
   object?: unknown | undefined;
@@ -1019,7 +1047,7 @@ type InputShared_Type_34 = {
   sha256?: string | undefined;
   metadata?:
     | {
-        [key: string]: InputShared_Auxiliary_383;
+        [key: string]: InputShared_Auxiliary_400;
       }
     | undefined;
 };
@@ -1072,6 +1100,12 @@ type InputShared_Type_38 =
   | {
       type: 'prompt_block_ref';
       id: string;
+      rules?:
+        | {
+            operator: 'AND' | 'OR';
+            conditions: InputShared_Type_37[];
+          }
+        | undefined;
     }
   | {
       type: 'prompt_block';
@@ -1464,10 +1498,40 @@ type InputShared_Type_63 = {
   observationalMemory?: (boolean | InputShared_Type_62) | undefined;
 };
 
-type InputShared_Type_64 =
-  | InputShared_Type_63
+type InputShared_Type_64 = {
+  /** Vector database identifier or false to disable */
+  vector?: (string | false) | undefined;
+  /** Memory behavior configuration, excluding workingMemory and threads */
+  options?: InputShared_Type_59 | undefined;
+  /** Embedding model ID in the format "provider/model" (e.g., "openai/text-embedding-3-small") */
+  embedder?: string | undefined;
+  /** Options to pass to the embedder, omitting telemetry */
+  embedderOptions?:
+    | {
+        [key: string]: unknown;
+      }
+    | undefined;
+  /** Serialized observational memory configuration */
+  observationalMemory?: (boolean | InputShared_Type_62) | undefined;
+  type?: never | undefined;
+};
+
+type InputShared_Type_65 =
   | {
-      value: InputShared_Type_63;
+      type: 'id';
+      /** Registry key (or id) of a Memory instance registered on Mastra */
+      memoryId: string;
+    }
+  | {
+      type: 'inline';
+      config: InputShared_Type_63;
+    }
+  | InputShared_Type_64;
+
+type InputShared_Type_66 =
+  | InputShared_Type_65
+  | {
+      value: InputShared_Type_65;
       rules?:
         | {
             operator: 'AND' | 'OR';
@@ -1476,7 +1540,7 @@ type InputShared_Type_64 =
         | undefined;
     }[];
 
-type InputShared_Type_65 = {
+type InputShared_Type_67 = {
   description?: string | undefined;
   sampling?:
     | (
@@ -1497,9 +1561,9 @@ type InputShared_Type_65 = {
     | undefined;
 };
 
-type InputShared_Type_66 = {
+type InputShared_Type_68 = {
   value: {
-    [key: string]: InputShared_Type_65;
+    [key: string]: InputShared_Type_67;
   };
   rules?:
     | {
@@ -1509,7 +1573,7 @@ type InputShared_Type_66 = {
     | undefined;
 };
 
-type InputShared_Type_67 = {
+type InputShared_Type_69 = {
   [key: string]: {
     description?: string | undefined;
     instructions?: string | undefined;
@@ -1518,10 +1582,10 @@ type InputShared_Type_67 = {
   };
 };
 
-type InputShared_Type_68 =
-  | InputShared_Type_67
+type InputShared_Type_70 =
+  | InputShared_Type_69
   | {
-      value: InputShared_Type_67;
+      value: InputShared_Type_69;
       rules?:
         | {
             operator: 'AND' | 'OR';
@@ -1530,7 +1594,7 @@ type InputShared_Type_68 =
         | undefined;
     }[];
 
-type InputShared_Type_69 =
+type InputShared_Type_71 =
   | {
       /** Filesystem provider name */
       provider: string;
@@ -1541,7 +1605,7 @@ type InputShared_Type_69 =
     }
   | undefined;
 
-type InputShared_Type_70 =
+type InputShared_Type_72 =
   | {
       /** Sandbox provider name */
       provider: string;
@@ -1552,7 +1616,7 @@ type InputShared_Type_70 =
     }
   | undefined;
 
-type InputShared_Type_71 = {
+type InputShared_Type_73 = {
   [key: string]: {
     /** Filesystem provider name */
     provider: string;
@@ -1563,7 +1627,7 @@ type InputShared_Type_71 = {
   };
 };
 
-type InputShared_Type_72 = {
+type InputShared_Type_74 = {
   /** Vector store provider identifier */
   vectorProvider?: string | undefined;
   /** Vector store provider-specific configuration */
@@ -1598,7 +1662,7 @@ type InputShared_Type_72 = {
   autoIndexPaths?: string[] | undefined;
 };
 
-type InputShared_Type_73 = {
+type InputShared_Type_75 = {
   /** Whether the tool is enabled */
   enabled?: boolean | undefined;
   /** Whether the tool requires user approval before execution */
@@ -1607,7 +1671,7 @@ type InputShared_Type_73 = {
   requireReadBeforeWrite?: boolean | undefined;
 };
 
-type InputShared_Type_74 = {
+type InputShared_Type_76 = {
   /** Default: whether all tools are enabled */
   enabled?: boolean | undefined;
   /** Default: whether all tools require user approval */
@@ -1615,35 +1679,35 @@ type InputShared_Type_74 = {
   /** Per-tool overrides keyed by workspace tool name */
   tools?:
     | {
-        [key: string]: InputShared_Type_73;
+        [key: string]: InputShared_Type_75;
       }
     | undefined;
 };
 
-type InputShared_Type_75 = {
+type InputShared_Type_77 = {
   /** Name of the workspace */
   name: string;
   /** Description of the workspace */
   description?: string | undefined;
   /** Filesystem configuration */
-  filesystem?: InputShared_Type_69;
+  filesystem?: InputShared_Type_71;
   /** Sandbox configuration */
-  sandbox?: InputShared_Type_70;
+  sandbox?: InputShared_Type_72;
   /** Mounted filesystems keyed by mount path */
-  mounts?: InputShared_Type_71 | undefined;
+  mounts?: InputShared_Type_73 | undefined;
   /** Search configuration */
-  search?: InputShared_Type_72 | undefined;
+  search?: InputShared_Type_74 | undefined;
   /** Array of skill IDs */
   skills?: string[] | undefined;
   /** Workspace tool configuration */
-  tools?: InputShared_Type_74 | undefined;
+  tools?: InputShared_Type_76 | undefined;
   /** Whether to automatically sync the workspace */
   autoSync?: boolean | undefined;
   /** Operation timeout in milliseconds */
   operationTimeout?: number | undefined;
 };
 
-type InputShared_Type_76 = {
+type InputShared_Type_78 = {
   type: 'provider';
   /** Workspace provider identifier */
   provider: string;
@@ -1653,7 +1717,7 @@ type InputShared_Type_76 = {
   };
 };
 
-type InputShared_Type_77 = {
+type InputShared_Type_79 = {
   value:
     | {
         type: 'id';
@@ -1661,9 +1725,9 @@ type InputShared_Type_77 = {
       }
     | {
         type: 'inline';
-        config: InputShared_Type_75;
+        config: InputShared_Type_77;
       }
-    | InputShared_Type_76;
+    | InputShared_Type_78;
   rules?:
     | {
         operator: 'AND' | 'OR';
@@ -1672,7 +1736,7 @@ type InputShared_Type_77 = {
     | undefined;
 };
 
-type InputShared_Type_78 =
+type InputShared_Type_80 =
   | (
       | (
           | {
@@ -1681,15 +1745,15 @@ type InputShared_Type_78 =
             }
           | {
               type: 'inline';
-              config: InputShared_Type_75;
+              config: InputShared_Type_77;
             }
-          | InputShared_Type_76
+          | InputShared_Type_78
         )
-      | InputShared_Type_77[]
+      | InputShared_Type_79[]
     )
   | undefined;
 
-type InputShared_Type_79 = {
+type InputShared_Type_81 = {
   /** Image format (default: jpeg) */
   format?: ('jpeg' | 'png') | undefined;
   /** JPEG quality 0-100 (default: 80) */
@@ -1702,7 +1766,7 @@ type InputShared_Type_79 = {
   everyNthFrame?: number | undefined;
 };
 
-type InputShared_Type_80 = {
+type InputShared_Type_82 = {
   /** Browser provider type (e.g., stagehand, playwright) */
   provider: string;
   /** Run browser in headless mode (default: true) */
@@ -1719,13 +1783,13 @@ type InputShared_Type_80 = {
   /** Default timeout in milliseconds (default: 10000) */
   timeout?: number | undefined;
   /** Screencast options for streaming browser frames */
-  screencast?: InputShared_Type_79 | undefined;
+  screencast?: InputShared_Type_81 | undefined;
 };
 
-type InputShared_Type_81 = {
+type InputShared_Type_83 = {
   value: {
     type: 'inline';
-    config: InputShared_Type_80;
+    config: InputShared_Type_82;
   };
   rules?:
     | {
@@ -1735,25 +1799,25 @@ type InputShared_Type_81 = {
     | undefined;
 };
 
-type InputShared_Type_82 = {
+type InputShared_Type_84 = {
   id?: string | undefined;
   cron: string;
   timezone?: string | undefined;
-  inputData?: InputShared_Auxiliary_680 | undefined;
-  initialState?: InputShared_Auxiliary_680 | undefined;
+  inputData?: InputShared_Auxiliary_705 | undefined;
+  initialState?: InputShared_Auxiliary_705 | undefined;
   requestContext?:
     | {
-        [key: string]: InputShared_Auxiliary_680;
+        [key: string]: InputShared_Auxiliary_705;
       }
     | undefined;
   metadata?:
     | {
-        [key: string]: InputShared_Auxiliary_680;
+        [key: string]: InputShared_Auxiliary_705;
       }
     | undefined;
 };
 
-type InputShared_Type_83 = {
+type InputShared_Type_85 = {
   [key: string]:
     | {
         versionId: string;
@@ -1763,7 +1827,7 @@ type InputShared_Type_83 = {
       };
 };
 
-type InputShared_Type_84 = {
+type InputShared_Type_86 = {
   retries?: number | undefined;
   metadata?:
     | {
@@ -1805,13 +1869,13 @@ type InputShared_Type_84 = {
   disableBackgroundTasks?: boolean | undefined;
   versions?:
     | {
-        agents?: InputShared_Type_83 | undefined;
+        agents?: InputShared_Type_85 | undefined;
         defaultStatus?: ('draft' | 'published') | undefined;
       }
     | undefined;
 };
 
-type InputShared_Type_85 = {
+type InputShared_Type_87 = {
   type: 'agent';
   id: string;
   agentId: string;
@@ -1821,10 +1885,10 @@ type InputShared_Type_85 = {
         [key: string]: unknown;
       }
     | undefined;
-  options?: InputShared_Type_84 | undefined;
+  options?: InputShared_Type_86 | undefined;
 };
 
-type InputShared_Type_86 = {
+type InputShared_Type_88 = {
   type: 'tool';
   id: string;
   toolId: string;
@@ -1841,7 +1905,7 @@ type InputShared_Type_86 = {
     | undefined;
 };
 
-type InputShared_Type_87 = {
+type InputShared_Type_89 = {
   type: 'mapping';
   id: string;
   description?: string | undefined;
@@ -1853,10 +1917,10 @@ type InputShared_Type_87 = {
   mapConfig: string;
 };
 
-type InputShared_Type_88 =
-  | InputShared_Type_85
-  | InputShared_Type_86
+type InputShared_Type_90 =
   | InputShared_Type_87
+  | InputShared_Type_88
+  | InputShared_Type_89
   | {
       type: 'workflow';
       id: string;
@@ -1864,7 +1928,7 @@ type InputShared_Type_88 =
       description?: string | undefined;
     };
 
-type InputShared_Type_89 = {
+type InputShared_Type_91 = {
   type: 'parallel';
   id?: string | undefined;
   description?: string | undefined;
@@ -1873,10 +1937,10 @@ type InputShared_Type_89 = {
         [key: string]: unknown;
       }
     | undefined;
-  steps: InputShared_Type_88[];
+  steps: InputShared_Type_90[];
 };
 
-type InputShared_Type_90 = {
+type InputShared_Type_92 = {
   type: 'foreach';
   id?: string | undefined;
   description?: string | undefined;
@@ -1886,8 +1950,8 @@ type InputShared_Type_90 = {
       }
     | undefined;
   step:
-    | InputShared_Type_85
-    | InputShared_Type_86
+    | InputShared_Type_87
+    | InputShared_Type_88
     | {
         type: 'workflow';
         id: string;
@@ -1901,7 +1965,7 @@ type InputShared_Type_90 = {
     | undefined;
 };
 
-type InputShared_Type_91 = {
+type InputShared_Type_93 = {
   type: 'sleep';
   id: string;
   description?: string | undefined;
@@ -1913,7 +1977,7 @@ type InputShared_Type_91 = {
   duration: number;
 };
 
-type InputShared_Type_92 = {
+type InputShared_Type_94 = {
   type: 'sleepUntil';
   id: string;
   description?: string | undefined;
@@ -1925,7 +1989,7 @@ type InputShared_Type_92 = {
   date: string;
 };
 
-type InputShared_Type_93 = {
+type InputShared_Type_95 = {
   type: 'conditional';
   id?: string | undefined;
   description?: string | undefined;
@@ -1934,11 +1998,11 @@ type InputShared_Type_93 = {
         [key: string]: unknown;
       }
     | undefined;
-  steps: InputShared_Type_88[];
-  predicates: InputShared_Auxiliary_714[];
+  steps: InputShared_Type_90[];
+  predicates: InputShared_Auxiliary_739[];
 };
 
-type InputShared_Type_94 = {
+type InputShared_Type_96 = {
   type: 'loop';
   id?: string | undefined;
   description?: string | undefined;
@@ -1947,29 +2011,29 @@ type InputShared_Type_94 = {
         [key: string]: unknown;
       }
     | undefined;
-  step: InputShared_Type_88;
+  step: InputShared_Type_90;
   loopType: 'dowhile' | 'dountil';
-  predicate: InputShared_Auxiliary_714;
+  predicate: InputShared_Auxiliary_739;
 };
 
-type InputShared_Type_95 =
-  | InputShared_Type_85
-  | InputShared_Type_86
+type InputShared_Type_97 =
   | InputShared_Type_87
+  | InputShared_Type_88
+  | InputShared_Type_89
   | {
       type: 'workflow';
       id: string;
       workflowId: string;
       description?: string | undefined;
     }
-  | InputShared_Type_89
-  | InputShared_Type_90
   | InputShared_Type_91
   | InputShared_Type_92
   | InputShared_Type_93
-  | InputShared_Type_94;
+  | InputShared_Type_94
+  | InputShared_Type_95
+  | InputShared_Type_96;
 
-type InputShared_Type_96 = {
+type InputShared_Type_98 = {
   /** Transport type: stdio for local processes, http for remote servers */
   type: 'stdio' | 'http';
   /** Command to run (stdio only) */
@@ -1988,7 +2052,7 @@ type InputShared_Type_96 = {
   timeout?: number | undefined;
 };
 
-type InputShared_Type_97 =
+type InputShared_Type_99 =
   | 'llm-judge'
   | 'answer-relevancy'
   | 'answer-similarity'
@@ -2002,7 +2066,7 @@ type InputShared_Type_97 =
   | 'tool-call-accuracy'
   | 'toxicity';
 
-type InputShared_Type_98 =
+type InputShared_Type_100 =
   | {
       /** Minimum score value (default: 0) */
       min?: number | undefined;
@@ -2011,7 +2075,7 @@ type InputShared_Type_98 =
     }
   | undefined;
 
-type InputShared_Type_99 =
+type InputShared_Type_101 =
   | {
       type: 'external';
       /** Package path for external source */
@@ -2028,7 +2092,7 @@ type InputShared_Type_99 =
       mastraPath: string;
     };
 
-type InputShared_Type_100 = {
+type InputShared_Type_102 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2053,7 +2117,7 @@ type InputShared_Type_100 = {
   success?: boolean | undefined;
 };
 
-type InputShared_Type_101 = {
+type InputShared_Type_103 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2079,7 +2143,7 @@ type InputShared_Type_101 = {
   success?: boolean | undefined;
 };
 
-type InputShared_Type_102 = {
+type InputShared_Type_104 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2097,7 +2161,7 @@ type InputShared_Type_102 = {
   finishReason?: string | undefined;
 };
 
-type InputShared_Type_103 = {
+type InputShared_Type_105 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2112,7 +2176,7 @@ type InputShared_Type_103 = {
   agentId?: string | undefined;
 };
 
-type InputShared_Type_104 = {
+type InputShared_Type_106 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2133,7 +2197,7 @@ type InputShared_Type_104 = {
     | undefined;
 };
 
-type InputShared_Type_105 = {
+type InputShared_Type_107 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2149,7 +2213,7 @@ type InputShared_Type_105 = {
   status?: string | undefined;
 };
 
-type InputShared_Type_106 = {
+type InputShared_Type_108 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2165,7 +2229,7 @@ type InputShared_Type_106 = {
   selectedSteps?: string[] | undefined;
 };
 
-type InputShared_Type_107 = {
+type InputShared_Type_109 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2181,7 +2245,7 @@ type InputShared_Type_107 = {
   parallelSteps?: string[] | undefined;
 };
 
-type InputShared_Type_108 = {
+type InputShared_Type_110 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2197,7 +2261,7 @@ type InputShared_Type_108 = {
   totalIterations?: number | undefined;
 };
 
-type InputShared_Type_109 = {
+type InputShared_Type_111 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2213,7 +2277,7 @@ type InputShared_Type_109 = {
   sleepType?: string | undefined;
 };
 
-type InputShared_Type_110 = {
+type InputShared_Type_112 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2229,7 +2293,7 @@ type InputShared_Type_110 = {
   eventReceived?: boolean | undefined;
 };
 
-type InputShared_Type_111 = {
+type InputShared_Type_113 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2244,9 +2308,7 @@ type InputShared_Type_111 = {
   processorId?: string | undefined;
 };
 
-type InputShared_Type_112 =
-  | InputShared_Type_100
-  | InputShared_Type_101
+type InputShared_Type_114 =
   | InputShared_Type_102
   | InputShared_Type_103
   | InputShared_Type_104
@@ -2256,9 +2318,11 @@ type InputShared_Type_112 =
   | InputShared_Type_108
   | InputShared_Type_109
   | InputShared_Type_110
-  | InputShared_Type_111;
+  | InputShared_Type_111
+  | InputShared_Type_112
+  | InputShared_Type_113;
 
-type InputShared_Type_113 = {
+type InputShared_Type_115 = {
   /** Step name to match */
   name: string;
   durationMs?: number | undefined;
@@ -2272,9 +2336,9 @@ type InputShared_Type_113 = {
   stepType?: undefined | undefined;
 };
 
-type InputShared_Type_114 = {
+type InputShared_Type_116 = {
   /** Expected steps for accuracy checking */
-  steps?: (InputShared_Type_112 | InputShared_Type_113)[] | undefined;
+  steps?: (InputShared_Type_114 | InputShared_Type_115)[] | undefined;
   /** How to compare step ordering (default: relaxed) */
   ordering?: ('strict' | 'relaxed' | 'unordered') | undefined;
   /** Whether to allow repeated steps (default: true) */
@@ -2295,7 +2359,7 @@ type InputShared_Type_114 = {
   maxRetriesPerTool?: number | undefined;
 };
 
-type InputShared_Type_115 = {
+type InputShared_Type_117 = {
   /** Name of the tool this mock applies to */
   toolName: string;
   /** Arguments to match against the tool call */
@@ -2308,14 +2372,14 @@ type InputShared_Type_115 = {
   matchArgs?: ('strict' | 'ignore') | undefined;
 };
 
-type InputShared_Type_116 = {
+type InputShared_Type_118 = {
   /** How this item was created */
   type: 'csv' | 'json' | 'trace' | 'llm' | 'experiment-result' | 'candidate-screener';
   /** Reference identifier (e.g., trace id, csv filename) */
   referenceId?: string | undefined;
 };
 
-type InputShared_Type_117 = {
+type InputShared_Type_119 = {
   behavior?: ('deliver' | 'persist' | 'discard') | undefined;
   attributes?:
     | {
@@ -2324,7 +2388,7 @@ type InputShared_Type_117 = {
     | undefined;
 };
 
-type InputShared_Type_118 = {
+type InputShared_Type_120 = {
   behavior?: ('wake' | 'persist' | 'discard') | undefined;
   attributes?:
     | {
@@ -2576,6 +2640,7 @@ type Shared_Type_11 =
   | {
       type: 'prompt_block_ref';
       id: string;
+      rules?: Shared_Type_10 | undefined;
     }
   | {
       type: 'prompt_block';
@@ -2838,6 +2903,36 @@ type Shared_Type_28 = {
 };
 
 type Shared_Type_29 = {
+  /** Vector database identifier or false to disable */
+  vector?: (string | false) | undefined;
+  /** Memory behavior configuration, excluding workingMemory and threads */
+  options?: Shared_Type_24 | undefined;
+  /** Embedding model ID in the format "provider/model" (e.g., "openai/text-embedding-3-small") */
+  embedder?: string | undefined;
+  /** Options to pass to the embedder, omitting telemetry */
+  embedderOptions?:
+    | {
+        [key: string]: unknown;
+      }
+    | undefined;
+  /** Serialized observational memory configuration */
+  observationalMemory?: (boolean | Shared_Type_27) | undefined;
+  type?: never | undefined;
+};
+
+type Shared_Type_30 =
+  | {
+      type: 'id';
+      /** Registry key (or id) of a Memory instance registered on Mastra */
+      memoryId: string;
+    }
+  | {
+      type: 'inline';
+      config: Shared_Type_28;
+    }
+  | Shared_Type_29;
+
+type Shared_Type_31 = {
   description?: string | undefined;
   sampling?:
     | (
@@ -2853,7 +2948,7 @@ type Shared_Type_29 = {
   rules?: Shared_Type_10 | undefined;
 };
 
-type Shared_Type_30 = {
+type Shared_Type_32 = {
   [key: string]: {
     description?: string | undefined;
     instructions?: string | undefined;
@@ -2862,7 +2957,7 @@ type Shared_Type_30 = {
   };
 };
 
-type Shared_Type_31 =
+type Shared_Type_33 =
   | {
       /** Filesystem provider name */
       provider: string;
@@ -2873,7 +2968,7 @@ type Shared_Type_31 =
     }
   | undefined;
 
-type Shared_Type_32 =
+type Shared_Type_34 =
   | {
       /** Sandbox provider name */
       provider: string;
@@ -2884,7 +2979,7 @@ type Shared_Type_32 =
     }
   | undefined;
 
-type Shared_Type_33 = {
+type Shared_Type_35 = {
   [key: string]: {
     /** Filesystem provider name */
     provider: string;
@@ -2895,7 +2990,7 @@ type Shared_Type_33 = {
   };
 };
 
-type Shared_Type_34 = {
+type Shared_Type_36 = {
   /** Vector store provider identifier */
   vectorProvider?: string | undefined;
   /** Vector store provider-specific configuration */
@@ -2930,7 +3025,7 @@ type Shared_Type_34 = {
   autoIndexPaths?: string[] | undefined;
 };
 
-type Shared_Type_35 = {
+type Shared_Type_37 = {
   /** Whether the tool is enabled */
   enabled?: boolean | undefined;
   /** Whether the tool requires user approval before execution */
@@ -2939,7 +3034,7 @@ type Shared_Type_35 = {
   requireReadBeforeWrite?: boolean | undefined;
 };
 
-type Shared_Type_36 = {
+type Shared_Type_38 = {
   /** Default: whether all tools are enabled */
   enabled?: boolean | undefined;
   /** Default: whether all tools require user approval */
@@ -2947,35 +3042,35 @@ type Shared_Type_36 = {
   /** Per-tool overrides keyed by workspace tool name */
   tools?:
     | {
-        [key: string]: Shared_Type_35;
+        [key: string]: Shared_Type_37;
       }
     | undefined;
 };
 
-type Shared_Type_37 = {
+type Shared_Type_39 = {
   /** Name of the workspace */
   name: string;
   /** Description of the workspace */
   description?: string | undefined;
   /** Filesystem configuration */
-  filesystem?: Shared_Type_31;
+  filesystem?: Shared_Type_33;
   /** Sandbox configuration */
-  sandbox?: Shared_Type_32;
+  sandbox?: Shared_Type_34;
   /** Mounted filesystems keyed by mount path */
-  mounts?: Shared_Type_33 | undefined;
+  mounts?: Shared_Type_35 | undefined;
   /** Search configuration */
-  search?: Shared_Type_34 | undefined;
+  search?: Shared_Type_36 | undefined;
   /** Array of skill IDs */
   skills?: string[] | undefined;
   /** Workspace tool configuration */
-  tools?: Shared_Type_36 | undefined;
+  tools?: Shared_Type_38 | undefined;
   /** Whether to automatically sync the workspace */
   autoSync?: boolean | undefined;
   /** Operation timeout in milliseconds */
   operationTimeout?: number | undefined;
 };
 
-type Shared_Type_38 = {
+type Shared_Type_40 = {
   type: 'provider';
   /** Workspace provider identifier */
   provider: string;
@@ -2985,7 +3080,7 @@ type Shared_Type_38 = {
   };
 };
 
-type Shared_Type_39 = {
+type Shared_Type_41 = {
   value:
     | {
         type: 'id';
@@ -2993,13 +3088,13 @@ type Shared_Type_39 = {
       }
     | {
         type: 'inline';
-        config: Shared_Type_37;
+        config: Shared_Type_39;
       }
-    | Shared_Type_38;
+    | Shared_Type_40;
   rules?: Shared_Type_10 | undefined;
 };
 
-type Shared_Type_40 = {
+type Shared_Type_42 = {
   /** Image format (default: jpeg) */
   format?: ('jpeg' | 'png') | undefined;
   /** JPEG quality 0-100 (default: 80) */
@@ -3012,7 +3107,7 @@ type Shared_Type_40 = {
   everyNthFrame?: number | undefined;
 };
 
-type Shared_Type_41 = {
+type Shared_Type_43 = {
   /** Browser provider type (e.g., stagehand, playwright) */
   provider: string;
   /** Run browser in headless mode (default: true) */
@@ -3029,23 +3124,23 @@ type Shared_Type_41 = {
   /** Default timeout in milliseconds (default: 10000) */
   timeout?: number | undefined;
   /** Screencast options for streaming browser frames */
-  screencast?: Shared_Type_40 | undefined;
+  screencast?: Shared_Type_42 | undefined;
 };
 
-type Shared_Type_42 =
+type Shared_Type_44 =
   | {
       type: 'inline';
-      config: Shared_Type_41;
+      config: Shared_Type_43;
     }
   | {
       value: {
         type: 'inline';
-        config: Shared_Type_41;
+        config: Shared_Type_43;
       };
       rules?: Shared_Type_10 | undefined;
     }[];
 
-type Shared_Type_43 = {
+type Shared_Type_45 = {
   id: string;
   /** Agent status: draft or published */
   status: string;
@@ -3178,12 +3273,12 @@ type Shared_Type_43 = {
   inputProcessors?: Shared_Type_21 | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: Shared_Type_21 | undefined;
-  /** Memory configuration — static or conditional */
+  /** Memory: registered memory reference or inline config — static or conditional */
   memory?:
     | (
-        | Shared_Type_28
+        | Shared_Type_30
         | {
-            value: Shared_Type_28;
+            value: Shared_Type_30;
             rules?: Shared_Type_10 | undefined;
           }[]
       )
@@ -3192,11 +3287,11 @@ type Shared_Type_43 = {
   scorers?:
     | (
         | {
-            [key: string]: Shared_Type_29;
+            [key: string]: Shared_Type_31;
           }
         | {
             value: {
-              [key: string]: Shared_Type_29;
+              [key: string]: Shared_Type_31;
             };
             rules?: Shared_Type_10 | undefined;
           }[]
@@ -3205,9 +3300,9 @@ type Shared_Type_43 = {
   /** Skill IDs mapped to per-skill config — static or conditional */
   skills?:
     | (
-        | Shared_Type_30
+        | Shared_Type_32
         | {
-            value: Shared_Type_30;
+            value: Shared_Type_32;
             rules?: Shared_Type_10 | undefined;
           }[]
       )
@@ -3222,15 +3317,15 @@ type Shared_Type_43 = {
               }
             | {
                 type: 'inline';
-                config: Shared_Type_37;
+                config: Shared_Type_39;
               }
-            | Shared_Type_38
+            | Shared_Type_40
           )
-        | Shared_Type_39[]
+        | Shared_Type_41[]
       )
     | undefined;
   /** Browser configuration — object config, true (apply default), false/null (disable) */
-  browser?: (Shared_Type_42 | boolean | null) | undefined;
+  browser?: (Shared_Type_44 | boolean | null) | undefined;
   /** JSON Schema defining valid request context variables */
   requestContextSchema?:
     | {
@@ -3249,7 +3344,7 @@ type Shared_Type_43 = {
     | undefined;
 };
 
-type Shared_Type_44 = {
+type Shared_Type_46 = {
   type: 'sso' | 'credentials' | 'both';
   sso?:
     | {
@@ -3264,7 +3359,7 @@ type Shared_Type_44 = {
   description?: string | undefined;
 };
 
-type Shared_Type_45 = {
+type Shared_Type_47 = {
   id: string;
   description?: string | undefined;
   stateSchema?: string | undefined;
@@ -3281,7 +3376,7 @@ type Shared_Type_45 = {
     | undefined;
 };
 
-type Shared_Type_46 = {
+type Shared_Type_48 = {
   type:
     | 'step'
     | 'agent'
@@ -3305,12 +3400,12 @@ type Shared_Type_46 = {
     | undefined;
 };
 
-type Shared_Type_47 = {
+type Shared_Type_49 = {
   steps: {
-    [key: string]: Shared_Type_45;
+    [key: string]: Shared_Type_47;
   };
   allSteps: {
-    [key: string]: Shared_Type_45;
+    [key: string]: Shared_Type_47;
   };
   name?: string | undefined;
   description?: string | undefined;
@@ -3319,7 +3414,7 @@ type Shared_Type_47 = {
         [key: string]: unknown;
       }
     | undefined;
-  stepGraph: Shared_Type_46[];
+  stepGraph: Shared_Type_48[];
   inputSchema?: string | undefined;
   outputSchema?: string | undefined;
   stateSchema?: string | undefined;
@@ -3328,7 +3423,7 @@ type Shared_Type_47 = {
   origin?: ('code' | 'dynamic') | undefined;
 };
 
-type Shared_Type_48 = {
+type Shared_Type_50 = {
   id: string;
   role: 'user' | 'assistant' | 'system' | 'tool' | 'signal';
   createdAt?: Date | undefined;
@@ -3343,7 +3438,7 @@ type Shared_Type_48 = {
   [x: string]: unknown;
 };
 
-type Shared_Type_49 = {
+type Shared_Type_51 = {
   id: string;
   type: 'function_call';
   call_id: string;
@@ -3352,7 +3447,7 @@ type Shared_Type_49 = {
   status?: ('in_progress' | 'completed' | 'incomplete') | undefined;
 };
 
-type Shared_Type_50 = {
+type Shared_Type_52 = {
   id: string;
   title?: string | undefined;
   resourceId: string;
@@ -3365,7 +3460,7 @@ type Shared_Type_50 = {
     | undefined;
 };
 
-type Shared_Type_51 = {
+type Shared_Type_53 = {
   id?: string | undefined;
   cycleId: string;
   observations: string;
@@ -3390,14 +3485,14 @@ type Shared_Type_51 = {
     | undefined;
 };
 
-type Shared_Type_52 = {
+type Shared_Type_54 = {
   id: string;
   scope: 'thread' | 'resource';
   resourceId: string;
   threadId: string | null;
   activeObservations: string;
   bufferedObservations?: string | undefined;
-  bufferedObservationChunks?: Shared_Type_51[] | undefined;
+  bufferedObservationChunks?: Shared_Type_53[] | undefined;
   bufferedReflection?: string | undefined;
   originType: 'initial' | 'observation' | 'reflection';
   generationCount: number;
@@ -3419,7 +3514,7 @@ type Shared_Type_52 = {
   updatedAt: Date;
 };
 
-type Shared_Type_53 = {
+type Shared_Type_55 = {
   config: {
     id: string;
     name?: string | undefined;
@@ -3429,8 +3524,8 @@ type Shared_Type_53 = {
   };
 };
 
-type Shared_Type_54 = {
-  scorer: Shared_Type_53;
+type Shared_Type_56 = {
+  scorer: Shared_Type_55;
   sampling?: {} | undefined;
   agentIds: string[];
   agentNames: string[];
@@ -3439,7 +3534,7 @@ type Shared_Type_54 = {
   source: 'code' | 'stored' | 'fs';
 };
 
-type Shared_Type_55 = {
+type Shared_Type_57 = {
   /** Total number of items available */
   total: number;
   /** Current page */
@@ -3450,14 +3545,14 @@ type Shared_Type_55 = {
   hasMore: boolean;
 };
 
-type Shared_Type_56 = {
+type Shared_Type_58 = {
   /** Maximum number of updates requested for this delta poll */
   limit: number;
   /** True when more matching updates remain after this response */
   hasMore: boolean;
 };
 
-type Shared_Type_57 =
+type Shared_Type_59 =
   | 'agent_run'
   | 'scorer_run'
   | 'classifier_evaluation'
@@ -3493,7 +3588,7 @@ type Shared_Type_57 =
   | 'skill_action'
   | 'agent_signal';
 
-type Shared_Type_58 =
+type Shared_Type_60 =
   | 'agent'
   | 'scorer'
   | 'rag_ingestion'
@@ -3509,111 +3604,6 @@ type Shared_Type_58 =
   | 'workflow_run'
   | 'memory';
 
-type Shared_Type_59 = {
-  /** Unique trace identifier */
-  traceId: string;
-  /** Unique span identifier within a trace */
-  spanId: string;
-  /** Human-readable span name */
-  name: string;
-  /** Span type (e.g., WORKFLOW_RUN, AGENT_RUN, TOOL_CALL, etc.) */
-  spanType: Shared_Type_57;
-  /** Whether this is an event (point-in-time) vs a span (duration) */
-  isEvent: boolean;
-  /** When the span started */
-  startedAt: Date;
-  parentSpanId?: (string | null) | undefined;
-  entityType?: (Shared_Type_58 | null) | undefined;
-  entityId?: (string | null) | undefined;
-  entityName?: (string | null) | undefined;
-  parentEntityType?: (Shared_Type_58 | null) | undefined;
-  parentEntityId?: (string | null) | undefined;
-  parentEntityName?: (string | null) | undefined;
-  rootEntityType?: (Shared_Type_58 | null) | undefined;
-  rootEntityId?: (string | null) | undefined;
-  rootEntityName?: (string | null) | undefined;
-  userId?: (string | null) | undefined;
-  organizationId?: (string | null) | undefined;
-  resourceId?: (string | null) | undefined;
-  runId?: (string | null) | undefined;
-  sessionId?: (string | null) | undefined;
-  threadId?: (string | null) | undefined;
-  requestId?: (string | null) | undefined;
-  environment?: (string | null) | undefined;
-  serviceName?: (string | null) | undefined;
-  scope?:
-    | ({
-        [key: string]: unknown;
-      } | null)
-    | undefined;
-  entityVersionId?: (string | null) | undefined;
-  parentEntityVersionId?: (string | null) | undefined;
-  rootEntityVersionId?: (string | null) | undefined;
-  /** Experiment or eval run identifier */
-  experimentId?: (string | null) | undefined;
-  source?: (string | null) | undefined;
-  metadata?:
-    | ({
-        [key: string]: unknown;
-      } | null)
-    | undefined;
-  tags?: (string[] | null) | undefined;
-  attributes?:
-    | ({
-        [key: string]: unknown;
-      } | null)
-    | undefined;
-  links?: (unknown[] | null) | undefined;
-  input?: (unknown | null) | undefined;
-  output?: (unknown | null) | undefined;
-  error?: (unknown | null) | undefined;
-  endedAt?: (Date | null) | undefined;
-  /** Request context data */
-  requestContext?:
-    | ({
-        [key: string]: unknown;
-      } | null)
-    | undefined;
-  /** Database record creation time */
-  createdAt: Date;
-  /** Database record last update time */
-  updatedAt: Date | null;
-  /** Current status of the trace */
-  status: 'success' | 'error' | 'running';
-};
-
-type Shared_Type_60 = {
-  /** Unique trace identifier */
-  traceId: string;
-  /** Unique span identifier within a trace */
-  spanId: string;
-  /** Human-readable span name */
-  name: string;
-  /** Span type (e.g., WORKFLOW_RUN, AGENT_RUN, TOOL_CALL, etc.) */
-  spanType: Shared_Type_57;
-  /** Whether this is an event (point-in-time) vs a span (duration) */
-  isEvent: boolean;
-  /** When the span started */
-  startedAt: Date;
-  parentSpanId?: (string | null) | undefined;
-  endedAt?: (Date | null) | undefined;
-  error?: (unknown | null) | undefined;
-  status?: (('success' | 'error' | 'running') | null) | undefined;
-  entityType?: (Shared_Type_58 | null) | undefined;
-  entityId?: (string | null) | undefined;
-  entityName?: (string | null) | undefined;
-  metadata?:
-    | ({
-        [key: string]: unknown;
-      } | null)
-    | undefined;
-  inputPreview?: (string | null) | undefined;
-  /** Database record creation time */
-  createdAt: Date;
-  /** Database record last update time */
-  updatedAt: Date | null;
-};
-
 type Shared_Type_61 = {
   /** Unique trace identifier */
   traceId: string;
@@ -3622,19 +3612,19 @@ type Shared_Type_61 = {
   /** Human-readable span name */
   name: string;
   /** Span type (e.g., WORKFLOW_RUN, AGENT_RUN, TOOL_CALL, etc.) */
-  spanType: Shared_Type_57;
+  spanType: Shared_Type_59;
   /** Whether this is an event (point-in-time) vs a span (duration) */
   isEvent: boolean;
   /** When the span started */
   startedAt: Date;
   parentSpanId?: (string | null) | undefined;
-  entityType?: (Shared_Type_58 | null) | undefined;
+  entityType?: (Shared_Type_60 | null) | undefined;
   entityId?: (string | null) | undefined;
   entityName?: (string | null) | undefined;
-  parentEntityType?: (Shared_Type_58 | null) | undefined;
+  parentEntityType?: (Shared_Type_60 | null) | undefined;
   parentEntityId?: (string | null) | undefined;
   parentEntityName?: (string | null) | undefined;
-  rootEntityType?: (Shared_Type_58 | null) | undefined;
+  rootEntityType?: (Shared_Type_60 | null) | undefined;
   rootEntityId?: (string | null) | undefined;
   rootEntityName?: (string | null) | undefined;
   userId?: (string | null) | undefined;
@@ -3679,13 +3669,138 @@ type Shared_Type_61 = {
         [key: string]: unknown;
       } | null)
     | undefined;
+  /** Short text preview of the span input */
+  inputPreview?: (string | null) | undefined;
+  /** Short text preview of the span output */
+  outputPreview?: (string | null) | undefined;
+  /** Short text preview of the span error */
+  errorPreview?: (string | null) | undefined;
+  /** Milliseconds from span start to the first streamed chunk; null when the span never streamed one */
+  timeToFirstChunkMs?: (number | null) | undefined;
+  /** Database record creation time */
+  createdAt: Date;
+  /** Database record last update time */
+  updatedAt: Date | null;
+  /** Current status of the trace */
+  status: 'success' | 'error' | 'running';
+};
+
+type Shared_Type_62 = {
+  /** Unique trace identifier */
+  traceId: string;
+  /** Unique span identifier within a trace */
+  spanId: string;
+  /** Human-readable span name */
+  name: string;
+  /** Span type (e.g., WORKFLOW_RUN, AGENT_RUN, TOOL_CALL, etc.) */
+  spanType: Shared_Type_59;
+  /** Whether this is an event (point-in-time) vs a span (duration) */
+  isEvent: boolean;
+  /** When the span started */
+  startedAt: Date;
+  parentSpanId?: (string | null) | undefined;
+  endedAt?: (Date | null) | undefined;
+  error?: (unknown | null) | undefined;
+  status?: (('success' | 'error' | 'running') | null) | undefined;
+  entityType?: (Shared_Type_60 | null) | undefined;
+  entityId?: (string | null) | undefined;
+  entityName?: (string | null) | undefined;
+  threadId?: ((string | null) | undefined) | null;
+  resourceId?: ((string | null) | undefined) | null;
+  metadata?:
+    | ({
+        [key: string]: unknown;
+      } | null)
+    | undefined;
+  inputPreview?: (string | null) | undefined;
+  outputPreview?: (string | null) | undefined;
+  errorPreview?: (string | null) | undefined;
   /** Database record creation time */
   createdAt: Date;
   /** Database record last update time */
   updatedAt: Date | null;
 };
 
-type Shared_Type_62 = {
+type Shared_Type_63 = {
+  /** Unique trace identifier */
+  traceId: string;
+  /** Unique span identifier within a trace */
+  spanId: string;
+  /** Human-readable span name */
+  name: string;
+  /** Span type (e.g., WORKFLOW_RUN, AGENT_RUN, TOOL_CALL, etc.) */
+  spanType: Shared_Type_59;
+  /** Whether this is an event (point-in-time) vs a span (duration) */
+  isEvent: boolean;
+  /** When the span started */
+  startedAt: Date;
+  parentSpanId?: (string | null) | undefined;
+  entityType?: (Shared_Type_60 | null) | undefined;
+  entityId?: (string | null) | undefined;
+  entityName?: (string | null) | undefined;
+  parentEntityType?: (Shared_Type_60 | null) | undefined;
+  parentEntityId?: (string | null) | undefined;
+  parentEntityName?: (string | null) | undefined;
+  rootEntityType?: (Shared_Type_60 | null) | undefined;
+  rootEntityId?: (string | null) | undefined;
+  rootEntityName?: (string | null) | undefined;
+  userId?: (string | null) | undefined;
+  organizationId?: (string | null) | undefined;
+  resourceId?: (string | null) | undefined;
+  runId?: (string | null) | undefined;
+  sessionId?: (string | null) | undefined;
+  threadId?: (string | null) | undefined;
+  requestId?: (string | null) | undefined;
+  environment?: (string | null) | undefined;
+  serviceName?: (string | null) | undefined;
+  scope?:
+    | ({
+        [key: string]: unknown;
+      } | null)
+    | undefined;
+  entityVersionId?: (string | null) | undefined;
+  parentEntityVersionId?: (string | null) | undefined;
+  rootEntityVersionId?: (string | null) | undefined;
+  /** Experiment or eval run identifier */
+  experimentId?: (string | null) | undefined;
+  source?: (string | null) | undefined;
+  metadata?:
+    | ({
+        [key: string]: unknown;
+      } | null)
+    | undefined;
+  tags?: (string[] | null) | undefined;
+  attributes?:
+    | ({
+        [key: string]: unknown;
+      } | null)
+    | undefined;
+  links?: (unknown[] | null) | undefined;
+  input?: (unknown | null) | undefined;
+  output?: (unknown | null) | undefined;
+  error?: (unknown | null) | undefined;
+  endedAt?: (Date | null) | undefined;
+  /** Request context data */
+  requestContext?:
+    | ({
+        [key: string]: unknown;
+      } | null)
+    | undefined;
+  /** Short text preview of the span input */
+  inputPreview?: (string | null) | undefined;
+  /** Short text preview of the span output */
+  outputPreview?: (string | null) | undefined;
+  /** Short text preview of the span error */
+  errorPreview?: (string | null) | undefined;
+  /** Milliseconds from span start to the first streamed chunk; null when the span never streamed one */
+  timeToFirstChunkMs?: (number | null) | undefined;
+  /** Database record creation time */
+  createdAt: Date;
+  /** Database record last update time */
+  updatedAt: Date | null;
+};
+
+type Shared_Type_64 = {
   traceId: string;
   rootSpanId: string;
   name: string;
@@ -3696,6 +3811,8 @@ type Shared_Type_62 = {
     [key: string]: unknown;
   } | null;
   inputPreview: string | null;
+  outputPreview: string | null;
+  errorPreview: string | null;
   threadId: string | null;
   resourceId: string | null;
   startedAt: string;
@@ -3706,7 +3823,7 @@ type Shared_Type_62 = {
   status: 'success' | 'error';
 };
 
-type Shared_Type_63 = {
+type Shared_Type_65 = {
   /** Unique id for this score event */
   scoreId?: (string | null) | undefined;
   /** When the score was recorded */
@@ -3724,13 +3841,13 @@ type Shared_Type_63 = {
   /** Score value (range defined by scorer) */
   score: number;
   reason?: (string | null) | undefined;
-  entityType?: (Shared_Type_58 | null) | undefined;
+  entityType?: (Shared_Type_60 | null) | undefined;
   entityId?: (string | null) | undefined;
   entityName?: (string | null) | undefined;
-  parentEntityType?: (Shared_Type_58 | null) | undefined;
+  parentEntityType?: (Shared_Type_60 | null) | undefined;
   parentEntityId?: (string | null) | undefined;
   parentEntityName?: (string | null) | undefined;
-  rootEntityType?: (Shared_Type_58 | null) | undefined;
+  rootEntityType?: (Shared_Type_60 | null) | undefined;
   rootEntityId?: (string | null) | undefined;
   rootEntityName?: (string | null) | undefined;
   userId?: (string | null) | undefined;
@@ -3763,7 +3880,7 @@ type Shared_Type_63 = {
     | undefined;
 };
 
-type Shared_Type_64 = {
+type Shared_Type_66 = {
   /** GET /observability/discovery/entity-types */
   entityTypes: boolean;
   /** GET /observability/discovery/entity-names */
@@ -3778,30 +3895,38 @@ type Shared_Type_64 = {
   metrics: boolean;
 };
 
-type Shared_Type_65 = {
+type Shared_Type_67 = {
   /** Metrics endpoints (/observability/metrics and /observability/metrics/*) */
   metrics: boolean;
   /** Logs endpoint (GET /observability/logs) */
   logs: boolean;
   /** Filter discovery endpoints. Unsupported discovery routes return empty results. */
-  discovery: Shared_Type_64;
+  discovery: Shared_Type_66;
   /** Cursor-based `mode: 'delta'` polling on observability list endpoints */
   deltaPolling: boolean;
   /** Advanced trace queries (POST /observability/traces/query). When false, list traces with GET /observability/traces/light instead. */
   traceQuery: boolean;
   /** `durationMs` predicates in trace and thread queries */
   traceQueryRootDuration: boolean;
+  /** `runId`, `sessionId`, `userId` and `organizationId` predicates in trace and thread queries */
+  traceQueryContextIds: boolean;
   /** Trace query field discovery (POST /observability/traces/query/fields and /values) */
   traceQueryDiscovery: boolean;
   /** Trusted tenant scoping of trace and thread queries */
   traceQueryTenantScope: boolean;
+  /** Trace aggregation (POST /observability/traces/aggregate). Unlike `traceQuery`, clients should treat a missing value as unavailable. */
+  traceAggregate: boolean;
   /** Advanced thread queries (POST /observability/threads/query) */
   threadQuery: boolean;
+  /** Span queries (POST /observability/spans/query) */
+  spanQuery: boolean;
+  /** Days of traces the store keeps. Older traces are gone, so clients can stop users from picking dates before them. Omitted when the store does not report a limit. */
+  traceRetentionDays?: number | undefined;
   /** Feedback endpoints (/observability/feedback and /observability/feedback/*). Unsupported feedback routes return 501. */
   feedback: boolean;
 };
 
-type Shared_Type_66 = {
+type Shared_Type_68 = {
   id?: string | undefined;
   name: string;
   description?: string | undefined;
@@ -3815,7 +3940,7 @@ type Shared_Type_66 = {
     | undefined;
 };
 
-type Shared_Type_67 = {
+type Shared_Type_69 = {
   kind: string;
   status: string;
   sourceDurability: 'durable' | 'best-effort' | 'live-only';
@@ -3832,16 +3957,16 @@ type Shared_Type_67 = {
     | undefined;
 };
 
-type Shared_Type_68 = {
+type Shared_Type_70 = {
   activeCount: number;
   waitingCount: number;
   retryingCount: number;
   failedCount: number;
-  latest?: Shared_Type_67 | undefined;
+  latest?: Shared_Type_69 | undefined;
   sessionOwnedOnly: true;
 };
 
-type Shared_Type_69 = {
+type Shared_Type_71 = {
   id: string;
   status: 'active' | 'paused' | 'done';
   turnsUsed: number;
@@ -3854,7 +3979,7 @@ type Shared_Type_69 = {
     | undefined;
 };
 
-type Shared_Type_70 = {
+type Shared_Type_72 = {
   sessionId: string;
   harnessName: string;
   resourceId: string;
@@ -3875,21 +4000,21 @@ type Shared_Type_70 = {
     kinds: ('tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access')[];
     sessionOwnedOnly: true;
   };
-  durableWork: Shared_Type_68;
-  goal?: Shared_Type_69 | undefined;
+  durableWork: Shared_Type_70;
+  goal?: Shared_Type_71 | undefined;
 };
 
-type Shared_Type_71 = {
+type Shared_Type_73 = {
   [key: string]: {
     toolCallId: string;
     toolName: string;
-    args: Shared_Auxiliary_565;
+    args: Shared_Auxiliary_579;
     startedAt: number;
     subagentSessionId?: string | undefined;
   };
 };
 
-type Shared_Type_72 = {
+type Shared_Type_74 = {
   subagentSessionId: string;
   agentType: string;
   task: string;
@@ -3908,7 +4033,7 @@ type Shared_Type_72 = {
   updatedAt?: number | undefined;
 };
 
-type Shared_Type_73 = {
+type Shared_Type_75 = {
   runId: string;
   sessionId: string;
   resourceId: string;
@@ -3925,7 +4050,7 @@ type Shared_Type_73 = {
   truncated?: boolean | undefined;
 };
 
-type Shared_Type_74 = {
+type Shared_Type_76 = {
   kind: 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
   itemId?: string | undefined;
   runId: string;
@@ -3938,13 +4063,13 @@ type Shared_Type_74 = {
   queuedItemId?: string | undefined;
   modeId?: string | undefined;
   resumedAt?: number | undefined;
-  payload?: Shared_Auxiliary_565 | undefined;
+  payload?: Shared_Auxiliary_579 | undefined;
   transitionModeId?: string | undefined;
   approvedTransitionModeId?: string | undefined;
   modeTransitionAppliedAt?: number | undefined;
 };
 
-type Shared_Type_75 = {
+type Shared_Type_77 = {
   version: 1;
   sessionId: string;
   threadId: string;
@@ -3959,7 +4084,7 @@ type Shared_Type_75 = {
   currentRunId?: string | undefined;
   currentMessageId?: string | undefined;
   currentTraceId?: string | undefined;
-  activeTools: Shared_Type_71;
+  activeTools: Shared_Type_73;
   toolInputBuffers: {
     [key: string]: {
       toolName: string;
@@ -3967,23 +4092,23 @@ type Shared_Type_75 = {
     };
   };
   activeSubagents: {
-    [key: string]: Shared_Type_72;
+    [key: string]: Shared_Type_74;
   };
   assistantDrafts: {
-    [key: string]: Shared_Type_73;
+    [key: string]: Shared_Type_75;
   };
   tokenUsage: {
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
   };
-  pending: Shared_Type_74 | null;
+  pending: Shared_Type_76 | null;
   queueDepth: number;
   currentQueuedItemId?: string | undefined;
-  goal?: Shared_Auxiliary_565 | undefined;
+  goal?: Shared_Auxiliary_579 | undefined;
 };
 
-type Shared_Type_76 = {
+type Shared_Type_78 = {
   cursor: {
     threadId: string;
     route: 'thread-messages';
@@ -3998,9 +4123,9 @@ type Shared_Type_76 = {
     | undefined;
 };
 
-type Shared_Type_77 = {
-  summary: Shared_Type_70;
-  state: Shared_Auxiliary_565;
+type Shared_Type_79 = {
+  summary: Shared_Type_72;
+  state: Shared_Auxiliary_579;
   queue: {
     depth: number;
     queuedItemIds: string[];
@@ -4013,7 +4138,7 @@ type Shared_Type_77 = {
     nextCursor?: string | undefined;
     sessionOwnedOnly: true;
   };
-  displayState?: Shared_Type_75 | undefined;
+  displayState?: Shared_Type_77 | undefined;
   goal?: (unknown | null) | undefined;
   channelBindings: unknown[];
   tokenUsage: {
@@ -4021,10 +4146,10 @@ type Shared_Type_77 = {
     completionTokens: number;
     totalTokens: number;
   };
-  messages: Shared_Type_76;
+  messages: Shared_Type_78;
 };
 
-type Shared_Type_78 = {
+type Shared_Type_80 = {
   /** Unique identifier for the version (UUID) */
   id: string;
   /** ID of the agent this version belongs to */
@@ -4123,12 +4248,12 @@ type Shared_Type_78 = {
   inputProcessors?: Shared_Type_21 | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: Shared_Type_21 | undefined;
-  /** Memory configuration — static or conditional */
+  /** Memory: registered memory reference or inline config — static or conditional */
   memory?:
     | (
-        | Shared_Type_28
+        | Shared_Type_30
         | {
-            value: Shared_Type_28;
+            value: Shared_Type_30;
             rules?: Shared_Type_10 | undefined;
           }[]
       )
@@ -4137,11 +4262,11 @@ type Shared_Type_78 = {
   scorers?:
     | (
         | {
-            [key: string]: Shared_Type_29;
+            [key: string]: Shared_Type_31;
           }
         | {
             value: {
-              [key: string]: Shared_Type_29;
+              [key: string]: Shared_Type_31;
             };
             rules?: Shared_Type_10 | undefined;
           }[]
@@ -4161,7 +4286,7 @@ type Shared_Type_78 = {
   createdAt: Date;
 };
 
-type Shared_Type_79 = {
+type Shared_Type_81 = {
   /** The field path that changed */
   field: string;
   /** The value in the "from" version */
@@ -4170,25 +4295,25 @@ type Shared_Type_79 = {
   currentValue: unknown;
 };
 
-type Shared_Type_80 = {
+type Shared_Type_82 = {
   id?: string | undefined;
   cron: string;
   timezone?: string | undefined;
-  inputData?: Shared_Auxiliary_747 | undefined;
-  initialState?: Shared_Auxiliary_747 | undefined;
+  inputData?: Shared_Auxiliary_761 | undefined;
+  initialState?: Shared_Auxiliary_761 | undefined;
   requestContext?:
     | {
-        [key: string]: Shared_Auxiliary_747;
+        [key: string]: Shared_Auxiliary_761;
       }
     | undefined;
   metadata?:
     | {
-        [key: string]: Shared_Auxiliary_747;
+        [key: string]: Shared_Auxiliary_761;
       }
     | undefined;
 };
 
-type Shared_Type_81 = {
+type Shared_Type_83 = {
   id: string;
   description?: string | undefined;
   metadata?:
@@ -4200,7 +4325,7 @@ type Shared_Type_81 = {
   outputSchema: unknown;
   stateSchema?: unknown | undefined;
   requestContextSchema?: unknown | undefined;
-  schedule?: (Shared_Type_80 | Shared_Type_80[]) | undefined;
+  schedule?: (Shared_Type_82 | Shared_Type_82[]) | undefined;
   graph: unknown[];
   status: 'active' | 'archived';
   source: 'storage';
@@ -4209,7 +4334,7 @@ type Shared_Type_81 = {
   updatedAt: Date | string;
 };
 
-type Shared_Type_82 = {
+type Shared_Type_84 = {
   /** Transport type: stdio for local processes, http for remote servers */
   type: 'stdio' | 'http';
   /** Command to run (stdio only) */
@@ -4228,7 +4353,7 @@ type Shared_Type_82 = {
   timeout?: number | undefined;
 };
 
-type Shared_Type_83 = {
+type Shared_Type_85 = {
   id: string;
   /** MCP client status: draft, published, or archived */
   status: string;
@@ -4247,11 +4372,11 @@ type Shared_Type_83 = {
   description?: string | undefined;
   /** Map of server name to server configuration */
   servers: {
-    [key: string]: Shared_Type_82;
+    [key: string]: Shared_Type_84;
   };
 };
 
-type Shared_Type_84 = {
+type Shared_Type_86 = {
   type: 'stdio' | 'http';
   command?: string | undefined;
   args?: string[] | undefined;
@@ -4264,7 +4389,7 @@ type Shared_Type_84 = {
   timeout?: number | undefined;
 };
 
-type Shared_Type_85 = {
+type Shared_Type_87 = {
   /** Unique identifier for the version (UUID) */
   id: string;
   /** ID of the MCP client this version belongs to */
@@ -4276,7 +4401,7 @@ type Shared_Type_85 = {
   /** Description of the MCP client */
   description?: string | undefined;
   servers: {
-    [key: string]: Shared_Type_84;
+    [key: string]: Shared_Type_86;
   };
   /** Array of field names that changed from the previous version */
   changedFields?: string[] | undefined;
@@ -4286,7 +4411,7 @@ type Shared_Type_85 = {
   createdAt: Date;
 };
 
-type Shared_Type_86 = {
+type Shared_Type_88 = {
   id: string;
   /** Prompt block status: draft, published, or archived */
   status: string;
@@ -4317,7 +4442,7 @@ type Shared_Type_86 = {
     | undefined;
 };
 
-type Shared_Type_87 = {
+type Shared_Type_89 = {
   /** Unique identifier for the version (UUID) */
   id: string;
   /** ID of the prompt block this version belongs to */
@@ -4346,7 +4471,7 @@ type Shared_Type_87 = {
   createdAt: Date;
 };
 
-type Shared_Type_88 =
+type Shared_Type_90 =
   | 'llm-judge'
   | 'answer-relevancy'
   | 'answer-similarity'
@@ -4360,7 +4485,7 @@ type Shared_Type_88 =
   | 'tool-call-accuracy'
   | 'toxicity';
 
-type Shared_Type_89 = {
+type Shared_Type_91 = {
   id: string;
   /** Scorer status: draft, published, or archived */
   status: string;
@@ -4378,7 +4503,7 @@ type Shared_Type_89 = {
   /** Description of the scorer */
   description?: string | undefined;
   /** Scorer type: llm-judge for custom, or a preset type name */
-  type: Shared_Type_88;
+  type: Shared_Type_90;
   model?: Shared_Type_12 | undefined;
   /** System instructions for the judge LLM */
   instructions?: string | undefined;
@@ -4406,7 +4531,7 @@ type Shared_Type_89 = {
     | undefined;
 };
 
-type Shared_Type_90 = {
+type Shared_Type_92 = {
   /** Unique identifier for the version (UUID) */
   id: string;
   /** ID of the scorer this version belongs to */
@@ -4417,7 +4542,7 @@ type Shared_Type_90 = {
   name: string;
   /** Description of the scorer */
   description?: string | undefined;
-  type: Shared_Type_88;
+  type: Shared_Type_90;
   model?: Shared_Type_12 | undefined;
   instructions?: string | undefined;
   scoreRange?:
@@ -4450,7 +4575,7 @@ type Shared_Type_90 = {
   createdAt: Date;
 };
 
-type Shared_Type_91 = {
+type Shared_Type_93 = {
   id: string;
   /** Workspace status: draft, published, or archived */
   status: string;
@@ -4468,24 +4593,24 @@ type Shared_Type_91 = {
   /** Description of the workspace */
   description?: string | undefined;
   /** Filesystem configuration */
-  filesystem?: Shared_Type_31;
+  filesystem?: Shared_Type_33;
   /** Sandbox configuration */
-  sandbox?: Shared_Type_32;
+  sandbox?: Shared_Type_34;
   /** Mounted filesystems keyed by mount path */
-  mounts?: Shared_Type_33 | undefined;
+  mounts?: Shared_Type_35 | undefined;
   /** Search configuration */
-  search?: Shared_Type_34 | undefined;
+  search?: Shared_Type_36 | undefined;
   /** Array of skill IDs */
   skills?: string[] | undefined;
   /** Workspace tool configuration */
-  tools?: Shared_Type_36 | undefined;
+  tools?: Shared_Type_38 | undefined;
   /** Whether to automatically sync the workspace */
   autoSync?: boolean | undefined;
   /** Operation timeout in milliseconds */
   operationTimeout?: number | undefined;
 };
 
-type Shared_Type_92 =
+type Shared_Type_94 =
   | {
       type: 'external';
       /** Package path for external source */
@@ -4502,7 +4627,7 @@ type Shared_Type_92 =
       mastraPath: string;
     };
 
-type Shared_Type_93 = {
+type Shared_Type_95 = {
   id: string;
   /** Skill status: draft, published, or archived */
   status: string;
@@ -4526,7 +4651,7 @@ type Shared_Type_93 = {
   /** Compatibility requirements */
   compatibility?: unknown | undefined;
   /** Source location of the skill */
-  source?: Shared_Type_92 | undefined;
+  source?: Shared_Type_94 | undefined;
   /** List of reference file paths */
   references?: string[] | undefined;
   /** List of script file paths */
@@ -4534,7 +4659,7 @@ type Shared_Type_93 = {
   /** List of asset file paths */
   assets?: string[] | undefined;
   /** Full file tree structure for the skill */
-  files?: Shared_Auxiliary_829[] | undefined;
+  files?: Shared_Auxiliary_843[] | undefined;
   /** Additional metadata for the skill */
   metadata?:
     | {
@@ -4543,7 +4668,7 @@ type Shared_Type_93 = {
     | undefined;
 };
 
-type Shared_Type_94 = {
+type Shared_Type_96 = {
   id: string;
   name: string;
   description?: (string | undefined) | null;
@@ -4579,7 +4704,7 @@ type Shared_Type_94 = {
   updatedAt: Date;
 };
 
-type Shared_Type_95 = {
+type Shared_Type_97 = {
   /** Name of the tool this mock applies to */
   toolName: string;
   /** Arguments to match against the tool call */
@@ -4592,14 +4717,14 @@ type Shared_Type_95 = {
   matchArgs?: ('strict' | 'ignore') | undefined;
 };
 
-type Shared_Type_96 = {
+type Shared_Type_98 = {
   /** How this item was created */
   type: 'csv' | 'json' | 'trace' | 'llm' | 'experiment-result' | 'candidate-screener';
   /** Reference identifier (e.g., trace id, csv filename) */
   referenceId?: string | undefined;
 };
 
-type Shared_Type_97 = {
+type Shared_Type_99 = {
   id: string;
   datasetId: string;
   datasetVersion: number;
@@ -4608,7 +4733,7 @@ type Shared_Type_97 = {
   groundTruth?: unknown | undefined;
   expectedTrajectory?: unknown | undefined;
   /** Ordered item-level static tool mocks served in place of executing the real tool */
-  toolMocks?: (Shared_Type_95[] | undefined) | null;
+  toolMocks?: (Shared_Type_97[] | undefined) | null;
   /** Policy for undeclared tool calls. 'allow' runs them live; 'deny' fails the experiment item */
   unmockedToolPolicy?: (('allow' | 'deny') | undefined) | null;
   scorerIds?: (string[] | undefined) | null;
@@ -4629,12 +4754,12 @@ type Shared_Type_97 = {
       )
     | null;
   /** Source/provenance of this dataset item */
-  source?: (Shared_Type_96 | undefined) | null;
+  source?: (Shared_Type_98 | undefined) | null;
   createdAt: Date;
   updatedAt: Date;
 };
 
-type Shared_Type_98 = {
+type Shared_Type_100 = {
   source?: string | undefined;
   sourceId?: string | undefined;
   sourceVersion?: string | undefined;
@@ -4645,7 +4770,7 @@ type Shared_Type_98 = {
     | undefined;
 };
 
-type Shared_Type_99 = {
+type Shared_Type_101 = {
   id: string;
   datasetId: string | null;
   datasetVersion: number | null;
@@ -4660,7 +4785,7 @@ type Shared_Type_99 = {
         [key: string]: unknown;
       }
     | undefined;
-  provenance?: (Shared_Type_98 | null) | undefined;
+  provenance?: (Shared_Type_100 | null) | undefined;
   runnerAttestation?:
     | ({
         runnerId: string;
@@ -4683,7 +4808,7 @@ type Shared_Type_99 = {
   updatedAt: Date;
 };
 
-type Shared_Type_100 = {
+type Shared_Type_102 = {
   served: {
     mockIndex: number;
     toolName: string;
@@ -4707,13 +4832,52 @@ type Shared_Type_100 = {
     | undefined;
 };
 
-type Shared_Type_101 = {
+type Shared_Type_103 = {
+  text?: string | undefined;
+  reasoningText?: string | undefined;
+  object?: unknown | undefined;
+  toolCalls?:
+    | {
+        [key: string]: unknown;
+      }[]
+    | undefined;
+  toolResults?:
+    | {
+        [key: string]: unknown;
+      }[]
+    | undefined;
+  sources?:
+    | {
+        [key: string]: unknown;
+      }[]
+    | undefined;
+  files?:
+    | {
+        [key: string]: unknown;
+      }[]
+    | undefined;
+  usage?:
+    | {
+        [key: string]: unknown;
+      }
+    | undefined;
+  traceId?: (string | null) | undefined;
+  error?:
+    | ({
+        message?: string | undefined;
+        stack?: string | undefined;
+        [x: string]: unknown;
+      } | null)
+    | undefined;
+  [x: string]: unknown;
+};
+
+type Shared_Type_104 = {
   id: string;
   experimentId: string;
   itemId: string;
   itemDatasetVersion: number | null;
   input: unknown;
-  output: unknown | null;
   groundTruth: unknown | null;
   metadata?:
     | (
@@ -4738,11 +4902,90 @@ type Shared_Type_101 = {
   tags?: (string[] | null) | undefined;
   comment?: (string | null) | undefined;
   /** Diagnostic receipt for item-level tool mocks */
-  toolMockReport?: (Shared_Type_100 | undefined) | null;
+  toolMockReport?: (Shared_Type_102 | undefined) | null;
   createdAt: Date;
+  targetType: 'agent';
+  output: Shared_Type_103 | null;
 };
 
-type Shared_Type_102 = {
+type Shared_Type_105 = {
+  id: string;
+  experimentId: string;
+  itemId: string;
+  itemDatasetVersion: number | null;
+  input: unknown;
+  groundTruth: unknown | null;
+  metadata?:
+    | (
+        | {
+            [key: string]: unknown;
+          }
+        | undefined
+      )
+    | null;
+  expectedTrajectory?: unknown | undefined;
+  error: {
+    message: string;
+    stack?: string | undefined;
+    code?: string | undefined;
+  } | null;
+  startedAt: Date;
+  completedAt: Date;
+  retryCount: number;
+  attempt?: number | undefined;
+  traceId: string | null;
+  status?: (('needs-review' | 'reviewed' | 'complete') | null) | undefined;
+  tags?: (string[] | null) | undefined;
+  comment?: (string | null) | undefined;
+  /** Diagnostic receipt for item-level tool mocks */
+  toolMockReport?: (Shared_Type_102 | undefined) | null;
+  createdAt: Date;
+  targetType: 'scorer';
+  output: {
+    score: number | null;
+    reason: string | null;
+    notScorable?: unknown | undefined;
+    [x: string]: unknown;
+  } | null;
+};
+
+type Shared_Type_106 = {
+  id: string;
+  experimentId: string;
+  itemId: string;
+  itemDatasetVersion: number | null;
+  input: unknown;
+  groundTruth: unknown | null;
+  metadata?:
+    | (
+        | {
+            [key: string]: unknown;
+          }
+        | undefined
+      )
+    | null;
+  expectedTrajectory?: unknown | undefined;
+  error: {
+    message: string;
+    stack?: string | undefined;
+    code?: string | undefined;
+  } | null;
+  startedAt: Date;
+  completedAt: Date;
+  retryCount: number;
+  attempt?: number | undefined;
+  traceId: string | null;
+  status?: (('needs-review' | 'reviewed' | 'complete') | null) | undefined;
+  tags?: (string[] | null) | undefined;
+  comment?: (string | null) | undefined;
+  /** Diagnostic receipt for item-level tool mocks */
+  toolMockReport?: (Shared_Type_102 | undefined) | null;
+  createdAt: Date;
+  targetType: ('workflow' | 'processor') | null;
+  output: unknown | null;
+};
+
+type Shared_Type_107 = {
   id: string;
   status: 'pending' | 'running' | 'suspended' | 'completed' | 'failed' | 'cancelled' | 'timed_out';
   toolName: string;
@@ -4770,7 +5013,7 @@ type Shared_Type_102 = {
   suspendPayload?: unknown | undefined;
 };
 
-type Shared_Type_103 =
+type Shared_Type_108 =
   | {
       kind: 'custom';
       provider: string;
@@ -4781,7 +5024,7 @@ type Shared_Type_103 =
       modelId?: string | undefined;
     };
 
-type Shared_Type_104 =
+type Shared_Type_109 =
   | {
       kind: 'custom';
       provider: string;
@@ -4792,7 +5035,7 @@ type Shared_Type_104 =
       modelId: string;
     };
 
-type Shared_Type_105 = {
+type Shared_Type_110 = {
   behavior?: ('deliver' | 'persist' | 'discard') | undefined;
   attributes?:
     | {
@@ -4801,7 +5044,7 @@ type Shared_Type_105 = {
     | undefined;
 };
 
-type Shared_Type_106 = {
+type Shared_Type_111 = {
   behavior?: ('wake' | 'persist' | 'discard') | undefined;
   attributes?:
     | {
@@ -4819,7 +5062,7 @@ type Shared_Type_106 = {
     | undefined;
 };
 
-type Shared_Type_107 = {
+type Shared_Type_112 = {
   id: string;
   agentId: string;
   workflowId?: undefined | undefined;
@@ -4830,7 +5073,7 @@ type Shared_Type_107 = {
   prompt: string;
   cron: string;
   timezone?: string | undefined;
-  status: 'active' | 'paused';
+  status: 'active' | 'paused' | 'completed';
   nextFireAt: number;
   lastFireAt?: number | undefined;
   lastRunId?: string | undefined;
@@ -4841,8 +5084,8 @@ type Shared_Type_107 = {
         [key: string]: (string | number | boolean | null) | undefined;
       }
     | undefined;
-  ifActive?: Shared_Type_105 | undefined;
-  ifIdle?: Shared_Type_106 | undefined;
+  ifActive?: Shared_Type_110 | undefined;
+  ifIdle?: Shared_Type_111 | undefined;
   providerOptions?:
     | {
         [key: string]: unknown;
@@ -4857,7 +5100,7 @@ type Shared_Type_107 = {
   updatedAt: number;
 };
 
-type Shared_Type_108 = {
+type Shared_Type_113 = {
   status:
     | 'running'
     | 'success'
@@ -4876,17 +5119,17 @@ type Shared_Type_108 = {
   error?: string | undefined;
 };
 
-type Shared_Type_109 = {
+type Shared_Type_114 = {
   id: string;
   workflowId: string;
   agentId?: undefined | undefined;
   cron: string;
   timezone?: string | undefined;
-  status: 'active' | 'paused';
+  status: 'active' | 'paused' | 'completed';
   nextFireAt: number;
   lastFireAt?: number | undefined;
   lastRunId?: string | undefined;
-  lastRun?: Shared_Type_108 | undefined;
+  lastRun?: Shared_Type_113 | undefined;
   inputData?: unknown | undefined;
   initialState?: unknown | undefined;
   requestContext?:
@@ -4902,6 +5145,21 @@ type Shared_Type_109 = {
     | undefined;
   createdAt: number;
   updatedAt: number;
+};
+
+type Shared_Type_115 = {
+  /** Installation identifier */
+  id: string;
+  /** Platform identifier */
+  platform: string;
+  /** Connected agent identifier */
+  agentId: string;
+  /** Installation status */
+  status: 'active' | 'pending';
+  /** Platform-specific display name */
+  displayName?: string | undefined;
+  /** Installation timestamp */
+  installedAt?: Date | undefined;
 };
 
 // ============================================================================
@@ -5010,7 +5268,7 @@ export type PostAgentsAgentIdClone_Body = {
   authorId?: string | undefined;
 };
 
-export type PostAgentsAgentIdClone_Response = Shared_Type_43;
+export type PostAgentsAgentIdClone_Response = Shared_Type_45;
 
 export type PostAgentsAgentIdClone_Request = Simplify<
   (PostAgentsAgentIdClone_PathParams extends never ? {} : { params: PostAgentsAgentIdClone_PathParams }) &
@@ -5489,11 +5747,11 @@ export interface PostAgentsAgentIdQueueMessage_RouteContract {
 }
 
 // ============================================================================
-// Route: POST /agents/:agentId/signals
+// Route: POST /agents/:agentId/queue-signal
 // ============================================================================
-export type PostAgentsAgentIdSignals_PathParams = GetAgentsAgentId_PathParams;
+export type PostAgentsAgentIdQueueSignal_PathParams = GetAgentsAgentId_PathParams;
 
-export type PostAgentsAgentIdSignals_Body =
+export type PostAgentsAgentIdQueueSignal_Body =
   | {
       ifActive?: InputShared_Type_4 | undefined;
       runId: string;
@@ -5510,6 +5768,34 @@ export type PostAgentsAgentIdSignals_Body =
       ifIdle?: InputShared_Type_9 | undefined;
       signal: InputShared_Type_10 | InputShared_Type_11 | InputShared_Type_12;
     };
+
+export type PostAgentsAgentIdQueueSignal_Response = PostAgentsAgentIdSendMessage_Response;
+
+export type PostAgentsAgentIdQueueSignal_Request = Simplify<
+  (PostAgentsAgentIdQueueSignal_PathParams extends never ? {} : { params: PostAgentsAgentIdQueueSignal_PathParams }) &
+    (never extends never ? {} : {} extends never ? { query?: never } : { query: never }) &
+    (PostAgentsAgentIdQueueSignal_Body extends never
+      ? {}
+      : {} extends PostAgentsAgentIdQueueSignal_Body
+        ? { body?: PostAgentsAgentIdQueueSignal_Body }
+        : { body: PostAgentsAgentIdQueueSignal_Body })
+>;
+
+export interface PostAgentsAgentIdQueueSignal_RouteContract {
+  pathParams: PostAgentsAgentIdQueueSignal_PathParams;
+  queryParams: never;
+  body: PostAgentsAgentIdQueueSignal_Body;
+  request: PostAgentsAgentIdQueueSignal_Request;
+  response: PostAgentsAgentIdQueueSignal_Response;
+  responseType: 'json';
+}
+
+// ============================================================================
+// Route: POST /agents/:agentId/signals
+// ============================================================================
+export type PostAgentsAgentIdSignals_PathParams = GetAgentsAgentId_PathParams;
+
+export type PostAgentsAgentIdSignals_Body = PostAgentsAgentIdQueueSignal_Body;
 
 export type PostAgentsAgentIdSignals_Response = PostAgentsAgentIdSendMessage_Response;
 
@@ -5702,6 +5988,14 @@ export type PostAgentsAgentIdApproveToolCall_Body = {
     | undefined;
   toolCallId: string;
   format?: string | undefined;
+  providerOptions?:
+    | {
+        [key: string]: {
+          [key: string]: InputShared_Auxiliary_21;
+        };
+      }
+    | undefined;
+  modelSettings?: unknown | undefined;
 };
 
 export type PostAgentsAgentIdApproveToolCall_Response = {
@@ -5844,6 +6138,14 @@ export type PostAgentsAgentIdDeclineToolCall_Body = {
     | undefined;
   toolCallId: string;
   format?: string | undefined;
+  providerOptions?:
+    | {
+        [key: string]: {
+          [key: string]: InputShared_Auxiliary_21;
+        };
+      }
+    | undefined;
+  modelSettings?: unknown | undefined;
   reason?: string | undefined;
 };
 
@@ -6601,6 +6903,12 @@ export type PostAgentsAgentIdVoiceSpeak_PathParams = GetAgentsAgentIdVoiceSpeake
 export type PostAgentsAgentIdVoiceSpeak_Body = {
   text: string;
   speakerId?: string | undefined;
+  options?:
+    | {
+        speaker?: string | undefined;
+        [x: string]: unknown;
+      }
+    | undefined;
 };
 
 export type PostAgentsAgentIdVoiceSpeak_Response = PostAgentsAgentIdGenerate_Response;
@@ -6856,7 +7164,7 @@ export interface PostAgentsAgentIdStreamUi_RouteContract {
 export type GetAuthCapabilities_Response =
   | {
       enabled: boolean;
-      login: Shared_Type_44 | null;
+      login: Shared_Type_46 | null;
       user: {
         id: string;
         email?: string | undefined;
@@ -6877,7 +7185,7 @@ export type GetAuthCapabilities_Response =
     }
   | {
       enabled: boolean;
-      login: Shared_Type_44 | null;
+      login: Shared_Type_46 | null;
     };
 
 export type GetAuthCapabilities_Request = Simplify<
@@ -7125,7 +7433,7 @@ export interface GetAuthPermissionPatterns_RouteContract {
 export type GetWorkflows_QueryParams = GetAgents_QueryParams;
 
 export type GetWorkflows_Response = {
-  [key: string]: Shared_Type_47;
+  [key: string]: Shared_Type_49;
 };
 
 export type GetWorkflows_Request = Simplify<
@@ -7180,7 +7488,7 @@ export type GetWorkflowsWorkflowId_PathParams = {
   workflowId: string;
 };
 
-export type GetWorkflowsWorkflowId_Response = Shared_Type_47;
+export type GetWorkflowsWorkflowId_Response = Shared_Type_49;
 
 export type GetWorkflowsWorkflowId_Request = Simplify<
   (GetWorkflowsWorkflowId_PathParams extends never ? {} : { params: GetWorkflowsWorkflowId_PathParams }) &
@@ -7317,7 +7625,7 @@ export type GetWorkflowsWorkflowIdRunsRunId_Response = {
         [key: string]: number[];
       }
     | undefined;
-  serializedStepGraph?: Shared_Type_46[] | undefined;
+  serializedStepGraph?: Shared_Type_48[] | undefined;
 };
 
 export type GetWorkflowsWorkflowIdRunsRunId_Request = Simplify<
@@ -7552,7 +7860,7 @@ export type PostWorkflowsWorkflowIdStartAsync_Response = {
         [key: string]: number[];
       }
     | undefined;
-  serializedStepGraph?: Shared_Type_46[] | undefined;
+  serializedStepGraph?: Shared_Type_48[] | undefined;
 };
 
 export type PostWorkflowsWorkflowIdStartAsync_Request = Simplify<
@@ -8044,6 +8352,7 @@ export type PostWorkflowsWorkflowIdRunsRunIdStepsExecute_PathParams = GetWorkflo
 export type PostWorkflowsWorkflowIdRunsRunIdStepsExecute_Body = {
   stepId: string;
   executionPath: number[];
+  parentWorkflow?: InputShared_Auxiliary_116 | undefined;
   stepResults: {
     [key: string]: unknown;
   };
@@ -8214,7 +8523,7 @@ export type GetProcessors_Response = {
     id: string;
     name?: string | undefined;
     description?: string | undefined;
-    phases: ('input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep' | 'toolResult')[];
+    phases: ('input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep' | 'toolResult' | 'llmRequest')[];
     agentIds: string[];
     configurations: {
       agentId: string;
@@ -8251,7 +8560,7 @@ export type GetProcessorsProcessorId_Response = {
   id: string;
   name?: string | undefined;
   description?: string | undefined;
-  phases: ('input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep' | 'toolResult')[];
+  phases: ('input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep' | 'toolResult' | 'llmRequest')[];
   configurations: {
     agentId: string;
     agentName: string;
@@ -8281,7 +8590,7 @@ export interface GetProcessorsProcessorId_RouteContract {
 export type PostProcessorsProcessorIdExecute_PathParams = GetProcessorsProcessorId_PathParams;
 
 export type PostProcessorsProcessorIdExecute_Body = {
-  phase: 'input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep' | 'toolResult';
+  phase: 'input' | 'inputStep' | 'outputStream' | 'outputResult' | 'outputStep' | 'toolResult' | 'llmRequest';
   messages: {
     id: string;
     role: 'user' | 'assistant' | 'system' | 'tool' | 'signal';
@@ -8307,10 +8616,10 @@ export type PostProcessorsProcessorIdExecute_Body = {
 export type PostProcessorsProcessorIdExecute_Response = {
   success: boolean;
   phase: string;
-  messages?: Shared_Type_48[] | undefined;
+  messages?: Shared_Type_50[] | undefined;
   messageList?:
     | {
-        messages: Shared_Type_48[];
+        messages: Shared_Type_50[];
       }
     | undefined;
   tripwire?:
@@ -8429,7 +8738,7 @@ export type PostV1Responses_Response = {
           logprobs?: unknown[] | undefined;
         }[];
       }
-    | Shared_Type_49
+    | Shared_Type_51
     | {
         id: string;
         type: 'function_call_output';
@@ -8594,7 +8903,7 @@ export type PostV1Conversations_Body = {
 export type PostV1Conversations_Response = {
   id: string;
   object: 'conversation';
-  thread: Shared_Type_50;
+  thread: Shared_Type_52;
 };
 
 export type PostV1Conversations_Request = Simplify<
@@ -8669,7 +8978,7 @@ export type GetV1ConversationsConversationIdItems_Response = {
             }
         )[];
       }
-    | Shared_Type_49
+    | Shared_Type_51
     | {
         id: string;
         type: 'function_call_output';
@@ -8875,8 +9184,8 @@ export type GetMemoryObservationalMemory_QueryParams = {
 };
 
 export type GetMemoryObservationalMemory_Response = {
-  record: Shared_Type_52 | null;
-  history?: Shared_Type_52[] | undefined;
+  record: Shared_Type_54 | null;
+  history?: Shared_Type_54[] | undefined;
 };
 
 export type GetMemoryObservationalMemory_Request = Simplify<
@@ -8904,7 +9213,7 @@ export interface GetMemoryObservationalMemory_RouteContract {
 export type PostMemoryObservationalMemoryBufferStatus_Body = GetMemoryStatus_QueryParams;
 
 export type PostMemoryObservationalMemoryBufferStatus_Response = {
-  record: Shared_Type_52 | null;
+  record: Shared_Type_54 | null;
 };
 
 export type PostMemoryObservationalMemoryBufferStatus_Request = Simplify<
@@ -8955,7 +9264,7 @@ export type GetMemoryThreads_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  threads: Shared_Type_50[];
+  threads: Shared_Type_52[];
 };
 
 export type GetMemoryThreads_Request = Simplify<
@@ -8990,7 +9299,7 @@ export type GetMemoryThreadsThreadId_QueryParams = {
   resourceId?: string | undefined;
 };
 
-export type GetMemoryThreadsThreadId_Response = Shared_Type_50;
+export type GetMemoryThreadsThreadId_Response = Shared_Type_52;
 
 export type GetMemoryThreadsThreadId_Request = Simplify<
   (GetMemoryThreadsThreadId_PathParams extends never ? {} : { params: GetMemoryThreadsThreadId_PathParams }) &
@@ -9298,7 +9607,7 @@ export type PostMemoryThreadsThreadIdClone_Body = {
 };
 
 export type PostMemoryThreadsThreadIdClone_Response = {
-  thread: Shared_Type_50;
+  thread: Shared_Type_52;
   clonedMessages: unknown[];
 };
 
@@ -9382,6 +9691,7 @@ export type PostMemoryThreadsThreadIdWorkingMemory_Body = {
         [key: string]: unknown;
       }
     | undefined;
+  mode?: ('replace' | 'merge') | undefined;
 };
 
 export type PostMemoryThreadsThreadIdWorkingMemory_Response = PostAuthRefresh_Response;
@@ -9800,7 +10110,7 @@ export interface PostMemoryNetworkMessagesDelete_RouteContract {
 // Route: GET /scores/scorers
 // ============================================================================
 export type GetScoresScorers_Response = {
-  [key: string]: Shared_Type_54;
+  [key: string]: Shared_Type_56;
 };
 
 export type GetScoresScorers_Request = Simplify<
@@ -9826,7 +10136,7 @@ export type GetScoresScorersScorerId_PathParams = {
   scorerId: string;
 };
 
-export type GetScoresScorersScorerId_Response = Shared_Type_54 | null;
+export type GetScoresScorersScorerId_Response = Shared_Type_56 | null;
 
 export type GetScoresScorersScorerId_Request = Simplify<
   (GetScoresScorersScorerId_PathParams extends never ? {} : { params: GetScoresScorersScorerId_PathParams }) &
@@ -10052,12 +10362,12 @@ export type GetObservabilityTraces_QueryParams = {
 };
 
 export type GetObservabilityTraces_Response = {
-  pagination?: Shared_Type_55 | undefined;
+  pagination?: Shared_Type_57 | undefined;
   /** Incremental polling metadata */
-  delta?: Shared_Type_56 | undefined;
+  delta?: Shared_Type_58 | undefined;
   /** Opaque cursor value for incremental polling */
   deltaCursor?: string | undefined;
-  spans: Shared_Type_59[];
+  spans: Shared_Type_61[];
 };
 
 export type GetObservabilityTraces_Request = Simplify<
@@ -10085,12 +10395,12 @@ export interface GetObservabilityTraces_RouteContract {
 export type GetObservabilityTracesLight_QueryParams = GetObservabilityTraces_QueryParams;
 
 export type GetObservabilityTracesLight_Response = {
-  pagination?: Shared_Type_55 | undefined;
+  pagination?: Shared_Type_57 | undefined;
   /** Incremental polling metadata */
-  delta?: Shared_Type_56 | undefined;
+  delta?: Shared_Type_58 | undefined;
   /** Opaque cursor value for incremental polling */
   deltaCursor?: string | undefined;
-  spans: Shared_Type_60[];
+  spans: Shared_Type_62[];
 };
 
 export type GetObservabilityTracesLight_Request = Simplify<
@@ -10181,12 +10491,12 @@ export type GetObservabilityBranches_QueryParams = {
 };
 
 export type GetObservabilityBranches_Response = {
-  pagination?: Shared_Type_55 | undefined;
+  pagination?: Shared_Type_57 | undefined;
   /** Incremental polling metadata */
-  delta?: Shared_Type_56 | undefined;
+  delta?: Shared_Type_58 | undefined;
   /** Opaque cursor value for incremental polling */
   deltaCursor?: string | undefined;
-  branches: Shared_Type_59[];
+  branches: Shared_Type_61[];
 };
 
 export type GetObservabilityBranches_Request = Simplify<
@@ -10226,7 +10536,7 @@ export type GetObservabilityTracesTraceIdBranchesSpanId_QueryParams = {
 export type GetObservabilityTracesTraceIdBranchesSpanId_Response = {
   /** Unique trace identifier */
   traceId: string;
-  spans: Shared_Type_61[];
+  spans: Shared_Type_63[];
 };
 
 export type GetObservabilityTracesTraceIdBranchesSpanId_Request = Simplify<
@@ -10261,7 +10571,7 @@ export type GetObservabilityTracesTraceId_PathParams = {
 export type GetObservabilityTracesTraceId_Response = {
   /** Unique trace identifier */
   traceId: string;
-  spans: Shared_Type_59[];
+  spans: Shared_Type_61[];
 };
 
 export type GetObservabilityTracesTraceId_Request = Simplify<
@@ -10287,7 +10597,7 @@ export type GetObservabilityTracesTraceIdLight_PathParams = GetObservabilityTrac
 export type GetObservabilityTracesTraceIdLight_Response = {
   /** Unique trace identifier */
   traceId: string;
-  spans: Shared_Type_60[];
+  spans: Shared_Type_62[];
 };
 
 export type GetObservabilityTracesTraceIdLight_Request = Simplify<
@@ -10315,7 +10625,7 @@ export type GetObservabilityTracesTraceIdSpansSpanId_PathParams =
 
 export type GetObservabilityTracesTraceIdSpansSpanId_Response = {
   /** Span record data */
-  span: Shared_Type_61;
+  span: Shared_Type_63;
 };
 
 export type GetObservabilityTracesTraceIdSpansSpanId_Request = Simplify<
@@ -10447,7 +10757,7 @@ export type GetObservabilityTracesTraceIdSpanIdScores_QueryParams = {
 };
 
 export type GetObservabilityTracesTraceIdSpanIdScores_Response = {
-  pagination: Shared_Type_55;
+  pagination: Shared_Type_57;
   scores: {
     id: string;
     scorerId: string;
@@ -10589,7 +10899,7 @@ export type PostObservabilityTracesQuery_Body = {
     from: string;
     to: string;
   };
-  where?: InputShared_Auxiliary_205 | undefined;
+  where?: InputShared_Auxiliary_208 | undefined;
   group?:
     | {
         by: ['threadId'];
@@ -10625,21 +10935,21 @@ export type PostObservabilityTracesQuery_Body = {
 
 export type PostObservabilityTracesQuery_Response =
   | {
-      traces: Shared_Type_62[];
+      traces: Shared_Type_64[];
       page: {
         next: string | null;
       };
     }
   | {
-      traces: Shared_Type_62[];
-      pagination: Shared_Type_55;
+      traces: Shared_Type_64[];
+      pagination: Shared_Type_57;
       /** Opaque cursor value for incremental polling */
       deltaCursor?: string | undefined;
     }
   | {
-      traces: Shared_Type_62[];
+      traces: Shared_Type_64[];
       /** Incremental polling metadata */
-      delta: Shared_Type_56;
+      delta: Shared_Type_58;
       /** Opaque cursor value for incremental polling */
       deltaCursor: string;
     }
@@ -10672,6 +10982,117 @@ export interface PostObservabilityTracesQuery_RouteContract {
 }
 
 // ============================================================================
+// Route: POST /observability/traces/aggregate
+// ============================================================================
+export type PostObservabilityTracesAggregate_Body = {
+  timeRange: {
+    from: string;
+    to: string;
+  };
+  where?: InputShared_Auxiliary_208 | undefined;
+  groupBy?: string[];
+  interval?: ('1m' | '5m' | '15m' | '1h' | '1d') | undefined;
+  measures: (
+    | (
+        | 'count'
+        | 'duration.avg'
+        | 'duration.min'
+        | 'duration.max'
+        | 'duration.p50'
+        | 'duration.p90'
+        | 'duration.p95'
+        | 'duration.p99'
+        | 'errorCount'
+        | 'errorRate'
+        | 'tokens.input.sum'
+        | 'tokens.input.avg'
+        | 'tokens.output.sum'
+        | 'tokens.output.avg'
+        | 'tokens.total.sum'
+        | 'tokens.total.avg'
+        | 'tokens.reasoning.sum'
+        | 'tokens.reasoning.avg'
+        | 'tokens.cached.sum'
+        | 'tokens.cached.avg'
+        | 'cost.sum'
+        | 'cost.avg'
+      )
+    | `countDistinct.${string}`
+  )[];
+  having?: InputShared_Auxiliary_231 | undefined;
+  orderBy?: {
+    field: string;
+    direction: 'asc' | 'desc';
+  };
+  limit?: number;
+};
+
+export type PostObservabilityTracesAggregate_Response = {
+  rows: {
+    dimensions?:
+      | {
+          [key: string]: string | null;
+        }
+      | undefined;
+    bucket?: string | undefined;
+    measures: {
+      [K in
+        | (
+            | 'count'
+            | 'duration.avg'
+            | 'duration.min'
+            | 'duration.max'
+            | 'duration.p50'
+            | 'duration.p90'
+            | 'duration.p95'
+            | 'duration.p99'
+            | 'errorCount'
+            | 'errorRate'
+            | 'tokens.input.sum'
+            | 'tokens.input.avg'
+            | 'tokens.output.sum'
+            | 'tokens.output.avg'
+            | 'tokens.total.sum'
+            | 'tokens.total.avg'
+            | 'tokens.reasoning.sum'
+            | 'tokens.reasoning.avg'
+            | 'tokens.cached.sum'
+            | 'tokens.cached.avg'
+            | 'cost.sum'
+            | 'cost.avg'
+          )
+        | `countDistinct.${string}`]?: number | null;
+    };
+    cost?:
+      | {
+          coverage: number | null;
+          unit: string | null;
+        }
+      | undefined;
+  }[];
+  truncated: boolean;
+};
+
+export type PostObservabilityTracesAggregate_Request = Simplify<
+  (never extends never ? {} : { params: never }) &
+    (never extends never ? {} : {} extends never ? { query?: never } : { query: never }) &
+    (PostObservabilityTracesAggregate_Body extends never
+      ? {}
+      : {} extends PostObservabilityTracesAggregate_Body
+        ? { body?: PostObservabilityTracesAggregate_Body }
+        : { body: PostObservabilityTracesAggregate_Body })
+>;
+
+export interface PostObservabilityTracesAggregate_RouteContract {
+  pathParams: never;
+  queryParams: never;
+  body: PostObservabilityTracesAggregate_Body;
+  request: PostObservabilityTracesAggregate_Request;
+  response: PostObservabilityTracesAggregate_Response;
+  responseType: 'json';
+}
+
+// ============================================================================
 // Route: POST /observability/threads/query
 // ============================================================================
 export type PostObservabilityThreadsQuery_Body = {
@@ -10680,9 +11101,9 @@ export type PostObservabilityThreadsQuery_Body = {
       from: string;
       to: string;
     };
-    where?: InputShared_Auxiliary_205 | undefined;
+    where?: InputShared_Auxiliary_208 | undefined;
   };
-  where?: InputShared_Auxiliary_252 | undefined;
+  where?: InputShared_Auxiliary_265 | undefined;
   page?: {
     limit?: number;
     after?: (string | null) | undefined;
@@ -10718,6 +11139,89 @@ export interface PostObservabilityThreadsQuery_RouteContract {
 }
 
 // ============================================================================
+// Route: POST /observability/spans/query
+// ============================================================================
+export type PostObservabilitySpansQuery_Body = {
+  timeRange: {
+    from: string;
+    to: string;
+  };
+  where?: InputShared_Auxiliary_231 | undefined;
+  orderBy?: {
+    field: 'startedAt' | 'endedAt';
+    direction: 'asc' | 'desc';
+  }[];
+  page?: {
+    limit?: number;
+    after?: string | undefined;
+  };
+};
+
+export type PostObservabilitySpansQuery_Response = {
+  spans: {
+    organizationId: string | null;
+    resourceId: string | null;
+    traceId: string;
+    spanId: string;
+    parentSpanId: string | null;
+    name: string;
+    spanType: string;
+    status: 'success' | 'error';
+    startedAt: string;
+    endedAt: string;
+    durationMs: number;
+    entityType: string | null;
+    entityId: string | null;
+    entityName: string | null;
+    entityVersionId: string | null;
+    parentEntityType: string | null;
+    parentEntityId: string | null;
+    parentEntityName: string | null;
+    parentEntityVersionId: string | null;
+    rootEntityType: string | null;
+    rootEntityId: string | null;
+    rootEntityName: string | null;
+    rootEntityVersionId: string | null;
+    threadId: string | null;
+    runId: string | null;
+    sessionId: string | null;
+    userId: string | null;
+    requestId: string | null;
+    serviceName: string | null;
+    experimentId: string | null;
+    environment: string | null;
+    executionSource: string | null;
+    model: string | null;
+    provider: string | null;
+    inputPreview: string | null;
+    outputPreview: string | null;
+    errorPreview: string | null;
+  }[];
+  page: {
+    next: string | null;
+  };
+};
+
+export type PostObservabilitySpansQuery_Request = Simplify<
+  (never extends never ? {} : { params: never }) &
+    (never extends never ? {} : {} extends never ? { query?: never } : { query: never }) &
+    (PostObservabilitySpansQuery_Body extends never
+      ? {}
+      : {} extends PostObservabilitySpansQuery_Body
+        ? { body?: PostObservabilitySpansQuery_Body }
+        : { body: PostObservabilitySpansQuery_Body })
+>;
+
+export interface PostObservabilitySpansQuery_RouteContract {
+  pathParams: never;
+  queryParams: never;
+  body: PostObservabilitySpansQuery_Body;
+  request: PostObservabilitySpansQuery_Request;
+  response: PostObservabilitySpansQuery_Response;
+  responseType: 'json';
+}
+
+// ============================================================================
 // Route: POST /observability/traces/query/fields
 // ============================================================================
 export type PostObservabilityTracesQueryFields_Body = {
@@ -10747,6 +11251,8 @@ export type PostObservabilityTracesQueryFields_Response = {
       | 'notExists'
       | 'includes'
       | 'notIncludes'
+      | 'matches'
+      | 'notMatches'
     )[];
     valueSuggestions: boolean;
   }[];
@@ -10758,6 +11264,22 @@ export type PostObservabilityTracesQueryFields_Response = {
     occurrences: number;
   }[];
   observedFieldsTruncated: boolean;
+  /** What `aggregateTraces()` accepts. Present only for `predicateScope: "trace"` when the store supports aggregation. Every observed field is also a groupable dimension, and `countDistinct.<field>` accepts any dimension or `traceId`. */
+  aggregate?:
+    | {
+        dimensions: {
+          path: string;
+          valueKind: 'string';
+        }[];
+        measures: {
+          name: string;
+          kind: 'count' | 'duration' | 'error' | 'tokens' | 'cost';
+          statistic?: ('avg' | 'min' | 'max' | 'p50' | 'p90' | 'p95' | 'p99' | 'sum') | undefined;
+          unit: 'count' | 'milliseconds' | 'ratio' | 'tokens' | 'currency';
+          approximate: boolean;
+        }[];
+      }
+    | undefined;
 };
 
 export type PostObservabilityTracesQueryFields_Request = Simplify<
@@ -10851,6 +11373,7 @@ export type GetObservabilityMetrics_QueryParams = {
   executionSource?: (string | undefined) | undefined;
   tags?: ((string[] | undefined) | undefined) | string;
   traceIds?: ((string[] | undefined) | undefined) | string;
+  experimentIds?: ((string[] | undefined) | undefined) | string;
   name?: ((string[] | undefined) | undefined) | string;
   /** Filter by execution source */
   source?: (string | undefined) | undefined;
@@ -10881,9 +11404,9 @@ export type GetObservabilityMetrics_QueryParams = {
 };
 
 export type GetObservabilityMetrics_Response = {
-  pagination?: Shared_Type_55 | undefined;
+  pagination?: Shared_Type_57 | undefined;
   /** Incremental polling metadata */
-  delta?: Shared_Type_56 | undefined;
+  delta?: Shared_Type_58 | undefined;
   /** Opaque cursor value for incremental polling */
   deltaCursor?: string | undefined;
   metrics: {
@@ -10897,13 +11420,13 @@ export type GetObservabilityMetrics_Response = {
     value: number;
     traceId?: (string | null) | undefined;
     spanId?: (string | null) | undefined;
-    entityType?: (Shared_Type_58 | null) | undefined;
+    entityType?: (Shared_Type_60 | null) | undefined;
     entityId?: (string | null) | undefined;
     entityName?: (string | null) | undefined;
-    parentEntityType?: (Shared_Type_58 | null) | undefined;
+    parentEntityType?: (Shared_Type_60 | null) | undefined;
     parentEntityId?: (string | null) | undefined;
     parentEntityName?: (string | null) | undefined;
-    rootEntityType?: (Shared_Type_58 | null) | undefined;
+    rootEntityType?: (Shared_Type_60 | null) | undefined;
     rootEntityId?: (string | null) | undefined;
     rootEntityName?: (string | null) | undefined;
     userId?: (string | null) | undefined;
@@ -11026,9 +11549,9 @@ export type GetObservabilityLogs_QueryParams = {
 };
 
 export type GetObservabilityLogs_Response = {
-  pagination?: Shared_Type_55 | undefined;
+  pagination?: Shared_Type_57 | undefined;
   /** Incremental polling metadata */
-  delta?: Shared_Type_56 | undefined;
+  delta?: Shared_Type_58 | undefined;
   /** Opaque cursor value for incremental polling */
   deltaCursor?: string | undefined;
   logs: {
@@ -11047,13 +11570,13 @@ export type GetObservabilityLogs_Response = {
       | undefined;
     traceId?: (string | null) | undefined;
     spanId?: (string | null) | undefined;
-    entityType?: (Shared_Type_58 | null) | undefined;
+    entityType?: (Shared_Type_60 | null) | undefined;
     entityId?: (string | null) | undefined;
     entityName?: (string | null) | undefined;
-    parentEntityType?: (Shared_Type_58 | null) | undefined;
+    parentEntityType?: (Shared_Type_60 | null) | undefined;
     parentEntityId?: (string | null) | undefined;
     parentEntityName?: (string | null) | undefined;
-    rootEntityType?: (Shared_Type_58 | null) | undefined;
+    rootEntityType?: (Shared_Type_60 | null) | undefined;
     rootEntityId?: (string | null) | undefined;
     rootEntityName?: (string | null) | undefined;
     userId?: (string | null) | undefined;
@@ -11165,12 +11688,12 @@ export type GetObservabilityScores_QueryParams = {
 };
 
 export type GetObservabilityScores_Response = {
-  pagination?: Shared_Type_55 | undefined;
+  pagination?: Shared_Type_57 | undefined;
   /** Incremental polling metadata */
-  delta?: Shared_Type_56 | undefined;
+  delta?: Shared_Type_58 | undefined;
   /** Opaque cursor value for incremental polling */
   deltaCursor?: string | undefined;
-  scores: Shared_Type_63[];
+  scores: Shared_Type_65[];
 };
 
 export type GetObservabilityScores_Request = Simplify<
@@ -11315,7 +11838,7 @@ export type GetObservabilityScoresScoreId_PathParams = {
 
 export type GetObservabilityScoresScoreId_Response = {
   /** Score record as stored in the database */
-  score: Shared_Type_63 | null;
+  score: Shared_Type_65 | null;
 };
 
 export type GetObservabilityScoresScoreId_Request = Simplify<
@@ -11570,9 +12093,9 @@ export type GetObservabilityFeedback_QueryParams = {
 };
 
 export type GetObservabilityFeedback_Response = {
-  pagination?: Shared_Type_55 | undefined;
+  pagination?: Shared_Type_57 | undefined;
   /** Incremental polling metadata */
-  delta?: Shared_Type_56 | undefined;
+  delta?: Shared_Type_58 | undefined;
   /** Opaque cursor value for incremental polling */
   deltaCursor?: string | undefined;
   feedback: {
@@ -11592,13 +12115,13 @@ export type GetObservabilityFeedback_Response = {
     value: number | string;
     comment?: (string | null) | undefined;
     feedbackUserId?: (string | null) | undefined;
-    entityType?: (Shared_Type_58 | null) | undefined;
+    entityType?: (Shared_Type_60 | null) | undefined;
     entityId?: (string | null) | undefined;
     entityName?: (string | null) | undefined;
-    parentEntityType?: (Shared_Type_58 | null) | undefined;
+    parentEntityType?: (Shared_Type_60 | null) | undefined;
     parentEntityId?: (string | null) | undefined;
     parentEntityName?: (string | null) | undefined;
-    rootEntityType?: (Shared_Type_58 | null) | undefined;
+    rootEntityType?: (Shared_Type_60 | null) | undefined;
     rootEntityId?: (string | null) | undefined;
     rootEntityName?: (string | null) | undefined;
     userId?: (string | null) | undefined;
@@ -11804,13 +12327,13 @@ export type PatchObservabilityFeedbackFeedbackIdReviewStatus_Response = {
   value: number | string;
   comment?: (string | null) | undefined;
   feedbackUserId?: (string | null) | undefined;
-  entityType?: (Shared_Type_58 | null) | undefined;
+  entityType?: (Shared_Type_60 | null) | undefined;
   entityId?: (string | null) | undefined;
   entityName?: (string | null) | undefined;
-  parentEntityType?: (Shared_Type_58 | null) | undefined;
+  parentEntityType?: (Shared_Type_60 | null) | undefined;
   parentEntityId?: (string | null) | undefined;
   parentEntityName?: (string | null) | undefined;
-  rootEntityType?: (Shared_Type_58 | null) | undefined;
+  rootEntityType?: (Shared_Type_60 | null) | undefined;
   rootEntityId?: (string | null) | undefined;
   rootEntityName?: (string | null) | undefined;
   userId?: (string | null) | undefined;
@@ -12331,7 +12854,7 @@ export interface GetObservabilityDiscoveryMetricLabelValues_RouteContract {
 // ============================================================================
 export type GetObservabilityDiscoveryEntityTypes_Response = {
   /** Distinct entity types */
-  entityTypes: Shared_Type_58[];
+  entityTypes: Shared_Type_60[];
 };
 
 export type GetObservabilityDiscoveryEntityTypes_Request = Simplify<
@@ -12462,7 +12985,7 @@ export interface GetObservabilityDiscoveryTags_RouteContract {
 export type GetObservabilityCapabilities_Response = {
   /** Class name of the configured observability storage, or null when none is configured */
   observabilityStorageType: string | null;
-  capabilities: Shared_Type_65;
+  capabilities: Shared_Type_67;
 };
 
 export type GetObservabilityCapabilities_Request = Simplify<
@@ -14440,7 +14963,7 @@ export type GetMcpServerIdTools_PathParams = {
 };
 
 export type GetMcpServerIdTools_Response = {
-  tools: Shared_Type_66[];
+  tools: Shared_Type_68[];
 };
 
 export type GetMcpServerIdTools_Request = Simplify<
@@ -14468,7 +14991,7 @@ export type GetMcpServerIdToolsToolId_PathParams = {
   toolId: string;
 };
 
-export type GetMcpServerIdToolsToolId_Response = Shared_Type_66;
+export type GetMcpServerIdToolsToolId_Response = Shared_Type_68;
 
 export type GetMcpServerIdToolsToolId_Request = Simplify<
   (GetMcpServerIdToolsToolId_PathParams extends never ? {} : { params: GetMcpServerIdToolsToolId_PathParams }) &
@@ -14581,6 +15104,12 @@ export type PostMcpServerIdResourcesRead_Response = {
     uri: string;
     text?: string | undefined;
     blob?: string | undefined;
+    mimeType?: string | undefined;
+    _meta?:
+      | {
+          [key: string]: unknown;
+        }
+      | undefined;
   }[];
 };
 
@@ -14678,7 +15207,7 @@ export type GetHarnessNameSessions_QueryParams = {
 };
 
 export type GetHarnessNameSessions_Response = {
-  items: Shared_Type_70[];
+  items: Shared_Type_72[];
   nextCursor?: string | undefined;
   truncated: boolean;
 };
@@ -14724,7 +15253,7 @@ export type PostHarnessNameSessions_Body = {
 };
 
 export type PostHarnessNameSessions_Response = {
-  session: Shared_Type_77;
+  session: Shared_Type_79;
 };
 
 export type PostHarnessNameSessions_Request = Simplify<
@@ -14756,7 +15285,7 @@ export type GetHarnessNameSessionsSessionId_PathParams = {
   sessionId: string;
 };
 
-export type GetHarnessNameSessionsSessionId_Response = Shared_Type_77;
+export type GetHarnessNameSessionsSessionId_Response = Shared_Type_79;
 
 export type GetHarnessNameSessionsSessionId_Request = Simplify<
   (GetHarnessNameSessionsSessionId_PathParams extends never
@@ -15000,7 +15529,7 @@ export type PostHarnessNameSessionsSessionIdAttachments_Body = {
   schemaId?: string | undefined;
   metadata?:
     | {
-        [key: string]: InputShared_Auxiliary_383;
+        [key: string]: InputShared_Auxiliary_400;
       }
     | undefined;
 };
@@ -15021,7 +15550,7 @@ export type PostHarnessNameSessionsSessionIdAttachments_Response = {
   schemaId?: string | undefined;
   metadata?:
     | {
-        [key: string]: Shared_Auxiliary_565;
+        [key: string]: Shared_Auxiliary_579;
       }
     | undefined;
   object?: unknown | undefined;
@@ -15344,7 +15873,7 @@ export interface GetHarnessNameSessionsSessionIdPermissions_RouteContract {
 export type PatchHarnessNameSessionsSessionIdState_PathParams = GetHarnessNameSessionsSessionId_PathParams;
 
 export type PatchHarnessNameSessionsSessionIdState_Body = {
-  [key: string]: InputShared_Auxiliary_383;
+  [key: string]: InputShared_Auxiliary_400;
 };
 
 export type PatchHarnessNameSessionsSessionIdState_Request = Simplify<
@@ -15506,7 +16035,7 @@ export type PostHarnessNameSessionsSessionIdInboxItemId_Body =
       approved: boolean;
       editedArgs?:
         | {
-            [key: string]: InputShared_Auxiliary_383;
+            [key: string]: InputShared_Auxiliary_400;
           }
         | undefined;
       reason?: string | undefined;
@@ -15518,7 +16047,7 @@ export type PostHarnessNameSessionsSessionIdInboxItemId_Body =
     }
   | {
       kind: 'tool-suspension';
-      resumeData: InputShared_Auxiliary_383;
+      resumeData: InputShared_Auxiliary_400;
       responseId: string;
       runId: string;
       toolCallId: string;
@@ -15526,7 +16055,7 @@ export type PostHarnessNameSessionsSessionIdInboxItemId_Body =
     }
   | {
       kind: 'question';
-      answer: InputShared_Auxiliary_383;
+      answer: InputShared_Auxiliary_400;
       responseId: string;
       runId: string;
       toolCallId: string;
@@ -15784,7 +16313,7 @@ export type GetStoredAgents_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  agents: Shared_Type_43[];
+  agents: Shared_Type_45[];
 };
 
 export type GetStoredAgents_Request = Simplify<
@@ -15943,24 +16472,24 @@ export type PostStoredAgentsStoredAgentIdExport_Body = {
   inputProcessors?: (InputShared_Type_56 | undefined) | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: (InputShared_Type_56 | undefined) | undefined;
-  /** Memory configuration — static, conditional, or null to disable memory */
-  memory?: ((InputShared_Type_64 | null) | undefined) | undefined;
+  /** Memory: registered memory reference or inline config — static, conditional, or null to disable memory */
+  memory?: ((InputShared_Type_66 | null) | undefined) | undefined;
   /** Scorer keys with optional sampling config — static or conditional */
   scorers?:
     | (
         | (
             | {
-                [key: string]: InputShared_Type_65;
+                [key: string]: InputShared_Type_67;
               }
-            | InputShared_Type_66[]
+            | InputShared_Type_68[]
           )
         | undefined
       )
     | undefined;
   /** Skill IDs mapped to per-skill config — static or conditional */
-  skills?: (InputShared_Type_68 | undefined) | undefined;
+  skills?: (InputShared_Type_70 | undefined) | undefined;
   /** Workspace reference (stored ID or inline config) — static or conditional */
-  workspace?: InputShared_Type_78 | undefined;
+  workspace?: InputShared_Type_80 | undefined;
   /** Browser configuration — object config, true (apply default), false/null (disable) */
   browser?:
     | (
@@ -15968,9 +16497,9 @@ export type PostStoredAgentsStoredAgentIdExport_Body = {
             | (
                 | {
                     type: 'inline';
-                    config: InputShared_Type_80;
+                    config: InputShared_Type_82;
                   }
-                | InputShared_Type_81[]
+                | InputShared_Type_83[]
               )
             | boolean
             | null
@@ -16098,24 +16627,24 @@ export type PostStoredAgentsStoredAgentIdChangeRequest_Body = {
   inputProcessors?: (InputShared_Type_56 | undefined) | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: (InputShared_Type_56 | undefined) | undefined;
-  /** Memory configuration — static, conditional, or null to disable memory */
-  memory?: ((InputShared_Type_64 | null) | undefined) | undefined;
+  /** Memory: registered memory reference or inline config — static, conditional, or null to disable memory */
+  memory?: ((InputShared_Type_66 | null) | undefined) | undefined;
   /** Scorer keys with optional sampling config — static or conditional */
   scorers?:
     | (
         | (
             | {
-                [key: string]: InputShared_Type_65;
+                [key: string]: InputShared_Type_67;
               }
-            | InputShared_Type_66[]
+            | InputShared_Type_68[]
           )
         | undefined
       )
     | undefined;
   /** Skill IDs mapped to per-skill config — static or conditional */
-  skills?: (InputShared_Type_68 | undefined) | undefined;
+  skills?: (InputShared_Type_70 | undefined) | undefined;
   /** Workspace reference (stored ID or inline config) — static or conditional */
-  workspace?: InputShared_Type_78 | undefined;
+  workspace?: InputShared_Type_80 | undefined;
   /** Browser configuration — object config, true (apply default), false/null (disable) */
   browser?:
     | (
@@ -16123,9 +16652,9 @@ export type PostStoredAgentsStoredAgentIdChangeRequest_Body = {
             | (
                 | {
                     type: 'inline';
-                    config: InputShared_Type_80;
+                    config: InputShared_Type_82;
                   }
-                | InputShared_Type_81[]
+                | InputShared_Type_83[]
               )
             | boolean
             | null
@@ -16300,12 +16829,12 @@ export type PostStoredAgents_Body = {
   inputProcessors?: InputShared_Type_56 | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: InputShared_Type_56 | undefined;
-  /** Memory configuration — static or conditional */
+  /** Memory: registered memory reference or inline config — static or conditional */
   memory?:
     | (
-        | InputShared_Type_63
+        | InputShared_Type_65
         | {
-            value: InputShared_Type_63;
+            value: InputShared_Type_65;
             rules?:
               | {
                   operator: 'AND' | 'OR';
@@ -16319,24 +16848,24 @@ export type PostStoredAgents_Body = {
   scorers?:
     | (
         | {
-            [key: string]: InputShared_Type_65;
+            [key: string]: InputShared_Type_67;
           }
-        | InputShared_Type_66[]
+        | InputShared_Type_68[]
       )
     | undefined;
   /** Skill IDs mapped to per-skill config — static or conditional */
-  skills?: InputShared_Type_68 | undefined;
+  skills?: InputShared_Type_70 | undefined;
   /** Workspace reference (stored ID or inline config) — static or conditional */
-  workspace?: InputShared_Type_78;
+  workspace?: InputShared_Type_80;
   /** Browser configuration — object config, true (apply default), false/null (disable) */
   browser?:
     | (
         | (
             | {
                 type: 'inline';
-                config: InputShared_Type_80;
+                config: InputShared_Type_82;
               }
-            | InputShared_Type_81[]
+            | InputShared_Type_83[]
           )
         | boolean
         | null
@@ -16460,24 +16989,24 @@ export type PatchStoredAgentsStoredAgentId_Body = {
   inputProcessors?: (InputShared_Type_56 | undefined) | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: (InputShared_Type_56 | undefined) | undefined;
-  /** Memory configuration — static, conditional, or null to disable memory */
-  memory?: ((InputShared_Type_64 | null) | undefined) | undefined;
+  /** Memory: registered memory reference or inline config — static, conditional, or null to disable memory */
+  memory?: ((InputShared_Type_66 | null) | undefined) | undefined;
   /** Scorer keys with optional sampling config — static or conditional */
   scorers?:
     | (
         | (
             | {
-                [key: string]: InputShared_Type_65;
+                [key: string]: InputShared_Type_67;
               }
-            | InputShared_Type_66[]
+            | InputShared_Type_68[]
           )
         | undefined
       )
     | undefined;
   /** Skill IDs mapped to per-skill config — static or conditional */
-  skills?: (InputShared_Type_68 | undefined) | undefined;
+  skills?: (InputShared_Type_70 | undefined) | undefined;
   /** Workspace reference (stored ID or inline config) — static or conditional */
-  workspace?: InputShared_Type_78 | undefined;
+  workspace?: InputShared_Type_80 | undefined;
   /** Browser configuration — object config, true (apply default), false/null (disable) */
   browser?:
     | (
@@ -16485,9 +17014,9 @@ export type PatchStoredAgentsStoredAgentId_Body = {
             | (
                 | {
                     type: 'inline';
-                    config: InputShared_Type_80;
+                    config: InputShared_Type_82;
                   }
-                | InputShared_Type_81[]
+                | InputShared_Type_83[]
               )
             | boolean
             | null
@@ -16538,7 +17067,7 @@ export type PatchStoredAgentsStoredAgentId_Response =
       createdAt: Date;
       updatedAt: Date;
     }
-  | Shared_Type_43;
+  | Shared_Type_45;
 
 export type PatchStoredAgentsStoredAgentId_Request = Simplify<
   (PatchStoredAgentsStoredAgentId_PathParams extends never
@@ -16609,7 +17138,7 @@ export type GetStoredAgentsAgentIdVersions_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  versions: Shared_Type_78[];
+  versions: Shared_Type_80[];
 };
 
 export type GetStoredAgentsAgentIdVersions_Request = Simplify<
@@ -16763,13 +17292,13 @@ export type PostStoredAgentsAgentIdVersions_Response = {
   inputProcessors?: (Shared_Type_21 | undefined) | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: (Shared_Type_21 | undefined) | undefined;
-  /** Memory configuration — static or conditional */
+  /** Memory: registered memory reference or inline config — static or conditional */
   memory?:
     | (
         | (
-            | Shared_Type_28
+            | Shared_Type_30
             | {
-                value: Shared_Type_28;
+                value: Shared_Type_30;
                 rules?: Shared_Type_10 | undefined;
               }[]
           )
@@ -16781,11 +17310,11 @@ export type PostStoredAgentsAgentIdVersions_Response = {
     | (
         | (
             | {
-                [key: string]: Shared_Type_29;
+                [key: string]: Shared_Type_31;
               }
             | {
                 value: {
-                  [key: string]: Shared_Type_29;
+                  [key: string]: Shared_Type_31;
                 };
                 rules?: Shared_Type_10 | undefined;
               }[]
@@ -16845,7 +17374,7 @@ export type GetStoredAgentsAgentIdVersionsCompare_QueryParams = {
 
 export type GetStoredAgentsAgentIdVersionsCompare_Response = {
   /** List of differences between versions */
-  diffs: Shared_Type_79[];
+  diffs: Shared_Type_81[];
   /** The source version */
   fromVersion: {
     /** Unique identifier for the version (UUID) */
@@ -16946,12 +17475,12 @@ export type GetStoredAgentsAgentIdVersionsCompare_Response = {
     inputProcessors?: Shared_Type_21 | undefined;
     /** Output processor graph — static or conditional */
     outputProcessors?: Shared_Type_21 | undefined;
-    /** Memory configuration — static or conditional */
+    /** Memory: registered memory reference or inline config — static or conditional */
     memory?:
       | (
-          | Shared_Type_28
+          | Shared_Type_30
           | {
-              value: Shared_Type_28;
+              value: Shared_Type_30;
               rules?: Shared_Type_10 | undefined;
             }[]
         )
@@ -16960,11 +17489,11 @@ export type GetStoredAgentsAgentIdVersionsCompare_Response = {
     scorers?:
       | (
           | {
-              [key: string]: Shared_Type_29;
+              [key: string]: Shared_Type_31;
             }
           | {
               value: {
-                [key: string]: Shared_Type_29;
+                [key: string]: Shared_Type_31;
               };
               rules?: Shared_Type_10 | undefined;
             }[]
@@ -17083,12 +17612,12 @@ export type GetStoredAgentsAgentIdVersionsCompare_Response = {
     inputProcessors?: Shared_Type_21 | undefined;
     /** Output processor graph — static or conditional */
     outputProcessors?: Shared_Type_21 | undefined;
-    /** Memory configuration — static or conditional */
+    /** Memory: registered memory reference or inline config — static or conditional */
     memory?:
       | (
-          | Shared_Type_28
+          | Shared_Type_30
           | {
-              value: Shared_Type_28;
+              value: Shared_Type_30;
               rules?: Shared_Type_10 | undefined;
             }[]
         )
@@ -17097,11 +17626,11 @@ export type GetStoredAgentsAgentIdVersionsCompare_Response = {
     scorers?:
       | (
           | {
-              [key: string]: Shared_Type_29;
+              [key: string]: Shared_Type_31;
             }
           | {
               value: {
-                [key: string]: Shared_Type_29;
+                [key: string]: Shared_Type_31;
               };
               rules?: Shared_Type_10 | undefined;
             }[]
@@ -17153,7 +17682,7 @@ export type GetStoredAgentsAgentIdVersionsVersionId_PathParams = {
   versionId: string;
 };
 
-export type GetStoredAgentsAgentIdVersionsVersionId_Response = Shared_Type_78;
+export type GetStoredAgentsAgentIdVersionsVersionId_Response = Shared_Type_80;
 
 export type GetStoredAgentsAgentIdVersionsVersionId_Request = Simplify<
   (GetStoredAgentsAgentIdVersionsVersionId_PathParams extends never
@@ -17306,12 +17835,12 @@ export type PostStoredAgentsAgentIdVersionsVersionIdRestore_Response = {
   inputProcessors?: Shared_Type_21 | undefined;
   /** Output processor graph — static or conditional */
   outputProcessors?: Shared_Type_21 | undefined;
-  /** Memory configuration — static or conditional */
+  /** Memory: registered memory reference or inline config — static or conditional */
   memory?:
     | (
-        | Shared_Type_28
+        | Shared_Type_30
         | {
-            value: Shared_Type_28;
+            value: Shared_Type_30;
             rules?: Shared_Type_10 | undefined;
           }[]
       )
@@ -17320,11 +17849,11 @@ export type PostStoredAgentsAgentIdVersionsVersionIdRestore_Response = {
   scorers?:
     | (
         | {
-            [key: string]: Shared_Type_29;
+            [key: string]: Shared_Type_31;
           }
         | {
             value: {
-              [key: string]: Shared_Type_29;
+              [key: string]: Shared_Type_31;
             };
             rules?: Shared_Type_10 | undefined;
           }[]
@@ -17449,7 +17978,7 @@ export type GetDynamicWorkflows_QueryParams = {
 };
 
 export type GetDynamicWorkflows_Response = {
-  workflows: Shared_Type_81[];
+  workflows: Shared_Type_83[];
   total: number;
 };
 
@@ -17502,9 +18031,9 @@ export type PostDynamicWorkflows_Body = {
         [key: string]: unknown;
       }
     | undefined;
-  schedule?: (InputShared_Type_82 | InputShared_Type_82[]) | undefined;
+  schedule?: (InputShared_Type_84 | InputShared_Type_84[]) | undefined;
   /** Static workflow graph — ordered array of serialized step entries with all refs as ids. */
-  graph: InputShared_Type_95[];
+  graph: InputShared_Type_97[];
   /** Helper workflow definitions this workflow nests. Saved with it as one unit — the whole set is validated together, hydrated in derived dependency order, and rejected together, so a failed save never leaves orphaned helpers behind. Each helper becomes an ordinary dynamic workflow in its own right. */
   dependencies?:
     | {
@@ -17534,9 +18063,9 @@ export type PostDynamicWorkflows_Body = {
               [key: string]: unknown;
             }
           | undefined;
-        schedule?: (InputShared_Type_82 | InputShared_Type_82[]) | undefined;
+        schedule?: (InputShared_Type_84 | InputShared_Type_84[]) | undefined;
         /** Static workflow graph — ordered array of serialized step entries with all refs as ids. */
-        graph: InputShared_Type_95[];
+        graph: InputShared_Type_97[];
       }[]
     | undefined;
 };
@@ -17575,7 +18104,7 @@ export type GetDynamicWorkflowsDynamicWorkflowId_PathParams = {
   dynamicWorkflowId: string;
 };
 
-export type GetDynamicWorkflowsDynamicWorkflowId_Response = Shared_Type_81;
+export type GetDynamicWorkflowsDynamicWorkflowId_Response = Shared_Type_83;
 
 export type GetDynamicWorkflowsDynamicWorkflowId_Request = Simplify<
   (GetDynamicWorkflowsDynamicWorkflowId_PathParams extends never
@@ -17650,7 +18179,7 @@ export type GetStoredMcpClients_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  mcpClients: Shared_Type_83[];
+  mcpClients: Shared_Type_85[];
 };
 
 export type GetStoredMcpClients_Request = Simplify<
@@ -17682,7 +18211,7 @@ export type GetStoredMcpClientsStoredMCPClientId_PathParams = {
 
 export type GetStoredMcpClientsStoredMCPClientId_QueryParams = GetStoredAgentsStoredAgentId_QueryParams;
 
-export type GetStoredMcpClientsStoredMCPClientId_Response = Shared_Type_83;
+export type GetStoredMcpClientsStoredMCPClientId_Response = Shared_Type_85;
 
 export type GetStoredMcpClientsStoredMCPClientId_Request = Simplify<
   (GetStoredMcpClientsStoredMCPClientId_PathParams extends never
@@ -17725,7 +18254,7 @@ export type PostStoredMcpClients_Body = {
   description?: string | undefined;
   /** Map of server name to server configuration */
   servers: {
-    [key: string]: InputShared_Type_96;
+    [key: string]: InputShared_Type_98;
   };
 };
 
@@ -17772,7 +18301,7 @@ export type PatchStoredMcpClientsStoredMCPClientId_Body = {
   /** Map of server name to server configuration */
   servers?:
     | {
-        [key: string]: InputShared_Type_96;
+        [key: string]: InputShared_Type_98;
       }
     | undefined;
 };
@@ -17791,7 +18320,7 @@ export type PatchStoredMcpClientsStoredMCPClientId_Response =
       createdAt: Date;
       updatedAt: Date;
     }
-  | Shared_Type_83;
+  | Shared_Type_85;
 
 export type PatchStoredMcpClientsStoredMCPClientId_Request = Simplify<
   (PatchStoredMcpClientsStoredMCPClientId_PathParams extends never
@@ -17853,7 +18382,7 @@ export type GetStoredMcpClientsMcpClientIdVersions_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  versions: Shared_Type_85[];
+  versions: Shared_Type_87[];
 };
 
 export type GetStoredMcpClientsMcpClientIdVersions_Request = Simplify<
@@ -17894,7 +18423,7 @@ export type PostStoredMcpClientsMcpClientIdVersions_Response = {
   description?: (string | undefined) | undefined;
   servers?:
     | {
-        [key: string]: Shared_Type_84;
+        [key: string]: Shared_Type_86;
       }
     | undefined;
   /** Array of field names that changed from the previous version */
@@ -17936,7 +18465,7 @@ export type GetStoredMcpClientsMcpClientIdVersionsCompare_QueryParams =
 
 export type GetStoredMcpClientsMcpClientIdVersionsCompare_Response = {
   /** List of differences between versions */
-  diffs: Shared_Type_79[];
+  diffs: Shared_Type_81[];
   /** The source version */
   fromVersion: {
     /** Unique identifier for the version (UUID) */
@@ -17950,7 +18479,7 @@ export type GetStoredMcpClientsMcpClientIdVersionsCompare_Response = {
     /** Description of the MCP client */
     description?: string | undefined;
     servers: {
-      [key: string]: Shared_Type_84;
+      [key: string]: Shared_Type_86;
     };
     /** Array of field names that changed from the previous version */
     changedFields?: string[] | undefined;
@@ -17972,7 +18501,7 @@ export type GetStoredMcpClientsMcpClientIdVersionsCompare_Response = {
     /** Description of the MCP client */
     description?: string | undefined;
     servers: {
-      [key: string]: Shared_Type_84;
+      [key: string]: Shared_Type_86;
     };
     /** Array of field names that changed from the previous version */
     changedFields?: string[] | undefined;
@@ -18014,7 +18543,7 @@ export type GetStoredMcpClientsMcpClientIdVersionsVersionId_PathParams = {
   versionId: string;
 };
 
-export type GetStoredMcpClientsMcpClientIdVersionsVersionId_Response = Shared_Type_85;
+export type GetStoredMcpClientsMcpClientIdVersionsVersionId_Response = Shared_Type_87;
 
 export type GetStoredMcpClientsMcpClientIdVersionsVersionId_Request = Simplify<
   (GetStoredMcpClientsMcpClientIdVersionsVersionId_PathParams extends never
@@ -18139,7 +18668,7 @@ export type GetStoredPromptBlocks_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  promptBlocks: Shared_Type_86[];
+  promptBlocks: Shared_Type_88[];
 };
 
 export type GetStoredPromptBlocks_Request = Simplify<
@@ -18171,7 +18700,7 @@ export type GetStoredPromptBlocksStoredPromptBlockId_PathParams = {
 
 export type GetStoredPromptBlocksStoredPromptBlockId_QueryParams = GetStoredAgentsStoredAgentId_QueryParams;
 
-export type GetStoredPromptBlocksStoredPromptBlockId_Response = Shared_Type_86;
+export type GetStoredPromptBlocksStoredPromptBlockId_Response = Shared_Type_88;
 
 export type GetStoredPromptBlocksStoredPromptBlockId_Request = Simplify<
   (GetStoredPromptBlocksStoredPromptBlockId_PathParams extends never
@@ -18303,7 +18832,7 @@ export type PatchStoredPromptBlocksStoredPromptBlockId_Response =
       createdAt: Date;
       updatedAt: Date;
     }
-  | Shared_Type_86;
+  | Shared_Type_88;
 
 export type PatchStoredPromptBlocksStoredPromptBlockId_Request = Simplify<
   (PatchStoredPromptBlocksStoredPromptBlockId_PathParams extends never
@@ -18366,7 +18895,7 @@ export type GetStoredPromptBlocksPromptBlockIdVersions_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  versions: Shared_Type_87[];
+  versions: Shared_Type_89[];
 };
 
 export type GetStoredPromptBlocksPromptBlockIdVersions_Request = Simplify<
@@ -18458,7 +18987,7 @@ export type GetStoredPromptBlocksPromptBlockIdVersionsCompare_QueryParams =
 
 export type GetStoredPromptBlocksPromptBlockIdVersionsCompare_Response = {
   /** List of differences between versions */
-  diffs: Shared_Type_79[];
+  diffs: Shared_Type_81[];
   /** The source version */
   fromVersion: {
     /** Unique identifier for the version (UUID) */
@@ -18550,7 +19079,7 @@ export type GetStoredPromptBlocksPromptBlockIdVersionsVersionId_PathParams = {
   versionId: string;
 };
 
-export type GetStoredPromptBlocksPromptBlockIdVersionsVersionId_Response = Shared_Type_87;
+export type GetStoredPromptBlocksPromptBlockIdVersionsVersionId_Response = Shared_Type_89;
 
 export type GetStoredPromptBlocksPromptBlockIdVersionsVersionId_Request = Simplify<
   (GetStoredPromptBlocksPromptBlockIdVersionsVersionId_PathParams extends never
@@ -18675,7 +19204,7 @@ export type GetStoredScorers_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  scorerDefinitions: Shared_Type_89[];
+  scorerDefinitions: Shared_Type_91[];
 };
 
 export type GetStoredScorers_Request = Simplify<
@@ -18707,7 +19236,7 @@ export type GetStoredScorersStoredScorerId_PathParams = {
 
 export type GetStoredScorersStoredScorerId_QueryParams = GetStoredAgentsStoredAgentId_QueryParams;
 
-export type GetStoredScorersStoredScorerId_Response = Shared_Type_89;
+export type GetStoredScorersStoredScorerId_Response = Shared_Type_91;
 
 export type GetStoredScorersStoredScorerId_Request = Simplify<
   (GetStoredScorersStoredScorerId_PathParams extends never
@@ -18749,13 +19278,13 @@ export type PostStoredScorers_Body = {
   /** Description of the scorer */
   description?: string | undefined;
   /** Scorer type: llm-judge for custom, or a preset type name */
-  type: InputShared_Type_97;
+  type: InputShared_Type_99;
   /** Model configuration for LLM judge */
   model?: InputShared_Type_39 | undefined;
   /** System instructions for the judge LLM (used when type is llm-judge) */
   instructions?: string | undefined;
   /** Score range configuration (used when type is llm-judge) */
-  scoreRange?: InputShared_Type_98;
+  scoreRange?: InputShared_Type_100;
   /** Serializable config options for preset scorers */
   presetConfig?:
     | {
@@ -18817,13 +19346,13 @@ export type PatchStoredScorersStoredScorerId_Body = {
   /** Description of the scorer */
   description?: (string | undefined) | undefined;
   /** Scorer type: llm-judge for custom, or a preset type name */
-  type?: InputShared_Type_97 | undefined;
+  type?: InputShared_Type_99 | undefined;
   /** Model configuration for LLM judge */
   model?: (InputShared_Type_39 | undefined) | undefined;
   /** System instructions for the judge LLM (used when type is llm-judge) */
   instructions?: (string | undefined) | undefined;
   /** Score range configuration (used when type is llm-judge) */
-  scoreRange?: InputShared_Type_98 | undefined;
+  scoreRange?: InputShared_Type_100 | undefined;
   /** Serializable config options for preset scorers */
   presetConfig?:
     | (
@@ -18864,7 +19393,7 @@ export type PatchStoredScorersStoredScorerId_Response =
       createdAt: Date;
       updatedAt: Date;
     }
-  | Shared_Type_89;
+  | Shared_Type_91;
 
 export type PatchStoredScorersStoredScorerId_Request = Simplify<
   (PatchStoredScorersStoredScorerId_PathParams extends never
@@ -18926,7 +19455,7 @@ export type GetStoredScorersScorerIdVersions_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  versions: Shared_Type_90[];
+  versions: Shared_Type_92[];
 };
 
 export type GetStoredScorersScorerIdVersions_Request = Simplify<
@@ -18965,7 +19494,7 @@ export type PostStoredScorersScorerIdVersions_Response = {
   name?: string | undefined;
   /** Description of the scorer */
   description?: (string | undefined) | undefined;
-  type?: Shared_Type_88 | undefined;
+  type?: Shared_Type_90 | undefined;
   model?: (Shared_Type_12 | undefined) | undefined;
   instructions?: (string | undefined) | undefined;
   scoreRange?:
@@ -19036,7 +19565,7 @@ export type GetStoredScorersScorerIdVersionsCompare_QueryParams = GetStoredAgent
 
 export type GetStoredScorersScorerIdVersionsCompare_Response = {
   /** List of differences between versions */
-  diffs: Shared_Type_79[];
+  diffs: Shared_Type_81[];
   /** The source version */
   fromVersion: {
     /** Unique identifier for the version (UUID) */
@@ -19049,7 +19578,7 @@ export type GetStoredScorersScorerIdVersionsCompare_Response = {
     name: string;
     /** Description of the scorer */
     description?: string | undefined;
-    type: Shared_Type_88;
+    type: Shared_Type_90;
     model?: Shared_Type_12 | undefined;
     instructions?: string | undefined;
     scoreRange?:
@@ -19093,7 +19622,7 @@ export type GetStoredScorersScorerIdVersionsCompare_Response = {
     name: string;
     /** Description of the scorer */
     description?: string | undefined;
-    type: Shared_Type_88;
+    type: Shared_Type_90;
     model?: Shared_Type_12 | undefined;
     instructions?: string | undefined;
     scoreRange?:
@@ -19158,7 +19687,7 @@ export type GetStoredScorersScorerIdVersionsVersionId_PathParams = {
   versionId: string;
 };
 
-export type GetStoredScorersScorerIdVersionsVersionId_Response = Shared_Type_90;
+export type GetStoredScorersScorerIdVersionsVersionId_Response = Shared_Type_92;
 
 export type GetStoredScorersScorerIdVersionsVersionId_Request = Simplify<
   (GetStoredScorersScorerIdVersionsVersionId_PathParams extends never
@@ -19299,17 +19828,17 @@ export type GetStoredWorkspaces_Response = {
     /** Description of the workspace */
     description?: string | undefined;
     /** Filesystem configuration */
-    filesystem?: Shared_Type_31;
+    filesystem?: Shared_Type_33;
     /** Sandbox configuration */
-    sandbox?: Shared_Type_32;
+    sandbox?: Shared_Type_34;
     /** Mounted filesystems keyed by mount path */
-    mounts?: Shared_Type_33 | undefined;
+    mounts?: Shared_Type_35 | undefined;
     /** Search configuration */
-    search?: Shared_Type_34 | undefined;
+    search?: Shared_Type_36 | undefined;
     /** Array of skill IDs */
     skills?: string[] | undefined;
     /** Workspace tool configuration */
-    tools?: Shared_Type_36 | undefined;
+    tools?: Shared_Type_38 | undefined;
     /** Whether to automatically sync the workspace */
     autoSync?: boolean | undefined;
     /** Operation timeout in milliseconds */
@@ -19346,7 +19875,7 @@ export type GetStoredWorkspacesStoredWorkspaceId_PathParams = {
   storedWorkspaceId: string;
 };
 
-export type GetStoredWorkspacesStoredWorkspaceId_Response = Shared_Type_91;
+export type GetStoredWorkspacesStoredWorkspaceId_Response = Shared_Type_93;
 
 export type GetStoredWorkspacesStoredWorkspaceId_Request = Simplify<
   (GetStoredWorkspacesStoredWorkspaceId_PathParams extends never
@@ -19382,17 +19911,17 @@ export type PostStoredWorkspaces_Body = {
   /** Description of the workspace */
   description?: string | undefined;
   /** Filesystem configuration */
-  filesystem?: InputShared_Type_69;
+  filesystem?: InputShared_Type_71;
   /** Sandbox configuration */
-  sandbox?: InputShared_Type_70;
+  sandbox?: InputShared_Type_72;
   /** Mounted filesystems keyed by mount path */
-  mounts?: InputShared_Type_71 | undefined;
+  mounts?: InputShared_Type_73 | undefined;
   /** Search configuration */
-  search?: InputShared_Type_72 | undefined;
+  search?: InputShared_Type_74 | undefined;
   /** Array of skill IDs */
   skills?: string[] | undefined;
   /** Workspace tool configuration */
-  tools?: InputShared_Type_74 | undefined;
+  tools?: InputShared_Type_76 | undefined;
   /** Whether to automatically sync the workspace */
   autoSync?: boolean | undefined;
   /** Operation timeout in milliseconds */
@@ -19439,17 +19968,17 @@ export type PatchStoredWorkspacesStoredWorkspaceId_Body = {
   /** Description of the workspace */
   description?: (string | undefined) | undefined;
   /** Filesystem configuration */
-  filesystem?: InputShared_Type_69 | undefined;
+  filesystem?: InputShared_Type_71 | undefined;
   /** Sandbox configuration */
-  sandbox?: InputShared_Type_70 | undefined;
+  sandbox?: InputShared_Type_72 | undefined;
   /** Mounted filesystems keyed by mount path */
-  mounts?: (InputShared_Type_71 | undefined) | undefined;
+  mounts?: (InputShared_Type_73 | undefined) | undefined;
   /** Search configuration */
-  search?: (InputShared_Type_72 | undefined) | undefined;
+  search?: (InputShared_Type_74 | undefined) | undefined;
   /** Array of skill IDs */
   skills?: (string[] | undefined) | undefined;
   /** Workspace tool configuration */
-  tools?: (InputShared_Type_74 | undefined) | undefined;
+  tools?: (InputShared_Type_76 | undefined) | undefined;
   /** Whether to automatically sync the workspace */
   autoSync?: (boolean | undefined) | undefined;
   /** Operation timeout in milliseconds */
@@ -19470,7 +19999,7 @@ export type PatchStoredWorkspacesStoredWorkspaceId_Response =
       createdAt: Date;
       updatedAt: Date;
     }
-  | Shared_Type_91;
+  | Shared_Type_93;
 
 export type PatchStoredWorkspacesStoredWorkspaceId_Request = Simplify<
   (PatchStoredWorkspacesStoredWorkspaceId_PathParams extends never
@@ -19552,7 +20081,7 @@ export type GetStoredSkills_Response = {
   page: number;
   perPage: number | false;
   hasMore: boolean;
-  skills: Shared_Type_93[];
+  skills: Shared_Type_95[];
 };
 
 export type GetStoredSkills_Request = Simplify<
@@ -19582,7 +20111,7 @@ export type GetStoredSkillsStoredSkillId_PathParams = {
   storedSkillId: string;
 };
 
-export type GetStoredSkillsStoredSkillId_Response = Shared_Type_93;
+export type GetStoredSkillsStoredSkillId_Response = Shared_Type_95;
 
 export type GetStoredSkillsStoredSkillId_Request = Simplify<
   (GetStoredSkillsStoredSkillId_PathParams extends never ? {} : { params: GetStoredSkillsStoredSkillId_PathParams }) &
@@ -19620,7 +20149,7 @@ export type PostStoredSkills_Body = {
   /** Compatibility requirements */
   compatibility?: unknown | undefined;
   /** Source location of the skill */
-  source?: InputShared_Type_99 | undefined;
+  source?: InputShared_Type_101 | undefined;
   /** List of reference file paths */
   references?: string[] | undefined;
   /** List of script file paths */
@@ -19628,7 +20157,7 @@ export type PostStoredSkills_Body = {
   /** List of asset file paths */
   assets?: string[] | undefined;
   /** Full file tree structure for the skill */
-  files?: InputShared_Auxiliary_788[] | undefined;
+  files?: InputShared_Auxiliary_813[] | undefined;
   /** Additional metadata for the skill */
   metadata?:
     | {
@@ -19678,7 +20207,7 @@ export type PatchStoredSkillsStoredSkillId_Body = {
   /** Compatibility requirements */
   compatibility?: (unknown | undefined) | undefined;
   /** Source location of the skill */
-  source?: (InputShared_Type_99 | undefined) | undefined;
+  source?: (InputShared_Type_101 | undefined) | undefined;
   /** List of reference file paths */
   references?: (string[] | undefined) | undefined;
   /** List of script file paths */
@@ -19686,7 +20215,7 @@ export type PatchStoredSkillsStoredSkillId_Body = {
   /** List of asset file paths */
   assets?: (string[] | undefined) | undefined;
   /** Full file tree structure for the skill */
-  files?: (InputShared_Auxiliary_788[] | undefined) | undefined;
+  files?: (InputShared_Auxiliary_813[] | undefined) | undefined;
   /** Additional metadata for the skill */
   metadata?:
     | (
@@ -19708,7 +20237,7 @@ export type PatchStoredSkillsStoredSkillId_Response =
       createdAt: Date;
       updatedAt: Date;
     }
-  | Shared_Type_93;
+  | Shared_Type_95;
 
 export type PatchStoredSkillsStoredSkillId_Request = Simplify<
   (PatchStoredSkillsStoredSkillId_PathParams extends never
@@ -20464,6 +20993,7 @@ export type GetSystemPackages_Response = {
   isDev: boolean;
   cmsEnabled: boolean;
   liveKitConnectionRouteEnabled: boolean;
+  liveKitRecordingRouteEnabled?: boolean | undefined;
   editorSource?: ('code' | 'db') | undefined;
   editorSourceCapabilities?:
     | {
@@ -20484,7 +21014,7 @@ export type GetSystemPackages_Response = {
   storageType?: string | undefined;
   observabilityStorageType?: string | undefined;
   observabilityRuntimeStrategy?: ('realtime' | 'batch-with-updates' | 'insert-only' | 'event-sourced') | undefined;
-  observabilityStorageCapabilities?: Shared_Type_65 | undefined;
+  observabilityStorageCapabilities?: Shared_Type_67 | undefined;
   observabilityRuntimeCapabilities?:
     | {
         tracing: {
@@ -20608,6 +21138,8 @@ export type GetDatasets_QueryParams = {
   targetType?: ('agent' | 'workflow' | 'scorer' | 'processor') | undefined;
   /** Only return datasets attached to at least one of these target IDs */
   targetIds?: string[] | undefined;
+  /** Only return datasets with these IDs (up to 100). All matches come back on one page; page and perPage are ignored. A blank value matches no datasets. */
+  datasetIds?: string[] | undefined;
   orderBy?:
     | (
         | {
@@ -20620,7 +21152,7 @@ export type GetDatasets_QueryParams = {
 };
 
 export type GetDatasets_Response = {
-  datasets: Shared_Type_94[];
+  datasets: Shared_Type_96[];
   pagination: {
     total: number;
     page: number;
@@ -20688,7 +21220,7 @@ export type PostDatasets_Body = {
   scorerIds?: string[] | undefined;
 };
 
-export type PostDatasets_Response = Shared_Type_94;
+export type PostDatasets_Response = Shared_Type_96;
 
 export type PostDatasets_Request = Simplify<
   (never extends never ? {} : { params: never }) &
@@ -20724,7 +21256,7 @@ export type GetDatasetsDatasetId_QueryParams = {
   projectId?: string | undefined;
 };
 
-export type GetDatasetsDatasetId_Response = Shared_Type_94 | null;
+export type GetDatasetsDatasetId_Response = Shared_Type_96 | null;
 
 export type GetDatasetsDatasetId_Request = Simplify<
   (GetDatasetsDatasetId_PathParams extends never ? {} : { params: GetDatasetsDatasetId_PathParams }) &
@@ -20866,7 +21398,7 @@ export type GetDatasetsDatasetIdItems_QueryParams = {
 };
 
 export type GetDatasetsDatasetIdItems_Response = {
-  items: Shared_Type_97[];
+  items: Shared_Type_99[];
   pagination: {
     total: number;
     page: number;
@@ -20907,9 +21439,9 @@ export type PostDatasetsDatasetIdItems_Body = {
   /** Expected output for comparison */
   groundTruth?: unknown | undefined;
   /** Expected trajectory configuration for trajectory scoring */
-  expectedTrajectory?: (InputShared_Type_114 | undefined) | null;
+  expectedTrajectory?: (InputShared_Type_116 | undefined) | null;
   /** Ordered item-level static tool mocks served in place of executing the real tool */
-  toolMocks?: InputShared_Type_115[] | undefined;
+  toolMocks?: InputShared_Type_117[] | undefined;
   /** Policy for undeclared tool calls. 'allow' runs them live; 'deny' fails the experiment item */
   unmockedToolPolicy?: ('allow' | 'deny') | undefined;
   /** IDs of scorers selected for this item */
@@ -20927,10 +21459,10 @@ export type PostDatasetsDatasetIdItems_Body = {
       }
     | undefined;
   /** Source/provenance of this dataset item */
-  source?: InputShared_Type_116 | undefined;
+  source?: InputShared_Type_118 | undefined;
 };
 
-export type PostDatasetsDatasetIdItems_Response = Shared_Type_97;
+export type PostDatasetsDatasetIdItems_Response = Shared_Type_99;
 
 export type PostDatasetsDatasetIdItems_Request = Simplify<
   (PostDatasetsDatasetIdItems_PathParams extends never ? {} : { params: PostDatasetsDatasetIdItems_PathParams }) &
@@ -20962,9 +21494,9 @@ export type PostDatasetsDatasetIdItemsBatch_Body = {
     input: unknown;
     groundTruth?: unknown | undefined;
     /** Expected trajectory configuration for trajectory scoring */
-    expectedTrajectory?: (InputShared_Type_114 | undefined) | null;
+    expectedTrajectory?: (InputShared_Type_116 | undefined) | null;
     /** Ordered item-level static tool mocks served in place of executing the real tool */
-    toolMocks?: InputShared_Type_115[] | undefined;
+    toolMocks?: InputShared_Type_117[] | undefined;
     /** Policy for undeclared tool calls. 'allow' runs them live; 'deny' fails the experiment item */
     unmockedToolPolicy?: ('allow' | 'deny') | undefined;
     scorerIds?: string[] | undefined;
@@ -20979,12 +21511,12 @@ export type PostDatasetsDatasetIdItemsBatch_Body = {
         }
       | undefined;
     /** Source/provenance of this dataset item */
-    source?: InputShared_Type_116 | undefined;
+    source?: InputShared_Type_118 | undefined;
   }[];
 };
 
 export type PostDatasetsDatasetIdItemsBatch_Response = {
-  items: Shared_Type_97[];
+  items: Shared_Type_99[];
   count: number;
 };
 
@@ -21084,9 +21616,9 @@ export type PatchDatasetsDatasetIdItemsItemId_Body = {
   /** Expected output for comparison */
   groundTruth?: unknown | undefined;
   /** Expected trajectory configuration for trajectory scoring */
-  expectedTrajectory?: (InputShared_Type_114 | undefined) | null;
+  expectedTrajectory?: (InputShared_Type_116 | undefined) | null;
   /** Ordered item-level static tool mocks served in place of executing the real tool */
-  toolMocks?: InputShared_Type_115[] | undefined;
+  toolMocks?: InputShared_Type_117[] | undefined;
   /** Policy for undeclared tool calls. 'allow' runs them live; 'deny' fails the experiment item */
   unmockedToolPolicy?: ('allow' | 'deny') | undefined;
   /** IDs of scorers selected for this item */
@@ -21104,7 +21636,7 @@ export type PatchDatasetsDatasetIdItemsItemId_Body = {
       }
     | undefined;
   /** Source/provenance of this dataset item */
-  source?: InputShared_Type_116 | undefined;
+  source?: InputShared_Type_118 | undefined;
 };
 
 export type PatchDatasetsDatasetIdItemsItemId_Response = PostDatasetsDatasetIdItems_Response;
@@ -21239,7 +21771,7 @@ export type GetDatasetsDatasetIdItemsItemIdHistory_Response = {
     groundTruth?: unknown | undefined;
     expectedTrajectory?: unknown | undefined;
     /** Ordered item-level static tool mocks served in place of executing the real tool */
-    toolMocks?: (Shared_Type_95[] | undefined) | null;
+    toolMocks?: (Shared_Type_97[] | undefined) | null;
     /** Policy for undeclared tool calls. 'allow' runs them live; 'deny' fails the experiment item */
     unmockedToolPolicy?: (('allow' | 'deny') | undefined) | null;
     scorerIds?: (string[] | undefined) | null;
@@ -21340,7 +21872,7 @@ export type GetExperiments_QueryParams = {
 };
 
 export type GetExperiments_Response = {
-  experiments: Shared_Type_99[];
+  experiments: Shared_Type_101[];
   pagination: {
     total: number;
     page: number;
@@ -21397,12 +21929,40 @@ export interface GetExperimentsReviewSummary_RouteContract {
 }
 
 // ============================================================================
-// Route: DELETE /experiments/:experimentId
+// Route: GET /experiments/:experimentId
 // ============================================================================
-export type DeleteExperimentsExperimentId_PathParams = {
+export type GetExperimentsExperimentId_PathParams = {
   /** Unique identifier for the experiment */
   experimentId: string;
 };
+
+export type GetExperimentsExperimentId_QueryParams = GetDatasetsDatasetId_QueryParams;
+
+export type GetExperimentsExperimentId_Response = Shared_Type_101;
+
+export type GetExperimentsExperimentId_Request = Simplify<
+  (GetExperimentsExperimentId_PathParams extends never ? {} : { params: GetExperimentsExperimentId_PathParams }) &
+    (GetExperimentsExperimentId_QueryParams extends never
+      ? {}
+      : {} extends GetExperimentsExperimentId_QueryParams
+        ? { query?: GetExperimentsExperimentId_QueryParams }
+        : { query: GetExperimentsExperimentId_QueryParams }) &
+    (never extends never ? {} : {} extends never ? { body?: never } : { body: never })
+>;
+
+export interface GetExperimentsExperimentId_RouteContract {
+  pathParams: GetExperimentsExperimentId_PathParams;
+  queryParams: GetExperimentsExperimentId_QueryParams;
+  body: never;
+  request: GetExperimentsExperimentId_Request;
+  response: GetExperimentsExperimentId_Response;
+  responseType: 'json';
+}
+
+// ============================================================================
+// Route: DELETE /experiments/:experimentId
+// ============================================================================
+export type DeleteExperimentsExperimentId_PathParams = GetExperimentsExperimentId_PathParams;
 
 export type DeleteExperimentsExperimentId_QueryParams = GetDatasetsDatasetId_QueryParams;
 
@@ -21565,7 +22125,7 @@ export type PostDatasetsDatasetIdExperiments_Response = {
     completedAt: Date;
     retryCount: number;
     /** Diagnostic receipt for item-level tool mocks */
-    toolMockReport?: (Shared_Type_100 | undefined) | null;
+    toolMockReport?: (Shared_Type_102 | undefined) | null;
     scores: {
       scorerId: string;
       scorerName: string;
@@ -21621,7 +22181,7 @@ export type PostDatasetsDatasetIdExperimentsExperimentIdItemsItemIdRun_Body = {
 };
 
 export type PostDatasetsDatasetIdExperimentsExperimentIdItemsItemIdRun_Response = {
-  result: Shared_Type_101;
+  result: Shared_Type_104 | Shared_Type_105 | Shared_Type_106;
   scores: {
     scorerId: string;
     scorerName: string;
@@ -21710,7 +22270,10 @@ export type PostDatasetsDatasetIdExperimentsExperimentIdResults_Body = {
     | undefined;
 };
 
-export type PostDatasetsDatasetIdExperimentsExperimentIdResults_Response = Shared_Type_101;
+export type PostDatasetsDatasetIdExperimentsExperimentIdResults_Response =
+  | Shared_Type_104
+  | Shared_Type_105
+  | Shared_Type_106;
 
 export type PostDatasetsDatasetIdExperimentsExperimentIdResults_Request = Simplify<
   (PostDatasetsDatasetIdExperimentsExperimentIdResults_PathParams extends never
@@ -21739,7 +22302,7 @@ export interface PostDatasetsDatasetIdExperimentsExperimentIdResults_RouteContra
 export type PostDatasetsDatasetIdExperimentsExperimentIdFinalize_PathParams =
   PostDatasetsDatasetIdExperimentsExperimentIdResults_PathParams;
 
-export type PostDatasetsDatasetIdExperimentsExperimentIdFinalize_Response = Shared_Type_99;
+export type PostDatasetsDatasetIdExperimentsExperimentIdFinalize_Response = GetExperimentsExperimentId_Response;
 
 export type PostDatasetsDatasetIdExperimentsExperimentIdFinalize_Request = Simplify<
   (PostDatasetsDatasetIdExperimentsExperimentIdFinalize_PathParams extends never
@@ -21764,7 +22327,7 @@ export interface PostDatasetsDatasetIdExperimentsExperimentIdFinalize_RouteContr
 export type GetDatasetsDatasetIdExperimentsExperimentId_PathParams =
   PostDatasetsDatasetIdExperimentsExperimentIdResults_PathParams;
 
-export type GetDatasetsDatasetIdExperimentsExperimentId_Response = Shared_Type_99 | null;
+export type GetDatasetsDatasetIdExperimentsExperimentId_Response = Shared_Type_101 | null;
 
 export type GetDatasetsDatasetIdExperimentsExperimentId_Request = Simplify<
   (GetDatasetsDatasetIdExperimentsExperimentId_PathParams extends never
@@ -21833,8 +22396,7 @@ export type PatchDatasetsDatasetIdExperimentsExperimentId_Body = {
     | undefined;
 };
 
-export type PatchDatasetsDatasetIdExperimentsExperimentId_Response =
-  PostDatasetsDatasetIdExperimentsExperimentIdFinalize_Response;
+export type PatchDatasetsDatasetIdExperimentsExperimentId_Response = GetExperimentsExperimentId_Response;
 
 export type PatchDatasetsDatasetIdExperimentsExperimentId_Request = Simplify<
   (PatchDatasetsDatasetIdExperimentsExperimentId_PathParams extends never
@@ -21880,7 +22442,7 @@ export type GetDatasetsDatasetIdExperimentsExperimentIdResults_QueryParams = {
 };
 
 export type GetDatasetsDatasetIdExperimentsExperimentIdResults_Response = {
-  results: Shared_Type_101[];
+  results: (Shared_Type_104 | Shared_Type_105 | Shared_Type_106)[];
   pagination: {
     total: number;
     page: number;
@@ -21957,12 +22519,19 @@ export interface PatchDatasetsDatasetIdExperimentsExperimentIdResultsResultId_Ro
 // ============================================================================
 export type PostDatasetsDatasetIdCompare_PathParams = GetDatasetsDatasetId_PathParams;
 
-export type PostDatasetsDatasetIdCompare_Body = {
-  /** ID of baseline experiment */
-  experimentIdA: string;
-  /** ID of candidate experiment */
-  experimentIdB: string;
-};
+export type PostDatasetsDatasetIdCompare_Body =
+  | {
+      /** IDs of the experiments to compare (2 to 10). Each one gets a result entry per item. */
+      experimentIds: string[];
+      /** Experiment the others are compared against. Must be one of experimentIds. Defaults to the first. */
+      baselineId?: string | undefined;
+    }
+  | {
+      /** Deprecated: use experimentIds. Baseline experiment ID. */
+      experimentIdA: string;
+      /** Deprecated: use experimentIds. Contender experiment ID. */
+      experimentIdB: string;
+    };
 
 export type PostDatasetsDatasetIdCompare_Response = {
   baselineId: string;
@@ -22169,7 +22738,7 @@ export type GetBackgroundTasks_QueryParams = {
 };
 
 export type GetBackgroundTasks_Response = {
-  tasks: Shared_Type_102[];
+  tasks: Shared_Type_107[];
   total: number;
 };
 
@@ -22199,7 +22768,7 @@ export type GetBackgroundTasksBackgroundTaskId_PathParams = {
   backgroundTaskId: string;
 };
 
-export type GetBackgroundTasksBackgroundTaskId_Response = Shared_Type_102;
+export type GetBackgroundTasksBackgroundTaskId_Response = Shared_Type_107;
 
 export type GetBackgroundTasksBackgroundTaskId_Request = Simplify<
   (GetBackgroundTasksBackgroundTaskId_PathParams extends never
@@ -22248,8 +22817,8 @@ export type GetEditorBuilderSettings_Response = {
           | {
               models?:
                 | {
-                    allowed?: Shared_Type_103[] | undefined;
-                    default?: Shared_Type_104 | undefined;
+                    allowed?: Shared_Type_108[] | undefined;
+                    default?: Shared_Type_109 | undefined;
                   }
                 | undefined;
               tools?:
@@ -22276,8 +22845,8 @@ export type GetEditorBuilderSettings_Response = {
     | {
         active: boolean;
         pickerVisible?: boolean | undefined;
-        allowed?: Shared_Type_103[] | undefined;
-        default?: Shared_Type_104 | undefined;
+        allowed?: Shared_Type_108[] | undefined;
+        default?: Shared_Type_109 | undefined;
       }
     | undefined;
   picker?:
@@ -22314,8 +22883,8 @@ export type GetEditorWorkflowBuilderSettings_Response = {
     | {
         active: boolean;
         pickerVisible?: boolean | undefined;
-        allowed?: Shared_Type_103[] | undefined;
-        default?: Shared_Type_104 | undefined;
+        allowed?: Shared_Type_108[] | undefined;
+        default?: Shared_Type_109 | undefined;
       }
     | undefined;
 };
@@ -23143,14 +23712,14 @@ export interface PostAgentBuilderActionIdRunsRunIdCancel_RouteContract {
 export type GetSchedules_QueryParams = {
   agentId?: string | undefined;
   workflowId?: string | undefined;
-  status?: ('active' | 'paused') | undefined;
+  status?: ('active' | 'paused' | 'completed') | undefined;
   threadId?: string | undefined;
   resourceId?: string | undefined;
   name?: string | undefined;
 };
 
 export type GetSchedules_Response = {
-  schedules: (Shared_Type_107 | Shared_Type_109)[];
+  schedules: (Shared_Type_112 | Shared_Type_114)[];
 };
 
 export type GetSchedules_Request = Simplify<
@@ -23179,7 +23748,7 @@ export type GetSchedulesScheduleId_PathParams = {
   scheduleId: string;
 };
 
-export type GetSchedulesScheduleId_Response = Shared_Type_107 | Shared_Type_109;
+export type GetSchedulesScheduleId_Response = Shared_Type_112 | Shared_Type_114;
 
 export type GetSchedulesScheduleId_Request = Simplify<
   (GetSchedulesScheduleId_PathParams extends never ? {} : { params: GetSchedulesScheduleId_PathParams }) &
@@ -23216,8 +23785,8 @@ export type PostSchedules_Body =
             [key: string]: (string | number | boolean | null) | undefined;
           }
         | undefined;
-      ifActive?: InputShared_Type_117 | undefined;
-      ifIdle?: InputShared_Type_118 | undefined;
+      ifActive?: InputShared_Type_119 | undefined;
+      ifIdle?: InputShared_Type_120 | undefined;
       providerOptions?:
         | {
             [key: string]: unknown;
@@ -23293,8 +23862,8 @@ export type PatchSchedulesScheduleId_Body = {
         [key: string]: (string | number | boolean | null) | undefined;
       }
     | undefined;
-  ifActive?: InputShared_Type_117 | undefined;
-  ifIdle?: InputShared_Type_118 | undefined;
+  ifActive?: InputShared_Type_119 | undefined;
+  ifIdle?: InputShared_Type_120 | undefined;
   providerOptions?:
     | {
         [key: string]: unknown;
@@ -23395,7 +23964,7 @@ export type GetSchedulesScheduleIdTriggers_Response = {
           [key: string]: unknown;
         }
       | undefined;
-    run?: Shared_Type_108 | undefined;
+    run?: Shared_Type_113 | undefined;
   }[];
 };
 
@@ -23531,20 +24100,7 @@ export type GetChannelsPlatformInstallations_PathParams = {
   platform: string;
 };
 
-export type GetChannelsPlatformInstallations_Response = {
-  /** Installation identifier */
-  id: string;
-  /** Platform identifier */
-  platform: string;
-  /** Connected agent identifier */
-  agentId: string;
-  /** Installation status */
-  status: 'active' | 'pending';
-  /** Platform-specific display name */
-  displayName?: string | undefined;
-  /** Installation timestamp */
-  installedAt?: Date | undefined;
-}[];
+export type GetChannelsPlatformInstallations_Response = Shared_Type_115[];
 
 export type GetChannelsPlatformInstallations_Request = Simplify<
   (GetChannelsPlatformInstallations_PathParams extends never
@@ -23623,14 +24179,38 @@ export interface PostChannelsPlatformConnect_RouteContract {
 }
 
 // ============================================================================
-// Route: POST /channels/:platform/:agentId/disconnect
+// Route: POST /channels/:platform/:agentId/reconcile
 // ============================================================================
-export type PostChannelsPlatformAgentIdDisconnect_PathParams = {
+export type PostChannelsPlatformAgentIdReconcile_PathParams = {
   /** Channel platform identifier (e.g., "slack") */
   platform: string;
   /** Agent identifier */
   agentId: string;
 };
+
+export type PostChannelsPlatformAgentIdReconcile_Response = Shared_Type_115 | null;
+
+export type PostChannelsPlatformAgentIdReconcile_Request = Simplify<
+  (PostChannelsPlatformAgentIdReconcile_PathParams extends never
+    ? {}
+    : { params: PostChannelsPlatformAgentIdReconcile_PathParams }) &
+    (never extends never ? {} : {} extends never ? { query?: never } : { query: never }) &
+    (never extends never ? {} : {} extends never ? { body?: never } : { body: never })
+>;
+
+export interface PostChannelsPlatformAgentIdReconcile_RouteContract {
+  pathParams: PostChannelsPlatformAgentIdReconcile_PathParams;
+  queryParams: never;
+  body: never;
+  request: PostChannelsPlatformAgentIdReconcile_Request;
+  response: PostChannelsPlatformAgentIdReconcile_Response;
+  responseType: 'json';
+}
+
+// ============================================================================
+// Route: POST /channels/:platform/:agentId/disconnect
+// ============================================================================
+export type PostChannelsPlatformAgentIdDisconnect_PathParams = PostChannelsPlatformAgentIdReconcile_PathParams;
 
 export type PostChannelsPlatformAgentIdDisconnect_Response = PostAuthRefresh_Response;
 
@@ -24284,14 +24864,8 @@ export type PostAgentControllerControllerIdSessionsResourceIdSteer_PathParams =
 export type PostAgentControllerControllerIdSessionsResourceIdSteer_QueryParams =
   PostAgentControllerControllerIdSessionsResourceIdThreads_QueryParams;
 
-export type PostAgentControllerControllerIdSessionsResourceIdSteer_Body = {
-  message: string;
-  requestContext?:
-    | {
-        [key: string]: unknown;
-      }
-    | undefined;
-};
+export type PostAgentControllerControllerIdSessionsResourceIdSteer_Body =
+  PostAgentControllerControllerIdSessionsResourceIdMessages_Body;
 
 export type PostAgentControllerControllerIdSessionsResourceIdSteer_Response =
   DeleteAgentControllerControllerIdSessionsResourceIdThreadsThreadId_Response;
@@ -24331,7 +24905,7 @@ export type PostAgentControllerControllerIdSessionsResourceIdFollowUp_QueryParam
   PostAgentControllerControllerIdSessionsResourceIdThreads_QueryParams;
 
 export type PostAgentControllerControllerIdSessionsResourceIdFollowUp_Body =
-  PostAgentControllerControllerIdSessionsResourceIdSteer_Body;
+  PostAgentControllerControllerIdSessionsResourceIdMessages_Body;
 
 export type PostAgentControllerControllerIdSessionsResourceIdFollowUp_Response =
   DeleteAgentControllerControllerIdSessionsResourceIdThreadsThreadId_Response;
@@ -24407,6 +24981,7 @@ export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_Body =
   runId: string;
   toolCallId: string;
   approved: boolean;
+  alwaysAllowCategory?: boolean | undefined;
   requestContext?:
     | {
         [key: string]: unknown;
@@ -24414,8 +24989,10 @@ export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_Body =
     | undefined;
 };
 
-export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_Response =
-  DeleteAgentControllerControllerIdSessionsResourceIdThreadsThreadId_Response;
+export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_Response = {
+  ok: boolean;
+  reason?: ('not_pending' | 'stale_tool_call' | 'aborting' | 'no_pending_suspension') | undefined;
+};
 
 export type PostAgentControllerControllerIdSessionsResourceIdToolApproval_Request = Simplify<
   (PostAgentControllerControllerIdSessionsResourceIdToolApproval_PathParams extends never
@@ -24453,6 +25030,7 @@ export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Quer
 
 export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Body = {
   toolCallId: string;
+  runId?: string | undefined;
   resumeData: unknown;
   requestContext?:
     | {
@@ -24462,7 +25040,7 @@ export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Body
 };
 
 export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Response =
-  DeleteAgentControllerControllerIdSessionsResourceIdThreadsThreadId_Response;
+  PostAgentControllerControllerIdSessionsResourceIdToolApproval_Response;
 
 export type PostAgentControllerControllerIdSessionsResourceIdToolSuspension_Request = Simplify<
   (PostAgentControllerControllerIdSessionsResourceIdToolSuspension_PathParams extends never
@@ -24541,8 +25119,7 @@ export type PostAgentControllerControllerIdSessionsResourceIdModel_QueryParams =
 
 export type PostAgentControllerControllerIdSessionsResourceIdModel_Body = {
   modelId: string;
-  scope?: ('global' | 'thread') | undefined;
-  modeId?: string | undefined;
+  thinkingLevel?: ('off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max') | undefined;
 };
 
 export type PostAgentControllerControllerIdSessionsResourceIdModel_Response =
@@ -24611,6 +25188,41 @@ export interface PostAgentControllerControllerIdSessionsResourceIdThread_RouteCo
   body: PostAgentControllerControllerIdSessionsResourceIdThread_Body;
   request: PostAgentControllerControllerIdSessionsResourceIdThread_Request;
   response: PostAgentControllerControllerIdSessionsResourceIdThread_Response;
+  responseType: 'json';
+}
+
+// ============================================================================
+// Route: POST /agent-controller/:controllerId/sessions/:resourceId/threads/:threadId/owner
+// ============================================================================
+export type PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_PathParams =
+  DeleteAgentControllerControllerIdSessionsResourceIdThreadsThreadId_PathParams;
+
+export type PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_QueryParams =
+  PostAgentControllerControllerIdSessionsResourceIdThreads_QueryParams;
+
+export type PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_Response = {
+  ok: boolean;
+  ownerId: string;
+};
+
+export type PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_Request = Simplify<
+  (PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_PathParams extends never
+    ? {}
+    : { params: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_PathParams }) &
+    (PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_QueryParams extends never
+      ? {}
+      : {} extends PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_QueryParams
+        ? { query?: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_QueryParams }
+        : { query: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_QueryParams }) &
+    (never extends never ? {} : {} extends never ? { body?: never } : { body: never })
+>;
+
+export interface PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_RouteContract {
+  pathParams: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_PathParams;
+  queryParams: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_QueryParams;
+  body: never;
+  request: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_Request;
+  response: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_Response;
   responseType: 'json';
 }
 
@@ -25165,6 +25777,7 @@ export interface RouteTypes {
   'POST /agents/:agentId/observe': PostAgentsAgentIdObserve_RouteContract;
   'POST /agents/:agentId/send-message': PostAgentsAgentIdSendMessage_RouteContract;
   'POST /agents/:agentId/queue-message': PostAgentsAgentIdQueueMessage_RouteContract;
+  'POST /agents/:agentId/queue-signal': PostAgentsAgentIdQueueSignal_RouteContract;
   'POST /agents/:agentId/signals': PostAgentsAgentIdSignals_RouteContract;
   'POST /agents/:agentId/threads/abort': PostAgentsAgentIdThreadsAbort_RouteContract;
   'POST /agents/:agentId/threads/signals/cancel': PostAgentsAgentIdThreadsSignalsCancel_RouteContract;
@@ -25290,7 +25903,9 @@ export interface RouteTypes {
   'POST /observability/traces/score': PostObservabilityTracesScore_RouteContract;
   'GET /observability/traces/:traceId/:spanId/scores': GetObservabilityTracesTraceIdSpanIdScores_RouteContract;
   'POST /observability/traces/query': PostObservabilityTracesQuery_RouteContract;
+  'POST /observability/traces/aggregate': PostObservabilityTracesAggregate_RouteContract;
   'POST /observability/threads/query': PostObservabilityThreadsQuery_RouteContract;
+  'POST /observability/spans/query': PostObservabilitySpansQuery_RouteContract;
   'POST /observability/traces/query/fields': PostObservabilityTracesQueryFields_RouteContract;
   'POST /observability/traces/query/values': PostObservabilityTracesQueryValues_RouteContract;
   'GET /observability/metrics': GetObservabilityMetrics_RouteContract;
@@ -25503,6 +26118,7 @@ export interface RouteTypes {
   'GET /datasets/:datasetId/items/:itemId/versions/:datasetVersion': GetDatasetsDatasetIdItemsItemIdVersionsDatasetVersion_RouteContract;
   'GET /experiments': GetExperiments_RouteContract;
   'GET /experiments/review-summary': GetExperimentsReviewSummary_RouteContract;
+  'GET /experiments/:experimentId': GetExperimentsExperimentId_RouteContract;
   'DELETE /experiments/:experimentId': DeleteExperimentsExperimentId_RouteContract;
   'GET /datasets/:datasetId/experiments': GetDatasetsDatasetIdExperiments_RouteContract;
   'POST /datasets/:datasetId/experiments': PostDatasetsDatasetIdExperiments_RouteContract;
@@ -25558,6 +26174,7 @@ export interface RouteTypes {
   'GET /channels/platforms': GetChannelsPlatforms_RouteContract;
   'GET /channels/:platform/installations': GetChannelsPlatformInstallations_RouteContract;
   'POST /channels/:platform/connect': PostChannelsPlatformConnect_RouteContract;
+  'POST /channels/:platform/:agentId/reconcile': PostChannelsPlatformAgentIdReconcile_RouteContract;
   'POST /channels/:platform/:agentId/disconnect': PostChannelsPlatformAgentIdDisconnect_RouteContract;
   'GET /agent-controller': GetAgentController_RouteContract;
   'GET /agent-controller/:controllerId/modes': GetAgentControllerControllerIdModes_RouteContract;
@@ -25581,6 +26198,7 @@ export interface RouteTypes {
   'POST /agent-controller/:controllerId/sessions/:resourceId/mode': PostAgentControllerControllerIdSessionsResourceIdMode_RouteContract;
   'POST /agent-controller/:controllerId/sessions/:resourceId/model': PostAgentControllerControllerIdSessionsResourceIdModel_RouteContract;
   'POST /agent-controller/:controllerId/sessions/:resourceId/thread': PostAgentControllerControllerIdSessionsResourceIdThread_RouteContract;
+  'POST /agent-controller/:controllerId/sessions/:resourceId/threads/:threadId/owner': PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_RouteContract;
   'POST /agent-controller/:controllerId/sessions/:resourceId/notifications': PostAgentControllerControllerIdSessionsResourceIdNotifications_RouteContract;
   'GET /agent-controller/:controllerId/workspace': GetAgentControllerControllerIdWorkspace_RouteContract;
   'GET /agent-controller/:controllerId/sessions/:resourceId/om': GetAgentControllerControllerIdSessionsResourceIdOm_RouteContract;
@@ -25745,6 +26363,9 @@ export interface Client {
   '/agent-controller/:controllerId/sessions/:resourceId/threads/:threadId/messages': {
     GET: GetAgentControllerControllerIdSessionsResourceIdThreadsThreadIdMessages_RouteContract;
   };
+  '/agent-controller/:controllerId/sessions/:resourceId/threads/:threadId/owner': {
+    POST: PostAgentControllerControllerIdSessionsResourceIdThreadsThreadIdOwner_RouteContract;
+  };
   '/agent-controller/:controllerId/sessions/:resourceId/threads/clone': {
     POST: PostAgentControllerControllerIdSessionsResourceIdThreadsClone_RouteContract;
   };
@@ -25822,6 +26443,9 @@ export interface Client {
   };
   '/agents/:agentId/queue-message': {
     POST: PostAgentsAgentIdQueueMessage_RouteContract;
+  };
+  '/agents/:agentId/queue-signal': {
+    POST: PostAgentsAgentIdQueueSignal_RouteContract;
   };
   '/agents/:agentId/recover': {
     POST: PostAgentsAgentIdRecover_RouteContract;
@@ -25946,6 +26570,9 @@ export interface Client {
   '/channels/:platform/:agentId/disconnect': {
     POST: PostChannelsPlatformAgentIdDisconnect_RouteContract;
   };
+  '/channels/:platform/:agentId/reconcile': {
+    POST: PostChannelsPlatformAgentIdReconcile_RouteContract;
+  };
   '/channels/:platform/connect': {
     POST: PostChannelsPlatformConnect_RouteContract;
   };
@@ -26066,6 +26693,7 @@ export interface Client {
   };
   '/experiments/:experimentId': {
     DELETE: DeleteExperimentsExperimentId_RouteContract;
+    GET: GetExperimentsExperimentId_RouteContract;
   };
   '/experiments/review-summary': {
     GET: GetExperimentsReviewSummary_RouteContract;
@@ -26324,6 +26952,9 @@ export interface Client {
   '/observability/scores/timeseries': {
     POST: PostObservabilityScoresTimeseries_RouteContract;
   };
+  '/observability/spans/query': {
+    POST: PostObservabilitySpansQuery_RouteContract;
+  };
   '/observability/threads/query': {
     POST: PostObservabilityThreadsQuery_RouteContract;
   };
@@ -26347,6 +26978,9 @@ export interface Client {
   };
   '/observability/traces/:traceId/trajectory': {
     GET: GetObservabilityTracesTraceIdTrajectory_RouteContract;
+  };
+  '/observability/traces/aggregate': {
+    POST: PostObservabilityTracesAggregate_RouteContract;
   };
   '/observability/traces/delete': {
     POST: PostObservabilityTracesDelete_RouteContract;

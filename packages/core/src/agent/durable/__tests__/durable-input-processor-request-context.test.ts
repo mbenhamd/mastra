@@ -75,6 +75,7 @@ describe('DurableAgent input processor requestContext writes (#23904)', () => {
     expect(getRequestContextEntries(result.workflowInput)).toEqual({
       userId: 'user-123',
       routePin: 'specialized',
+      mastra__scopes: [],
     });
   });
 
@@ -119,6 +120,7 @@ describe('DurableAgent input processor requestContext writes (#23904)', () => {
     expect(getRequestContextEntries(result.workflowInput)).toEqual({
       userId: 'user-123',
       stage: 'processed',
+      mastra__scopes: [],
     });
     // The caller's version selectors are pinned through the workflow input's
     // dedicated recovery-contract field instead.

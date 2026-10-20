@@ -157,6 +157,55 @@ describe('tool approval: standalone Agent (no Mastra) vs Agent with Mastra', () 
     expect(mockFindUser).toHaveBeenCalledTimes(1);
   }, 30000);
 
+  // PF-1703 strict approval decision kept (PF-5928): an approval-gated call only accepts custom
+  // resume data made of approval decision fields; other keys are refused before anything resumes.
+  it('sendToolApproval refuses custom resume data outside the approval decision fields', async () => {
+    const seenResumeData: unknown[] = [];
+    const findUserTool = createTool({
+      id: 'Find user tool',
+      description: 'Returns the name and email of a user',
+      inputSchema: z.object({ name: z.string() }),
+      requireApproval: true,
+      execute: async (_input, context) => {
+        seenResumeData.push(context?.agent?.resumeData);
+        return { name: 'Dero Israel', email: 'dero@mail.com' };
+      },
+    });
+    const userAgent = new Agent({
+      id: 'send-tool-approval-agent',
+      name: 'Send Tool Approval Agent',
+      instructions: 'Use findUserTool.',
+      model: createMockModel(),
+      tools: { findUserTool },
+    });
+    const mastra = new Mastra({
+      agents: { userAgent },
+      logger: false,
+      storage: new InMemoryStore(),
+    });
+    const agent = mastra.getAgent('userAgent');
+    const memory = { thread: 'send-tool-approval-thread', resource: 'send-tool-approval-resource' };
+    const stream = await agent.stream('Find the user with name - Dero Israel', { memory });
+
+    let toolCallId = '';
+    for await (const chunk of stream.fullStream) {
+      if (chunk.type === 'tool-call-approval') {
+        toolCallId = chunk.payload.toolCallId;
+      }
+    }
+
+    await expect(
+      agent.sendToolApproval({
+        threadId: memory.thread,
+        resourceId: memory.resource,
+        toolCallId,
+        approved: true,
+        resumeData: { note: 'hello' },
+      }),
+    ).rejects.toMatchObject({ id: 'AGENT_SEND_TOOL_APPROVAL_INVALID_RESUME_DATA' });
+    expect(seenResumeData).toEqual([]);
+  }, 30000);
+
   it('WITHOUT Mastra initially: manually registering Mastra with storage fixes resume', async () => {
     mockFindUser.mockClear();
 

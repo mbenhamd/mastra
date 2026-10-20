@@ -1,5 +1,5 @@
-import SelectedServerModule = require('@mastra/server/server-adapter/selected');
 import SelectedFastifyModule = require('@mastra/fastify/selected');
+import SelectedServerModule = require('@mastra/server/server-adapter/selected');
 
 type ServerRoute = import('@mastra/server/server-adapter/selected').ServerRoute;
 

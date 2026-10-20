@@ -8,6 +8,7 @@ import type { ObservabilityContext } from '../../observability';
 import { WORKFLOW_LIFECYCLE_OUTBOX_LIMIT } from '../../storage/domains/workflows/resume';
 import type { PersistWorkflowStepUpdateResult } from '../../storage/types';
 import { WorkflowCancelRequestedError } from '../cancel-request';
+import { WORKFLOW_CANCELLED_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
 import { requireWorkflowExecutionGeneration, workflowLifecycleEventsAreSuppressed } from '../lifecycle-events';
 import type { WorkflowLifecycleEvent } from '../lifecycle-events';
@@ -495,6 +496,11 @@ export interface PersistStepUpdateParams {
   phase?: string;
   /** Canonical lifecycle events that must commit with this snapshot or not at all. */
   lifecycleEvents?: WorkflowLifecycleEvent[];
+  /**
+   * Persist the `running` update even if the last persisted status was `suspended`.
+   * Used when a resumed step starts, so its resume data survives a crash mid-step.
+   */
+  recordResumedStepStart?: boolean;
 }
 
 export function prepareStepSnapshot(engine: DefaultExecutionEngine, params: PersistStepUpdateParams) {
@@ -514,6 +520,7 @@ export function prepareStepSnapshot(engine: DefaultExecutionEngine, params: Pers
 
   const snapshot: WorkflowRunState = {
     runId,
+    parentWorkflow: executionContext.parentWorkflow,
     executionGeneration: executionContext.executionGeneration,
     lifecycleResumeAttempt: executionContext.lifecycleResumeAttempt,
     lifecycleStepStates: executionContext.lifecycleStepStates,
@@ -599,6 +606,7 @@ export async function persistStepUpdate(
     tracingContext,
     phase,
     lifecycleEvents,
+    recordResumedStepStart,
   } = params;
 
   // A transient run is a per-execution decision. The workflow-level callback
@@ -633,7 +641,7 @@ export async function persistStepUpdate(
     // otherwise clobber the suspend record before the resume actually
     // completes. The engine tracks its own last-persisted status for this
     // run (process-local) so we don't need an extra storage read per step.
-    if (workflowStatus === 'running') {
+    if (workflowStatus === 'running' && !recordResumedStepStart) {
       const lastPersisted = engine.getLastPersistedStatus(runId);
       if (lastPersisted === 'suspended' || lastPersisted === 'paused') {
         return;
@@ -715,7 +723,7 @@ export async function persistStepUpdate(
       };
     }
 
-    const persisted = await workflowsStore?.persistWorkflowStepUpdate({
+    const stepUpdate = {
       workflowName: workflowId,
       runId,
       resourceId,
@@ -725,7 +733,26 @@ export async function persistStepUpdate(
       snapshot: snapshotForPersistence,
       lifecycleEvents: prunedLifecycleEvents,
       retainExistingLifecycleOutbox: engine.options?.pruneSnapshot === undefined,
-    });
+    };
+    let persisted = await workflowsStore?.persistWorkflowStepUpdate(stepUpdate);
+    // A lifetime-bound step update never recreates a missing row (PF-4385 tombstone). A run
+    // whose persistence predicate rejects both `pending` and `running` (for example a
+    // suspended-only workflow) was never admitted with a row, so its first persisted state
+    // creates it. That applies only to a fresh execution this engine has never persisted:
+    // a resume, or a run whose row this engine wrote and that was since deleted, stays fenced.
+    if (
+      persisted?.status === 'missing_run' &&
+      executionContext.resumeOperationHash === undefined &&
+      engine.getLastPersistedStatus(runId) === undefined &&
+      !persistencePredicate?.({ stepResults: {}, workflowStatus: 'pending' }) &&
+      !persistencePredicate?.({ stepResults, workflowStatus: 'running' })
+    ) {
+      persisted = await workflowsStore?.persistWorkflowStepUpdate({
+        ...stepUpdate,
+        expectedExecutionGeneration: undefined,
+        expectedLifecycleResumeAttempt: undefined,
+      });
+    }
     if (persisted?.status === 'unsupported') {
       throw new Error(`Workflow storage for ${workflowId}/${runId} does not support fenced workflow step updates`);
     }
@@ -1383,14 +1410,27 @@ export async function executeEntry(
   }
 
   if (abortController?.signal?.aborted) {
-    execResults = { ...execResults, status: 'canceled' };
+    execResults = {
+      ...execResults,
+      // Upstream #24684: only an explicit cancellation is terminal. The fork's durable cancel
+      // request (WorkflowCancelRequestedError) is explicit too; any other abort is an executor
+      // interruption that the engine leaves restartable.
+      status:
+        abortController.signal.reason === WORKFLOW_CANCELLED_SYMBOL ||
+        abortController.signal.reason instanceof WorkflowCancelRequestedError
+          ? 'canceled'
+          : 'waiting',
+    };
   }
 
   let persistOutcome: PersistWorkflowStepUpdateResult | void = undefined;
   if (!executionContext.transientExecution) {
     const isCompositeChild = executionContext.foreachIndex !== undefined || executionContext.executionPath.length > 1;
+    // Upstream #24684: an executor-aborted entry persists the restart-compatible `waiting`
+    // status (lineage-fenced like every entry write) so startup recovery can resume it.
     const workflowStatus =
-      !isCompositeChild && (execResults.status === 'suspended' || execResults.status === 'paused')
+      !isCompositeChild &&
+      (execResults.status === 'suspended' || execResults.status === 'paused' || execResults.status === 'waiting')
         ? execResults.status
         : 'running';
     persistOutcome = await engine.persistStepUpdate({

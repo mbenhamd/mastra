@@ -12,6 +12,7 @@ import {
   GOAL_STATE_TYPE,
   resolveEffectiveGoalSettings,
 } from '../goal';
+import { resolveGoalStore, writeObjective } from '../goal/objective';
 import { Agent } from '../index';
 import type { GoalConfig } from '../types';
 
@@ -271,9 +272,107 @@ describe('Agent objective methods', () => {
       }),
     ).resolves.toMatchObject({ status: 'paused', pausedReason: 'waiting for user review' });
 
-    await expect(
-      agent.updateObjectiveOptions({ threadId: THREAD, resourceId: RESOURCE, status: 'active' }),
-    ).resolves.toMatchObject({ status: 'active', pausedReason: undefined });
+    // Upstream clears the cause by dropping the key; either form leaves no pause reason.
+    const resumed = await agent.updateObjectiveOptions({ threadId: THREAD, resourceId: RESOURCE, status: 'active' });
+    expect(resumed).toMatchObject({ status: 'active' });
+    expect(resumed?.pausedReason).toBeUndefined();
+  });
+
+  it('updateObjectiveOptions persists the pause cause and clears it when the goal leaves paused', async () => {
+    const agent = makeAgent();
+    await agent.setObjective('Goal', { threadId: THREAD, resourceId: RESOURCE });
+
+    const paused = await agent.updateObjectiveOptions({
+      resourceId: RESOURCE,
+      threadId: THREAD,
+      status: 'paused',
+      pausedReason: 'The goal judge failed to evaluate the objective.',
+    });
+    expect(paused).toMatchObject({
+      status: 'paused',
+      pausedReason: 'The goal judge failed to evaluate the objective.',
+    });
+    expect(await agent.getObjective({ resourceId: RESOURCE, threadId: THREAD })).toMatchObject({
+      pausedReason: 'The goal judge failed to evaluate the objective.',
+    });
+
+    const resumed = await agent.updateObjectiveOptions({ resourceId: RESOURCE, threadId: THREAD, status: 'active' });
+    expect(resumed?.pausedReason).toBeUndefined();
+    expect((await agent.getObjective({ resourceId: RESOURCE, threadId: THREAD }))?.pausedReason).toBeUndefined();
+
+    // A reason supplied alongside a non-paused status is retired too: the
+    // resulting status decides, not the caller's arguments.
+    const done = await agent.updateObjectiveOptions({
+      resourceId: RESOURCE,
+      threadId: THREAD,
+      status: 'done',
+      pausedReason: 'stale reason',
+    });
+    expect(done).toMatchObject({ status: 'done' });
+    expect(done?.pausedReason).toBeUndefined();
+  });
+
+  it('updateObjectiveOptions keeps the pause cause when an already-paused goal is paused again without one', async () => {
+    const agent = makeAgent();
+    await agent.setObjective('Goal', { threadId: THREAD, resourceId: RESOURCE });
+
+    await agent.updateObjectiveOptions({
+      resourceId: RESOURCE,
+      threadId: THREAD,
+      status: 'paused',
+      pausedReason: 'The goal judge failed to evaluate the objective.',
+    });
+
+    // An idempotent re-pause (the agent goal route forwards a status and never
+    // a reason) changes nothing, so it must not erase why the goal paused.
+    const repaused = await agent.updateObjectiveOptions({ resourceId: RESOURCE, threadId: THREAD, status: 'paused' });
+    expect(repaused?.status).toBe('paused');
+    expect(repaused?.pausedReason).toBe('The goal judge failed to evaluate the objective.');
+    expect((await agent.getObjective({ resourceId: RESOURCE, threadId: THREAD }))?.pausedReason).toBe(
+      'The goal judge failed to evaluate the objective.',
+    );
+  });
+
+  it('updateObjectiveOptions drops a stale pause cause when an active record is paused without one', async () => {
+    const agent = new Agent({
+      id: 'goal-agent',
+      name: 'goal-agent',
+      instructions: 'You work toward goals.',
+      model: singleStepModel(),
+      memory: new MockMemory(),
+    });
+    const mastra = new Mastra({ agents: { 'goal-agent': agent }, storage: new InMemoryStore(), logger: false });
+    const created = await agent.setObjective('Goal', { threadId: THREAD, resourceId: RESOURCE });
+
+    // Records written before pause causes were retired on resume can be active
+    // while still carrying the old cause.
+    const store = await resolveGoalStore(mastra);
+    await writeObjective(store, RESOURCE, THREAD, { ...created!, status: 'active', pausedReason: 'stale reason' });
+
+    const paused = await agent.updateObjectiveOptions({ resourceId: RESOURCE, threadId: THREAD, status: 'paused' });
+    expect(paused?.status).toBe('paused');
+    expect(paused?.pausedReason).toBeUndefined();
+  });
+
+  it('updateObjectiveOptions keeps the pause cause when an update carries no status', async () => {
+    const agent = makeAgent();
+    await agent.setObjective('Goal', { threadId: THREAD, resourceId: RESOURCE });
+    await agent.updateObjectiveOptions({
+      resourceId: RESOURCE,
+      threadId: THREAD,
+      status: 'paused',
+      pausedReason: 'The goal judge failed to evaluate the objective.',
+    });
+
+    // Only an explicit pause is authoritative about its own cause. A settings
+    // update that says nothing about status must not silently retire it.
+    const updated = await agent.updateObjectiveOptions({ resourceId: RESOURCE, threadId: THREAD, maxRuns: 9 });
+    expect(updated?.maxRuns).toBe(9);
+    expect(updated?.status).toBe('paused');
+    expect(updated?.pausedReason).toBe('The goal judge failed to evaluate the objective.');
+
+    const reloaded = await agent.getObjective({ resourceId: RESOURCE, threadId: THREAD });
+    expect(reloaded?.pausedReason).toBe('The goal judge failed to evaluate the objective.');
   });
 
   it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
@@ -408,6 +507,57 @@ describe('in-loop goal scoring', () => {
     const record = await agent.getObjective({ threadId: THREAD, resourceId: RESOURCE });
     expect(record?.status).toBe('done');
     expect(record?.runsUsed).toBe(1);
+  });
+
+  describe('string goal.scorer resolution', () => {
+    async function runWithRegisteredScorer(scorerRef: string, scorers: Record<string, any>) {
+      const agent = new Agent({
+        id: 'goal-agent',
+        name: 'goal-agent',
+        instructions: 'You work toward goals.',
+        model: singleStepModel(),
+        memory: new MockMemory(),
+        goal: { judge: 'mock-model-id', scorer: scorerRef },
+      });
+      new Mastra({ agents: { 'goal-agent': agent }, scorers, storage: new InMemoryStore(), logger: false });
+      await agent.setObjective('Reach the goal', { threadId: THREAD, resourceId: RESOURCE });
+      const stream = await agent.stream('go', { memory: { resource: RESOURCE, thread: { id: THREAD } }, maxSteps: 3 });
+      for await (const _chunk of stream.fullStream) {
+        // drain
+      }
+      return agent.getObjective({ resourceId: RESOURCE, threadId: THREAD });
+    }
+
+    it('resolves a scorer by its id when registered under a different key', async () => {
+      const scorer = { ...passingScorer(), id: 'tests-pass', name: 'Tests Pass', __registerMastra: vi.fn() };
+      const record = await runWithRegisteredScorer('tests-pass', { testsPass: scorer });
+      expect(scorer.run).toHaveBeenCalled();
+      expect(record?.status).toBe('done');
+    });
+
+    it('prefers a scorer id over another scorer name', async () => {
+      const scorerA = { ...passingScorer(), id: 'shared-ref', name: 'Scorer A', __registerMastra: vi.fn() };
+      const scorerB = { ...passingScorer(), id: 'scorer-b', name: 'shared-ref', __registerMastra: vi.fn() };
+      const record = await runWithRegisteredScorer('shared-ref', { scorerB, scorerA });
+      expect(scorerA.run).toHaveBeenCalled();
+      expect(scorerB.run).not.toHaveBeenCalled();
+      expect(record?.status).toBe('done');
+    });
+
+    it('still resolves a scorer by its registration key', async () => {
+      const scorer = { ...passingScorer(), id: 'tests-pass', name: 'Tests Pass', __registerMastra: vi.fn() };
+      const record = await runWithRegisteredScorer('testsPass', { testsPass: scorer });
+      expect(scorer.run).toHaveBeenCalled();
+      expect(record?.status).toBe('done');
+    });
+
+    it('pauses with a not-found reason for an unknown scorer', async () => {
+      const scorer = { ...passingScorer(), id: 'tests-pass', name: 'Tests Pass', __registerMastra: vi.fn() };
+      const record = await runWithRegisteredScorer('missing-scorer', { testsPass: scorer });
+      expect(scorer.run).not.toHaveBeenCalled();
+      expect(record?.status).toBe('paused');
+      expect(record?.pausedReason).toContain('not found');
+    });
   });
 
   it('direct agent goal loop completes with built-in scorer without manual continuation', async () => {

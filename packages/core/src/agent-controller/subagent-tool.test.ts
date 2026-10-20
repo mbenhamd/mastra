@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
-import { RequestContext } from '../request-context';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../request-context';
 
 // We need to mock Agent before importing tools.ts.
 const { mockStream, MockAgent, mockCreateWorkspaceTools } = vi.hoisted(() => {
@@ -158,6 +158,25 @@ describe('createSubagentTool requestContext forwarding', () => {
     expect(result.content).not.toContain('<subagent-meta');
   });
 
+  it('resolves the subagent model with the calling run request context', async () => {
+    mockStream.mockResolvedValue(createMockStreamResponse('result text'));
+    const tool = createSubagentTool({ subagents, resolveModel, fallbackModelId: 'test-model' });
+    const requestContext = new RequestContext();
+    requestContext.set('tenant', 'org-1');
+    requestContext.set('controller', { threadId: 'parent-thread', resourceId: 'parent-resource' });
+
+    await (tool as any).execute(
+      { agentType: 'explore', task: 'task' },
+      { requestContext, agent: { toolCallId: 'tc-model' } },
+    );
+
+    const [modelId, options] = resolveModel.mock.calls.at(-1)!;
+    expect(modelId).toBe('test-model');
+    expect(options.requestContext).not.toBe(requestContext);
+    expect(options.requestContext.get('tenant')).toBe('org-1');
+    expect(options.requestContext.get('controller')).toMatchObject({ threadId: null, resourceId: '' });
+  });
+
   it('forwards a copy of requestContext with threadId/resourceId stripped', async () => {
     mockStream.mockResolvedValue(createMockStreamResponse('result text'));
 
@@ -175,6 +194,8 @@ describe('createSubagentTool requestContext forwarding', () => {
       resourceId: 'parent-resource-456',
     };
     requestContext.set('controller', controllerCtx);
+    requestContext.set(MASTRA_THREAD_ID_KEY, 'parent-thread-123');
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, 'parent-resource-456');
 
     const result = await (tool as any).execute(
       { agentType: 'explore', task: 'Find all usages of foo' },
@@ -190,6 +211,10 @@ describe('createSubagentTool requestContext forwarding', () => {
     const subagentController = subagentCtx.get('controller') as Partial<AgentControllerRequestContext>;
     expect(subagentController.threadId).toBeNull();
     expect(subagentController.resourceId).toBe('');
+    // Reserved memory keys would otherwise bind the subagent to the parent thread
+    expect(subagentCtx.has(MASTRA_THREAD_ID_KEY)).toBe(false);
+    expect(subagentCtx.has(MASTRA_RESOURCE_ID_KEY)).toBe(false);
+    expect(requestContext.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread-123');
     // Other controller fields should be preserved
     expect(subagentController.emitEvent).toBe(controllerCtx.emitEvent);
     expect(result.isError).toBe(false);
@@ -778,6 +803,8 @@ describe('createSubagentTool forked subagent behavior', () => {
       resourceId: 'parent-resource-1',
     };
     requestContext.set('controller', controllerCtx);
+    requestContext.set(MASTRA_THREAD_ID_KEY, 'parent-thread-1');
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, 'parent-resource-1');
 
     const input: { agentType: 'explore'; task: string; forked: boolean; modelId?: string } = {
       agentType: 'explore',
@@ -794,6 +821,7 @@ describe('createSubagentTool forked subagent behavior', () => {
       sourceThreadId: 'parent-thread-1',
       resourceId: 'parent-resource-1',
       title: expect.stringContaining('Fork:'),
+      requestContext,
     });
 
     // Parent agent's stream is used — no fresh Agent is constructed for the fork.
@@ -822,6 +850,10 @@ describe('createSubagentTool forked subagent behavior', () => {
     const subagentController = streamOpts.requestContext.get('controller') as Partial<AgentControllerRequestContext>;
     expect(subagentController.threadId).toBe('forked-thread-1');
     expect(subagentController.resourceId).toBe('parent-resource-1');
+    // Reserved memory keys take precedence over `memory`, so they must point at the fork too.
+    expect(streamOpts.requestContext.get(MASTRA_THREAD_ID_KEY)).toBe('forked-thread-1');
+    expect(streamOpts.requestContext.get(MASTRA_RESOURCE_ID_KEY)).toBe('parent-resource-1');
+    expect(requestContext.get(MASTRA_THREAD_ID_KEY)).toBe('parent-thread-1');
   });
 
   it('forks: drains the parent save queue before cloning so the fork carries the latest turn', async () => {

@@ -37,6 +37,37 @@ export async function claimWorkflowRestart({
   if (!workflowsStore) return;
 
   const concurrentCas = workflowsStore.supportsConcurrentUpdates();
+  if (!concurrentCas) {
+    // No compare-and-set: install the fresh generation unconditionally. Adapters that
+    // declare they do not implement `updateWorkflowState` (Cloudflare D1/KV/DO, ClickHouse,
+    // LanceDB) get the adopted lineage through the snapshot instead, so restart()/timeTravel()
+    // keep working there (upstream #27313 skips the claim).
+    if (supportsWorkflowStateUpdate(workflowsStore)) {
+      await workflowsStore.updateWorkflowState({
+        workflowName: workflowId,
+        runId,
+        opts: {
+          status: 'running',
+          executionGeneration: lifecycleExecution.executionGeneration,
+          lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+          lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
+        },
+      });
+    } else {
+      await workflowsStore.persistWorkflowSnapshot({
+        workflowName: workflowId,
+        runId,
+        snapshot: {
+          ...snapshot,
+          status: 'running',
+          executionGeneration: lifecycleExecution.executionGeneration,
+          lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+          lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
+        },
+      });
+    }
+    return;
+  }
   const claimed = await workflowsStore.updateWorkflowState({
     workflowName: workflowId,
     runId,
@@ -45,20 +76,16 @@ export async function claimWorkflowRestart({
       executionGeneration: lifecycleExecution.executionGeneration,
       lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
       lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
-      ...(concurrentCas
-        ? {
-            expectedStatus: snapshot.status,
-            // A pre-upgrade `running` snapshot carries no lineage fields, so
-            // name the absent generation explicitly: the guard then fails for a
-            // second claimant that loaded the same legacy row after the winner
-            // installed its generation, instead of degrading to status alone.
-            expectedExecutionGeneration: snapshot.executionGeneration ?? null,
-            expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
-          }
-        : {}),
+      expectedStatus: snapshot.status,
+      // A pre-upgrade `running` snapshot carries no lineage fields, so
+      // name the absent generation explicitly: the guard then fails for a
+      // second claimant that loaded the same legacy row after the winner
+      // installed its generation, instead of degrading to status alone.
+      expectedExecutionGeneration: snapshot.executionGeneration ?? null,
+      expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
     },
   });
-  if (!concurrentCas || claimed) return;
+  if (claimed) return;
 
   const current = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflowId, runId });
   throw workflowRestartNotClaimedError({
@@ -75,6 +102,17 @@ export async function claimWorkflowRestart({
       lifecycleResumeAttempt: current?.lifecycleResumeAttempt ?? 'missing',
     },
   });
+}
+
+/**
+ * Whether the adapter implements `updateWorkflowState`. Adapters without it (Cloudflare
+ * D1/KV/DO, ClickHouse, LanceDB) declare `supportsWorkflowStateUpdate(): false`; an
+ * adapter that does not declare the capability is assumed to implement the method, and
+ * any error it throws still propagates.
+ */
+function supportsWorkflowStateUpdate(workflowsStore: WorkflowsStorage): boolean {
+  const declared = (workflowsStore as { supportsWorkflowStateUpdate?: () => boolean }).supportsWorkflowStateUpdate;
+  return typeof declared === 'function' ? declared.call(workflowsStore) !== false : true;
 }
 
 /**

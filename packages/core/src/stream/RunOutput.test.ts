@@ -194,10 +194,11 @@ describe('WorkflowRunOutput', () => {
         workflowStatus: 'success',
         metadata: {},
         output: {
+          // Upstream #25402: no step reported usage, so the counts stay unknown.
           usage: {
-            inputTokens: 0,
-            outputTokens: 0,
-            totalTokens: 0,
+            inputTokens: undefined,
+            outputTokens: undefined,
+            totalTokens: undefined,
           },
         },
       },
@@ -239,7 +240,12 @@ describe('WorkflowRunOutput', () => {
 
     await expect(resultPromise).resolves.toEqual(firstResult);
     expect(output.result).toBe(resultPromise);
-    await expect(usagePromise).resolves.toMatchObject({ inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+    // Upstream #25402: no step reported usage, so the counts stay unknown.
+    await expect(usagePromise).resolves.toMatchObject({
+      inputTokens: undefined,
+      outputTokens: undefined,
+      totalTokens: undefined,
+    });
     expect(output.usage).toBe(usagePromise);
 
     output.rejectResults(new Error('late rejection'));
@@ -416,6 +422,31 @@ describe('WorkflowRunOutput', () => {
     expect(usage.outputTokens).toBe(1500);
     expect(usage.cachedInputTokens).toBe(12686);
     expect((usage as { cacheCreationInputTokens?: number }).cacheCreationInputTokens).toBe(5268);
+  });
+
+  it('keeps omitted primary workflow usage unknown while preserving reported details', async () => {
+    const output = new WorkflowRunOutput({
+      runId: 'run-1',
+      workflowId: 'workflow-1',
+      stream: createWorkflowStream([
+        createWorkflowStepOutput({
+          inputTokens: 10,
+          outputTokens: 20,
+          totalTokens: 30,
+          reasoningTokens: 4,
+          cachedInputTokens: 3,
+        }),
+        createWorkflowStepOutput({ outputTokens: 5 }),
+      ]),
+    });
+
+    await expect(output.usage).resolves.toMatchObject({
+      inputTokens: undefined,
+      outputTokens: 25,
+      totalTokens: undefined,
+      reasoningTokens: 4,
+      cachedInputTokens: 3,
+    });
   });
 
   it('cancelling one fullStream consumer does not detach the others', async () => {

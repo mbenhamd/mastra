@@ -126,6 +126,23 @@ describe('Session.respondToPersistedToolApproval', () => {
     expect(session.approval.isArmed()).toBe(false);
   }, 30_000);
 
+  it('grants the tool category to the thread for an "always allow" after a restart', async () => {
+    const env = backend();
+    const session = await env.parkThenRestart();
+    session.setCategoryResolver(toolName => (toolName === 'lookup' ? 'read' : null));
+    const [run] = await env.suspendedRuns(session);
+
+    await session.respondToPersistedToolApproval({
+      runId: run!.runId,
+      toolCallId: 'call-1',
+      approved: true,
+      alwaysAllowCategory: true,
+    });
+
+    expect(session.hasCategoryGrant('read', ids.threadId)).toBe(true);
+    await vi.waitFor(() => expect(env.executed).toEqual(['lookup']));
+  }, 30_000);
+
   it('declines a tool call parked before a restart', async () => {
     const env = backend();
     const session = await env.parkThenRestart();

@@ -129,6 +129,8 @@ describe('AgentConfig.durable', () => {
     const registeredPrepared = await registered.prepare('hello', { requestContext });
     expect(registeredPrepared.workflowInput.requestContextEntries).toEqual({
       principalRef: { id: 'principal-1' },
+      // Upstream #26593 (adopted): the run's scopes are always persisted, `[]` included.
+      mastra__scopes: [],
     });
     registeredPrepared.cleanup();
 
@@ -136,6 +138,8 @@ describe('AgentConfig.durable', () => {
     const forkPrepared = await registeredFork.prepare('hello', { requestContext });
     expect(forkPrepared.workflowInput.requestContextEntries).toEqual({
       principalRef: { id: 'principal-1' },
+      // Upstream #26593 (adopted): the run's scopes are always persisted, `[]` included.
+      mastra__scopes: [],
     });
     forkPrepared.cleanup();
 
@@ -161,7 +165,7 @@ describe('AgentConfig.durable', () => {
 
     try {
       await standalone.stream('hello', { requestContext });
-      expect(standaloneEntries).toEqual({ principalRef: { id: 'principal-1' } });
+      expect(standaloneEntries).toEqual({ principalRef: { id: 'principal-1' }, mastra__scopes: [] });
     } finally {
       spy.mockRestore();
     }

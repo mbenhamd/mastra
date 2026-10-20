@@ -293,6 +293,23 @@ export function createDeprecationProxy<T extends Record<string, any>>(
   });
 }
 
+/**
+ * Defines `writer` on execute params as a memoized getter so the stream is only
+ * allocated when step code actually reads it. The property stays enumerable so
+ * spreading the params still carries `writer` along.
+ */
+export function defineLazyWriter<T extends object, W>(
+  params: T,
+  createWriter: () => W,
+): NoInfer<T> & { writer: NoInfer<W> } {
+  let writer: W | undefined;
+  return Object.defineProperty(params, 'writer', {
+    enumerable: true,
+    configurable: true,
+    get: () => (writer ??= createWriter()),
+  }) as T & { writer: W };
+}
+
 const SINGLE_STEP_TYPES = ['step', 'agent', 'tool', 'classifier', 'mapping'] as const;
 
 /**
@@ -597,9 +614,10 @@ export const createRestartExecutionParams = ({
     }
   }
 
-  const nestedWorkflowActiveStepsPath: Record<string, number[]> = {};
-  const addNestedWorkflowActiveStep = (stepId: string) => {
-    Object.defineProperty(nestedWorkflowActiveStepsPath, stepId, {
+  // Own data properties, so step ids such as `__proto__` or `constructor` stay ordinary keys.
+  const firstEntryActiveStepsPath: Record<string, number[]> = {};
+  const addFirstEntryActiveStep = (stepId: string) => {
+    Object.defineProperty(firstEntryActiveStepsPath, stepId, {
       value: [0],
       enumerable: true,
       configurable: true,
@@ -610,22 +628,30 @@ export const createRestartExecutionParams = ({
   const firstEntry = graph.steps[0]!;
 
   if (isSingleStepEntry(firstEntry)) {
-    addNestedWorkflowActiveStep(getSingleStepEntryId(firstEntry));
+    addFirstEntryActiveStep(getSingleStepEntryId(firstEntry));
   } else if (firstEntry.type === 'foreach' || firstEntry.type === 'loop') {
-    addNestedWorkflowActiveStep(getSingleStepEntryId(firstEntry.step));
+    addFirstEntryActiveStep(getSingleStepEntryId(firstEntry.step));
   } else if (firstEntry.type === 'sleep' || firstEntry.type === 'sleepUntil') {
-    addNestedWorkflowActiveStep(firstEntry.id);
+    addFirstEntryActiveStep(firstEntry.id);
   } else if (firstEntry.type === 'conditional' || firstEntry.type === 'parallel') {
     for (const step of firstEntry.steps) {
-      addNestedWorkflowActiveStep(getSingleStepEntryId(step));
+      addFirstEntryActiveStep(getSingleStepEntryId(step));
     }
   }
+
+  const hasFirstEntryResult = getStepIds(firstEntry).some(stepId =>
+    Object.prototype.hasOwnProperty.call(snapshot.context, stepId),
+  );
+  const isPreFirstStepRestart = nestedWorkflowPending || (snapshot.activePaths.length === 0 && !hasFirstEntryResult);
   const restartData: RestartExecutionParams = {
-    activePaths: nestedWorkflowPending ? [0] : snapshot.activePaths,
-    activeStepsPath: nestedWorkflowPending ? nestedWorkflowActiveStepsPath : snapshot.activeStepsPath,
+    activePaths: isPreFirstStepRestart ? [0] : snapshot.activePaths,
+    activeStepsPath: isPreFirstStepRestart ? firstEntryActiveStepsPath : snapshot.activeStepsPath,
     stepResults: snapshot.context,
-    state: snapshot.value,
+    // The evented engine records mid-run state as `context.__state` alongside step results;
+    // `value` only holds the state from the run's start or last suspension.
+    state: (snapshot.context as Record<string, any>)?.__state ?? snapshot.value,
     stepExecutionPath: snapshot?.stepExecutionPath,
+    isPreFirstStepRestart,
   };
 
   return restartData;
@@ -845,10 +871,13 @@ export async function waitForSuspendedSnapshot(
     timeoutMs = RESUME_SNAPSHOT_POLL_TIMEOUT_MS,
     missingSnapshotGraceReads = 1,
     isReady = () => true,
+    onClaimedRunFinished,
   }: {
     timeoutMs?: number;
     missingSnapshotGraceReads?: number;
     isReady?: (snapshot: WorkflowRunState) => boolean;
+    /** Called when a `running`/`pending` row is seen and then disappears (its run finished and was cleaned up). */
+    onClaimedRunFinished?: () => void;
   } = {},
 ): Promise<WorkflowRunState | null> {
   if (!workflowsStore) return null;
@@ -865,7 +894,12 @@ export async function waitForSuspendedSnapshot(
       const isSettled = !RESUME_SNAPSHOT_WAIT_STATUSES.has(snapshot.status);
       if (isSettled && (snapshot.status !== 'suspended' || isReady(snapshot))) return snapshot;
       observedTransitionableSnapshot = true;
-    } else if (!observedTransitionableSnapshot && ++missingReads >= missingSnapshotGraceReads) {
+    } else if (observedTransitionableSnapshot) {
+      if (onClaimedRunFinished) {
+        onClaimedRunFinished();
+        return null;
+      }
+    } else if (++missingReads >= missingSnapshotGraceReads) {
       return null;
     }
 

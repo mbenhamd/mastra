@@ -211,11 +211,13 @@ describe.each([
       // constant factor reflects the remaining live resume-state copies:
       // each `__streamState.messageList` encodes the conversation twice
       // (`content.content` + `content.parts[].text`), and a suspension is held
-      // in the tool-call step's suspendPayload, its foreach aggregation entry,
-      // and the parent loop row (the evented engine mirrors one more copy into
-      // the nested run's context). Deduplicating those is a follow-up —
-      // measured: ~7.4× (default) / ~9.8× (evented) vs ~33× unpruned.
-      const ceiling = rawThreadSize * (evented ? 12 : 9);
+      // once in the nested run's foreach aggregation entry and once in the
+      // parent loop row — the foreach step's own mirror of that entry is not
+      // persisted (the evented engine mirrors one more copy into the nested
+      // run's context). Measured: ~5.1× default (was ~7.4× with the mirror,
+      // ~33× unpruned); the evented ceiling keeps the fork's measured ~9.8×.
+      if (!evented) expect(fillerCopiesFirst).toBeLessThanOrEqual(4);
+      const ceiling = rawThreadSize * (evented ? 12 : 6);
       expect(sizeAtFirstSuspension).toBeLessThan(ceiling);
       expect(sizeAtSecondSuspension).toBeLessThan(ceiling);
 

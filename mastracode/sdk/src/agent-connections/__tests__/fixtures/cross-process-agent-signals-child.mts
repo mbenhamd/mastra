@@ -4,7 +4,6 @@ import { createInterface } from 'node:readline';
 
 import { Agent } from '@mastra/core/agent';
 import { AgentController } from '@mastra/core/agent-controller';
-import type { LeaseProvider } from '@mastra/core/events';
 import { createMockModel } from '@mastra/core/test-utils/llm-mock';
 
 import { createSignalsPubSub } from '../../../utils/signals-pubsub.js';
@@ -23,26 +22,51 @@ const transitionedSenderThreadId = 'sender-thread-2';
 const contentionThreadId = 'contended-thread';
 const threadId = role === 'owner' ? ownerThreadId : senderThreadId;
 const peerThreadId = role === 'owner' ? senderThreadId : ownerThreadId;
-const pubsub = createSignalsPubSub(resourceId);
+// A thread may be keyed to a resource other than the project's (e.g. after `/resource`).
+const threadResourceId = process.env.MC_TEST_THREAD_RESOURCE_ID || resourceId;
+const pubsub = createSignalsPubSub(resourceId, {
+  sharedAgentDiscovery: process.env.MC_TEST_SHARED_DISCOVERY === '1',
+});
+
+function promptText(props: { prompt?: unknown }) {
+  return JSON.stringify(props.prompt ?? '');
+}
+
+const model = createMockModel({
+  mockText: `${role}-response`,
+  spyStream:
+    scenario === 'simultaneous-owner-wake'
+      ? () => emit('model-stream', { threadId: contentionThreadId })
+      : scenario === 'gated-owner'
+        ? props => emit('model-stream', { prompt: promptText(props) })
+        : undefined,
+});
+let releaseGate: () => void = () => {};
+const gate = new Promise<void>(resolve => {
+  releaseGate = resolve;
+});
+if (scenario === 'gated-owner' && role === 'owner' && model.specificationVersion === 'v2') {
+  // The first model call blocks until the parent sends `release`, keeping the
+  // owner's run active while a signal arrives.
+  const doStream = model.doStream.bind(model);
+  let gated = false;
+  model.doStream = async (props: Parameters<typeof doStream>[0]) => {
+    if (!gated) {
+      gated = true;
+      emit('gated');
+    }
+    await gate;
+    return doStream(props);
+  };
+}
+
 const agent = new Agent({
   id: 'code-agent',
   name: role,
   instructions: 'Cross-process signal test',
-  model: createMockModel({
-    mockText: `${role}-response`,
-    spyStream:
-      scenario === 'simultaneous-owner-wake' ? () => emit('model-stream', { threadId: contentionThreadId }) : undefined,
-  }),
+  model,
   pubsub,
 });
-
-// Fork (PF-4629): SignalsPubSub keeps the fork-main in-process lease fallback and
-// exposes no cross-process lease provider; only the skipped lease scenarios use this.
-function leaseProviderOf(): LeaseProvider {
-  const provider = (pubsub as { getLeaseProvider?: () => LeaseProvider }).getLeaseProvider?.();
-  if (!provider) throw new Error('SignalsPubSub exposes no cross-process lease provider (PF-4629)');
-  return provider;
-}
 
 function emit(event: string, data: Record<string, unknown> = {}) {
   process.stdout.write(`${JSON.stringify({ event, role, pid: process.pid, ...data })}\n`);
@@ -74,9 +98,9 @@ async function waitForCommand<T extends string>(expected: T | readonly T[]): Pro
 
 async function claimThread(claimThreadId: string) {
   const claim = await agent.claimThreadOwnership({
-    resourceId,
+    resourceId: threadResourceId,
     threadId: claimThreadId,
-    streamOptions: { memory: { resource: resourceId, thread: claimThreadId } },
+    streamOptions: { memory: { resource: threadResourceId, thread: claimThreadId } },
     peer: { label: `${role}:${claimThreadId}`, metadata: { pid: process.pid, role } },
   });
   if (!claim.claimed) throw new Error(`Failed to claim ${claimThreadId}`);
@@ -84,7 +108,7 @@ async function claimThread(claimThreadId: string) {
 }
 
 async function runRequestReply() {
-  const subscription = await agent.subscribeToThread({ resourceId, threadId });
+  const subscription = await agent.subscribeToThread({ resourceId: threadResourceId, threadId });
   const iterator = subscription.stream[Symbol.asyncIterator]();
   const claim = await claimThread(threadId);
   emit('thread-owned', { threadId });
@@ -93,11 +117,11 @@ async function runRequestReply() {
     const peers = await agent.discoverThreadPeers({ timeoutMs: 1_000 });
     const peer = peers.find(candidate => candidate.threadId === peerThreadId);
     if (!peer) throw new Error(`Did not discover ${peerThreadId}`);
-    emit('discovered', { peerId: peer.id, peerThreadId: peer.threadId });
+    emit('discovered', { peerId: peer.id, peerThreadId: peer.threadId, peerResourceId: peer.resourceId });
 
     const signal = await agent.sendSignal(
       { type: 'user-message', contents: 'cross-process request' },
-      { resourceId, threadId: peerThreadId, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
+      { resourceId: peer.resourceId, threadId: peerThreadId, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
     );
     const accepted = await signal.accepted;
     emit('send-result', { action: accepted.action, runId: 'runId' in accepted ? accepted.runId : undefined });
@@ -116,11 +140,11 @@ async function runRequestReply() {
     const peers = await agent.discoverThreadPeers({ timeoutMs: 1_000 });
     const peer = peers.find(candidate => candidate.threadId === peerThreadId);
     if (!peer) throw new Error(`Did not discover ${peerThreadId}`);
-    emit('discovered', { peerId: peer.id, peerThreadId: peer.threadId });
+    emit('discovered', { peerId: peer.id, peerThreadId: peer.threadId, peerResourceId: peer.resourceId });
 
     const signal = await agent.sendSignal(
       { type: 'user-message', contents: 'cross-process reply' },
-      { resourceId, threadId: peerThreadId, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
+      { resourceId: peer.resourceId, threadId: peerThreadId, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
     );
     const accepted = await signal.accepted;
     emit('send-result', { action: accepted.action, runId: 'runId' in accepted ? accepted.runId : undefined });
@@ -138,6 +162,26 @@ async function runClaimOnly() {
   claim.unsubscribe();
 }
 
+/**
+ * Claims the way a session does: through the ownership manager, which retries
+ * a claim that fails (say, on an election lock a crashed process left behind).
+ */
+async function runManagedClaim() {
+  const manager = createThreadOwnershipManager(async claimThreadId => {
+    const claim = await agent.claimThreadOwnership({
+      resourceId: threadResourceId,
+      threadId: claimThreadId,
+      streamOptions: { memory: { resource: threadResourceId, thread: claimThreadId } },
+      peer: { label: `${role}:${claimThreadId}`, metadata: { pid: process.pid, role } },
+    });
+    if (claim.claimed) emit('thread-owned', { threadId: claimThreadId });
+    return claim;
+  });
+  await manager.claim(threadId).catch(() => {});
+  await waitForCommand('close');
+  manager.close();
+}
+
 async function runDiscoveryProbe() {
   const peers = await agent.discoverThreadPeers({ timeoutMs: 1_000 });
   const peer = peers.find(candidate => candidate.threadId === peerThreadId);
@@ -149,11 +193,78 @@ async function runDiscoveryProbe() {
   await waitForCommand('close');
 }
 
+const HAMMER_ROUNDS = 100;
+
+async function runDiscoveryHammer() {
+  if (role === 'owner') {
+    const claim = await claimThread(ownerThreadId);
+    emit('thread-owned', { threadId: ownerThreadId });
+    await waitForCommand('close');
+    claim.unsubscribe();
+    return;
+  }
+
+  let found = 0;
+  for (let i = 0; i < HAMMER_ROUNDS; i++) {
+    const peers = await agent.discoverThreadPeers({ timeoutMs: 250 });
+    if (peers.some(candidate => candidate.threadId === ownerThreadId)) found++;
+  }
+  // Each failed claim of the owner's thread runs one owner-discovery round trip.
+  let claimed = 0;
+  for (let i = 0; i < HAMMER_ROUNDS; i++) {
+    const claim = await agent.claimThreadOwnership({ resourceId, threadId: ownerThreadId, peer: false });
+    if (claim.claimed) {
+      claimed++;
+      claim.unsubscribe();
+    }
+  }
+  // Reply topics are released fire-and-forget once each request settles.
+  await new Promise(resolve => setTimeout(resolve, 250));
+  emit('discovery-hammer-done', { found, claimed, rounds: HAMMER_ROUNDS });
+  await waitForCommand('close');
+}
+
+/**
+ * Owner: starts a run on its own thread whose first model call blocks until
+ * `release`, and reports every finished run. Sender: wakes the owner's thread
+ * (found through discovery) with `WAKE-<nonce>` while that run is active.
+ */
+async function runGatedOwner() {
+  if (role === 'owner') {
+    const subscription = await agent.subscribeToThread({ resourceId: threadResourceId, threadId: ownerThreadId });
+    const iterator = subscription.stream[Symbol.asyncIterator]();
+    const claim = await claimThread(ownerThreadId);
+    emit('thread-owned', { threadId: ownerThreadId });
+    void (async () => {
+      for (;;) emit('run-finished', await readRun(iterator));
+    })().catch(() => {});
+    await agent.sendSignal(
+      { type: 'user-message', contents: 'START' },
+      { resourceId: threadResourceId, threadId: ownerThreadId, ifIdle: { behavior: 'wake' } },
+    ).accepted;
+    while ((await waitForCommand(['release', 'close'])) === 'release') releaseGate();
+    claim.unsubscribe();
+    subscription.unsubscribe();
+    return;
+  }
+
+  const peers = await agent.discoverThreadPeers({ timeoutMs: 1_000 });
+  const peer = peers.find(candidate => candidate.threadId === ownerThreadId);
+  if (!peer) throw new Error(`Did not discover ${ownerThreadId}`);
+  const signal = await agent.sendSignal(
+    { type: 'user-message', contents: `WAKE-${startAtArg}` },
+    { resourceId: peer.resourceId, threadId: ownerThreadId, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
+  );
+  const accepted = await signal.accepted;
+  emit('send-result', { action: accepted.action, runId: 'runId' in accepted ? accepted.runId : undefined });
+  await waitForCommand('close');
+}
+
 async function runOwnershipContention() {
   const claim = await agent.claimThreadOwnership({
-    resourceId,
+    resourceId: threadResourceId,
     threadId: contentionThreadId,
-    streamOptions: { memory: { resource: resourceId, thread: contentionThreadId } },
+    streamOptions: { memory: { resource: threadResourceId, thread: contentionThreadId } },
     peer: { label: `${role}:${contentionThreadId}`, metadata: { pid: process.pid, role } },
   });
   emit('claim-result', { claimed: claim.claimed, threadId: contentionThreadId });
@@ -213,7 +324,7 @@ async function runThreadTransition() {
 
     const signal = await agent.sendSignal(
       { type: 'user-message', contents: 'capture my original thread' },
-      { resourceId, threadId: ownerThreadId, ifIdle: { behavior: 'wake', requireClaimedOwner: true } },
+      { resourceId, threadId: ownerThreadId, ifIdle: { behavior: 'wake' } },
     );
     const accepted = await signal.accepted;
     emit('request-send', { action: accepted.action });
@@ -351,7 +462,7 @@ async function runYieldOnDemand() {
 
 /** Races two processes to reclaim a filesystem lease from a killed holder. */
 async function runStaleLeaseTakeover() {
-  const leaseProvider = leaseProviderOf();
+  const leaseProvider = pubsub.getLeaseProvider();
   const leaseKey = 'stale-holder-race';
   if (role === 'sender') await waitUntil(Number(startAtArg));
   const result = await leaseProvider.acquireLease(leaseKey, `${role}:${process.pid}`, 15_000);
@@ -361,7 +472,7 @@ async function runStaleLeaseTakeover() {
 
 /** Repeatedly releases and reacquires one lease while another process does the same. */
 async function runLeaseMutationHammer() {
-  const leaseProvider = leaseProviderOf();
+  const leaseProvider = pubsub.getLeaseProvider();
   const leaseKey = 'mutation-lock-hammer';
   const criticalPath = join('/tmp/mc', resourceId, 'mutation-lock-hammer.critical');
   const owner = `${role}:${process.pid}`;
@@ -420,7 +531,7 @@ async function runSessionAdvertisementYield() {
     emit('discovered', {
       threadId: ownerThreadId,
       currentThreadId: session.thread.getId(),
-      leaseOwner: await leaseProviderOf().getLeaseOwner(claimLeaseKey),
+      leaseOwner: await pubsub.getLeaseProvider().getLeaseOwner(claimLeaseKey),
       hasPeer: Boolean(shared),
       selfAdvertised: shared?.selfAdvertised === true,
       label: shared?.label,
@@ -429,7 +540,7 @@ async function runSessionAdvertisementYield() {
 
   if (role === 'owner') {
     await session.thread.create({ id: ownerThreadId });
-    while (!(await leaseProviderOf().getLeaseOwner(claimLeaseKey))) {
+    while (!(await pubsub.getLeaseProvider().getLeaseOwner(claimLeaseKey))) {
       await new Promise(resolve => setTimeout(resolve, 25));
     }
     emit('thread-owned', { threadId: ownerThreadId });
@@ -491,7 +602,10 @@ async function main() {
   else if (scenario === 'stale-lease-takeover') await runStaleLeaseTakeover();
   else if (scenario === 'lease-mutation-hammer') await runLeaseMutationHammer();
   else if (scenario === 'claim-only') await runClaimOnly();
+  else if (scenario === 'managed-claim') await runManagedClaim();
   else if (scenario === 'discovery-probe') await runDiscoveryProbe();
+  else if (scenario === 'discovery-hammer') await runDiscoveryHammer();
+  else if (scenario === 'gated-owner') await runGatedOwner();
   else if (scenario === 'ownership-contention') await runOwnershipContention();
   else if (scenario === 'simultaneous-owner-wake') await runSimultaneousOwnerWake();
   else if (scenario === 'simultaneous-wake-sender') await runSimultaneousWakeSender();

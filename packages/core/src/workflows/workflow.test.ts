@@ -14,7 +14,7 @@ import { MastraNonRetryableError } from '../error';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import { MastraLanguageModelV2Mock as MockLanguageModelV2 } from '../loop/test-utils/MastraLanguageModelV2Mock';
 import { Mastra } from '../mastra';
-import { RequestContext } from '../request-context';
+import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from '../request-context';
 import { MockStore } from '../storage/mock';
 import { createTool } from '../tools/tool';
 import { PUBSUB_SYMBOL } from './constants';
@@ -279,6 +279,296 @@ describe('Workflow (Default Engine Specifics)', () => {
         startedAt: expect.any(Number),
         endedAt: expect.any(Number),
       });
+    });
+
+    it('does not resolve before workflow dispatch is durable', async () => {
+      let releaseOnStart!: () => void;
+      const onStartGate = new Promise<void>(resolve => {
+        releaseOnStart = resolve;
+      });
+      const onStart = vi.fn(() => onStartGate);
+
+      const step = createStep({
+        id: 'step',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: vi.fn().mockResolvedValue({}),
+      });
+      const workflow = createWorkflow({
+        id: 'durable-startAsync-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        options: { onStart },
+      })
+        .then(step)
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'durable-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      // PF-5928 adaptation (fork PF-2056/PF-3750): the dispatch snapshot is a fenced step update.
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate');
+      let startReturned = false;
+      const startPromise = run.startAsync({ inputData: {} }).then(result => {
+        startReturned = true;
+        return result;
+      });
+
+      await vi.waitFor(() => expect(onStart).toHaveBeenCalledOnce());
+      const snapshotWhileOnStartWasBlocked = await workflowsStore?.getWorkflowRunById({
+        workflowName: workflow.id,
+        runId: run.runId,
+      });
+      const returnedWhileSnapshotWasPending = startReturned;
+
+      releaseOnStart();
+      await startPromise;
+      const snapshotAfterStartReturned = await workflowsStore?.getWorkflowRunById({
+        workflowName: workflow.id,
+        runId: run.runId,
+      });
+
+      const dispatchSnapshot = persistSnapshot.mock.calls.find(
+        ([args]) => (args.snapshot as any).status === 'waiting',
+      )?.[0].snapshot as any;
+
+      expect((snapshotWhileOnStartWasBlocked?.snapshot as any)?.status).toBe('pending');
+      expect(returnedWhileSnapshotWasPending).toBe(false);
+      expect(dispatchSnapshot).toMatchObject({
+        status: 'waiting',
+        context: { input: {} },
+        activePaths: [0],
+        activeStepsPath: {},
+        suspendedPaths: {},
+        waitingPaths: {},
+      });
+      expect(dispatchSnapshot.serializedStepGraph).toBeDefined();
+      expect((snapshotAfterStartReturned?.snapshot as any)?.status).not.toBe('pending');
+    });
+
+    // PF-5928: the dispatch snapshot is fenced like every other write of the lineage, so a
+    // cancellation another process committed while onStart ran is never overwritten.
+    it('does not dispatch over a cancellation committed while onStart runs', async () => {
+      let releaseOnStart!: () => void;
+      const onStartGate = new Promise<void>(resolve => {
+        releaseOnStart = resolve;
+      });
+      const onStart = vi.fn(() => onStartGate);
+      const execute = vi.fn().mockResolvedValue({});
+      const workflow = createWorkflow({
+        id: 'cancel-during-onstart-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        options: { onStart },
+      })
+        .then(createStep({ id: 'step', inputSchema: z.object({}), outputSchema: z.object({}), execute }))
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'cancel-during-onstart-workflow': workflow } });
+      const run = await workflow.createRun();
+      const workflowsStore = (await storage.getStore('workflows'))!;
+
+      const started = run.startAsync({ inputData: {} }).then(
+        () => 'resolved',
+        () => 'rejected',
+      );
+      await vi.waitFor(() => expect(onStart).toHaveBeenCalledOnce());
+      // Another process cancels the admitted pending run.
+      const pending = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
+      expect(pending?.status).toBe('pending');
+      await workflowsStore.updateWorkflowState({
+        workflowName: workflow.id,
+        runId: run.runId,
+        opts: { status: 'canceled', expectedStatus: 'pending' },
+      });
+      releaseOnStart();
+
+      await expect(started).resolves.toBe('rejected');
+      expect(execute).not.toHaveBeenCalled();
+      const after = await workflowsStore.loadWorkflowSnapshot({ workflowName: workflow.id, runId: run.runId });
+      expect(after?.status).toBe('canceled');
+    });
+
+    it('does not persist the auth token in the durable dispatch snapshot', async () => {
+      const workflow = createWorkflow({
+        id: 'token-startAsync-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute: vi.fn().mockResolvedValue({}),
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'token-startAsync-workflow': workflow } });
+      const workflowsStore = await storage.getStore('workflows');
+      // PF-5928 adaptation (fork PF-2056/PF-3750): the dispatch snapshot is a fenced step update.
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate');
+
+      const requestContext = new RequestContext();
+      requestContext.set(MASTRA_AUTH_TOKEN_KEY, 'live-bearer-token');
+      requestContext.set('tenant', 'acme');
+      const run = await workflow.createRun();
+      await run.startAsync({ inputData: {}, requestContext });
+
+      const dispatchSnapshot = persistSnapshot.mock.calls.find(
+        ([args]) => (args.snapshot as any).status === 'waiting',
+      )?.[0].snapshot as any;
+      expect(dispatchSnapshot.requestContext).toEqual({ tenant: 'acme' });
+    });
+
+    it('preserves null input in the durable dispatch snapshot', async () => {
+      const workflow = createWorkflow({
+        id: 'null-input-startAsync-workflow',
+        inputSchema: z.null(),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.null(),
+            outputSchema: z.object({}),
+            execute: vi.fn().mockResolvedValue({}),
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'null-input-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      // PF-5928 adaptation (fork PF-2056/PF-3750): the dispatch snapshot is a fenced step update.
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate');
+
+      await run.startAsync({ inputData: null });
+
+      const dispatchSnapshot = persistSnapshot.mock.calls.find(
+        ([args]) => (args.snapshot as any).status === 'waiting',
+      )?.[0].snapshot as any;
+      expect(dispatchSnapshot.context).toEqual({ input: null });
+    });
+
+    it('rejects without executing when onStart fails', async () => {
+      const execute = vi.fn().mockResolvedValue({});
+      const workflow = createWorkflow({
+        id: 'rejected-startAsync-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        options: {
+          onStart: () => {
+            throw new Error('start rejected');
+          },
+        },
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute,
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'rejected-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+
+      await expect(run.startAsync({ inputData: {} })).rejects.toThrow('start rejected');
+      expect(execute).not.toHaveBeenCalled();
+      expect((await workflow.getWorkflowRunById(run.runId))?.status).toBe('pending');
+    });
+
+    it('rejects when the durable dispatch snapshot cannot be persisted', async () => {
+      const execute = vi.fn().mockResolvedValue({});
+      const workflow = createWorkflow({
+        id: 'failed-dispatch-persistence-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute,
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'failed-dispatch-persistence-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      // PF-5928 adaptation (fork PF-2056/PF-3750): the dispatch snapshot is a fenced step update.
+      vi.spyOn(workflowsStore!, 'persistWorkflowStepUpdate').mockRejectedValueOnce(new Error('storage unavailable'));
+
+      await expect(run.startAsync({ inputData: {} })).rejects.toThrow('storage unavailable');
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('respects snapshot persistence opt-out for startAsync', async () => {
+      const execute = vi.fn().mockResolvedValue({});
+      const workflow = createWorkflow({
+        id: 'non-persisting-startAsync-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        options: { shouldPersistSnapshot: () => false },
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute,
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'non-persisting-startAsync-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot');
+
+      // PF-5928 adaptation: the fork's startAsync() also returns the background `execution` promise.
+      await expect(run.startAsync({ inputData: {} })).resolves.toMatchObject({ runId: run.runId });
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+
+      expect(persistSnapshot.mock.calls.some(([args]) => (args.snapshot as any).status === 'waiting')).toBe(false);
+    });
+
+    it('does not add the startAsync dispatch snapshot to synchronous start', async () => {
+      const workflow = createWorkflow({
+        id: 'synchronous-start-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(
+          createStep({
+            id: 'step',
+            inputSchema: z.object({}),
+            outputSchema: z.object({}),
+            execute: vi.fn().mockResolvedValue({}),
+          }),
+        )
+        .commit();
+      const storage = new MockStore();
+      new Mastra({ storage, workflows: { 'synchronous-start-workflow': workflow } });
+
+      const run = await workflow.createRun();
+      const workflowsStore = await storage.getStore('workflows');
+      const persistSnapshot = vi.spyOn(workflowsStore!, 'persistWorkflowSnapshot');
+
+      await run.start({ inputData: {} });
+
+      expect(persistSnapshot.mock.calls.some(([args]) => (args.snapshot as any).status === 'waiting')).toBe(false);
     });
   });
 
@@ -762,7 +1052,53 @@ describe('Workflow (Default Engine Specifics)', () => {
     });
   });
 
-  describe('tool step cancellation', () => {
+  describe('workflow cancellation', () => {
+    it('leaves an executor-aborted run recoverable without invoking onFinish', async () => {
+      let notifyStepStarted!: () => void;
+      const stepStarted = new Promise<void>(resolve => {
+        notifyStepStarted = resolve;
+      });
+      const onFinish = vi.fn();
+
+      const blockingStep = createStep({
+        id: 'blocking-step',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: async ({ abortSignal }) => {
+          notifyStepStarted();
+          await new Promise<void>(resolve => abortSignal?.addEventListener('abort', () => resolve(), { once: true }));
+          return {};
+        },
+      });
+      const workflow = createWorkflow({
+        id: 'executor-abort-workflow',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        steps: [blockingStep],
+        options: { onFinish },
+      });
+      workflow.then(blockingStep).commit();
+
+      new Mastra({
+        logger: false,
+        storage: testStorage,
+        workflows: { 'executor-abort-workflow': workflow },
+      });
+
+      const run = await workflow.createRun();
+      const resultPromise = run.start({ inputData: {} });
+      await stepStarted;
+
+      run.abortController.abort();
+
+      const result = await resultPromise;
+      const snapshot = await workflow.getWorkflowRunById(run.runId);
+
+      expect(result.status).toBe('waiting');
+      expect(snapshot?.status).toBe('waiting');
+      expect(onFinish).not.toHaveBeenCalled();
+    });
+
     it('forwards abortSignal to tool-wrapped steps so run.cancel() can stop cooperative tools', async () => {
       let capturedAbortSignal: AbortSignal | undefined;
       let toolStoppedEarly = false;
@@ -1815,5 +2151,69 @@ describe('concurrent stream close', () => {
     expect(secondDrain.closed).toBe(true);
     expect(firstDrain.types).toContain('workflow-finish');
     expect(secondDrain.types).toContain('workflow-finish');
+  });
+});
+
+// PF-5928: a handle created before its workflow was registered admits its pending row at
+// start. That admission must never overwrite a row another creator wrote meanwhile.
+describe('late-bound pending admission', () => {
+  it('never overwrites a run another creator admitted and started meanwhile', async () => {
+    let effects = 0;
+    let releaseEffect!: () => void;
+    const effectGate = new Promise<void>(resolve => {
+      releaseEffect = resolve;
+    });
+    const define = () => {
+      const step = createStep({
+        id: 'effect',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: async () => {
+          effects++;
+          await effectGate;
+          return {};
+        },
+      });
+      return createWorkflow({ id: 'late-bound-admission', inputSchema: z.object({}), outputSchema: z.object({}) })
+        .then(step)
+        .commit();
+    };
+    const storage = new MockStore();
+    const runId = 'late-bound-admission-run';
+    const lateWorkflow = define();
+    const late = await lateWorkflow.createRun({ runId });
+    new Mastra({ logger: false, storage }).__registerInternalWorkflow(lateWorkflow, runId);
+    const otherWorkflow = define();
+    new Mastra({ logger: false, storage, workflows: { 'late-bound-admission': otherWorkflow } });
+
+    // The other creator admits and starts the run after the late handle checked for a row
+    // and before it writes one, whichever storage API the admission uses.
+    const store = (await storage.getStore('workflows')) as any;
+    let armed = true;
+    let otherStart: Promise<unknown> | undefined;
+    const admitOther = async () => {
+      if (!armed) return;
+      armed = false;
+      const other = await otherWorkflow.createRun({ runId });
+      otherStart = other.start({ inputData: {} });
+      await vi.waitFor(() => expect(effects).toBe(1));
+    };
+    for (const method of ['persistWorkflowSnapshot', 'createWorkflowSnapshotIfAbsent'] as const) {
+      const original = store[method].bind(store);
+      vi.spyOn(store, method).mockImplementation(async (args: any) => {
+        await admitOther();
+        return original(args);
+      });
+    }
+
+    const lateStart = late.start({ inputData: {} }).then(
+      result => result,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(otherStart).toBeDefined());
+    releaseEffect();
+    expect(await otherStart).toMatchObject({ status: 'success' });
+    expect(await lateStart).toBeInstanceOf(Error);
+    expect(effects).toBe(1);
   });
 });

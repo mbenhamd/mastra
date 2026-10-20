@@ -12,6 +12,7 @@ import {
   RequestContext,
   MASTRA_AUTH_TOKEN_KEY,
   MASTRA_RESOURCE_ID_KEY,
+  MASTRA_SCOPES_KEY,
   MASTRA_THREAD_ID_KEY,
 } from '@mastra/core/request-context';
 import { createTool } from '@mastra/core/tools';
@@ -173,7 +174,11 @@ export function createRequestContextTests({ createAgent }: DurableAgentTestConte
 
         const entries = (result.workflowInput as { requestContextEntries?: Record<string, unknown> })
           .requestContextEntries;
-        expect(entries).toBeUndefined();
+        // Fork contract: unlisted caller entries never cross the durable boundary.
+        // Upstream #26593 records the run's scope set ([] when it held none) so a
+        // resume can tell "no scopes" apart from a pre-scopes snapshot; that
+        // framework entry is the only one allowed without an allowlist.
+        expect(Object.keys(entries ?? {}).filter(key => key !== MASTRA_SCOPES_KEY)).toEqual([]);
         expect(JSON.stringify(result.workflowInput)).not.toContain('user-123');
 
         // The framework-managed auth token must never be persisted.

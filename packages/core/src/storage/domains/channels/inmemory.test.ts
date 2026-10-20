@@ -55,6 +55,19 @@ describe('InMemoryChannelsStorage', () => {
       expect(result?.status).toBe('active');
     });
 
+    // PF-5928 ledger L52: the fork patch is superseded by upstream #26418; this pins the
+    // behaviour in core (the shared store suite also covers it).
+    it('keeps the original createdAt when an installation is saved again', async () => {
+      await storage.saveInstallation(makeInstallation({ status: 'pending' }));
+      await storage.saveInstallation(
+        makeInstallation({ status: 'active', createdAt: new Date('2026-02-02'), updatedAt: new Date('2026-02-02') }),
+      );
+
+      const result = await storage.getInstallation('inst-1');
+      expect(result?.createdAt).toEqual(new Date('2026-01-01'));
+      expect(result?.updatedAt).toEqual(new Date('2026-02-02'));
+    });
+
     it('returns clones (no external mutation)', async () => {
       const inst = makeInstallation();
       await storage.saveInstallation(inst);

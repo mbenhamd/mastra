@@ -223,16 +223,21 @@ export async function processWorkflowParallel(
   },
 ) {
   const pathsToRun = new Set<string>();
+  // Upstream #25389: a restart routes only the entry its snapshot captured; later entries of
+  // the restarted run execute normally. A restart that records no active paths keeps the
+  // fork's behaviour of treating this entry as the restarted one.
+  const isRestartedEntry =
+    restart !== undefined && (restart.activePaths === undefined || restart.activePaths[0] === executionPath[0]);
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
-  const restartContainerPath = restart
+  const restartContainerPath = isRestartedEntry
     ? executionPath.length === 1
       ? executionPath
       : executionPath.slice(0, -1)
     : undefined;
-  if (restart) {
+  if (isRestartedEntry) {
     validateParallelRestartPaths({
-      activeStepsPath: restart.activeStepsPath,
+      activeStepsPath: restart!.activeStepsPath,
       allowContainerPath: executionPath.length === 1,
       restartContainerPath: restartContainerPath!,
       step,
@@ -242,9 +247,9 @@ export async function processWorkflowParallel(
     const nestedStep = step.steps[i];
     if (nestedStep) {
       const nestedStepId = getSingleStepEntryId(nestedStep);
-      //if restart, only run the step if it's in the active steps path
-      if (restart) {
-        const descriptor = Object.getOwnPropertyDescriptor(restart.activeStepsPath, nestedStepId);
+      // Only filter branches while routing the entry captured by the restart snapshot.
+      if (isRestartedEntry) {
+        const descriptor = Object.getOwnPropertyDescriptor(restart!.activeStepsPath, nestedStepId);
         if (descriptor) {
           pathsToRun.add(nestedStepId);
         }
@@ -262,7 +267,7 @@ export async function processWorkflowParallel(
     return [
       {
         nestedStep,
-        executionPath: restart ? restartContainerPath!.concat([idx]) : executionPath.concat([idx]),
+        executionPath: isRestartedEntry ? restartContainerPath!.concat([idx]) : executionPath.concat([idx]),
       },
     ];
   });
@@ -352,8 +357,10 @@ export async function processWorkflowConditional(
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
 
-  // On restart, executionPath already includes the persisted branch index, so replace it instead of appending.
-  const branchPath = (idx: number) => (restart ? executionPath.slice(0, -1) : executionPath).concat([idx]);
+  // On an in-flight restart of this entry, executionPath includes the persisted branch index, so replace it.
+  const isRestartedEntry = restart?.activePaths[0] === executionPath[0];
+  const branchPath = (idx: number) =>
+    (isRestartedEntry && !restart?.isPreFirstStepRestart ? executionPath.slice(0, -1) : executionPath).concat([idx]);
 
   // Create a proper RequestContext from the plain object passed in ProcessorArgs
   const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);
