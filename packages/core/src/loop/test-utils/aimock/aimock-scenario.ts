@@ -3,6 +3,7 @@ import { LLMock } from '@copilotkit/aimock';
 import { afterAll, afterEach, beforeAll, describe } from 'vitest';
 import { Agent } from '../../../agent';
 import { createDurableAgent, createEventedAgent } from '../../../agent/durable';
+import { getGlobalRunRegistryEntry } from '../../../agent/durable/run-registry';
 import { assembleAgentFromFsEntry } from '../../../agent/fs-routing';
 import { isDurableAgentLike } from '../../../agent/types';
 import { EventEmitterPubSub } from '../../../events';
@@ -542,10 +543,24 @@ export async function runLoopScenario(opts: RunLoopScenarioOptions): Promise<Loo
   // the test wants to consume the stream manually (e.g. streamUntilIdle tests
   // that publish bg-task events after runLoopScenario returns).
   if (isDurable && rawResult.cleanup && !suspendedDuringDrain && !manualStreamConsumption) {
+    // PF-5928: a tripwire can close the stream while the run's workflow tail still runs. Test ids
+    // come from a per-test counter, so the next scenario reuses this run's id and runtime binding;
+    // let the tail settle (bounded) so it never acts on the next scenario's run. Production ids
+    // are random.
+    const workflowExecution = getGlobalRunRegistryEntry(output.runId)?.workflowExecution;
     try {
       rawResult.cleanup();
     } catch {
       // cleanup may race
+    }
+    if (workflowExecution) {
+      await Promise.race([
+        workflowExecution.then(
+          () => undefined,
+          () => undefined,
+        ),
+        new Promise(resolve => setTimeout(resolve, 5_000)),
+      ]);
     }
   }
 
