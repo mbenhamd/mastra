@@ -112,11 +112,12 @@ describe('thread stream subscriber acknowledgements', () => {
     const observer = new AgentThreadStreamRuntime();
     const pubsub = new AckTrackingPubSub();
     const runId = 'notification-owner-run';
-    await owner.waitForCrossAgentThreadRun(
-      agent,
-      { runId, memory: { thread: threadId, resource: resourceId } },
-      pubsub,
-    );
+    // PF-5928 adaptation (fork PF-4402): waitForCrossAgentThreadRun only orders cross-agent work and
+    // never reserves; the owning run holds the thread via reserveRun, and the reservation wait
+    // installs the thread's control listener (as the fork's other tests in this file do).
+    const ownerRun = { runId, memory: { thread: threadId, resource: resourceId } };
+    owner.reserveRun(ownerRun, pubsub, agent.id);
+    await owner.waitForThreadRunReservation(ownerRun, pubsub, agent.id);
     const observation = await observer.subscribeToThread(agent, { resourceId, threadId }, pubsub);
     let notifications = 0;
     const admitted: string[][] = [];

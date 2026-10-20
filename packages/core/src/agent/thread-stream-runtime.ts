@@ -9154,15 +9154,15 @@ export class AgentThreadStreamRuntime {
       scheduleCheck();
     };
 
-    const resolveTerminalEventStreamId = (
+    // Selects the registered segment a terminal belongs to without marking it, so
+    // the PF-2935 owner check can authenticate against that segment's accepted
+    // owner before `resolveTerminalEventStreamId` records the match.
+    const peekTerminalEventStreamId = (
       runId: string,
       type: 'run-failed' | 'run-completed' | 'run-aborted' | 'run-suspended',
       streamId?: string,
     ) => {
-      if (streamId) {
-        terminalEventStreamIds.add(streamId);
-        return streamId;
-      }
+      if (streamId) return streamId;
 
       const registered = registeredSeqsByRunId.get(runId);
       let oldestUnmatched: { streamId: string; streamSeq: number } | undefined;
@@ -9180,10 +9180,19 @@ export class AgentThreadStreamRuntime {
           newestTracked = { streamId: registeredStreamId, streamSeq };
         }
       }
-      const resolvedStreamId =
+      return (
         (type === 'run-suspended' ? oldestUnmatched?.streamId : newestTracked?.streamId) ??
         oldestUnmatched?.streamId ??
-        runId;
+        runId
+      );
+    };
+
+    const resolveTerminalEventStreamId = (
+      runId: string,
+      type: 'run-failed' | 'run-completed' | 'run-aborted' | 'run-suspended',
+      streamId?: string,
+    ) => {
+      const resolvedStreamId = peekTerminalEventStreamId(runId, type, streamId);
       terminalEventStreamIds.add(resolvedStreamId);
       return resolvedStreamId;
     };
@@ -9497,7 +9506,7 @@ export class AgentThreadStreamRuntime {
         return;
       }
       if (data.type === 'run-failed') {
-        const authStreamId = data.streamId ?? data.runId;
+        const authStreamId = peekTerminalEventStreamId(data.runId, data.type, data.streamId);
         const localRecord = data.streamId
           ? state.threadRunsByStreamId.get(data.streamId)
           : state.threadRunsById.get(data.runId);
@@ -9530,7 +9539,7 @@ export class AgentThreadStreamRuntime {
         this.#forgetCallerSignalsForRun(state, data.runId);
         this.#forgetSignalAdmissionsForRun(state, key, data.runId);
         // Upstream (#26554): only an authenticated terminal resolves (and marks) its segment.
-        const eventStreamId = resolveTerminalEventStreamId(data.runId, data.type, data.streamId);
+        const eventStreamId = resolveTerminalEventStreamId(data.runId, data.type, authStreamId);
         stopRemoteRunLeaseWatch(eventStreamId);
         remoteRunSuspensionPrompts.delete(eventStreamId);
         clearActiveIfCurrent(data.runId, data.streamId);
@@ -9594,7 +9603,7 @@ export class AgentThreadStreamRuntime {
         return;
       }
       if (data.type === 'run-completed' || data.type === 'run-aborted' || data.type === 'run-suspended') {
-        const eventStreamId = data.streamId ?? data.runId;
+        const eventStreamId = peekTerminalEventStreamId(data.runId, data.type, data.streamId);
         const localRecord =
           state.threadRunsByStreamId.get(eventStreamId) ??
           (data.streamId === undefined ? state.threadRunsById.get(data.runId) : undefined);
@@ -9614,7 +9623,7 @@ export class AgentThreadStreamRuntime {
           return;
         }
         // Upstream (#26554): record the authenticated terminal against its registered segment.
-        resolveTerminalEventStreamId(data.runId, data.type, data.streamId);
+        resolveTerminalEventStreamId(data.runId, data.type, eventStreamId);
         const activeRunId = state.activeThreadRunIds.get(key);
         const activeStreamId = state.activeThreadStreamIds.get(key);
         const currentStreamId = activeRunId === data.runId ? activeStreamId : undefined;

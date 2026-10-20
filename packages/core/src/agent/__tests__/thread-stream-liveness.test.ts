@@ -1,7 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentThreadLeaseLostError } from '../thread-stream-runtime';
-import { AGENT_THREAD_KEY_SEPARATOR, createHarness, setupRuntime } from './thread-stream-test-utils';
+import {
+  AGENT_THREAD_KEY_SEPARATOR,
+  createHarness,
+  setupRuntime as setupUnownedRuntime,
+} from './thread-stream-test-utils';
+import type { ThreadStreamHarness } from './thread-stream-test-utils';
+
+// PF-5928 adaptation (fork PF-2935 exact stream ownership): on a lease provider every remote event
+// is signed with the producer's lease owner token (here the raw run id the test lease names), and
+// an ownerless remote registration is dropped. Legacy events still omit the streamId, but are signed.
+function setupRuntime(harness: ThreadStreamHarness) {
+  const base = setupUnownedRuntime(harness);
+  const emit = (data: Record<string, unknown>) => base.emit({ leaseOwner: data.runId, ...data });
+  const streamPart = (part: unknown) =>
+    emit({ type: 'stream-part', runId: harness.runId, streamId: harness.streamId, sourceId: 'origin', part });
+  return { ...base, emit, streamPart };
+}
 
 const LEASE_TTL_MS = 15_000;
 
@@ -76,11 +92,22 @@ describe('thread stream remote-run liveness', () => {
       part: { type: 'tool-call', payload: { toolCallId: 'call-1', toolName: 'lookup' } },
     });
     // Recovery re-acquires the lease under the same runId and registers a new segment.
-    await emit({ type: 'run-registered', runId: harness.runId, streamId: recoveredStreamId, streamSeq: 1 });
+    // PF-5928 adaptation (PF-2935): recovery runs in another process, which signs with its own
+    // lease owner token, so its registration is not fenced as a replay of the crashed segment.
+    const recovererOwner = `mastra-thread-owner:${JSON.stringify([harness.runId, 'recoverer', 'attempt-2'])}`;
+    pubsub.owners.set(key, recovererOwner);
+    await emit({
+      type: 'run-registered',
+      runId: harness.runId,
+      streamId: recoveredStreamId,
+      streamSeq: 1,
+      leaseOwner: recovererOwner,
+    });
     await emit({
       type: 'stream-part',
       runId: harness.runId,
       streamId: recoveredStreamId,
+      leaseOwner: recovererOwner,
       sourceId: 'recoverer',
       part: { type: 'tool-call-approval', payload: { toolCallId: 'call-2', toolName: 'refund' } },
     });
@@ -97,6 +124,7 @@ describe('thread stream remote-run liveness', () => {
       type: 'stream-part',
       runId: harness.runId,
       streamId: recoveredStreamId,
+      leaseOwner: recovererOwner,
       sourceId: 'recoverer',
       part: { type: 'tool-call-resumed', payload: { toolCallId: 'call-2' } },
     });
