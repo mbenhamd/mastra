@@ -29,6 +29,42 @@ const history = (): MastraDBMessage[] =>
 
 type SnapshotRow = { workflowName: string; runId: string; resourceId?: string; snapshot: WorkflowRunState };
 const allHistoryIds = history().map(message => message.id);
+
+// PF-1875 (PF-5928 decision, option a): the fork refuses cold recovery of a run whose agent has
+// request-local processor state (here, memory processors), because that state is not persisted.
+const PROCESSOR_STATE_UNRECOVERABLE = { id: 'DURABLE_AGENT_RESUME_PROCESSOR_STATE_UNRECOVERABLE' };
+
+/**
+ * PF-5928 adaptation (fork PF-4389/PF-2056 fenced step updates): running checkpoints are written
+ * through `persistWorkflowStepUpdate` (and, on the evented engine, the CAS `updateWorkflowResults` /
+ * `updateWorkflowState`), not only `persistWorkflowSnapshot`. Report the stored row after every
+ * workflow write so the checkpoints the upstream assertions inspect are the ones storage holds.
+ */
+function onStoredRow(
+  workflows: { getWorkflowRunById: (args: { runId: string; workflowName: string }) => Promise<any> },
+  record: (row: SnapshotRow) => void,
+) {
+  for (const method of [
+    'persistWorkflowSnapshot',
+    'persistWorkflowStepUpdate',
+    'updateWorkflowResults',
+    'updateWorkflowState',
+  ] as const) {
+    const target = workflows as any;
+    const original = target[method].bind(target);
+    target[method] = async (args: any) => {
+      const result = await original(args);
+      const run = await workflows.getWorkflowRunById({ runId: args.runId, workflowName: args.workflowName });
+      if (run) {
+        const snapshot = typeof run.snapshot === 'string' ? JSON.parse(run.snapshot) : run.snapshot;
+        record(
+          structuredClone({ workflowName: args.workflowName, runId: args.runId, resourceId: run.resourceId, snapshot }),
+        );
+      }
+      return result;
+    };
+  }
+}
 type Engine = 'default' | 'evented';
 const engines: Engine[] = ['default', 'evented'];
 
@@ -196,12 +232,10 @@ async function recoverableCheckpoints() {
   const original = await startProcess(history());
   const rows = new Map<string, SnapshotRow>();
   const checkpoints: SnapshotRow[][] = [];
-  const persist = original.workflows.persistWorkflowSnapshot.bind(original.workflows);
-  original.workflows.persistWorkflowSnapshot = async args => {
-    rows.set(`${args.workflowName}:${args.runId}`, structuredClone(args));
-    checkpoints.push([...rows.values()].map(row => structuredClone(row)));
-    return persist(args);
-  };
+  onStoredRow(original.workflows, row => {
+    rows.set(`${row.workflowName}:${row.runId}`, row);
+    checkpoints.push([...rows.values()].map(stored => structuredClone(stored)));
+  });
   const result = await original.durableAgent.stream('Look it up', { memory: memoryOption });
   expect(await collectText(result)).toBe('done');
 
@@ -301,11 +335,7 @@ describe('memory-recalled messages in durable runs', () => {
     async engine => {
       const { durableAgent, workflows, prompts, storage } = await startProcess(history(), { engine, toolRounds: 3 });
       const persisted: SnapshotRow[] = [];
-      const persist = workflows.persistWorkflowSnapshot.bind(workflows);
-      workflows.persistWorkflowSnapshot = async args => {
-        persisted.push(structuredClone(args));
-        return persist(args);
-      };
+      onStoredRow(workflows, row => persisted.push(row));
 
       const result = await durableAgent.stream('Look it up', { memory: memoryOption, savePerStep: true });
       expect(await collectText(result)).toBe('done');
@@ -339,11 +369,7 @@ describe('memory-recalled messages in durable runs', () => {
       });
       const marker = 'saved-input-marker';
       const persisted: SnapshotRow[] = [];
-      const persist = workflows.persistWorkflowSnapshot.bind(workflows);
-      workflows.persistWorkflowSnapshot = async args => {
-        persisted.push(structuredClone(args));
-        return persist(args);
-      };
+      onStoredRow(workflows, row => persisted.push(row));
 
       const result = await durableAgent.stream(`${marker} ${'p'.repeat(20_000)}`, {
         memory: memoryOption,
@@ -393,13 +419,11 @@ describe('memory-recalled messages in durable runs', () => {
     });
     const rows = new Map<string, SnapshotRow>();
     let checkpoint: SnapshotRow[] | undefined;
-    const persist = original.workflows.persistWorkflowSnapshot.bind(original.workflows);
-    original.workflows.persistWorkflowSnapshot = async args => {
-      rows.set(`${args.workflowName}:${args.runId}`, structuredClone(args));
+    onStoredRow(original.workflows, stored => {
+      rows.set(`${stored.workflowName}:${stored.runId}`, stored);
       const loop = [...rows.values()].find(row => row.workflowName === DurableStepIds.AGENTIC_LOOP);
       if (loop?.snapshot.status === 'running') checkpoint = [...rows.values()].map(row => structuredClone(row));
-      return persist(args);
-    };
+    });
 
     const result = await original.durableAgent.stream('Look it up', { memory: memoryOption });
     void collectText(result).catch(() => {});
@@ -415,42 +439,32 @@ describe('memory-recalled messages in durable runs', () => {
 
     // Recover the run in a fresh process from the storage as it was at the last
     // checkpoint, as if this process had exited right after writing it.
+    // PF-5928 adaptation (PF-1875 option a): the drain still writes the recoverable checkpoint
+    // (asserted above); a fresh process refuses to cold-recover it and runs nothing.
     const recovering = await startProcess(history());
     for (const row of checkpoint!) await recovering.workflows.persistWorkflowSnapshot(row);
-    const recovered = await recovering.durableAgent.recover(result.runId);
-    expect(await collectText(recovered)).toBe('done');
+    await expect(recovering.durableAgent.recover(result.runId)).rejects.toMatchObject(PROCESSOR_STATE_UNRECOVERABLE);
     expect(recovering.toolExecutions()).toBe(0);
+    expect(recovering.prompts).toHaveLength(0);
   }, 30_000);
 
   it('recovers in a fresh process with the stored version of recalled messages edited or deleted meanwhile', async () => {
-    // Recover from every checkpoint after history-0 was edited and history-1 deleted.
+    // PF-5928 adaptation (PF-1875 option a): every recoverable checkpoint still stores the
+    // transcript as memory refs (asserted by recoverableCheckpoints), but a fresh process refuses to
+    // cold-recover a run with request-local processor state, so no model call reads stale or edited
+    // history. The same-process approval resume below covers reading the stored version.
     const { runId, recoverable } = await recoverableCheckpoints();
-
     const [first, , ...rest] = history();
     const edited = {
       ...first!,
       content: { format: 2 as const, parts: [{ type: 'text' as const, text: 'edited meanwhile' }] },
     };
-    const modelCalls: number[] = [];
     for (const checkpoint of recoverable) {
       const recovering = await startProcess([edited, ...rest]);
       for (const row of checkpoint) await recovering.workflows.persistWorkflowSnapshot(row);
-
-      const recovered = await recovering.durableAgent.recover(runId);
-      expect(await collectText(recovered)).toBe('done');
-
-      modelCalls.push(recovering.prompts.length);
-      for (const prompt of recovering.prompts) {
-        expect(prompt).toContain('edited meanwhile');
-        expect(prompt).not.toContain(historyText(0));
-        expect(prompt).not.toContain(historyText(1));
-        expect(prompt).toContain(historyText(2));
-        expect(prompt).toContain(historyText(3));
-      }
+      await expect(recovering.durableAgent.recover(runId)).rejects.toMatchObject(PROCESSOR_STATE_UNRECOVERABLE);
+      expect(recovering.prompts).toHaveLength(0);
     }
-    // Covers recovery that calls the model again and recovery that only finishes up.
-    expect(modelCalls).toContain(1);
-    expect(modelCalls).toContain(0);
   }, 60_000);
 
   it.each(engines)(
@@ -567,11 +581,11 @@ describe('memory-recalled messages in durable runs', () => {
     expect(listMessagesById).toHaveBeenCalledTimes(1);
     expect(await outerSnapshot(recovering.workflows, runId)).toMatchObject({ status: 'running' });
 
-    const recovered = await recovering.durableAgent.recover(runId);
-    expect(await collectText(recovered)).toBe('done');
+    // PF-5928 adaptation (PF-1875 option a): once the recalled messages load, the fork refuses to
+    // cold-recover a run with request-local processor state; the crashed run stays in storage.
+    await expect(recovering.durableAgent.recover(runId)).rejects.toMatchObject(PROCESSOR_STATE_UNRECOVERABLE);
     expect(listMessagesById).toHaveBeenCalledTimes(2);
-    for (const prompt of recovering.prompts) {
-      for (let i = 0; i < 4; i++) expect(prompt).toContain(historyText(i));
-    }
+    expect(await outerSnapshot(recovering.workflows, runId)).toMatchObject({ status: 'running' });
+    expect(recovering.prompts).toHaveLength(0);
   }, 30_000);
 });
