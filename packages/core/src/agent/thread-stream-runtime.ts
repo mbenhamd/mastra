@@ -4644,6 +4644,22 @@ export class AgentThreadStreamRuntime {
     state.abortedRunIds.delete(runId);
   }
 
+  /**
+   * A resume of a parked suspension is a new attempt: storage still holds the run as suspended,
+   * and the resume claim (upstream #26688) admits exactly one caller. The aborted-run tombstone
+   * (PF-513) exists to refuse the aborted attempt itself, so once that attempt has settled (no
+   * preparation, no live record here) it must not refuse the resume: a tool call that parked
+   * after its run was aborted stays resumable (upstream #26871). Called before the resume
+   * prepares, because preparation aborts a tombstoned run id.
+   */
+  admitParkedRunResume(runId: string, pubsub?: PubSub): void {
+    const state = this.#getState(pubsub);
+    if (!state.abortedRunIds.has(runId) || state.preparedRunsById.has(runId)) return;
+    const record = state.threadRunsById.get(runId);
+    if (record && !this.#isParkedRun(state, runId)) return;
+    this.#forgetAbortedRun(state, runId);
+  }
+
   #rememberAbortedRun(state: AgentThreadRuntimeState, runId: string) {
     this.#forgetAbortedRun(state, runId);
 

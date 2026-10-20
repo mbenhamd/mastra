@@ -13465,6 +13465,8 @@ export class Agent<
           };
         }
       }
+      // PF-5928 (upstream #26871 over fork PF-513): resuming a parked suspension is a new attempt.
+      agentThreadStreamRuntime.admitParkedRunResume(runId, pubsub);
       const preparedOptions = agentThreadStreamRuntime.prepareRunOptions(
         mergedStreamOptions as unknown as AgentExecutionOptions<OUTPUT>,
         pubsub,
