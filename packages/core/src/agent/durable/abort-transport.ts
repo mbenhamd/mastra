@@ -19,6 +19,7 @@ import {
   getBoundRunRegistryEntry,
   getGlobalRunRegistryEntry,
   getRunRegistryEntry,
+  isRuntimeBindingRetired,
   setRunRegistryEntry,
 } from './run-registry';
 import type { RunRegistryEntry } from './types';
@@ -109,6 +110,10 @@ export async function ensureRemoteAbortListener(
   }
 
   if (!entry) {
+    // PF-5928: a late step of an execution this process released while it still ran must not
+    // resurrect the released run id (see isRuntimeBindingRetired). A worker that never ran the
+    // execution has not retired its binding and still seeds one.
+    if (isRuntimeBindingRetired(runtimeBindingId)) return;
     // A worker can reach its first step before anything has populated the
     // registry for this run. Returning early here would leave that run
     // permanently deaf to remote aborts, so seed a minimal entry instead. It is

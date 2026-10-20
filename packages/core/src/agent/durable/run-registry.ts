@@ -370,6 +370,31 @@ function isReboundRunRegistryEntry(entry: RunRegistryEntry, runtimeBindingId: st
   );
 }
 
+/**
+ * Runtime bindings whose registry entry this process released while that execution's workflow
+ * was still running (PF-5928). A late step of the released execution (for example a tail that
+ * kept running after a tripwire closed its stream and cleanup ran) must not re-seed a
+ * remote-abort placeholder for the released run id, or a later run that reuses the id inherits
+ * it. Each retirement lasts exactly until its execution settles and is then pruned: it is
+ * bounded by the executions still running, never by a count, and a later segment of the same
+ * execution (a resume awaits the prior segment) is never refused.
+ */
+const retiredRuntimeBindings = new Map<string, Promise<unknown>>();
+
+function retireRuntimeBindingUntilSettled(runtimeBindingId: string, execution: Promise<unknown> | undefined): void {
+  if (!execution) return;
+  retiredRuntimeBindings.set(runtimeBindingId, execution);
+  const prune = () => {
+    if (retiredRuntimeBindings.get(runtimeBindingId) === execution) retiredRuntimeBindings.delete(runtimeBindingId);
+  };
+  void execution.then(prune, prune);
+}
+
+/** Whether this process released `runtimeBindingId` while its execution still runs. @internal */
+export function isRuntimeBindingRetired(runtimeBindingId: string): boolean {
+  return retiredRuntimeBindings.has(runtimeBindingId);
+}
+
 /** Register without replacing another active run that happens to reuse the same ID. */
 export function registerGlobalRunRegistryEntry(runId: string, entry: RunRegistryEntry): void {
   if (getGlobalRunRegistryEntry(runId)) {
@@ -397,6 +422,7 @@ export function deleteBoundRunRegistryEntry(
   const cachedMatches =
     cached?.runtimeBindingId === runtimeBindingId && (expectedEntry === undefined || cached === expectedEntry);
   if (!pinnedMatches && !cachedMatches) return false;
+  retireRuntimeBindingUntilSettled(runtimeBindingId, (pinnedMatches ? pinned.entry : cached)?.workflowExecution);
 
   // Terminal cleanup can race the active segment's `finally`. Remove the
   // matching pin first so a later unpin cannot restore terminal runtime state
