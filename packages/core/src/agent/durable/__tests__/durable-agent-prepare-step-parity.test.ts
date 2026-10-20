@@ -137,8 +137,15 @@ describe('T22 prepare-step (plain, durable, evented)', () => {
           model,
           tools: { first, second },
           defaultOptions: {
-            prepareStep: ({ stepNumber }) => ({
-              tools: stepNumber === 0 ? { first } : stepNumber === 1 ? { second } : {},
+            // PF-5928 adaptation (fork PF-2040 durable tool-surface fence): narrow the provided
+            // reconstructible view instead of returning raw tool objects, which fails closed.
+            prepareStep: ({ stepNumber, tools }) => ({
+              tools:
+                stepNumber === 0
+                  ? { first: (tools as Record<string, any>).first }
+                  : stepNumber === 1
+                    ? { second: (tools as Record<string, any>).second }
+                    : {},
               activeTools: undefined,
             }),
           },

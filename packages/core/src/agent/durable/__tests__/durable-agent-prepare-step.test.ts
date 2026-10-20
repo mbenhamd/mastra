@@ -179,7 +179,11 @@ describe('DurableAgent prepareStep', () => {
       input: 'go',
       options: {
         maxSteps: 2,
-        prepareStep: async ({ stepNumber }) => (stepNumber === 1 ? { tools: { kept } } : undefined),
+        // PF-5928 adaptation (fork PF-2040 durable tool-surface fence): a durable step can only
+        // narrow the reconstructible tool view it is given; returning raw tool objects reads as
+        // replacing an executable and fails closed on durable/evented.
+        prepareStep: async ({ stepNumber, tools }) =>
+          stepNumber === 1 ? { tools: { kept: (tools as Record<string, any>).kept } } : undefined,
       },
     });
 
@@ -215,7 +219,8 @@ describe('DurableAgent prepareStep', () => {
       input: 'go',
       options: {
         maxSteps: 3,
-        prepareStep: async () => ({ tools: { step } }),
+        // PF-5928 adaptation (fork PF-2040): narrow the provided view, as above.
+        prepareStep: async ({ tools }) => ({ tools: { step: (tools as Record<string, any>).step } }),
       },
     });
 

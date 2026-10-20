@@ -172,18 +172,24 @@ describe('durable agent approval resume request context (#25960)', () => {
     expect(run.seen).toEqual([]);
   });
 
-  it('keeps a configured tool an input processor replaced when approved in the same process', async () => {
-    const run = await suspendForApproval({ replaceTool: true });
+  // PF-5928 adaptation (fork PF-2040 durable tool-surface fence): a tool implementation replaced
+  // inside processInputStep is not reconstructible, so the durable run fails closed before it asks
+  // for approval; neither the configured nor the replacement tool runs.
+  it('refuses a configured tool an input processor replaced before asking for approval', async () => {
+    const storage = new InMemoryStore();
+    const seen: unknown[] = [];
+    const durableAgent = startProcess(storage, seen, { replaceTool: true });
+    const stream = await durableAgent.stream('Who am I?', { requestContext: contextFor('first') });
 
-    await drain(
-      await run.durableAgent.approveToolCall({
-        runId: run.runId,
-        toolCallId: run.toolCallId,
-        requestContext: contextFor('second'),
-      }),
-    );
-
-    expect(run.seen).toEqual(['replacement']);
+    const types: string[] = [];
+    const errors: unknown[] = [];
+    for await (const chunk of stream.fullStream as AsyncIterable<any>) {
+      types.push(chunk.type);
+      if (chunk.type === 'error') errors.push(chunk.payload?.error);
+    }
+    expect(types).not.toContain('tool-call-approval');
+    expect(JSON.stringify(errors)).toContain('cannot replace executable tool');
+    expect(seen).toEqual([]);
   });
 
   it('does not restore a tool an input processor withheld when approved in the same process', async () => {
