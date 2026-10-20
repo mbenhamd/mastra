@@ -41,7 +41,9 @@ describe('Mastra workflow registry classifier schemas', () => {
     await mastra.addDynamicWorkflow({
       id: 'classify',
       inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-      outputSchema: {},
+      // PF-5928 adaptation (fork PF-3608): dynamic workflow schemas must use the admitted closed
+      // JSON Schema dialect, which requires an explicit `type`; upstream's `{}` is refused.
+      outputSchema: { type: 'object' },
       graph: [{ type: 'classifier', id: 'classify', classifierId: 'triage' }],
     });
 

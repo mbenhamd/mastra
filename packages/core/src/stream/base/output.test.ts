@@ -2635,8 +2635,15 @@ describe('MastraModelOutput', () => {
       });
       expect(output.error).toBeUndefined();
       expect(output.terminalToolResult).toBeUndefined();
-      expect(chunks.map(chunk => chunk.type)).toEqual(['finish']);
-      expect((chunks[0] as any).payload.stepResult.reason).toBe('other');
+      // PF-5928 adaptation (upstream #27377): a processOutputResult TripWire ends the stream with a
+      // `tripwire` chunk instead of `finish`, like every other tripwire; every completion surface
+      // above still reports it consistently.
+      expect(chunks.map(chunk => chunk.type)).toEqual(['tripwire']);
+      expect((chunks[0] as any).payload).toEqual({
+        reason: 'Terminal answer blocked by policy',
+        retry: false,
+        processorId: 'terminal-content-policy',
+      });
       expect(onStepFinish).not.toHaveBeenCalled();
       expect(onFinish).toHaveBeenCalledOnce();
       expect(onFinish.mock.calls[0]?.[0]).toMatchObject({ finishReason: 'other', text: '' });

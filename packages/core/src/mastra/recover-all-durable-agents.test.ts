@@ -498,6 +498,11 @@ describe('Mastra.recoverAllDurableAgents', () => {
       durable = makeDurable('transient-agent');
       mastra = new Mastra({ agents: { durable: durable as any }, storage: store });
       const workflows = (await store.getStore('workflows'))!;
+      // PF-5928 adaptation (fork PF-1875): cold recovery refuses a persisted input whose tool
+      // surface, model, model list or runtime services differ from what the agent resolves now,
+      // so the row carries the agent's own prepared workflow input instead of a hand-written stub.
+      const prepared = await durable.prepare('recover me', { runId });
+      prepared.cleanup();
       await workflows.persistWorkflowSnapshot({
         workflowName: DurableStepIds.AGENTIC_LOOP,
         runId,
@@ -506,12 +511,7 @@ describe('Mastra.recoverAllDurableAgents', () => {
           status: 'running',
           value: {},
           context: {
-            input: {
-              __workflowKind: 'durable-agent',
-              runId,
-              agentId: durable.id,
-              messageListState: { memoryInfo: null },
-            },
+            input: prepared.workflowInput,
           },
           activePaths: [],
           activeStepsPath: {},
