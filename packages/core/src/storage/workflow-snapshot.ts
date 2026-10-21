@@ -107,6 +107,24 @@ function mergeForeachProgress(
   };
 }
 
+/**
+ * Whether `snapshot` is exactly `createEmptyWorkflowSnapshot(runId)` apart from
+ * its `timestamp`: the content-free snapshot a retained fence handoff keeps.
+ */
+export function isEmptyWorkflowSnapshot(snapshot: unknown, runId: string): boolean {
+  if (snapshot === null || typeof snapshot !== 'object') return false;
+  const { timestamp: _timestamp, ...rest } = snapshot as Record<string, unknown>;
+  const { timestamp: _emptyTimestamp, ...empty } = createEmptyWorkflowSnapshot(runId) as unknown as Record<
+    string,
+    unknown
+  >;
+  const keys = Object.keys(empty);
+  return (
+    Object.keys(rest).length === keys.length &&
+    keys.every(key => Object.hasOwn(rest, key) && JSON.stringify(rest[key]) === JSON.stringify(empty[key]))
+  );
+}
+
 export function createEmptyWorkflowSnapshot(runId: string): WorkflowRunState {
   return {
     context: {},

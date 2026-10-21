@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkflowRunState } from '../../../workflows';
 import { createWorkflowTerminalGraphFingerprint } from '../../../workflows/terminal-continuation';
-import { createEmptyWorkflowSnapshot } from '../../workflow-snapshot';
+import { createEmptyWorkflowSnapshot, isEmptyWorkflowSnapshot } from '../../workflow-snapshot';
+import { WorkflowSnapshotHandoffFenceError } from '../../workflow-snapshot-handoff';
 import { InMemoryDB } from '../inmemory-db';
 import { WorkflowsInMemory } from './inmemory';
 import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
@@ -450,5 +451,151 @@ describe('WorkflowsInMemory run closure delete', () => {
       closures: [{ workflowName: 'research', runId: 'run-c', snapshot: true, terminalSnapshot: false }],
       hasMore: false,
     });
+  });
+});
+
+describe('WorkflowsInMemory run closure delete: retained absence fence (PF-6186)', () => {
+  const FENCE = 'product-erasure-absent@1';
+  const run: Run = { workflowName: 'research', runId: 'run-fenced' };
+  const handoffOf = (db: InMemoryDB) => db.workflowSnapshotHandoffs.get(JSON.stringify([run.workflowName, run.runId]));
+
+  /** Claims and completes a handoff over an absent run, as an erasure's absence fence. */
+  async function fenceAbsence(
+    workflows: WorkflowsInMemory,
+    { fence = FENCE, resourceId = RESOURCE, snapshot = createEmptyWorkflowSnapshot(run.runId), complete = true } = {},
+  ) {
+    await expect(
+      workflows.claimWorkflowSnapshotHandoff({
+        ...run,
+        expectedCanonical: { kind: 'absent' },
+        resourceId,
+        snapshot,
+        mutationFence: fence,
+      }),
+    ).resolves.toMatchObject({ status: 'created' });
+    if (!complete) return;
+    await expect(
+      workflows.completeWorkflowSnapshotHandoff({
+        ...run,
+        expectedResourceId: resourceId,
+        expectedSnapshot: snapshot,
+        resourceId,
+        snapshot,
+        mutationFence: fence,
+      }),
+    ).resolves.toMatchObject({ status: 'completed' });
+  }
+
+  async function settledRun(workflows: WorkflowsInMemory) {
+    await workflows.persistWorkflowSnapshot({
+      ...run,
+      resourceId: RESOURCE,
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'success', result: { report: 'private' } },
+    });
+  }
+
+  it('advertises fence retention', () => {
+    expect(setup().workflows.getWorkflowSnapshotHandoffCapabilities()).toMatchObject({
+      closureDeleteRetainFenceVersion: 1,
+    });
+  });
+
+  it("keeps a newer worker's absence fence when a stale delete lands after it and its response is lost", async () => {
+    const { db, workflows } = setup();
+    await settledRun(workflows);
+    // Worker B erases the closure and fences the run's absence.
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toMatchObject({ status: 'deleted' });
+    await fenceAbsence(workflows);
+    // Worker A's delayed delete arrives afterwards; its caller never sees the
+    // answer (lost response), so nothing would re-fence the run.
+    await workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE });
+
+    const listed = await workflows.listWorkflowSnapshotHandoffs({ status: 'completed' });
+    expect(listed.records.filter(record => record.runId === run.runId)).toHaveLength(1);
+    expect(handoffOf(db)).toMatchObject({ status: 'completed', mutationFence: FENCE });
+    await expect(
+      workflows.persistWorkflowSnapshot({
+        ...run,
+        resourceId: RESOURCE,
+        snapshot: { ...createEmptyWorkflowSnapshot(run.runId), status: 'running' },
+      }),
+    ).rejects.toBeInstanceOf(WorkflowSnapshotHandoffFenceError);
+    expect(closureRows(db, run)).toMatchObject({ snapshot: false, handoff: true });
+  });
+
+  it('empties a retained fence snapshot in place and keeps its fence, status and claim generation', async () => {
+    const { db, workflows } = setup();
+    await fenceAbsence(workflows, {
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), context: { private: { output: 'content' } } } as any,
+    });
+    const before = handoffOf(db)!;
+
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toEqual({
+      status: 'deleted',
+      removed: { snapshot: false, handoff: false, terminalRows: 0 },
+      retainedFence: true,
+    });
+    const after = handoffOf(db)!;
+    expect(after).toMatchObject({
+      mutationFence: before.mutationFence,
+      status: 'completed',
+      claimGeneration: before.claimGeneration,
+      resourceId: RESOURCE,
+    });
+    expect(after.releasedAt).toBeUndefined();
+    expect(isEmptyWorkflowSnapshot(after.snapshot, run.runId)).toBe(true);
+    // Already content-free: an idempotent no-op.
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toEqual({ status: 'missing' });
+    expect(handoffOf(db)).toMatchObject({ mutationFence: FENCE, status: 'completed' });
+  });
+
+  it('still deletes a handoff under another fence, or when no fence is named', async () => {
+    for (const retainHandoffFence of ['another-fence@1', undefined]) {
+      const { db, workflows } = setup();
+      await fenceAbsence(workflows);
+      await expect(
+        workflows.deleteWorkflowRunClosure({
+          ...run,
+          expectedResourceId: RESOURCE,
+          ...(retainHandoffFence === undefined ? {} : { retainHandoffFence }),
+        }),
+      ).resolves.toEqual({ status: 'deleted', removed: { snapshot: false, handoff: true, terminalRows: 0 } });
+      expect(closureRows(db, run)).toEqual(NOTHING);
+    }
+  });
+
+  it('answers resource_mismatch for a matching fence recorded under another resource, without changes', async () => {
+    const { db, workflows } = setup();
+    await fenceAbsence(workflows, { resourceId: 'workspace-2:user-2' });
+    const before = structuredClone(handoffOf(db));
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toEqual({ status: 'resource_mismatch' });
+    expect(handoffOf(db)).toEqual(before);
+  });
+
+  it('answers fenced for a pending fence, and deletes a released one', async () => {
+    const pending = setup();
+    await fenceAbsence(pending.workflows, { complete: false });
+    await expect(
+      pending.workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toEqual({ status: 'fenced' });
+    expect(handoffOf(pending.db)).toMatchObject({ status: 'pending', mutationFence: FENCE });
+
+    const released = setup();
+    await fenceAbsence(released.workflows);
+    await expect(
+      released.workflows.releaseWorkflowSnapshotHandoff({ ...run, expectedClaimGeneration: 1 }),
+    ).resolves.toMatchObject({ status: 'released' });
+    await expect(
+      released.workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toMatchObject({ status: 'deleted', removed: { handoff: true } });
+    expect(handoffOf(released.db)).toBeUndefined();
   });
 });

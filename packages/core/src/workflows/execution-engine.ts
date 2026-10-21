@@ -232,6 +232,12 @@ export abstract class ExecutionEngine extends MastraBase {
     serializedStepGraph: SerializedStepFlowEntry[];
     input?: TInput;
     initialState?: TState;
+    /**
+     * Set only by `Run.start`: this execution admits the run for the first
+     * time. Resume, restart and time travel never set it, so a step update of
+     * theirs that finds the run deleted (`missing_run`) never recreates it.
+     */
+    firstAdmission?: boolean;
     timeTravel?: TimeTravelExecutionParams;
     restart?: RestartExecutionParams;
     resume?: {

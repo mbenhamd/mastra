@@ -114,6 +114,7 @@ import type {
 import { STALE_EXECUTION_RESULT, matchesExpectedWorkflowState } from '../../types';
 import {
   createEmptyWorkflowSnapshot,
+  isEmptyWorkflowSnapshot,
   mergeWorkflowStepResult,
   validateWorkflowSnapshotTimestampForFinalState,
 } from '../../workflow-snapshot';
@@ -749,6 +750,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       recoveryVersion: 1,
       releaseVersion: 1,
       closureDeleteVersion: 1,
+      closureDeleteRetainFenceVersion: 1,
       closureCancelVersion: 1,
       threadErasureListVersion: 1,
     };
@@ -2302,8 +2304,9 @@ export class WorkflowsInMemory extends WorkflowsStorage {
   }
 
   async deleteWorkflowRunClosure(input: DeleteWorkflowRunClosureInput): Promise<DeleteWorkflowRunClosureResult> {
-    const { workflowName, runId, expectedResourceId } = input;
+    const { workflowName, runId, expectedResourceId, retainHandoffFence } = input;
     validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    if (retainHandoffFence !== undefined) validateWorkflowSnapshotHandoffFence(retainHandoffFence);
     const key = this.getWorkflowKey(workflowName, runId);
     const belongsToRun = (record: { workflowName: string; runId: string }) =>
       record.workflowName === workflowName && record.runId === runId;
@@ -2360,6 +2363,19 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     // this run's parent state; erase children first.
     if (this.hasPendingTerminalDependents(workflowName, runId)) return { status: 'active' };
 
+    // A completed, unreleased handoff under the caller's retain fence stays as
+    // the run's absence fence, with a content-free snapshot.
+    const retained =
+      handoff !== undefined &&
+      retainHandoffFence !== undefined &&
+      handoff.status === 'completed' &&
+      handoff.releasedAt === undefined &&
+      handoff.mutationFence === retainHandoffFence
+        ? handoff
+        : undefined;
+    const neutralize = retained !== undefined && !isEmptyWorkflowSnapshot(retained.snapshot, runId);
+    if (retained && !run && terminalRows === 0 && !neutralize) return { status: 'missing' };
+
     // Leaves first and the journal last, as completed-journal cleanup does.
     for (const planKey of planKeys) this.db.workflowTerminalContinuationPlans.delete(planKey);
     for (const receiptKey of receiptKeys) this.db.workflowTerminalDestinationReceipts.delete(receiptKey);
@@ -2367,9 +2383,19 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     this.db.workflowTerminalSnapshots.delete(key);
     this.db.workflowTerminalRecoveryAncestries.delete(key);
     this.db.workflowTerminalizations.delete(key);
-    this.db.workflowSnapshotHandoffs.delete(key);
+    if (retained) {
+      if (neutralize) {
+        this.db.workflowSnapshotHandoffs.set(key, {
+          ...retained,
+          snapshot: createEmptyWorkflowSnapshot(runId),
+          updatedAt: Date.now(),
+        });
+      }
+    } else {
+      this.db.workflowSnapshotHandoffs.delete(key);
+    }
     const snapshotDeleted = this.db.workflows.delete(key);
-    if (handoff) {
+    if (handoff && !retained) {
       // Keep the erased claim history's high-water mark on the kept revision.
       const revision = this.db.workflowTerminalParentRevisions.get(key) ?? {
         generation: 1,
@@ -2397,7 +2423,8 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     }
     return {
       status: 'deleted',
-      removed: { snapshot: snapshotDeleted, handoff: handoff !== undefined, terminalRows },
+      removed: { snapshot: snapshotDeleted, handoff: handoff !== undefined && !retained, terminalRows },
+      ...(retained ? { retainedFence: true } : {}),
     };
   }
 

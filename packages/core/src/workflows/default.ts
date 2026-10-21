@@ -918,6 +918,8 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     serializedStepGraph: SerializedStepFlowEntry[];
     input?: TInput;
     initialState?: TState;
+    /** Set only by `Run.start` (see `ExecutionEngine.execute`). */
+    firstAdmission?: boolean;
     restart?: RestartExecutionParams;
     timeTravel?: TimeTravelExecutionParams;
     resume?: {
@@ -1255,6 +1257,9 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         lifecycleResumeAttempt,
         lifecycleStepStates,
         resumeOperationHash: params.resumeOperationHash,
+        ...(params.firstAdmission === true && !params.resume && !params.restart && !params.timeTravel
+          ? { firstAdmission: true }
+          : {}),
         parentWorkflow: params.parentWorkflow,
         executionPath: [i],
         stepExecutionPath,
