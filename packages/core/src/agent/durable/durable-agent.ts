@@ -2688,6 +2688,9 @@ export class DurableAgent<
         // in-process engine (see resolveWorkflowEngine).
         engine: this.resolveWorkflowEngine(),
         shouldPersistSnapshot: this.resolveShouldPersistSnapshot(),
+        // Stored snapshots keep only the allowlisted request context; the live
+        // context stays whole in the run registry and the running workflow.
+        persistedRequestContextKeys: this.#durableRequestContextKeys,
       },
       this.logger,
     );
@@ -3378,17 +3381,31 @@ export class DurableAgent<
   }
 
   #createPrivatePreparation(preparation: PreparationResult<TOutput>): PreparationResult<TOutput> {
+    const { tools: preparedTools, requestTools: preparedRequestTools } = preparation.registryEntry;
+    const tools = Object.fromEntries(
+      Object.entries(preparedTools).map(([toolId, tool]) => {
+        const copy = { ...tool };
+        // Upstream #27296: the approval-exemption marker is non-enumerable, so a framework copy
+        // re-applies it (a user's own spread copy stays gated).
+        if (isApprovalExempt(tool)) markApprovalExempt(copy);
+        return [toolId, copy];
+      }),
+    );
+    // A warm resume refreshes only the entries still holding a request-built
+    // tool (by identity), so the private copy must point `requestTools` at the
+    // copies of those same entries, not at the originals.
+    const requestTools = preparedRequestTools
+      ? Object.fromEntries(
+          Object.entries(preparedRequestTools).map(([toolId, tool]) => [
+            toolId,
+            preparedTools[toolId] === tool ? tools[toolId]! : tool,
+          ]),
+        )
+      : undefined;
     const registryEntry: RunRegistryEntry = {
       ...preparation.registryEntry,
-      tools: Object.fromEntries(
-        Object.entries(preparation.registryEntry.tools).map(([toolId, tool]) => {
-          const copy = { ...tool };
-          // Upstream #27296: the approval-exemption marker is non-enumerable, so a framework copy
-          // re-applies it (a user's own spread copy stays gated).
-          if (isApprovalExempt(tool)) markApprovalExempt(copy);
-          return [toolId, copy];
-        }),
-      ),
+      tools,
+      requestTools,
       modelList: preparation.registryEntry.modelList?.map(entry => ({ ...entry })),
       versions: preparation.registryEntry.versions ? structuredClone(preparation.registryEntry.versions) : undefined,
       // Keep the private context object captured by converted tool closures.
@@ -4447,6 +4464,8 @@ export class DurableAgent<
       threadId,
       resourceId,
       tools,
+      // Rebuilt for this request, so a later warm resume can refresh them.
+      requestTools: tools,
       model: model as MastraLanguageModel,
       modelList,
       memory,

@@ -155,6 +155,9 @@ interface FakeGoalHarnessOptions {
   thinkingLevel?: 'high';
   thread?: { id?: string; continueLatest?: boolean };
   threadList?: Promise<Array<{ id: string; updatedAt: Date }>>;
+  pack?: { id: string; resolve: () => any; onApplied?: () => void };
+  /** Settles the first thread.setSetting call (the pack activation). */
+  firstSetSetting?: Promise<void>;
 }
 
 function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
@@ -229,6 +232,17 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
       create: vi.fn(),
       list: vi.fn(() => options.threadList ?? Promise.resolve([])),
       switch: vi.fn().mockResolvedValue(undefined),
+      setSetting: vi.fn(() =>
+        options.firstSetSetting && session.thread.setSetting.mock.calls.length === 1
+          ? options.firstSetSetting
+          : Promise.resolve(),
+      ),
+    },
+    mode: {
+      get: vi.fn(() => 'build'),
+    },
+    subagents: {
+      model: { set: vi.fn().mockResolvedValue(undefined) },
     },
   };
   const goalManager = {
@@ -251,6 +265,7 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
     ...(options.model ? { model: options.model } : {}),
     ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
     ...(options.thread ? { thread: options.thread } : {}),
+    ...(options.pack ? { pack: options.pack } : {}),
   });
 
   return {
@@ -884,6 +899,42 @@ describe('runMC', () => {
       expect(result.status).toBe('aborted');
       expect(harness.session.state.set).not.toHaveBeenCalled();
       expect(harness.session.subscribe).not.toHaveBeenCalled();
+      expect(harness.session.sendSignal).not.toHaveBeenCalled();
+    });
+
+    it('does not continue pack setup after abort settles during a pack write', async () => {
+      const abortController = new AbortController();
+      let resolveFirstWrite!: () => void;
+      const firstSetSetting = new Promise<void>(resolve => {
+        resolveFirstWrite = resolve;
+      });
+      const onApplied = vi.fn();
+      const harness = makeFakeGoalHarness({
+        signal: abortController.signal,
+        firstSetSetting,
+        pack: {
+          id: 'custom:Test',
+          resolve: () => ({
+            modelId: 'mock-model',
+            subagentModels: { explore: 'test/explore-model' },
+            modelRoute: { entries: [] },
+          }),
+          onApplied,
+        },
+      });
+      await vi.waitFor(() => expect(harness.session.thread.setSetting).toHaveBeenCalledTimes(1));
+
+      abortController.abort();
+      const result = await harness.run.result;
+      resolveFirstWrite();
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(result.status).toBe('aborted');
+      expect(harness.session.thread.setSetting).toHaveBeenCalledTimes(1);
+      expect(harness.session.subagents.model.set).not.toHaveBeenCalled();
+      expect(harness.session.state.set).not.toHaveBeenCalled();
+      expect(harness.session.model.switch).not.toHaveBeenCalled();
+      expect(onApplied).not.toHaveBeenCalled();
       expect(harness.session.sendSignal).not.toHaveBeenCalled();
     });
 

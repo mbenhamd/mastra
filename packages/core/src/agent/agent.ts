@@ -12427,6 +12427,31 @@ export class Agent<
         (await this.getDefaultOptions({
           requestContext: requestContextToUse,
         }));
+      // A default `untilIdle` takes the idle loop too, as upstream routes on the
+      // merged options. A call that set `untilIdle` was routed above. Calls
+      // from inside the loop (its first turn and continuations) carry the
+      // loop's defaults and never re-enter it.
+      const defaultUntilIdle = (defaultOptions as { untilIdle?: boolean | { maxIdleMs?: number } } | undefined)
+        ?.untilIdle;
+      if (
+        streamOptionsBase.untilIdle === undefined &&
+        !(STREAM_UNTIL_IDLE_DEFAULT_OPTIONS in streamOptionsBase) &&
+        defaultUntilIdle
+      ) {
+        if (trackedThreadStreamPubSubTarget) {
+          this.#forgetThreadStreamPubSubForTarget(trackedThreadStreamPubSubTarget);
+        } else {
+          this.#forgetThreadStreamPubSub(streamOptionsWithRunId);
+        }
+        if (releaseReservedRun && !ownsExternalReservation) releaseReservedRun();
+        releaseReservedRun = undefined;
+        const maxIdleMs = typeof defaultUntilIdle === 'object' ? defaultUntilIdle.maxIdleMs : undefined;
+        return (this.streamUntilIdle as any)(
+          messages,
+          { ...streamOptionsBase, maxIdleMs },
+          executionMemoryId,
+        ) as Promise<MastraModelOutput<OUTPUT>>;
+      }
       const mergedBaseOptions = mergeAgentExecutionOptions(
         defaultOptions as Record<string, unknown>,
         streamOptionsWithRunId as Record<string, unknown>,
@@ -13152,6 +13177,23 @@ export class Agent<
     defaultOptions ??= (await this.getDefaultOptions({
       requestContext: requestContextToUse,
     })) as AgentExecutionOptions<TOutput>;
+    // A default `untilIdle` takes the idle loop too (see `stream`). Nothing is
+    // reserved yet. Calls from inside the loop carry its defaults and never
+    // re-enter it.
+    const defaultUntilIdle = (defaultOptions as { untilIdle?: boolean | { maxIdleMs?: number } } | undefined)
+      ?.untilIdle;
+    if (
+      streamOptionsWithPubSub?.untilIdle === undefined &&
+      !(streamOptionsWithPubSub && STREAM_UNTIL_IDLE_DEFAULT_OPTIONS in streamOptionsWithPubSub) &&
+      defaultUntilIdle
+    ) {
+      const maxIdleMs = typeof defaultUntilIdle === 'object' ? defaultUntilIdle.maxIdleMs : undefined;
+      return (this.resumeStreamUntilIdle as any)(
+        resumeData,
+        { ...(streamOptionsWithPubSub ?? {}), maxIdleMs },
+        executionMemoryId,
+      ) as Promise<MastraModelOutput<OUTPUT>>;
+    }
     const ownershipOptions = deepMerge(
       defaultOptions as Record<string, unknown>,
       (streamOptionsWithPubSub ?? {}) as Record<string, unknown>,

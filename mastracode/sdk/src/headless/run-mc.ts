@@ -463,15 +463,20 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         // Mirror /models → Activate on the session: sticky thread pack id,
         // subagent models, and the fallback route. Clears any pending fallback
         // from a continued thread so the pack's own route starts clean.
+        // A run that settles mid-setup (abort, timeout) stops before its next write.
         await session.thread.setSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: options.pack.id });
+        if (settled) return;
         await session.thread.setSetting({ key: MODEL_FALLBACK_STATE_KEY, value: undefined });
+        if (settled) return;
         for (const [agentType, modelId] of Object.entries(packSelection.subagentModels ?? {})) {
           await session.subagents.model.set({ modelId, agentType });
+          if (settled) return;
         }
         await session.state.set({
           modelRoute: packSelection.modelRoute,
           [MODEL_FALLBACK_STATE_KEY]: null,
         } as unknown as Partial<TState>);
+        if (settled) return;
       }
       const sessionModelId = modelIdToApply ?? packModelId;
       if (sessionModelId) {
