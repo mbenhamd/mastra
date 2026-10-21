@@ -1,1 +1,3 @@
 patches/*.patch -text
+# Unified-diff context lines for empty source lines are a single space, not a whitespace error.
+*.patch -whitespace

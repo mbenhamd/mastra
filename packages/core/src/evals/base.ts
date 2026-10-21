@@ -33,7 +33,7 @@ import type {
   InputProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
 } from '../processors/index';
-import { RequestContext } from '../request-context';
+import { isReservedRequestContextKey, RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../schema';
 import type { JSONValue, MastraOnFinishCallback } from '../stream';
@@ -204,9 +204,14 @@ export interface ScorerJudgeConfig {
    */
   errorProcessors?: ErrorProcessorOrWorkflow[];
   /**
+   * Set to `false` to run only the judge's configured `errorProcessors`, with none
+   * of the agent's shared stability defaults added. See `AgentConfig.errorProcessorDefaults`.
+   */
+  errorProcessorDefaults?: boolean;
+  /**
    * Maximum number of times error processors can retry one V2+ judge generation.
    * When errorProcessors are configured and this is omitted, the runtime cap is
-   * 10. Set this explicitly to bound the coordinated retry budget.
+   * 3. Set this explicitly to bound the coordinated retry budget.
    */
   maxProcessorRetries?: number;
   /**
@@ -1059,8 +1064,9 @@ class MastraScorer<
    * on the scorer-run span input for repeatability.
    *
    * Selection happens before traversal so omitted contexts remain untouched.
-   * Once a caller explicitly opts in, the selected projection is recursively
-   * bounded and sensitive keys are redacted before it reaches observability.
+   * Reserved Mastra keys are always omitted. Once a caller explicitly opts in,
+   * the selected projection is recursively bounded and sensitive keys are
+   * redacted before it reaches observability.
    *
    * - omitted / empty → nothing is persisted (secure default)
    * - `['*']`         → the full bounded/redacted context
@@ -1076,7 +1082,14 @@ class MastraScorer<
 
     let selected: Record<string, unknown>;
     try {
-      const raw = requestContext.all as Record<string, unknown>;
+      // Reserved framework keys (`mastra__*`, `__mastra_*`: the raw auth token,
+      // delegated memory, live channel adapters) are never caller data, so they
+      // are omitted before selection, even for the wildcard.
+      const raw = Object.fromEntries(
+        Object.entries(requestContext.all as Record<string, unknown>).filter(
+          ([key]) => !isReservedRequestContextKey(key),
+        ),
+      );
       selected = keys.includes('*') ? raw : selectFields(raw, keys);
     } catch {
       return undefined;
@@ -1343,8 +1356,8 @@ class MastraScorer<
         description: `Scorer step: ${scorerStep.name}`,
         inputSchema: z.any(),
         outputSchema: z.any(),
-        execute: async ({ inputData, getInitData, bail, ...rest }) => {
-          const observabilityContext = resolveObservabilityContext(rest);
+        execute: async ({ inputData, getInitData, bail, tracing, tracingContext, loggerVNext, metrics }) => {
+          const observabilityContext = resolveObservabilityContext({ tracing, tracingContext, loggerVNext, metrics });
           const { accumulatedResults = {}, generatedPrompts = {}, judge } = inputData;
           const { run } = getInitData<{ run: ScorerRun<TInput, TRunOutput> }>();
 
@@ -1574,6 +1587,8 @@ class MastraScorer<
     const inputProcessors = originalStep.judge?.inputProcessors ?? this.config.judge?.inputProcessors;
     const outputProcessors = originalStep.judge?.outputProcessors ?? this.config.judge?.outputProcessors;
     const errorProcessors = originalStep.judge?.errorProcessors ?? this.config.judge?.errorProcessors;
+    const errorProcessorDefaults =
+      originalStep.judge?.errorProcessorDefaults ?? this.config.judge?.errorProcessorDefaults;
     const maxProcessorRetries = originalStep.judge?.maxProcessorRetries ?? this.config.judge?.maxProcessorRetries;
     const modelSettings = originalStep.judge?.modelSettings ?? this.config.judge?.modelSettings;
     const memoryOptions = stepMemoryOptions
@@ -1776,6 +1791,7 @@ class MastraScorer<
       ...(inputProcessors ? { inputProcessors } : {}),
       ...(outputProcessors ? { outputProcessors } : {}),
       ...(errorProcessors ? { errorProcessors } : {}),
+      ...(errorProcessorDefaults !== undefined ? { errorProcessorDefaults } : {}),
       ...(maxProcessorRetries !== undefined ? { maxProcessorRetries } : {}),
     });
     if (this.#mastra) {

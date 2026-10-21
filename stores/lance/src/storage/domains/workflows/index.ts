@@ -39,6 +39,14 @@ export class StoreWorkflowsLance extends WorkflowsStorage {
     return false;
   }
 
+  /**
+   * PapersFlow fork: this adapter does not implement `updateWorkflowState`, so lifecycle
+   * claims (restart/timeTravel) install the claimed generation through the snapshot.
+   */
+  supportsWorkflowStateUpdate(): boolean {
+    return false;
+  }
+
   private parseWorkflowRun(row: any): WorkflowRun {
     let parsedSnapshot: WorkflowRunState | string = row.snapshot;
     if (typeof parsedSnapshot === 'string') {

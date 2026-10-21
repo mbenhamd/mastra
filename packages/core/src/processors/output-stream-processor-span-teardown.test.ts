@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { SpanType } from '../observability';
 import { ProcessorRunner, ProcessorState } from './runner';
 import type { Processor } from './index';
 
@@ -138,5 +139,32 @@ describe('output stream processor span teardown', () => {
     }
     expect(processorStates.get(processor.id)?.customState.callCount).toBe(2);
     expect(streamPartCounts).toEqual([1, 2]);
+  });
+
+  it("keeps a step's workflow span open when only its model stream closed, and ends it on cancel", () => {
+    const stepSpanEnd = vi.fn();
+    const runSpanEnd = vi.fn();
+    const state = new ProcessorState();
+    // Workflow-path spans live on the runtime state, not in processor-owned customState.
+    state.setWorkflowOutputStreamSpan('step', { end: stepSpanEnd, parent: { type: SpanType.MODEL_STEP } } as any);
+    state.setWorkflowOutputStreamSpan('run', { end: runSpanEnd, parent: { type: SpanType.AGENT_RUN } } as any);
+    const processorStates = new Map([['processor', state]]);
+    const runner = new ProcessorRunner({
+      inputProcessors: [],
+      outputProcessors: [],
+      logger: mockLogger,
+      agentName: 'test-agent',
+    });
+
+    // The step's tool results still go through the processors after its model stream ends
+    runner.endStreamProcessorSpans(processorStates, { keepStepScopedSpans: true });
+    expect(stepSpanEnd).not.toHaveBeenCalled();
+    expect(state.getWorkflowOutputStreamSpan('step')).toBeDefined();
+    expect(runSpanEnd).toHaveBeenCalledTimes(1);
+    expect(state.getWorkflowOutputStreamSpan('run')).toBeUndefined();
+
+    runner.endStreamProcessorSpans(processorStates);
+    expect(stepSpanEnd).toHaveBeenCalledTimes(1);
+    expect(state.getWorkflowOutputStreamSpan('step')).toBeUndefined();
   });
 });

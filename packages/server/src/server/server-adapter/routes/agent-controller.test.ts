@@ -27,6 +27,15 @@ describe('agent-controller routes', () => {
     }
   });
 
+  it('requires execute permission to take thread ownership', () => {
+    const route = AGENT_CONTROLLER_ROUTES.find(
+      r =>
+        r.method === 'POST' &&
+        r.path === '/agent-controller/:controllerId/sessions/:resourceId/threads/:threadId/owner',
+    );
+    expect(route?.requiresPermission).toBe('agent-controller:execute');
+  });
+
   it('preserves the independent Harness v1 route contract', () => {
     expect(HARNESS_ROUTES.length).toBeGreaterThan(0);
     const publicInboundRouteKey = 'POST /harness/:name/channels/:channelId/inbound';

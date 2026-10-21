@@ -20,7 +20,7 @@ import {
   createObservabilityContext,
   resolveObservabilityContext,
 } from '../observability';
-import type { ObservabilityContext, ProcessorSpanType, Span } from '../observability';
+import type { AnySpan, ObservabilityContext, ProcessorSpanType, Span } from '../observability';
 import { createExactJsonMeasurementSnapshot } from '../observability/content-free-measurement';
 import type { ProcessorRunAttributes, TracingContext } from '../observability/types';
 import { executeWithContext } from '../observability/utils';
@@ -31,6 +31,7 @@ import type { LanguageModelUsage, ProviderMetadata } from '../stream/types';
 import { deepEqual } from '../utils';
 import { PROCESSOR_EXECUTION_SYMBOL } from '../workflows/constants';
 import type { OutputWriter } from '../workflows/types';
+import type { AnyWorkspace } from '../workspace/workspace';
 import {
   isProcessorWorkflow,
   processorWorkflowRequiresDurableExecution,
@@ -426,9 +427,15 @@ export class ProcessorState<OUTPUT = undefined> {
     }
   }
 
-  /** @internal */
-  endWorkflowOutputStreamSpans(): void {
-    for (const processorId of this.workflowOutputStreamSpans.keys()) {
+  /**
+   * @internal End every workflow output-stream span. With `keepStepScopedSpans`,
+   * spans that sit under a MODEL_STEP stay open: the step's tool results still
+   * run through the processors after its model stream ends, and
+   * {@link endOutputStreamSpanAtStepEnd} closes them when the step ends.
+   */
+  endWorkflowOutputStreamSpans(options?: { keepStepScopedSpans?: boolean }): void {
+    for (const [processorId, span] of [...this.workflowOutputStreamSpans]) {
+      if (options?.keepStepScopedSpans && span.parent?.type === SpanType.MODEL_STEP) continue;
       // The workflow stream path accumulates hook time beside the span; attach
       // it on teardown and drop the bookkeeping key with the span it belongs to.
       const durationKey = OUTPUT_STREAM_HOOK_DURATION_KEY_PREFIX + processorId;
@@ -584,9 +591,73 @@ export class ProcessorState<OUTPUT = undefined> {
 
 /**
  * Key under which the workflow-processor stream path keeps its accumulated
- * hook time on the shared processor state, next to `__outputStreamSpan_<id>`.
+ * hook time on the shared processor state. The span itself lives on the
+ * runtime {@link ProcessorState}, never in processor-owned `customState`.
  */
 export const OUTPUT_STREAM_HOOK_DURATION_KEY_PREFIX = '__outputStreamHookDurationMs_';
+
+/**
+ * The MODEL_STEP an output stream processor span belongs under: `span` itself
+ * (a step's stream passes its step span) or its nearest step ancestor. Stops at
+ * the first agent run, so a nested agent's stream never attaches to its
+ * caller's step.
+ */
+export function findOwnModelStepSpan(span: AnySpan | undefined): AnySpan | undefined {
+  for (let current = span; current && current.type !== SpanType.AGENT_RUN; current = current.parent) {
+    if (current.type === SpanType.MODEL_STEP) {
+      return current;
+    }
+  }
+  return undefined;
+}
+
+/** Chunk types that end the model step an output stream processor span sits under. */
+const STEP_END_CHUNK_TYPES = new Set(['step-finish', 'error', 'abort']);
+
+function endStoredOutputStreamSpan(runtimeState: ProcessorState<any>, processorId: string, totalChunks: number): void {
+  const hookDurationKey = `${OUTPUT_STREAM_HOOK_DURATION_KEY_PREFIX}${processorId}`;
+  runtimeState.endWorkflowOutputStreamSpan(processorId, {
+    output: { totalChunks },
+    attributes: { hookDurationMs: (runtimeState.customState[hookDurationKey] as number | undefined) ?? 0 },
+  });
+  delete runtimeState.customState[hookDurationKey];
+}
+
+/**
+ * When a step's stream starts, ends the runtime-held output stream processor
+ * span if it was opened outside that step (e.g. by a tool result replayed on
+ * resume, before any step started), so it does not carry into the step.
+ * Without shared runtime state the invocation owns and ends its own span.
+ */
+export function endOutputStreamSpanOutsideStep(
+  runtimeState: ProcessorState<any> | undefined,
+  processorId: string,
+  part: ChunkType,
+  stepSpan: AnySpan | undefined,
+  totalChunks: number,
+): void {
+  const span = runtimeState?.getWorkflowOutputStreamSpan(processorId) as AnySpan | undefined;
+  if (span && part.type === 'step-start' && stepSpan?.type === SpanType.MODEL_STEP && span.parent?.id !== stepSpan.id) {
+    endStoredOutputStreamSpan(runtimeState!, processorId, totalChunks);
+  }
+}
+
+/**
+ * Ends the runtime-held output stream processor span when the model step it
+ * sits under ends. The span outlives the step's model stream so the step's
+ * tool results land in it too.
+ */
+export function endOutputStreamSpanAtStepEnd(
+  runtimeState: ProcessorState<any> | undefined,
+  processorId: string,
+  part: ChunkType,
+  totalChunks: number,
+): void {
+  const span = runtimeState?.getWorkflowOutputStreamSpan(processorId) as AnySpan | undefined;
+  if (span?.parent?.type === SpanType.MODEL_STEP && STEP_END_CHUNK_TYPES.has(part.type)) {
+    endStoredOutputStreamSpan(runtimeState!, processorId, totalChunks);
+  }
+}
 
 /**
  * Union type for processor or workflow that can be used as a processor
@@ -1433,6 +1504,7 @@ export class ProcessorRunner {
     messageList?: MessageList,
     retryCount: number = 0,
     writer?: ProcessorStreamWriter,
+    abortSignal?: AbortSignal,
   ): Promise<{
     part: ChunkType<OUTPUT> | null | undefined;
     blocked: boolean;
@@ -1479,6 +1551,7 @@ export class ProcessorRunner {
               observabilityContext,
               requestContext,
               writer,
+              abortSignal,
             );
 
             // Extract the processed part from the result if it exists
@@ -1497,7 +1570,7 @@ export class ProcessorRunner {
                 processorId: error.processorId || workflowId,
               };
             }
-            this.logger.error('Output processor workflow failed', { agent: this.agentName, workflowId, error });
+            throw error;
           }
           continue;
         }
@@ -1561,6 +1634,7 @@ export class ProcessorRunner {
                       )),
                     }
                   : {}),
+                abortSignal,
               });
             } finally {
               state.hookDurationMs += performance.now() - hookStart;
@@ -1595,11 +1669,9 @@ export class ProcessorRunner {
               processorId: processor.id,
             };
           }
-          // End span with error
-          const state = processorStates.get(processor.id);
-          state?.errorSpan({ error: error as Error, endSpan: true, attributes: state.getFinalAttributes() });
-          // Log error but continue with original part
-          this.logger.error('Output processor failed', { agent: this.agentName, processorId: processor.id, error });
+          // Fail closed: an output stream processor error must not let the
+          // unprocessed part through. The outer handler ends every span.
+          throw error;
         }
       }
 
@@ -1617,16 +1689,29 @@ export class ProcessorRunner {
       for (const state of processorStates.values()) {
         state.errorSpan({ error: error as Error, endSpan: true, attributes: state.getFinalAttributes() });
       }
-      return { part, blocked: false };
+      throw error;
     }
   }
 
-  endStreamProcessorSpans<OUTPUT>(processorStates: Map<string, ProcessorState<OUTPUT>>): void {
+  endStreamProcessorSpans<OUTPUT>(
+    processorStates: Map<string, ProcessorState<OUTPUT>>,
+    options?: {
+      /**
+       * Leave workflow-path spans parented to a model step open. Set when only
+       * the step's model stream closed: the step's tool results still flow
+       * through the processors, and the span ends with the step's
+       * `step-finish` chunk.
+       */
+      keepStepScopedSpans?: boolean;
+    },
+  ): void {
     for (const state of processorStates.values()) {
       state.endSpan({ attributes: state.getFinalAttributes() });
       // Spans live on the runtime state, never in processor-owned customState,
       // so processor keys that merely resemble span storage are left untouched.
-      state.endWorkflowOutputStreamSpans();
+      // Step-scoped workflow spans stay open while the step's tool results are
+      // still processed; they end at the step boundary.
+      state.endWorkflowOutputStreamSpans({ keepStepScopedSpans: options?.keepStepScopedSpans });
     }
   }
 
@@ -1651,6 +1736,7 @@ export class ProcessorRunner {
     messageList?: MessageList,
     retryCount: number = 0,
     writer?: ProcessorStreamWriter,
+    abortSignal?: AbortSignal,
   ): Promise<
     Array<{
       part: ChunkType<OUTPUT> | null | undefined;
@@ -1689,6 +1775,7 @@ export class ProcessorRunner {
         messageList,
         retryCount,
         writer,
+        abortSignal,
       );
       results.push(result);
       if (result.blocked) {
@@ -1798,6 +1885,7 @@ export class ProcessorRunner {
           }
         } catch (error) {
           controller.error(error);
+          await reader.cancel(error).catch(() => {});
         }
       },
     });
@@ -2375,6 +2463,7 @@ export class ProcessorRunner {
     prompt: LanguageModelV2Prompt;
     model: unknown;
     messageList?: MessageList;
+    workspace?: AnyWorkspace;
     stepNumber: number;
     steps: Array<StepResult<any>>;
     requestContext?: RequestContext;
@@ -2432,6 +2521,7 @@ export class ProcessorRunner {
           // (e.g. unresolved string ids or function-typed dynamic models).
           model: args.model as never,
           messageList: args.messageList,
+          workspace: args.workspace,
           stepNumber: args.stepNumber,
           steps: args.steps,
           state: processorState.customState,

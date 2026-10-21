@@ -47,6 +47,7 @@ export function createIsTaskCompleteStep<Tools extends ToolSet = ToolSet, OUTPUT
       if (inputData.terminalToolResult) {
         return inputData;
       }
+      if (inputData.stepResult?.signalPreempted) return inputData;
 
       // Increment iteration count
       currentIteration++;

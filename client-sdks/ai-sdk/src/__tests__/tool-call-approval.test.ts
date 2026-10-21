@@ -968,6 +968,44 @@ describe('handleChatStream v6 native approve() resume flow', () => {
     expect(mockAgent.resumeStream).not.toHaveBeenCalled();
   });
 
+  it('skips a response another request is already resuming when a later exact target resumes', async () => {
+    vi.clearAllMocks();
+    mockAgent.resumeStream
+      .mockRejectedValueOnce(Object.assign(new Error('already claimed'), { id: 'AGENT_RESUME_ALREADY_CLAIMED' }))
+      .mockResolvedValueOnce(emptyStream);
+    // The fork resumes only approvals on the trailing assistant message, so
+    // both responses live on that message here.
+    const response = (runId: string, toolCallId: string) => ({
+      type: 'tool-myTool',
+      toolCallId,
+      state: 'approval-responded',
+      input: {},
+      approval: { id: `${runId}${APPROVAL_ID_SEPARATOR}${toolCallId}`, approved: true },
+    });
+
+    const stream = await handleChatStream({
+      mastra: mockMastra as any,
+      agentId: 'test-agent',
+      version: 'v6',
+      params: {
+        messages: [
+          {
+            id: 'msg-1',
+            role: 'assistant',
+            parts: [response('busy-run', 'busy-call'), response('new-run', 'new-call')],
+          },
+        ],
+      } as any,
+    });
+    await collectChunks(stream);
+
+    expect(mockAgent.resumeStream).toHaveBeenCalledTimes(2);
+    expect(mockAgent.resumeStream).toHaveBeenLastCalledWith(
+      { approved: true },
+      expect.objectContaining({ runId: 'new-run', toolCallId: 'new-call' }),
+    );
+  });
+
   it('surfaces the core error when no approval target can be resumed', async () => {
     mockAgent.resumeStream.mockRejectedValueOnce(
       Object.assign(new Error('target is not suspended'), { id: 'AGENT_RESUME_TOOL_CALL_NOT_SUSPENDED' }),

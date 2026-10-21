@@ -398,6 +398,9 @@ class ProcessorWithAgent implements Processor {
       name: `${id} Internal Agent`,
       instructions: 'Internal processor agent',
       model,
+      // The internal agent's span tree is the subject here, so the framework's
+      // default error processors stay out of its request lane.
+      errorProcessorDefaults: false,
     });
   }
 
@@ -546,6 +549,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         inputProcessors: [new SimpleInputProcessor('validator')],
       });
 
@@ -700,6 +706,49 @@ describe('Processor Tracing Tests', () => {
      *     - MODEL_STEP
      *   - output processor: formatter PROCESSOR_RUN
      */
+    it('should trace the default error processors that join the request lane', async () => {
+      const model = createMockModel();
+      // No processor list at all: the agent resolves the framework's stability
+      // defaults, and `ProviderHistoryCompat` is the one that implements
+      // `processLLMRequest`, so it runs — and is traced — in the request lane.
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model,
+      });
+
+      const mastra = new Mastra({
+        ...getBaseMastraConfig(testExporter),
+        agents: { agent },
+      });
+
+      const registeredAgent = mastra.getAgent('agent');
+      await registeredAgent.generate('Hello');
+
+      const processorSpans = testExporter.getProcessorSpans();
+      const modelSpan = testExporter.getModelSpans()[0];
+      const modelStepSpan = testExporter.getModelStepSpans()[0];
+
+      const requestLaneSpans = processorSpans.filter(
+        span => span.name === 'llm request processor: provider-history-compat',
+      );
+
+      // One per model step, parented under the step it rewrites.
+      expect(requestLaneSpans.length).toBe(testExporter.getModelStepSpans().length);
+      expect(requestLaneSpans.length).toBeGreaterThan(0);
+      expect(requestLaneSpans[0]?.parentSpanId).toBe(modelStepSpan?.id);
+      // Fork (PF-3243): the provider-request lane is a per-step processor phase.
+      expect(requestLaneSpans[0]?.entityType).toBe(EntityType.INPUT_STEP_PROCESSOR);
+      expect(requestLaneSpans[0]?.attributes?.processorExecutor).toBe('legacy');
+
+      // The two retry processors implement no `processLLMRequest`, so they are
+      // inert in this lane and produce no span here.
+      expect(processorSpans.some(span => span.name?.includes('stream-error-retry-processor'))).toBe(false);
+      expect(processorSpans.some(span => span.name?.includes('prefill-error-handler'))).toBe(false);
+      expect(modelSpan).toBeDefined();
+    });
+
     it('should trace a single output processor with processor ID in span name', async () => {
       const model = createMockModel();
       const agent = new Agent({
@@ -707,6 +756,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         outputProcessors: [new SimpleOutputProcessor('formatter')],
       });
 
@@ -1022,9 +1074,9 @@ describe('Processor Tracing Tests', () => {
       const modelInferenceSpan = modelInferenceSpans[0];
 
       // Step processors only run during inputStep phase (per LLM call in agent loop)
-      const inputStepSpans = processorSpans.filter(
-        s => s.name?.includes('input step processor') || s.entityType === EntityType.INPUT_STEP_PROCESSOR,
-      );
+      // Fork (PF-3243): llm-request lane spans (e.g. the default provider-history-compat
+      // processor) also carry INPUT_STEP_PROCESSOR, so select the processInputStep span by name.
+      const inputStepSpans = processorSpans.filter(s => s.name?.startsWith('input step processor:'));
 
       expect(inputStepSpans.length).toBe(1);
       const inputStepSpan = inputStepSpans[0];
@@ -1146,6 +1198,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         inputProcessors: [new FullProcessor('full-input')],
         outputProcessors: [new FullProcessor('full-output')],
       });
@@ -1233,6 +1288,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         outputProcessors: [new OutputStreamProcessor('stream-first'), new OutputStreamProcessor('stream-second')],
       });
 
@@ -1275,9 +1333,9 @@ describe('Processor Tracing Tests', () => {
       expect(modelSpan?.parentSpanId).toBe(agentSpan?.id);
       // 2. MODEL_STEP is child of MODEL_GENERATION
       expect(modelStepSpan?.parentSpanId).toBe(modelSpan?.id);
-      // 3. Both stream processor spans are children of agent span
-      expect(streamSpan1?.parentSpanId).toBe(agentSpan?.id);
-      expect(streamSpan2?.parentSpanId).toBe(agentSpan?.id);
+      // 3. Both stream processor spans are children of the step whose stream they process
+      expect(streamSpan1?.parentSpanId).toBe(modelStepSpan?.id);
+      expect(streamSpan2?.parentSpanId).toBe(modelStepSpan?.id);
 
       await testExporter.finalExpectations();
     });
@@ -1348,6 +1406,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         inputProcessors: [new ProcessorWithAgent('validator', model)],
       });
 
@@ -1445,6 +1506,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         inputProcessors: [new ModerationProcessor({ model, strategy: 'warn' })],
       });
 
@@ -1779,6 +1843,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         inputProcessors: [
           new SimpleInputProcessor('simple'), // processInput only
           new InputStepProcessor('step'), // processInputStep only
@@ -2022,6 +2089,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         memory: mockMemory,
         inputProcessors: [new SimpleInputProcessor('custom-input')],
         outputProcessors: [new SimpleOutputProcessor('custom-output')],
@@ -2097,6 +2167,9 @@ describe('Processor Tracing Tests', () => {
         name: 'Test Agent',
         instructions: 'Test',
         model,
+        // These cases assert the span tree of the processors they configure, so the
+        // framework's default error processors stay out of the request lane.
+        errorProcessorDefaults: false,
         memory: mockMemory,
         inputProcessors: [new SimpleInputProcessor('guardrail')],
         outputProcessors: [new SimpleOutputProcessor('filter')],
@@ -2700,6 +2773,359 @@ describe('Processor Tracing Tests', () => {
         span => JSON.stringify(span.output ?? {}).includes('Blocked by aborting-stream') || span.errorInfo,
       );
       expect(tripwireSpans.length).toBe(1);
+    });
+
+    it("should keep a single processor's stream span under the agent run across steps, including its tool results", async () => {
+      let call = 0;
+      const model = new MockLanguageModelV2({
+        doStream: async () => {
+          call++;
+          if (call === 1) {
+            return {
+              stream: convertArrayToReadableStream([
+                { type: 'response-metadata', id: '1' },
+                { type: 'tool-call', toolCallId: 'call-1', toolName: 'echo', input: JSON.stringify({ text: 'hi' }) },
+                {
+                  type: 'finish',
+                  finishReason: 'tool-calls',
+                  usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+                },
+              ]),
+            };
+          }
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'response-metadata', id: '2' },
+              { type: 'text-delta', id: '1', delta: 'done' },
+              {
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              },
+            ]),
+          };
+        },
+      });
+
+      // The processor span each chunk was processed under, in order
+      const seen: Array<{ type: string; spanId?: string; parentId?: string; open: boolean }> = [];
+      class RecordingStreamProcessor implements Processor {
+        readonly id = 'recording-stream';
+
+        async processOutputStream({ part, tracingContext }: ProcessOutputStreamArgs): Promise<ChunkType> {
+          const span = tracingContext?.currentSpan;
+          seen.push({ type: part.type, spanId: span?.id, parentId: span?.parent?.id, open: !!span && !span.endTime });
+          return part;
+        }
+      }
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model,
+        tools: {
+          echo: createTool({
+            id: 'echo',
+            description: 'Echo the input back',
+            inputSchema: z.object({ text: z.string() }),
+            execute: async ({ text }) => ({ text }),
+          }),
+        },
+        outputProcessors: [new RecordingStreamProcessor()],
+      });
+
+      const mastra = new Mastra({
+        ...getBaseMastraConfig(testExporter),
+        agents: { agent },
+      });
+
+      const stream = await mastra.getAgent('agent').stream('Hello');
+      for await (const _chunk of stream.fullStream) {
+        // drain
+      }
+
+      const [firstStep, secondStep] = testExporter
+        .getModelStepSpans()
+        .sort((a, b) => a.startTime.getTime() - b.startTime.getTime());
+      const streamProcessorSpans = testExporter
+        .getProcessorSpans()
+        .filter(span => span.name === 'output stream processor: recording-stream');
+
+      // Fork decision (PF-5928 kept): PF-2236 6731e3a2 runs a single processor directly (no
+      // synthetic processor workflow), so its output stream processor span is parented to
+      // the AGENT_RUN, not to each MODEL_STEP as upstream #27172's workflow path does.
+      const [agentSpan] = testExporter.getAgentSpans();
+      expect(firstStep).toBeDefined();
+      expect(secondStep).toBeDefined();
+      expect(streamProcessorSpans.length).toBeGreaterThan(0);
+      for (const span of streamProcessorSpans) expect(span.parentSpanId).toBe(agentSpan!.id);
+      // Every chunk, the tool result included, is processed inside an open span under the agent run
+      expect(seen.find(chunk => chunk.type === 'step-start')?.parentId).toBe(agentSpan!.id);
+      expect(seen.find(chunk => chunk.type === 'tool-result')).toMatchObject({ parentId: agentSpan!.id, open: true });
+      expect(seen.find(chunk => chunk.type === 'text-delta')).toMatchObject({ parentId: agentSpan!.id, open: true });
+
+      await testExporter.finalExpectations();
+    });
+
+    it("should keep a failing step's single-processor stream spans under the agent run and end them", async () => {
+      let call = 0;
+      const model = new MockLanguageModelV2({
+        doStream: async () => {
+          call++;
+          if (call === 1) {
+            return {
+              stream: convertArrayToReadableStream([
+                { type: 'response-metadata', id: '1' },
+                { type: 'tool-call', toolCallId: 'call-1', toolName: 'echo', input: JSON.stringify({ text: 'hi' }) },
+                {
+                  type: 'finish',
+                  finishReason: 'tool-calls',
+                  usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+                },
+              ]),
+            };
+          }
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'response-metadata', id: '2' },
+              { type: 'text-delta', id: '1', delta: 'partial' },
+              { type: 'error', error: new Error('provider stream broke') },
+            ]),
+          };
+        },
+      });
+
+      // Parent of the processor span the error chunk was processed under
+      let errorChunkSpanParentId: string | undefined;
+      class PassThroughStreamProcessor implements Processor {
+        readonly id = 'pass-through-stream';
+
+        async processOutputStream({ part, tracingContext }: ProcessOutputStreamArgs): Promise<ChunkType> {
+          if (part.type === 'error') errorChunkSpanParentId = tracingContext?.currentSpan?.parent?.id;
+          return part;
+        }
+      }
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model,
+        tools: {
+          echo: createTool({
+            id: 'echo',
+            description: 'Echo the input back',
+            inputSchema: z.object({ text: z.string() }),
+            execute: async ({ text }) => ({ text }),
+          }),
+        },
+        outputProcessors: [new PassThroughStreamProcessor()],
+      });
+
+      const mastra = new Mastra({
+        ...getBaseMastraConfig(testExporter),
+        agents: { agent },
+      });
+
+      const stream = await mastra.getAgent('agent').stream('Hello');
+      const chunkTypes: string[] = [];
+      for await (const chunk of stream.fullStream) {
+        chunkTypes.push(chunk.type);
+      }
+      expect(chunkTypes).toContain('error');
+
+      const [firstStep, failedStep] = testExporter
+        .getModelStepSpans()
+        .sort((a, b) => a.startTime.getTime() - b.startTime.getTime());
+      const streamProcessorSpans = testExporter
+        .getProcessorSpans()
+        .filter(span => span.name === 'output stream processor: pass-through-stream');
+
+      // Fork decision (PF-5928 kept): PF-2236 6731e3a2 runs a single processor directly (no
+      // synthetic processor workflow), so its output stream processor span is parented to
+      // the AGENT_RUN, not to each MODEL_STEP as upstream #27172's workflow path does.
+      const [agentSpan] = testExporter.getAgentSpans();
+      expect(firstStep).toBeDefined();
+      expect(failedStep).toBeDefined();
+      // Including the span for the deferred error chunk; all of them ended (finalExpectations)
+      expect(streamProcessorSpans).toHaveLength(3);
+      for (const span of streamProcessorSpans) {
+        expect(span.parentSpanId).toBe(agentSpan!.id);
+        expect(span.endTime).toBeDefined();
+      }
+      expect(errorChunkSpanParentId).toBe(agentSpan!.id);
+
+      await testExporter.finalExpectations();
+    });
+
+    it("should put the resumed run's stream processor span under the resumed agent run after a tool approval", async () => {
+      let call = 0;
+      const model = new MockLanguageModelV2({
+        doStream: async () => {
+          call++;
+          if (call === 1) {
+            return {
+              stream: convertArrayToReadableStream([
+                { type: 'response-metadata', id: '1' },
+                {
+                  type: 'tool-call',
+                  toolCallId: 'call-1',
+                  toolName: 'refund',
+                  input: JSON.stringify({ orderId: '1' }),
+                },
+                {
+                  type: 'finish',
+                  finishReason: 'tool-calls',
+                  usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+                },
+              ]),
+            };
+          }
+          return {
+            stream: convertArrayToReadableStream([
+              { type: 'response-metadata', id: '2' },
+              { type: 'text-delta', id: '1', delta: 'refunded' },
+              {
+                type: 'finish',
+                finishReason: 'stop',
+                usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+              },
+            ]),
+          };
+        },
+      });
+
+      // Parent of the processor span each chunk was processed under
+      const seen: Array<{ type: string; parentId?: string }> = [];
+      class RecordingStreamProcessor implements Processor {
+        readonly id = 'recording-stream';
+
+        async processOutputStream({ part, tracingContext }: ProcessOutputStreamArgs): Promise<ChunkType> {
+          seen.push({ type: part.type, parentId: tracingContext?.currentSpan?.parent?.id });
+          return part;
+        }
+      }
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model,
+        tools: {
+          refund: createTool({
+            id: 'refund',
+            description: 'Refund an order',
+            inputSchema: z.object({ orderId: z.string() }),
+            requireApproval: true,
+            execute: async () => ({ refunded: true }),
+          }),
+        },
+        outputProcessors: [new RecordingStreamProcessor()],
+      });
+
+      const mastra = new Mastra({
+        ...getBaseMastraConfig(testExporter),
+        agents: { agent },
+      });
+
+      const first = await mastra.getAgent('agent').stream('Refund order 1');
+      let toolCallId: string | undefined;
+      for await (const chunk of first.fullStream) {
+        if (chunk.type === 'tool-call-approval') toolCallId = chunk.payload.toolCallId;
+      }
+      expect(toolCallId).toBeDefined();
+
+      const resumed = await mastra.getAgent('agent').approveToolCall({ runId: first.runId, toolCallId: toolCallId! });
+      for await (const _chunk of resumed.fullStream) {
+        // drain
+      }
+
+      // Fork decision (PF-5928 kept): PF-2236 6731e3a2 runs a single processor directly (no
+      // synthetic processor workflow), so its output stream processor span is parented to
+      // the AGENT_RUN, not to each MODEL_STEP as upstream #27172's workflow path does.
+      const steps = testExporter.getModelStepSpans();
+      expect(steps.length).toBeGreaterThan(1);
+      const [initialRun, resumedRun] = testExporter.getAgentSpans();
+      expect(resumedRun?.parentSpanId).toBe(initialRun!.id);
+      // Chunks before the approval belong to the initial run; the resumed tool result and the next
+      // step's text belong to the resumed run, never to the initial invocation
+      expect(seen.find(chunk => chunk.type === 'tool-call')?.parentId).toBe(initialRun!.id);
+      expect(seen.find(chunk => chunk.type === 'tool-result')?.parentId).toBe(resumedRun!.id);
+      expect(seen.find(chunk => chunk.type === 'text-delta')?.parentId).toBe(resumedRun!.id);
+      const streamSpans = testExporter
+        .getProcessorSpans()
+        .filter(span => span.name === 'output stream processor: recording-stream');
+      expect(streamSpans.map(span => span.parentSpanId).sort()).toEqual([initialRun!.id, resumedRun!.id].sort());
+
+      await testExporter.finalExpectations();
+    });
+
+    it("should end the resumed tool result's stream processor span when no step follows the approval", async () => {
+      const model = new MockLanguageModelV2({
+        doStream: async () => ({
+          stream: convertArrayToReadableStream([
+            { type: 'response-metadata', id: '1' },
+            { type: 'tool-call', toolCallId: 'call-1', toolName: 'refund', input: JSON.stringify({ orderId: '1' }) },
+            {
+              type: 'finish',
+              finishReason: 'tool-calls',
+              usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+            },
+          ]),
+        }),
+      });
+
+      class PassThroughStreamProcessor implements Processor {
+        readonly id = 'pass-through-stream';
+
+        async processOutputStream({ part }: ProcessOutputStreamArgs): Promise<ChunkType> {
+          return part;
+        }
+      }
+
+      const agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'Test',
+        model,
+        tools: {
+          refund: createTool({
+            id: 'refund',
+            description: 'Refund an order',
+            inputSchema: z.object({ orderId: z.string() }),
+            requireApproval: true,
+            execute: async () => ({ refunded: true }),
+          }),
+        },
+        outputProcessors: [new PassThroughStreamProcessor()],
+      });
+
+      const mastra = new Mastra({
+        ...getBaseMastraConfig(testExporter),
+        agents: { agent },
+      });
+
+      const first = await mastra.getAgent('agent').stream('Refund order 1', { maxSteps: 1 });
+      let toolCallId: string | undefined;
+      for await (const chunk of first.fullStream) {
+        if (chunk.type === 'tool-call-approval') toolCallId = chunk.payload.toolCallId;
+      }
+      expect(toolCallId).toBeDefined();
+
+      const resumed = await mastra
+        .getAgent('agent')
+        .approveToolCall({ runId: first.runId, toolCallId: toolCallId!, maxSteps: 1 });
+      for await (const _chunk of resumed.fullStream) {
+        // drain
+      }
+
+      // No step starts after the resumed tool result, so its span is closed when the run ends
+      expect(
+        testExporter.getProcessorSpans().filter(span => span.name === 'output stream processor: pass-through-stream')
+          .length,
+      ).toBeGreaterThan(1);
+      await testExporter.finalExpectations();
     });
   });
 });

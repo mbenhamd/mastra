@@ -17,15 +17,18 @@ import { Inngest } from 'inngest';
 
 import { createInngestDurableAgenticWorkflowIds } from '../durable-agent/create-inngest-agentic-workflow';
 import { serve as inngestServe } from '../index';
-import { ensureInngestCliBinary } from './inngest-cli';
 import {
   createInngestTestRuntimeConfig,
   createLocalTestEndpoints,
   InngestTestRuntimeManager,
 } from './inngest-test-runtime';
 
-export const INNGEST_PORT = 4100;
-export const HANDLER_PORT = 4101;
+// Set INNGEST_TEST_PORT_OFFSET to run several dev servers side by side (one per test worker).
+const PORT_OFFSET = Number(process.env.INNGEST_TEST_PORT_OFFSET ?? 0);
+export const INNGEST_PORT = 4100 + PORT_OFFSET;
+export const HANDLER_PORT = 4101 + PORT_OFFSET;
+// The fork runs a digest-pinned Inngest runtime (inngest-test-runtime) instead of the CLI dev
+// server, so upstream's dev-server connect-port offsets (#27372) do not apply here.
 
 const DURABLE_AGENT_TEST_ENDPOINTS = createLocalTestEndpoints({
   inngestPort: INNGEST_PORT,
@@ -111,75 +114,6 @@ async function closeServer(server: ServerType): Promise<void> {
   });
 }
 
-/**
- * Start the Inngest dev server using the inngest-cli binary.
- * Returns a promise that resolves when the server is ready.
- *
- * `sdkUrl` is the app serve URL the dev server polls for function sync. Pass `null` for tests whose
- * app connects outbound via `connect()` instead of being served over HTTP.
- */
-async function startInngestDevServer({
-  sdkUrl = `http://localhost:${HANDLER_PORT}/inngest/api`,
-}: { sdkUrl?: string | null } = {}): Promise<ChildProcess> {
-  const inngestBinary = ensureInngestCliBinary();
-  return new Promise((resolve, reject) => {
-    const args = [
-      'dev',
-      '-p',
-      String(INNGEST_PORT),
-      ...(sdkUrl ? ['-u', sdkUrl] : []),
-      '--poll-interval=1',
-      '--no-discovery',
-    ];
-
-    const proc = spawn(inngestBinary, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false,
-    });
-
-    let started = false;
-    const timeout = setTimeout(() => {
-      if (!started) {
-        proc.kill();
-        reject(new Error('Inngest dev server failed to start within 30s'));
-      }
-    }, 30000);
-
-    const checkOutput = (output: string) => {
-      // Inngest dev server outputs JSON logs - look for the API server starting
-      // Example: {"time":"...","level":"INFO","msg":"starting server","caller":"api","addr":"0.0.0.0:4100"}
-      if (output.includes('"starting server"') && output.includes(`"addr":"0.0.0.0:${INNGEST_PORT}"`)) {
-        if (!started) {
-          started = true;
-          clearTimeout(timeout);
-          resolve(proc);
-        }
-      }
-    };
-
-    proc.stdout?.on('data', (data: Buffer) => {
-      checkOutput(data.toString());
-    });
-
-    proc.stderr?.on('data', (data: Buffer) => {
-      // JSON output often goes to stderr
-      checkOutput(data.toString());
-    });
-
-    proc.on('error', err => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-
-    proc.on('exit', code => {
-      if (!started) {
-        clearTimeout(timeout);
-        reject(new Error(`Inngest dev server exited with code ${code}`));
-      }
-    });
-  });
-}
-
 export async function cleanupSharedTestResources<TServer, TRuntime>(params: {
   server: TServer | null;
   runtime: TRuntime | null;
@@ -247,7 +181,9 @@ export async function startConnectInngestDevServer(): Promise<InngestTestRuntime
  * The handler starts before the policy-owned, digest-pinned Inngest runtime so
  * registration readiness proves this exact test app is reachable.
  */
-export async function setupSharedTestInfrastructure(): Promise<void> {
+export async function setupSharedTestInfrastructure({
+  observability,
+}: { observability?: NonNullable<ConstructorParameters<typeof Mastra>[0]>['observability'] } = {}): Promise<void> {
   if (sharedRuntime || sharedServer) {
     throw new Error('Shared Inngest test infrastructure still requires cleanup; retry teardown before setup.');
   }
@@ -273,6 +209,7 @@ export async function setupSharedTestInfrastructure(): Promise<void> {
       workflows: {
         [workflow.id]: workflow,
       },
+      ...(observability ? { observability } : {}),
       server: {
         apiRoutes: [
           {

@@ -3,12 +3,16 @@
     "agent_run: \"agent run: 'child-span-agent'\"",
     "\u2514\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
     "    \u251c\u2500\u2500 model_step: \"step: 0\"",
+    "    \u2502   \u251c\u2500\u2500 processor_run: \"llm request processor: provider-history-compat\"",
+    "    \u2502   \u251c\u2500\u2500 processor_run: \"llm request processor: unsupported-file-handler\"",
     "    \u2502   \u251c\u2500\u2500 model_inference: \"inference: 0\"",
     "    \u2502   \u2502   \u251c\u2500\u2500 model_chunk: \"chunk: 'tool-call'\"",
     "    \u2502   \u2502   \u2514\u2500\u2500 model_chunk: \"chunk: 'tool-result'\"",
     "    \u2502   \u2514\u2500\u2500 tool_call: \"tool: 'childSpanTool'\"",
     "    \u2502       \u2514\u2500\u2500 generic: \"tool-child-operation\"",
     "    \u2514\u2500\u2500 model_step: \"step: 1\"",
+    "        \u251c\u2500\u2500 processor_run: \"llm request processor: provider-history-compat\"",
+    "        \u251c\u2500\u2500 processor_run: \"llm request processor: unsupported-file-handler\"",
     "        \u2514\u2500\u2500 model_inference: \"inference: 1\"",
     "            \u2514\u2500\u2500 model_chunk: \"chunk: 'text'\""
   ],
@@ -26,7 +30,8 @@
         "entityId": "child-span-agent",
         "attributes": {
           "instructions": "You use tools that create child spans",
-          "availableTools": ["childSpanTool"]
+          "availableTools": ["childSpanTool"],
+          "completionStartTime": "<date>"
         },
         "metadata": {
           "runId": "<runId-1>",
@@ -98,6 +103,7 @@
               "providerRequestBytesTotal": 1479,
               "providerPreparationMsTotal": "<providerPreparationMsTotal>",
               "providerMeasurementMsTotal": "<providerMeasurementMsTotal>",
+              "completionStartTime": "<date>",
               "providerSucceededInferenceCount": 2,
               "providerErrorInferenceCount": 0,
               "providerAbortedInferenceCount": 0,
@@ -105,7 +111,6 @@
               "finishReason": "stop",
               "responseId": "<responseId-1>",
               "responseModel": "mock-model-id",
-              "completionStartTime": "<date>",
               "usage": {
                 "inputTokens": 30,
                 "outputTokens": 35,
@@ -171,6 +176,7 @@
                 "attributes": {
                   "stepIndex": 0,
                   "messageId": "<messageId-1>",
+                  "completionStartTime": "<date>",
                   "usage": {
                     "inputTokens": 15,
                     "outputTokens": 10,
@@ -221,6 +227,124 @@
                   "span": {
                     "id": "<span-4>",
                     "traceId": "<trace-1>",
+                    "name": "llm request processor: provider-history-compat",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-3>",
+                    "entityType": "input_step_processor",
+                    "entityId": "provider-history-compat",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 0,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 1,
+                      "processorInputMessageBytes": 152,
+                      "processorOutputMessageCount": 1,
+                      "processorOutputMessageBytes": 152,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 69,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 69,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 152,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 152,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 0,
+                      "processorInputAssistantMessageBytes": 2,
+                      "processorOutputAssistantMessageCount": 0,
+                      "processorOutputAssistantMessageBytes": 2,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 0,
+                      "processorInputToolMessageBytes": 2,
+                      "processorOutputToolMessageCount": 0,
+                      "processorOutputToolMessageBytes": 2,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-5>",
+                    "traceId": "<trace-1>",
+                    "name": "llm request processor: unsupported-file-handler",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-3>",
+                    "entityType": "input_step_processor",
+                    "entityId": "unsupported-file-handler",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 2,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 1,
+                      "processorInputMessageBytes": 152,
+                      "processorOutputMessageCount": 1,
+                      "processorOutputMessageBytes": 152,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 69,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 69,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 152,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 152,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 0,
+                      "processorInputAssistantMessageBytes": 2,
+                      "processorOutputAssistantMessageCount": 0,
+                      "processorOutputAssistantMessageBytes": 2,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 0,
+                      "processorInputToolMessageBytes": 2,
+                      "processorOutputToolMessageCount": 0,
+                      "processorOutputToolMessageBytes": 2,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-6>",
+                    "traceId": "<trace-1>",
                     "name": "inference: 0",
                     "type": "model_inference",
                     "completed": true,
@@ -239,6 +363,24 @@
                         "maxRetries": 0
                       },
                       "availableTools": ["childSpanTool"],
+                      "tools": [
+                        {
+                          "type": "function",
+                          "name": "childSpanTool",
+                          "description": "A tool that creates child spans",
+                          "parameters": {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "type": "object",
+                            "properties": {
+                              "input": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["input"],
+                            "additionalProperties": false
+                          }
+                        }
+                      ],
                       "toolChoice": "auto",
                       "measurementState": "measured",
                       "providerBreakdownState": "serialized_components_non_additive",
@@ -288,6 +430,16 @@
                       "runId": "<runId-1>",
                       "environment": "test"
                     },
+                    "input": [
+                      {
+                        "role": "system",
+                        "content": "You use tools that create child spans"
+                      },
+                      {
+                        "role": "user",
+                        "content": "Use child span tool to process test-data"
+                      }
+                    ],
                     "output": {
                       "text": "",
                       "toolCalls": [
@@ -304,14 +456,14 @@
                   "children": [
                     {
                       "span": {
-                        "id": "<span-5>",
+                        "id": "<span-7>",
                         "traceId": "<trace-1>",
                         "name": "chunk: 'tool-call'",
                         "type": "model_chunk",
                         "completed": true,
                         "isEvent": false,
                         "isRootSpan": false,
-                        "parentId": "<span-4>",
+                        "parentId": "<span-6>",
                         "entityType": "agent",
                         "entityId": "child-span-agent",
                         "attributes": {
@@ -333,14 +485,14 @@
                     },
                     {
                       "span": {
-                        "id": "<span-6>",
+                        "id": "<span-8>",
                         "traceId": "<trace-1>",
                         "name": "chunk: 'tool-result'",
                         "type": "model_chunk",
                         "completed": true,
                         "isEvent": true,
                         "isRootSpan": false,
-                        "parentId": "<span-4>",
+                        "parentId": "<span-6>",
                         "entityType": "agent",
                         "entityId": "child-span-agent",
                         "attributes": {
@@ -359,7 +511,7 @@
                 },
                 {
                   "span": {
-                    "id": "<span-7>",
+                    "id": "<span-9>",
                     "traceId": "<trace-1>",
                     "name": "tool: 'childSpanTool'",
                     "type": "tool_call",
@@ -389,14 +541,14 @@
                   "children": [
                     {
                       "span": {
-                        "id": "<span-8>",
+                        "id": "<span-10>",
                         "traceId": "<trace-1>",
                         "name": "tool-child-operation",
                         "type": "generic",
                         "completed": true,
                         "isEvent": false,
                         "isRootSpan": false,
-                        "parentId": "<span-7>",
+                        "parentId": "<span-9>",
                         "entityType": "tool",
                         "entityId": "childSpanTool",
                         "metadata": {
@@ -416,7 +568,7 @@
             },
             {
               "span": {
-                "id": "<span-9>",
+                "id": "<span-11>",
                 "traceId": "<trace-1>",
                 "name": "step: 1",
                 "type": "model_step",
@@ -429,6 +581,7 @@
                 "attributes": {
                   "stepIndex": 1,
                   "messageId": "<messageId-1>",
+                  "completionStartTime": "<date>",
                   "usage": {
                     "inputTokens": 15,
                     "outputTokens": 25,
@@ -477,14 +630,132 @@
               "children": [
                 {
                   "span": {
-                    "id": "<span-10>",
+                    "id": "<span-12>",
+                    "traceId": "<trace-1>",
+                    "name": "llm request processor: provider-history-compat",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-11>",
+                    "entityType": "input_step_processor",
+                    "entityId": "provider-history-compat",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 0,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 3,
+                      "processorInputMessageBytes": 509,
+                      "processorOutputMessageCount": 3,
+                      "processorOutputMessageBytes": 509,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 69,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 69,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 152,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 152,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 1,
+                      "processorInputAssistantMessageBytes": 145,
+                      "processorOutputAssistantMessageCount": 1,
+                      "processorOutputAssistantMessageBytes": 145,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 1,
+                      "processorInputToolMessageBytes": 214,
+                      "processorOutputToolMessageCount": 1,
+                      "processorOutputToolMessageBytes": 214,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-13>",
+                    "traceId": "<trace-1>",
+                    "name": "llm request processor: unsupported-file-handler",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-11>",
+                    "entityType": "input_step_processor",
+                    "entityId": "unsupported-file-handler",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 2,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 3,
+                      "processorInputMessageBytes": 509,
+                      "processorOutputMessageCount": 3,
+                      "processorOutputMessageBytes": 509,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 69,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 69,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 152,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 152,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 1,
+                      "processorInputAssistantMessageBytes": 145,
+                      "processorOutputAssistantMessageCount": 1,
+                      "processorOutputAssistantMessageBytes": 145,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 1,
+                      "processorInputToolMessageBytes": 214,
+                      "processorOutputToolMessageCount": 1,
+                      "processorOutputToolMessageBytes": 214,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-14>",
                     "traceId": "<trace-1>",
                     "name": "inference: 1",
                     "type": "model_inference",
                     "completed": true,
                     "isEvent": false,
                     "isRootSpan": false,
-                    "parentId": "<span-9>",
+                    "parentId": "<span-11>",
                     "entityType": "agent",
                     "entityId": "child-span-agent",
                     "attributes": {
@@ -497,6 +768,24 @@
                         "maxRetries": 0
                       },
                       "availableTools": ["childSpanTool"],
+                      "tools": [
+                        {
+                          "type": "function",
+                          "name": "childSpanTool",
+                          "description": "A tool that creates child spans",
+                          "parameters": {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "type": "object",
+                            "properties": {
+                              "input": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["input"],
+                            "additionalProperties": false
+                          }
+                        }
+                      ],
                       "toolChoice": "auto",
                       "measurementState": "measured",
                       "providerBreakdownState": "serialized_components_non_additive",
@@ -546,6 +835,24 @@
                       "runId": "<runId-1>",
                       "environment": "test"
                     },
+                    "input": [
+                      {
+                        "role": "system",
+                        "content": "You use tools that create child spans"
+                      },
+                      {
+                        "role": "user",
+                        "content": "Use child span tool to process test-data"
+                      },
+                      {
+                        "role": "assistant",
+                        "content": "[tool: childSpanTool]"
+                      },
+                      {
+                        "role": "tool",
+                        "content": "[tool-result: childSpanTool]"
+                      }
+                    ],
                     "output": {
                       "text": "Mock V2 stream response",
                       "toolCalls": []
@@ -554,14 +861,14 @@
                   "children": [
                     {
                       "span": {
-                        "id": "<span-11>",
+                        "id": "<span-15>",
                         "traceId": "<trace-1>",
                         "name": "chunk: 'text'",
                         "type": "model_chunk",
                         "completed": true,
                         "isEvent": false,
                         "isRootSpan": false,
-                        "parentId": "<span-10>",
+                        "parentId": "<span-14>",
                         "entityType": "agent",
                         "entityId": "child-span-agent",
                         "attributes": {

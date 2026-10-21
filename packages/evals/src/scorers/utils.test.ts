@@ -1724,6 +1724,58 @@ describe('Scorer Utils', () => {
         expect(result.matchedSteps).toBe(0);
       });
 
+      it('should match provider_tool_call ExpectedStep when toolArgs match', () => {
+        const actual: Trajectory = {
+          steps: [{ stepType: 'provider_tool_call', name: 'web_search', toolArgs: { query: 'hello' }, success: true }],
+        };
+        const expected: { steps: ExpectedStep[] } = {
+          steps: [{ name: 'web_search', stepType: 'provider_tool_call', toolArgs: { query: 'hello' }, success: true }],
+        };
+
+        const result = compareTrajectories(actual, expected);
+        expect(result.score).toBe(1);
+        expect(result.matchedSteps).toBe(1);
+      });
+
+      it('should fail provider_tool_call ExpectedStep when toolArgs differ', () => {
+        const actual: Trajectory = {
+          steps: [{ stepType: 'provider_tool_call', name: 'web_search', toolArgs: { query: 'different' } }],
+        };
+        const expected: { steps: ExpectedStep[] } = {
+          steps: [{ name: 'web_search', stepType: 'provider_tool_call', toolArgs: { query: 'hello' } }],
+        };
+
+        const result = compareTrajectories(actual, expected);
+        expect(result.matchedSteps).toBe(0);
+        expect(result.missingSteps).toEqual(['web_search']);
+      });
+
+      it('should fail provider_tool_call ExpectedStep when toolResult differs', () => {
+        const actual: Trajectory = {
+          steps: [{ stepType: 'provider_tool_call', name: 'web_search', toolResult: { hits: 1 } }],
+        };
+        const expected: { steps: ExpectedStep[] } = {
+          steps: [{ name: 'web_search', stepType: 'provider_tool_call', toolResult: { hits: 2 } }],
+        };
+
+        const result = compareTrajectories(actual, expected);
+        expect(result.matchedSteps).toBe(0);
+        expect(result.missingSteps).toEqual(['web_search']);
+      });
+
+      it('should fail provider_tool_call ExpectedStep when success differs', () => {
+        const actual: Trajectory = {
+          steps: [{ stepType: 'provider_tool_call', name: 'web_search', toolArgs: { query: 'hello' }, success: false }],
+        };
+        const expected: { steps: ExpectedStep[] } = {
+          steps: [{ name: 'web_search', stepType: 'provider_tool_call', toolArgs: { query: 'hello' }, success: true }],
+        };
+
+        const result = compareTrajectories(actual, expected);
+        expect(result.matchedSteps).toBe(0);
+        expect(result.missingSteps).toEqual(['web_search']);
+      });
+
       it('should match by name+type only when no data fields are specified', () => {
         const actual: Trajectory = {
           steps: [{ stepType: 'tool_call', name: 'search', toolArgs: { query: 'anything' } }],
@@ -2005,6 +2057,73 @@ describe('Scorer Utils', () => {
       expect(result.score).toBe(1);
     });
 
+    it('should detect redundant consecutive tool calls nested inside an agent_run', () => {
+      const trajectory: Trajectory = {
+        steps: [
+          { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'test' } },
+          {
+            stepType: 'agent_run' as const,
+            name: 'subagent',
+            children: [
+              { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'test' } },
+              { stepType: 'tool_call' as const, name: 'lookup', toolArgs: { id: 1 } },
+              { stepType: 'tool_call' as const, name: 'lookup', toolArgs: { id: 1 } },
+              { stepType: 'tool_call' as const, name: 'lookup', toolArgs: { id: 2 } },
+            ],
+          },
+        ],
+      };
+      const result = checkTrajectoryEfficiency(trajectory, { noRedundantCalls: true });
+      expect(result.redundantCalls).toEqual([{ name: 'lookup', index: 2 }]);
+      expect(result.score).toBeLessThan(1);
+    });
+
+    it('should detect redundant tool calls separated by processor_run and model_generation steps', () => {
+      const trajectory: Trajectory = {
+        steps: [
+          {
+            stepType: 'agent_run' as const,
+            name: 'agent',
+            children: [
+              { stepType: 'model_generation' as const, name: 'model' },
+              { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'test' } },
+              { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+              { stepType: 'model_generation' as const, name: 'model' },
+              { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'test' } },
+            ],
+          },
+        ],
+      };
+      const result = checkTrajectoryEfficiency(trajectory, { noRedundantCalls: true });
+      expect(result.redundantCalls).toEqual([{ name: 'search', index: 4 }]);
+    });
+
+    it('should not flag identical tool calls separated by a different tool call', () => {
+      const trajectory: Trajectory = {
+        steps: [
+          { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'test' } },
+          { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+          { stepType: 'tool_call' as const, name: 'lookup', toolArgs: { id: 1 } },
+          { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+          { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'test' } },
+        ],
+      };
+      const result = checkTrajectoryEfficiency(trajectory, { noRedundantCalls: true });
+      expect(result.redundantCalls).toEqual([]);
+    });
+
+    it('should not flag tool calls with different args separated by processor_run', () => {
+      const trajectory: Trajectory = {
+        steps: [
+          { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'a' } },
+          { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+          { stepType: 'tool_call' as const, name: 'search', toolArgs: { q: 'b' } },
+        ],
+      };
+      const result = checkTrajectoryEfficiency(trajectory, { noRedundantCalls: true });
+      expect(result.redundantCalls).toEqual([]);
+    });
+
     it('should check token budget from model_generation steps', () => {
       const trajectory: Trajectory = {
         steps: [
@@ -2040,6 +2159,76 @@ describe('Scorer Utils', () => {
   });
 
   describe('checkTrajectoryBlacklist', () => {
+    it('should detect blacklisted tools nested inside agent_run and workflow_step', () => {
+      const oneLevel: Trajectory = {
+        steps: [
+          {
+            stepType: 'agent_run' as const,
+            name: 'subagent',
+            children: [{ stepType: 'tool_call' as const, name: 'deleteAll' }],
+          },
+        ],
+      };
+      const oneLevelResult = checkTrajectoryBlacklist(oneLevel, { blacklistedTools: ['deleteAll'] });
+      expect(oneLevelResult.score).toBe(0);
+      expect(oneLevelResult.violatedTools).toEqual(['deleteAll']);
+
+      const twoLevels: Trajectory = {
+        steps: [
+          {
+            stepType: 'workflow_step' as const,
+            name: 'step1',
+            children: [
+              {
+                stepType: 'agent_run' as const,
+                name: 'agent',
+                children: [
+                  {
+                    stepType: 'tool_call' as const,
+                    name: 'delegate',
+                    children: [{ stepType: 'tool_call' as const, name: 'dropTable' }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+      const twoLevelResult = checkTrajectoryBlacklist(twoLevels, { blacklistedTools: ['dropTable'] });
+      expect(twoLevelResult.score).toBe(0);
+      expect(twoLevelResult.violatedTools).toEqual(['dropTable']);
+      expect(checkTrajectoryBlacklist(twoLevels, { blacklistedTools: ['deleteAll'] }).score).toBe(1);
+    });
+
+    it('should match blacklisted sequences within a nested list but not across nesting levels', () => {
+      const nested: Trajectory = {
+        steps: [
+          {
+            stepType: 'agent_run' as const,
+            name: 'subagent',
+            children: [
+              { stepType: 'tool_call' as const, name: 'escalate' },
+              { stepType: 'tool_call' as const, name: 'deleteAll' },
+            ],
+          },
+        ],
+      };
+      expect(
+        checkTrajectoryBlacklist(nested, { blacklistedSequences: [['escalate', 'deleteAll']] }).violatedSequences,
+      ).toEqual([['escalate', 'deleteAll']]);
+
+      const split: Trajectory = {
+        steps: [
+          {
+            stepType: 'agent_run' as const,
+            name: 'escalate',
+            children: [{ stepType: 'tool_call' as const, name: 'deleteAll' }],
+          },
+        ],
+      };
+      expect(checkTrajectoryBlacklist(split, { blacklistedSequences: [['escalate', 'deleteAll']] }).score).toBe(1);
+    });
+
     it('should return score 1.0 when no violations are found', () => {
       const trajectory: Trajectory = {
         steps: [
@@ -2114,6 +2303,74 @@ describe('Scorer Utils', () => {
       expect(result.violatedTools).toEqual(['deleteAll']);
       expect(result.violatedSequences).toEqual([['escalate', 'admin']]);
     });
+
+    // Trace-derived trajectories nest tool calls under model_generation and interleave processor_run steps
+    const sequenceMessageTrajectory: Trajectory = {
+      steps: [
+        { stepType: 'tool_call' as const, name: 'searchCorpus' },
+        { stepType: 'tool_call' as const, name: 'lookupSource' },
+      ],
+    };
+    const sequenceTraceTrajectory: Trajectory = {
+      steps: [
+        { stepType: 'processor_run' as const, name: 'input-processor', processorId: 'p' },
+        {
+          stepType: 'model_generation' as const,
+          name: 'model',
+          children: [
+            { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+            { stepType: 'tool_call' as const, name: 'searchCorpus' },
+            { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+            { stepType: 'tool_call' as const, name: 'lookupSource' },
+            { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+          ],
+        },
+      ],
+    };
+
+    it('should detect blacklisted sequences separated by processor_run steps in a trace trajectory', () => {
+      const result = checkTrajectoryBlacklist(sequenceTraceTrajectory, {
+        blacklistedSequences: [['searchCorpus', 'lookupSource']],
+      });
+      expect(result.score).toBe(0);
+      expect(result.violatedSequences).toEqual([['searchCorpus', 'lookupSource']]);
+    });
+
+    it('should not flag sequences separated by another tool call in a trace trajectory', () => {
+      const trajectory: Trajectory = {
+        steps: [
+          {
+            stepType: 'model_generation' as const,
+            name: 'model',
+            children: [
+              { stepType: 'tool_call' as const, name: 'searchCorpus' },
+              { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+              { stepType: 'tool_call' as const, name: 'summarize' },
+              { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+              { stepType: 'tool_call' as const, name: 'lookupSource' },
+            ],
+          },
+        ],
+      };
+      const result = checkTrajectoryBlacklist(trajectory, {
+        blacklistedSequences: [['searchCorpus', 'lookupSource']],
+      });
+      expect(result.score).toBe(1);
+      expect(result.violatedSequences).toEqual([]);
+    });
+
+    it('should return the same result for message and trace trajectories of the same run', () => {
+      const options = {
+        blacklistedTools: ['lookupSource'],
+        blacklistedSequences: [
+          ['searchCorpus', 'lookupSource'],
+          ['lookupSource', 'searchCorpus'],
+        ],
+      };
+      expect(checkTrajectoryBlacklist(sequenceTraceTrajectory, options)).toEqual(
+        checkTrajectoryBlacklist(sequenceMessageTrajectory, options),
+      );
+    });
   });
 
   describe('analyzeToolFailures', () => {
@@ -2178,6 +2435,77 @@ describe('Scorer Utils', () => {
       const result = analyzeToolFailures(trajectory);
       expect(result.score).toBe(1);
       expect(result.patterns).toEqual([]);
+    });
+
+    // Trace-derived trajectories nest tool calls under model_generation and interleave processor_run steps
+    const flakyMessageTrajectory: Trajectory = {
+      steps: [
+        { stepType: 'tool_call' as const, name: 'flakySearch', success: false },
+        { stepType: 'tool_call' as const, name: 'flakySearch', success: true },
+        { stepType: 'tool_call' as const, name: 'summarize', success: true },
+      ],
+    };
+    const flakyTraceTrajectory: Trajectory = {
+      steps: [
+        { stepType: 'processor_run' as const, name: 'input-processor', processorId: 'p' },
+        {
+          stepType: 'model_generation' as const,
+          name: 'model',
+          children: [
+            { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+            { stepType: 'tool_call' as const, name: 'flakySearch', success: false },
+            { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+            { stepType: 'tool_call' as const, name: 'flakySearch', success: true },
+            { stepType: 'processor_run' as const, name: 'processor', processorId: 'p' },
+            { stepType: 'tool_call' as const, name: 'summarize', success: true },
+          ],
+        },
+        { stepType: 'processor_run' as const, name: 'output-processor', processorId: 'p' },
+      ],
+    };
+
+    it('should detect retries nested under model_generation with interleaved processor_run steps', () => {
+      const result = analyzeToolFailures(flakyTraceTrajectory, { maxRetriesPerTool: 0 });
+      expect(result.totalRetries).toBe(1);
+      expect(result.score).toBe(0.8);
+      expect(result.excessiveRetryTools).toEqual(['flakySearch']);
+      expect(result.patterns).toEqual([
+        {
+          toolName: 'flakySearch',
+          retryCount: 1,
+          fellBackToAlternative: false,
+          alternativeTool: undefined,
+          eventuallySucceeded: true,
+        },
+      ]);
+    });
+
+    it('should return the same result for message and trace trajectories of the same run', () => {
+      for (const maxRetriesPerTool of [0, 2]) {
+        expect(analyzeToolFailures(flakyTraceTrajectory, { maxRetriesPerTool })).toEqual(
+          analyzeToolFailures(flakyMessageTrajectory, { maxRetriesPerTool }),
+        );
+      }
+    });
+
+    it('should not group calls to the same tool across different sibling lists', () => {
+      const trajectory: Trajectory = {
+        steps: [
+          {
+            stepType: 'model_generation' as const,
+            name: 'model',
+            children: [{ stepType: 'tool_call' as const, name: 'flakySearch', success: false }],
+          },
+          {
+            stepType: 'model_generation' as const,
+            name: 'model',
+            children: [{ stepType: 'tool_call' as const, name: 'flakySearch', success: true }],
+          },
+        ],
+      };
+      const result = analyzeToolFailures(trajectory, { maxRetriesPerTool: 0 });
+      expect(result.totalRetries).toBe(0);
+      expect(result.score).toBe(1);
     });
   });
 });

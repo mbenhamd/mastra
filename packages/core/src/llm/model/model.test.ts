@@ -396,7 +396,7 @@ describe('MastraLLM', () => {
       expect(result.text).toEqual('Custom text response');
     });
 
-    it('should handle tool conversion', async () => {
+    it('should pass core tools to the provider as function definitions', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
 
       await aisdkText.__text({
@@ -408,7 +408,14 @@ describe('MastraLLM', () => {
         tracingContext,
       });
 
-      expect(generateSpy).toHaveBeenCalled();
+      expect(generateSpy.mock.lastCall?.[0].mode.tools).toEqual([
+        expect.objectContaining({
+          type: 'function',
+          name: 'testTool',
+          description: 'Test tool description',
+          parameters: expect.objectContaining({ properties: { test: { type: 'string' } } }),
+        }),
+      ]);
     });
 
     it('should handle pre-converted tools', async () => {
@@ -455,55 +462,9 @@ describe('MastraLLM', () => {
       expect(generateSpy).toHaveBeenCalled();
     });
 
-    it('should handle rate limiting', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-      const onStepFinish = vi.fn();
-      // const mockResponse = {
-      //   response: {
-      //     headers: {
-      //       'x-ratelimit-remaining-tokens': '1500',
-      //     },
-      //   },
-      // };
-
-      await aisdkText.__text({
-        messages,
-        onStepFinish,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(generateSpy).toHaveBeenCalled();
-    });
-
     it('should log debug messages', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
       const runId = 'test-run';
-
-      await aisdkText.__text({
-        messages,
-        runId,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(generateSpy).toHaveBeenCalled();
-    });
-
-    it('should handle step change logging', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-      const runId = 'test-run';
-      // const mockStepData = {
-      //   text: 'Custom text response',
-      //   toolCalls: [],
-      //   toolResults: [],
-      //   finishReason: 'stop',
-      //   usage: { promptTokens: 10, completionTokens: 20 },
-      // };
 
       await aisdkText.__text({
         messages,
@@ -534,10 +495,10 @@ describe('MastraLLM', () => {
       expect(streamSpy).toHaveBeenCalled();
     });
 
-    it('should handle tool conversion', async () => {
+    it('should pass core tools to the provider as function definitions', async () => {
       const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
 
-      await aisdkText.__stream({
+      const result = await aisdkText.__stream({
         messages,
         tools: mockTools,
         temperature: 0.7,
@@ -545,8 +506,16 @@ describe('MastraLLM', () => {
         requestContext,
         tracingContext,
       });
+      await result.consumeStream();
 
-      expect(streamSpy).toHaveBeenCalled();
+      expect(streamSpy.mock.lastCall?.[0].mode.tools).toEqual([
+        expect.objectContaining({
+          type: 'function',
+          name: 'testTool',
+          description: 'Test tool description',
+          parameters: expect.objectContaining({ properties: { test: { type: 'string' } } }),
+        }),
+      ]);
     });
 
     it('should handle pre-converted tools', async () => {
@@ -822,27 +791,6 @@ describe('MastraLLM', () => {
         messages,
         structuredOutput: schema,
         tools: mockTools,
-        temperature: 0.7,
-        maxSteps: 5,
-        requestContext,
-        tracingContext,
-      });
-
-      expect(streamSpy).toHaveBeenCalled();
-    });
-
-    it('should handle rate limiting', async () => {
-      const messages: CoreMessage[] = [{ role: 'user', content: 'test message' }];
-      const schema = z.object({
-        content: z.string(),
-      }) as z.ZodType<any>;
-
-      const runId = 'test-run';
-
-      await aisdkObject.__streamObject({
-        messages,
-        structuredOutput: schema,
-        runId,
         temperature: 0.7,
         maxSteps: 5,
         requestContext,

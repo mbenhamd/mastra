@@ -47,6 +47,9 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
     race: 'run-rollback-finalize-race',
     skipped: 'run-skipped',
     missing: 'run-missing',
+    deleted: 'run-deleted-stale-step',
+    generationDelete: 'run-generation-conditional-delete',
+    createIfAbsent: 'run-create-if-absent',
   };
   const admissionFor = (runId: string): AdmitWorkflowResumeInput => ({
     workflowName: options.workflowName,
@@ -226,6 +229,29 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
       options.primary.loadWorkflowSnapshot({ workflowName: options.workflowName, runId: runIds.missing }),
     ).resolves.toBeNull();
 
+    // PF-4385 tombstone: a late step write from an aborted or stale execution
+    // (generation-fenced, no resume operation) must not recreate a deleted run.
+    await options.primary.persistWorkflowSnapshot({
+      workflowName: options.workflowName,
+      runId: runIds.deleted,
+      resourceId,
+      snapshot: suspendedSnapshot(runIds.deleted, resourceId),
+    });
+    await options.primary.deleteWorkflowRunById({ workflowName: options.workflowName, runId: runIds.deleted });
+    await expect(
+      secondary.persistWorkflowStepUpdate({
+        workflowName: options.workflowName,
+        runId: runIds.deleted,
+        resourceId,
+        expectedExecutionGeneration: 'wfeg:atomic-resume-contract',
+        expectedLifecycleResumeAttempt: 0,
+        snapshot: { ...suspendedSnapshot(runIds.deleted, resourceId), status: 'running' },
+      }),
+    ).resolves.toEqual({ status: 'missing_run' });
+    await expect(
+      options.primary.loadWorkflowSnapshot({ workflowName: options.workflowName, runId: runIds.deleted }),
+    ).resolves.toBeNull();
+
     const consumeInput = {
       workflowName: options.workflowName,
       runId: runIds.main,
@@ -320,6 +346,57 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
         snapshot: { ...suspendedSnapshot(runIds.skipped, resourceId), status: 'running' },
       }),
     ).resolves.toEqual({ status: 'finalized', disposition: 'skipped' });
+
+    // PF-5928: deferred cleanup deletes only its own generation's row, atomically.
+    if (options.primary.getWorkflowResumeCapabilities().generationDeleteVersion === 1) {
+      const generationDelete = { workflowName: options.workflowName, runId: runIds.generationDelete };
+      await options.primary.persistWorkflowSnapshot({
+        ...generationDelete,
+        resourceId,
+        snapshot: {
+          ...suspendedSnapshot(runIds.generationDelete, resourceId),
+          status: 'running',
+          executionGeneration: 'wfeg:newer',
+        },
+      });
+      await expect(
+        secondary.deleteWorkflowRunIfGeneration({ ...generationDelete, expectedExecutionGeneration: 'wfeg:older' }),
+      ).resolves.toEqual({ status: 'stale' });
+      expect(await options.primary.loadWorkflowSnapshot(generationDelete)).toMatchObject({
+        executionGeneration: 'wfeg:newer',
+      });
+      await expect(
+        secondary.deleteWorkflowRunIfGeneration({ ...generationDelete, expectedExecutionGeneration: 'wfeg:newer' }),
+      ).resolves.toEqual({ status: 'deleted' });
+      expect(await options.primary.loadWorkflowSnapshot(generationDelete)).toBeNull();
+      await expect(
+        secondary.deleteWorkflowRunIfGeneration({ ...generationDelete, expectedExecutionGeneration: 'wfeg:newer' }),
+      ).resolves.toEqual({ status: 'missing' });
+    }
+
+    // PF-5928: a late creator's first snapshot never overwrites a row another creator wrote.
+    if (options.primary.getWorkflowResumeCapabilities().createIfAbsentVersion === 1) {
+      const createIfAbsent = { workflowName: options.workflowName, runId: runIds.createIfAbsent };
+      const pending = (generation: string) => ({
+        ...suspendedSnapshot(runIds.createIfAbsent, resourceId),
+        status: 'pending' as const,
+        executionGeneration: generation,
+      });
+      await expect(
+        options.primary.createWorkflowSnapshotIfAbsent({
+          ...createIfAbsent,
+          resourceId,
+          snapshot: pending('wfeg:first'),
+        }),
+      ).resolves.toEqual({ status: 'created' });
+      await expect(
+        secondary.createWorkflowSnapshotIfAbsent({ ...createIfAbsent, resourceId, snapshot: pending('wfeg:late') }),
+      ).resolves.toEqual({ status: 'exists' });
+      expect(await options.primary.loadWorkflowSnapshot(createIfAbsent)).toMatchObject({
+        status: 'pending',
+        executionGeneration: 'wfeg:first',
+      });
+    }
   } finally {
     await Promise.all(
       Object.values(runIds).map(runId =>

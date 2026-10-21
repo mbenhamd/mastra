@@ -364,6 +364,7 @@ describe('stream disconnect handling', () => {
 
     expect(canceledByRequestClose).toBe(true);
     await expect(canceled).resolves.toBe('request aborted');
+    expect(reply.hijack).toHaveBeenCalled();
     // The datastream-response path now hijacks the reply and writes the status +
     // headers directly to the raw response (so the SSE content-type is not dropped),
     // rather than going through reply.status().

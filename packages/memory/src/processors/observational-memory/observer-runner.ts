@@ -1,7 +1,7 @@
 import { Agent } from '@mastra/core/agent';
-import type { MastraDBMessage } from '@mastra/core/agent';
+import type { AgentMemoryOption, MastraDBMessage, ModelWithRetries } from '@mastra/core/agent';
 import { modelSupportsAttachments } from '@mastra/core/llm';
-import type { WidenModelId } from '@mastra/core/llm';
+import type { WidenedMastraModelConfig, WidenModelId } from '@mastra/core/llm';
 import type { Mastra } from '@mastra/core/mastra';
 import type { MastraMemory } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
@@ -27,21 +27,33 @@ import {
   parseMultiThreadObserverOutput,
   describeDegenerateOutput,
 } from './observer-agent';
-import { withRetry } from './retry';
+import { assertCompleteModelResponse, withRetry } from './retry';
 import { createTemporaryOmMemoryContext } from './temporary-memory';
 import type { TokenCounter } from './token-counter';
 import { withOmTracingSpan } from './tracing';
 import { applyBeforeObservation, applyTextTransform } from './transform-hooks';
-import type { ObserveTransformHooks, ObserveTrigger, ResolvedObservationConfig } from './types';
+import type {
+  ObservationModelContext,
+  ObserveTransformHooks,
+  ObserveTrigger,
+  ResolvedObservationConfig,
+} from './types';
 
-type ConcreteObservationModel = Exclude<ResolvedObservationConfig['model'], ModelByInputTokens>;
+type ConcreteObservationModel = Exclude<ResolvedObservationConfig['model'], ModelByInputTokens | 'auto'>;
 
-type ObservationModelResolver = (inputTokens: number) => {
+type ObservationModelResolver = (
+  inputTokens: number,
+  options?: {
+    requestContext?: RequestContext;
+    mainAgent?: ProcessorContext['agent'];
+    currentModel?: ObservationModelContext;
+  },
+) => Promise<{
   model: ConcreteObservationModel;
   selectedThreshold?: number;
   routingStrategy?: 'model-by-input-tokens';
   routingThresholds?: string;
-};
+}>;
 
 /**
  * Runs the Observer agent for extracting observations from messages.
@@ -83,6 +95,7 @@ interface ObserverCallOptions {
   mainAgent?: ProcessorContext['agent'];
   /** Zone the Observer sees message dates in: the record's `observedTimezone`. */
   timeZone?: string;
+  currentModel?: ObservationModelContext;
 }
 
 interface ObserverCallResult {
@@ -168,7 +181,7 @@ export class ObserverRunner {
     } else if (typeof agentModel === 'function') {
       const resolveDynamicModel = agentModel;
       agentModel = (async args => {
-        const resolvedModel = await resolveDynamicModel(args);
+        const resolvedModel: WidenedMastraModelConfig | ModelWithRetries[] = await resolveDynamicModel(args);
         return Array.isArray(resolvedModel)
           ? resolvedModel.map(fallback => ({ ...fallback, maxRetries: 0 }))
           : resolvedModel;
@@ -178,6 +191,9 @@ export class ObserverRunner {
       id: isMultiThread ? 'multi-thread-observer' : 'observational-memory-observer',
       name: isMultiThread ? 'multi-thread-observer' : 'Observer',
       maxRetries: 0,
+      // withRetry owns retries and restarts each attempt from a clean prompt.
+      // Processor retries would continue from the failed attempt instead.
+      errorProcessorDefaults: false,
       instructions: buildObserverSystemPrompt(
         isMultiThread,
         this.observationConfig.instruction,
@@ -282,19 +298,24 @@ export class ObserverRunner {
     options?: ObserverCallOptions,
   ): Promise<ObserverCallResult> {
     const inputTokens = this.tokenCounter.countMessages(messagesToObserve);
-    const resolvedModel = (() => {
-      try {
-        return options?.model ? { model: options.model } : this.resolveModel(inputTokens);
-      } catch (error) {
-        this.mastra?.getLogger?.().error('OM observer model resolution failed', {
-          diagnostic: formatOmError(error),
-          inputTokens,
-          threadId: messagesToObserve[0]?.threadId,
-          hasRequestContext: Boolean(options?.requestContext),
-        });
-        throw error;
-      }
-    })();
+    let resolvedModel: Awaited<ReturnType<ObservationModelResolver>>;
+    try {
+      resolvedModel = options?.model
+        ? { model: options.model }
+        : await this.resolveModel(inputTokens, {
+            requestContext: options?.requestContext,
+            mainAgent: options?.mainAgent,
+            currentModel: options?.currentModel,
+          });
+    } catch (error) {
+      this.mastra?.getLogger?.().error('OM observer model resolution failed', {
+        diagnostic: formatOmError(error),
+        inputTokens,
+        threadId: messagesToObserve[0]?.threadId,
+        hasRequestContext: Boolean(options?.requestContext),
+      });
+      throw error;
+    }
     const extractorResolutionFailures: Array<{ slug: string; error: string }> = [];
     const activeExtractors = await resolveExtractors(
       filterObserverExtractors(this.observationConfig.extractors, options?.skipContinuationHints),
@@ -315,6 +336,7 @@ export class ObserverRunner {
       ? this.createAgent(resolvedModel.model, false, temporaryMemory.memory, activeExtractors)
       : this.createAgent(resolvedModel.model, false, undefined, activeExtractors);
     const internalRequestContext = withOmInternalThreadId(options?.requestContext, agent.id);
+    let attemptMemory: AgentMemoryOption | undefined;
 
     const attachmentFilter = await this.resolveAttachmentFilter(resolvedModel.model, options?.requestContext);
 
@@ -354,16 +376,21 @@ export class ObserverRunner {
             callback: childObservabilityContext =>
               this.withAbortCheck(async () => {
                 try {
+                  attemptMemory = temporaryMemory?.newThread();
                   const streamResult = await agent.stream(observerMessages, {
+                    // One prompt, one reply. Without this cap, a reply cut off with finishReason
+                    // "other" or "unknown" makes the loop continue from the partial text, and
+                    // assertCompleteModelResponse would only see the final step's "stop".
+                    maxSteps: 1,
                     // OM owns the retry budget; avoid multiplying provider attempts.
                     modelSettings: { ...this.observationConfig.modelSettings, maxRetries: 0 },
                     providerOptions: this.observationConfig.providerOptions as any,
-                    ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
+                    ...(attemptMemory ? { memory: attemptMemory } : {}),
                     abortSignal: operationAbortSignal,
                     ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                     ...childObservabilityContext,
                   });
-                  return await streamResult.getFullOutput();
+                  return assertCompleteModelResponse(await streamResult.getFullOutput(), 'OM observer');
                 } catch (error) {
                   this.mastra?.getLogger?.().error('OM observer provider call failed', {
                     diagnostic: formatOmError(error),
@@ -414,7 +441,7 @@ export class ObserverRunner {
       agent,
       source: 'observer',
       extractors: activeExtractors,
-      memory: temporaryMemory?.options,
+      memory: attemptMemory,
       priorExtractedValues: options?.priorExtractedValues,
       requestContext: internalRequestContext,
       observabilityContext: options?.observabilityContext,
@@ -487,6 +514,9 @@ export class ObserverRunner {
     model?: ConcreteObservationModel,
     hookContext?: { resourceId?: string; trigger?: ObserveTrigger },
     timeZone?: string,
+    mainAgent?: ProcessorContext['agent'],
+    currentModel?: ObservationModelContext,
+    wasTruncated?: boolean,
   ): Promise<{
     results: Map<string, MultiThreadObserverResult>;
     usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
@@ -518,6 +548,9 @@ export class ObserverRunner {
       model,
       hookContext?.resourceId,
       timeZone,
+      mainAgent,
+      currentModel,
+      wasTruncated,
     );
 
     for (const threadId of allThreadOrder) {
@@ -551,6 +584,9 @@ export class ObserverRunner {
     model?: ConcreteObservationModel,
     resourceId?: string,
     timeZone?: string,
+    mainAgent?: ProcessorContext['agent'],
+    currentModel?: ObservationModelContext,
+    wasTruncated?: boolean,
   ): Promise<{
     results: Map<string, MultiThreadObserverResult>;
     usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
@@ -564,22 +600,23 @@ export class ObserverRunner {
       (total, messages) => total + this.tokenCounter.countMessages(messages),
       0,
     );
-    const resolvedModel = (() => {
-      try {
-        return model ? { model } : this.resolveModel(inputTokens);
-      } catch (error) {
-        this.mastra?.getLogger?.().error('OM multi-thread observer model resolution failed', {
-          diagnostic: formatOmError(error),
-          inputTokens,
-          threadIds: {
-            sample: threadOrder.slice(0, 10).map(threadId => threadId.slice(0, 128)),
-            total: threadOrder.length,
-          },
-          hasRequestContext: Boolean(requestContext),
-        });
-        throw error;
-      }
-    })();
+    let resolvedModel: Awaited<ReturnType<ObservationModelResolver>>;
+    try {
+      resolvedModel = model
+        ? { model }
+        : await this.resolveModel(inputTokens, { requestContext, mainAgent, currentModel });
+    } catch (error) {
+      this.mastra?.getLogger?.().error('OM multi-thread observer model resolution failed', {
+        diagnostic: formatOmError(error),
+        inputTokens,
+        threadIds: {
+          sample: threadOrder.slice(0, 10).map(threadId => threadId.slice(0, 128)),
+          total: threadOrder.length,
+        },
+        hasRequestContext: Boolean(requestContext),
+      });
+      throw error;
+    }
     const firstThreadMessages = messagesByThread.get(threadOrder[0] ?? '') ?? [];
     const extractorResolutionFailures: Array<{ slug: string; error: string }> = [];
     const activeExtractors = await resolveExtractors(
@@ -617,6 +654,7 @@ export class ObserverRunner {
             model: resolvedModel.model,
             resourceId: resourceId ?? messagesByThread.get(threadId)?.[0]?.resourceId,
             timeZone,
+            wasTruncated,
           },
         );
         results.set(threadId, {
@@ -646,7 +684,6 @@ export class ObserverRunner {
       return { results, usage: totalUsage };
     }
 
-    let temporaryMemory: Awaited<ReturnType<typeof createTemporaryOmMemoryContext>> | undefined;
     const agent = this.createAgent(resolvedModel.model, true, undefined, activeExtractors);
     const internalRequestContext = withOmInternalThreadId(requestContext, agent.id);
 
@@ -658,7 +695,7 @@ export class ObserverRunner {
         messagesByThread,
         threadOrder,
         priorMetadataByThread,
-        undefined,
+        wasTruncated,
         this.observationConfig.threadTitle,
         activeExtractors,
         { attachmentFilter: multiThreadAttachmentFilter, timeZone },
@@ -677,6 +714,7 @@ export class ObserverRunner {
             metadata: {
               omThreadCount: threadOrder.length,
               omPreviousObserverTokens: this.observationConfig.previousObserverTokens,
+              omWasTruncated: wasTruncated ?? false,
               omThreadTitleEnabled: this.observationConfig.threadTitle,
               ...(resolvedModel.selectedThreshold !== undefined
                 ? { omSelectedThreshold: resolvedModel.selectedThreshold }
@@ -688,15 +726,18 @@ export class ObserverRunner {
               this.withAbortCheck(async () => {
                 try {
                   const streamResult = await agent.stream(observerMessages, {
+                    // One prompt, one reply. Without this cap, a reply cut off with finishReason
+                    // "other" or "unknown" makes the loop continue from the partial text, and
+                    // assertCompleteModelResponse would only see the final step's "stop".
+                    maxSteps: 1,
                     // OM owns the retry budget; avoid multiplying provider attempts.
                     modelSettings: { ...this.observationConfig.modelSettings, maxRetries: 0 },
                     providerOptions: this.observationConfig.providerOptions as any,
-                    ...(temporaryMemory ? { memory: temporaryMemory.options } : {}),
                     abortSignal: operationAbortSignal,
                     ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                     ...childObservabilityContext,
                   });
-                  return await streamResult.getFullOutput();
+                  return assertCompleteModelResponse(await streamResult.getFullOutput(), 'OM multi-thread observer');
                 } catch (error) {
                   this.mastra?.getLogger?.().error('OM multi-thread observer provider call failed', {
                     diagnostic: formatOmError(error),

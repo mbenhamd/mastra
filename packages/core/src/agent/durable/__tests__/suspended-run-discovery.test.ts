@@ -647,7 +647,8 @@ describe('DurableAgent suspended-run discovery', () => {
       runId: started.runId,
     });
     const snapshot = typeof persisted?.snapshot === 'string' ? JSON.parse(persisted.snapshot) : persisted?.snapshot;
-    expect((snapshot?.context?.input as any)?.requestContextEntries).toBeUndefined();
+    // Only the Core-written (empty) run scope set is persisted (upstream #26593).
+    expect((snapshot?.context?.input as any)?.requestContextEntries).toEqual({ mastra__scopes: [] });
     expect((snapshot?.context?.input as any)?.requiredRequestContextCapabilities).toEqual({ authToken: true });
     started.cleanup();
     globalRunRegistry.delete(started.runId);
@@ -1067,7 +1068,7 @@ describe('DurableAgent suspended-run discovery', () => {
           memory: { thread: 'thread-1', resource: 'resource-1' },
         },
       ),
-    ).rejects.toMatchObject({ id: 'DURABLE_AGENT_RESUME_RUN_NOT_SUSPENDED' });
+    ).rejects.toMatchObject({ id: 'AGENT_RESUME_RUN_NOT_SUSPENDED' });
   });
 
   it('lists durable snapshots with exact ownership and tool-call identity', async () => {

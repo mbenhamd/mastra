@@ -30,6 +30,14 @@ export class WorkflowsStorageCloudflare extends WorkflowsStorage {
     return false;
   }
 
+  /**
+   * PapersFlow fork: this adapter does not implement `updateWorkflowState`, so lifecycle
+   * claims (restart/timeTravel) install the claimed generation through the snapshot.
+   */
+  supportsWorkflowStateUpdate(): boolean {
+    return false;
+  }
+
   async init(): Promise<void> {
     // Cloudflare KV is schemaless, no table creation needed
   }

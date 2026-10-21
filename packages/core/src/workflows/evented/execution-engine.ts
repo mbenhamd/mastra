@@ -117,9 +117,35 @@ export class EventedExecutionEngine extends ExecutionEngine {
     // subscriptions the run needs to make progress.
     const releaseTracking = this.mastra?.__trackEventedRun(resultPromise) ?? (() => {});
 
+    // Resolved up front: a finishing run unregisters its run-scoped workflow.
+    // A workflow Mastra can't resolve sets no such option.
+    let isForeignExecution: ((eventRequestContext: unknown, requestContext: RequestContext) => boolean) | undefined;
+    try {
+      isForeignExecution = this.resolveWorkflow(params.workflowId, params.runId)?.options?.isForeignExecution;
+    } catch {
+      isForeignExecution = undefined;
+    }
+
     const finishCb = async (event: Event, ack?: () => Promise<void>) => {
-      if (event.runId !== params.runId || event.data?.workflowId !== params.workflowId) {
+      // Another execution of this run (one that lost it to recover(), say) still
+      // publishes its finish under the same runId; it isn't this caller's result.
+      if (
+        event.runId !== params.runId ||
+        event.data?.workflowId !== params.workflowId ||
+        isForeignExecution?.(event.data?.requestContext, params.requestContext)
+      ) {
         await ack?.();
+        return;
+      }
+
+      // PF-5928 (fork L32 generations): the processor reports that a newer generation took
+      // this run over while this execution's step was running. Only this generation's caller
+      // settles on it; the new owner's caller keeps waiting for the owner's own finish.
+      if (event.type === 'workflow.superseded') {
+        await ack?.();
+        if (event.data?.executionGeneration !== executionGeneration) return;
+        await pubsub.unsubscribe('workflows-finish', finishCb);
+        resolveResult({ superseded: true });
         return;
       }
 
@@ -139,7 +165,10 @@ export class EventedExecutionEngine extends ExecutionEngine {
 
     // AWAIT subscription first - ensures listener is registered before any events fire
     try {
-      await pubsub.subscribe('workflows-finish', finishCb);
+      // Live-tail: persistent pubsubs replay retained events from 'earliest', which
+      // would hand this waiter stale finish events (e.g. this run's own prior suspend).
+      // Safe because we subscribe before publishing the start/resume event below.
+      await pubsub.subscribe('workflows-finish', finishCb, { startFrom: 'latest' });
     } catch (err) {
       releaseTracking();
       this.mastra?.getLogger()?.error('Failed to subscribe to workflows-finish:', err);
@@ -258,8 +287,16 @@ export class EventedExecutionEngine extends ExecutionEngine {
           },
         });
       } else if (params.restart) {
+        // A restart publishes an event that a worker has to consume. Unlike the
+        // durable-agent recovery path (`DurableAgent.recover()` calls
+        // `ensureEngineWorkersStarted()` first) this path never started them, so
+        // a restart issued before `startWorkers()` was published to no one: the
+        // run stalled forever with no error and no rejection. Starting them here
+        // is a no-op when they are already running or are disabled.
+        await this.mastra?.__ensureExecutionWorkersStarted();
         const prevStepId = getStepId(this.resolveWorkflow(params.workflowId, params.runId), params.restart.activePaths);
-        const prevResult = params.restart.stepResults[prevStepId ?? 'input'];
+        const prevResult =
+          params.restart.stepResults[params.restart.isPreFirstStepRestart ? 'input' : (prevStepId ?? 'input')];
         await pubsub.publish('workflows', {
           type: 'workflow.start',
           runId: params.runId,
@@ -272,7 +309,10 @@ export class EventedExecutionEngine extends ExecutionEngine {
             executionPath: params.restart.activePaths,
             stepResults: params.restart.stepResults,
             restart: params.restart,
-            prevResult: { status: 'success', output: prevResult?.payload },
+            prevResult: {
+              status: 'success',
+              output: params.restart.isPreFirstStepRestart ? prevResult : prevResult?.payload,
+            },
             requestContext: params.requestContext.toJSON(),
             actor: params.actor,
             format: params.format,
@@ -313,6 +353,12 @@ export class EventedExecutionEngine extends ExecutionEngine {
       resultData = await resultPromise;
     } finally {
       releaseTracking();
+    }
+
+    // Same outcome as the default engine's superseded execution (resolveRejectedTerminalWrite):
+    // canceled with no steps, and no lifecycle callbacks — the new owner runs those.
+    if (resultData?.superseded === true) {
+      return { status: 'canceled', steps: {} } as TOutput;
     }
 
     // Extract state from resultData (stored in stepResults.__state)

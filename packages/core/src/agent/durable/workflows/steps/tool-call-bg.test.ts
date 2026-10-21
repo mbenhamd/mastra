@@ -83,7 +83,10 @@ function makeMessageList() {
     updateToolInvocation: vi.fn().mockReturnValue(true),
     updateMessageMetadataByToolCallId: vi.fn().mockReturnValue(true),
     add: vi.fn(),
-    get: { all: { db: vi.fn().mockReturnValue([]) } },
+    get: {
+      all: { db: vi.fn().mockReturnValue([]) },
+      input: { aiV5: { model: vi.fn().mockReturnValue([]) } },
+    },
     makeMessageSourceChecker: vi.fn().mockReturnValue(() => false),
     getAllSystemMessages: vi.fn().mockReturnValue([]),
     startRecording: vi.fn(),
@@ -1550,7 +1553,9 @@ describe('durable tool-call background task dispatch', () => {
           'response',
         );
       }
-      expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined);
+      expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined, {
+        beforePersist: expect.any(Function),
+      });
     },
   );
 
@@ -1610,7 +1615,10 @@ describe('durable tool-call background task dispatch', () => {
       }),
     );
 
-    expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined);
+    // Late background writes re-check that no newer execution claimed the run (#26418).
+    expect(saveQueueManager.flushMessages).toHaveBeenCalledWith(messageList, 'thread-1', undefined, {
+      beforePersist: expect.any(Function),
+    });
   });
 
   it('onExecution hook updates message metadata with startedAt/taskId', async () => {

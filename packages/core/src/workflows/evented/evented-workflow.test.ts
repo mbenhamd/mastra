@@ -553,6 +553,37 @@ describe('Workflow (Evented Engine Specific)', () => {
       expect((result as any).state).toEqual({ first: 1, second: 1 });
     });
 
+    it('treats a throwing branch condition as falsy and runs the remaining branches', async () => {
+      const id = 'conditional-throwing-condition';
+      const step1 = makeBranchStep('branch1', 5, { first: 1 });
+      const step2 = makeBranchStep('branch2', 5, { second: 1 });
+
+      const workflow = createWorkflow({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        stateSchema,
+        steps: [step1, step2],
+      });
+      workflow
+        .branch([
+          [
+            async () => {
+              throw new Error('condition boom');
+            },
+            step1,
+          ],
+          [async () => true, step2],
+        ])
+        .commit();
+
+      const result = await runWorkflow(workflow, id);
+      expect(result.status).toBe('success');
+      expect(result.steps.branch1).toBeUndefined();
+      expect(result.steps.branch2?.status).toBe('success');
+      expect((result as any).state).toEqual({ first: 0, second: 1 });
+    });
+
     it('exposes the merged state to the step after the parallel block', async () => {
       const id = 'parallel-set-state-after';
       const step1 = makeBranchStep('branch1', 30, { first: 1 });
@@ -865,11 +896,9 @@ describe('Workflow (Evented Engine Specific)', () => {
           workflowStatus: 'paused',
           metadata: {},
           output: {
-            usage: {
-              inputTokens: 0,
-              outputTokens: 0,
-              totalTokens: 0,
-            },
+            // Upstream #25402: no step reported usage, so no count is known (the
+            // watch payload is serialized, which drops the unknown keys).
+            usage: {},
           },
         },
       });
@@ -956,11 +985,9 @@ describe('Workflow (Evented Engine Specific)', () => {
           workflowStatus: 'success',
           metadata: {},
           output: {
-            usage: {
-              inputTokens: 0,
-              outputTokens: 0,
-              totalTokens: 0,
-            },
+            // Upstream #25402: no step reported usage, so no count is known (the
+            // watch payload is serialized, which drops the unknown keys).
+            usage: {},
           },
         },
       });
@@ -1442,6 +1469,98 @@ describe('Workflow (Evented Engine Specific)', () => {
         expect(executions).toEqual([2, 1, 1]);
       } finally {
         releaseSlow();
+        await mastra.stopWorkers();
+      }
+    });
+  });
+
+  describe('foreach iteration records (issue #24943)', () => {
+    it('does not copy the foreach input array into each iteration record', async () => {
+      const items = Array.from({ length: 5 }, (_, i) => i);
+
+      const seed = createStep({
+        id: 'records-seed',
+        inputSchema: z.object({}),
+        outputSchema: z.array(z.number()),
+        execute: async () => items,
+      });
+      const double = createStep({
+        id: 'records-double',
+        inputSchema: z.number(),
+        outputSchema: z.number(),
+        execute: async ({ inputData }) => inputData * 2,
+      });
+
+      const workflow = createWorkflow({
+        id: 'evented-foreach-records',
+        inputSchema: z.object({}),
+        outputSchema: z.array(z.number()),
+      });
+      workflow.then(seed).foreach(double, { concurrency: 1 }).commit();
+
+      const mastra = new Mastra({
+        logger: false,
+        storage: testStorage,
+        pubsub: new EventEmitterPubSub(),
+        workflows: { 'evented-foreach-records': workflow },
+      });
+      await mastra.startWorkers();
+
+      // PF-5928 adaptation (fork PF-2010): a completed evented foreach clears its aggregate
+      // suspension envelope from the terminal record, so the per-iteration records are read
+      // from storage just before that completion write instead of from the terminal row.
+      const workflowsStore = await testStorage.getStore('workflows');
+      if (!workflowsStore) throw new Error('Workflows store is unavailable');
+      let iterationRecords: unknown;
+      const updateWorkflowResults = workflowsStore.updateWorkflowResults.bind(workflowsStore);
+      const updateSpy = vi.spyOn(workflowsStore, 'updateWorkflowResults').mockImplementation(async args => {
+        const written = args.result as { status?: string; suspendPayload?: unknown } | undefined;
+        if (
+          args.workflowName === 'evented-foreach-records' &&
+          args.stepId === 'records-double' &&
+          written?.status === 'success' &&
+          written.suspendPayload === undefined
+        ) {
+          const inFlight = await workflowsStore.loadWorkflowSnapshot({
+            workflowName: args.workflowName,
+            runId: args.runId,
+          });
+          iterationRecords = (inFlight?.context?.['records-double'] as any)?.suspendPayload?.__workflow_meta
+            ?.foreachOutput;
+        }
+        return updateWorkflowResults(args);
+      });
+
+      try {
+        const run = await workflow.createRun();
+        const result = await run.start({ inputData: {} });
+        expect(result.status).toBe('success');
+        if (result.status === 'success') {
+          expect(result.result).toEqual([0, 2, 4, 6, 8]);
+        }
+
+        const record = await workflowsStore.getWorkflowRunById({
+          runId: run.runId,
+          workflowName: 'evented-foreach-records',
+        });
+        const snapshot = typeof record?.snapshot === 'string' ? JSON.parse(record.snapshot) : record?.snapshot;
+        const stepResult = snapshot?.context?.['records-double'];
+        expect(stepResult?.payload).toEqual(items);
+        expect(stepResult?.suspendPayload).toBeUndefined();
+
+        const entries = Array.isArray(iterationRecords)
+          ? iterationRecords.map((entry, index) => [index, entry] as const)
+          : Object.entries((iterationRecords ?? {}) as Record<string, any>).map(
+              ([index, entry]) => [Number(index), entry] as const,
+            );
+        expect(entries).toHaveLength(items.length);
+        for (const [i, entry] of entries) {
+          expect(entry).not.toHaveProperty('payload');
+          expect(entry.status).toBe('success');
+          expect(entry.output).toBe(i * 2);
+        }
+      } finally {
+        updateSpy.mockRestore();
         await mastra.stopWorkers();
       }
     });

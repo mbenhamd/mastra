@@ -835,3 +835,19 @@ describe('MessageList step content across input-step processors (PF-5415)', () =
     expect(partsOf(list, id)?.map(part => (part as { text?: string }).text)).toEqual(['earlier step [redacted]']);
   });
 });
+
+describe('MessageList#partsSinceStepBoundary across serialize/deserialize', () => {
+  it('keeps scoping to the last opened boundary after a round-trip', () => {
+    const { list, id } = listWith(assistant([text('Old.'), toolCall('c1')]));
+    list.openStepBoundary();
+    const message = list.get.all.db().find(m => m.id === id)!;
+    message.content.parts.push(toolCall('c2'));
+
+    const before = list.partsSinceStepBoundary(message).map(p => p.type);
+    expect(before).toEqual(['tool-invocation']);
+
+    const restored = new MessageList({ threadId: 't' }).deserialize(list.serialize());
+    const restoredMessage = restored.get.all.db().find(m => m.id === id)!;
+    expect(restored.partsSinceStepBoundary(restoredMessage).map(p => p.type)).toEqual(before);
+  });
+});

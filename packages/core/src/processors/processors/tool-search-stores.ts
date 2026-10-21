@@ -30,9 +30,10 @@ export interface LoadedToolStoreContext {
  * - {@link LegacyMapLoadedToolStore} (default) keeps loaded state in an in-memory
  *   map with TTL cleanup. This preserves the original processor behavior.
  * - {@link ContextLoadedToolStore} ('context' mode, opt-in) derives loaded state
- *   from the conversation messages. Restart-safe, requires no memory, and de-loads
- *   automatically when a result block is no longer present in the messages — parity
- *   with native provider tool-search.
+ *   from the conversation messages. Works without memory, and survives a restart
+ *   whenever the messages are available again (Agent memory with message history, or
+ *   the caller resending the conversation); de-loads a tool once its result block has
+ *   been observed and then leaves the messages — parity with native provider tool-search.
  */
 export interface LoadedToolStore {
   /** Resolve the set of currently-loaded tool names for this context. */

@@ -12,6 +12,7 @@ import type { LoadedToolStore, LoadedToolStoreContext } from './tool-search-stor
 import {
   LegacyMapLoadedToolStore,
   ContextLoadedToolStore,
+  deriveLoadedNamesFromMessages,
   TOOL_SEARCH_AUTO_LOAD_ACTIVATION_TYPE,
   TOOL_SEARCH_AUTO_LOAD_ACTIVATION_VERSION,
 } from './tool-search-stores';
@@ -83,7 +84,12 @@ export interface ToolSearchProcessorOptions {
     topK?: number;
 
     /**
-     * Minimum relevance score (0-1) for including a tool in search results
+     * Minimum relevance score for including a tool in search results.
+     * Scores are raw BM25 relevance plus name-match boosts (+5 exact ID term,
+     * +2 ID substring), are not normalized, and can exceed 1. Scores depend on
+     * the tool catalog, so thresholds may not carry over between tool sets.
+     * Tools scoring less than or equal to this value are excluded. Small values
+     * such as 0 to 0.5 require some term overlap.
      * @default 0
      */
     minScore?: number;
@@ -114,8 +120,11 @@ export interface ToolSearchProcessorOptions {
    * - `'context'`: derived from canonical assistant tool results in the
    *   conversation. `load_tool` results must contain `loaded`; `search_tools`
    *   results activate tools only when auto-load emitted an explicit activation
-   *   receipt. Restart-safe, requires no memory, and de-loads automatically when
-   *   the result block is no longer present in the messages.
+   *   receipt. Requires no memory, and de-loads automatically when the result
+   *   block is no longer present in the messages. Loaded state never outlives the
+   *   request in process memory: it survives a restart or resume only when the
+   *   messages are available again (Agent memory with message history, a resume
+   *   boundary supplying them, or the caller resending the conversation).
    *
    * @default 'in-memory'
    */
@@ -462,8 +471,11 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
    * Resolution:
    * - If `stepArgs` are supplied, resolve through the store with the live messages.
    * - Otherwise (resume path) resolve from the store using the thread ID derived
-   *   from the request context. The context store falls back to its same-process
-   *   supplemental set.
+   *   from the request context. The context store derives loaded names from the
+   *   persisted `messages` supplied by the resume boundary, or else from the
+   *   thread messages returned by `getMessages` (e.g. after a restart, when no
+   *   in-process state survives). `runMessages` from an in-flight run add the
+   *   tools that run loaded before it was saved, for either store.
    *
    * `tools` carries the resumed request's resolved tools. Without them a loaded
    * request-scoped tool has no entry in the static catalog, so the approved call
@@ -475,6 +487,9 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     /** Persisted messages supplied by a resume boundary before a live step exists. */
     messages?: ProcessInputStepArgs['messages'];
     tools?: Record<string, unknown>;
+    getMessages?: () => Promise<ProcessInputStepArgs['messages']>;
+    /** Messages of an in-flight run not yet saved to memory (durable recovery in a fresh process). */
+    runMessages?: ProcessInputStepArgs['messages'];
   }): Promise<Record<string, Tool<any, any>>> {
     if (args?.stepArgs) {
       const loadedNames = await this.store.getLoadedNames(this.makeStoreContext(args.stepArgs));
@@ -488,7 +503,18 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     }
 
     const threadId = this.resolveThreadId(args?.requestContext);
-    const loadedNames = await this.store.getLoadedNames({ threadId, args: undefined, messages: args?.messages });
+    const persistedMessages =
+      args?.messages ??
+      (this.store instanceof ContextLoadedToolStore && args?.getMessages ? await args.getMessages() : undefined);
+    const loadedNames = new Set(
+      await this.store.getLoadedNames({ threadId, args: undefined, messages: persistedMessages }),
+    );
+    // Neither store keeps state across a process: tools this run loaded are still
+    // recorded in its own (possibly not yet saved) messages. Only canonical
+    // assistant tool results count (see deriveLoadedNamesFromMessages).
+    if (args?.runMessages?.length) {
+      for (const name of deriveLoadedNamesFromMessages({ messages: args.runMessages })) loadedNames.add(name);
+    }
     return this.getLoadedTools(this.catalogForStep(args?.tools), loadedNames, args?.requestContext);
   }
 

@@ -17,10 +17,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import type { MastraDBMessage } from '../../../message-list';
 import { MessageList } from '../../../message-list';
+import { SaveQueueManager } from '../../../save-queue';
 import { createToolCallIdentityDigest } from '../../../tool-call-identity';
 import { ensureRemoteAbortListener } from '../../abort-transport';
 import { globalRunRegistry } from '../../run-registry';
-import { resolveRuntimeDependencies, toolApprovalRequirement } from '../../utils/resolve-runtime';
+import {
+  rebuildRunToolsFromMastra,
+  resolveRuntimeDependencies,
+  toolApprovalRequirement,
+} from '../../utils/resolve-runtime';
 import { createDurableLLMMappingStep } from './llm-mapping';
 import { createDurableToolCallStep } from './tool-call';
 
@@ -305,6 +310,85 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('cold-worker durable approval resume', () => {
+  it.each([TOOL_NAME, 'agent-worker'])(
+    'restores cold-worker context for %s without persisting the copied transcript',
+    async toolName => {
+      const messageList = new MessageList({ threadId: THREAD_ID, resourceId: RESOURCE_ID });
+      messageList.add('Original parent request', 'input');
+      messageList.add(
+        {
+          id: 'parent-assistant',
+          role: 'assistant',
+          createdAt: new Date(),
+          content: {
+            format: 2,
+            parts: ['call-1', 'call-2'].map(toolCallId => ({
+              type: 'tool-invocation' as const,
+              toolInvocation: { state: 'call' as const, toolCallId, toolName, args: TOOL_ARGS },
+            })),
+          },
+        },
+        'response',
+      );
+      const messageListState = messageList.serialize();
+      const memory = {
+        recall: vi.fn().mockResolvedValue({ messages: messageList.get.all.db() }),
+        saveMessages: vi.fn().mockResolvedValue([]),
+      };
+      const saveQueueManager = new SaveQueueManager({ memory: memory as any });
+      const flush = vi.spyOn(saveQueueManager, 'flushMessages');
+      const execute = vi.fn(async (_args, context) => {
+        expect(JSON.stringify(context.messages)).toContain('Original parent request');
+        await context.suspend({}, { requireToolApproval: true });
+      });
+      expect(globalRunRegistry.has(RUN_ID)).toBe(false);
+      for (const toolCallId of ['call-1', 'call-2']) {
+        vi.mocked(rebuildRunToolsFromMastra).mockResolvedValueOnce({
+          tools: { [toolName]: { execute } },
+          memory,
+          saveQueueManager,
+        } as any);
+        const suspend = vi.fn().mockResolvedValue('suspended');
+        await (createDurableToolCallStep() as any).execute({
+          inputData: { toolCallId, toolName, args: TOOL_ARGS },
+          mastra: { getLogger: () => undefined },
+          suspend,
+          resumeData: { approved: true },
+          // Fork (PF-1703): a resume must present the exact persisted envelope.
+          suspendData: {
+            version: 1,
+            type: 'approval',
+            approvalSource: 'tool-gate',
+            runId: RUN_ID,
+            iterationCount: 0,
+            stepId: 'durable-tool-call',
+            toolCallId,
+            toolName,
+            args: TOOL_ARGS,
+            identityDigest: createToolCallIdentityDigest({ toolCallId, toolName, args: TOOL_ARGS }),
+          },
+          requestContext: new Map(),
+          getInitData: () => makeInitData(),
+          state: { messageListState },
+          getStepResult: () => undefined,
+          [PUBSUB_SYMBOL]: mockPubsub(),
+        });
+        expect(suspend).toHaveBeenCalledTimes(1);
+      }
+
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(memory.saveMessages).not.toHaveBeenCalled();
+      expect(flush).not.toHaveBeenCalled();
+      for (const [, context] of execute.mock.calls) {
+        expect(context.getMessages).toBeUndefined();
+      }
+      expect(globalRunRegistry.has(RUN_ID)).toBe(false);
+      expect(messageList.serialize()).toEqual(messageListState);
+    },
+  );
+});
+
 describe('cross-process durable step handoff', () => {
   it('installs the replayed abort listener before a tool-call step uses the run registry', async () => {
     const pubsub = mockPubsub();
@@ -312,7 +396,7 @@ describe('cross-process durable step handoff', () => {
 
     await runToolCallStep({ approved: false }, makeSuspendEnvelope(), vi.fn(), pubsub);
 
-    expect(ensureRemoteAbortListener).toHaveBeenCalledWith(pubsub, RUN_ID, RUNTIME_BINDING_ID);
+    expect(ensureRemoteAbortListener).toHaveBeenCalledWith(pubsub, RUN_ID, RUNTIME_BINDING_ID, expect.anything());
   });
 
   it('passes the live resume request context when the mapping step rehydrates runtime tools', async () => {
@@ -349,7 +433,7 @@ describe('cross-process durable step handoff', () => {
       [PUBSUB_SYMBOL]: pubsub,
     });
 
-    expect(ensureRemoteAbortListener).toHaveBeenCalledWith(pubsub, RUN_ID, RUNTIME_BINDING_ID);
+    expect(ensureRemoteAbortListener).toHaveBeenCalledWith(pubsub, RUN_ID, RUNTIME_BINDING_ID, expect.anything());
     expect(resolveRuntimeDependencies).toHaveBeenCalledWith(expect.objectContaining({ runId: RUN_ID, requestContext }));
   });
 });

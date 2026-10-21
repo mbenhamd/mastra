@@ -43,6 +43,8 @@ describe('prepare memory step source-write fencing', () => {
       methodType: 'stream',
       instructions: 'resume',
       memory,
+      // Fork: memory reads/writes always pass through the FGA authorizer.
+      authorizeMemory: vi.fn(async () => {}),
       resumeContext: {
         snapshot: {
           context: {

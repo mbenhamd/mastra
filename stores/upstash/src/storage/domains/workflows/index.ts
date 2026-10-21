@@ -1,12 +1,21 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   createStorageErrorId,
+  isRunFenceConflictError,
   normalizePerPage,
+  resolveRunFence,
+  TABLE_WORKFLOW_RUN_OWNERS,
   TABLE_WORKFLOW_SNAPSHOT,
   WorkflowsStorage,
   ensureDate,
 } from '@mastra/core/storage';
 import type {
+  ClaimRunOwnershipInput,
+  ClaimRunOwnershipResult,
+  RenewRunOwnershipInput,
+  RenewRunOwnershipResult,
+  RunFence,
+  RunOwnershipRecord,
   StorageListWorkflowRunsInput,
   WorkflowRun,
   WorkflowRuns,
@@ -16,6 +25,16 @@ import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 import type { Redis } from '@upstash/redis';
 import { UpstashDB, resolveUpstashConfig } from '../../db';
 import type { UpstashDomainConfig } from '../../db';
+import {
+  claimRunOwnership,
+  evalFenced,
+  getRunOwnership,
+  releaseRunOwnership,
+  renewRunOwnership,
+  runClaimKey,
+  writeBatch,
+} from '../run-fencing';
+import type { RunFenceCheck } from '../run-fencing';
 import { getKey } from '../utils';
 
 type WorkflowRunRecord = {
@@ -62,8 +81,64 @@ export class WorkflowsUpstash extends WorkflowsStorage {
     };
   }
 
+  override supportsRunFencing(): boolean {
+    return true;
+  }
+
   async dangerouslyClearAll(): Promise<void> {
     await this.#db.deleteData({ tableName: TABLE_WORKFLOW_SNAPSHOT });
+    await this.#db.scanAndDelete(`${runClaimKey(TABLE_WORKFLOW_RUN_OWNERS, '')}*`);
+  }
+
+  #runFenceCheck(fence: RunFence | undefined, runId: string, operation: string): RunFenceCheck | undefined {
+    const resolved = resolveRunFence(this, fence, runId);
+    return resolved && { claims: TABLE_WORKFLOW_RUN_OWNERS, fence: resolved, operation };
+  }
+
+  #ownershipError(operation: string, runId: string, error: unknown): MastraError {
+    return new MastraError(
+      {
+        id: createStorageErrorId('UPSTASH', operation, 'FAILED'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.THIRD_PARTY,
+        details: { runId },
+      },
+      error,
+    );
+  }
+
+  // Each operation is one script over the run's ownership hash, so racing
+  // claimers and renewals serialize on Redis and resolve to a single winner.
+  override async claimRunOwnership(args: ClaimRunOwnershipInput): Promise<ClaimRunOwnershipResult> {
+    try {
+      return await claimRunOwnership(this.client, args);
+    } catch (error) {
+      throw this.#ownershipError('CLAIM_RUN_OWNERSHIP', args.runId, error);
+    }
+  }
+
+  override async renewRunOwnership(args: RenewRunOwnershipInput): Promise<RenewRunOwnershipResult> {
+    try {
+      return await renewRunOwnership(this.client, args);
+    } catch (error) {
+      throw this.#ownershipError('RENEW_RUN_OWNERSHIP', args.runId, error);
+    }
+  }
+
+  override async releaseRunOwnership(fence: RunFence): Promise<boolean> {
+    try {
+      return await releaseRunOwnership(this.client, fence);
+    } catch (error) {
+      throw this.#ownershipError('RELEASE_RUN_OWNERSHIP', fence.runId, error);
+    }
+  }
+
+  override async getRunOwnership({ runId }: { runId: string }): Promise<RunOwnershipRecord | null> {
+    try {
+      return await getRunOwnership(this.client, runId);
+    } catch (error) {
+      throw this.#ownershipError('GET_RUN_OWNERSHIP', runId, error);
+    }
   }
 
   private async getWorkflowRunRecord({
@@ -116,13 +191,18 @@ export class WorkflowsUpstash extends WorkflowsStorage {
     stepId,
     result,
     requestContext,
+    state,
+    fence,
   }: {
     workflowName: string;
     runId: string;
     stepId: string;
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
+    state?: Record<string, any>;
+    fence?: RunFence;
   }): Promise<Record<string, StepResult<any, any, any, any>>> {
+    const check = this.#runFenceCheck(fence, runId, 'updateWorkflowResults');
     try {
       const key = getKey(TABLE_WORKFLOW_SNAPSHOT, {
         namespace: 'workflows',
@@ -145,6 +225,7 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         local workflowName = ARGV[6]
         local runId = ARGV[7]
         local timestamp = tonumber(ARGV[8])
+        local stateJson = ARGV[9]
 
         -- Get existing data
         local existing = redis.call('GET', key)
@@ -191,6 +272,11 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         local stepResult = cjson.decode(resultJson)
         snapshot.context[stepId] = stepResult
 
+        -- Record workflow state in the same write when provided
+        if stateJson ~= '' then
+          snapshot.context['__state'] = cjson.decode(stateJson)
+        end
+
         -- Merge request context
         local newRequestContext = cjson.decode(requestContextJson)
         if snapshot.requestContext == nil then
@@ -211,7 +297,8 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         return cjson.encode(data)
       `;
 
-      const resultJson = await this.client.eval(
+      const resultJson = await evalFenced(
+        this.client,
         luaScript,
         [key],
         [
@@ -223,7 +310,9 @@ export class WorkflowsUpstash extends WorkflowsStorage {
           workflowName,
           runId,
           String(Date.now()),
+          state === undefined ? '' : JSON.stringify(state),
         ],
+        check,
       );
 
       // Parse the result - handle both string and already-parsed object
@@ -254,10 +343,12 @@ export class WorkflowsUpstash extends WorkflowsStorage {
     workflowName,
     runId,
     opts,
+    fence,
   }: {
     workflowName: string;
     runId: string;
     opts: UpdateWorkflowStateOptions;
+    fence?: RunFence;
   }): Promise<WorkflowRunState | undefined> {
     const { expectedCancelRequest, ...stateOptions } = opts;
     if (expectedCancelRequest !== undefined) {
@@ -265,6 +356,7 @@ export class WorkflowsUpstash extends WorkflowsStorage {
     }
     opts = stateOptions;
 
+    const check = this.#runFenceCheck(fence, runId, 'updateWorkflowState');
     try {
       const key = getKey(TABLE_WORKFLOW_SNAPSHOT, {
         namespace: 'workflows',
@@ -355,7 +447,8 @@ export class WorkflowsUpstash extends WorkflowsStorage {
           ? ''
           : JSON.stringify(Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus]);
 
-      const resultJson = await this.client.eval(
+      const resultJson = await evalFenced(
+        this.client,
         luaScript,
         [key],
         [
@@ -366,6 +459,7 @@ export class WorkflowsUpstash extends WorkflowsStorage {
           expectedExecutionGeneration ?? '',
           expectedLifecycleResumeAttempt === undefined ? '' : String(expectedLifecycleResumeAttempt),
         ],
+        check,
       );
 
       if (!resultJson) {
@@ -404,8 +498,10 @@ export class WorkflowsUpstash extends WorkflowsStorage {
     snapshot: WorkflowRunState;
     createdAt?: Date;
     updatedAt?: Date;
+    fence?: RunFence;
   }): Promise<void> {
     const { namespace = 'workflows', workflowName, runId, resourceId, snapshot, createdAt, updatedAt } = params;
+    const check = this.#runFenceCheck(params.fence, runId, 'persistWorkflowSnapshot');
     try {
       const now = new Date();
       const key = getKey(TABLE_WORKFLOW_SNAPSHOT, {
@@ -424,7 +520,8 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         updatedAt: (updatedAt ?? now).toISOString(),
       };
 
-      await (this.client as any).eval(
+      await evalFenced(
+        this.client,
         `
         local existing = redis.call("GET", KEYS[1])
         local next = cjson.decode(ARGV[1])
@@ -442,8 +539,10 @@ export class WorkflowsUpstash extends WorkflowsStorage {
         `,
         [key],
         [JSON.stringify(record)],
+        check,
       );
     } catch (error) {
+      if (isRunFenceConflictError(error)) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('UPSTASH', 'PERSIST_WORKFLOW_SNAPSHOT', 'FAILED'),
@@ -515,15 +614,27 @@ export class WorkflowsUpstash extends WorkflowsStorage {
     }
   }
 
-  async deleteWorkflowRunById({ runId, workflowName }: { runId: string; workflowName: string }): Promise<void> {
+  async deleteWorkflowRunById({
+    runId,
+    workflowName,
+    fence,
+  }: {
+    runId: string;
+    workflowName: string;
+    fence?: RunFence;
+  }): Promise<void> {
+    const check = this.#runFenceCheck(fence, runId, 'deleteWorkflowRunById');
     try {
       const key = getKey(TABLE_WORKFLOW_SNAPSHOT, {
         namespace: 'workflows',
         workflow_name: workflowName,
         run_id: runId,
       });
-      await this.client.del(key);
+      const batch = writeBatch(this.client, check);
+      batch.del(key);
+      await batch.exec();
     } catch (error) {
+      if (isRunFenceConflictError(error)) throw error;
       throw new MastraError(
         {
           id: createStorageErrorId('UPSTASH', 'DELETE_WORKFLOW_RUN_BY_ID', 'FAILED'),

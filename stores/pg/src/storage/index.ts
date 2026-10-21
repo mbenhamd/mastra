@@ -36,7 +36,7 @@ import { DatasetsPG } from './domains/datasets';
 import { ExperimentsPG } from './domains/experiments';
 import { FavoritesPG } from './domains/favorites';
 import { HarnessPG } from './domains/harness';
-import { KnowledgePG } from './domains/knowledge';
+import { getPgKnowledgeIsolationKey, KnowledgePG } from './domains/knowledge';
 import { MCPClientsPG } from './domains/mcp-clients';
 import { MCPServersPG } from './domains/mcp-servers';
 import { MemoryPG } from './domains/memory';
@@ -319,7 +319,12 @@ export class PostgresStore extends MastraCompositeStore {
           workflowDefinitions: new WorkflowDefinitionsPG(domainConfig),
         }),
         ...(wants('memory') && { memory: new MemoryPG(domainConfig) }),
-        ...(wants('knowledge') && { knowledge: new KnowledgePG(domainConfig) }),
+        ...(wants('knowledge') && {
+          knowledge: new KnowledgePG({
+            ...domainConfig,
+            storageIsolationKey: config.storageIsolationKey ?? getPgKnowledgeIsolationKey(config),
+          }),
+        }),
         ...(wants('notifications') && { notifications: new NotificationsPG(domainConfig) }),
         ...(wants('observability') && { observability: new ObservabilityPG(domainConfig) }),
         ...(wants('agents') && { agents: new AgentsPG(domainConfig) }),
@@ -442,8 +447,11 @@ export class PostgresStore extends MastraCompositeStore {
       }
     };
 
-    for (const domain of Object.values(this.stores)) {
-      if (!domain || started.has(domain) || typeof domain.init !== 'function') {
+    for (const [name, domain] of Object.entries(this.stores)) {
+      // Knowledge activates lazily through getStore('knowledge'). Published Core
+      // releases without the knowledge-v2 feature would otherwise make ordinary
+      // storage init fail, so it is never initialized here.
+      if (name === 'knowledge' || !domain || started.has(domain) || typeof domain.init !== 'function') {
         continue;
       }
       started.add(domain);

@@ -1,5 +1,5 @@
 import { MastraError } from '@mastra/core/error';
-import { DOMAIN_KEYS } from '@mastra/core/storage';
+import { DOMAIN_KEYS, TABLE_MEMORY_RUN_FENCES } from '@mastra/core/storage';
 import { Client, Pool } from 'pg';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -85,6 +85,11 @@ describe('PostgresStore enabledDomains configuration', () => {
     try {
       expect(Object.keys(store.stores).sort()).toEqual([...DOMAIN_KEYS].sort());
       for (const key of DOMAIN_KEYS) {
+        // Upstream #26018: getStore('knowledge') activates Knowledge on access when init is enabled.
+        if (key === 'knowledge') {
+          expect(store.stores?.knowledge, 'knowledge should be registered by default').toBeDefined();
+          continue;
+        }
         expect(await store.getStore(key), `${key} should be registered by default`).toBeDefined();
       }
     } finally {
@@ -201,15 +206,23 @@ describe('PostgresStore memory-only initialization', () => {
         'SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = $1 ORDER BY tablename',
         [schemaName],
       );
-      expect(tables.rows.map(row => row.tablename)).toEqual([...MemoryPG.MANAGED_TABLES].sort());
+      // Upstream #26420: memory initialization also creates its run-fence table.
+      expect(tables.rows.map(row => row.tablename)).toEqual(
+        [...MemoryPG.MANAGED_TABLES, TABLE_MEMORY_RUN_FENCES].sort(),
+      );
       expect(coldStatements.filter(sql => CROSS_DOMAIN_SQL.test(sql))).toEqual([]);
 
       const warmStatements = await captureStatements(() => warm.init());
       const catalogStatements = warmStatements.filter(sql => /(?:pg_catalog|information_schema)\./i.test(sql));
 
-      expect(warmStatements.length).toBeGreaterThanOrEqual(1);
-      expect(warmStatements.length).toBeLessThanOrEqual(3);
-      expect(warmStatements.every(sql => /^\s*SELECT\b/i.test(sql))).toBe(true);
+      // Upstream #25906 repairs observational-memory rows retired by older adapters on every init:
+      // one data UPDATE of supersededBy, never DDL. Everything else stays read-only catalog work.
+      const supersededRepair = warmStatements.filter(sql => /^\s*UPDATE\b[\s\S]*SET "supersededBy" = h\.id/i.test(sql));
+      expect(supersededRepair).toHaveLength(1);
+      const catalogWork = warmStatements.filter(sql => !supersededRepair.includes(sql));
+      expect(catalogWork.length).toBeGreaterThanOrEqual(1);
+      expect(catalogWork.length).toBeLessThanOrEqual(3);
+      expect(catalogWork.every(sql => /^\s*SELECT\b/i.test(sql))).toBe(true);
       expect(catalogStatements).toHaveLength(3);
       expect(count(catalogStatements, /pg_catalog\.pg_tables/i)).toBe(1);
       expect(count(catalogStatements, /SELECT c\.relname AS table_name[\s\S]*JOIN pg_catalog\.pg_attribute a/i)).toBe(

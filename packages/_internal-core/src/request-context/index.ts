@@ -31,6 +31,28 @@ export const MASTRA_RESOURCE_ID_KEY = 'mastra__resourceId';
 export const MASTRA_THREAD_ID_KEY = 'mastra__threadId';
 
 /**
+ * Reserved key for setting agent scopes from middleware.
+ *
+ * Holds a `string[]` of `<type>:<value>` addresses (for example `org:acme`,
+ * `resource:user-1`, `thread:t-9`). Scope types are arbitrary; `resource:` and
+ * `thread:` are the conventions Memory reads as the run's resource and thread.
+ * Middleware-set scopes are combined with the agent's `scopes` resolver and the
+ * per-call `scopes` option. Conflicting `resource:`/`thread:` values throw.
+ *
+ * During a run, the agent passes tools, processors and sub-agents a copy of the
+ * request context whose `mastra__scopes` holds only the non-identity scopes;
+ * the caller's own request context is never modified.
+ *
+ * @example
+ * ```typescript
+ * // In your auth middleware:
+ * const requestContext = c.get('requestContext');
+ * requestContext.set(MASTRA_SCOPES_KEY, [`org:${user.orgId}`, `resource:${user.id}`]);
+ * ```
+ */
+export const MASTRA_SCOPES_KEY = 'mastra__scopes';
+
+/**
  * Reserved key for storing version overrides on RequestContext.
  * When set, sub-agent delegation resolves versioned agents from these overrides.
  *
@@ -122,6 +144,19 @@ function addSpanTruncationMarker(snapshot: Record<string, unknown>, emittedKeys:
       delete snapshot[key];
     }
   }
+}
+
+/**
+ * Whether a request-context key is reserved for Mastra itself.
+ *
+ * Framework keys use the `mastra__` prefix (e.g. `mastra__threadId`,
+ * `mastra__authToken`) and internal runtime plumbing uses the `__mastra_`
+ * prefix (e.g. the channel render context, which holds live platform adapters).
+ * Reserved keys are framework state rather than caller-provided data, so they
+ * are left out of span serialization.
+ */
+export function isReservedRequestContextKey(key: string): boolean {
+  return key.startsWith('mastra__') || key.startsWith('__mastra_');
 }
 
 export type VersionSelector = { versionId: string } | { status: 'draft' | 'published' };
@@ -580,17 +615,26 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
   /**
    * Returns a bounded snapshot for observability span input.
    *
-   * Unlike `toJSON`, this method never traverses stored objects. It redacts the
-   * reserved raw auth token and replaces non-primitive values with type labels,
-   * preventing the internal registry from exposing auth or nested runtime state
-   * when observability serializers inspect a RequestContext instance.
+   * Unlike `toJSON`, this method never traverses stored objects. It omits
+   * reserved Mastra keys (`mastra__*`, `__mastra_*`: the raw auth token,
+   * delegated memory and live channel adapters) and replaces non-primitive
+   * values with type labels, preventing the internal registry from exposing
+   * auth or nested runtime state when observability serializers inspect a
+   * RequestContext instance.
    */
   public serializeForSpan(): Record<string, unknown> {
     const safe: Record<string, unknown> = {};
     const emittedKeys: string[] = [];
     let keyCount = 0;
     let truncated = false;
+    let reservedKeyCount = 0;
     for (const [key, value] of this.registry.entries()) {
+      // Reserved keys (including the raw auth token) are framework state, not
+      // caller data; omit them without marking the snapshot as truncated.
+      if (isReservedRequestContextKey(key)) {
+        reservedKeyCount += 1;
+        continue;
+      }
       if (keyCount >= SPAN_CONTEXT_MAX_KEYS) {
         truncated = true;
         break;
@@ -598,9 +642,7 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
       const safeKey = truncateSpanString(key, SPAN_CONTEXT_MAX_STRING_BYTES);
 
       let safeValue: unknown;
-      if (key === MASTRA_AUTH_TOKEN_KEY) {
-        safeValue = '[REDACTED]';
-      } else if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') {
+      if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') {
         safeValue = value;
       } else if (typeof value === 'string') {
         safeValue = truncateSpanString(value, SPAN_CONTEXT_MAX_STRING_BYTES);
@@ -623,7 +665,7 @@ export class RequestContext<Values extends Record<string, any> | unknown = unkno
       emittedKeys.push(safeKey);
       keyCount += 1;
     }
-    if (truncated || keyCount < this.registry.size) {
+    if (truncated || keyCount + reservedKeyCount < this.registry.size) {
       addSpanTruncationMarker(safe, emittedKeys);
     }
     return safe;

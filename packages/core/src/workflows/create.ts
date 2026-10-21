@@ -13,16 +13,20 @@
  * By keeping the Workflow class in `workflow.ts` and the factories here,
  * neither module needs to import the other's runtime dependencies.
  */
+import { ConsoleLogger } from '../logger';
 import { copyProcessorWorkflowTraits } from '../processors/is-processor-workflow';
 import type { InferPublicSchema, InferPublicSchemaInput, PublicSchema } from '../schema';
 import { createWorkflow as createEventedWorkflowImpl } from './evented/workflow';
 import type { Step } from './step';
-import type { CreateWorkflowParams, DefaultEngineType, InferSchemaOutput } from './types';
+import type { CreateWorkflowParams, DefaultEngineType, InferSchemaOutput, InferWorkflowRequestContext } from './types';
 import { Workflow } from './workflow';
 
 /**
  * Creates a workflow for composing typed steps. Declaring a `schedule`
- * automatically selects the evented engine.
+ * registers cron fires with the Mastra scheduler. It also switches the
+ * workflow to the evented engine, but only when the `MASTRA_WORKERS`
+ * environment variable is set (split-worker deployments); otherwise the
+ * engine does not change.
  *
  * @example
  * `yourStep` is a configured step with string input and output.
@@ -53,18 +57,13 @@ export function createWorkflow<
   TSteps extends Step<string, any, any, any, any, any, DefaultEngineType>[] = Step[],
   TRequestContextSchema extends PublicSchema<any> | undefined = undefined,
 >(params: CreateWorkflowParams<TWorkflowId, TStateSchema, TInputSchema, TOutputSchema, TSteps, TRequestContextSchema>) {
-  if (params.schedule) {
-    return createEventedWorkflowImpl(params as any) as unknown as Workflow<
-      DefaultEngineType,
-      TSteps,
-      TWorkflowId,
-      InferSchemaOutput<TStateSchema>,
-      InferPublicSchema<TInputSchema>,
-      InferPublicSchema<TOutputSchema>,
-      InferPublicSchema<TInputSchema>,
-      InferSchemaOutput<TRequestContextSchema>,
-      InferPublicSchemaInput<TInputSchema>
-    >;
+  // Any non-empty MASTRA_WORKERS, including `false` on the API process, marks a
+  // split-worker deployment, where every process must pick the same engine.
+  if (params.schedule !== undefined && process.env.MASTRA_WORKERS?.trim()) {
+    new ConsoleLogger({ level: 'warn' }).warn(
+      `Workflow "${params.id}" declares \`schedule\` and MASTRA_WORKERS is set, so it runs on the evented engine for split-worker scheduling. This requires storage that supports concurrent updates. To keep the default engine, unset MASTRA_WORKERS on every process; to make the choice explicit, import createWorkflow from @mastra/core/workflows/evented.`,
+    );
+    return createEventedWorkflow(params);
   }
   return new Workflow<
     DefaultEngineType,
@@ -74,7 +73,7 @@ export function createWorkflow<
     InferPublicSchema<TInputSchema>,
     InferPublicSchema<TOutputSchema>,
     InferPublicSchema<TInputSchema>,
-    InferSchemaOutput<TRequestContextSchema>,
+    InferWorkflowRequestContext<TRequestContextSchema>,
     InferPublicSchemaInput<TInputSchema>
   >(params as any);
 }
@@ -83,7 +82,7 @@ export function createWorkflow<
  * @internal Build a workflow on the evented execution engine.
  *
  * Used by internal code (agentic loop, prepare-stream) that always needs the
- * evented engine regardless of whether a schedule is declared.
+ * evented engine.
  */
 export function createEventedWorkflow<
   TWorkflowId extends string = string,
@@ -101,7 +100,7 @@ export function createEventedWorkflow<
     InferPublicSchema<TInputSchema>,
     InferPublicSchema<TOutputSchema>,
     InferPublicSchema<TInputSchema>,
-    InferSchemaOutput<TRequestContextSchema>,
+    InferWorkflowRequestContext<TRequestContextSchema>,
     InferPublicSchemaInput<TInputSchema>
   >;
 }

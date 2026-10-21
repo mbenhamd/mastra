@@ -341,7 +341,19 @@ describe('Harness.attachments', () => {
     const { harness, agent } = setupHarness();
     agent.enqueueRun({ finishReason: 'stop', text: 'queued reply' });
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
-    const pngBytes = new TextEncoder().encode('PNGDATA');
+    // A real PNG signature: the prompt conversion now validates inline image
+    // content (upstream) and replaces unrecognisable bytes with a placeholder.
+    const pngBytes = new Uint8Array([
+      0x89,
+      0x50,
+      0x4e,
+      0x47,
+      0x0d,
+      0x0a,
+      0x1a,
+      0x0a,
+      ...new TextEncoder().encode('PNGDATA'),
+    ]);
     const result = await harness.attachments.upload({
       sessionId: session.id,
       data: pngBytes,
@@ -370,9 +382,9 @@ describe('Harness.attachments', () => {
     // The decoded bytes must be the original PNG bytes, NOT `base64,undefined`.
     const decoded =
       filePart?.data instanceof Uint8Array
-        ? Buffer.from(filePart.data).toString()
-        : Buffer.from(String(filePart?.data), 'base64').toString();
-    expect(decoded).toBe('PNGDATA');
+        ? Buffer.from(filePart.data)
+        : Buffer.from(String(filePart?.data).replace(/^data:[^,]*,/, ''), 'base64');
+    expect(decoded.equals(Buffer.from(pngBytes))).toBe(true);
   });
 
   it('dispatches a queued turn with NO attachments as a bare string (unchanged)', async () => {

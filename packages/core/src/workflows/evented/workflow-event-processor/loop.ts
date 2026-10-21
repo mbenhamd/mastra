@@ -321,6 +321,97 @@ export async function processWorkflowForEach(
   const idx = currentResult?.output?.length ?? 0;
   const targetLen = (prevResult as any)?.output?.length ?? 0;
 
+  // Fork: aggregate every iteration's durable suspension state (fails closed on a corrupted
+  // envelope). The step-level payload still mirrors the first suspension for user-facing
+  // compatibility; upstream #25639 keeps the step's existing workflow metadata.
+  const publishSuspendedState = async () => {
+    let suspension: ReturnType<typeof aggregateEventedForeachSuspensions>;
+    try {
+      suspension = aggregateEventedForeachSuspensions(durableIterationResults ?? currentResult.output);
+    } catch (error) {
+      await pubsub.publish('workflows', {
+        type: 'workflow.fail',
+        runId,
+        data: {
+          ...lifecycleExecution,
+          parentWorkflow,
+          workflowId,
+          runId,
+          executionPath,
+          resumeSteps,
+          stepResults,
+          prevResult: {
+            status: 'failed',
+            error: error instanceof Error ? error : new Error('Invalid workflow resume label metadata'),
+          },
+          activeStepsPath,
+          requestContext,
+          state: currentState,
+          outputOptions,
+        },
+      });
+      return;
+    }
+    if (!suspension) return;
+
+    const suspendMeta: {
+      foreachIndex?: number;
+      resumeLabels?: Record<string, { stepId: string; foreachIndex?: number }>;
+    } = {
+      foreachIndex: suspension.firstSuspendedIndex,
+    };
+    if (Object.keys(suspension.resumeLabels).length > 0) {
+      suspendMeta.resumeLabels = suspension.resumeLabels;
+    }
+
+    const aggregatedSuspendPayload = {
+      ...suspension.firstSuspendPayload,
+      __workflow_meta: {
+        ...(currentResult?.suspendPayload?.__workflow_meta ?? {}),
+        ...(suspension.firstSuspendPayload?.__workflow_meta ?? {}),
+        ...suspendMeta,
+        foreachOutput: suspension.foreachOutput,
+      },
+    };
+
+    // Re-suspend the workflow - there are still pending iterations
+    // Use workflow.step.end with suspended status to update storage
+    await pubsub.publish('workflows', {
+      type: 'workflow.step.end',
+      runId,
+      data: {
+        ...lifecycleExecution,
+        parentWorkflow,
+        workflowId,
+        runId,
+        executionPath,
+        resumeSteps,
+        stepResults: {
+          ...stepResults,
+          [getEntryId(step.step)]: {
+            ...currentResult,
+            status: 'suspended',
+            suspendedAt: Date.now(),
+            suspendPayload: aggregatedSuspendPayload,
+          },
+        },
+        prevResult: {
+          status: 'suspended',
+          output: currentResult.output,
+          suspendPayload: aggregatedSuspendPayload,
+          payload: currentResult.payload,
+          startedAt: currentResult.startedAt,
+          suspendedAt: Date.now(),
+        },
+        activeStepsPath,
+        requestContext,
+        actor,
+        state: currentState,
+        outputOptions,
+      },
+    });
+  };
+
   // Handle resume with forEachIndex: kick off the targeted iteration resume
   if (forEachIndex !== undefined && resumeSteps?.length > 0 && idx > 0) {
     // Validate forEachIndex is within bounds to fail loudly instead of silently no-op
@@ -403,93 +494,7 @@ export async function processWorkflowForEach(
 
     const suspendedIterations = currentResult.output.filter(isEventedForeachSuspensionResult);
     if (suspendedIterations.length > 0) {
-      // Collect every iteration's durable suspension state. The step-level
-      // payload still mirrors the first suspension for user-facing compatibility.
-      let suspension: ReturnType<typeof aggregateEventedForeachSuspensions>;
-      try {
-        suspension = aggregateEventedForeachSuspensions(durableIterationResults ?? currentResult.output);
-      } catch (error) {
-        await pubsub.publish('workflows', {
-          type: 'workflow.fail',
-          runId,
-          data: {
-            ...lifecycleExecution,
-            parentWorkflow,
-            workflowId,
-            runId,
-            executionPath,
-            resumeSteps,
-            stepResults,
-            prevResult: {
-              status: 'failed',
-              error: error instanceof Error ? error : new Error('Invalid workflow resume label metadata'),
-            },
-            activeStepsPath,
-            requestContext,
-            state: currentState,
-            outputOptions,
-          },
-        });
-        return;
-      }
-      if (!suspension) return;
-
-      // Build the suspend metadata with all collected resumeLabels
-      const suspendMeta: {
-        foreachIndex?: number;
-        resumeLabels?: Record<string, { stepId: string; foreachIndex?: number }>;
-      } = {
-        foreachIndex: suspension.firstSuspendedIndex,
-      };
-      if (Object.keys(suspension.resumeLabels).length > 0) {
-        suspendMeta.resumeLabels = suspension.resumeLabels;
-      }
-
-      const aggregatedSuspendPayload = {
-        ...suspension.firstSuspendPayload,
-        __workflow_meta: {
-          ...(suspension.firstSuspendPayload?.__workflow_meta ?? {}),
-          ...suspendMeta,
-          foreachOutput: suspension.foreachOutput,
-        },
-      };
-
-      // Re-suspend the workflow - there are still pending iterations
-      // Use workflow.step.end with suspended status to update storage
-      await pubsub.publish('workflows', {
-        type: 'workflow.step.end',
-        runId,
-        data: {
-          ...lifecycleExecution,
-          parentWorkflow,
-          workflowId,
-          runId,
-          executionPath,
-          resumeSteps,
-          stepResults: {
-            ...stepResults,
-            [getEntryId(step.step)]: {
-              ...currentResult,
-              status: 'suspended',
-              suspendedAt: Date.now(),
-              suspendPayload: aggregatedSuspendPayload,
-            },
-          },
-          prevResult: {
-            status: 'suspended',
-            output: currentResult.output,
-            suspendPayload: aggregatedSuspendPayload,
-            payload: currentResult.payload,
-            startedAt: currentResult.startedAt,
-            suspendedAt: Date.now(),
-          },
-          activeStepsPath,
-          requestContext,
-          actor,
-          state: currentState,
-          outputOptions,
-        },
-      });
+      await publishSuspendedState();
       return;
     }
 
@@ -701,9 +706,36 @@ export async function processWorkflowForEach(
     return;
   }
 
+  const concurrency =
+    idx === 0
+      ? undefined
+      : resolveForeachConcurrency(step.opts, {
+          inputData: (prevResult as any)?.output,
+          getInitData: () => (stepResults as any)?.input,
+          requestContext: reqContext,
+        });
+  const runningIterations = currentResult?.output?.filter((result: any) => result === null).length ?? 0;
+  // Fork: only an engine suspension envelope is a suspended iteration; a user output may carry `status`.
+  const suspendedIndices =
+    currentResult?.output?.flatMap((result: any, index: number) =>
+      isEventedForeachSuspensionResult(result) ? [index] : [],
+    ) ?? [];
+  const activeIterations = runningIterations + suspendedIndices.length;
+
+  if (
+    suspendedIndices.length > 0 &&
+    runningIterations === 0 &&
+    (idx >= targetLen || (concurrency !== undefined && activeIterations >= concurrency))
+  ) {
+    await publishSuspendedState();
+    return;
+  }
+
   if (
     (idx >= targetLen &&
-      currentResult?.output?.filter((r: any) => r !== null && !isQueuedForeachIteration(r))?.length >= targetLen) ||
+      currentResult?.output?.filter(
+        (r: any) => r !== null && !isEventedForeachSuspensionResult(r) && !isQueuedForeachIteration(r),
+      )?.length >= targetLen) ||
     (prevResult as any)?.output?.length === 0
   ) {
     // Foreach completed all iterations or the previous result is an empty array - advance to next step
@@ -837,6 +869,10 @@ export async function processWorkflowForEach(
       });
     }
 
+    return;
+  }
+
+  if (concurrency !== undefined && activeIterations >= concurrency) {
     return;
   }
 

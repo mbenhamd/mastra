@@ -33,7 +33,7 @@ If you prefer not to install packages globally, you can use `npx`:
 npx mastracode
 ```
 
-On first launch, an interactive onboarding wizard guides you through:
+On first launch, the onboarding wizard connects a model provider, configures main model packs, and asks whether tool calls should require approval. Run `/setup` to repeat onboarding later.
 
 1. **Authentication**: Log in with your AI provider (Anthropic, OpenAI, etc.)
 2. **Model packs**: Choose default models for each mode (build / plan / fast)

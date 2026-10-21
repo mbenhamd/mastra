@@ -624,7 +624,7 @@ class EnumFormatHandler<OUTPUT = undefined> extends BaseFormatHandler<OUTPUT> {
  * @param transformedSchema - Wrapped/transformed schema used for LLM generation (arrays wrapped in {elements: []}, enums in {result: ""})
  * @returns Handler instance for the detected format type
  */
-function createOutputHandler<OUTPUT = undefined>({
+export function createOutputHandler<OUTPUT = undefined>({
   schema,
   model,
 }: {
@@ -680,12 +680,27 @@ export function createObjectStreamTransformer<OUTPUT = undefined>({
   let currentRunId: string | undefined;
   let finalResult: ValidateAndTransformFinalResult<OUTPUT> | undefined;
   let finishReason: MastraFinishReason | undefined;
+  let hasPendingToolCalls = false;
 
   return new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
     async transform(chunk, controller) {
       if (chunk.runId) {
         // save runId to use in error chunks
         currentRunId = chunk.runId;
+      }
+
+      // A single transformer can span several model steps (durable agents pipe the whole run through
+      // one stream). Only the terminal step's text is the structured answer, so start each step fresh.
+      if (chunk.type === 'step-start') {
+        accumulatedText = '';
+        previousObject = undefined;
+        finalResult = undefined;
+        finishReason = undefined;
+        hasPendingToolCalls = false;
+      }
+
+      if (chunk.type === 'tool-call' && !chunk.payload?.providerExecuted) {
+        hasPendingToolCalls = true;
       }
 
       if (chunk.type === 'text-delta' && typeof chunk.payload?.text === 'string') {
@@ -741,6 +756,13 @@ export function createObjectStreamTransformer<OUTPUT = undefined>({
   ): Promise<Error | undefined> {
     if (!accumulatedText?.trim() || finalResult) {
       return undefined;
+    }
+
+    // Text from a step that calls client-executed tools is narration before the tools run, not the
+    // final answer. Truncated steps still fall through so the truncation is reported; an error finish
+    // already surfaces its own error, so its narration must not become an object result.
+    if (hasPendingToolCalls && finishReason !== 'length' && finishReason !== 'content-filter') {
+      return;
     }
 
     if (finishReason === 'length' || finishReason === 'content-filter') {
@@ -815,8 +837,15 @@ export function createObjectStreamTransformer<OUTPUT = undefined>({
  * - For objects/no-schema: emits the object as JSON
  */
 export function createJsonTextStreamTransformer<OUTPUT = undefined>(schema?: StandardSchemaWithJSON<OUTPUT>) {
-  let previousArrayLength = 0;
+  let emittedCount = 0;
+  let latestArray: unknown[] = [];
   let hasStartedArray = false;
+  const emitElements = (controller: TransformStreamDefaultController<string>, array: unknown[], end: number) => {
+    for (; emittedCount < end; emittedCount++) {
+      const elementJson = JSON.stringify(array[emittedCount]);
+      controller.enqueue(emittedCount > 0 ? ',' + elementJson : elementJson);
+    }
+  };
   // The first array chunk is held back instead of being emitted immediately.
   // A single object chunk may already contain the complete array (coarse or
   // batched provider deltas), in which case it should be emitted as one closed
@@ -836,14 +865,9 @@ export function createJsonTextStreamTransformer<OUTPUT = undefined>(schema?: Sta
       if (outputSchema?.outputFormat === 'array' && Array.isArray(chunk.object)) {
         if (pendingFirstArrayChunk !== undefined) {
           // A second chunk arrived, so the buffered chunk was only the first
-          // slice. Switch to incremental mode and replay the buffered elements.
+          // slice. Switch to incremental mode.
           controller.enqueue('[');
           hasStartedArray = true;
-          for (let i = 0; i < pendingFirstArrayChunk.length; i++) {
-            const elementJson = JSON.stringify(pendingFirstArrayChunk[i]);
-            controller.enqueue(i > 0 ? ',' + elementJson : elementJson);
-          }
-          previousArrayLength = pendingFirstArrayChunk.length;
           pendingFirstArrayChunk = undefined;
         } else if (!hasStartedArray) {
           // First chunk -- buffer it and wait to see whether the stream ends here.
@@ -851,16 +875,11 @@ export function createJsonTextStreamTransformer<OUTPUT = undefined>(schema?: Sta
           return;
         }
 
-        // Emit new elements that were added
-        for (let i = previousArrayLength; i < chunk.object.length; i++) {
-          const elementJson = JSON.stringify(chunk.object[i]);
-          if (i > 0) {
-            controller.enqueue(',' + elementJson);
-          } else {
-            controller.enqueue(elementJson);
-          }
-        }
-        previousArrayLength = chunk.object.length;
+        latestArray = chunk.object;
+        // The trailing element may still be partial: a later chunk can complete
+        // it in place at the same index. Only emit elements followed by another
+        // element; the rest are emitted on flush.
+        emitElements(controller, chunk.object, chunk.object.length - 1);
       } else {
         // For non-array objects, just emit as JSON
         controller.enqueue(JSON.stringify(chunk.object));
@@ -878,7 +897,8 @@ export function createJsonTextStreamTransformer<OUTPUT = undefined>(schema?: Sta
         pendingFirstArrayChunk = undefined;
         controller.enqueue(firstChunk.length > 0 ? JSON.stringify(firstChunk) : '[]');
       } else if (hasStartedArray) {
-        // Close the incrementally-streamed array.
+        // Emit the held-back trailing element(s), then close the array.
+        emitElements(controller, latestArray, latestArray.length);
         controller.enqueue(']');
       }
     },

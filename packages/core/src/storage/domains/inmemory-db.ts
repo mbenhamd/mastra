@@ -57,13 +57,7 @@ import type {
   OperationAdmissionTombstone,
   SessionRecord,
 } from './harness/types';
-import type {
-  KnowledgeActivityEvent,
-  KnowledgeCurationCursor,
-  KnowledgeRecord,
-  KnowledgeNode,
-  KnowledgeSemanticOutboxEntry,
-} from './knowledge';
+import type { KnowledgeActivityEvent, KnowledgeRecord, KnowledgeNode, KnowledgeSemanticOutboxEntry } from './knowledge';
 import type { MCPClientVersion } from './mcp-clients';
 import type { MCPServerVersion } from './mcp-servers';
 import type { TraceEntry } from './observability';
@@ -222,6 +216,10 @@ export class InMemoryDB {
   readonly workflowTerminalParentRevisions = new Map<string, WorkflowTerminalParentRevisionState>();
   /** Framework-owned product snapshot handoff records and mutation fences. */
   readonly workflowSnapshotHandoffs = new Map<string, WorkflowSnapshotHandoffRecord>();
+  /** Workflows-domain run ownership, keyed by runId. */
+  readonly runOwners = new Map<string, { generation: number; ownerId: string; leaseExpiresAt: Date | null }>();
+  /** Memory-domain run fences, keyed by runId. */
+  readonly runFences = new Map<string, { generation: number; ownerId: string }>();
   readonly workflowDefinitions = new Map<string, WorkflowDefinition>();
   readonly scores = new Map<string, ScoreRowData>();
   readonly traces = new Map<string, TraceEntry>();
@@ -281,7 +279,6 @@ export class InMemoryDB {
   readonly knowledgeNodeKeys = new Map<string, string>();
   readonly knowledgeRecords = new Map<string, KnowledgeRecord>();
   readonly knowledgeMentions = new Map<string, Set<string>>();
-  readonly knowledgeCursors = new Map<string, KnowledgeCurationCursor>();
   readonly knowledgeActivity: KnowledgeActivityEvent[] = [];
   readonly knowledgeSemanticOutbox = new Map<string, KnowledgeSemanticOutboxEntry>();
   readonly knowledgeSemanticIdempotency = new Map<string, string>();
@@ -352,6 +349,8 @@ export class InMemoryDB {
     this.workflowTerminalContinuationPlans.clear();
     this.workflowTerminalParentRevisions.clear();
     this.workflowSnapshotHandoffs.clear();
+    this.runOwners.clear();
+    this.runFences.clear();
     this.workflowDefinitions.clear();
     this.scores.clear();
     this.traces.clear();
@@ -394,7 +393,6 @@ export class InMemoryDB {
     this.knowledgeNodeKeys.clear();
     this.knowledgeRecords.clear();
     this.knowledgeMentions.clear();
-    this.knowledgeCursors.clear();
     this.knowledgeActivity.length = 0;
     this.knowledgeSemanticOutbox.clear();
     this.knowledgeSemanticIdempotency.clear();

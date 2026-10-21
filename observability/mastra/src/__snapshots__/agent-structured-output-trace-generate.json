@@ -3,11 +3,15 @@
     "agent_run: \"agent run: 'test-agent'\"",
     "\u251c\u2500\u2500 model_generation: \"llm: 'mock-model-id'\"",
     "\u2502   \u2514\u2500\u2500 model_step: \"step: 0\"",
+    "\u2502       \u251c\u2500\u2500 processor_run: \"llm request processor: provider-history-compat\"",
+    "\u2502       \u251c\u2500\u2500 processor_run: \"llm request processor: unsupported-file-handler\"",
     "\u2502       \u251c\u2500\u2500 model_inference: \"inference: 0\"",
     "\u2502       \u2502   \u251c\u2500\u2500 model_chunk: \"chunk: 'text'\"",
     "\u2502       \u2502   \u2514\u2500\u2500 model_chunk: \"chunk: 'object'\"",
     "\u2502       \u2514\u2500\u2500 processor_run: \"output step processor: structured-output\"",
-    "\u2514\u2500\u2500 processor_run: \"output stream processor: Structured Output\""
+    "\u2514\u2500\u2500 processor_run: \"output stream processor: Structured Output\"",
+    "    \u251c\u2500\u2500 processor_run: \"llm request processor: provider-history-compat\"",
+    "    \u2514\u2500\u2500 processor_run: \"llm request processor: unsupported-file-handler\""
   ],
   "spans": [
     {
@@ -22,7 +26,8 @@
         "entityType": "agent",
         "entityId": "test-agent",
         "attributes": {
-          "instructions": "Return a simple response"
+          "instructions": "Return a simple response",
+          "completionStartTime": "<date>"
         },
         "metadata": {
           "runId": "<runId-1>",
@@ -79,6 +84,7 @@
               "providerRequestBytesTotal": 817,
               "providerPreparationMsTotal": "<providerPreparationMsTotal>",
               "providerMeasurementMsTotal": "<providerMeasurementMsTotal>",
+              "completionStartTime": "<date>",
               "providerSucceededInferenceCount": 1,
               "providerErrorInferenceCount": 0,
               "providerAbortedInferenceCount": 0,
@@ -86,7 +92,6 @@
               "finishReason": "stop",
               "responseId": "<responseId-1>",
               "responseModel": "mock-model-id",
-              "completionStartTime": "<date>",
               "usage": {
                 "inputTokens": 15,
                 "outputTokens": 25,
@@ -146,6 +151,7 @@
                 "attributes": {
                   "stepIndex": 0,
                   "messageId": "<messageId-1>",
+                  "completionStartTime": "<date>",
                   "usage": {
                     "inputTokens": 15,
                     "outputTokens": 25,
@@ -191,6 +197,124 @@
                 {
                   "span": {
                     "id": "<span-4>",
+                    "traceId": "<trace-1>",
+                    "name": "llm request processor: provider-history-compat",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-3>",
+                    "entityType": "input_step_processor",
+                    "entityId": "provider-history-compat",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 0,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 1,
+                      "processorInputMessageBytes": 154,
+                      "processorOutputMessageCount": 1,
+                      "processorOutputMessageBytes": 154,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 56,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 56,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 154,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 154,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 0,
+                      "processorInputAssistantMessageBytes": 2,
+                      "processorOutputAssistantMessageCount": 0,
+                      "processorOutputAssistantMessageBytes": 2,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 0,
+                      "processorInputToolMessageBytes": 2,
+                      "processorOutputToolMessageCount": 0,
+                      "processorOutputToolMessageBytes": 2,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-5>",
+                    "traceId": "<trace-1>",
+                    "name": "llm request processor: unsupported-file-handler",
+                    "type": "processor_run",
+                    "completed": true,
+                    "isEvent": false,
+                    "isRootSpan": false,
+                    "parentId": "<span-3>",
+                    "entityType": "input_step_processor",
+                    "entityId": "unsupported-file-handler",
+                    "attributes": {
+                      "processorPhase": "llm_request",
+                      "processorExecutor": "legacy",
+                      "processorIndex": 2,
+                      "processorMeasurementState": "measured",
+                      "processorMeasurementMs": {
+                        "__any__": "number"
+                      },
+                      "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                      "processorInputMessageCount": 1,
+                      "processorInputMessageBytes": 154,
+                      "processorOutputMessageCount": 1,
+                      "processorOutputMessageBytes": 154,
+                      "processorMessageDeltaBytes": 0,
+                      "processorInputSystemMessageCount": 1,
+                      "processorInputSystemMessageBytes": 56,
+                      "processorOutputSystemMessageCount": 1,
+                      "processorOutputSystemMessageBytes": 56,
+                      "processorSystemMessageDeltaBytes": 0,
+                      "processorTotalDeltaBytes": 0,
+                      "processorInputUserMessageCount": 1,
+                      "processorInputUserMessageBytes": 154,
+                      "processorOutputUserMessageCount": 1,
+                      "processorOutputUserMessageBytes": 154,
+                      "processorUserMessageDeltaBytes": 0,
+                      "processorInputAssistantMessageCount": 0,
+                      "processorInputAssistantMessageBytes": 2,
+                      "processorOutputAssistantMessageCount": 0,
+                      "processorOutputAssistantMessageBytes": 2,
+                      "processorAssistantMessageDeltaBytes": 0,
+                      "processorInputToolMessageCount": 0,
+                      "processorInputToolMessageBytes": 2,
+                      "processorOutputToolMessageCount": 0,
+                      "processorOutputToolMessageBytes": 2,
+                      "processorToolMessageDeltaBytes": 0,
+                      "processorInputOtherMessageCount": 0,
+                      "processorInputOtherMessageBytes": 2,
+                      "processorOutputOtherMessageCount": 0,
+                      "processorOutputOtherMessageBytes": 2,
+                      "processorOtherMessageDeltaBytes": 0
+                    },
+                    "metadata": {
+                      "runId": "<runId-1>",
+                      "environment": "test"
+                    }
+                  }
+                },
+                {
+                  "span": {
+                    "id": "<span-6>",
                     "traceId": "<trace-1>",
                     "name": "inference: 0",
                     "type": "model_inference",
@@ -261,6 +385,16 @@
                       "runId": "<runId-1>",
                       "environment": "test"
                     },
+                    "input": [
+                      {
+                        "role": "system",
+                        "content": "Return a simple response"
+                      },
+                      {
+                        "role": "user",
+                        "content": "Return a list of items separated by commas"
+                      }
+                    ],
                     "output": {
                       "text": "Mock V2 generate response",
                       "toolCalls": [],
@@ -272,14 +406,14 @@
                   "children": [
                     {
                       "span": {
-                        "id": "<span-5>",
+                        "id": "<span-7>",
                         "traceId": "<trace-1>",
                         "name": "chunk: 'text'",
                         "type": "model_chunk",
                         "completed": true,
                         "isEvent": false,
                         "isRootSpan": false,
-                        "parentId": "<span-4>",
+                        "parentId": "<span-6>",
                         "entityType": "agent",
                         "entityId": "test-agent",
                         "attributes": {
@@ -297,14 +431,14 @@
                     },
                     {
                       "span": {
-                        "id": "<span-6>",
+                        "id": "<span-8>",
                         "traceId": "<trace-1>",
                         "name": "chunk: 'object'",
                         "type": "model_chunk",
                         "completed": true,
                         "isEvent": false,
                         "isRootSpan": false,
-                        "parentId": "<span-4>",
+                        "parentId": "<span-6>",
                         "entityType": "agent",
                         "entityId": "test-agent",
                         "attributes": {
@@ -324,7 +458,7 @@
                 },
                 {
                   "span": {
-                    "id": "<span-7>",
+                    "id": "<span-9>",
                     "traceId": "<trace-1>",
                     "name": "output step processor: structured-output",
                     "type": "processor_run",
@@ -335,9 +469,9 @@
                     "entityType": "output_step_processor",
                     "entityId": "structured-output",
                     "attributes": {
+                      "processorPhase": "outputStep",
                       "processorExecutor": "legacy",
-                      "processorIndex": 0,
-                      "processorPhase": "outputStep"
+                      "processorIndex": 0
                     },
                     "metadata": {
                       "runId": "<runId-1>",
@@ -405,7 +539,7 @@
         },
         {
           "span": {
-            "id": "<span-8>",
+            "id": "<span-10>",
             "traceId": "<trace-1>",
             "name": "output stream processor: Structured Output",
             "type": "processor_run",
@@ -416,6 +550,7 @@
             "entityType": "output_processor",
             "entityId": "structured-output",
             "attributes": {
+              "processorPhase": "outputStream",
               "processorExecutor": "legacy",
               "processorIndex": 0,
               "internalUsage": {
@@ -430,8 +565,7 @@
               },
               "hookDurationMs": {
                 "__any__": "number"
-              },
-              "processorPhase": "outputStream"
+              }
             },
             "metadata": {
               "runId": "<runId-1>",
@@ -445,7 +579,127 @@
               "totalChunks": 6,
               "accumulatedText": "Mock V2 generate response"
             }
-          }
+          },
+          "children": [
+            {
+              "span": {
+                "id": "<span-11>",
+                "traceId": "<trace-1>",
+                "name": "llm request processor: provider-history-compat",
+                "type": "processor_run",
+                "completed": true,
+                "isEvent": false,
+                "isRootSpan": false,
+                "parentId": "<span-10>",
+                "entityType": "input_step_processor",
+                "entityId": "provider-history-compat",
+                "attributes": {
+                  "processorPhase": "llm_request",
+                  "processorExecutor": "legacy",
+                  "processorIndex": 0,
+                  "processorMeasurementState": "measured",
+                  "processorMeasurementMs": {
+                    "__any__": "number"
+                  },
+                  "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                  "processorInputMessageCount": 1,
+                  "processorInputMessageBytes": 354,
+                  "processorOutputMessageCount": 1,
+                  "processorOutputMessageBytes": 354,
+                  "processorMessageDeltaBytes": 0,
+                  "processorInputSystemMessageCount": 1,
+                  "processorInputSystemMessageBytes": 938,
+                  "processorOutputSystemMessageCount": 1,
+                  "processorOutputSystemMessageBytes": 938,
+                  "processorSystemMessageDeltaBytes": 0,
+                  "processorTotalDeltaBytes": 0,
+                  "processorInputUserMessageCount": 1,
+                  "processorInputUserMessageBytes": 354,
+                  "processorOutputUserMessageCount": 1,
+                  "processorOutputUserMessageBytes": 354,
+                  "processorUserMessageDeltaBytes": 0,
+                  "processorInputAssistantMessageCount": 0,
+                  "processorInputAssistantMessageBytes": 2,
+                  "processorOutputAssistantMessageCount": 0,
+                  "processorOutputAssistantMessageBytes": 2,
+                  "processorAssistantMessageDeltaBytes": 0,
+                  "processorInputToolMessageCount": 0,
+                  "processorInputToolMessageBytes": 2,
+                  "processorOutputToolMessageCount": 0,
+                  "processorOutputToolMessageBytes": 2,
+                  "processorToolMessageDeltaBytes": 0,
+                  "processorInputOtherMessageCount": 0,
+                  "processorInputOtherMessageBytes": 2,
+                  "processorOutputOtherMessageCount": 0,
+                  "processorOutputOtherMessageBytes": 2,
+                  "processorOtherMessageDeltaBytes": 0
+                },
+                "metadata": {
+                  "runId": "<runId-2>",
+                  "environment": "test"
+                }
+              }
+            },
+            {
+              "span": {
+                "id": "<span-12>",
+                "traceId": "<trace-1>",
+                "name": "llm request processor: unsupported-file-handler",
+                "type": "processor_run",
+                "completed": true,
+                "isEvent": false,
+                "isRootSpan": false,
+                "parentId": "<span-10>",
+                "entityType": "input_step_processor",
+                "entityId": "unsupported-file-handler",
+                "attributes": {
+                  "processorPhase": "llm_request",
+                  "processorExecutor": "legacy",
+                  "processorIndex": 2,
+                  "processorMeasurementState": "measured",
+                  "processorMeasurementMs": {
+                    "__any__": "number"
+                  },
+                  "processorRoleBreakdownState": "serialized_subsets_non_additive",
+                  "processorInputMessageCount": 1,
+                  "processorInputMessageBytes": 354,
+                  "processorOutputMessageCount": 1,
+                  "processorOutputMessageBytes": 354,
+                  "processorMessageDeltaBytes": 0,
+                  "processorInputSystemMessageCount": 1,
+                  "processorInputSystemMessageBytes": 938,
+                  "processorOutputSystemMessageCount": 1,
+                  "processorOutputSystemMessageBytes": 938,
+                  "processorSystemMessageDeltaBytes": 0,
+                  "processorTotalDeltaBytes": 0,
+                  "processorInputUserMessageCount": 1,
+                  "processorInputUserMessageBytes": 354,
+                  "processorOutputUserMessageCount": 1,
+                  "processorOutputUserMessageBytes": 354,
+                  "processorUserMessageDeltaBytes": 0,
+                  "processorInputAssistantMessageCount": 0,
+                  "processorInputAssistantMessageBytes": 2,
+                  "processorOutputAssistantMessageCount": 0,
+                  "processorOutputAssistantMessageBytes": 2,
+                  "processorAssistantMessageDeltaBytes": 0,
+                  "processorInputToolMessageCount": 0,
+                  "processorInputToolMessageBytes": 2,
+                  "processorOutputToolMessageCount": 0,
+                  "processorOutputToolMessageBytes": 2,
+                  "processorToolMessageDeltaBytes": 0,
+                  "processorInputOtherMessageCount": 0,
+                  "processorInputOtherMessageBytes": 2,
+                  "processorOutputOtherMessageCount": 0,
+                  "processorOutputOtherMessageBytes": 2,
+                  "processorOtherMessageDeltaBytes": 0
+                },
+                "metadata": {
+                  "runId": "<runId-2>",
+                  "environment": "test"
+                }
+              }
+            }
+          ]
         }
       ]
     }

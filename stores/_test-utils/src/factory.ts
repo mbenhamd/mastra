@@ -15,6 +15,7 @@ import { createToolProviderConnectionsTests } from './domains/tool-provider-conn
 import { createHarnessTest } from './domains/harness';
 import { createSkillsTests } from './domains/skills';
 import { createWorkflowDefinitionsTests } from './domains/workflow-definitions';
+import { createRunFencingTests } from './domains/run-fencing';
 export * from './domains/memory/data';
 export * from './domains/harness/data';
 export * from './domains/workflows/data';
@@ -49,11 +50,22 @@ export type TestCapabilities = {
   /** Whether permanent dataset item purge is supported by the test topology (defaults to true). */
   datasetItemPurge?: boolean;
   /**
+   * Whether late workflow-result writes preserve a deleted run. Concurrent adapters default to true;
+   * adapters pending alignment under COR-1448 set this to false. Pending adapters are Convex, DSQL,
+   * DynamoDB, Elasticsearch, MongoDB, MSSQL, MySQL, OracleDB, Redis, Spanner, Upstash, and Valkey.
+   */
+  workflowResultsNoopWhenRunMissing?: boolean;
+  /**
    * Whether batchDeleteTraces supports tenant-scoped deletion via
    * organizationId/resourceId (defaults to false). Adapters without tenant
    * columns must reject scoped calls; the suite asserts that rejection.
    */
   scopedTraceDeletion?: boolean;
+  /**
+   * Whether skills list/listResolved apply the `metadata` filter against the
+   * resolved version (defaults to true). Pending adapters: MongoDB, MySQL, Spanner.
+   */
+  skillsMetadataFilter?: boolean;
 };
 
 export function createTestSuite(storage: MastraStorage, capabilities: TestCapabilities = {}) {
@@ -137,7 +149,10 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
 
     // Tests are registered unconditionally - each test internally handles
     // checking if the storage domain is available
-    createWorkflowsTests({ storage });
+    createWorkflowsTests({
+      storage,
+      workflowResultsNoopWhenRunMissing: capabilities.workflowResultsNoopWhenRunMissing,
+    });
     createMemoryTest({ storage });
     createScoresTest({ storage, capabilities });
     createObservabilityTests({ storage, capabilities });
@@ -146,11 +161,12 @@ export function createTestSuite(storage: MastraStorage, capabilities: TestCapabi
     createExperimentsTests({ storage, capabilities });
     createBackgroundTasksTests({ storage });
     createFavoritesTests({ storage });
-    createSkillsTests({ storage });
+    createSkillsTests({ storage, metadataFilter: capabilities.skillsMetadataFilter ?? true });
     createSchedulesTests({ storage });
     createChannelsTests({ storage });
     createToolProviderConnectionsTests({ storage });
     createHarnessTest({ storage });
     createWorkflowDefinitionsTests({ storage });
+    createRunFencingTests({ storage });
   });
 }

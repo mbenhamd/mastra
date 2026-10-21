@@ -3,6 +3,7 @@ import { MessageList } from '../../agent/message-list';
 import { ConsoleLogger } from '../../logger';
 import { Mastra } from '../../mastra';
 import type { Processor, ProcessorStreamWriter } from '../../processors';
+import { REPROCESS_PART_KEY } from '../../processors/stream-reprocess';
 import { InMemoryStore } from '../../storage';
 import { createEmptyWorkflowSnapshot } from '../../storage/workflow-snapshot';
 import { ChunkFrom } from '../../stream/types';
@@ -119,6 +120,48 @@ describe('workflowLoopStream', () => {
     expect(messageList.get.response.db()[0]?.content.parts).toEqual([
       expect.objectContaining({ type: 'data-moderation', id: 'moderation-1', data: { flagged: true } }),
     ]);
+  });
+
+  it('emits parts a processor stashed for reprocessing instead of leaking them to the next step (#25532)', async () => {
+    const stashed = { type: 'data-stashed', data: { n: 1 }, runId: 'run-1', from: ChunkFrom.AGENT } as ChunkType;
+
+    const processor: Processor = {
+      id: 'stasher',
+      // PF-5928 adaptation (fork L20, PF-2236): the runner honours the documented
+      // `processDataParts` default (false), so a processor that stashes `data-*` parts opts in.
+      processDataParts: true,
+      name: 'Stasher',
+      processOutputStream: async ({ part, state }) => {
+        if (part.type === 'data-moderation') {
+          state[REPROCESS_PART_KEY] = stashed;
+        }
+        return part;
+      },
+    };
+
+    const messageList = new MessageList({ threadId: 'test-thread' });
+    const stream = workflowLoopStream({
+      messageId: 'msg-3',
+      runId: 'run-1',
+      startTimestamp: Date.now(),
+      agentId: 'test-agent',
+      messageList,
+      models: [{ model: {} as any, toolChoice: undefined }],
+      outputProcessors: [processor],
+      _internal: {},
+      streamState: { serialize: () => ({}), deserialize: () => {} },
+      methodType: 'stream',
+    });
+
+    const chunks: ChunkType[] = [];
+    for await (const chunk of stream) chunks.push(chunk);
+
+    const types = chunks.map(chunk => chunk.type);
+    expect(types).toContain('data-stashed');
+    expect(types.indexOf('data-stashed')).toBe(types.indexOf('data-moderation') + 1);
+
+    const persistedTypes = messageList.get.response.db().flatMap(message => message.content.parts.map(p => p.type));
+    expect(persistedTypes).toContain('data-stashed');
   });
 
   it('should forward resourceId from _internal to createRun()', async () => {

@@ -249,6 +249,7 @@ export async function applyExtractorHooks(opts: {
   writer?: ProcessorStreamWriter;
   abortSignal?: AbortSignal;
   requestContext?: RequestContext;
+  observationCommitted?: Promise<boolean>;
 }): Promise<{ values?: Record<string, unknown>; failures?: ExtractionFailure[] }> {
   const values = normalizeExtractedValues(opts.values) ?? {};
   const failures: ExtractionFailure[] = [...(opts.failures ?? [])];
@@ -288,6 +289,7 @@ export async function applyExtractorHooks(opts: {
         writer: opts.writer,
         abortSignal: opts.abortSignal,
         requestContext: opts.requestContext,
+        observationCommitted: opts.observationCommitted,
       });
       if (isHook || hookValue === undefined) {
         continue;

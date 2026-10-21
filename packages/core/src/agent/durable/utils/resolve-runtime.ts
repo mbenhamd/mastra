@@ -9,6 +9,7 @@ import type {
   ProcessorState,
   ErrorProcessorOrWorkflow,
   InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
 } from '../../../processors';
 import {
@@ -26,7 +27,10 @@ import type { MastraDBMessage, MessageList } from '../../message-list';
 import { stableStringify } from '../../message-list/cache/stable-stringify';
 import type { SerializedMessageListState } from '../../message-list/state';
 import { SaveQueueManager } from '../../save-queue';
+import { restoreRunAgentScopes } from '../../scopes';
 import { createToolSurfaceFence } from '../../tool-surface-fence';
+import type { ToolsInput } from '../../types';
+import { recordRunSavedMessages } from '../run-message-refs';
 import {
   getBoundRunRegistryEntry,
   getGlobalRunRegistryEntry,
@@ -49,12 +53,42 @@ import { assertDurableToolHookPolicyAvailable } from './tool-hook-policy';
 
 const DURABLE_RUNTIME_TOOL_BINDING_MISMATCH = 'DURABLE_AGENT_RUNTIME_TOOL_BINDING_MISMATCH';
 
+/**
+ * The binding-relevant view of a tool surface. The top-level `$schema` dialect
+ * URI is dropped on both sides: rebuilding a JSON-serialized client tool
+ * re-emits its schema under the current dialect (draft-07 -> 2020-12) without
+ * changing the shape. A client tool also has no server-side implementation, so
+ * its runtime fingerprint (which hashes the caller's live schema object) cannot
+ * survive the wire; its serialized definition is its whole durable contract and
+ * every field of it stays compared.
+ */
+function runtimeToolBindingView(
+  metadata: SerializableToolMetadata[] | undefined,
+  clientToolNames: ReadonlySet<string>,
+): unknown {
+  // A missing binding stays missing so it can never compare equal to a resolved surface.
+  if (!Array.isArray(metadata)) return metadata;
+  return metadata.map(entry => {
+    const { $schema: _dialect, ...inputSchema } = (entry.inputSchema ?? {}) as Record<string, unknown>;
+    const view: Record<string, unknown> = { ...entry, inputSchema };
+    if (clientToolNames.has(entry.name)) delete view.recoveryFingerprint;
+    return view;
+  });
+}
+
 function assertRuntimeToolBinding(
   tools: Record<string, CoreTool>,
   expected: SerializableToolMetadata[],
   context: { agentId: string; runId: string },
+  clientTools?: Record<string, unknown>,
 ): void {
-  if (stableStringify(serializeToolsMetadata(tools)) === stableStringify(expected)) return;
+  const clientToolNames = new Set(Object.keys(clientTools ?? {}));
+  if (
+    stableStringify(runtimeToolBindingView(serializeToolsMetadata(tools), clientToolNames)) ===
+    stableStringify(runtimeToolBindingView(expected, clientToolNames))
+  ) {
+    return;
+  }
 
   throw new MastraError({
     id: DURABLE_RUNTIME_TOOL_BINDING_MISMATCH,
@@ -92,8 +126,8 @@ export interface ResolvedRuntimeDependencies {
   workspace?: Workspace;
   /** Resolved input processors (rebuilt from the agent when the registry is empty) */
   inputProcessors?: InputProcessorOrWorkflow[];
-  /** Uncombined input processors for processLLMRequest */
-  llmRequestInputProcessors?: InputProcessorOrWorkflow[];
+  /** Uncombined processors for processLLMRequest: input processors plus error-phase processors */
+  llmRequestInputProcessors?: LLMRequestProcessorOrWorkflow[];
   /** Resolved output processors */
   outputProcessors?: OutputProcessorOrWorkflow[];
   /** Resolved error processors */
@@ -107,9 +141,13 @@ export interface ResolvedRuntimeDependencies {
  * is configured. Shared by `resolveRuntimeDependencies` and
  * `rebuildRunToolsFromMastra` so the construction lives in one place.
  */
-function makeSaveQueueManager(memory: MastraMemory | undefined, mastra?: Mastra): SaveQueueManager | undefined {
+function makeSaveQueueManager(
+  memory: MastraMemory | undefined,
+  runId: string,
+  mastra?: Mastra,
+): SaveQueueManager | undefined {
   if (!memory) return undefined;
-  return new SaveQueueManager({ logger: mastra?.getLogger?.(), memory });
+  return new SaveQueueManager({ logger: mastra?.getLogger?.(), memory, onSaved: recordRunSavedMessages(runId) });
 }
 
 /**
@@ -154,6 +192,8 @@ export function restoreRequestContext(entries?: Record<string, unknown>, runLeve
   );
   const liveToken = runLevel?.getRaw?.(MASTRA_AUTH_TOKEN_KEY);
   if (liveToken !== undefined) restored.setRaw(MASTRA_AUTH_TOKEN_KEY, liveToken);
+  // Scopes Core persisted with the run stay trusted after the JSON round trip.
+  restoreRunAgentScopes(restored);
   return restored;
 }
 
@@ -197,6 +237,8 @@ export function createDurableRuntimeRequestContext(options: {
         : {}),
     });
   }
+  // Scopes Core persisted with the run stay trusted after the JSON round trip.
+  restoreRunAgentScopes(context);
   return context;
 }
 
@@ -213,6 +255,78 @@ export class DurableProcessorRebuildError extends Error {
     );
     this.name = 'DurableProcessorRebuildError';
     this.cause = cause;
+  }
+}
+
+/**
+ * Rebuild a run's processor pipeline from the registered agent. Error
+ * processors resolve once (upstream semantics: an empty call-time override
+ * replaces the defaults) and the request lane reuses them.
+ */
+async function rebuildProcessorPipeline(options: {
+  agent: any;
+  agentId: string;
+  requestContext: RequestContext;
+  emptyErrorProcessorOverride?: boolean;
+  processorStates?: Map<string, ProcessorState>;
+  logger?: { error?: (...args: any[]) => void };
+}) {
+  const { agent, agentId, requestContext, emptyErrorProcessorOverride, processorStates, logger } = options;
+
+  try {
+    const inputProcessors = await agent.listInputProcessors?.(requestContext);
+    const outputProcessors = await agent.listOutputProcessors?.(requestContext);
+    const errorProcessorOverride = emptyErrorProcessorOverride ? [] : undefined;
+    const errorProcessors = (await agent.__resolveRunErrorProcessors?.(requestContext, errorProcessorOverride))
+      ?.errorProcessors;
+    const llmRequestInputProcessors = await agent.__listLLMRequestProcessors?.(requestContext, errorProcessors);
+
+    return {
+      inputProcessors,
+      llmRequestInputProcessors,
+      outputProcessors,
+      errorProcessors,
+      // A fresh processor-state map is correct here: on a cross-process worker
+      // there is no prior state to carry, and processors are re-run per step.
+      processorStates: processorStates ?? new Map<string, ProcessorState>(),
+    };
+  } catch (processorError) {
+    // Fail the step loudly rather than continuing (and writing back) an
+    // incomplete pipeline: running without the rebuilt processors would
+    // silently drop skills / workspace instructions.
+    logger?.error?.(`[DurableAgent:${agentId}] Failed to rebuild processors from Mastra: ${processorError}`);
+    throw new DurableProcessorRebuildError(agentId, processorError);
+  }
+}
+
+/** True when the registry entry was seeded in this process (not a cross-process placeholder). */
+function isHydratedRegistryEntry(entry: RunRegistryEntry | undefined): boolean {
+  const model = entry?.model as (MastraLanguageModel & { __metadataOnly?: boolean }) | undefined;
+  return !!entry && entry.isPlaceholder !== true && !!model && model.__metadataOnly !== true;
+}
+
+/**
+ * Throws when call-time `toolsets` tools named in the durable options are missing
+ * after a cross-process rebuild, instead of silently running without them.
+ */
+function assertToolsetToolsAvailable(
+  tools: Record<string, unknown>,
+  toolsetToolNames: string[] | undefined,
+  agentId: string,
+  runId: string,
+): void {
+  const missingToolsetTools = (toolsetToolNames ?? []).filter(name => !(name in tools));
+  if (missingToolsetTools.length > 0) {
+    throw new MastraError({
+      id: 'DURABLE_AGENT_TOOLSETS_UNAVAILABLE',
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.USER,
+      text:
+        `Call-time toolsets tool(s) ${missingToolsetTools.map(n => `"${n}"`).join(', ')} are not available ` +
+        `to durable agent "${agentId}" in this worker process. Toolset tools contain server-side code that ` +
+        `cannot be serialized across processes; register them on the agent (statically or via requestContext) instead.`,
+      details: { agentId, runId, missingTools: missingToolsetTools.join(',') },
+    });
   }
 }
 
@@ -253,9 +367,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
     serialized: input.options?.toolHookPolicy,
     registryEntry: globalEntry,
   });
-  const registryModel = globalEntry?.model as (MastraLanguageModel & { __metadataOnly?: boolean }) | undefined;
-  const hasHydratedEntry =
-    !!globalEntry && globalEntry.isPlaceholder !== true && !!registryModel && registryModel.__metadataOnly !== true;
+  const hasHydratedEntry = isHydratedRegistryEntry(globalEntry);
   if (globalEntry && hasHydratedEntry && input.options?.toolSurfaceFence !== undefined) {
     // This also rejects stale persisted name ceilings whose concrete tool was
     // omitted or replaced with an accessor/undefined registry value.
@@ -296,7 +408,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   let memory: MastraMemory | undefined = globalEntry?.memory;
   let saveQueueManager = globalEntry?.saveQueueManager;
   let inputProcessors: InputProcessorOrWorkflow[] | undefined = globalEntry?.inputProcessors;
-  let llmRequestInputProcessors: InputProcessorOrWorkflow[] | undefined = globalEntry?.llmRequestInputProcessors;
+  let llmRequestInputProcessors: LLMRequestProcessorOrWorkflow[] | undefined = globalEntry?.llmRequestInputProcessors;
   let outputProcessors: OutputProcessorOrWorkflow[] | undefined = globalEntry?.outputProcessors;
   let errorProcessors: ErrorProcessorOrWorkflow[] | undefined = globalEntry?.errorProcessors;
   let processorStates: Map<string, ProcessorState> | undefined = globalEntry?.processorStates;
@@ -335,9 +447,11 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
         requestContext: resolveRequestContext,
         memoryConfig: input.state.memoryConfig,
         autoResumeSuspendedTools: input.options?.autoResumeSuspendedTools,
+        clientTools: input.options?.clientTools as ToolsInput | undefined,
         processorMessages: messageList.get.all.db(),
       });
-      assertRuntimeToolBinding(tools, input.toolsMetadata, { agentId, runId });
+      assertToolsetToolsAvailable(tools, input.options?.toolsetToolNames, agentId, runId);
+      assertRuntimeToolBinding(tools, input.toolsMetadata, { agentId, runId }, input.options?.clientTools);
       model =
         (await (agent as any).getModel?.({ requestContext: resolveRequestContext })) ??
         resolveModel(input.modelConfig, mastra);
@@ -359,26 +473,26 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       // WorkspaceInstructionsProcessor (see Agent.listInputProcessors), so this
       // restores the missing available-skills list + workspace instructions in
       // the cross-process system prompt. Mirrors preparation.ts.
-      try {
-        inputProcessors = await (agent as any).listInputProcessors?.(resolveRequestContext);
-        llmRequestInputProcessors = await (agent as any).__listLLMRequestProcessors?.(resolveRequestContext);
-        outputProcessors = await (agent as any).listOutputProcessors?.(resolveRequestContext);
-        errorProcessors = await (agent as any).listErrorProcessors?.(resolveRequestContext);
-        // A fresh processor-state map is correct here: on a cross-process worker
-        // there is no prior state to carry, and processors are re-run per step.
-        processorStates = globalEntry?.processorStates ?? new Map<string, ProcessorState>();
-      } catch (processorError) {
-        // Fail the step loudly rather than continuing (and writing back) an
-        // incomplete pipeline: running without the rebuilt processors would
-        // silently drop skills / workspace instructions.
-        logger?.error?.(`[DurableAgent:${agentId}] Failed to rebuild processors from Mastra: ${processorError}`);
-        throw new DurableProcessorRebuildError(agentId, processorError);
-      }
+      const rebuiltProcessors = await rebuildProcessorPipeline({
+        agent,
+        agentId,
+        requestContext: resolveRequestContext,
+        emptyErrorProcessorOverride: input.options?.emptyErrorProcessorOverride,
+        processorStates: globalEntry?.processorStates,
+        logger,
+      });
+      inputProcessors = rebuiltProcessors.inputProcessors;
+      llmRequestInputProcessors = rebuiltProcessors.llmRequestInputProcessors;
+      outputProcessors = rebuiltProcessors.outputProcessors;
+      errorProcessors = rebuiltProcessors.errorProcessors;
+      processorStates = rebuiltProcessors.processorStates;
 
       rehydratedFromMastra = true;
     } catch (error) {
       if (error instanceof DurableProcessorRebuildError) throw error;
       if (isRuntimeToolBindingMismatch(error)) throw error;
+      // Falling back would silently drop call-time toolsets, so surface the failure.
+      if ((input.options?.toolsetToolNames?.length ?? 0) > 0) throw error;
       logger?.debug?.(`[DurableAgent:${agentId}] Failed to get agent from Mastra: ${error}`);
       model = resolveModel(input.modelConfig, mastra);
     }
@@ -391,7 +505,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
     logger?.debug?.(`[DurableAgent:${agentId}] No tools resolved for run ${runId}`);
   }
 
-  saveQueueManager ??= makeSaveQueueManager(memory, mastra);
+  saveQueueManager ??= makeSaveQueueManager(memory, runId, mastra);
 
   // Write the rebuilt state back into the per-process registry so sibling
   // durable steps in THIS process (e.g. the tool-call step that runs after the
@@ -459,6 +573,11 @@ export interface RebuiltRunTools {
   workspace?: Workspace;
   memory?: MastraMemory;
   saveQueueManager?: SaveQueueManager;
+  inputProcessors?: InputProcessorOrWorkflow[];
+  llmRequestInputProcessors?: LLMRequestProcessorOrWorkflow[];
+  outputProcessors?: OutputProcessorOrWorkflow[];
+  errorProcessors?: ErrorProcessorOrWorkflow[];
+  processorStates?: Map<string, ProcessorState>;
   /**
    * The restored RequestContext the rebuilt tools were BUILT with (their
    * closures capture this instance, not the step's own). Exposed so the
@@ -506,7 +625,15 @@ export async function rebuildRunToolsFromMastra(options: {
   messageListState?: SerializedMessageListState;
   /** Already-materialized messages, when the caller still owns the live list. */
   processorMessages?: MastraDBMessage[];
-  logger?: { debug?: (...args: any[]) => void };
+  /** Restore processors for tool execution, not persistence-only rebuilds. */
+  rehydrateProcessors?: boolean;
+  /**
+   * Runtime binding from the step's workflow input. A placeholder carrier
+   * created here is stamped with it, so bound reads fence it exactly like a
+   * prepared entry and a reused run ID cannot adopt it.
+   */
+  runtimeBindingId?: string;
+  logger?: { debug?: (...args: any[]) => void; error?: (...args: any[]) => void };
 }): Promise<RebuiltRunTools | undefined> {
   const {
     mastra,
@@ -522,8 +649,10 @@ export async function rebuildRunToolsFromMastra(options: {
   } = options;
   if (!mastra) return undefined;
 
+  let agentResolved = false;
   try {
     const agent = mastra.getAgentById(agentId);
+    agentResolved = true;
     // Restore the caller's request context so request-scoped tools, workspace
     // and memory resolve with the same configuration as the original call.
     const resolveRequestContext = createDurableRuntimeRequestContext({
@@ -549,33 +678,110 @@ export async function rebuildRunToolsFromMastra(options: {
       requestContext: resolveRequestContext,
       memoryConfig: state.memoryConfig,
       autoResumeSuspendedTools: execOptions?.autoResumeSuspendedTools,
+      clientTools: execOptions?.clientTools as ToolsInput | undefined,
       ...(processorMessages !== undefined ? { processorMessages } : {}),
     });
-    assertRuntimeToolBinding(tools, toolsMetadata, { agentId, runId });
+
+    // A hydrated entry means the caller's process still holds the toolset tools
+    // (e.g. a memoryless run rebuilding only for a save queue), so nothing was lost.
+    const toolsetsLocal = isHydratedRegistryEntry(getGlobalRunRegistryEntry(runId));
+    if (!toolsetsLocal) assertToolsetToolsAvailable(tools, execOptions?.toolsetToolNames, agentId, runId);
+    assertRuntimeToolBinding(tools, toolsMetadata, { agentId, runId }, execOptions?.clientTools);
 
     const memory = await (agent as any).getMemory?.({ requestContext: resolveRequestContext });
     const workspace = await (agent as any).getWorkspace?.({ requestContext: resolveRequestContext });
-    const saveQueueManager = makeSaveQueueManager(memory, mastra);
+    const saveQueueManager = makeSaveQueueManager(memory, runId, mastra);
+    let existing = getGlobalRunRegistryEntry(runId);
+    const rebuiltProcessors: Partial<Awaited<ReturnType<typeof rebuildProcessorPipeline>>> =
+      !options.rehydrateProcessors
+        ? {}
+        : existing?.outputProcessors && existing.processorStates
+          ? {
+              inputProcessors: existing.inputProcessors,
+              llmRequestInputProcessors: existing.llmRequestInputProcessors,
+              outputProcessors: existing.outputProcessors,
+              errorProcessors: existing.errorProcessors,
+              processorStates: existing.processorStates,
+            }
+          : await rebuildProcessorPipeline({
+              agent,
+              agentId,
+              requestContext: resolveRequestContext,
+              emptyErrorProcessorOverride: execOptions?.emptyErrorProcessorOverride,
+              processorStates: existing?.processorStates,
+              logger,
+            });
 
-    // Write back so sibling steps in this process reuse the rebuilt tools.
-    const existing = getGlobalRunRegistryEntry(runId);
-    const patch: Partial<RunRegistryEntry> = { tools, workspace, memory, saveQueueManager };
+    // Write back so sibling steps in this process reuse the rebuilt tools and
+    // processor pipeline. Only fill fields the entry is missing — never clobber
+    // live per-request instances from a populated in-process entry.
+    const patch: Partial<RunRegistryEntry> = {
+      tools,
+      workspace,
+      memory,
+      saveQueueManager,
+      ...rebuiltProcessors,
+      ...(options.rehydrateProcessors ? { requestContext: resolveRequestContext } : {}),
+    };
+    // A sibling may have published during construction. Keep lookup, merge and return synchronous.
+    existing = getGlobalRunRegistryEntry(runId);
     if (existing) {
-      // Only fill fields the entry is missing — never clobber a populated entry.
-      if (Object.keys(existing.tools ?? {}).length === 0) existing.tools = tools;
+      const needsProcessorPipeline = !existing.outputProcessors || !existing.processorStates;
+      if (
+        options.rehydrateProcessors &&
+        ((existing.isPlaceholder && needsProcessorPipeline) || !existing.requestContext)
+      ) {
+        existing.requestContext = resolveRequestContext;
+      }
+      // Only fill fields the entry is missing — never clobber a populated
+      // entry, and never replace an authoritative in-process tool snapshot.
+      const hasAuthoritativeToolSnapshot =
+        isHydratedRegistryEntry(existing) && (existing.baseTools !== undefined || existing.tools !== undefined);
+      if (!hasAuthoritativeToolSnapshot && Object.keys(existing.tools ?? {}).length === 0) existing.tools = tools;
       existing.workspace ??= workspace;
       existing.memory ??= memory;
       existing.saveQueueManager ??= saveQueueManager;
+      existing.inputProcessors ??= rebuiltProcessors.inputProcessors;
+      existing.llmRequestInputProcessors ??= rebuiltProcessors.llmRequestInputProcessors;
+      existing.outputProcessors ??= rebuiltProcessors.outputProcessors;
+      existing.errorProcessors ??= rebuiltProcessors.errorProcessors;
+      existing.processorStates ??= rebuiltProcessors.processorStates;
     } else {
       // The patch has no model and no runtime binding — register it as an
       // untrusted placeholder carrier so bound reads never mistake it for the
       // prepared run's runtime dependencies.
-      globalRunRegistry.set(runId, { isPlaceholder: true, ...patch } as RunRegistryEntry);
+      existing = {
+        isPlaceholder: true,
+        ...(options.runtimeBindingId !== undefined ? { runtimeBindingId: options.runtimeBindingId } : {}),
+        ...patch,
+      } as RunRegistryEntry;
+      globalRunRegistry.set(runId, existing);
     }
 
-    return { tools, workspace, memory, saveQueueManager, requestContext: resolveRequestContext };
+    return {
+      tools,
+      workspace,
+      memory,
+      saveQueueManager,
+      inputProcessors: existing.inputProcessors,
+      llmRequestInputProcessors: existing.llmRequestInputProcessors,
+      outputProcessors: existing.outputProcessors,
+      errorProcessors: existing.errorProcessors,
+      processorStates: existing.processorStates,
+      requestContext: resolveRequestContext,
+    };
   } catch (error) {
+    if (error instanceof DurableProcessorRebuildError) throw error;
     if (isRuntimeToolBindingMismatch(error)) throw error;
+
+    const entry = getGlobalRunRegistryEntry(runId);
+    // Falling back would silently drop call-time toolsets, so surface the failure.
+    if ((execOptions?.toolsetToolNames?.length ?? 0) > 0 && !isHydratedRegistryEntry(entry)) {
+      throw error;
+    }
+    if (agentResolved && options.rehydrateProcessors && (!entry?.outputProcessors || !entry.processorStates)) {
+      throw new DurableProcessorRebuildError(agentId, error);
+    }
     logger?.debug?.(`[DurableAgent:${agentId}] Failed to rebuild tools from Mastra for run ${runId}: ${error}`);
     return undefined;
   }
@@ -663,7 +869,8 @@ export function resolveTool(toolName: string, mastra?: Mastra): CoreTool | undef
  *  - Function-form global `requireToolApproval` is evaluated per call with
  *    `(toolName, args, ...)`. Throwing defaults to "require approval" (safe).
  *  - Boolean global / tool-level `requireApproval` seed the decision.
- *  - A per-tool `needsApprovalFn` (e.g. skill tools) is authoritative when
+ *  - Approval-exempt tools (skill tools) never require approval.
+ *  - A per-tool `needsApprovalFn` is authoritative when
  *    present and overrides the seed. It receives `{ requestContext, workspace }`
  *    as its second argument, exactly like the non-durable loop.
  *

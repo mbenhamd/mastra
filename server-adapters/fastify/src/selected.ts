@@ -9,6 +9,7 @@ import {
   MastraServer as MastraServerBase,
   checkRouteFGA,
   getCustomHTTPExceptionResponse,
+  isSafeObjectKey,
   isZodError,
   normalizeQueryParams,
   redactSensitiveQueryParams,
@@ -569,7 +570,7 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           file.on('error', () => {});
 
           file.on('end', () => {
-            if (!settled) {
+            if (!settled && isSafeObjectKey(fieldname)) {
               result[fieldname] = Buffer.concat(chunks);
             }
           });
@@ -583,6 +584,9 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         // aggregate cap is breached as well.
         if (valueTruncated) {
           abortTooLarge();
+          return;
+        }
+        if (!isSafeObjectKey(fieldname)) {
           return;
         }
         // Try to parse JSON strings (like 'options')
@@ -769,8 +773,17 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
       fetchResponse.headers.forEach((value, key) => {
         const lowerKey = key.toLowerCase();
         if (lowerKey === 'content-length' || lowerKey === 'transfer-encoding') return;
+        // Headers.forEach joins Set-Cookie values into one string; forward them individually below.
+        if (lowerKey === 'set-cookie') return;
         mergedHeaders[key] = value;
       });
+      const setCookies = fetchResponse.headers.getSetCookie();
+      if (setCookies.length > 0) {
+        // Keep cookies hooks already set on the reply (e.g. a session refresh).
+        const existing = mergedHeaders['set-cookie'];
+        const existingCookies = existing === undefined ? [] : Array.isArray(existing) ? existing : [String(existing)];
+        mergedHeaders['set-cookie'] = [...existingCookies, ...setCookies];
+      }
 
       reply.hijack();
 
