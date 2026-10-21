@@ -1690,6 +1690,29 @@ export class WorkflowEventProcessor extends EventProcessor {
       if (!currentClaim) return;
     }
 
+    // PF-6182: a restart was claimed by `Run.restart` before it was dispatched.
+    // Its running snapshot is written as a lifetime-bound step update under
+    // that claim, which never recreates a run deleted since the claim (for
+    // example by account erasure); a first start still creates its row below.
+    const fencedRestart =
+      !!restart &&
+      !parentWorkflow &&
+      shouldPersist &&
+      !childSnapshotEnsuredByAdmission &&
+      !!workflowsStore &&
+      workflowsStore.getWorkflowResumeCapabilities()?.fencedStepUpdateVersion === 1;
+    if (fencedRestart && workflowsStore) {
+      const written = await workflowsStore.persistWorkflowStepUpdate({
+        workflowName: workflow.id,
+        runId,
+        resourceId,
+        expectedExecutionGeneration: executionGeneration,
+        expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
+        snapshot: initialWorkflowSnapshotToPersist!,
+      });
+      if (written.status !== 'persisted') return;
+    }
+
     // The run is now admitted (or readmitted through time travel/restart), so
     // cancel any terminal-topic cleanup before the first new watch event is
     // published. Delaying this until after durable parent admission keeps a
@@ -1725,7 +1748,13 @@ export class WorkflowEventProcessor extends EventProcessor {
             },
     });
 
-    if (shouldInitializeSnapshot && workflowsStore && !childSnapshotEnsuredByAdmission && !guardedResume) {
+    if (
+      shouldInitializeSnapshot &&
+      workflowsStore &&
+      !childSnapshotEnsuredByAdmission &&
+      !guardedResume &&
+      !fencedRestart
+    ) {
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflow.id,
         runId,

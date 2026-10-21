@@ -2187,6 +2187,10 @@ export class InMemoryMemory extends MemoryStorage {
       ) {
         throw new Error('Observational memory guard does not match the active observation record.');
       }
+      // A generation that a concurrent reflection retired stays in this
+      // lineage: answer `retired` so the caller recomposes on the new head
+      // (PF-6182), instead of failing the observation.
+      if (record.supersededBy) return { applied: false, reason: 'retired' };
       const current = this.db.observationalMemory.get(
         this.getObservationalMemoryKey(
           observationalMemoryWriteGuard.threadId,

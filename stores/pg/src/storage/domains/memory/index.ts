@@ -5068,6 +5068,17 @@ export class MemoryPG extends MemoryStorage {
           if (writeGuard.recordId !== input.id) {
             throw new ObservationalMemoryGenerationConflictError();
           }
+          // A generation that a concurrent reflection retired stays in its
+          // lineage: answer `retired` so the caller recomposes on the new head
+          // (PF-6182). A cleared record, or one under another scope, still
+          // fails the generation check below.
+          const guarded = await this.#lockOMRow(t, tableName, input.id);
+          if (
+            guarded?.supersededBy &&
+            guarded.lookupKey === this.getOMKey(writeGuard.threadId, writeGuard.resourceId)
+          ) {
+            return { applied: false, reason: 'retired' as const };
+          }
           await this.assertCurrentObservationalMemoryGeneration(t, writeGuard);
         }
         const row = await this.#lockOMRow(t, tableName, input.id);

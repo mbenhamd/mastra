@@ -2154,6 +2154,41 @@ export function createObservationalMemoryTest({ storage }: { storage: MastraStor
         expect((await head(input)).activeObservations).toBe('- reflected');
       });
 
+      it('C9b: a guarded commit to a generation a concurrent reflection retired answers retired (PF-6182)', async () => {
+        const input = createSampleOMInput();
+        const record = await memoryStorage.initializeObservationalMemory(input);
+        const guard = { recordId: record.id, threadId: input.threadId, resourceId: input.resourceId };
+        // Another process reflects: a new generation becomes the head and retires `record`.
+        const next = await memoryStorage.createReflectionGeneration({
+          currentRecord: await snapshot(input),
+          reflection: '- reflected',
+          tokenCount: 1,
+        });
+        expect(
+          await memoryStorage.commitActiveObservations({
+            id: record.id,
+            observations: '- late',
+            tokenCount: 1,
+            lastObservedAt: at(300),
+            observationalMemoryWriteGuard: guard,
+          }),
+        ).toEqual({ applied: false, reason: 'retired' });
+        expect((await head(input)).id).toBe(next.id);
+        expect((await head(input)).activeObservations).toBe('- reflected');
+
+        // A cleared lineage is not a retirement: the guarded write still fails.
+        await memoryStorage.clearObservationalMemory(input.threadId, input.resourceId);
+        await expect(
+          memoryStorage.commitActiveObservations({
+            id: record.id,
+            observations: '- after clear',
+            tokenCount: 1,
+            lastObservedAt: at(400),
+            observationalMemoryWriteGuard: guard,
+          }),
+        ).rejects.toThrow();
+      });
+
       it('C10: a chunk wholly covered by the cursor is skipped, and activation never moves the cursor back', async () => {
         const input = createSampleOMInput();
         const record = await memoryStorage.initializeObservationalMemory(input);
