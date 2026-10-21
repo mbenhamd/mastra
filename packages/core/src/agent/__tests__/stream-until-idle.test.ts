@@ -493,6 +493,52 @@ describe('Agent.streamUntilIdle', () => {
     expect(getCallCount()).toBe(1);
   });
 
+  it('continues after a background task when untilIdle comes only from defaultOptions', async () => {
+    const memory = new MockMemory();
+    const { model, getCallCount, getCallOptions } = makeScriptedModel([
+      textResponse('first response'),
+      textResponse('continuation response'),
+    ]);
+    const agent = new Agent({
+      id: 'd0',
+      name: 'd0',
+      instructions: 'test',
+      model,
+      memory,
+      defaultOptions: { untilIdle: true },
+    });
+    mastra.addAgent(agent, 'd0');
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'task-d0',
+        toolName: 'dummy',
+        toolCallId: 'task-d0',
+        runId: 'run-d0',
+        agentId: 'd0',
+        threadId: 'thread-d0',
+        resourceId: 'user-1',
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+
+    // No untilIdle on the call: the agent's default must still keep the
+    // stream open for the background task and continue after it.
+    const outer = await agent.stream('hi', { memory: { thread: 'thread-d0', resource: 'user-1' } });
+    await publishEvent('task.running');
+    await new Promise(r => setTimeout(r, 50));
+    await publishEvent('task.completed');
+    await drain(outer.fullStream as ReadableStream<any>);
+
+    expect(getCallCount()).toBe(2);
+    expect(JSON.stringify(getCallOptions()[1]?.prompt)).toContain('task-d0');
+  });
+
   it('does not recurse when untilIdle comes from static defaultOptions (no bg manager)', async () => {
     const plainMastra = new Mastra({ logger: false, storage, backgroundTasks: { enabled: false } });
     const { model, getCallCount } = makeScriptedModel([textResponse('ok')]);
