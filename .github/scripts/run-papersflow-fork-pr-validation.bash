@@ -830,7 +830,8 @@ verify_pf5928_reviewed_merge() (
     echo 'PF-5928 protected base does not descend from the reviewed fork parent.' >&2
     return 1
   fi
-  protected_merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+  # --all: the base and head must meet only at the reviewed fork parent.
+  protected_merge_base="$(git merge-base --all "$BASE_SHA" "$HEAD_SHA")"
   if [[ "$protected_merge_base" != "$PF5928_FORK_PARENT" ]]; then
     echo 'PF-5928 protected base and reviewed head no longer meet at the reviewed fork parent.' >&2
     echo "expected: $PF5928_FORK_PARENT" >&2
