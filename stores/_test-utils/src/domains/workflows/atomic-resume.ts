@@ -1,8 +1,16 @@
-import { materializeWorkflowResumeOperationHash } from '@mastra/core/storage';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import {
+  isRunFenceConflictError,
+  materializeWorkflowResumeOperationHash,
+  setRunFenceContext,
+} from '@mastra/core/storage';
 import type {
   AdmitWorkflowResumeInput,
   FinalizeWorkflowResumeInput,
   RollbackWorkflowResumeInput,
+  RunFence,
+  RunFenceContext,
+  RunFenceScope,
   WorkflowsStorage,
 } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
@@ -404,4 +412,106 @@ export async function expectAtomicWorkflowResumeStorageContract(options: {
       ),
     );
   }
+}
+
+/**
+ * PF-6182: the atomic resume mutations are fenced workflow writes. Inside a
+ * durable execution's run fence scope, an execution that lost the run's claim
+ * can no longer admit, roll back or finalize a resume; the run's snapshot is
+ * left as the current owner wrote it. Outside any scope they behave as before.
+ */
+export async function expectAtomicWorkflowResumeRunFenceContract(options: {
+  primary: WorkflowsStorage;
+  workflowName: string;
+}): Promise<void> {
+  const { primary: store, workflowName } = options;
+  const resourceId = 'Resource-Fence';
+  const context = setRunFenceContext(localRunFenceContext());
+  const inScope = <T>(fence: RunFence, fn: () => Promise<T>) =>
+    context.run({ fenceFor: (target, runId) => (target === store && runId === fence.runId ? fence : undefined) }, fn);
+  const admissionFor = (runId: string): AdmitWorkflowResumeInput => ({
+    workflowName,
+    runId,
+    resourceId,
+    resumeOperationHash: materializeWorkflowResumeOperationHash({ runId, step: 'wait', approved: true }),
+    operationReplayContext: { version: 1, steps: ['wait'], resumePath: [0] },
+    executionGeneration: 'wfeg:atomic-resume-contract',
+    lifecycleResumeAttempt: 0,
+    lifecycleStepStates: {},
+    nextLifecycleResumeAttempt: 1,
+  });
+  const seed = (runId: string) =>
+    store.persistWorkflowSnapshot({ workflowName, runId, resourceId, snapshot: suspendedSnapshot(runId, resourceId) });
+  const claim = async (runId: string, ownerId: string, force = false): Promise<RunFence> => {
+    const claimed = await store.claimRunOwnership({ runId, ownerId, leaseMs: 60_000, force });
+    expect(claimed.acquired).toBe(true);
+    return { runId, generation: claimed.record!.generation, ownerId };
+  };
+  const expectFenceConflict = async (write: Promise<unknown>) => {
+    const error = await write.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(isRunFenceConflictError(error)).toBe(true);
+  };
+  const load = (runId: string) => store.loadWorkflowSnapshot({ workflowName, runId });
+
+  expect(store.supportsRunFencing()).toBe(true);
+
+  // A stale owner can neither finalize nor roll back the resume it admitted.
+  const runId = `${workflowName}-run`;
+  await seed(runId);
+  const ownerA = await claim(runId, 'owner-a');
+  const admission = admissionFor(runId);
+  await expect(inScope(ownerA, () => store.admitWorkflowResume(admission))).resolves.toMatchObject({
+    status: 'admitted',
+  });
+  const admitted = (await load(runId))!;
+  expect(admitted).toMatchObject({ status: 'running', lifecycleResumeAttempt: 1 });
+  const ownerB = await claim(runId, 'owner-b', true);
+  expect(ownerB.generation).toBeGreaterThan(ownerA.generation);
+  const rollback: RollbackWorkflowResumeInput = {
+    workflowName,
+    runId,
+    resourceId,
+    resumeOperationHash: admission.resumeOperationHash,
+    executionGeneration: admission.executionGeneration,
+    lifecycleResumeAttempt: 1,
+    lifecycleStepStates: {},
+  };
+  const finalization: FinalizeWorkflowResumeInput = {
+    ...rollback,
+    shouldPersistSnapshot: false,
+    receiptKey: 'resume-fence-receipt',
+    snapshot: { ...admitted, status: 'success', result: { from: 'stale' } },
+    result: { status: 'success', steps: {}, result: { from: 'stale' } },
+  };
+  await expectFenceConflict(inScope(ownerA, () => store.finalizeWorkflowResume(finalization)));
+  await expectFenceConflict(inScope(ownerA, () => store.rollbackWorkflowResume(rollback)));
+  expect(await load(runId)).toMatchObject({ status: 'running', lifecycleResumeAttempt: 1 });
+  expect((await load(runId))?.result).toBeUndefined();
+  // The current owner still can.
+  await expect(inScope(ownerB, () => store.rollbackWorkflowResume(rollback))).resolves.toMatchObject({
+    status: 'rolled_back',
+  });
+
+  // A stale owner cannot admit a resume either.
+  const staleAdmitRunId = `${workflowName}-stale-admit`;
+  await seed(staleAdmitRunId);
+  const staleAdmitOwner = await claim(staleAdmitRunId, 'owner-a');
+  await claim(staleAdmitRunId, 'owner-b', true);
+  await expectFenceConflict(inScope(staleAdmitOwner, () => store.admitWorkflowResume(admissionFor(staleAdmitRunId))));
+  expect(await load(staleAdmitRunId)).toMatchObject({ status: 'suspended', lifecycleResumeAttempt: 0 });
+
+  // Outside any fence scope the mutations behave as before.
+  const unscopedRunId = `${workflowName}-unscoped`;
+  await seed(unscopedRunId);
+  await claim(unscopedRunId, 'owner-a');
+  await expect(store.admitWorkflowResume(admissionFor(unscopedRunId))).resolves.toMatchObject({ status: 'admitted' });
+}
+
+/** A run fence context for tests that run without the durable agent runtime. */
+function localRunFenceContext(): RunFenceContext {
+  const storage = new AsyncLocalStorage<RunFenceScope | undefined>();
+  return { current: () => storage.getStore(), run: (scope, fn) => storage.run(scope, fn) };
 }

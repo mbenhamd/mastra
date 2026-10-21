@@ -1,4 +1,7 @@
-import { expectAtomicWorkflowResumeStorageContract } from '@internal/storage-test-utils';
+import {
+  expectAtomicWorkflowResumeRunFenceContract,
+  expectAtomicWorkflowResumeStorageContract,
+} from '@internal/storage-test-utils';
 import { createClient } from '@libsql/client';
 import { Mastra } from '@mastra/core/mastra';
 import { InMemoryDB, TABLE_SCHEMAS, TABLE_WORKFLOW_SNAPSHOT, WorkflowsInMemory } from '@mastra/core/storage';
@@ -109,6 +112,26 @@ describe('atomic workflow resume storage contract', () => {
       await expectAtomicWorkflowResumeStorageContract({
         primary: workflows!,
         workflowName: 'atomic-resume-bare-memory',
+      });
+    } finally {
+      await store.close();
+    }
+  });
+
+  it('refuses in-memory resume mutations from an execution that lost the run claim (PF-6182)', async () => {
+    await expectAtomicWorkflowResumeRunFenceContract({
+      primary: new WorkflowsInMemory({ db: new InMemoryDB() }),
+      workflowName: 'atomic-resume-fence-in-memory',
+    });
+  });
+
+  it('refuses libsql resume mutations from an execution that lost the run claim (PF-6182)', async () => {
+    const store = new LibSQLStore({ id: 'atomic-resume-fence-bare-memory', url: ':memory:' });
+    try {
+      await store.init();
+      await expectAtomicWorkflowResumeRunFenceContract({
+        primary: (await store.getStore('workflows'))!,
+        workflowName: 'atomic-resume-fence-libsql',
       });
     } finally {
       await store.close();

@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { expectAtomicWorkflowResumeStorageContract } from '@internal/storage-test-utils';
+import {
+  expectAtomicWorkflowResumeRunFenceContract,
+  expectAtomicWorkflowResumeStorageContract,
+} from '@internal/storage-test-utils';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, it } from 'vitest';
 import { WorkflowsPG } from '.';
@@ -28,6 +31,13 @@ describe('WorkflowsPG atomic resume transaction', () => {
       primary,
       concurrent,
       workflowName: `atomic-resume-pg-${randomUUID()}`,
+    });
+  });
+
+  it('refuses resume mutations from an execution that lost the run claim (PF-6182)', async () => {
+    await expectAtomicWorkflowResumeRunFenceContract({
+      primary,
+      workflowName: `atomic-resume-fence-pg-${randomUUID()}`,
     });
   });
 });
