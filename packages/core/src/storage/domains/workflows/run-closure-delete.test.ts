@@ -548,11 +548,49 @@ describe('WorkflowsInMemory run closure delete: retained absence fence (PF-6186)
     });
     expect(after.releasedAt).toBeUndefined();
     expect(isEmptyWorkflowSnapshot(after.snapshot, run.runId)).toBe(true);
-    // Already content-free: an idempotent no-op.
+    expect(JSON.stringify(after.snapshot)).not.toContain('content');
+    // Already content-free: an idempotent no-op that still reports the fence.
     await expect(
       workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
-    ).resolves.toEqual({ status: 'missing' });
+    ).resolves.toEqual({ status: 'missing', retainedFence: true });
     expect(handoffOf(db)).toMatchObject({ mutationFence: FENCE, status: 'completed' });
+  });
+
+  it('replaces a fence snapshot whose timestamp carries content', async () => {
+    const { db, workflows } = setup();
+    await fenceAbsence(workflows, {
+      snapshot: { ...createEmptyWorkflowSnapshot(run.runId), timestamp: { userText: 'private content' } } as any,
+    });
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toMatchObject({ status: 'deleted', retainedFence: true });
+    const after = handoffOf(db)!;
+    expect(typeof (after.snapshot as { timestamp?: unknown }).timestamp).toBe('number');
+    expect(JSON.stringify(after.snapshot)).not.toContain('private content');
+    expect(after).toMatchObject({ mutationFence: FENCE, status: 'completed' });
+  });
+
+  it("clears the erased lifetime's terminal latch even when only the empty fence remains", async () => {
+    const { db, workflows } = setup();
+    await settledRun(workflows);
+    const key = JSON.stringify([run.workflowName, run.runId]);
+    await workflows.deleteWorkflowRunById(run);
+    expect(db.workflowTerminalParentRevisions.get(key)?.terminalStatus).toBe('success');
+    await fenceAbsence(workflows);
+    const before = db.workflowTerminalParentRevisions.get(key)!;
+
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toMatchObject({ retainedFence: true });
+    const revision = db.workflowTerminalParentRevisions.get(key)!;
+    expect(revision.terminalStatus).toBeNull();
+    expect(revision.generation).toBeGreaterThan(before.generation);
+    expect(handoffOf(db)).toMatchObject({ mutationFence: FENCE, status: 'completed' });
+    // Now fully normalized: a repeat is a no-op.
+    await expect(
+      workflows.deleteWorkflowRunClosure({ ...run, expectedResourceId: RESOURCE, retainHandoffFence: FENCE }),
+    ).resolves.toEqual({ status: 'missing', retainedFence: true });
+    expect(db.workflowTerminalParentRevisions.get(key)!.generation).toBe(revision.generation);
   });
 
   it('still deletes a handoff under another fence, or when no fence is named', async () => {

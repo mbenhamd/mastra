@@ -2374,7 +2374,15 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         ? handoff
         : undefined;
     const neutralize = retained !== undefined && !isEmptyWorkflowSnapshot(retained.snapshot, runId);
-    if (retained && !run && terminalRows === 0 && !neutralize) return { status: 'missing' };
+    // Nothing left to erase only once the kept revision carries no terminal
+    // latch either; otherwise the cleanup below still clears it.
+    const latchedRevision = this.db.workflowTerminalParentRevisions.get(key);
+    const latched =
+      latchedRevision !== undefined &&
+      (latchedRevision.terminalStatus !== null || latchedRevision.erasureCancelled === true);
+    if (retained && !run && terminalRows === 0 && !neutralize && !latched) {
+      return { status: 'missing', retainedFence: true };
+    }
 
     // Leaves first and the journal last, as completed-journal cleanup does.
     for (const planKey of planKeys) this.db.workflowTerminalContinuationPlans.delete(planKey);

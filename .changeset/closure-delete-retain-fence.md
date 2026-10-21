@@ -27,6 +27,6 @@ await workflows.deleteWorkflowRunClosure({
 // and every later snapshot write for the run id is refused.
 ```
 
-Handoffs under another fence, pending or released handoffs, and calls without the option behave as before.
+Handoffs under another fence, pending or released handoffs, and calls without the option behave as before. When only the empty fence handoff remains, the delete answers `missing` with `retainedFence: true`.
 
-A resumed, restarted or time-traveled workflow run no longer recreates its run when erasure deleted it while a step was executing, even in a fresh process and for a run that persists only suspensions. Only a run's first admission (`run.start()`) may create its row from a step update.
+A restart that finds every entry already finished now fences its terminal write with the restart's execution generation, so it never recreates a run that erasure deleted after the restart claimed it.

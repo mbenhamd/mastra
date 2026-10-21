@@ -738,12 +738,11 @@ export async function persistStepUpdate(
     // A lifetime-bound step update never recreates a missing row (PF-4385 tombstone). A run
     // whose persistence predicate rejects both `pending` and `running` (for example a
     // suspended-only workflow) was never admitted with a row, so its first persisted state
-    // creates it. That applies only to the run's first admission (`Run.start`) that this
-    // engine has never persisted: a resume, restart or time travel (even in a fresh process),
-    // or a run whose row this engine wrote and that was since deleted, stays fenced (PF-6186).
+    // creates it. That applies only to a fresh execution this engine has never persisted:
+    // a resume, or a run whose row this engine wrote and that was since deleted, stays fenced.
     if (
       persisted?.status === 'missing_run' &&
-      executionContext.firstAdmission === true &&
+      executionContext.resumeOperationHash === undefined &&
       engine.getLastPersistedStatus(runId) === undefined &&
       !persistencePredicate?.({ stepResults: {}, workflowStatus: 'pending' }) &&
       !persistencePredicate?.({ stepResults, workflowStatus: 'running' })

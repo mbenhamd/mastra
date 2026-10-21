@@ -6176,7 +6176,12 @@ export class WorkflowsPG extends WorkflowsStorage {
             ? handoff
             : undefined;
         const neutralize = retained !== undefined && !isEmptyWorkflowSnapshot(retained.snapshot, runId);
-        if (retained && !snapshot && !hasTerminalRows && !neutralize) return { status: 'missing' };
+        // Nothing left to erase only once the kept revision carries no
+        // terminal latch either; otherwise the cleanup below still clears it.
+        const latched = revision !== undefined && revision.terminalStatus !== null;
+        if (retained && !snapshot && !hasTerminalRows && !neutralize && !latched) {
+          return { status: 'missing', retainedFence: true };
+        }
 
         // Leaves first and the journal last, as completed-journal cleanup does.
         let terminalRows = 0;

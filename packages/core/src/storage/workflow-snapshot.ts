@@ -109,11 +109,15 @@ function mergeForeachProgress(
 
 /**
  * Whether `snapshot` is exactly `createEmptyWorkflowSnapshot(runId)` apart from
- * its `timestamp`: the content-free snapshot a retained fence handoff keeps.
+ * its (numeric) `timestamp`: the content-free snapshot a retained fence
+ * handoff keeps.
  */
 export function isEmptyWorkflowSnapshot(snapshot: unknown, runId: string): boolean {
   if (snapshot === null || typeof snapshot !== 'object') return false;
-  const { timestamp: _timestamp, ...rest } = snapshot as Record<string, unknown>;
+  const { timestamp, ...rest } = snapshot as Record<string, unknown>;
+  // A handoff accepts any JSON object, so the excluded timestamp must itself
+  // carry no content.
+  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return false;
   const { timestamp: _emptyTimestamp, ...empty } = createEmptyWorkflowSnapshot(runId) as unknown as Record<
     string,
     unknown

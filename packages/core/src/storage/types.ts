@@ -365,6 +365,8 @@ export interface DeleteWorkflowRunClosureInput {
  * - `deleted`: the closure is gone; `removed` counts what this call deleted.
  *   `retainedFence` is true when the handoff was kept under
  *   `retainHandoffFence` (its snapshot emptied, if it was not already).
+ * - `missing` with `retainedFence`: only the kept, already empty fence
+ *   handoff remains (for example a repeated or late delete).
  * - `unsupported`: the adapter does not implement `closureDeleteVersion: 1`.
  */
 export type DeleteWorkflowRunClosureResult =
@@ -373,7 +375,8 @@ export type DeleteWorkflowRunClosureResult =
       removed: { snapshot: boolean; handoff: boolean; terminalRows: number };
       retainedFence?: boolean;
     }
-  | { status: 'missing' | 'resource_mismatch' | 'fenced' | 'active' | 'unsupported' };
+  | { status: 'missing'; retainedFence?: boolean }
+  | { status: 'resource_mismatch' | 'fenced' | 'active' | 'unsupported' };
 
 /**
  * Settles a run that will never settle on its own (an erased account's agent
