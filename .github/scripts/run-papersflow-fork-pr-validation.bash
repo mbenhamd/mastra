@@ -3553,7 +3553,7 @@ run_pf5928_admission_self_tests() (
   grep -Fq 'no longer meet at the reviewed fork parent' "$output"
 
   output="$test_root/wrong-metadata.log"
-  if run_fixture_admission "$reviewed_head" "$output" HEAD_REF=feature/not-pf-4402; then
+  if run_fixture_admission "$reviewed_head" "$output" HEAD_REF=feature/not-pf-5928; then
     echo 'Wrong PF-5928 branch metadata unexpectedly passed admission.' >&2
     return 1
   fi

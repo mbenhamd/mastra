@@ -239,7 +239,7 @@ jobs:
           if grep -Fq -- '--self-test-pf5928-upstream-sync' "$policy_script"; then
             cp "$policy_script" "$pf5928_policy_script"
           elif [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && \
-            "$HEAD_REF" == 'ci/pf-4402-upstream-sync-validation' && \
+            "$HEAD_REF" == 'ci/pf-5928-upstream-sync-validation' && \
             "$BASE_REF" == 'main' ]]; then
             echo 'Bootstrapping the PF-5928 exact-merge fixtures from this same-repository policy PR.'
             /usr/bin/git show "${HEAD_SHA}:${script_path}" > "$pf5928_policy_script"
