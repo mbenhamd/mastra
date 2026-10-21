@@ -1721,6 +1721,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         lifecycleResumeAttempt,
         lifecycleStepStates,
         resumeOperationHash: params.resumeOperationHash,
+        parentWorkflow: params.parentWorkflow,
         executionPath: [lastIdx],
         stepExecutionPath,
         activeStepsPath: {},
