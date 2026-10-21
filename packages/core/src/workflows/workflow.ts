@@ -5559,6 +5559,7 @@ export class Run<
           serializedStepGraph: this.serializedStepGraph,
           input: inputDataToUse,
           initialState: initialStateToUse,
+          firstAdmission: true,
           pubsub: this.pubsub,
           retryConfig: this.retryConfig,
           requestContext: (requestContext ?? new RequestContext()) as RequestContext,

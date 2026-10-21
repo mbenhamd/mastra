@@ -167,6 +167,13 @@ export interface WorkflowSnapshotHandoffCapabilities {
    */
   closureDeleteVersion?: 1;
   /**
+   * `deleteWorkflowRunClosure` honours `retainHandoffFence`: a completed,
+   * unreleased handoff under exactly that fence survives the delete with a
+   * content-free snapshot, so a run already fenced as absent is never left
+   * unfenced by a stale delete.
+   */
+  closureDeleteRetainFenceVersion?: 1;
+  /**
    * Atomic erasure cancel: `cancelWorkflowRunForErasure`, which overwrites an
    * unsettled snapshot with an empty `canceled` one only when no journal and
    * no pending nested dependent still needs it.
@@ -332,6 +339,16 @@ export interface DeleteWorkflowRunClosureInput {
   workflowName: string;
   runId: string;
   expectedResourceId: string;
+  /**
+   * Keep the run's handoff when it is completed, unreleased, records
+   * `expectedResourceId` and carries exactly this `mutationFence`
+   * (`closureDeleteRetainFenceVersion: 1`). Everything else in the closure is
+   * erased as usual; the kept handoff's snapshot is replaced, in the same
+   * atomic step, by an empty one, so it holds no run content. Its fence,
+   * status and claim generation are unchanged. Any other handoff is deleted
+   * as without the option.
+   */
+  retainHandoffFence?: string;
 }
 
 /**
@@ -346,14 +363,20 @@ export interface DeleteWorkflowRunClosureInput {
  *   by a parent effect or recovery ancestry) has not completed its terminal
  *   journal. Retry later; erase child runs first.
  * - `deleted`: the closure is gone; `removed` counts what this call deleted.
+ *   `retainedFence` is true when the handoff was kept under
+ *   `retainHandoffFence` (its snapshot emptied, if it was not already).
+ * - `missing` with `retainedFence`: only the kept, already empty fence
+ *   handoff remains (for example a repeated or late delete).
  * - `unsupported`: the adapter does not implement `closureDeleteVersion: 1`.
  */
 export type DeleteWorkflowRunClosureResult =
   | {
       status: 'deleted';
       removed: { snapshot: boolean; handoff: boolean; terminalRows: number };
+      retainedFence?: boolean;
     }
-  | { status: 'missing' | 'resource_mismatch' | 'fenced' | 'active' | 'unsupported' };
+  | { status: 'missing'; retainedFence?: boolean }
+  | { status: 'resource_mismatch' | 'fenced' | 'active' | 'unsupported' };
 
 /**
  * Settles a run that will never settle on its own (an erased account's agent

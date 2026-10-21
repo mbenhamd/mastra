@@ -96,6 +96,7 @@ import {
   WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_MATCH_PATH,
   WORKFLOW_SNAPSHOT_NETWORK_THREAD_ERASURE_ANY_THREAD_PATH,
   createEmptyWorkflowSnapshot,
+  isEmptyWorkflowSnapshot,
   isSettledWorkflowRunStatus,
   workflowSnapshotHandoffCanonicalStatesEqual,
   workflowSnapshotHandoffSnapshotsEqual,
@@ -545,6 +546,7 @@ export class WorkflowsPG extends WorkflowsStorage {
       recoveryVersion: 1,
       releaseVersion: 1,
       closureDeleteVersion: 1,
+      closureDeleteRetainFenceVersion: 1,
       closureCancelVersion: 1,
       threadErasureListVersion: 1,
     };
@@ -6101,8 +6103,9 @@ export class WorkflowsPG extends WorkflowsStorage {
   }
 
   async deleteWorkflowRunClosure(input: DeleteWorkflowRunClosureInput): Promise<DeleteWorkflowRunClosureResult> {
-    const { workflowName, runId, expectedResourceId } = input;
+    const { workflowName, runId, expectedResourceId, retainHandoffFence } = input;
     validateWorkflowRunClosureIdentity(workflowName, runId, expectedResourceId);
+    if (retainHandoffFence !== undefined) validateWorkflowSnapshotHandoffFence(retainHandoffFence);
     const identity = [workflowName, runId];
     try {
       return await this.#db.client.tx(async t => {
@@ -6162,6 +6165,24 @@ export class WorkflowsPG extends WorkflowsStorage {
         // needs this run's parent state; erase children first.
         if (await this.hasPendingTerminalDependents(t, workflowName, runId)) return { status: 'active' };
 
+        // A completed, unreleased handoff under the caller's retain fence
+        // stays as the run's absence fence, with a content-free snapshot.
+        const retained =
+          handoff !== undefined &&
+          retainHandoffFence !== undefined &&
+          handoff.status === 'completed' &&
+          handoff.releasedAt === undefined &&
+          handoff.mutationFence === retainHandoffFence
+            ? handoff
+            : undefined;
+        const neutralize = retained !== undefined && !isEmptyWorkflowSnapshot(retained.snapshot, runId);
+        // Nothing left to erase only once the kept revision carries no
+        // terminal latch either; otherwise the cleanup below still clears it.
+        const latched = revision !== undefined && revision.terminalStatus !== null;
+        if (retained && !snapshot && !hasTerminalRows && !neutralize && !latched) {
+          return { status: 'missing', retainedFence: true };
+        }
+
         // Leaves first and the journal last, as completed-journal cleanup does.
         let terminalRows = 0;
         for (const table of [
@@ -6175,7 +6196,7 @@ export class WorkflowsPG extends WorkflowsStorage {
           const result = await t.query(`DELETE FROM ${table} WHERE workflow_name = $1 AND run_id = $2`, identity);
           terminalRows += result.rowCount ?? 0;
         }
-        if (handoff) {
+        if (handoff && !retained) {
           // Keep the erased claim history's high-water mark on the kept
           // revision row (locked above), so a later claim starts above it.
           if (!revision) throw new TypeError('Workflow snapshot handoff is missing parent revision evidence');
@@ -6188,10 +6209,23 @@ export class WorkflowsPG extends WorkflowsStorage {
             [workflowName, runId, handoff.claimGeneration],
           );
         }
-        const handoffDeleted = await t.query(
-          `DELETE FROM ${this.workflowSnapshotHandoffTableName()} WHERE workflow_name = $1 AND run_id = $2`,
-          identity,
-        );
+        let handoffDeleted = 0;
+        if (!retained) {
+          const deleted = await t.query(
+            `DELETE FROM ${this.workflowSnapshotHandoffTableName()} WHERE workflow_name = $1 AND run_id = $2`,
+            identity,
+          );
+          handoffDeleted = deleted.rowCount ?? 0;
+        } else if (neutralize) {
+          // Only the snapshot changes: fence, status and claim generation stay.
+          await t.none(
+            `UPDATE ${this.workflowSnapshotHandoffTableName()}
+             SET snapshot = $1,
+                 updated_at = GREATEST(updated_at, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint)
+             WHERE workflow_name = $2 AND run_id = $3`,
+            [sanitizeJsonForPg(JSON.stringify(createEmptyWorkflowSnapshot(runId))), workflowName, runId],
+          );
+        }
         // Deletes the snapshot and bumps the kept parent revision, the
         // content-free run-id reuse fence, exactly as deleteWorkflowRunById.
         const snapshotDeleted = await this.deleteUnfencedWorkflowRun(t, workflowName, runId, revision);
@@ -6207,7 +6241,8 @@ export class WorkflowsPG extends WorkflowsStorage {
         );
         return {
           status: 'deleted',
-          removed: { snapshot: snapshotDeleted, handoff: (handoffDeleted.rowCount ?? 0) > 0, terminalRows },
+          removed: { snapshot: snapshotDeleted, handoff: handoffDeleted > 0, terminalRows },
+          ...(retained ? { retainedFence: true } : {}),
         };
       });
     } catch (error) {

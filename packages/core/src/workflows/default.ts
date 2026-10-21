@@ -918,6 +918,8 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     serializedStepGraph: SerializedStepFlowEntry[];
     input?: TInput;
     initialState?: TState;
+    /** Set only by `Run.start` (see `ExecutionEngine.execute`). */
+    firstAdmission?: boolean;
     restart?: RestartExecutionParams;
     timeTravel?: TimeTravelExecutionParams;
     resume?: {
@@ -974,6 +976,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     );
     const lifecycleResumeAttempt = params.lifecycleResumeAttempt;
     const lifecycleStepStates = params.lifecycleStepStates;
+    // Only a run's first admission (`Run.start`) may create its row from a step
+    // update; resume, restart and time travel keep their lifecycle expectations.
+    const firstAdmission =
+      params.firstAdmission === true && !params.resume && !params.restart && !params.timeTravel
+        ? ({ firstAdmission: true } as const)
+        : {};
     const suppressLifecycleEvents = workflowLifecycleEventsAreSuppressed(params.pubsub);
     const { attempts = 0, delay = 0 } = retryConfig ?? {};
     const steps = graph.steps;
@@ -1232,6 +1240,8 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             lifecycleResumeAttempt,
             lifecycleStepStates,
             resumeOperationHash: params.resumeOperationHash,
+            parentWorkflow: params.parentWorkflow,
+            ...firstAdmission,
             executionPath: [i],
             stepExecutionPath,
             activeStepsPath: {},
@@ -1255,6 +1265,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         lifecycleResumeAttempt,
         lifecycleStepStates,
         resumeOperationHash: params.resumeOperationHash,
+        ...firstAdmission,
         parentWorkflow: params.parentWorkflow,
         executionPath: [i],
         stepExecutionPath,
@@ -1699,9 +1710,19 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             )
           : this.getStepOutput(stepResults, lastEntry);
       lastOutput = { result: { status: 'success', output }, stepResults };
+      // Carry the admitted lifecycle identity, as every other context here
+      // does: without the execution generation the terminal write is unfenced
+      // and would recreate a run that erasure deleted after the restart's
+      // claim (PF-6186).
       lastExecutionContext = {
         workflowId,
         runId,
+        transientExecution: params.transientExecution,
+        executionGeneration,
+        lifecycleResumeAttempt,
+        lifecycleStepStates,
+        resumeOperationHash: params.resumeOperationHash,
+        parentWorkflow: params.parentWorkflow,
         executionPath: [lastIdx],
         stepExecutionPath,
         activeStepsPath: {},

@@ -1717,6 +1717,11 @@ export type ExecutionContext = {
   lifecycleStepStates?: Record<string, { stepCallId: string; stepAttempt: number }>;
   /** Storage-owned identity for an atomically admitted resume attempt. */
   resumeOperationHash?: `sha256:${string}`;
+  /**
+   * This execution is the run's first admission (`Run.start`). Only then may
+   * a step update that finds no row create it; see `persistStepUpdate`.
+   */
+  firstAdmission?: boolean;
   parentWorkflow?: NestedWorkflowParent;
   executionPath: number[];
   stepExecutionPath?: string[];
