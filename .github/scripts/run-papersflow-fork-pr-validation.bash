@@ -14402,6 +14402,17 @@ while IFS= read -r file; do
     stores/libsql/src/storage/domains/workflows/index.ts)
       queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
       ;;
+    stores/libsql/src/storage/domains/memory/index.ts)
+      # PF-6182: the shared observational-memory contract runs from the store suite.
+      queue_owned_workspace_test "$file" stores/libsql/src/storage/index.test.ts
+      ;;
+    stores/libsql/src/__tests__/cross-process/fixtures/t79-peer.ts)
+      # PF-6182: the T79 peer fixture runs only in the cross-process abort
+      # harness's xproc cells, which stay skipped until PF-6165 reworks them
+      # for binding-scoped control. Until then this job's stores/libsql
+      # typecheck is its real validation; the harness test covers its imports.
+      queue_owned_workspace_test "$file" stores/libsql/src/__tests__/cross-process/xproc-abort.test.ts
+      ;;
     workflows/inngest/src/__tests__/durable-agent.test.utils.ts)
       queue_owned_workspace_test "$file" workflows/inngest/src/__tests__/durable-agent.test.utils.test.ts
       ;;
