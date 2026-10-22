@@ -15328,7 +15328,10 @@ if workspace_changed mastracode || workspace_changed mastracode/sdk || workspace
     done < "$changed_files"
   )
   if (( ${#mastracode_lint_files[@]} > 0 )); then
-    run_with_validation_budget 600 pnpm exec oxlint "${mastracode_lint_files[@]}"
+    # Package configs ignore some admitted paths (for example the SDK's
+    # scripts/**, which get their own typecheck below); a selection that is
+    # entirely ignored is not a lint failure.
+    run_with_validation_budget 600 pnpm exec oxlint --no-error-on-unmatched-pattern "${mastracode_lint_files[@]}"
   fi
 fi
 
