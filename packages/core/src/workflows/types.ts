@@ -904,6 +904,15 @@ export interface WorkflowOptions {
   isForeignExecution?: (eventRequestContext: unknown, requestContext: RequestContext) => boolean;
 
   /**
+   * Bounds the request context a stored snapshot keeps. The evented engine
+   * merges the context into storage on every step write, past `pruneSnapshot`,
+   * so it applies this to each persisted copy; the live context stays whole.
+   *
+   * @internal Set by durable agent workflows with a `durableRequestContextKeys` allowlist.
+   */
+  persistedRequestContext?: (requestContext: Record<string, any>) => Record<string, any>;
+
+  /**
    * Transforms the run snapshot immediately before it is persisted.
    * Called at every snapshot persist site (both engines). Must be a pure
    * function returning JSON-safe data — the snapshot may cross a pubsub

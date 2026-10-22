@@ -2097,6 +2097,7 @@ export class Workflow<
       allowUnclaimedResumes: options.allowUnclaimedResumes,
       isOwnershipLostError: options.isOwnershipLostError,
       isForeignExecution: options.isForeignExecution,
+      persistedRequestContext: options.persistedRequestContext,
       pruneSnapshot: options.pruneSnapshot,
       tracingPolicy: options.tracingPolicy,
       onStart: options.onStart,

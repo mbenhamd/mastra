@@ -80,12 +80,19 @@ export async function processWorkflowLoop(
     stepExecutor,
     step,
     stepResult,
+    ownerWorkflow,
   }: {
     pubsub: PubSub;
     mastra: Mastra;
     stepExecutor: StepExecutor;
     step: Extract<StepFlowEntry, { type: 'loop' }>;
     stepResult: StepResult<any, any, any, any>;
+    /**
+     * The live workflow owning the loop, when `workflow` is the parent
+     * descriptor of a nested loop body that just ended; its options bound the
+     * stored request context (PF-6182).
+     */
+    ownerWorkflow?: ProcessorArgs['workflow'];
   },
 ) {
   const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
@@ -182,7 +189,7 @@ export async function processWorkflowLoop(
       runId,
       stepId: getEntryId(step.step),
       result: nextIterationResult,
-      requestContext: getPersistedRequestContext(requestContext),
+      requestContext: getPersistedRequestContext(requestContext, ownerWorkflow ?? workflow),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
     return isStaleExecutionResult(write) || isDeletedRunResultWrite(write, workflow, parentWorkflow, stepResults);
@@ -549,7 +556,7 @@ export async function processWorkflowForEach(
           ...currentResult,
           output: updatedOutput,
         } as any,
-        requestContext: getPersistedRequestContext(requestContext),
+        requestContext: getPersistedRequestContext(requestContext, workflow),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
       if (stopOnStaleWrite(resumeWrite, getEntryId(step.step))) return;
@@ -637,7 +644,7 @@ export async function processWorkflowForEach(
       runId,
       stepId,
       result: currentResult,
-      requestContext: getPersistedRequestContext(requestContext),
+      requestContext: getPersistedRequestContext(requestContext, workflow),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
     if (stopOnStaleWrite(restoreWrite, stepId)) return;
@@ -666,7 +673,7 @@ export async function processWorkflowForEach(
         runId,
         stepId,
         result: { ...currentResult, output: updatedOutput } as any,
-        requestContext: getPersistedRequestContext(requestContext),
+        requestContext: getPersistedRequestContext(requestContext, workflow),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
       if (stopOnStaleWrite(queueWrite, stepId)) return;
@@ -754,7 +761,7 @@ export async function processWorkflowForEach(
         runId,
         stepId: getEntryId(step.step),
         result,
-        requestContext: getPersistedRequestContext(requestContext),
+        requestContext: getPersistedRequestContext(requestContext, workflow),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
       if (stopOnStaleWrite(emptyWrite, getEntryId(step.step))) return;
@@ -770,7 +777,7 @@ export async function processWorkflowForEach(
         runId,
         stepId: getEntryId(step.step),
         result: { ...result, suspendPayload: undefined, suspendOutput: undefined } as any,
-        requestContext: getPersistedRequestContext(requestContext),
+        requestContext: getPersistedRequestContext(requestContext, workflow),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
       if (stopOnStaleWrite(completedWrite, getEntryId(step.step))) return;
@@ -827,7 +834,7 @@ export async function processWorkflowForEach(
         startedAt: Date.now(),
         payload: (prevResult as any)?.output,
       } as any,
-      requestContext: getPersistedRequestContext(requestContext),
+      requestContext: getPersistedRequestContext(requestContext, workflow),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
     if (stopOnStaleWrite(kickoffWrite, getEntryId(step.step))) return;
@@ -887,7 +894,7 @@ export async function processWorkflowForEach(
       startedAt: Date.now(),
       payload: (prevResult as any)?.output,
     } as any,
-    requestContext: getPersistedRequestContext(requestContext),
+    requestContext: getPersistedRequestContext(requestContext, workflow),
     executionGeneration: lifecycleExecution.executionGeneration,
   });
   if (stopOnStaleWrite(iterWrite, getEntryId(step.step))) return;

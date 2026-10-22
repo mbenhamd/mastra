@@ -813,6 +813,7 @@ export class WorkflowsInMemory extends WorkflowsStorage {
     runId: string,
     resourceId: string | undefined,
     mutate: (snapshot: WorkflowRunState | undefined) => { status: string; snapshot?: WorkflowRunState },
+    operation: string,
   ) {
     const key = this.getWorkflowKey(workflowName, runId);
     for (let attempt = 1; ; attempt++) {
@@ -846,6 +847,11 @@ export class WorkflowsInMemory extends WorkflowsStorage {
         throwIfWorkflowReentrantAttemptsExhausted(attempt);
         continue;
       }
+      // A stale execution's resume admission, rollback, finalization or
+      // receipt consumption is a fenced workflow write like any other
+      // (PF-6182). Checked here, after the last caller code, so no reentrant
+      // claim can land between the check and the write.
+      this.assertFence(undefined, runId, operation);
       if (revision?.erasureCancelled && storedSnapshot && fencedStatus !== revision.terminalStatus) {
         throw new WorkflowStaleSnapshotPersistError({ workflowName, runId });
       }
@@ -899,8 +905,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       replaceRequestContext,
       operationReplayContext,
     };
-    return this.applyWorkflowResumeMutation(workflowName, runId, resourceId, snapshot =>
-      admitWorkflowResumeRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+    return this.applyWorkflowResumeMutation(
+      workflowName,
+      runId,
+      resourceId,
+      snapshot => admitWorkflowResumeRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+      'admitWorkflowResume',
     ) as AdmitWorkflowResumeResult;
   }
 
@@ -929,8 +939,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       lifecycleStepStates,
       resourceId,
     };
-    return this.applyWorkflowResumeMutation(workflowName, runId, resourceId, snapshot =>
-      rollbackWorkflowResumeRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+    return this.applyWorkflowResumeMutation(
+      workflowName,
+      runId,
+      resourceId,
+      snapshot => rollbackWorkflowResumeRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+      'rollbackWorkflowResume',
     ) as RollbackWorkflowResumeResult;
   }
 
@@ -966,8 +980,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       snapshot,
       result,
     };
-    return this.applyWorkflowResumeMutation(workflowName, runId, resourceId, snapshot =>
-      finalizeWorkflowResumeRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+    return this.applyWorkflowResumeMutation(
+      workflowName,
+      runId,
+      resourceId,
+      snapshot => finalizeWorkflowResumeRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+      'finalizeWorkflowResume',
     ) as FinalizeWorkflowResumeResult;
   }
 
@@ -990,8 +1008,12 @@ export class WorkflowsInMemory extends WorkflowsStorage {
       receiptKey,
       consumerId,
     };
-    return this.applyWorkflowResumeMutation(workflowName, runId, undefined, snapshot =>
-      consumeWorkflowResumeResultRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+    return this.applyWorkflowResumeMutation(
+      workflowName,
+      runId,
+      undefined,
+      snapshot => consumeWorkflowResumeResultRecord(snapshot, frozenInput, Date.now(), cloneRunData),
+      'consumeWorkflowResumeResult',
     ) as ConsumeWorkflowResumeResult;
   }
 

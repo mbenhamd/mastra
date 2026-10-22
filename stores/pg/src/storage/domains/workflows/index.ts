@@ -572,8 +572,12 @@ export class WorkflowsPG extends WorkflowsStorage {
     mutate: (snapshot: WorkflowRunState | undefined) => T & { snapshot?: WorkflowRunState },
     operation: string,
   ): Promise<T> {
+    const fence = resolveRunFence(this, undefined, runId);
     try {
       return await this.#db.client.tx(async t => {
+        // A stale execution's resume admission, rollback, finalization or
+        // receipt consumption is a fenced workflow write like any other (PF-6182).
+        if (fence) await assertRunFence(t, this.#runOwnersTable(), fence, operation);
         const revision = await this.lockExistingWorkflowParentRevision(t, workflowName, runId);
         const row = await t.oneOrNone<{ snapshot: WorkflowRunState | string; resourceId?: string | null }>(
           `SELECT snapshot, "resourceId" FROM ${this.workflowSnapshotTableName()}
@@ -603,7 +607,11 @@ export class WorkflowsPG extends WorkflowsStorage {
         return publicResult as T;
       });
     } catch (error) {
-      if (error instanceof WorkflowSnapshotHandoffFenceError || isWorkflowSnapshotHandoffSchemaError(error))
+      if (
+        error instanceof WorkflowSnapshotHandoffFenceError ||
+        isWorkflowSnapshotHandoffSchemaError(error) ||
+        isRunFenceConflictError(error)
+      )
         throw error;
       throw new MastraError(
         {

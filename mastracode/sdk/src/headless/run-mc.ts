@@ -188,6 +188,9 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     | undefined;
   let nonSuspendedAgentEndObserved = false;
   let agentStarts = 0;
+  // Set just before the prompt or goal signal goes out. Until then no agent run
+  // exists, so no agent_end will arrive to settle an abort or timeout.
+  let dispatched = false;
   let unsubscribe: (() => void) | undefined;
   let removeAbortListener: (() => void) | undefined;
   let resolveResult!: (r: RunMCResult) => void;
@@ -305,6 +308,8 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     // agent run has started (so no agent_end will ever arrive).
     const status = forcedGoalStatus();
     if (status && !settled) finish(status);
+    // A prompt-only run aborted before dispatch settles now: nothing would end it.
+    else if (!settled && !dispatched) finish('aborted');
   }
 
   function abort(): void {
@@ -330,7 +335,7 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
     timeoutId = setTimeout(() => {
       timedOut = true;
       session.abort();
-      if (goal && !settled) finish('timeout');
+      if ((goal || !dispatched) && !settled) finish('timeout');
     }, options.timeoutMs);
   }
 
@@ -463,15 +468,20 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
         // Mirror /models → Activate on the session: sticky thread pack id,
         // subagent models, and the fallback route. Clears any pending fallback
         // from a continued thread so the pack's own route starts clean.
+        // A run that settles mid-setup (abort, timeout) stops before its next write.
         await session.thread.setSetting({ key: THREAD_ACTIVE_MODEL_PACK_ID_KEY, value: options.pack.id });
+        if (settled) return;
         await session.thread.setSetting({ key: MODEL_FALLBACK_STATE_KEY, value: undefined });
+        if (settled) return;
         for (const [agentType, modelId] of Object.entries(packSelection.subagentModels ?? {})) {
           await session.subagents.model.set({ modelId, agentType });
+          if (settled) return;
         }
         await session.state.set({
           modelRoute: packSelection.modelRoute,
           [MODEL_FALLBACK_STATE_KEY]: null,
         } as unknown as Partial<TState>);
+        if (settled) return;
       }
       const sessionModelId = modelIdToApply ?? packModelId;
       if (sessionModelId) {
@@ -639,10 +649,12 @@ export function runMC<TState extends Record<string, unknown>>(options: RunMCOpti
 
         await goalManager.saveToThread(state);
         if (settled) return;
+        dispatched = true;
         if (!settled) await session.sendSignal(createGoalReminderSignal(objective)).accepted;
       } else {
         if (!options.prompt) return fail('A prompt or goal is required.');
         if (settled) return;
+        dispatched = true;
         await session.sendMessage({ content: options.prompt });
       }
     } catch (err) {

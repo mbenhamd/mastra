@@ -247,6 +247,8 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
       snapshot =>
         admitWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
       'admitWorkflowResume',
+      // A stale execution's resume mutation is a fenced workflow write too (PF-6182).
+      this.#runFenceCheck(undefined, input.runId, 'admitWorkflowResume'),
     );
   }
 
@@ -258,6 +260,8 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
       snapshot =>
         rollbackWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
       'rollbackWorkflowResume',
+      // A stale execution's resume mutation is a fenced workflow write too (PF-6182).
+      this.#runFenceCheck(undefined, input.runId, 'rollbackWorkflowResume'),
     );
   }
 
@@ -269,6 +273,8 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
       snapshot =>
         finalizeWorkflowResumeRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
       'finalizeWorkflowResume',
+      // A stale execution's resume mutation is a fenced workflow write too (PF-6182).
+      this.#runFenceCheck(undefined, input.runId, 'finalizeWorkflowResume'),
     );
   }
 
@@ -280,6 +286,8 @@ export class WorkflowsLibSQL extends WorkflowsStorage {
       snapshot =>
         consumeWorkflowResumeResultRecord(snapshot, input, Date.now(), value => this.materializeResumeSnapshot(value)),
       'consumeWorkflowResumeResult',
+      // A stale execution's resume mutation is a fenced workflow write too (PF-6182).
+      this.#runFenceCheck(undefined, input.runId, 'consumeWorkflowResumeResult'),
     );
   }
 

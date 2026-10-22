@@ -1536,7 +1536,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           expectedChildGraphFingerprint: createWorkflowTerminalGraphFingerprint(serializedStepGraph),
           forEachIndex: parentForEachIndex,
           result: parentResult,
-          requestContext: getPersistedRequestContext(requestContext),
+          requestContext: getPersistedRequestContext(requestContext, workflow),
           recoveryAncestry,
           ...(initialWorkflowSnapshotToPersist
             ? {
@@ -1605,7 +1605,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           nestedRunId: runId,
           forEachIndex: parentForEachIndex,
           result: parentResult,
-          requestContext: getPersistedRequestContext(requestContext),
+          requestContext: getPersistedRequestContext(requestContext, workflow),
         });
         if (ownership.status === 'unsupported') {
           const ownershipFallbackWrite = await workflowsStore.updateWorkflowResults({
@@ -1613,7 +1613,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             runId: parentWorkflow.runId,
             stepId: parentWorkflow.stepId,
             result: { ...parentResult, metadata: nestedRunMetadata },
-            requestContext: getPersistedRequestContext(requestContext),
+            requestContext: getPersistedRequestContext(requestContext, workflow),
             executionGeneration: parentWorkflow.executionGeneration,
           });
           if (
@@ -1687,7 +1687,36 @@ export class WorkflowEventProcessor extends EventProcessor {
             : {}),
         },
       });
-      if (!currentClaim) return;
+      if (!currentClaim) {
+        await this.publishSupersededAdmission(workflow.id, runId, executionGeneration, lifecycleResumeAttempt);
+        return;
+      }
+    }
+
+    // PF-6182: a restart was claimed by `Run.restart` before it was dispatched.
+    // Its running snapshot is written as a lifetime-bound step update under
+    // that claim, which never recreates a run deleted since the claim (for
+    // example by account erasure); a first start still creates its row below.
+    const fencedRestart =
+      !!restart &&
+      !parentWorkflow &&
+      shouldPersist &&
+      !childSnapshotEnsuredByAdmission &&
+      !!workflowsStore &&
+      workflowsStore.getWorkflowResumeCapabilities()?.fencedStepUpdateVersion === 1;
+    if (fencedRestart && workflowsStore) {
+      const written = await workflowsStore.persistWorkflowStepUpdate({
+        workflowName: workflow.id,
+        runId,
+        resourceId,
+        expectedExecutionGeneration: executionGeneration,
+        expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
+        snapshot: initialWorkflowSnapshotToPersist!,
+      });
+      if (written.status !== 'persisted') {
+        await this.publishSupersededAdmission(workflow.id, runId, executionGeneration, lifecycleResumeAttempt);
+        return;
+      }
     }
 
     // The run is now admitted (or readmitted through time travel/restart), so
@@ -1725,7 +1754,13 @@ export class WorkflowEventProcessor extends EventProcessor {
             },
     });
 
-    if (shouldInitializeSnapshot && workflowsStore && !childSnapshotEnsuredByAdmission && !guardedResume) {
+    if (
+      shouldInitializeSnapshot &&
+      workflowsStore &&
+      !childSnapshotEnsuredByAdmission &&
+      !guardedResume &&
+      !fencedRestart
+    ) {
       await workflowsStore.persistWorkflowSnapshot({
         workflowName: workflow.id,
         runId,
@@ -1774,6 +1809,26 @@ export class WorkflowEventProcessor extends EventProcessor {
         outputOptions,
         forEachIndex,
       },
+    });
+  }
+
+  /**
+   * PF-6182: an admission whose claim no longer holds (the run was deleted, for
+   * example by account erasure, or another generation took it over) runs
+   * nothing. Settle this generation's caller with the default engine's
+   * superseded outcome instead of leaving `restart()`/`resume()` waiting on a
+   * finish event that would never arrive.
+   */
+  private async publishSupersededAdmission(
+    workflowId: string,
+    runId: string,
+    executionGeneration: string,
+    lifecycleResumeAttempt: number,
+  ): Promise<void> {
+    await this.mastra.pubsub.publish('workflows-finish', {
+      type: 'workflow.superseded',
+      runId,
+      data: { workflowId, runId, executionGeneration, lifecycleResumeAttempt },
     });
   }
 
@@ -2086,6 +2141,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             stepExecutor: this.stepExecutor,
             step,
             stepResult: prevResult,
+            ownerWorkflow: liveParentWorkflow,
           },
         );
       } else {
@@ -2945,7 +3001,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             status: 'running',
           } as any,
           // Never persist the live authenticated organization selection.
-          requestContext: getPersistedRequestContext(requestContext),
+          requestContext: getPersistedRequestContext(requestContext, workflow),
           // PF-4387: fence the pre-execution running record to this lifetime.
           executionGeneration: lifecycleExecution.executionGeneration,
         });
@@ -4208,7 +4264,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           stepId: '__state',
           result: currentState as any,
-          requestContext: getPersistedRequestContext(requestContext),
+          requestContext: getPersistedRequestContext(requestContext, workflow),
           executionGeneration: lifecycleExecution.executionGeneration,
         });
         if (this.#isStaleResultWrite(stateWrite, { workflowId: workflow.id, runId, stepId: '__state' })) {
@@ -4297,7 +4353,7 @@ export class WorkflowEventProcessor extends EventProcessor {
       runId,
       stepId: '__state',
       result: currentState as any,
-      requestContext: getPersistedRequestContext(requestContext),
+      requestContext: getPersistedRequestContext(requestContext, workflow),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
     if (this.#isStaleResultWrite(mergedStateWrite, { workflowId: workflow.id, runId, stepId: '__state' })) {
@@ -4576,7 +4632,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             runId,
             stepId: getEntryId(step.step),
             result: bailedResult as any,
-            requestContext: getPersistedRequestContext(requestContext),
+            requestContext: getPersistedRequestContext(requestContext, workflow),
             executionGeneration: lifecycleExecution.executionGeneration,
           });
           if (this.#isStaleResultWrite(bailWrite, { workflowId: workflow.id, runId, stepId: getEntryId(step.step) })) {
@@ -4704,7 +4760,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         runId,
         stepId: getEntryId(step.step),
         result: storageResult ?? newResult,
-        requestContext: getPersistedRequestContext(requestContext),
+        requestContext: getPersistedRequestContext(requestContext, workflow),
         executionGeneration: lifecycleExecution.executionGeneration,
       });
       if (this.#isStaleResultWrite(newStepResults, { workflowId: workflow.id, runId, stepId: getEntryId(step.step) })) {
@@ -4732,7 +4788,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           stepId: '__state',
           result: currentState as any,
-          requestContext: getPersistedRequestContext(requestContext),
+          requestContext: getPersistedRequestContext(requestContext, workflow),
           executionGeneration: lifecycleExecution.executionGeneration,
         });
         if (this.#isStaleResultWrite(stateWrite, { workflowId: workflow.id, runId, stepId: '__state' })) {
@@ -4990,7 +5046,7 @@ export class WorkflowEventProcessor extends EventProcessor {
             runId,
             stepId: getEntryId(step.step),
             result: foreachSuspendResult as any,
-            requestContext: getPersistedRequestContext(requestContext),
+            requestContext: getPersistedRequestContext(requestContext, workflow),
             executionGeneration: lifecycleExecution.executionGeneration,
           });
           if (
@@ -5023,7 +5079,7 @@ export class WorkflowEventProcessor extends EventProcessor {
               runId,
               stepId: '__state',
               result: currentState as any,
-              requestContext: getPersistedRequestContext(requestContext),
+              requestContext: getPersistedRequestContext(requestContext, workflow),
               executionGeneration: lifecycleExecution.executionGeneration,
             });
             if (this.#isStaleResultWrite(foreachStateWrite, { workflowId: workflow.id, runId, stepId: '__state' })) {
@@ -5168,7 +5224,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         runId,
         stepId,
         result: storedResult,
-        requestContext: getPersistedRequestContext(requestContext),
+        requestContext: getPersistedRequestContext(requestContext, workflow),
         executionGeneration: lifecycleExecution.executionGeneration,
         ...(isParallelBranch ? {} : { state: currentState }),
       });
@@ -5329,7 +5385,7 @@ export class WorkflowEventProcessor extends EventProcessor {
           runId,
           stepId: '__state',
           result: currentState as any,
-          requestContext: getPersistedRequestContext(requestContext),
+          requestContext: getPersistedRequestContext(requestContext, workflow),
           executionGeneration: lifecycleExecution.executionGeneration,
         });
         if (this.#isStaleResultWrite(suspendStateWrite, { workflowId: workflow.id, runId, stepId: '__state' })) {
@@ -5882,6 +5938,26 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
   }
 
+  /**
+   * PF-6182: a top-level start or resume dropped before admission (another
+   * generation claimed the run, or the run was canceled, for example by
+   * account erasure) runs nothing. Its caller still settles, as it does when
+   * admission itself refuses it.
+   */
+  async #settleDroppedAdmission(
+    type: string,
+    data: Omit<ProcessorArgs, 'workflow'>,
+    executionGeneration: string,
+  ): Promise<void> {
+    if ((type !== 'workflow.start' && type !== 'workflow.resume') || data.parentWorkflow) return;
+    await this.publishSupersededAdmission(
+      data.workflowId,
+      data.runId,
+      executionGeneration,
+      data.lifecycleResumeAttempt ?? 0,
+    );
+  }
+
   async #dispatch(event: Event, internalWorkflowRegistrationGeneration?: number): Promise<boolean> {
     const { type, data } = event;
 
@@ -5902,6 +5978,7 @@ export class WorkflowEventProcessor extends EventProcessor {
         currentExecutionGeneration: currentState.executionGeneration,
         incomingExecutionGeneration: executionGeneration,
       });
+      await this.#settleDroppedAdmission(type, incomingWorkflowData, executionGeneration);
       return false;
     }
     const workflowData: Omit<ProcessorArgs, 'workflow'> = {
@@ -5940,6 +6017,7 @@ export class WorkflowEventProcessor extends EventProcessor {
     }
 
     if (currentState?.status === 'canceled' && type !== 'workflow.end' && type !== 'workflow.cancel') {
+      await this.#settleDroppedAdmission(type, incomingWorkflowData, executionGeneration);
       return false;
     }
 
