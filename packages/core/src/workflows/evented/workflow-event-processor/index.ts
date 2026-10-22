@@ -1687,7 +1687,10 @@ export class WorkflowEventProcessor extends EventProcessor {
             : {}),
         },
       });
-      if (!currentClaim) return;
+      if (!currentClaim) {
+        await this.publishSupersededAdmission(workflow.id, runId, executionGeneration, lifecycleResumeAttempt);
+        return;
+      }
     }
 
     // PF-6182: a restart was claimed by `Run.restart` before it was dispatched.
@@ -1710,7 +1713,10 @@ export class WorkflowEventProcessor extends EventProcessor {
         expectedLifecycleResumeAttempt: lifecycleResumeAttempt,
         snapshot: initialWorkflowSnapshotToPersist!,
       });
-      if (written.status !== 'persisted') return;
+      if (written.status !== 'persisted') {
+        await this.publishSupersededAdmission(workflow.id, runId, executionGeneration, lifecycleResumeAttempt);
+        return;
+      }
     }
 
     // The run is now admitted (or readmitted through time travel/restart), so
@@ -1803,6 +1809,26 @@ export class WorkflowEventProcessor extends EventProcessor {
         outputOptions,
         forEachIndex,
       },
+    });
+  }
+
+  /**
+   * PF-6182: an admission whose claim no longer holds (the run was deleted, for
+   * example by account erasure, or another generation took it over) runs
+   * nothing. Settle this generation's caller with the default engine's
+   * superseded outcome instead of leaving `restart()`/`resume()` waiting on a
+   * finish event that would never arrive.
+   */
+  private async publishSupersededAdmission(
+    workflowId: string,
+    runId: string,
+    executionGeneration: string,
+    lifecycleResumeAttempt: number,
+  ): Promise<void> {
+    await this.mastra.pubsub.publish('workflows-finish', {
+      type: 'workflow.superseded',
+      runId,
+      data: { workflowId, runId, executionGeneration, lifecycleResumeAttempt },
     });
   }
 

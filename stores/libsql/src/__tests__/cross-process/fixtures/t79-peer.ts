@@ -27,6 +27,14 @@ export interface T79PeerArgs {
   engine: 'durable' | 'evented';
   agentId: string;
   runId: string;
+  /**
+   * The owner execution's runtime binding. The fork scopes a run's control
+   * topic to it (PF-5928 adaptation, fork rule since PF-3759), so a peer can
+   * only count control frames for a binding it was given; without one it
+   * records none. The cross-process cells that spawn this peer are skipped
+   * until the harness is reworked for binding-scoped control (PF-6165).
+   */
+  runtimeBindingId?: string;
 }
 
 export interface T79PeerResult {
@@ -63,11 +71,13 @@ runPeer<T79PeerArgs>(async peer => {
   // that ignored the abort.
   let receivedByPeer = 0;
   const echoed = gate<void>();
-  await peer.pubsub().subscribe(AGENT_CONTROL_TOPIC(runId), async (event, ack) => {
-    receivedByPeer++;
-    if (event.type === AgentControlEventTypes.ABORT_REQUEST) echoed.resolve();
-    await ack?.();
-  });
+  if (peer.args.runtimeBindingId !== undefined) {
+    await peer.pubsub().subscribe(AGENT_CONTROL_TOPIC(runId, peer.args.runtimeBindingId), async (event, ack) => {
+      receivedByPeer++;
+      if (event.type === AgentControlEventTypes.ABORT_REQUEST) echoed.resolve();
+      await ack?.();
+    });
+  }
 
   // The harness waits up to 60s for this signal (its `waitFor` default), which
   // is longer than the peer-process budget: the run's own hang guard is what
@@ -76,18 +86,21 @@ runPeer<T79PeerArgs>(async peer => {
   // Tri-state on purpose: a process owning no local run may report false while the run stops anyway.
   const accepted = runner.abortRunStream(runId);
   let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      echoed.promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`abort request for ${runId} never echoed back through the broker (hang guard)`)),
-          DEFAULT_HANG_GUARD_MS,
-        );
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
+  // Only a peer subscribed to the binding-scoped topic can see its abort echo.
+  if (peer.args.runtimeBindingId !== undefined) {
+    try {
+      await Promise.race([
+        echoed.promise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`abort request for ${runId} never echoed back through the broker (hang guard)`)),
+            DEFAULT_HANG_GUARD_MS,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
   // No `mastra.shutdown()` here on purpose: aborting a run this process does not
   // own leaves a phantom entry in `globalRunRegistry`, and shutdown throws on it

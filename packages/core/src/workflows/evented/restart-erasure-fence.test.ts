@@ -119,14 +119,9 @@ describe('evented restart erasure fence (PF-6182)', () => {
       }
       restarting = true;
 
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        run.restart().catch(() => undefined),
-        new Promise(resolve => {
-          timer = setTimeout(resolve, 3000);
-        }),
-      ]);
-      clearTimeout(timer);
+      // The restart settles (the default engine's superseded outcome) rather
+      // than waiting on a finish event no worker would publish.
+      await expect(run.restart()).resolves.toMatchObject({ status: 'canceled' });
 
       expect(erased).toBe(true);
       // Give the worker time to process the restart's start event.

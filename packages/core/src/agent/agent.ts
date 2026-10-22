@@ -12448,7 +12448,7 @@ export class Agent<
         const maxIdleMs = typeof defaultUntilIdle === 'object' ? defaultUntilIdle.maxIdleMs : undefined;
         return (this.streamUntilIdle as any)(
           messages,
-          { ...streamOptionsBase, maxIdleMs },
+          { ...streamOptionsBase, ...(maxIdleMs === undefined ? {} : { maxIdleMs }) },
           executionMemoryId,
         ) as Promise<MastraModelOutput<OUTPUT>>;
       }
@@ -13190,7 +13190,7 @@ export class Agent<
       const maxIdleMs = typeof defaultUntilIdle === 'object' ? defaultUntilIdle.maxIdleMs : undefined;
       return (this.resumeStreamUntilIdle as any)(
         resumeData,
-        { ...(streamOptionsWithPubSub ?? {}), maxIdleMs },
+        { ...(streamOptionsWithPubSub ?? {}), ...(maxIdleMs === undefined ? {} : { maxIdleMs }) },
         executionMemoryId,
       ) as Promise<MastraModelOutput<OUTPUT>>;
     }
