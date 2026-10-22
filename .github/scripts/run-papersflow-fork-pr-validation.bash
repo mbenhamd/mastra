@@ -14407,8 +14407,10 @@ while IFS= read -r file; do
       queue_owned_workspace_test "$file" stores/libsql/src/storage/index.test.ts
       ;;
     stores/libsql/src/__tests__/cross-process/fixtures/t79-peer.ts)
-      # PF-6182: the T79 peer fixture is spawned only by the cross-process
-      # abort harness, which validates it (its xproc cells stay skipped).
+      # PF-6182: the T79 peer fixture runs only in the cross-process abort
+      # harness's xproc cells, which stay skipped until PF-6165 reworks them
+      # for binding-scoped control. Until then this job's stores/libsql
+      # typecheck is its real validation; the harness test covers its imports.
       queue_owned_workspace_test "$file" stores/libsql/src/__tests__/cross-process/xproc-abort.test.ts
       ;;
     workflows/inngest/src/__tests__/durable-agent.test.utils.ts)
