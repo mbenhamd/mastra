@@ -1085,12 +1085,67 @@ interface KnownChunkDifference {
   missingKeys?: readonly string[];
   /** Whether this declaration applies to this plain chunk occurrence. */
   appliesTo?: (plainPayload: unknown) => boolean;
+  /**
+   * The declared shape of the difference. A declaration with `matches`
+   * removes its paths only from a chunk pair that `appliesTo` and `matches`
+   * both hold for, so any other difference in those paths still fails the
+   * comparison. (Without it, `appliesTo` only scopes the stale check; the
+   * older COR-1390 entries rely on that, see PF-6314.)
+   */
+  matches?: (plainPayload: unknown, wrappedPayload: unknown) => boolean;
+  /**
+   * Paths each side must still emit (non-empty): a declaration that tolerates
+   * different values must not also tolerate a side dropping the field.
+   */
+  required?: { readonly plain?: readonly string[]; readonly wrapped?: readonly string[] };
 }
 
 /** Whether a chunk's resume schema offers edited arguments (plain's tool-gate approval). */
 const offersEditedArgs = (payload: unknown) => {
   const schema = getAtPath(payload, 'resumeSchema');
   return typeof schema === 'string' && schema.includes('"editedArgs"');
+};
+
+/**
+ * A resume schema without its `editedArgs` property and the definitions only
+ * that property referenced, or `undefined` when it is not a JSON schema string.
+ */
+function withoutEditedArgsProperty(resumeSchema: unknown): string | undefined {
+  if (typeof resumeSchema !== 'string') return undefined;
+  try {
+    const schema = JSON.parse(resumeSchema) as {
+      properties?: Record<string, unknown>;
+      definitions?: Record<string, unknown>;
+    };
+    if (!schema.properties || !('editedArgs' in schema.properties)) return resumeSchema;
+    const referenced = JSON.stringify(schema.properties.editedArgs);
+    delete schema.properties.editedArgs;
+    for (const name of Object.keys(schema.definitions ?? {})) {
+      const ref = `#/definitions/${name}`;
+      const { definitions, ...rest } = schema;
+      if (
+        referenced.includes(ref) &&
+        !JSON.stringify({ ...rest, definitions: { ...definitions, [name]: null } }).includes(`"${ref}"`)
+      ) {
+        delete schema.definitions![name];
+      }
+    }
+    if (schema.definitions && Object.keys(schema.definitions).length === 0) delete schema.definitions;
+    return JSON.stringify(schema);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Plain's approval schema differs from the wrapped one by exactly `editedArgs`. */
+export const differsOnlyByEditedArgs = (plainPayload: unknown, wrappedPayload: unknown) => {
+  const plainSchema = withoutEditedArgsProperty(getAtPath(plainPayload, 'resumeSchema'));
+  const wrappedSchema = getAtPath(wrappedPayload, 'resumeSchema');
+  return (
+    plainSchema !== undefined &&
+    typeof wrappedSchema === 'string' &&
+    isDeepStrictEqual(JSON.parse(plainSchema), JSON.parse(wrappedSchema))
+  );
 };
 
 const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
@@ -1101,6 +1156,7 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
       "originated in, its own step id, and plain's identity digest (which only plain's resume checks).",
     chunkType,
     paths: ['originRunId', 'stepId', 'resumeIdentityDigest'],
+    required: { plain: ['originRunId', 'stepId', 'resumeIdentityDigest'], wrapped: ['originRunId', 'stepId'] },
   })),
   ...(['tool-call-approval', 'tool-call-resumed'] as const).map(chunkType => ({
     ticket: 'PF-4112',
@@ -1111,6 +1167,7 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
     chunkType,
     paths: ['resumeSchema'],
     appliesTo: offersEditedArgs,
+    matches: differsOnlyByEditedArgs,
   })),
   {
     ticket: 'COR-1390',
@@ -1238,15 +1295,36 @@ function deleteAtPath(target: unknown, path: string): void {
   if (node !== null && typeof node === 'object') delete (node as Record<string, unknown>)[parts[parts.length - 1]!];
 }
 
-/** A copy of a chunk payload with the declared differences removed. */
-function withoutDeclaredPayloadDifferences(chunkType: string, payload: unknown): unknown {
-  const declarations = KNOWN_CHUNK_DIFFERENCES.filter(d => d.chunkType === chunkType);
+/**
+ * A copy of one side's chunk payload with the declared differences removed.
+ * A declaration applies to a chunk pair (plain's and the wrapped engine's
+ * same-type occurrence) only when its `appliesTo` and `matches` hold for it,
+ * so it never removes a difference it does not describe.
+ */
+function withoutDeclaredPayloadDifferences(
+  chunkType: string,
+  payload: unknown,
+  pair: { readonly plain: unknown; readonly wrapped: unknown },
+): unknown {
+  const declarations = KNOWN_CHUNK_DIFFERENCES.filter(
+    d =>
+      d.chunkType === chunkType &&
+      (!d.matches || ((!d.appliesTo || d.appliesTo(pair.plain)) && d.matches(pair.plain, pair.wrapped))),
+  );
   if (declarations.length === 0) return payload;
   const copy = structuredClone(payload);
   for (const declared of declarations) {
     for (const path of declared.paths) deleteAtPath(copy, path);
   }
   return copy;
+}
+
+/** The payload of the same-type chunk occurrence as `index` in another turn. */
+function pairedPayload(from: ParitySnapshot, index: number, other: ParitySnapshot | undefined): unknown {
+  const chunkType = from.chunkTypes[index];
+  const occurrence = from.chunkTypes.slice(0, index).filter(type => type === chunkType).length;
+  const otherIndex = other ? indexesOfType(other, chunkType ?? '')[occurrence] : undefined;
+  return otherIndex === undefined ? undefined : other!.chunkPayloads[otherIndex];
 }
 
 /**
@@ -1272,22 +1350,31 @@ function withoutKnownTurnDifferences(reference: ParitySnapshot | undefined, turn
  */
 function withoutKnownEngineDifferences(
   reference: EngineObservation,
-  observation: EngineObservation,
+  wrapped: EngineObservation,
   side: 'plain' | 'wrapped',
 ): EngineObservation {
+  const observation = side === 'plain' ? reference : wrapped;
   return {
     ...observation,
     turns: observation.turns.map((turn, index) => {
+      const plainTurn = reference.turns[index];
+      const wrappedTurn = wrapped.turns[index];
       const stripped: ParitySnapshot = {
         ...turn,
         chunkPayloads: turn.chunkPayloads.map((payload, i) =>
-          withoutDeclaredPayloadDifferences(turn.chunkTypes[i] ?? '', payload),
+          withoutDeclaredPayloadDifferences(turn.chunkTypes[i] ?? '', payload, {
+            plain: side === 'plain' ? payload : pairedPayload(turn, i, plainTurn),
+            wrapped: side === 'wrapped' ? payload : pairedPayload(turn, i, wrappedTurn),
+          }),
         ),
         // The finish chunk is compared twice: as `finishChunk` and in `chunkPayloads`.
         finishChunk: {
           ...turn.finishChunk,
           payloadKeys: turn.finishChunk.payloadKeys.filter(k => !declaredMissingKeysFor('finish').includes(k)),
-          payload: withoutDeclaredPayloadDifferences('finish', turn.finishChunk.payload),
+          payload: withoutDeclaredPayloadDifferences('finish', turn.finishChunk.payload, {
+            plain: plainTurn?.finishChunk.payload,
+            wrapped: wrappedTurn?.finishChunk.payload,
+          }),
         },
       };
       return side === 'wrapped' ? withoutKnownTurnDifferences(reference.turns[index], stripped) : stripped;
@@ -1333,6 +1420,18 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
     });
 
     for (const pair of pairs) {
+      for (const [side, paths, payload] of [
+        ['plain', declared.required?.plain ?? [], pair.plainPayload],
+        [engine, declared.required?.wrapped ?? [], pair.wrappedPayload],
+      ] as const) {
+        for (const path of paths) {
+          if (!isEmptyValue(getAtPath(payload, path))) continue;
+          failures.push(
+            `${side}: turns[${pair.turn}] ${declared.chunkType} payload no longer emits '${path}', ` +
+              `which ${declared.ticket} requires of it`,
+          );
+        }
+      }
       const pathValues = declared.paths.map(path => ({
         path,
         plain: getAtPath(pair.plainPayload, path),
@@ -1415,7 +1514,7 @@ function checkEngine(
   const stale = staleKnownDifferences(engine, reference, actual);
   if (stale.length > 0) return stale;
 
-  const plain = withoutKnownEngineDifferences(reference, reference, 'plain');
+  const plain = withoutKnownEngineDifferences(reference, actual, 'plain');
   const observed = withoutKnownEngineDifferences(reference, actual, 'wrapped');
   const difference = scenario.differences?.[engine];
   const raw = compareObservations(plain, observed, new Set());

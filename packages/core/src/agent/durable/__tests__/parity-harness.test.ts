@@ -24,6 +24,7 @@ import {
   chunksOfType,
   expectEngineParity,
   lastUserText,
+  differsOnlyByEditedArgs,
   staleKnownDifferences,
   textOnlyTape,
   toolCallTape,
@@ -1296,6 +1297,51 @@ describe('expectEngineParity', () => {
         }),
       ),
     ).rejects.toThrow('add a `resume` continuation');
+  });
+
+  it('holds each engine to its declared resume envelope and approval schema', async () => {
+    const results = await expectEngineParity(
+      approvalScenario({
+        model: { tapes: [toolCallTape('gate', {}), textOnlyTape('Done.')] },
+        options: {
+          maxSteps: 3,
+          requireToolApproval: true,
+          memory: { thread: 'parity-envelope-thread', resource: 'parity-envelope-resource' },
+          resume: { approve: true },
+        },
+      }),
+    );
+    const observe = (r: EngineRunResult) => structuredClone({ turns: r.turns, requests: r.requests });
+    const approval = (r: EngineObservation) =>
+      r.turns[0]!.chunkPayloads[r.turns[0]!.chunkTypes.indexOf('tool-call-approval')] as Record<string, unknown>;
+    expect(staleKnownDifferences('durable', observe(results.plain!), observe(results.durable!))).toEqual([]);
+
+    // An engine dropping a field its envelope must carry fails, though the
+    // value was allowed to differ.
+    const noOrigin = observe(results.durable!);
+    delete approval(noOrigin).originRunId;
+    expect(staleKnownDifferences('durable', observe(results.plain!), noOrigin)).toContain(
+      "durable: turns[0] tool-call-approval payload no longer emits 'originRunId', which PF-1703 requires of it",
+    );
+    const noDigest = observe(results.plain!);
+    delete approval(noDigest).resumeIdentityDigest;
+    expect(staleKnownDifferences('durable', noDigest, observe(results.durable!))).toContain(
+      "plain: turns[0] tool-call-approval payload no longer emits 'resumeIdentityDigest', which PF-1703 requires of it",
+    );
+
+    // The approval schema declaration covers exactly plain's editedArgs: any
+    // other schema difference is not the declared one, so it is compared.
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA },
+        { resumeSchema: APPROVAL_RESUME_SCHEMA },
+      ),
+    ).toBe(true);
+    const changed = APPROVAL_RESUME_SCHEMA.replace('"required":["approved"]', '"required":[]');
+    expect(
+      differsOnlyByEditedArgs({ resumeSchema: PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA }, { resumeSchema: changed }),
+    ).toBe(false);
+    expect(differsOnlyByEditedArgs({ resumeSchema: APPROVAL_RESUME_SCHEMA }, { resumeSchema: changed })).toBe(false);
   });
 
   it('runs an approval on all three engines', async () => {
