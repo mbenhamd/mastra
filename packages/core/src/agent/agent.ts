@@ -12448,7 +12448,13 @@ export class Agent<
         const maxIdleMs = typeof defaultUntilIdle === 'object' ? defaultUntilIdle.maxIdleMs : undefined;
         return (this.streamUntilIdle as any)(
           messages,
-          { ...streamOptionsBase, ...(maxIdleMs === undefined ? {} : { maxIdleMs }) },
+          {
+            ...streamOptionsBase,
+            ...(maxIdleMs === undefined ? {} : { maxIdleMs }),
+            // Hand the loop the defaults resolved for this route, so it runs
+            // with the same snapshot instead of resolving them again.
+            [STREAM_UNTIL_IDLE_DEFAULT_OPTIONS]: defaultOptions,
+          },
           executionMemoryId,
         ) as Promise<MastraModelOutput<OUTPUT>>;
       }
@@ -13190,7 +13196,11 @@ export class Agent<
       const maxIdleMs = typeof defaultUntilIdle === 'object' ? defaultUntilIdle.maxIdleMs : undefined;
       return (this.resumeStreamUntilIdle as any)(
         resumeData,
-        { ...(streamOptionsWithPubSub ?? {}), ...(maxIdleMs === undefined ? {} : { maxIdleMs }) },
+        {
+          ...(streamOptionsWithPubSub ?? {}),
+          ...(maxIdleMs === undefined ? {} : { maxIdleMs }),
+          [STREAM_UNTIL_IDLE_DEFAULT_OPTIONS]: defaultOptions,
+        },
         executionMemoryId,
       ) as Promise<MastraModelOutput<OUTPUT>>;
     }

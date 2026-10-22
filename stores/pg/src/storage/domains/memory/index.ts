@@ -5073,9 +5073,13 @@ export class MemoryPG extends MemoryStorage {
           // (PF-6182). A cleared record, or one under another scope, still
           // fails the generation check below.
           const guarded = await this.#lockOMRow(t, tableName, input.id);
+          // The lookup key of a thread-scoped record omits the resource, so
+          // the record's own resource and thread must match the guard too.
           if (
             guarded?.supersededBy &&
-            guarded.lookupKey === this.getOMKey(writeGuard.threadId, writeGuard.resourceId)
+            guarded.lookupKey === this.getOMKey(writeGuard.threadId, writeGuard.resourceId) &&
+            guarded.resourceId === writeGuard.resourceId &&
+            (guarded.threadId ?? null) === (writeGuard.threadId ?? null)
           ) {
             return { applied: false, reason: 'retired' as const };
           }

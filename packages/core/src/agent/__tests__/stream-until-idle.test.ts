@@ -1015,6 +1015,78 @@ describe('Agent.streamUntilIdle', () => {
     expect(defaultsRead).toBeLessThan(5);
   });
 
+  it('continues a resumed run after a background task when untilIdle comes only from defaultOptions', async () => {
+    const memory = new MockMemory();
+    const { model, getCallCount } = makeScriptedModel([
+      toolCallResponse('approval'),
+      textResponse('resumed response'),
+      textResponse('continuation response'),
+    ]);
+    let untilIdleDefault = false;
+    const agent = new Agent({
+      id: 'resume-default-continue',
+      name: 'resume-default-continue',
+      instructions: 'test',
+      model,
+      memory,
+      defaultOptions: () => (untilIdleDefault ? { untilIdle: true } : {}),
+      tools: {
+        approval: createTool({
+          id: 'approval',
+          description: 'Request approval',
+          inputSchema: z.object({}),
+          suspendSchema: z.object({ question: z.string() }),
+          resumeSchema: z.object({ approved: z.boolean() }),
+          execute: async (_, context) => {
+            if (!context?.agent?.resumeData) return context?.agent?.suspend({ question: 'Continue?' });
+            return context.agent.resumeData;
+          },
+        }),
+      },
+    });
+    mastra.addAgent(agent, 'resume-default-continue');
+
+    const memoryOptions = { thread: 'resume-default-continue-thread', resource: 'user-1' };
+    const initial = await agent.stream('start', { memory: memoryOptions });
+    const initialChunks = await drain(initial.fullStream as ReadableStream<any>);
+    expect(initialChunks.some(chunk => chunk.type === 'tool-call-suspended')).toBe(true);
+
+    // No untilIdle on the resume call: the agent's default must keep it open.
+    untilIdleDefault = true;
+    const resumed = await agent.resumeStream(
+      { approved: true },
+      { runId: initial.runId, toolCallId: 'approval', memory: memoryOptions },
+    );
+    const bgManager = mastra.backgroundTaskManager!;
+    const publishEvent = (type: string) =>
+      (bgManager as any).publishLifecycleEvent(type, {
+        id: 'resume-default-task',
+        toolName: 'dummy',
+        toolCallId: 'resume-default-task',
+        runId: 'background-run',
+        agentId: 'resume-default-continue',
+        threadId: 'resume-default-continue-thread',
+        resourceId: 'user-1',
+        status: type.split('.')[1],
+        result: {},
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 1000,
+        createdAt: new Date(),
+        args: {},
+      });
+    await publishEvent('task.running');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await publishEvent('task.completed');
+    const resumedChunks = await drain(resumed.fullStream as ReadableStream<any>);
+
+    expect(getCallCount()).toBe(3);
+    expect(resumedChunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.payload.text)).toEqual([
+      'resumed response',
+      'continuation response',
+    ]);
+  });
+
   it('drops the resumed runId from a plain Agent autonomous continuation', async () => {
     const memory = new MockMemory();
     const { model } = makeScriptedModel([

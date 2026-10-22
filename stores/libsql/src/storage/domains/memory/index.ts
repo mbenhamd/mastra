@@ -2383,6 +2383,24 @@ export class MemoryLibSQL extends MemoryStorage {
             });
           }
           const stored = row.record;
+          // A guard must name this record and its own scope before a retired
+          // generation can answer `retired`; otherwise a guard from another
+          // resource or thread would be told to retry (PF-6182).
+          const guard = input.observationalMemoryWriteGuard;
+          if (
+            guard &&
+            (guard.recordId !== input.id ||
+              guard.resourceId !== stored.resourceId ||
+              (guard.threadId ?? null) !== (stored.threadId ?? null))
+          ) {
+            throw new MastraError({
+              id: createStorageErrorId('LIBSQL', 'UPDATE_ACTIVE_OBSERVATIONS', 'GUARD_MISMATCH'),
+              text: 'Observational memory guard does not match the active observation record.',
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.USER,
+              details: { id: input.id },
+            });
+          }
           if (stored.supersededBy) return { applied: false, reason: 'retired' as const };
           if (
             input.expectedActiveObservations !== undefined &&

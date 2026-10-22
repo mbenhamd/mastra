@@ -2176,6 +2176,40 @@ export function createObservationalMemoryTest({ storage }: { storage: MastraStor
         expect((await head(input)).id).toBe(next.id);
         expect((await head(input)).activeObservations).toBe('- reflected');
 
+        // A guard naming another resource is a scope mismatch, not a retirement.
+        await expect(
+          memoryStorage.commitActiveObservations({
+            id: record.id,
+            observations: '- other resource',
+            tokenCount: 1,
+            lastObservedAt: at(350),
+            observationalMemoryWriteGuard: { ...guard, resourceId: `${guard.resourceId}-other` },
+          }),
+        ).rejects.toThrow();
+
+        // A thread-scoped record's lookup key carries no resource, so a guard
+        // naming another resource must still be refused, not called retired.
+        const threadInput = createSampleOMInput({ threadId: `thread-${randomUUID()}`, scope: 'thread' });
+        const threadRecord = await memoryStorage.initializeObservationalMemory(threadInput);
+        await memoryStorage.createReflectionGeneration({
+          currentRecord: await snapshot(threadInput),
+          reflection: '- thread reflected',
+          tokenCount: 1,
+        });
+        await expect(
+          memoryStorage.commitActiveObservations({
+            id: threadRecord.id,
+            observations: '- other resource',
+            tokenCount: 1,
+            lastObservedAt: at(360),
+            observationalMemoryWriteGuard: {
+              recordId: threadRecord.id,
+              threadId: threadInput.threadId,
+              resourceId: `${threadInput.resourceId}-other`,
+            },
+          }),
+        ).rejects.toThrow();
+
         // A cleared lineage is not a retirement: the guarded write still fails.
         await memoryStorage.clearObservationalMemory(input.threadId, input.resourceId);
         await expect(

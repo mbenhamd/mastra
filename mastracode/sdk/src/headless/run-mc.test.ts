@@ -158,6 +158,8 @@ interface FakeGoalHarnessOptions {
   pack?: { id: string; resolve: () => any; onApplied?: () => void };
   /** Settles the first thread.setSetting call (the pack activation). */
   firstSetSetting?: Promise<void>;
+  /** Run a plain prompt instead of a goal. */
+  promptOnly?: boolean;
 }
 
 function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
@@ -252,12 +254,16 @@ function makeFakeGoalHarness(options: FakeGoalHarnessOptions = {}) {
   const run = runMC({
     controller: controller as any,
     session: session as any,
-    goal: {
-      objective: objectiveRecord.objective,
-      judgeModelId: objectiveRecord.judgeModelId,
-      maxRuns: objectiveRecord.maxRuns,
-      goalManager: goalManager as any,
-    },
+    ...(options.promptOnly
+      ? { prompt: 'What is 2+2?' }
+      : {
+          goal: {
+            objective: objectiveRecord.objective,
+            judgeModelId: objectiveRecord.judgeModelId,
+            maxRuns: objectiveRecord.maxRuns,
+            goalManager: goalManager as any,
+          },
+        }),
     ...(options.signal ? { signal: options.signal } : {}),
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
@@ -937,6 +943,42 @@ describe('runMC', () => {
       expect(onApplied).not.toHaveBeenCalled();
       expect(harness.session.sendSignal).not.toHaveBeenCalled();
     });
+
+    for (const interruption of ['abort', 'timeout'] as const) {
+      it(`settles a prompt-only run on ${interruption} during a pack write and stops setup`, async () => {
+        const abortController = new AbortController();
+        let resolveFirstWrite!: () => void;
+        const firstSetSetting = new Promise<void>(resolve => {
+          resolveFirstWrite = resolve;
+        });
+        const harness = makeFakeGoalHarness({
+          promptOnly: true,
+          signal: abortController.signal,
+          ...(interruption === 'timeout' ? { timeoutMs: 5 } : {}),
+          firstSetSetting,
+          pack: {
+            id: 'custom:Test',
+            resolve: () => ({
+              modelId: 'mock-model',
+              subagentModels: { explore: 'test/explore-model' },
+              modelRoute: { entries: [] },
+            }),
+          },
+        });
+        await vi.waitFor(() => expect(harness.session.thread.setSetting).toHaveBeenCalledTimes(1));
+
+        if (interruption === 'abort') abortController.abort();
+        const result = await harness.run.result;
+        resolveFirstWrite();
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        expect(result.status).toBe(interruption === 'abort' ? 'aborted' : 'timeout');
+        expect(harness.session.thread.setSetting).toHaveBeenCalledTimes(1);
+        expect(harness.session.subagents.model.set).not.toHaveBeenCalled();
+        expect(harness.session.model.switch).not.toHaveBeenCalled();
+        expect(harness.session.sendMessage).not.toHaveBeenCalled();
+      });
+    }
 
     it('does not switch threads after abort settles during a deferred thread lookup', async () => {
       const abortController = new AbortController();
