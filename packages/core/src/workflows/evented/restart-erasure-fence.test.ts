@@ -41,13 +41,14 @@ function setup() {
     .then(work)
     .commit();
   const storage = new MockStore();
+  const pubsub = new EventEmitterPubSub();
   const mastra = new Mastra({
     storage,
-    pubsub: new EventEmitterPubSub(),
+    pubsub,
     workflows: { [WORKFLOW_ID]: workflow },
     logger: false,
   });
-  return { workflow, storage, mastra };
+  return { workflow, storage, mastra, pubsub };
 }
 
 async function waitFor(check: () => Promise<boolean>, timeoutMs = 3000) {
@@ -129,6 +130,118 @@ describe('evented restart erasure fence (PF-6182)', () => {
         async () => (await workflows.getWorkflowRunById({ runId: run.runId, workflowName: WORKFLOW_ID })) !== null,
       );
       expect(recreated).toBe(false);
+    } finally {
+      await mastra.stopWorkers?.();
+    }
+  });
+
+  it('settles a restart whose run erasure canceled before the start was dispatched', async () => {
+    const { workflow, storage, mastra, pubsub } = setup();
+    await mastra.startWorkers();
+    try {
+      const run = await workflow.createRun({ resourceId: RESOURCE_ID });
+      expect((await run.start({ inputData: { item: 'widget' } })).status).toBe('suspended');
+      const workflows = (await storage.getStore('workflows'))!;
+      const id = { workflowName: WORKFLOW_ID, runId: run.runId, expectedResourceId: RESOURCE_ID };
+      const suspended = (await workflows.loadWorkflowSnapshot({ workflowName: WORKFLOW_ID, runId: run.runId }))!;
+      await workflows.persistWorkflowSnapshot({
+        workflowName: WORKFLOW_ID,
+        runId: run.runId,
+        resourceId: RESOURCE_ID,
+        snapshot: {
+          ...suspended,
+          status: 'running',
+          suspendedPaths: {},
+          activePaths: [0],
+          activeStepsPath: { work: [0] },
+        },
+      });
+
+      // Erasure cancels the run after the restart claimed it, while its start
+      // event is still on the way to the worker.
+      let canceled = false;
+      const publish = pubsub.publish.bind(pubsub);
+      vi.spyOn(pubsub, 'publish').mockImplementation(async (topic: string, event: any) => {
+        if (!canceled && topic === 'workflows' && event.type === 'workflow.start' && event.runId === run.runId) {
+          canceled = true;
+          expect(await workflows.deleteWorkflowRunClosure(id)).toEqual({ status: 'active' });
+          await expect(workflows.cancelWorkflowRunForErasure(id)).resolves.toMatchObject({ status: 'cancelled' });
+        }
+        return publish(topic, event);
+      });
+
+      await expect(run.restart()).resolves.toMatchObject({ status: 'canceled' });
+      expect(canceled).toBe(true);
+    } finally {
+      await mastra.stopWorkers?.();
+    }
+  });
+
+  it('keeps a resume waiting when a refused admission of another resume attempt settles', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let resumedStarted = false;
+    const work = createStep({
+      id: 'work',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ suspend, resumeData }) => {
+        if (!resumeData) {
+          await suspend({});
+          return { done: false };
+        }
+        resumedStarted = true;
+        await gate;
+        return { done: true };
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'evented-resume-attempt-wf',
+      inputSchema: z.object({ item: z.string() }),
+      outputSchema: z.object({ done: z.boolean() }),
+      steps: [work],
+      options: { validateInputs: false },
+    })
+      .then(work)
+      .commit();
+    const storage = new MockStore();
+    const mastra = new Mastra({
+      storage,
+      pubsub: new EventEmitterPubSub(),
+      workflows: { 'evented-resume-attempt-wf': workflow },
+      logger: false,
+    });
+    await mastra.startWorkers();
+    try {
+      const run = await workflow.createRun({ resourceId: RESOURCE_ID });
+      expect((await run.start({ inputData: { item: 'widget' } })).status).toBe('suspended');
+      const resumed = run.resume({ step: 'work', resumeData: { go: true } });
+      expect(await waitFor(async () => resumedStarted)).toBe(true);
+
+      // A redelivered resume of an earlier attempt is refused under the same
+      // generation; its settlement is not this resume's outcome.
+      const workflows = (await storage.getStore('workflows'))!;
+      const current = (await workflows.loadWorkflowSnapshot({
+        workflowName: 'evented-resume-attempt-wf',
+        runId: run.runId,
+      }))!;
+      await mastra.pubsub.publish('workflows-finish', {
+        type: 'workflow.superseded',
+        runId: run.runId,
+        data: {
+          workflowId: 'evented-resume-attempt-wf',
+          runId: run.runId,
+          executionGeneration: current.executionGeneration,
+          lifecycleResumeAttempt: (current.lifecycleResumeAttempt ?? 0) - 1,
+        },
+      });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      release();
+
+      await expect(resumed).resolves.toMatchObject({ status: 'success', result: { done: true } });
     } finally {
       await mastra.stopWorkers?.();
     }

@@ -72,6 +72,7 @@ export async function processWorkflowWaitForEvent(
  */
 async function recordSleepWaiting({
   workflowsStore,
+  workflow,
   workflowId,
   runId,
   stepId,
@@ -84,6 +85,7 @@ async function recordSleepWaiting({
   requestContext,
 }: {
   workflowsStore?: WorkflowsStorage;
+  workflow: ProcessorArgs['workflow'];
   workflowId: string;
   runId: string;
   stepId: string;
@@ -101,7 +103,7 @@ async function recordSleepWaiting({
     runId,
     stepId,
     result: { status: 'waiting', payload, startedAt } as any,
-    requestContext: getPersistedRequestContext(requestContext ?? {}),
+    requestContext: getPersistedRequestContext(requestContext ?? {}, workflow),
     executionGeneration,
   });
   if (isStaleExecutionResult(write)) return false;
@@ -181,6 +183,7 @@ export async function processWorkflowSleep(
   if (
     !(await recordSleepWaiting({
       workflowsStore,
+      workflow,
       workflowId,
       runId,
       stepId: step.id,
@@ -311,6 +314,7 @@ export async function processWorkflowSleepUntil(
   if (
     !(await recordSleepWaiting({
       workflowsStore,
+      workflow,
       workflowId,
       runId,
       stepId: step.id,

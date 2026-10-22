@@ -270,7 +270,13 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
   readonly #recoveryMaxSteps: number;
   readonly #logger?: IMastraLogger;
   readonly #shouldPersistSnapshot: ShouldPersistSnapshotFn;
-  readonly #persistedRequestContextKeys?: ReadonlySet<string>;
+  /**
+   * The durable allowlist bounds storage, not only the workflow input: every
+   * stored copy of the request context keeps only the allowlisted keys. Set as
+   * the workflows' `persistedRequestContext` too, since the evented engine
+   * merges the context into storage past `pruneSnapshot`.
+   */
+  readonly #persistedRequestContext?: (requestContext: Record<string, any>) => Record<string, any>;
 
   constructor(options?: DurableAgenticWorkflowOptions, logger?: IMastraLogger) {
     // No main-loop params: the durable loop resolves its runtime from the run
@@ -286,15 +292,17 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
     this.#maxSteps = options?.maxSteps ?? DurableAgentDefaults.MAX_STEPS;
     this.#recoveryMaxSteps = options?.recoveryMaxSteps ?? 0;
     this.#shouldPersistSnapshot = options?.shouldPersistSnapshot ?? defaultShouldPersistSnapshot;
-    this.#persistedRequestContextKeys = options?.persistedRequestContextKeys
-      ? new Set([
-          ...options.persistedRequestContextKeys,
-          MASTRA_THREAD_ID_KEY,
-          MASTRA_RESOURCE_ID_KEY,
-          MASTRA_SCOPES_KEY,
-          MASTRA_VERSIONS_KEY,
-        ])
-      : undefined;
+    if (options?.persistedRequestContextKeys) {
+      const allowed = new Set([
+        ...options.persistedRequestContextKeys,
+        MASTRA_THREAD_ID_KEY,
+        MASTRA_RESOURCE_ID_KEY,
+        MASTRA_SCOPES_KEY,
+        MASTRA_VERSIONS_KEY,
+      ]);
+      this.#persistedRequestContext = requestContext =>
+        Object.fromEntries(Object.entries(requestContext).filter(([key]) => allowed.has(key)));
+    }
   }
 
   /**
@@ -318,15 +326,11 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
    * (see `dehydrateSnapshotTranscripts`).
    */
   protected pruneSnapshotHook(stepResultReads: StepResultReads = {}): typeof pruneAgentLoopSnapshot {
-    const allowed = this.#persistedRequestContextKeys;
+    const bound = this.#persistedRequestContext;
     return args => {
       const pruned = dehydrateSnapshotTranscripts(pruneAgentLoopSnapshot({ ...args, stepResultReads }));
-      if (!allowed || !pruned.requestContext) return pruned;
-      // The durable allowlist bounds storage, not only the workflow input.
-      const requestContext = Object.fromEntries(
-        Object.entries(pruned.requestContext).filter(([key]) => allowed.has(key)),
-      );
-      return { ...pruned, requestContext };
+      if (!bound || !pruned.requestContext) return pruned;
+      return { ...pruned, requestContext: bound(pruned.requestContext) };
     };
   }
 
@@ -560,6 +564,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
           // (the evented engine otherwise merges, marks failed, or deletes it).
           isOwnershipLostError: isExecutionFenceError,
           isForeignExecution: isForeignExecutionContext,
+          persistedRequestContext: this.#persistedRequestContext,
           // Agent-loop snapshots are pure resume artifacts — strip everything a
           // resume never reads. The declared reads below cover every
           // same-iteration step-result read (see pruneSnapshotHook).
@@ -1188,6 +1193,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
           allowUnclaimedResumes: true,
           isOwnershipLostError: isExecutionFenceError,
           isForeignExecution: isForeignExecutionContext,
+          persistedRequestContext: this.#persistedRequestContext,
           // Agent-loop snapshots are pure resume artifacts — strip everything a
           // resume never reads. This loop reads iteration state from workflow
           // `value`, so it has no declared step-result reads (see pruneSnapshotHook).

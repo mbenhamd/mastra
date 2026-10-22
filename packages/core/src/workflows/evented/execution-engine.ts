@@ -144,6 +144,9 @@ export class EventedExecutionEngine extends ExecutionEngine {
       if (event.type === 'workflow.superseded') {
         await ack?.();
         if (event.data?.executionGeneration !== executionGeneration) return;
+        // A resume keeps its generation and takes the next attempt, so a refused
+        // admission of another attempt (a redelivered earlier resume) is not ours.
+        if ((event.data?.lifecycleResumeAttempt ?? lifecycleResumeAttempt) !== lifecycleResumeAttempt) return;
         await pubsub.unsubscribe('workflows-finish', finishCb);
         resolveResult({ superseded: true });
         return;

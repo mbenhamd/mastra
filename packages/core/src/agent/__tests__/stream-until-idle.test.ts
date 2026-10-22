@@ -1087,6 +1087,50 @@ describe('Agent.streamUntilIdle', () => {
     ]);
   });
 
+  it('runs a resume routed by a default untilIdle with the defaults it routed on', async () => {
+    const memory = new MockMemory();
+    const { model, getCallOptions } = makeScriptedModel([toolCallResponse('approval'), textResponse('resumed')]);
+    // Each read of the defaults answers a different temperature, so the
+    // resumed turn shows which read it ran with.
+    let resuming = false;
+    let resumeReads = 0;
+    const agent = new Agent({
+      id: 'resume-default-snapshot',
+      name: 'resume-default-snapshot',
+      instructions: 'test',
+      model,
+      memory,
+      defaultOptions: () => (resuming ? { untilIdle: true, modelSettings: { temperature: ++resumeReads / 10 } } : {}),
+      tools: {
+        approval: createTool({
+          id: 'approval',
+          description: 'Request approval',
+          inputSchema: z.object({}),
+          suspendSchema: z.object({ question: z.string() }),
+          resumeSchema: z.object({ approved: z.boolean() }),
+          execute: async (_, context) => {
+            if (!context?.agent?.resumeData) return context?.agent?.suspend({ question: 'Continue?' });
+            return context.agent.resumeData;
+          },
+        }),
+      },
+    });
+    mastra.addAgent(agent, 'resume-default-snapshot');
+
+    const memoryOptions = { thread: 'resume-default-snapshot-thread', resource: 'user-1' };
+    const initial = await agent.stream('start', { memory: memoryOptions });
+    await drain(initial.fullStream as ReadableStream<any>);
+
+    resuming = true;
+    const resumed = await agent.resumeStream(
+      { approved: true },
+      { runId: initial.runId, toolCallId: 'approval', memory: memoryOptions },
+    );
+    await drain(resumed.fullStream as ReadableStream<any>);
+
+    expect(getCallOptions()[1]?.temperature).toBe(0.1);
+  });
+
   it('drops the resumed runId from a plain Agent autonomous continuation', async () => {
     const memory = new MockMemory();
     const { model } = makeScriptedModel([

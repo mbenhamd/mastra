@@ -4,7 +4,7 @@
 
 import { TripWire } from '../../agent/trip-wire';
 import { MASTRA_AUTH_ORGANIZATION_KEY, MASTRA_AUTH_TOKEN_KEY } from '../../request-context';
-import type { StepResult } from '../types';
+import type { StepResult, WorkflowOptions } from '../types';
 import type { Workflow } from '../workflow';
 import type { ParentWorkflow } from './workflow-event-processor';
 
@@ -44,14 +44,21 @@ export function runExpectsPersistedRow(
 
 /**
  * Keep authenticated selection live in events, but never recover it from a stored context.
- * The persisted copy also drops the framework bearer token (upstream #26638, `withoutAuthToken`).
+ * The persisted copy also drops the framework bearer token (upstream #26638, `withoutAuthToken`),
+ * and keeps only what the workflow's `persistedRequestContext` bound allows (PF-6182).
  */
-export function getPersistedRequestContext(requestContext: Record<string, any>): Record<string, any> {
+export function getPersistedRequestContext(
+  requestContext: Record<string, any>,
+  workflow?: { options?: Pick<WorkflowOptions, 'persistedRequestContext'> },
+): Record<string, any> {
   const withoutToken = withoutAuthToken(requestContext);
-  if (!withoutToken || !Object.hasOwn(withoutToken, MASTRA_AUTH_ORGANIZATION_KEY)) return withoutToken;
+  const bound = workflow?.options?.persistedRequestContext;
+  if (!withoutToken || !Object.hasOwn(withoutToken, MASTRA_AUTH_ORGANIZATION_KEY)) {
+    return bound && withoutToken ? bound(withoutToken) : withoutToken;
+  }
   const persisted = { ...withoutToken };
   delete persisted[MASTRA_AUTH_ORGANIZATION_KEY];
-  return persisted;
+  return bound ? bound(persisted) : persisted;
 }
 
 /**

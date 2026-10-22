@@ -12883,9 +12883,13 @@ export class Agent<
         [SKIP_AGENT_EXECUTION_PREFLIGHT]: true,
       };
     } else if (this.#requestContextSchema || this.#mastra?.getServer()?.fga) {
-      const defaultOptions = await this.getDefaultOptions({
-        requestContext: streamOptionsWithPubSub.requestContext,
-      });
+      // A route from `stream()` hands over the defaults it routed on; resolving
+      // them again could pick a different configuration for the same call.
+      const defaultOptions =
+        streamOptionsWithPubSub[STREAM_UNTIL_IDLE_DEFAULT_OPTIONS] ??
+        (await this.getDefaultOptions({
+          requestContext: streamOptionsWithPubSub.requestContext,
+        }));
       const preflightOptions = deepMerge(
         defaultOptions as Record<string, unknown>,
         streamOptionsWithPubSub as Record<string, unknown>,
@@ -13013,9 +13017,12 @@ export class Agent<
         actor: streamOptionsWithPubSub.actor,
       });
     } else {
-      const defaultOptions = await this.getDefaultOptions({
-        requestContext: streamOptionsWithPubSub.requestContext,
-      });
+      // A route from `resumeStream()` hands over the defaults it routed on.
+      const defaultOptions =
+        streamOptionsWithPubSub[STREAM_UNTIL_IDLE_DEFAULT_OPTIONS] ??
+        (await this.getDefaultOptions({
+          requestContext: streamOptionsWithPubSub.requestContext,
+        }));
       const preflightOptions = deepMerge(
         defaultOptions as Record<string, unknown>,
         streamOptionsWithPubSub as Record<string, unknown>,
