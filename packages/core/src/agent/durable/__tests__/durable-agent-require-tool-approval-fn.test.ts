@@ -210,9 +210,16 @@ describe('DurableAgent function-form requireToolApproval', () => {
     cleanup();
   });
 
-  it('evaluates a warm-resumed policy with the resumed caller context', async () => {
+  // An authenticated resume honours the approval it carries: the policy is not
+  // asked again (live permission checks still run), and the approved tool runs
+  // once with the resumed caller's context.
+  it("honours a warm resume's approval and runs the tool with the resumed caller context", async () => {
     const mockModel = createToolCallThenTextModel({ name: 'tenantTool', args: { value: 'test' } });
-    const execute = vi.fn(async () => 'ok');
+    const seen: unknown[] = [];
+    const execute = vi.fn(async (_input: unknown, context: any) => {
+      seen.push(context?.requestContext?.get('tenantId'));
+      return 'ok';
+    });
     const tenantTool = createTool({
       id: 'tenantTool',
       description: 'tenant-aware tool',
@@ -264,16 +271,9 @@ describe('DurableAgent function-form requireToolApproval', () => {
     );
     await vi.waitFor(() => expect(finishData).toBeDefined());
 
-    expect(policy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        requestContext: expect.objectContaining({
-          tenantId: 'resume-tenant',
-          authToken: 'resume-auth',
-        }),
-      }),
-    );
-    expect(policy).toHaveBeenCalledTimes(1);
+    expect(policy).not.toHaveBeenCalled();
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(seen).toEqual(['resume-tenant']);
 
     resumed.cleanup();
     initial.cleanup();

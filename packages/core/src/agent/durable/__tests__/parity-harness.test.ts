@@ -1226,6 +1226,44 @@ describe('expectEngineParity', () => {
     expect(normalizePayload({ stack: 'a' })).not.toEqual(normalizePayload({ stack: 'b' }));
   });
 
+  it("ignores only the engine-local resume envelope and plain's edited-arguments field", () => {
+    const schema = (editable: boolean, reasonType = 'string') =>
+      JSON.stringify({
+        type: 'object',
+        properties: {
+          approved: { type: 'boolean' },
+          reason: { type: reasonType },
+          ...(editable ? { editedArgs: { $ref: '#/definitions/__schema0' } } : {}),
+        },
+        ...(editable ? { definitions: { __schema0: { type: 'string' } } } : {}),
+      });
+    const plain = {
+      toolCallId: 'c1',
+      originRunId: 'plain-run',
+      stepId: 'toolCallStep',
+      resumeIdentityDigest: 'digest',
+      resumeSchema: schema(true),
+    };
+    const durable = {
+      toolCallId: 'c1',
+      originRunId: 'durable-run',
+      stepId: 'durable-tool-call',
+      resumeSchema: schema(false),
+    };
+    expect(normalizeChunkPayload('tool-call-approval', plain)).toEqual(
+      normalizeChunkPayload('tool-call-approval', durable),
+    );
+    // Any other difference still shows: the call id, and the rest of the schema.
+    expect(normalizeChunkPayload('tool-call-approval', { ...plain, toolCallId: 'c2' })).not.toEqual(
+      normalizeChunkPayload('tool-call-approval', durable),
+    );
+    expect(normalizeChunkPayload('tool-call-approval', { ...plain, resumeSchema: schema(true, 'number') })).not.toEqual(
+      normalizeChunkPayload('tool-call-approval', durable),
+    );
+    // Outside tool-call chunks the fields are the application's.
+    expect(normalizeChunkPayload('tool-result', plain)).toEqual(plain);
+  });
+
   it('reads a live Error as the name and message a serialised one carries', () => {
     // Plain hands a failure on as the `Error` itself; the wrapped engines hand
     // on `{ name, message, stack }`. Both have to record the same thing, or the

@@ -23,13 +23,15 @@ const makeAgent = () =>
   });
 
 const cacheKeyFor = (topic: string) => `pubsub:${topic}`;
+// Every durable publish names its run: the replay cache refuses to retain an
+// event without one (PF-2007).
 
 describe('DurableAgent shouldCache', () => {
   it('caches every non-run-local topic by default', async () => {
     const cache = new InMemoryServerCache();
     const durable = createDurableAgent({ agent: makeAgent(), pubsub: new EventEmitterPubSub(), cache });
 
-    await durable.pubsub.publish('agent.stream.run-1', { type: 'chunk', data: {} });
+    await durable.pubsub.publish('agent.stream.run-1', { type: 'chunk', runId: 'run-1', data: {} });
 
     expect(await cache.listLength(cacheKeyFor('agent.stream.run-1'))).toBe(1);
   });
@@ -49,8 +51,8 @@ describe('DurableAgent shouldCache', () => {
       received.push(e.type);
     });
 
-    await durable.pubsub.publish('agent.stream.run-1', { type: 'chunk', data: {} });
-    await durable.pubsub.publish('agent.control.run-1', { type: 'cancel', data: {} });
+    await durable.pubsub.publish('agent.stream.run-1', { type: 'chunk', runId: 'run-1', data: {} });
+    await durable.pubsub.publish('agent.control.run-1', { type: 'cancel', runId: 'run-1', data: {} });
     await new Promise(r => setTimeout(r, 0));
 
     expect(received).toEqual(['chunk']);
@@ -67,7 +69,7 @@ describe('DurableAgent shouldCache', () => {
       shouldCache: () => true,
     });
 
-    await durable.pubsub.publish('workflow.events.v2.run-1', { type: 'watch', data: {} });
+    await durable.pubsub.publish('workflow.events.v2.run-1', { type: 'watch', runId: 'run-1', data: {} });
 
     expect(await cache.listLength(cacheKeyFor('workflow.events.v2.run-1'))).toBe(0);
   });
@@ -86,7 +88,7 @@ describe('DurableAgent shouldCache', () => {
 
     // No double-wrapping: the existing instance is reused and its policy wins.
     expect(durable.pubsub).toBe(existing);
-    await durable.pubsub.publish('agent.stream.run-1', { type: 'chunk', data: {} });
+    await durable.pubsub.publish('agent.stream.run-1', { type: 'chunk', runId: 'run-1', data: {} });
 
     expect(await cache.listLength(cacheKeyFor('agent.stream.run-1'))).toBe(1);
     expect(warn).toHaveBeenCalledTimes(1);
@@ -102,7 +104,7 @@ describe('DurableAgent shouldCache', () => {
       shouldCache: () => false,
     });
 
-    await evented.pubsub.publish('agent.stream.run-1', { type: 'chunk', data: {} });
+    await evented.pubsub.publish('agent.stream.run-1', { type: 'chunk', runId: 'run-1', data: {} });
 
     expect(await cache.listLength(cacheKeyFor('agent.stream.run-1'))).toBe(0);
   });
