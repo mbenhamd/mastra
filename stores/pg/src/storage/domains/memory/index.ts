@@ -5065,24 +5065,28 @@ export class MemoryPG extends MemoryStorage {
             await this.lockThreadLifecycles(t, [writeGuard.threadId]);
           }
           await this.lockObservationalMemoryResource(t, writeGuard.resourceId);
-          if (writeGuard.recordId !== input.id) {
-            throw new ObservationalMemoryGenerationConflictError();
+          const guarded = await this.#lockOMRow(t, tableName, input.id);
+          // The guard must name this record and its own scope; the lookup key of
+          // a thread-scoped record omits the resource, so check both (PF-6182,
+          // PF-6254). Every store refuses a mismatch with the same message.
+          if (
+            writeGuard.recordId !== input.id ||
+            (guarded &&
+              (guarded.resourceId !== writeGuard.resourceId ||
+                (guarded.threadId ?? null) !== (writeGuard.threadId ?? null)))
+          ) {
+            throw new MastraError({
+              id: createStorageErrorId('PG', 'UPDATE_ACTIVE_OBSERVATIONS', 'GUARD_MISMATCH'),
+              text: 'Observational memory guard does not match the active observation record.',
+              domain: ErrorDomain.STORAGE,
+              category: ErrorCategory.USER,
+              details: { id: input.id },
+            });
           }
           // A generation that a concurrent reflection retired stays in its
           // lineage: answer `retired` so the caller recomposes on the new head
-          // (PF-6182). A cleared record, or one under another scope, still
-          // fails the generation check below.
-          const guarded = await this.#lockOMRow(t, tableName, input.id);
-          // The lookup key of a thread-scoped record omits the resource, so
-          // the record's own resource and thread must match the guard too.
-          if (
-            guarded?.supersededBy &&
-            guarded.lookupKey === this.getOMKey(writeGuard.threadId, writeGuard.resourceId) &&
-            guarded.resourceId === writeGuard.resourceId &&
-            (guarded.threadId ?? null) === (writeGuard.threadId ?? null)
-          ) {
-            return { applied: false, reason: 'retired' as const };
-          }
+          // (PF-6182). A cleared record still fails the generation check below.
+          if (guarded?.supersededBy) return { applied: false, reason: 'retired' as const };
           await this.assertCurrentObservationalMemoryGeneration(t, writeGuard);
         }
         const row = await this.#lockOMRow(t, tableName, input.id);

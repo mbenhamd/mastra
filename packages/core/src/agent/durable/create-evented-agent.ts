@@ -68,6 +68,18 @@ export interface CreateEventedAgentOptions<
   maxSteps?: number;
 
   /**
+   * Auto-cleanup timer for durable stream state (ms).
+   * Set to `0` to disable auto-cleanup. Defaults to `30_000` (30 seconds).
+   */
+  cleanupTimeoutMs?: number;
+
+  /**
+   * Explicit non-secret application RequestContext keys that may be persisted
+   * for cold recovery. Infrastructure keys and credentials are forbidden.
+   */
+  durableRequestContextKeys?: readonly string[];
+
+  /**
    * Per-topic opt-out of the replay cache.
    *
    * Return `false` to publish a topic straight through to the underlying
@@ -120,13 +132,24 @@ export function createEventedAgent<
   TTools extends Record<string, any> = Record<string, any>,
   TOutput = undefined,
 >(options: CreateEventedAgentOptions<TAgentId, TTools, TOutput>): EventedAgent<TAgentId, TTools, TOutput> {
-  const { agent, pubsub, cache, maxSteps, shouldCache, shouldPersistSnapshot } = options;
+  const {
+    agent,
+    pubsub,
+    cache,
+    maxSteps,
+    cleanupTimeoutMs,
+    durableRequestContextKeys,
+    shouldCache,
+    shouldPersistSnapshot,
+  } = options;
 
   return new EventedAgent({
     agent,
     pubsub,
     cache,
     maxSteps,
+    cleanupTimeoutMs,
+    durableRequestContextKeys,
     shouldCache,
     shouldPersistSnapshot,
   } as EventedAgentConfig<TAgentId, TTools, TOutput>);

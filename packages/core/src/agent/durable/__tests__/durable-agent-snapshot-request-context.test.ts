@@ -15,7 +15,7 @@ import { MockStore } from '../../../storage/mock';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
-import { EventedAgent } from '../evented-agent';
+import { createEventedAgent } from '../create-evented-agent';
 import { globalRunRegistry } from '../run-registry';
 
 function toolCallThenText(toolName: string) {
@@ -97,7 +97,7 @@ describe('DurableAgent stored snapshot request context (PF-6182)', () => {
         tools: { approvalTool },
       });
       const durableAgent = evented
-        ? new EventedAgent({ agent: baseAgent, pubsub, durableRequestContextKeys: ['tenantId'] })
+        ? createEventedAgent({ agent: baseAgent, pubsub, durableRequestContextKeys: ['tenantId'] })
         : createDurableAgent({ agent: baseAgent, pubsub, durableRequestContextKeys: ['tenantId'] });
       const storage = new MockStore();
       new Mastra({ logger: false, storage, agents: { snapshotContextAgent: durableAgent } });
