@@ -6733,7 +6733,7 @@ NODE
     PAPERSFLOW_PF2042_INNGEST_ADAPTER_SHA256="$fixture_inngest_adapter_sha"
   assert_contains 'compose -f workflows/inngest/docker-compose.yaml config --quiet' "$docker_log"
   assert_contains 'PF-2042 exact Inngest test/Compose/adapter trio: deferring the package-wide typecheck and build baseline to PF-2051.' "$output"
-  assert_contains 'exec eslint workflows/inngest/src/index.test.ts workflows/inngest/src/__tests__/adapters/_utils.ts' "$command_log"
+  assert_contains 'exec oxlint workflows/inngest/src/index.test.ts workflows/inngest/src/__tests__/adapters/_utils.ts' "$command_log"
   assert_contains '--filter ./packages/deployer --fail-if-no-match build:lib' "$command_log"
   assert_contains '--filter ./stores/libsql --fail-if-no-match build:lib' "$command_log"
   assert_contains '--filter ./observability/mastra --fail-if-no-match build' "$command_log"
@@ -15280,7 +15280,7 @@ elif [[ "$inngest_pf2042_trio_only" == true ]]; then
   # every other Inngest source/test continues through the normal owned map and
   # package gates above.
   echo 'PF-2042 exact Inngest test/Compose/adapter trio: deferring the package-wide typecheck and build baseline to PF-2051.'
-  run_with_validation_budget 600 pnpm exec eslint \
+  run_with_validation_budget 600 pnpm exec oxlint \
     workflows/inngest/src/index.test.ts \
     workflows/inngest/src/__tests__/adapters/_utils.ts
 fi
@@ -15328,7 +15328,10 @@ if workspace_changed mastracode || workspace_changed mastracode/sdk || workspace
     done < "$changed_files"
   )
   if (( ${#mastracode_lint_files[@]} > 0 )); then
-    run_with_validation_budget 600 pnpm exec eslint "${mastracode_lint_files[@]}"
+    # Package configs ignore some admitted paths (for example the SDK's
+    # scripts/**, which get their own typecheck below); a selection that is
+    # entirely ignored is not a lint failure.
+    run_with_validation_budget 600 pnpm exec oxlint --no-error-on-unmatched-pattern "${mastracode_lint_files[@]}"
   fi
 fi
 
