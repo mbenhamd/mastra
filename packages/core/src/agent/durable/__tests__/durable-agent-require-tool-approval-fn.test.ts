@@ -17,6 +17,7 @@ import { MockStore } from '../../../storage/mock';
 import { createTool } from '../../../tools';
 import { delay } from '../../../utils';
 import { Agent } from '../../agent';
+import { ON_BEFORE_TOOL_EXECUTION_KEY } from '../../tool-permission-prefilter';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import { globalRunRegistry } from '../run-registry';
@@ -241,6 +242,8 @@ describe('DurableAgent function-form requireToolApproval', () => {
     });
 
     const policy = vi.fn(() => true);
+    // The resume's live, action-time permission check: it still runs.
+    const livePermissionCheck = vi.fn().mockResolvedValue('allow');
     let suspendedData: unknown;
     const initial = await durableAgent.stream('Run the tenant tool', {
       requireToolApproval: policy,
@@ -263,6 +266,7 @@ describe('DurableAgent function-form requireToolApproval', () => {
         requestContext: new RequestContext([
           ['tenantId', 'resume-tenant'],
           ['authToken', 'resume-auth'],
+          [ON_BEFORE_TOOL_EXECUTION_KEY, livePermissionCheck],
         ]),
         onFinish: data => {
           finishData = data;
@@ -272,6 +276,9 @@ describe('DurableAgent function-form requireToolApproval', () => {
     await vi.waitFor(() => expect(finishData).toBeDefined());
 
     expect(policy).not.toHaveBeenCalled();
+    expect(livePermissionCheck).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: 'tenantTool', isResume: true }),
+    );
     expect(execute).toHaveBeenCalledTimes(1);
     expect(seen).toEqual(['resume-tenant']);
 
