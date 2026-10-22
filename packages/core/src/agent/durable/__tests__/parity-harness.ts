@@ -284,51 +284,10 @@ export function normalizePayload(value: unknown, ancestors: readonly object[] = 
   return out;
 }
 
-/**
- * The engine-local part of a suspended or approval-gated tool call's resume
- * envelope (PF-1703): which run and step resume it, and plain's identity
- * digest. Each engine resumes through its own; every other field must match.
- */
-const ENGINE_LOCAL_RESUME_FIELDS = ['originRunId', 'resumeIdentityDigest', 'stepId'] as const;
-
-/**
- * A tool-gate approval's resume schema, without plain's optional `editedArgs`:
- * the durable engines reject edited arguments on resume (PF-4112), so only the
- * plain engine advertises them. Only the framework's approval schema (its
- * boolean `approved`) is touched; a suspension's schema is the application's.
- */
-function withoutEditedArgs(resumeSchema: unknown): unknown {
-  if (typeof resumeSchema !== 'string') return resumeSchema;
-  try {
-    const schema = JSON.parse(resumeSchema) as {
-      properties?: Record<string, { type?: unknown } | undefined>;
-      definitions?: Record<string, unknown>;
-    };
-    if (!schema.properties || !('editedArgs' in schema.properties)) return resumeSchema;
-    if (schema.properties.approved?.type !== 'boolean') return resumeSchema;
-    delete schema.properties.editedArgs;
-    // The JSON value type only `editedArgs` referenced goes with it.
-    if (schema.definitions) {
-      const { definitions, ...rest } = schema;
-      if (!JSON.stringify(rest).includes('"$ref"')) return JSON.stringify(rest);
-      schema.definitions = definitions;
-    }
-    return JSON.stringify(schema);
-  } catch {
-    return resumeSchema;
-  }
-}
-
 export function normalizeChunkPayload(type: string, payload: unknown): unknown {
   if (type === 'error') return normalizePayload(payload, [], true);
 
   const normalized = normalizePayload(payload);
-  if (type.startsWith('tool-call-') && normalized !== null && typeof normalized === 'object') {
-    const fields = normalized as Record<string, unknown>;
-    for (const field of ENGINE_LOCAL_RESUME_FIELDS) delete fields[field];
-    const approval = type === 'tool-call-approval' || (type === 'tool-call-resumed' && fields.kind === 'approval');
-    if (approval && 'resumeSchema' in fields) fields.resumeSchema = withoutEditedArgs(fields.resumeSchema);
-  }
   if (type !== 'tool-error' || normalized === null || typeof normalized !== 'object') return normalized;
 
   const error = (normalized as Record<string, unknown>).error;
@@ -1128,7 +1087,31 @@ interface KnownChunkDifference {
   appliesTo?: (plainPayload: unknown) => boolean;
 }
 
+/** Whether a chunk's resume schema offers edited arguments (plain's tool-gate approval). */
+const offersEditedArgs = (payload: unknown) => {
+  const schema = getAtPath(payload, 'resumeSchema');
+  return typeof schema === 'string' && schema.includes('"editedArgs"');
+};
+
 const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
+  ...(['tool-call-approval', 'tool-call-suspended'] as const).map(chunkType => ({
+    ticket: 'PF-1703',
+    reason:
+      'Each engine resumes a suspended or approval-gated call through its own envelope: the run it ' +
+      "originated in, its own step id, and plain's identity digest (which only plain's resume checks).",
+    chunkType,
+    paths: ['originRunId', 'stepId', 'resumeIdentityDigest'],
+  })),
+  ...(['tool-call-approval', 'tool-call-resumed'] as const).map(chunkType => ({
+    ticket: 'PF-4112',
+    reason:
+      "Only plain's tool-gate approval offers edited arguments (`editedArgs`); the durable engines reject " +
+      'them on resume, so their approval resume schema omits the field. Both schemas are pinned verbatim in ' +
+      'parity-harness.test.ts.',
+    chunkType,
+    paths: ['resumeSchema'],
+    appliesTo: offersEditedArgs,
+  })),
   {
     ticket: 'COR-1390',
     reason:

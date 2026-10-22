@@ -67,6 +67,14 @@ const APPROVAL_RESUME_SCHEMA =
   '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"approved":{"type":"boolean","description":"Controls if the tool call is approved or not, should be true when approved and false when declined"},"reason":{"description":"Optional explanation for the decision, surfaced to the model when the tool call is declined","type":"string"}},"required":["approved"],"additionalProperties":false}';
 
 /**
+ * Plain's tool-gate approval `resumeSchema`: the shared schema plus the optional
+ * `editedArgs` patch, which only plain accepts (PF-4112). Pinned verbatim so
+ * plain dropping it, or a durable engine starting to offer it, fails here.
+ */
+const PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA =
+  '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"approved":{"type":"boolean","description":"Controls if the tool call is approved or not, should be true when approved and false when declined"},"reason":{"description":"Optional explanation for the decision, surfaced to the model when the tool call is declined","type":"string"},"editedArgs":{"description":"Shallow JSON input patch","type":"object","propertyNames":{"type":"string"},"additionalProperties":{"$ref":"#/definitions/__schema0"}}},"required":["approved"],"additionalProperties":false,"definitions":{"__schema0":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"},{"type":"array","items":{"$ref":"#/definitions/__schema0"}},{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{"$ref":"#/definitions/__schema0"}}]}}}';
+
+/**
  * A tool that suspends until the caller resumes it, then answers with the
  * resume data. `question` is what the caller is asked, so a scenario can make
  * one engine suspend with a different payload.
@@ -591,10 +599,9 @@ describe('expectEngineParity', () => {
     const approvalPayload = (r: EngineObservation) =>
       r.turns[0]!.chunkPayloads[r.turns[0]!.chunkTypes.indexOf('tool-call-approval')] as Record<string, unknown>;
 
+    expect(approvalPayload(observe(results.plain!)).resumeSchema).toBe(PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA);
     for (const engine of ['durable', 'evented'] as const) {
-      expect(approvalPayload(observe(results[engine]!)).resumeSchema).toBe(
-        approvalPayload(observe(results.plain!)).resumeSchema,
-      );
+      expect(approvalPayload(observe(results[engine]!)).resumeSchema).toBe(APPROVAL_RESUME_SCHEMA);
       expect(results[engine]!.turns[0]!.toolCalls).toEqual(results.plain!.turns[0]!.toolCalls);
       expect(results[engine]!.turns[0]!.toolCalls).toHaveLength(1);
       expect(staleKnownDifferences(engine, observe(results.plain!), observe(results[engine]!))).toEqual([]);
@@ -1226,59 +1233,6 @@ describe('expectEngineParity', () => {
     expect(normalizePayload({ stack: 'a' })).not.toEqual(normalizePayload({ stack: 'b' }));
   });
 
-  it("ignores only the engine-local resume envelope and plain's edited-arguments field", () => {
-    const schema = (editable: boolean, reasonType = 'string') =>
-      JSON.stringify({
-        type: 'object',
-        properties: {
-          approved: { type: 'boolean' },
-          reason: { type: reasonType },
-          ...(editable ? { editedArgs: { $ref: '#/definitions/__schema0' } } : {}),
-        },
-        ...(editable ? { definitions: { __schema0: { type: 'string' } } } : {}),
-      });
-    const plain = {
-      toolCallId: 'c1',
-      originRunId: 'plain-run',
-      stepId: 'toolCallStep',
-      resumeIdentityDigest: 'digest',
-      resumeSchema: schema(true),
-    };
-    const durable = {
-      toolCallId: 'c1',
-      originRunId: 'durable-run',
-      stepId: 'durable-tool-call',
-      resumeSchema: schema(false),
-    };
-    expect(normalizeChunkPayload('tool-call-approval', plain)).toEqual(
-      normalizeChunkPayload('tool-call-approval', durable),
-    );
-    // Any other difference still shows: the call id, and the rest of the schema.
-    expect(normalizeChunkPayload('tool-call-approval', { ...plain, toolCallId: 'c2' })).not.toEqual(
-      normalizeChunkPayload('tool-call-approval', durable),
-    );
-    expect(normalizeChunkPayload('tool-call-approval', { ...plain, resumeSchema: schema(true, 'number') })).not.toEqual(
-      normalizeChunkPayload('tool-call-approval', durable),
-    );
-    // Outside tool-call chunks the fields are the application's.
-    expect(normalizeChunkPayload('tool-result', plain)).toEqual(plain);
-    // A suspension's schema is the application's, even with an `editedArgs` field.
-    const suspension = (editedArgsType: string) => ({
-      toolCallId: 'c1',
-      resumeSchema: JSON.stringify({ type: 'object', properties: { editedArgs: { type: editedArgsType } } }),
-    });
-    expect(normalizeChunkPayload('tool-call-suspended', suspension('string'))).not.toEqual(
-      normalizeChunkPayload('tool-call-suspended', suspension('number')),
-    );
-    expect(normalizeChunkPayload('tool-call-resumed', { ...suspension('string'), kind: 'suspension' })).not.toEqual(
-      normalizeChunkPayload('tool-call-resumed', { ...suspension('number'), kind: 'suspension' }),
-    );
-    // The resumed approval chunk is normalized like the approval itself.
-    expect(normalizeChunkPayload('tool-call-resumed', { ...plain, kind: 'approval' })).toEqual(
-      normalizeChunkPayload('tool-call-resumed', { ...durable, kind: 'approval' }),
-    );
-  });
-
   it('reads a live Error as the name and message a serialised one carries', () => {
     // Plain hands a failure on as the `Error` itself; the wrapped engines hand
     // on `{ name, message, stack }`. Both have to record the same thing, or the
@@ -1361,7 +1315,9 @@ describe('expectEngineParity', () => {
       const turn = results[engine]!.turns[0]!;
       for (const ct of ['tool-call-approval', 'tool-call-resumed']) {
         const payload = turn.chunkPayloads[turn.chunkTypes.indexOf(ct)] as { resumeSchema: string };
-        expect(payload.resumeSchema).toBe(APPROVAL_RESUME_SCHEMA);
+        expect(payload.resumeSchema).toBe(
+          engine === 'plain' ? PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA : APPROVAL_RESUME_SCHEMA,
+        );
       }
       expect(turn.chunks).toContain('AGENT:tool-call-approval:gate');
       expect(turn.chunks).toContain('AGENT:finish');
