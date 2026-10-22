@@ -4798,6 +4798,7 @@ run_validator_self_tests() {
     "$fixture_repo/stores/convex/src/server" \
     "$fixture_repo/stores/_test-utils/src/domains/harness" \
     "$fixture_repo/stores/_test-utils/src/domains/workflows" \
+    "$fixture_repo/stores/_test-utils/src/domains/memory" \
     "$fixture_repo/stores/libsql/src/storage/domains/harness" \
     "$fixture_repo/stores/libsql/src/storage/domains/workflows" \
     "$fixture_repo/stores/libsql/src/storage" \
@@ -5121,6 +5122,8 @@ run_validator_self_tests() {
       > stores/_test-utils/src/domains/workflows/atomic-resume.ts
     printf '%s\n' "export { atomicResumeConformance } from './domains/workflows/atomic-resume';" \
       > stores/_test-utils/src/index.ts
+    printf '%s\n' 'export const observationalMemoryConformance = true;' \
+      > stores/_test-utils/src/domains/memory/observational-memory.ts
     printf '%s\n' '{}' > stores/libsql/package.json
     printf '%s\n' 'export const libsqlStore = true;' \
       > stores/libsql/src/storage/index.ts
@@ -7077,6 +7080,28 @@ NODE
   assert_contains '--filter ./stores/pg --fail-if-no-match exec tsc --noEmit' "$command_log"
   assert_contains 'src/storage/domains/workflows/atomic-resume.test.ts' "$command_log"
   assert_contains 'postgres 127.0.0.1:5434' "$service_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const observationalMemoryConformance = "head";' \
+      > stores/_test-utils/src/domains/memory/observational-memory.ts
+    printf '%s\n' 'export const atomicResumeConformance = "with-observational-memory";' \
+      > stores/_test-utils/src/domains/workflows/atomic-resume.ts
+    git add .
+    git commit -q -m 'exercise shared observational memory conformance'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/observational-memory-conformance-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  # PF-6182: the shared contract runs from the in-memory and libSQL suites.
+  assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
+  assert_contains 'stores/libsql/src/storage/index.test.ts' "$output"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -14206,10 +14231,14 @@ while IFS= read -r file; do
   esac
 done < "$changed_files"
 
+# Reviewed shared conformance helpers, each owned by the suites that execute
+# it. A change confined to these helpers is owned; any other stores/_test-utils
+# change still needs its own changed Vitest file below.
+storage_conformance_helpers='^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts|domains/memory/observational-memory\.ts)$'
 storage_atomic_resume_conformance_owned=false
-if grep -Eq '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files" &&
+if grep -Eq "$storage_conformance_helpers" "$changed_files" &&
   ! grep -E '^stores/_test-utils/' "$changed_files" |
-    grep -Ev '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' |
+    grep -Ev "$storage_conformance_helpers" |
     grep -q .; then
   storage_atomic_resume_conformance_owned=true
   while IFS= read -r file; do
@@ -14217,6 +14246,14 @@ if grep -Eq '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\
     queue_owned_workspace_test "$file" stores/pg/src/storage/domains/workflows/atomic-resume.test.ts
   done < <(
     grep -E '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files"
+  )
+  # PF-6182: the shared observational-memory contract runs from the in-memory
+  # suite (createTestSuite over MockStore) and the libSQL store suite.
+  while IFS= read -r file; do
+    queue_owned_workspace_test "$file" stores/_test-utils/src/index.test.ts
+    queue_owned_workspace_test "$file" stores/libsql/src/storage/index.test.ts
+  done < <(
+    grep -E '^stores/_test-utils/src/domains/memory/observational-memory\.ts$' "$changed_files"
   )
 fi
 
