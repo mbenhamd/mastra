@@ -7103,6 +7103,28 @@ NODE
   assert_contains 'stores/_test-utils/src/index.test.ts' "$output"
   assert_contains 'stores/libsql/src/storage/index.test.ts' "$output"
 
+  # A changed _test-utils test alongside the helper does not stand in for the
+  # helper's owner suites.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const observationalMemoryConformance = "with-test";' \
+      > stores/_test-utils/src/domains/memory/observational-memory.ts
+    printf '%s\n' "it('in-memory suite edit', () => {});" \
+      >> stores/_test-utils/src/index.test.ts
+    git add .
+    git commit -q -m 'observational memory helper with a changed shared test'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  : > "$service_log"
+  output="$test_root/observational-memory-with-test-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'stores/libsql/src/storage/index.test.ts' "$output"
+
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
@@ -14241,21 +14263,23 @@ if grep -Eq "$storage_conformance_helpers" "$changed_files" &&
     grep -Ev "$storage_conformance_helpers" |
     grep -q .; then
   storage_atomic_resume_conformance_owned=true
-  while IFS= read -r file; do
-    queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
-    queue_owned_workspace_test "$file" stores/pg/src/storage/domains/workflows/atomic-resume.test.ts
-  done < <(
-    grep -E '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files"
-  )
-  # PF-6182: the shared observational-memory contract runs from the in-memory
-  # suite (createTestSuite over MockStore) and the libSQL store suite.
-  while IFS= read -r file; do
-    queue_owned_workspace_test "$file" stores/_test-utils/src/index.test.ts
-    queue_owned_workspace_test "$file" stores/libsql/src/storage/index.test.ts
-  done < <(
-    grep -E '^stores/_test-utils/src/domains/memory/observational-memory\.ts$' "$changed_files"
-  )
 fi
+# Each changed helper's owner suites run whatever else changed with it, so a
+# changed _test-utils Vitest file never stands in for them.
+while IFS= read -r file; do
+  queue_owned_workspace_test "$file" stores/libsql/src/storage/domains/workflows/atomic-resume.test.ts
+  queue_owned_workspace_test "$file" stores/pg/src/storage/domains/workflows/atomic-resume.test.ts
+done < <(
+  grep -E '^stores/_test-utils/src/(domains/workflows/atomic-resume\.ts|index\.ts)$' "$changed_files"
+)
+# PF-6182: the shared observational-memory contract runs from the in-memory
+# suite (createTestSuite over MockStore) and the libSQL store suite.
+while IFS= read -r file; do
+  queue_owned_workspace_test "$file" stores/_test-utils/src/index.test.ts
+  queue_owned_workspace_test "$file" stores/libsql/src/storage/index.test.ts
+done < <(
+  grep -E '^stores/_test-utils/src/domains/memory/observational-memory\.ts$' "$changed_files"
+)
 
 storage_harness_factory_registered=false
 if grep -Eq '^stores/_test-utils/src/(domains/harness/index\.ts|factory\.ts|index\.test\.ts)$' "$changed_files"; then
