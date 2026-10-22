@@ -1262,6 +1262,21 @@ describe('expectEngineParity', () => {
     );
     // Outside tool-call chunks the fields are the application's.
     expect(normalizeChunkPayload('tool-result', plain)).toEqual(plain);
+    // A suspension's schema is the application's, even with an `editedArgs` field.
+    const suspension = (editedArgsType: string) => ({
+      toolCallId: 'c1',
+      resumeSchema: JSON.stringify({ type: 'object', properties: { editedArgs: { type: editedArgsType } } }),
+    });
+    expect(normalizeChunkPayload('tool-call-suspended', suspension('string'))).not.toEqual(
+      normalizeChunkPayload('tool-call-suspended', suspension('number')),
+    );
+    expect(normalizeChunkPayload('tool-call-resumed', { ...suspension('string'), kind: 'suspension' })).not.toEqual(
+      normalizeChunkPayload('tool-call-resumed', { ...suspension('number'), kind: 'suspension' }),
+    );
+    // The resumed approval chunk is normalized like the approval itself.
+    expect(normalizeChunkPayload('tool-call-resumed', { ...plain, kind: 'approval' })).toEqual(
+      normalizeChunkPayload('tool-call-resumed', { ...durable, kind: 'approval' }),
+    );
   });
 
   it('reads a live Error as the name and message a serialised one carries', () => {

@@ -292,18 +292,20 @@ export function normalizePayload(value: unknown, ancestors: readonly object[] = 
 const ENGINE_LOCAL_RESUME_FIELDS = ['originRunId', 'resumeIdentityDigest', 'stepId'] as const;
 
 /**
- * A tool-call approval's resume schema, without plain's optional `editedArgs`:
+ * A tool-gate approval's resume schema, without plain's optional `editedArgs`:
  * the durable engines reject edited arguments on resume (PF-4112), so only the
- * plain engine advertises them.
+ * plain engine advertises them. Only the framework's approval schema (its
+ * boolean `approved`) is touched; a suspension's schema is the application's.
  */
 function withoutEditedArgs(resumeSchema: unknown): unknown {
   if (typeof resumeSchema !== 'string') return resumeSchema;
   try {
     const schema = JSON.parse(resumeSchema) as {
-      properties?: Record<string, unknown>;
+      properties?: Record<string, { type?: unknown } | undefined>;
       definitions?: Record<string, unknown>;
     };
     if (!schema.properties || !('editedArgs' in schema.properties)) return resumeSchema;
+    if (schema.properties.approved?.type !== 'boolean') return resumeSchema;
     delete schema.properties.editedArgs;
     // The JSON value type only `editedArgs` referenced goes with it.
     if (schema.definitions) {
@@ -324,7 +326,8 @@ export function normalizeChunkPayload(type: string, payload: unknown): unknown {
   if (type.startsWith('tool-call-') && normalized !== null && typeof normalized === 'object') {
     const fields = normalized as Record<string, unknown>;
     for (const field of ENGINE_LOCAL_RESUME_FIELDS) delete fields[field];
-    if ('resumeSchema' in fields) fields.resumeSchema = withoutEditedArgs(fields.resumeSchema);
+    const approval = type === 'tool-call-approval' || (type === 'tool-call-resumed' && fields.kind === 'approval');
+    if (approval && 'resumeSchema' in fields) fields.resumeSchema = withoutEditedArgs(fields.resumeSchema);
   }
   if (type !== 'tool-error' || normalized === null || typeof normalized !== 'object') return normalized;
 
