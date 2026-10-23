@@ -1355,7 +1355,9 @@ describe('expectEngineParity', () => {
     expect(staleKnownDifferences('durable', pinned[0], pinned[1])).toEqual([]);
     // A digest that no longer binds the advertised call fails, though present.
     const wrongDigest = observe(results.plain!);
-    approval(wrongDigest).resumeIdentityDigest = 'not-this-call';
+    const approvalAt = wrongDigest.turns[0]!.chunkTypes.indexOf('tool-call-approval');
+    expect(wrongDigest.turns[0]!.resumeDigestBinds?.[approvalAt]).toBe(true);
+    wrongDigest.turns[0]!.resumeDigestBinds![approvalAt] = false;
     expect(staleKnownDifferences('durable', wrongDigest, observe(results.durable!))).toContain(
       "plain: turns[0] tool-call-approval payload 'resumeIdentityDigest' does not bind its tool call (PF-1703)",
     );
@@ -1461,6 +1463,39 @@ describe('expectEngineParity', () => {
       differsOnlyByEditedArgs({ resumeSchema: PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA }, { resumeSchema: changed }),
     ).toBe(false);
     expect(differsOnlyByEditedArgs({ resumeSchema: APPROVAL_RESUME_SCHEMA }, { resumeSchema: changed })).toBe(false);
+  });
+
+  it('accepts a digest whose call arguments hold keys normalization drops', async () => {
+    // `id` is a volatile payload key, so the recorded payload's args lose it;
+    // the digest is checked on the raw chunk, so a correct one still holds.
+    const invoice = createTool({
+      id: 'gate',
+      description: 'Run once the caller approves',
+      inputSchema: z.object({ id: z.string() }),
+      execute: async () => 'ran',
+    });
+    const results = await expectEngineParity(
+      approvalScenario({
+        model: { tapes: [toolCallTape('gate', { id: 'invoice-42' }), textOnlyTape('Done.')] },
+        buildAgent: ({ model }) =>
+          new Agent({
+            id: 'parity-approval-id-args',
+            name: 'Parity Approval',
+            instructions: 'Ask before doing anything',
+            model,
+            memory: new MockMemory(),
+            tools: { gate: invoice },
+          }),
+        options: {
+          maxSteps: 3,
+          requireToolApproval: true,
+          memory: { thread: 'parity-id-args-thread', resource: 'parity-id-args-resource' },
+          resume: { approve: true },
+        },
+      }),
+    );
+    const turn = results.plain!.turns[0]!;
+    expect(turn.resumeDigestBinds?.[turn.chunkTypes.indexOf('tool-call-approval')]).toBe(true);
   });
 
   it('runs an approval on all three engines', async () => {

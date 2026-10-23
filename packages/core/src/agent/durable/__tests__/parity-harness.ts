@@ -153,6 +153,13 @@ export interface ParitySnapshot {
    * envelopes against it (`KnownChunkDifference.validate`).
    */
   runId?: string;
+  /**
+   * For each tool-call chunk (by index) that carries a `resumeIdentityDigest`,
+   * whether that digest binds the call it advertises, checked on the raw chunk
+   * before normalization drops volatile keys from its arguments. Never
+   * compared; declarations read it (`KnownChunkDifference.validate`).
+   */
+  resumeDigestBinds?: Record<number, boolean>;
   text: string;
   finishReason: string | undefined;
   usage: {
@@ -327,6 +334,8 @@ interface TurnChunks {
   error?: ParityRunError;
   /** See `ParitySnapshot.generate`. */
   generate?: true;
+  /** See `ParitySnapshot.resumeDigestBinds`. */
+  resumeDigestBinds: Record<number, boolean>;
 }
 
 /**
@@ -372,6 +381,18 @@ async function drainInto(acc: TurnChunks, output: MastraModelOutput<any>): Promi
       } else {
         // Failure chunk payloads carry the error itself, so their `stack` goes:
         // see `normalizePayload`.
+        const raw = chunk.payload as
+          | { toolCallId?: unknown; toolName?: unknown; args?: unknown; resumeIdentityDigest?: unknown }
+          | undefined;
+        if (chunk.type.startsWith('tool-call-') && typeof raw?.resumeIdentityDigest === 'string') {
+          acc.resumeDigestBinds[acc.chunkPayloads.length] =
+            raw.resumeIdentityDigest ===
+            createToolCallIdentityDigest({
+              toolCallId: String(raw.toolCallId),
+              toolName: String(raw.toolName),
+              args: raw.args,
+            });
+        }
         acc.chunkPayloads.push(normalizeChunkPayload(chunk.type, chunk.payload));
       }
       if (chunk.type === 'text-delta') acc.streamedText += chunk.payload?.text ?? '';
@@ -398,6 +419,7 @@ function emptyTurnChunks(output?: MastraModelOutput<any>): TurnChunks {
     chunks: [],
     chunkTypes: [],
     chunkPayloads: [],
+    resumeDigestBinds: {},
     streamedText: '',
     finishPayload: undefined,
     resumed: false,
@@ -485,7 +507,7 @@ interface TurnReads {
 }
 
 function assembleSnapshot(acc: TurnChunks, reads: TurnReads): ParitySnapshot {
-  const { chunks, chunkTypes, chunkPayloads, streamedText, finishPayload, resumed, generate } = acc;
+  const { chunks, chunkTypes, chunkPayloads, resumeDigestBinds, streamedText, finishPayload, resumed, generate } = acc;
   const { text, finishReason, usage, toolCalls, toolResults, steps, full, error } = reads;
 
   return {
@@ -516,6 +538,7 @@ function assembleSnapshot(acc: TurnChunks, reads: TurnReads): ParitySnapshot {
     chunks,
     chunkTypes,
     chunkPayloads,
+    ...(Object.keys(resumeDigestBinds).length > 0 ? { resumeDigestBinds } : {}),
     streamedText,
     finishChunk: {
       // Keys holding `undefined` are not observable over any serialized transport.
@@ -1105,7 +1128,11 @@ interface KnownChunkDifference {
    * declaration that tolerates different values must not also tolerate a side
    * dropping a field or emitting a wrong one. Returns the problems found.
    */
-  validate?: (payload: unknown, side: ParityEngine, runId: string | undefined) => readonly string[];
+  validate?: (
+    payload: unknown,
+    side: ParityEngine,
+    context: { readonly runId: string | undefined; readonly digestBinds: boolean | undefined },
+  ) => readonly string[];
   /**
    * Declared paths that may also match across engines (a run id a scenario
    * pins for every engine): still removed and validated, but not required to
@@ -1126,7 +1153,11 @@ const RESUME_STEP_IDS: Record<ParityEngine, string> = {
  * harness-generated run id carries the engine's name) and its own tool-call
  * step; only plain adds the identity digest its resume checks.
  */
-function validResumeEnvelope(payload: unknown, side: ParityEngine, runId: string | undefined): string[] {
+function validResumeEnvelope(
+  payload: unknown,
+  side: ParityEngine,
+  { runId, digestBinds }: { readonly runId: string | undefined; readonly digestBinds: boolean | undefined },
+): string[] {
   const problems: string[] = [];
   const originRunId = getAtPath(payload, 'originRunId');
   if (typeof originRunId !== 'string' || originRunId.length === 0) problems.push("emits no 'originRunId'");
@@ -1139,16 +1170,10 @@ function validResumeEnvelope(payload: unknown, side: ParityEngine, runId: string
   const digest = getAtPath(payload, 'resumeIdentityDigest');
   if (side === 'plain' && (typeof digest !== 'string' || digest.length === 0))
     problems.push("emits no 'resumeIdentityDigest'");
-  else if (side === 'plain') {
-    // The digest binds the call it advertises: recomputed from the chunk's own
-    // call id, tool name and (transformed) arguments.
-    const expected = createToolCallIdentityDigest({
-      toolCallId: String(getAtPath(payload, 'toolCallId')),
-      toolName: String(getAtPath(payload, 'toolName')),
-      args: getAtPath(payload, 'args'),
-    });
-    if (digest !== expected) problems.push(`'resumeIdentityDigest' does not bind its tool call`);
-  }
+  // The digest binds the call it advertises, as checked on the raw chunk
+  // (normalization drops volatile keys from its arguments).
+  else if (side === 'plain' && digestBinds !== true)
+    problems.push(`'resumeIdentityDigest' does not bind its tool call`);
   if (side !== 'plain' && digest !== undefined) problems.push("now emits 'resumeIdentityDigest'");
   return problems;
 }
@@ -1492,6 +1517,8 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
       turn: number;
       plainRunId: string | undefined;
       wrappedRunId: string | undefined;
+      plainDigestBinds: boolean | undefined;
+      wrappedDigestBinds: boolean | undefined;
       plainPayload: unknown;
       wrappedPayload: unknown;
       wrappedRecord?: Record<string, unknown>;
@@ -1511,6 +1538,8 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
           turn: i,
           plainRunId: turn.runId,
           wrappedRunId: wrapped.runId,
+          plainDigestBinds: turn.resumeDigestBinds?.[plainIndex],
+          wrappedDigestBinds: wrapped.resumeDigestBinds?.[wrappedIndex],
           plainPayload,
           wrappedPayload,
           wrappedRecord:
@@ -1522,11 +1551,11 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
     });
 
     for (const pair of pairs) {
-      for (const [side, payload, runId] of [
-        ['plain', pair.plainPayload, pair.plainRunId],
-        [engine as ParityEngine, pair.wrappedPayload, pair.wrappedRunId],
+      for (const [side, payload, runId, digestBinds] of [
+        ['plain', pair.plainPayload, pair.plainRunId, pair.plainDigestBinds],
+        [engine as ParityEngine, pair.wrappedPayload, pair.wrappedRunId, pair.wrappedDigestBinds],
       ] as const) {
-        for (const problem of declared.validate?.(payload, side, runId) ?? []) {
+        for (const problem of declared.validate?.(payload, side, { runId, digestBinds }) ?? []) {
           failures.push(`${side}: turns[${pair.turn}] ${declared.chunkType} payload ${problem} (${declared.ticket})`);
         }
       }
@@ -1731,8 +1760,9 @@ function compareObservations(
     const fields = new Set([...Object.keys(actual.turns[i]!), ...Object.keys(expected.turns[i]!)]);
     for (const field of [...fields].sort() as Array<keyof ParitySnapshot>) {
       if (ignore.has(field)) continue;
-      // Each engine runs as its own run: see `ParitySnapshot.runId`.
-      if (field === 'runId') continue;
+      // Each engine runs as its own run, and only plain emits the digest: see
+      // `ParitySnapshot.runId` and `ParitySnapshot.resumeDigestBinds`.
+      if (field === 'runId' || field === 'resumeDigestBinds') continue;
       check(field, `turns[${i}].${field}`, actual.turns[i]![field], expected.turns[i]![field]);
     }
   }
