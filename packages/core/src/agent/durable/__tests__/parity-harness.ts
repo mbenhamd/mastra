@@ -1119,8 +1119,7 @@ interface KnownChunkDifference {
    * The declared shape of the difference. A declaration with `matches`
    * removes its paths only from a chunk pair that `appliesTo` and `matches`
    * both hold for, so any other difference in those paths still fails the
-   * comparison. (Without it, `appliesTo` only scopes the stale check; the
-   * older COR-1390 entries rely on that, see PF-6314.)
+   * comparison. Without it, `appliesTo` alone decides which pairs are stripped.
    */
   matches?: (plainPayload: unknown, wrappedPayload: unknown) => boolean;
   /**
@@ -1313,6 +1312,18 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
   },
   {
     ticket: 'COR-1390',
+    reason:
+      "Durable and evented add an empty `warnings` list to a failed run's finish step result, where plain " +
+      'emits none (the step-finish side is `FAILED_STEP_WARNINGS_DIFFERENCE`).',
+    chunkType: 'finish',
+    paths: ['stepResult.warnings'],
+    appliesTo: plainPayload => getAtPath(plainPayload, 'stepResult.reason') === 'error',
+    matches: (plainPayload, wrappedPayload) =>
+      getAtPath(plainPayload, 'stepResult.warnings') === undefined &&
+      isDeepStrictEqual(getAtPath(wrappedPayload, 'stepResult.warnings'), []),
+  },
+  {
+    ticket: 'COR-1390',
     reason: 'Durable and evented add the workflow step id to the step-start chunk payload.',
     chunkType: 'step-start',
     paths: ['stepId'],
@@ -1432,7 +1443,8 @@ function withoutDeclaredPayloadDifferences(
   const declarations = KNOWN_CHUNK_DIFFERENCES.filter(
     d =>
       d.chunkType === chunkType &&
-      (!d.matches || ((!d.appliesTo || d.appliesTo(pair.plain)) && d.matches(pair.plain, pair.wrapped))),
+      (!d.appliesTo || d.appliesTo(pair.plain)) &&
+      (!d.matches || d.matches(pair.plain, pair.wrapped)),
   );
   if (declarations.length === 0) return payload;
   const copy = structuredClone(payload);

@@ -688,8 +688,9 @@ describe('expectEngineParity', () => {
   it('records a run that fails mid-stream and compares it', async () => {
     // The failure is compared rather than thrown out of the scenario. The
     // wrapped engines re-emit the failure's chunks from workflow state, and the
-    // only payload difference left is the `type` key plain keeps on its error
-    // chunk, which `KNOWN_CHUNK_DIFFERENCES` declares — so the payloads are not
+    // only payload differences left are the `type` key plain keeps on its error
+    // chunk and the empty `warnings` the wrapped engines add to the failed
+    // finish, which `KNOWN_CHUNK_DIFFERENCES` declares — so the payloads are not
     // ignored here, they are compared.
     const results = await expectEngineParity(failingScenario());
 
@@ -717,6 +718,36 @@ describe('expectEngineParity', () => {
       const errorPayload = (turn.chunkPayloads[turn.chunks.indexOf('AGENT:error')] as { error?: unknown }).error;
       expect(errorPayload).toStrictEqual({ name: 'Error', message: 'scripted model failure' });
     }
+  });
+
+  it("strips a failed finish's step result only where a declaration describes it (PF-6314)", async () => {
+    const results = await expectEngineParity(failingScenario());
+    const observe = (r: EngineRunResult): EngineObservation =>
+      structuredClone({ turns: r.turns, requests: r.requests });
+    const finishStepResult = (observation: EngineObservation) => {
+      const turn = observation.turns[0]!;
+      return (turn.chunkPayloads[turn.chunkTypes.indexOf('finish')] as { stepResult: Record<string, unknown> })
+        .stepResult;
+    };
+    const finishPaths = (messages: string[]) =>
+      messages.filter(message => message.includes('].stepResult.')).map(message => message.split(' at ')[1]);
+
+    expect(undeclaredDifferences('durable', observe(results.plain!), observe(results.durable!))).toEqual([]);
+
+    // The successful-finish declaration does not apply to a failed finish, so
+    // any other change in its step result is still compared.
+    const continued = observe(results.durable!);
+    finishStepResult(continued).isContinued = true;
+    expect(finishPaths(undeclaredDifferences('durable', observe(results.plain!), continued))).toEqual([
+      'turns[0].chunkPayloads[6].stepResult.isContinued',
+    ]);
+
+    // The failed-finish declaration covers an empty `warnings` list only.
+    const warned = observe(results.durable!);
+    finishStepResult(warned).warnings = ['unexpected'];
+    expect(finishPaths(undeclaredDifferences('durable', observe(results.plain!), warned))).toEqual([
+      'turns[0].chunkPayloads[6].stepResult.warnings',
+    ]);
   });
 
   it('compares the error when engines fail mid-stream with different messages', async () => {
