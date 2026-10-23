@@ -1353,6 +1353,12 @@ describe('expectEngineParity', () => {
       approval(observation).originRunId = 'pinned-run';
     }
     expect(staleKnownDifferences('durable', pinned[0], pinned[1])).toEqual([]);
+    // A digest that no longer binds the advertised call fails, though present.
+    const wrongDigest = observe(results.plain!);
+    approval(wrongDigest).resumeIdentityDigest = 'not-this-call';
+    expect(staleKnownDifferences('durable', wrongDigest, observe(results.durable!))).toContain(
+      "plain: turns[0] tool-call-approval payload 'resumeIdentityDigest' does not bind its tool call (PF-1703)",
+    );
     const noDigest = observe(results.plain!);
     delete approval(noDigest).resumeIdentityDigest;
     expect(staleKnownDifferences('durable', noDigest, observe(results.durable!))).toContain(

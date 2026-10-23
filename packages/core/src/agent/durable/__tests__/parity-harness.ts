@@ -112,6 +112,7 @@ import type { MastraModelOutput } from '../../../stream/base/output';
 import type { Agent } from '../../agent';
 import type { AgentExecutionOptions } from '../../agent.types';
 import type { MessageListInput } from '../../message-list/types';
+import { createToolCallIdentityDigest } from '../../tool-call-identity';
 import { createDurableAgent } from '../create-durable-agent';
 import { createEventedAgent } from '../create-evented-agent';
 import type { DurableAgent, DurableAgentStreamOptions } from '../durable-agent';
@@ -1138,6 +1139,16 @@ function validResumeEnvelope(payload: unknown, side: ParityEngine, runId: string
   const digest = getAtPath(payload, 'resumeIdentityDigest');
   if (side === 'plain' && (typeof digest !== 'string' || digest.length === 0))
     problems.push("emits no 'resumeIdentityDigest'");
+  else if (side === 'plain') {
+    // The digest binds the call it advertises: recomputed from the chunk's own
+    // call id, tool name and (transformed) arguments.
+    const expected = createToolCallIdentityDigest({
+      toolCallId: String(getAtPath(payload, 'toolCallId')),
+      toolName: String(getAtPath(payload, 'toolName')),
+      args: getAtPath(payload, 'args'),
+    });
+    if (digest !== expected) problems.push(`'resumeIdentityDigest' does not bind its tool call`);
+  }
   if (side !== 'plain' && digest !== undefined) problems.push("now emits 'resumeIdentityDigest'");
   return problems;
 }
