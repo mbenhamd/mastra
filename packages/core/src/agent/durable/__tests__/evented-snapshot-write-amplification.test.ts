@@ -17,9 +17,10 @@
  * `llm-execution` result loses the `messages` the plain loop's mapping step
  * reads back (the iteration-output failure pinned below), while a prune
  * against the cleared `activeStepsPath` strips the payload a restart re-runs.
- * The evented running write therefore keeps more history than the default
- * engine, but a constant amount: the bound pinned here is that it does not
- * grow with run length.
+ * The evented running write therefore keeps more copies of the iteration
+ * state than the default engine, but a constant number of them: the bound
+ * pinned here is that the copy count does not grow with run length (snapshot
+ * bytes still grow with the conversation itself).
  */
 
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
@@ -294,6 +295,9 @@ describe('evented durable snapshot retention (COR-1431)', () => {
     // comparison is vacuous.
     expect(defaultSmall.runningWrites).toBeGreaterThan(2);
     expect(eventedSmall.runningWrites).toBeGreaterThan(2);
+    // ...and the large run must really run longer, or the growth check below
+    // compares two runs of the same length.
+    expect(eventedLarge.runningWrites).toBeGreaterThan(eventedSmall.runningWrites);
 
     // Regression: evented must not accumulate per-completed-step history in the
     // running write. Upstream (COR-1431) also holds it within a small margin of
