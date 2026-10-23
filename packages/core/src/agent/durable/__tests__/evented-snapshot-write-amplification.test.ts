@@ -11,10 +11,19 @@
  * This suite runs the SAME durable loop on both engines and pins how much
  * completed-step history a single running write retains, so a regression shows
  * up as a size/duplication change rather than a production OOM.
+ *
+ * Fork divergence (PF-6306): the fork does not prune at the evented merge.
+ * Later merges reload earlier step results from storage, and a pruned
+ * `llm-execution` result loses the `messages` the plain loop's mapping step
+ * reads back (the iteration-output failure pinned below), while a prune
+ * against the cleared `activeStepsPath` strips the payload a restart re-runs.
+ * The evented running write therefore keeps more history than the default
+ * engine, but a constant amount: the bound pinned here is that it does not
+ * grow with run length.
  */
 
 import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { Mastra } from '../../../mastra';
 import { InMemoryStore } from '../../../storage';
@@ -171,9 +180,8 @@ async function measureRun(engine: 'default' | 'evented', toolIterations: number)
       // Counted here (not when aggregating below) so the quiesce wait after the
       // run can observe progress as writes land.
       stats.writes += 1;
-      // Measured across all `running` writes: with the prune removed the
-      // evented merge keeps the full completed-step history and this count
-      // rises (9 vs 4), so the check fails rather than passing vacuously.
+      // Measured across all `running` writes, so history that accumulated with
+      // each completed step would show up as a count rising with run length.
       if (status === 'running') {
         stats.maxDuplicatesPerWrite = Math.max(stats.maxDuplicatesPerWrite, serialized.split(marker).length - 1);
         maxRunningAccumulatedSteps = Math.max(
@@ -288,17 +296,37 @@ describe('evented durable snapshot retention (COR-1431)', () => {
     expect(eventedSmall.runningWrites).toBeGreaterThan(2);
 
     // Regression: evented must not accumulate per-completed-step history in the
-    // running write. Pre-fix it held one `accumulatedSteps` copy per completed
-    // step (9, and rising with the run length); post-fix it keeps only a small
-    // constant margin over the default engine regardless of run length
-    // (COR-1431).
-    expect(eventedLarge.maxRunningAccumulatedSteps).toBeLessThanOrEqual(defaultLarge.maxRunningAccumulatedSteps + 3);
-    expect(eventedLarge.maxDuplicatesPerWrite).toBeLessThanOrEqual(defaultLarge.maxDuplicatesPerWrite + 2);
-
-    // ...and that constant must not grow with the number of iterations, so the
-    // 4x jump from the small to the large run changes nothing.
+    // running write. Upstream (COR-1431) also holds it within a small margin of
+    // the default engine by pruning at the merge; the fork does not prune there
+    // (see the header, PF-6306), so the retained history is a constant, and that
+    // constant must not grow with the number of iterations: the 4x jump from the
+    // small to the large run changes nothing.
     expect(eventedLarge.maxRunningAccumulatedSteps).toBeLessThanOrEqual(eventedSmall.maxRunningAccumulatedSteps + 1);
     expect(eventedLarge.maxDuplicatesPerWrite).toBeLessThanOrEqual(eventedSmall.maxDuplicatesPerWrite + 2);
     expect(eventedLarge.maxRunningMessageListState).toBeLessThanOrEqual(eventedSmall.maxRunningMessageListState + 1);
   }, 240000);
+
+  it('keeps the iteration output a stored evented run reads back (PF-6306)', async () => {
+    vi.stubEnv('MASTRA_EVENTED_EXECUTION', 'true');
+    try {
+      const agent = new Agent({
+        id: 'evented-iteration-output-agent',
+        name: 'Evented iteration output agent',
+        instructions: 'Answer briefly.',
+        model: createLoopingModel(0, 'unused') as any,
+      });
+      new Mastra({ agents: { agent }, logger: false, storage: new InMemoryStore() });
+
+      const output = await agent.stream('Say done');
+      const errors: unknown[] = [];
+      for await (const chunk of output.fullStream as AsyncIterable<any>) {
+        if (chunk?.type === 'error') errors.push(chunk.payload?.error ?? chunk);
+      }
+
+      expect(errors).toEqual([]);
+      expect(await output.text).toBe('done');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 60000);
 });
