@@ -24,7 +24,9 @@ import {
   chunksOfType,
   expectEngineParity,
   lastUserText,
+  differsOnlyByEditedArgs,
   staleKnownDifferences,
+  undeclaredDifferences,
   textOnlyTape,
   toolCallTape,
   normalizeRequest,
@@ -65,6 +67,14 @@ const ENGINES: ParityEngine[] = ['plain', 'durable', 'evented'];
  */
 const APPROVAL_RESUME_SCHEMA =
   '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"approved":{"type":"boolean","description":"Controls if the tool call is approved or not, should be true when approved and false when declined"},"reason":{"description":"Optional explanation for the decision, surfaced to the model when the tool call is declined","type":"string"}},"required":["approved"],"additionalProperties":false}';
+
+/**
+ * Plain's tool-gate approval `resumeSchema`: the shared schema plus the optional
+ * `editedArgs` patch, which only plain accepts (PF-4112). Pinned verbatim so
+ * plain dropping it, or a durable engine starting to offer it, fails here.
+ */
+const PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA =
+  '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"approved":{"type":"boolean","description":"Controls if the tool call is approved or not, should be true when approved and false when declined"},"reason":{"description":"Optional explanation for the decision, surfaced to the model when the tool call is declined","type":"string"},"editedArgs":{"description":"Shallow JSON input patch","type":"object","propertyNames":{"type":"string"},"additionalProperties":{"$ref":"#/definitions/__schema0"}}},"required":["approved"],"additionalProperties":false,"definitions":{"__schema0":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"},{"type":"array","items":{"$ref":"#/definitions/__schema0"}},{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{"$ref":"#/definitions/__schema0"}}]}}}';
 
 /**
  * A tool that suspends until the caller resumes it, then answers with the
@@ -591,10 +601,9 @@ describe('expectEngineParity', () => {
     const approvalPayload = (r: EngineObservation) =>
       r.turns[0]!.chunkPayloads[r.turns[0]!.chunkTypes.indexOf('tool-call-approval')] as Record<string, unknown>;
 
+    expect(approvalPayload(observe(results.plain!)).resumeSchema).toBe(PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA);
     for (const engine of ['durable', 'evented'] as const) {
-      expect(approvalPayload(observe(results[engine]!)).resumeSchema).toBe(
-        approvalPayload(observe(results.plain!)).resumeSchema,
-      );
+      expect(approvalPayload(observe(results[engine]!)).resumeSchema).toBe(APPROVAL_RESUME_SCHEMA);
       expect(results[engine]!.turns[0]!.toolCalls).toEqual(results.plain!.turns[0]!.toolCalls);
       expect(results[engine]!.turns[0]!.toolCalls).toHaveLength(1);
       expect(staleKnownDifferences(engine, observe(results.plain!), observe(results[engine]!))).toEqual([]);
@@ -1291,6 +1300,204 @@ describe('expectEngineParity', () => {
     ).rejects.toThrow('add a `resume` continuation');
   });
 
+  it('holds each engine to its declared resume envelope and approval schema', async () => {
+    const results = await expectEngineParity(
+      approvalScenario({
+        model: { tapes: [toolCallTape('gate', {}), textOnlyTape('Done.')] },
+        options: {
+          maxSteps: 3,
+          requireToolApproval: true,
+          memory: { thread: 'parity-envelope-thread', resource: 'parity-envelope-resource' },
+          resume: { approve: true },
+        },
+      }),
+    );
+    const observe = (r: EngineRunResult) => structuredClone({ turns: r.turns, requests: r.requests });
+    const approval = (r: EngineObservation) =>
+      r.turns[0]!.chunkPayloads[r.turns[0]!.chunkTypes.indexOf('tool-call-approval')] as Record<string, unknown>;
+    expect(staleKnownDifferences('durable', observe(results.plain!), observe(results.durable!))).toEqual([]);
+
+    // An engine dropping a field its envelope must carry fails, though the
+    // value was allowed to differ.
+    const noOrigin = observe(results.durable!);
+    delete approval(noOrigin).originRunId;
+    expect(staleKnownDifferences('durable', observe(results.plain!), noOrigin)).toContain(
+      "durable: turns[0] tool-call-approval payload emits no 'originRunId' (PF-1703)",
+    );
+    // A wrong but present value fails too: another engine's run, another step,
+    // or a wrapped engine starting to emit plain's digest.
+    const wrongRun = observe(results.durable!);
+    approval(wrongRun).originRunId = 'parity-plain-0';
+    approval(wrongRun).stepId = 'toolCallStep';
+    approval(wrongRun).resumeIdentityDigest = 'digest';
+    expect(staleKnownDifferences('durable', observe(results.plain!), wrongRun)).toEqual(
+      expect.arrayContaining([
+        "durable: turns[0] tool-call-approval payload names run 'parity-plain-0' in 'originRunId', not its own 'parity-durable-0' (PF-1703)",
+        "durable: turns[0] tool-call-approval payload names step 'toolCallStep', not 'durable-tool-call' (PF-1703)",
+        "durable: turns[0] tool-call-approval payload now emits 'resumeIdentityDigest' (PF-1703)",
+      ]),
+    );
+    // Any other wrong run id fails too, whatever its form.
+    for (const wrongId of ['unrelated-run', 'parity-durable-99']) {
+      const wrong = observe(results.durable!);
+      approval(wrong).originRunId = wrongId;
+      expect(staleKnownDifferences('durable', observe(results.plain!), wrong)).toContain(
+        `durable: turns[0] tool-call-approval payload names run '${wrongId}' in 'originRunId', not its own 'parity-durable-0' (PF-1703)`,
+      );
+    }
+    // A run id the scenario pins for every engine is each engine's own: the
+    // same value on both sides does not read as the difference going stale.
+    const pinned = [observe(results.plain!), observe(results.durable!)] as const;
+    for (const observation of pinned) {
+      observation.turns[0]!.runId = 'pinned-run';
+      approval(observation).originRunId = 'pinned-run';
+    }
+    expect(staleKnownDifferences('durable', pinned[0], pinned[1])).toEqual([]);
+    // A digest that no longer binds the advertised call fails, though present.
+    const wrongDigest = observe(results.plain!);
+    const approvalAt = wrongDigest.turns[0]!.chunkTypes.indexOf('tool-call-approval');
+    expect(wrongDigest.turns[0]!.resumeDigestBinds?.[approvalAt]).toBe(true);
+    wrongDigest.turns[0]!.resumeDigestBinds![approvalAt] = false;
+    expect(staleKnownDifferences('durable', wrongDigest, observe(results.durable!))).toContain(
+      "plain: turns[0] tool-call-approval payload 'resumeIdentityDigest' does not bind its tool call (PF-1703)",
+    );
+    const noDigest = observe(results.plain!);
+    delete approval(noDigest).resumeIdentityDigest;
+    expect(staleKnownDifferences('durable', noDigest, observe(results.durable!))).toContain(
+      "plain: turns[0] tool-call-approval payload emits no 'resumeIdentityDigest' (PF-1703)",
+    );
+
+    // Through the comparison itself: the approval schema declaration covers
+    // exactly plain's editedArgs, so any other schema difference is compared.
+    expect(undeclaredDifferences('durable', observe(results.plain!), observe(results.durable!))).toEqual([]);
+    const loosened = observe(results.durable!);
+    approval(loosened).resumeSchema = APPROVAL_RESUME_SCHEMA.replace('"required":["approved"]', '"required":[]');
+    expect(undeclaredDifferences('durable', observe(results.plain!), loosened)).toContain(
+      'durable differs from plain at turns[0].chunkPayloads[' +
+        `${loosened.turns[0]!.chunkTypes.indexOf('tool-call-approval')}].resumeSchema`,
+    );
+    // A definition plain's other fields still reach (here through a child
+    // path) is not plain's editedArgs: dropping it on the wrapped side shows.
+    const sharedDefinition = (withDefinition: boolean) =>
+      JSON.stringify({
+        type: 'object',
+        properties: {
+          approved: { type: 'boolean' },
+          reason: { $ref: '#/definitions/__schema0/anyOf/0' },
+          ...(withDefinition ? { editedArgs: { $ref: '#/definitions/__schema0' } } : {}),
+        },
+        ...(withDefinition ? { definitions: { __schema0: { anyOf: [{ type: 'string' }] } } } : {}),
+      });
+    expect(
+      differsOnlyByEditedArgs({ resumeSchema: sharedDefinition(true) }, { resumeSchema: sharedDefinition(false) }),
+    ).toBe(false);
+    // An escaped definition name (RFC 6901 `~1`) another field reaches, and a
+    // definition editedArgs never referenced, are not plain's editedArgs either.
+    const withDefinitions = (names: string[], edited: boolean) =>
+      JSON.stringify({
+        type: 'object',
+        properties: {
+          approved: { type: 'boolean' },
+          reason: { $ref: '#/definitions/reason~1text' },
+          ...(edited ? { editedArgs: { $ref: '#/definitions/editedOnly' } } : {}),
+        },
+        definitions: Object.fromEntries(names.map(name => [name, { type: 'string' }])),
+      });
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: withDefinitions(['reason/text', 'editedOnly'], true) },
+        { resumeSchema: withDefinitions(['reason/text'], false) },
+      ),
+    ).toBe(true);
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: withDefinitions(['reason/text', 'editedOnly'], true) },
+        { resumeSchema: withDefinitions([], false) },
+      ),
+    ).toBe(false);
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: withDefinitions(['reason/text', 'editedOnly', 'unrelated'], true) },
+        { resumeSchema: withDefinitions(['reason/text'], false) },
+      ),
+    ).toBe(false);
+
+    // An application suspension's resumed chunk keeps its own schema, even
+    // with an editedArgs field: never declared, so it neither reads as the
+    // stale PF-4112 difference nor hides a real schema difference.
+    const resumedIndex = (r: EngineObservation) => r.turns[0]!.chunkTypes.indexOf('tool-call-resumed');
+    const asSuspension = (r: EngineObservation, schema: string) => {
+      const payload = r.turns[0]!.chunkPayloads[resumedIndex(r)] as Record<string, unknown>;
+      payload.kind = 'suspension';
+      payload.resumeSchema = schema;
+      return r;
+    };
+    const appSchema = (editedArgsType: string) =>
+      JSON.stringify({ type: 'object', properties: { editedArgs: { type: editedArgsType } } });
+    expect(
+      undeclaredDifferences(
+        'durable',
+        asSuspension(observe(results.plain!), appSchema('string')),
+        asSuspension(observe(results.durable!), appSchema('string')),
+      ),
+    ).toEqual([]);
+    expect(
+      undeclaredDifferences(
+        'durable',
+        asSuspension(observe(results.plain!), appSchema('string')),
+        asSuspension(observe(results.durable!), appSchema('number')),
+      ),
+    ).toContain(
+      `durable differs from plain at turns[0].chunkPayloads[${resumedIndex(observe(results.durable!))}].resumeSchema`,
+    );
+
+    // The predicate alone: the declared shape, and two that are not it.
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA },
+        { resumeSchema: APPROVAL_RESUME_SCHEMA },
+      ),
+    ).toBe(true);
+    const changed = APPROVAL_RESUME_SCHEMA.replace('"required":["approved"]', '"required":[]');
+    expect(
+      differsOnlyByEditedArgs({ resumeSchema: PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA }, { resumeSchema: changed }),
+    ).toBe(false);
+    expect(differsOnlyByEditedArgs({ resumeSchema: APPROVAL_RESUME_SCHEMA }, { resumeSchema: changed })).toBe(false);
+  });
+
+  it('accepts a digest whose call arguments hold keys normalization drops', async () => {
+    // `id` is a volatile payload key, so the recorded payload's args lose it;
+    // the digest is checked on the raw chunk, so a correct one still holds.
+    const invoice = createTool({
+      id: 'gate',
+      description: 'Run once the caller approves',
+      inputSchema: z.object({ id: z.string() }),
+      execute: async () => 'ran',
+    });
+    const results = await expectEngineParity(
+      approvalScenario({
+        model: { tapes: [toolCallTape('gate', { id: 'invoice-42' }), textOnlyTape('Done.')] },
+        buildAgent: ({ model }) =>
+          new Agent({
+            id: 'parity-approval-id-args',
+            name: 'Parity Approval',
+            instructions: 'Ask before doing anything',
+            model,
+            memory: new MockMemory(),
+            tools: { gate: invoice },
+          }),
+        options: {
+          maxSteps: 3,
+          requireToolApproval: true,
+          memory: { thread: 'parity-id-args-thread', resource: 'parity-id-args-resource' },
+          resume: { approve: true },
+        },
+      }),
+    );
+    const turn = results.plain!.turns[0]!;
+    expect(turn.resumeDigestBinds?.[turn.chunkTypes.indexOf('tool-call-approval')]).toBe(true);
+  });
+
   it('runs an approval on all three engines', async () => {
     const results = await expectEngineParity(
       approvalScenario({
@@ -1308,7 +1515,9 @@ describe('expectEngineParity', () => {
       const turn = results[engine]!.turns[0]!;
       for (const ct of ['tool-call-approval', 'tool-call-resumed']) {
         const payload = turn.chunkPayloads[turn.chunkTypes.indexOf(ct)] as { resumeSchema: string };
-        expect(payload.resumeSchema).toBe(APPROVAL_RESUME_SCHEMA);
+        expect(payload.resumeSchema).toBe(
+          engine === 'plain' ? PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA : APPROVAL_RESUME_SCHEMA,
+        );
       }
       expect(turn.chunks).toContain('AGENT:tool-call-approval:gate');
       expect(turn.chunks).toContain('AGENT:finish');

@@ -201,7 +201,10 @@ describe('rebuildRunToolsFromMastra request context', () => {
     expect(used.get('tenantId')).toBe('acme');
   });
 
-  it('prefers the step input snapshot when present', async () => {
+  // The run's live context wins over its persisted entries: a resumed segment
+  // runs with the context it was admitted with (warm and cold resume overlay
+  // the caller's values the same way); persisted entries fill what it lacks.
+  it('prefers the live run context over persisted entries', async () => {
     const agent = makeAgent();
 
     await rebuildRunToolsFromMastra({
@@ -215,7 +218,7 @@ describe('rebuildRunToolsFromMastra request context', () => {
     });
 
     const used = agent.getToolsForExecution.mock.calls[0]![0].requestContext;
-    expect(used.get('tenantId')).toBe('from-snapshot');
+    expect(used.get('tenantId')).toBe('from-run');
   });
 
   it('carries the live auth token over the snapshot, which never persists it', async () => {
@@ -236,7 +239,7 @@ describe('rebuildRunToolsFromMastra request context', () => {
     });
 
     const used = agent.getToolsForExecution.mock.calls[0]![0].requestContext;
-    expect(used.get('tenantId')).toBe('from-snapshot');
+    expect(used.get('tenantId')).toBe('from-run');
     expect(used.getRaw(MASTRA_AUTH_TOKEN_KEY)).toBe('live-bearer-token');
   });
 
@@ -255,7 +258,7 @@ describe('rebuildRunToolsFromMastra request context', () => {
     });
 
     const used = agent.getToolsForExecution.mock.calls[0]![0].requestContext;
-    expect(used.get('tenantId')).toBe('from-snapshot');
+    expect(used.get('tenantId')).toBe('from-run');
     expect(used.getRaw(MASTRA_AUTH_TOKEN_KEY)).toBeUndefined();
   });
 });

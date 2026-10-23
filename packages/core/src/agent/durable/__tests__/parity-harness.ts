@@ -112,6 +112,7 @@ import type { MastraModelOutput } from '../../../stream/base/output';
 import type { Agent } from '../../agent';
 import type { AgentExecutionOptions } from '../../agent.types';
 import type { MessageListInput } from '../../message-list/types';
+import { createToolCallIdentityDigest } from '../../tool-call-identity';
 import { createDurableAgent } from '../create-durable-agent';
 import { createEventedAgent } from '../create-evented-agent';
 import type { DurableAgent, DurableAgentStreamOptions } from '../durable-agent';
@@ -146,6 +147,19 @@ function describeRunError(thrown: unknown): ParityRunError {
 }
 
 export interface ParitySnapshot {
+  /**
+   * The run id this turn ran as (each engine has its own). Never compared:
+   * like a payload `runId` it is expected to differ; declarations validate
+   * envelopes against it (`KnownChunkDifference.validate`).
+   */
+  runId?: string;
+  /**
+   * For each tool-call chunk (by index) that carries a `resumeIdentityDigest`,
+   * whether that digest binds the call it advertises, checked on the raw chunk
+   * before normalization drops volatile keys from its arguments. Never
+   * compared; declarations read it (`KnownChunkDifference.validate`).
+   */
+  resumeDigestBinds?: Record<number, boolean>;
   text: string;
   finishReason: string | undefined;
   usage: {
@@ -320,6 +334,8 @@ interface TurnChunks {
   error?: ParityRunError;
   /** See `ParitySnapshot.generate`. */
   generate?: true;
+  /** See `ParitySnapshot.resumeDigestBinds`. */
+  resumeDigestBinds: Record<number, boolean>;
 }
 
 /**
@@ -365,6 +381,18 @@ async function drainInto(acc: TurnChunks, output: MastraModelOutput<any>): Promi
       } else {
         // Failure chunk payloads carry the error itself, so their `stack` goes:
         // see `normalizePayload`.
+        const raw = chunk.payload as
+          | { toolCallId?: unknown; toolName?: unknown; args?: unknown; resumeIdentityDigest?: unknown }
+          | undefined;
+        if (chunk.type.startsWith('tool-call-') && typeof raw?.resumeIdentityDigest === 'string') {
+          acc.resumeDigestBinds[acc.chunkPayloads.length] =
+            raw.resumeIdentityDigest ===
+            createToolCallIdentityDigest({
+              toolCallId: String(raw.toolCallId),
+              toolName: String(raw.toolName),
+              args: raw.args,
+            });
+        }
         acc.chunkPayloads.push(normalizeChunkPayload(chunk.type, chunk.payload));
       }
       if (chunk.type === 'text-delta') acc.streamedText += chunk.payload?.text ?? '';
@@ -391,6 +419,7 @@ function emptyTurnChunks(output?: MastraModelOutput<any>): TurnChunks {
     chunks: [],
     chunkTypes: [],
     chunkPayloads: [],
+    resumeDigestBinds: {},
     streamedText: '',
     finishPayload: undefined,
     resumed: false,
@@ -478,7 +507,7 @@ interface TurnReads {
 }
 
 function assembleSnapshot(acc: TurnChunks, reads: TurnReads): ParitySnapshot {
-  const { chunks, chunkTypes, chunkPayloads, streamedText, finishPayload, resumed, generate } = acc;
+  const { chunks, chunkTypes, chunkPayloads, resumeDigestBinds, streamedText, finishPayload, resumed, generate } = acc;
   const { text, finishReason, usage, toolCalls, toolResults, steps, full, error } = reads;
 
   return {
@@ -509,6 +538,7 @@ function assembleSnapshot(acc: TurnChunks, reads: TurnReads): ParitySnapshot {
     chunks,
     chunkTypes,
     chunkPayloads,
+    ...(Object.keys(resumeDigestBinds).length > 0 ? { resumeDigestBinds } : {}),
     streamedText,
     finishChunk: {
       // Keys holding `undefined` are not observable over any serialized transport.
@@ -985,7 +1015,7 @@ async function runOnEngine(engine: ParityEngine, scenario: EngineParityScenario)
       }
 
       acc.lastOutput = streamed;
-      const snapshot = await snapshotFromDrainedTurn(acc);
+      const snapshot: ParitySnapshot = { ...(await snapshotFromDrainedTurn(acc)), runId };
       turns.push(snapshot);
       return snapshot;
     },
@@ -1005,7 +1035,7 @@ async function runOnEngine(engine: ParityEngine, scenario: EngineParityScenario)
         acc.error ??= describeRunError(error);
       }
 
-      const snapshot = snapshotFromGenerateResult(acc, result);
+      const snapshot: ParitySnapshot = { ...snapshotFromGenerateResult(acc, result), runId };
       turns.push(snapshot);
       return snapshot;
     },
@@ -1085,9 +1115,183 @@ interface KnownChunkDifference {
   missingKeys?: readonly string[];
   /** Whether this declaration applies to this plain chunk occurrence. */
   appliesTo?: (plainPayload: unknown) => boolean;
+  /**
+   * The declared shape of the difference. A declaration with `matches`
+   * removes its paths only from a chunk pair that `appliesTo` and `matches`
+   * both hold for, so any other difference in those paths still fails the
+   * comparison. (Without it, `appliesTo` only scopes the stale check; the
+   * older COR-1390 entries rely on that, see PF-6314.)
+   */
+  matches?: (plainPayload: unknown, wrappedPayload: unknown) => boolean;
+  /**
+   * What each side's payload must hold for the declaration to stand: a
+   * declaration that tolerates different values must not also tolerate a side
+   * dropping a field or emitting a wrong one. Returns the problems found.
+   */
+  validate?: (
+    payload: unknown,
+    side: ParityEngine,
+    context: { readonly runId: string | undefined; readonly digestBinds: boolean | undefined },
+  ) => readonly string[];
+  /**
+   * Declared paths that may also match across engines (a run id a scenario
+   * pins for every engine): still removed and validated, but not required to
+   * differ for the declaration to stand.
+   */
+  volatilePaths?: readonly string[];
 }
 
+/** The step that resumes a suspended or approval-gated tool call on each engine. */
+const RESUME_STEP_IDS: Record<ParityEngine, string> = {
+  plain: 'toolCallStep',
+  durable: 'durable-tool-call',
+  evented: 'durable-tool-call',
+};
+
+/**
+ * PF-1703: each engine's resume envelope. It names this engine's own run (a
+ * harness-generated run id carries the engine's name) and its own tool-call
+ * step; only plain adds the identity digest its resume checks.
+ */
+function validResumeEnvelope(
+  payload: unknown,
+  side: ParityEngine,
+  { runId, digestBinds }: { readonly runId: string | undefined; readonly digestBinds: boolean | undefined },
+): string[] {
+  const problems: string[] = [];
+  const originRunId = getAtPath(payload, 'originRunId');
+  if (typeof originRunId !== 'string' || originRunId.length === 0) problems.push("emits no 'originRunId'");
+  else if (runId !== undefined ? originRunId !== runId : !originRunId.startsWith(`parity-${side}-`))
+    problems.push(
+      `names run '${originRunId}' in 'originRunId', not its own${runId === undefined ? '' : ` '${runId}'`}`,
+    );
+  const stepId = getAtPath(payload, 'stepId');
+  if (stepId !== RESUME_STEP_IDS[side]) problems.push(`names step '${String(stepId)}', not '${RESUME_STEP_IDS[side]}'`);
+  const digest = getAtPath(payload, 'resumeIdentityDigest');
+  if (side === 'plain' && (typeof digest !== 'string' || digest.length === 0))
+    problems.push("emits no 'resumeIdentityDigest'");
+  // The digest binds the call it advertises, as checked on the raw chunk
+  // (normalization drops volatile keys from its arguments).
+  else if (side === 'plain' && digestBinds !== true)
+    problems.push(`'resumeIdentityDigest' does not bind its tool call`);
+  if (side !== 'plain' && digest !== undefined) problems.push("now emits 'resumeIdentityDigest'");
+  return problems;
+}
+
+/** Whether a chunk's resume schema offers edited arguments (plain's tool-gate approval). */
+const offersEditedArgs = (payload: unknown) => {
+  const schema = getAtPath(payload, 'resumeSchema');
+  return typeof schema === 'string' && schema.includes('"editedArgs"');
+};
+
+/** Every `$ref` string anywhere inside a JSON schema node. */
+function refsIn(node: unknown, out: string[] = []): string[] {
+  if (Array.isArray(node)) for (const entry of node) refsIn(entry, out);
+  else if (node !== null && typeof node === 'object') {
+    for (const [key, value] of Object.entries(node)) {
+      if (key === '$ref' && typeof value === 'string') out.push(value);
+      else refsIn(value, out);
+    }
+  }
+  return out;
+}
+
+/**
+ * The definition a `#/definitions/<name>[/...]` reference points into: the
+ * URI fragment is decoded first, then the name's JSON Pointer `~1` and `~0`
+ * (RFC 6901 §§4, 6).
+ */
+function definitionOf(ref: string): string | undefined {
+  let pointer = ref;
+  try {
+    pointer = decodeURIComponent(ref);
+  } catch {
+    // An undecodable fragment is read as written.
+  }
+  const token = /^#\/definitions\/([^/]+)(?:\/|$)/.exec(pointer)?.[1];
+  return token?.replaceAll('~1', '/').replaceAll('~0', '~');
+}
+
+/** The definitions a schema node reaches, through other definitions too. */
+function reachedDefinitions(node: unknown, definitions: Record<string, unknown>): Set<string> {
+  const reached = new Set<string>();
+  const pending = refsIn(node).map(definitionOf);
+  while (pending.length > 0) {
+    const name = pending.pop();
+    if (name === undefined || reached.has(name) || !Object.hasOwn(definitions, name)) continue;
+    reached.add(name);
+    pending.push(...refsIn(definitions[name]).map(definitionOf));
+  }
+  return reached;
+}
+
+/**
+ * A resume schema without its `editedArgs` property and the definitions only
+ * that property reaches (never one any other field still reaches, nor one it
+ * never referenced), or `undefined` when it is not a JSON schema string.
+ */
+function withoutEditedArgsProperty(resumeSchema: unknown): string | undefined {
+  if (typeof resumeSchema !== 'string') return undefined;
+  try {
+    const schema = JSON.parse(resumeSchema) as {
+      properties?: Record<string, unknown>;
+      definitions?: Record<string, unknown>;
+    };
+    if (!schema.properties || !('editedArgs' in schema.properties)) return resumeSchema;
+    const editedArgs = schema.properties.editedArgs;
+    delete schema.properties.editedArgs;
+    const { definitions, ...rest } = schema;
+    if (definitions) {
+      const stillReached = reachedDefinitions(rest, definitions);
+      for (const name of reachedDefinitions(editedArgs, definitions)) {
+        if (!stillReached.has(name)) delete definitions[name];
+      }
+      if (Object.keys(definitions).length === 0) delete schema.definitions;
+    }
+    return JSON.stringify(schema);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Plain's approval schema differs from the wrapped one by exactly `editedArgs`. */
+export const differsOnlyByEditedArgs = (plainPayload: unknown, wrappedPayload: unknown) => {
+  const plainSchema = withoutEditedArgsProperty(getAtPath(plainPayload, 'resumeSchema'));
+  const wrappedSchema = getAtPath(wrappedPayload, 'resumeSchema');
+  if (plainSchema === undefined || typeof wrappedSchema !== 'string') return false;
+  try {
+    return isDeepStrictEqual(JSON.parse(plainSchema), JSON.parse(wrappedSchema));
+  } catch {
+    // A schema that is not JSON is not the declared difference: it is compared.
+    return false;
+  }
+};
+
 const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
+  ...(['tool-call-approval', 'tool-call-suspended'] as const).map(chunkType => ({
+    ticket: 'PF-1703',
+    reason:
+      'Each engine resumes a suspended or approval-gated call through its own envelope: the run it ' +
+      "originated in, its own step id, and plain's identity digest (which only plain's resume checks).",
+    chunkType,
+    paths: ['originRunId', 'stepId', 'resumeIdentityDigest'],
+    validate: validResumeEnvelope,
+    // Each engine names its own run, which a scenario may pin for all of them.
+    volatilePaths: ['originRunId'],
+  })),
+  ...(['tool-call-approval', 'tool-call-resumed'] as const).map(chunkType => ({
+    ticket: 'PF-4112',
+    reason:
+      "Only plain's tool-gate approval offers edited arguments (`editedArgs`); the durable engines reject " +
+      'them on resume, so their approval resume schema omits the field. Both schemas are pinned verbatim in ' +
+      'parity-harness.test.ts.',
+    chunkType,
+    paths: ['resumeSchema'],
+    // A suspension's resumed chunk carries the application's own schema.
+    appliesTo: (payload: unknown) =>
+      offersEditedArgs(payload) && (chunkType === 'tool-call-approval' || getAtPath(payload, 'kind') === 'approval'),
+    matches: differsOnlyByEditedArgs,
+  })),
   {
     ticket: 'COR-1390',
     reason:
@@ -1214,15 +1418,36 @@ function deleteAtPath(target: unknown, path: string): void {
   if (node !== null && typeof node === 'object') delete (node as Record<string, unknown>)[parts[parts.length - 1]!];
 }
 
-/** A copy of a chunk payload with the declared differences removed. */
-function withoutDeclaredPayloadDifferences(chunkType: string, payload: unknown): unknown {
-  const declarations = KNOWN_CHUNK_DIFFERENCES.filter(d => d.chunkType === chunkType);
+/**
+ * A copy of one side's chunk payload with the declared differences removed.
+ * A declaration applies to a chunk pair (plain's and the wrapped engine's
+ * same-type occurrence) only when its `appliesTo` and `matches` hold for it,
+ * so it never removes a difference it does not describe.
+ */
+function withoutDeclaredPayloadDifferences(
+  chunkType: string,
+  payload: unknown,
+  pair: { readonly plain: unknown; readonly wrapped: unknown },
+): unknown {
+  const declarations = KNOWN_CHUNK_DIFFERENCES.filter(
+    d =>
+      d.chunkType === chunkType &&
+      (!d.matches || ((!d.appliesTo || d.appliesTo(pair.plain)) && d.matches(pair.plain, pair.wrapped))),
+  );
   if (declarations.length === 0) return payload;
   const copy = structuredClone(payload);
   for (const declared of declarations) {
     for (const path of declared.paths) deleteAtPath(copy, path);
   }
   return copy;
+}
+
+/** The payload of the same-type chunk occurrence as `index` in another turn. */
+function pairedPayload(from: ParitySnapshot, index: number, other: ParitySnapshot | undefined): unknown {
+  const chunkType = from.chunkTypes[index];
+  const occurrence = from.chunkTypes.slice(0, index).filter(type => type === chunkType).length;
+  const otherIndex = other ? indexesOfType(other, chunkType ?? '')[occurrence] : undefined;
+  return otherIndex === undefined ? undefined : other!.chunkPayloads[otherIndex];
 }
 
 /**
@@ -1248,22 +1473,31 @@ function withoutKnownTurnDifferences(reference: ParitySnapshot | undefined, turn
  */
 function withoutKnownEngineDifferences(
   reference: EngineObservation,
-  observation: EngineObservation,
+  wrapped: EngineObservation,
   side: 'plain' | 'wrapped',
 ): EngineObservation {
+  const observation = side === 'plain' ? reference : wrapped;
   return {
     ...observation,
     turns: observation.turns.map((turn, index) => {
+      const plainTurn = reference.turns[index];
+      const wrappedTurn = wrapped.turns[index];
       const stripped: ParitySnapshot = {
         ...turn,
         chunkPayloads: turn.chunkPayloads.map((payload, i) =>
-          withoutDeclaredPayloadDifferences(turn.chunkTypes[i] ?? '', payload),
+          withoutDeclaredPayloadDifferences(turn.chunkTypes[i] ?? '', payload, {
+            plain: side === 'plain' ? payload : pairedPayload(turn, i, plainTurn),
+            wrapped: side === 'wrapped' ? payload : pairedPayload(turn, i, wrappedTurn),
+          }),
         ),
         // The finish chunk is compared twice: as `finishChunk` and in `chunkPayloads`.
         finishChunk: {
           ...turn.finishChunk,
           payloadKeys: turn.finishChunk.payloadKeys.filter(k => !declaredMissingKeysFor('finish').includes(k)),
-          payload: withoutDeclaredPayloadDifferences('finish', turn.finishChunk.payload),
+          payload: withoutDeclaredPayloadDifferences('finish', turn.finishChunk.payload, {
+            plain: plainTurn?.finishChunk.payload,
+            wrapped: wrappedTurn?.finishChunk.payload,
+          }),
         },
       };
       return side === 'wrapped' ? withoutKnownTurnDifferences(reference.turns[index], stripped) : stripped;
@@ -1281,6 +1515,10 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
   for (const declared of KNOWN_CHUNK_DIFFERENCES) {
     const pairs: Array<{
       turn: number;
+      plainRunId: string | undefined;
+      wrappedRunId: string | undefined;
+      plainDigestBinds: boolean | undefined;
+      wrappedDigestBinds: boolean | undefined;
       plainPayload: unknown;
       wrappedPayload: unknown;
       wrappedRecord?: Record<string, unknown>;
@@ -1298,6 +1536,10 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
         if (declared.appliesTo && !declared.appliesTo(plainPayload)) return;
         pairs.push({
           turn: i,
+          plainRunId: turn.runId,
+          wrappedRunId: wrapped.runId,
+          plainDigestBinds: turn.resumeDigestBinds?.[plainIndex],
+          wrappedDigestBinds: wrapped.resumeDigestBinds?.[wrappedIndex],
           plainPayload,
           wrappedPayload,
           wrappedRecord:
@@ -1309,11 +1551,21 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
     });
 
     for (const pair of pairs) {
-      const pathValues = declared.paths.map(path => ({
-        path,
-        plain: getAtPath(pair.plainPayload, path),
-        wrapped: getAtPath(pair.wrappedPayload, path),
-      }));
+      for (const [side, payload, runId, digestBinds] of [
+        ['plain', pair.plainPayload, pair.plainRunId, pair.plainDigestBinds],
+        [engine as ParityEngine, pair.wrappedPayload, pair.wrappedRunId, pair.wrappedDigestBinds],
+      ] as const) {
+        for (const problem of declared.validate?.(payload, side, { runId, digestBinds }) ?? []) {
+          failures.push(`${side}: turns[${pair.turn}] ${declared.chunkType} payload ${problem} (${declared.ticket})`);
+        }
+      }
+      const pathValues = declared.paths
+        .filter(path => !declared.volatilePaths?.includes(path))
+        .map(path => ({
+          path,
+          plain: getAtPath(pair.plainPayload, path),
+          wrapped: getAtPath(pair.wrappedPayload, path),
+        }));
       const missingKeys = (declared.missingKeys ?? []).map(key => {
         const plainRecord =
           pair.plainPayload !== null && typeof pair.plainPayload === 'object'
@@ -1382,6 +1634,23 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
   return failures;
 }
 
+/**
+ * What the comparison reports for one wrapped engine with only the declared
+ * engine differences applied (no per-scenario `differences`): the harness's
+ * own tests use it to prove a declaration hides nothing it does not describe.
+ */
+export function undeclaredDifferences(
+  engine: Exclude<ParityEngine, 'plain'>,
+  reference: EngineObservation,
+  actual: EngineObservation,
+): string[] {
+  const stale = staleKnownDifferences(engine, reference, actual);
+  if (stale.length > 0) return stale;
+  const plain = withoutKnownEngineDifferences(reference, actual, 'plain');
+  const observed = withoutKnownEngineDifferences(reference, actual, 'wrapped');
+  return compareObservations(plain, observed, new Set()).map(m => `${engine} differs from plain at ${m.path}`);
+}
+
 function checkEngine(
   engine: Exclude<ParityEngine, 'plain'>,
   reference: EngineObservation,
@@ -1391,7 +1660,7 @@ function checkEngine(
   const stale = staleKnownDifferences(engine, reference, actual);
   if (stale.length > 0) return stale;
 
-  const plain = withoutKnownEngineDifferences(reference, reference, 'plain');
+  const plain = withoutKnownEngineDifferences(reference, actual, 'plain');
   const observed = withoutKnownEngineDifferences(reference, actual, 'wrapped');
   const difference = scenario.differences?.[engine];
   const raw = compareObservations(plain, observed, new Set());
@@ -1491,6 +1760,9 @@ function compareObservations(
     const fields = new Set([...Object.keys(actual.turns[i]!), ...Object.keys(expected.turns[i]!)]);
     for (const field of [...fields].sort() as Array<keyof ParitySnapshot>) {
       if (ignore.has(field)) continue;
+      // Each engine runs as its own run, and only plain emits the digest: see
+      // `ParitySnapshot.runId` and `ParitySnapshot.resumeDigestBinds`.
+      if (field === 'runId' || field === 'resumeDigestBinds') continue;
       check(field, `turns[${i}].${field}`, actual.turns[i]![field], expected.turns[i]![field]);
     }
   }

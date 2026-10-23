@@ -17,6 +17,7 @@ import { MockStore } from '../../../storage/mock';
 import { createTool } from '../../../tools';
 import { delay } from '../../../utils';
 import { Agent } from '../../agent';
+import { ON_BEFORE_TOOL_EXECUTION_KEY } from '../../tool-permission-prefilter';
 import { AGENT_STREAM_TOPIC, AgentStreamEventTypes } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import { globalRunRegistry } from '../run-registry';
@@ -210,9 +211,16 @@ describe('DurableAgent function-form requireToolApproval', () => {
     cleanup();
   });
 
-  it('evaluates a warm-resumed policy with the resumed caller context', async () => {
+  // An authenticated resume honours the approval it carries: the policy is not
+  // asked again (live permission checks still run), and the approved tool runs
+  // once with the resumed caller's context.
+  it("honours a warm resume's approval and runs the tool with the resumed caller context", async () => {
     const mockModel = createToolCallThenTextModel({ name: 'tenantTool', args: { value: 'test' } });
-    const execute = vi.fn(async () => 'ok');
+    const seen: unknown[] = [];
+    const execute = vi.fn(async (_input: unknown, context: any) => {
+      seen.push(context?.requestContext?.get('tenantId'));
+      return 'ok';
+    });
     const tenantTool = createTool({
       id: 'tenantTool',
       description: 'tenant-aware tool',
@@ -234,6 +242,8 @@ describe('DurableAgent function-form requireToolApproval', () => {
     });
 
     const policy = vi.fn(() => true);
+    // The resume's live, action-time permission check: it still runs.
+    const livePermissionCheck = vi.fn().mockResolvedValue('allow');
     let suspendedData: unknown;
     const initial = await durableAgent.stream('Run the tenant tool', {
       requireToolApproval: policy,
@@ -256,6 +266,7 @@ describe('DurableAgent function-form requireToolApproval', () => {
         requestContext: new RequestContext([
           ['tenantId', 'resume-tenant'],
           ['authToken', 'resume-auth'],
+          [ON_BEFORE_TOOL_EXECUTION_KEY, livePermissionCheck],
         ]),
         onFinish: data => {
           finishData = data;
@@ -264,16 +275,12 @@ describe('DurableAgent function-form requireToolApproval', () => {
     );
     await vi.waitFor(() => expect(finishData).toBeDefined());
 
-    expect(policy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        requestContext: expect.objectContaining({
-          tenantId: 'resume-tenant',
-          authToken: 'resume-auth',
-        }),
-      }),
+    expect(policy).not.toHaveBeenCalled();
+    expect(livePermissionCheck).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: 'tenantTool', isResume: true }),
     );
-    expect(policy).toHaveBeenCalledTimes(1);
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(seen).toEqual(['resume-tenant']);
 
     resumed.cleanup();
     initial.cleanup();
