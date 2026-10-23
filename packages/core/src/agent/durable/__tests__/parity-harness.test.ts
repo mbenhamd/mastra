@@ -26,6 +26,7 @@ import {
   lastUserText,
   differsOnlyByEditedArgs,
   staleKnownDifferences,
+  undeclaredDifferences,
   textOnlyTape,
   toolCallTape,
   normalizeRequest,
@@ -1329,8 +1330,32 @@ describe('expectEngineParity', () => {
       "plain: turns[0] tool-call-approval payload no longer emits 'resumeIdentityDigest', which PF-1703 requires of it",
     );
 
-    // The approval schema declaration covers exactly plain's editedArgs: any
-    // other schema difference is not the declared one, so it is compared.
+    // Through the comparison itself: the approval schema declaration covers
+    // exactly plain's editedArgs, so any other schema difference is compared.
+    expect(undeclaredDifferences('durable', observe(results.plain!), observe(results.durable!))).toEqual([]);
+    const loosened = observe(results.durable!);
+    approval(loosened).resumeSchema = APPROVAL_RESUME_SCHEMA.replace('"required":["approved"]', '"required":[]');
+    expect(undeclaredDifferences('durable', observe(results.plain!), loosened)).toContain(
+      'durable differs from plain at turns[0].chunkPayloads[' +
+        `${loosened.turns[0]!.chunkTypes.indexOf('tool-call-approval')}].resumeSchema`,
+    );
+    // A definition plain's other fields still reach (here through a child
+    // path) is not plain's editedArgs: dropping it on the wrapped side shows.
+    const sharedDefinition = (withDefinition: boolean) =>
+      JSON.stringify({
+        type: 'object',
+        properties: {
+          approved: { type: 'boolean' },
+          reason: { $ref: '#/definitions/__schema0/anyOf/0' },
+          ...(withDefinition ? { editedArgs: { $ref: '#/definitions/__schema0' } } : {}),
+        },
+        ...(withDefinition ? { definitions: { __schema0: { anyOf: [{ type: 'string' }] } } } : {}),
+      });
+    expect(
+      differsOnlyByEditedArgs({ resumeSchema: sharedDefinition(true) }, { resumeSchema: sharedDefinition(false) }),
+    ).toBe(false);
+
+    // The predicate alone: the declared shape, and two that are not it.
     expect(
       differsOnlyByEditedArgs(
         { resumeSchema: PLAIN_EDITABLE_APPROVAL_RESUME_SCHEMA },

@@ -1106,9 +1106,25 @@ const offersEditedArgs = (payload: unknown) => {
   return typeof schema === 'string' && schema.includes('"editedArgs"');
 };
 
+/** Every `$ref` string anywhere inside a JSON schema node. */
+function refsIn(node: unknown, out: string[] = []): string[] {
+  if (Array.isArray(node)) for (const entry of node) refsIn(entry, out);
+  else if (node !== null && typeof node === 'object') {
+    for (const [key, value] of Object.entries(node)) {
+      if (key === '$ref' && typeof value === 'string') out.push(value);
+      else refsIn(value, out);
+    }
+  }
+  return out;
+}
+
+/** The definition a `#/definitions/<name>[/...]` reference points into. */
+const definitionOf = (ref: string) => /^#\/definitions\/([^/]+)(?:\/|$)/.exec(ref)?.[1];
+
 /**
- * A resume schema without its `editedArgs` property and the definitions only
- * that property referenced, or `undefined` when it is not a JSON schema string.
+ * A resume schema without its `editedArgs` property and every definition
+ * nothing else still reaches (references into a definition's children count,
+ * transitively), or `undefined` when it is not a JSON schema string.
  */
 function withoutEditedArgsProperty(resumeSchema: unknown): string | undefined {
   if (typeof resumeSchema !== 'string') return undefined;
@@ -1118,19 +1134,20 @@ function withoutEditedArgsProperty(resumeSchema: unknown): string | undefined {
       definitions?: Record<string, unknown>;
     };
     if (!schema.properties || !('editedArgs' in schema.properties)) return resumeSchema;
-    const referenced = JSON.stringify(schema.properties.editedArgs);
     delete schema.properties.editedArgs;
-    for (const name of Object.keys(schema.definitions ?? {})) {
-      const ref = `#/definitions/${name}`;
-      const { definitions, ...rest } = schema;
-      if (
-        referenced.includes(ref) &&
-        !JSON.stringify({ ...rest, definitions: { ...definitions, [name]: null } }).includes(`"${ref}"`)
-      ) {
-        delete schema.definitions![name];
+    const { definitions, ...rest } = schema;
+    if (definitions) {
+      const reached = new Set<string>();
+      const pending = refsIn(rest).map(definitionOf);
+      while (pending.length > 0) {
+        const name = pending.pop();
+        if (name === undefined || reached.has(name) || !(name in definitions)) continue;
+        reached.add(name);
+        pending.push(...refsIn(definitions[name]).map(definitionOf));
       }
+      for (const name of Object.keys(definitions)) if (!reached.has(name)) delete definitions[name];
+      if (Object.keys(definitions).length === 0) delete schema.definitions;
     }
-    if (schema.definitions && Object.keys(schema.definitions).length === 0) delete schema.definitions;
     return JSON.stringify(schema);
   } catch {
     return undefined;
@@ -1503,6 +1520,23 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
     }
   }
   return failures;
+}
+
+/**
+ * What the comparison reports for one wrapped engine with only the declared
+ * engine differences applied (no per-scenario `differences`): the harness's
+ * own tests use it to prove a declaration hides nothing it does not describe.
+ */
+export function undeclaredDifferences(
+  engine: Exclude<ParityEngine, 'plain'>,
+  reference: EngineObservation,
+  actual: EngineObservation,
+): string[] {
+  const stale = staleKnownDifferences(engine, reference, actual);
+  if (stale.length > 0) return stale;
+  const plain = withoutKnownEngineDifferences(reference, actual, 'plain');
+  const observed = withoutKnownEngineDifferences(reference, actual, 'wrapped');
+  return compareObservations(plain, observed, new Set()).map(m => `${engine} differs from plain at ${m.path}`);
 }
 
 function checkEngine(
