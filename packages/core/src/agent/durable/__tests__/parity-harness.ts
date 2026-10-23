@@ -1119,8 +1119,7 @@ interface KnownChunkDifference {
    * The declared shape of the difference. A declaration with `matches`
    * removes its paths only from a chunk pair that `appliesTo` and `matches`
    * both hold for, so any other difference in those paths still fails the
-   * comparison. (Without it, `appliesTo` only scopes the stale check; the
-   * older COR-1390 entries rely on that, see PF-6314.)
+   * comparison. Without it, `appliesTo` alone decides which pairs are stripped.
    */
   matches?: (plainPayload: unknown, wrappedPayload: unknown) => boolean;
   /**
@@ -1313,6 +1312,19 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
   },
   {
     ticket: 'COR-1390',
+    reason:
+      "Durable and evented add an empty `warnings` list to a failed run's finish step result, where plain " +
+      'emits none (the step-finish side is `FAILED_STEP_WARNINGS_DIFFERENCE`).',
+    chunkType: 'finish',
+    paths: ['stepResult.warnings'],
+    // Call-level failures emit `warnings: []` on every engine, plain included.
+    appliesTo: plainPayload =>
+      getAtPath(plainPayload, 'stepResult.reason') === 'error' &&
+      getAtPath(plainPayload, 'stepResult.warnings') === undefined,
+    matches: (_plainPayload, wrappedPayload) => isDeepStrictEqual(getAtPath(wrappedPayload, 'stepResult.warnings'), []),
+  },
+  {
+    ticket: 'COR-1390',
     reason: 'Durable and evented add the workflow step id to the step-start chunk payload.',
     chunkType: 'step-start',
     paths: ['stepId'],
@@ -1432,7 +1444,8 @@ function withoutDeclaredPayloadDifferences(
   const declarations = KNOWN_CHUNK_DIFFERENCES.filter(
     d =>
       d.chunkType === chunkType &&
-      (!d.matches || ((!d.appliesTo || d.appliesTo(pair.plain)) && d.matches(pair.plain, pair.wrapped))),
+      (!d.appliesTo || d.appliesTo(pair.plain)) &&
+      (!d.matches || d.matches(pair.plain, pair.wrapped)),
   );
   if (declarations.length === 0) return payload;
   const copy = structuredClone(payload);
@@ -1578,17 +1591,23 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
           wrappedHas: pair.wrappedRecord ? key in pair.wrappedRecord : false,
         };
       });
+      // A declaration with `matches` names its exact shape, which may be an
+      // empty value against an absent one, so only equality ends it.
       const hasObservedDifference =
         pathValues.some(
           values =>
             !isDeepStrictEqual(values.plain, values.wrapped) &&
-            (!isEmptyValue(values.plain) || !isEmptyValue(values.wrapped)),
+            (declared.matches !== undefined || !isEmptyValue(values.plain) || !isEmptyValue(values.wrapped)),
         ) ||
         missingKeys.some(
           values => values.wrappedHas || (values.plainHas && !isEmptyValue(values.plainValue) && !values.wrappedHas),
         );
       const hasPopulatedField = pathValues.some(values => !isEmptyValue(values.plain) || !isEmptyValue(values.wrapped));
-      const applicable = hasObservedDifference || hasPopulatedField || missingKeys.some(values => values.wrappedHas);
+      const applicable =
+        declared.matches !== undefined ||
+        hasObservedDifference ||
+        hasPopulatedField ||
+        missingKeys.some(values => values.wrappedHas);
       if (!applicable) continue;
 
       for (const { path, plain: plainValue, wrapped: wrappedValue } of pathValues) {

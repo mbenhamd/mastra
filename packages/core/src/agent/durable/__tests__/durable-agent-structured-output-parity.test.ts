@@ -256,18 +256,28 @@ function moveErrorLast(turn: ParitySnapshot): ParitySnapshot {
   const stepFinishIndex = chunkTypes.indexOf('step-finish');
   const stepFinishPayload = chunkPayloads[stepFinishIndex] as { stepResult?: { reason?: string } } | undefined;
   if (stepFinishPayload?.stepResult) stepFinishPayload.stepResult.reason = 'stop';
+  // The finish step result also reports `stop`, with the run's usage.
+  const stoppedFinish = (payload: unknown) => {
+    const copy = structuredClone(payload) as { stepResult?: Record<string, unknown> } | undefined;
+    if (copy?.stepResult) Object.assign(copy.stepResult, { reason: 'stop', totalUsage: turn.finishChunk.usage });
+    return copy;
+  };
+  const finishIndex = chunkTypes.indexOf('finish');
+  if (finishIndex >= 0) chunkPayloads[finishIndex] = stoppedFinish(chunkPayloads[finishIndex]);
   return {
     ...turn,
     chunks: move(turn.chunks),
     chunkTypes,
     chunkPayloads,
     finishReason: 'stop',
-    finishChunk: { ...turn.finishChunk, reason: 'stop' },
+    finishChunk: { ...turn.finishChunk, reason: 'stop', payload: stoppedFinish(turn.finishChunk.payload) },
   };
 }
 
 const STRICT_ORDER: EngineDifference = {
-  reason: 'COR-1390: wrapped engines emit the structured-output error chunk after step-finish and finish.',
+  reason:
+    'COR-1390: wrapped engines emit the structured-output error chunk after step-finish and finish, and ' +
+    'finish the step as `stop` (with its usage) where plain finishes it as `error` (PF-6339).',
   expect: plain => ({ ...plain, turns: plain.turns.map(moveErrorLast) }),
 };
 
