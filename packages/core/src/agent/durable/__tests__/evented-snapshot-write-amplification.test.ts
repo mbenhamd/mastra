@@ -303,8 +303,10 @@ describe('evented durable snapshot retention (COR-1431)', () => {
     // running write. Upstream (COR-1431) also holds it within a small margin of
     // the default engine by pruning at the merge; the fork does not prune there
     // (see the header, PF-6306), so the retained history is a constant, and that
-    // constant must not grow with the number of iterations: the 4x jump from the
-    // small to the large run changes nothing.
+    // constant must not grow with the number of iterations. The 4x jump from the
+    // small to the large run adds twelve iterations; the slack below (one or two
+    // copies, kept from upstream against timing noise) is far less than one copy
+    // per added iteration. Observed counts are identical at both lengths.
     expect(eventedLarge.maxRunningAccumulatedSteps).toBeLessThanOrEqual(eventedSmall.maxRunningAccumulatedSteps + 1);
     expect(eventedLarge.maxDuplicatesPerWrite).toBeLessThanOrEqual(eventedSmall.maxDuplicatesPerWrite + 2);
     expect(eventedLarge.maxRunningMessageListState).toBeLessThanOrEqual(eventedSmall.maxRunningMessageListState + 1);
