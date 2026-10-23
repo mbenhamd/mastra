@@ -1322,12 +1322,25 @@ describe('expectEngineParity', () => {
     const noOrigin = observe(results.durable!);
     delete approval(noOrigin).originRunId;
     expect(staleKnownDifferences('durable', observe(results.plain!), noOrigin)).toContain(
-      "durable: turns[0] tool-call-approval payload no longer emits 'originRunId', which PF-1703 requires of it",
+      "durable: turns[0] tool-call-approval payload emits no 'originRunId' (PF-1703)",
+    );
+    // A wrong but present value fails too: another engine's run, another step,
+    // or a wrapped engine starting to emit plain's digest.
+    const wrongRun = observe(results.durable!);
+    approval(wrongRun).originRunId = 'parity-plain-0';
+    approval(wrongRun).stepId = 'toolCallStep';
+    approval(wrongRun).resumeIdentityDigest = 'digest';
+    expect(staleKnownDifferences('durable', observe(results.plain!), wrongRun)).toEqual(
+      expect.arrayContaining([
+        "durable: turns[0] tool-call-approval payload names another engine's run in 'originRunId' (parity-plain-0) (PF-1703)",
+        "durable: turns[0] tool-call-approval payload names step 'toolCallStep', not 'durable-tool-call' (PF-1703)",
+        "durable: turns[0] tool-call-approval payload now emits 'resumeIdentityDigest' (PF-1703)",
+      ]),
     );
     const noDigest = observe(results.plain!);
     delete approval(noDigest).resumeIdentityDigest;
     expect(staleKnownDifferences('durable', noDigest, observe(results.durable!))).toContain(
-      "plain: turns[0] tool-call-approval payload no longer emits 'resumeIdentityDigest', which PF-1703 requires of it",
+      "plain: turns[0] tool-call-approval payload emits no 'resumeIdentityDigest' (PF-1703)",
     );
 
     // Through the comparison itself: the approval schema declaration covers
@@ -1384,6 +1397,35 @@ describe('expectEngineParity', () => {
         { resumeSchema: withDefinitions(['reason/text'], false) },
       ),
     ).toBe(false);
+
+    // An application suspension's resumed chunk keeps its own schema, even
+    // with an editedArgs field: never declared, so it neither reads as the
+    // stale PF-4112 difference nor hides a real schema difference.
+    const resumedIndex = (r: EngineObservation) => r.turns[0]!.chunkTypes.indexOf('tool-call-resumed');
+    const asSuspension = (r: EngineObservation, schema: string) => {
+      const payload = r.turns[0]!.chunkPayloads[resumedIndex(r)] as Record<string, unknown>;
+      payload.kind = 'suspension';
+      payload.resumeSchema = schema;
+      return r;
+    };
+    const appSchema = (editedArgsType: string) =>
+      JSON.stringify({ type: 'object', properties: { editedArgs: { type: editedArgsType } } });
+    expect(
+      undeclaredDifferences(
+        'durable',
+        asSuspension(observe(results.plain!), appSchema('string')),
+        asSuspension(observe(results.durable!), appSchema('string')),
+      ),
+    ).toEqual([]);
+    expect(
+      undeclaredDifferences(
+        'durable',
+        asSuspension(observe(results.plain!), appSchema('string')),
+        asSuspension(observe(results.durable!), appSchema('number')),
+      ),
+    ).toContain(
+      `durable differs from plain at turns[0].chunkPayloads[${resumedIndex(observe(results.durable!))}].resumeSchema`,
+    );
 
     // The predicate alone: the declared shape, and two that are not it.
     expect(

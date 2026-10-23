@@ -1094,10 +1094,38 @@ interface KnownChunkDifference {
    */
   matches?: (plainPayload: unknown, wrappedPayload: unknown) => boolean;
   /**
-   * Paths each side must still emit (non-empty): a declaration that tolerates
-   * different values must not also tolerate a side dropping the field.
+   * What each side's payload must hold for the declaration to stand: a
+   * declaration that tolerates different values must not also tolerate a side
+   * dropping a field or emitting a wrong one. Returns the problems found.
    */
-  required?: { readonly plain?: readonly string[]; readonly wrapped?: readonly string[] };
+  validate?: (payload: unknown, side: ParityEngine) => readonly string[];
+}
+
+/** The step that resumes a suspended or approval-gated tool call on each engine. */
+const RESUME_STEP_IDS: Record<ParityEngine, string> = {
+  plain: 'toolCallStep',
+  durable: 'durable-tool-call',
+  evented: 'durable-tool-call',
+};
+
+/**
+ * PF-1703: each engine's resume envelope. It names this engine's own run (a
+ * harness-generated run id carries the engine's name) and its own tool-call
+ * step; only plain adds the identity digest its resume checks.
+ */
+function validResumeEnvelope(payload: unknown, side: ParityEngine): string[] {
+  const problems: string[] = [];
+  const originRunId = getAtPath(payload, 'originRunId');
+  if (typeof originRunId !== 'string' || originRunId.length === 0) problems.push("emits no 'originRunId'");
+  else if (/^parity-(?:plain|durable|evented)-\d+$/.test(originRunId) && !originRunId.startsWith(`parity-${side}-`))
+    problems.push(`names another engine's run in 'originRunId' (${originRunId})`);
+  const stepId = getAtPath(payload, 'stepId');
+  if (stepId !== RESUME_STEP_IDS[side]) problems.push(`names step '${String(stepId)}', not '${RESUME_STEP_IDS[side]}'`);
+  const digest = getAtPath(payload, 'resumeIdentityDigest');
+  if (side === 'plain' && (typeof digest !== 'string' || digest.length === 0))
+    problems.push("emits no 'resumeIdentityDigest'");
+  if (side !== 'plain' && digest !== undefined) problems.push("now emits 'resumeIdentityDigest'");
+  return problems;
 }
 
 /** Whether a chunk's resume schema offers edited arguments (plain's tool-gate approval). */
@@ -1180,11 +1208,13 @@ function withoutEditedArgsProperty(resumeSchema: unknown): string | undefined {
 export const differsOnlyByEditedArgs = (plainPayload: unknown, wrappedPayload: unknown) => {
   const plainSchema = withoutEditedArgsProperty(getAtPath(plainPayload, 'resumeSchema'));
   const wrappedSchema = getAtPath(wrappedPayload, 'resumeSchema');
-  return (
-    plainSchema !== undefined &&
-    typeof wrappedSchema === 'string' &&
-    isDeepStrictEqual(JSON.parse(plainSchema), JSON.parse(wrappedSchema))
-  );
+  if (plainSchema === undefined || typeof wrappedSchema !== 'string') return false;
+  try {
+    return isDeepStrictEqual(JSON.parse(plainSchema), JSON.parse(wrappedSchema));
+  } catch {
+    // A schema that is not JSON is not the declared difference: it is compared.
+    return false;
+  }
 };
 
 const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
@@ -1195,7 +1225,7 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
       "originated in, its own step id, and plain's identity digest (which only plain's resume checks).",
     chunkType,
     paths: ['originRunId', 'stepId', 'resumeIdentityDigest'],
-    required: { plain: ['originRunId', 'stepId', 'resumeIdentityDigest'], wrapped: ['originRunId', 'stepId'] },
+    validate: validResumeEnvelope,
   })),
   ...(['tool-call-approval', 'tool-call-resumed'] as const).map(chunkType => ({
     ticket: 'PF-4112',
@@ -1205,7 +1235,9 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
       'parity-harness.test.ts.',
     chunkType,
     paths: ['resumeSchema'],
-    appliesTo: offersEditedArgs,
+    // A suspension's resumed chunk carries the application's own schema.
+    appliesTo: (payload: unknown) =>
+      offersEditedArgs(payload) && (chunkType === 'tool-call-approval' || getAtPath(payload, 'kind') === 'approval'),
     matches: differsOnlyByEditedArgs,
   })),
   {
@@ -1459,16 +1491,12 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
     });
 
     for (const pair of pairs) {
-      for (const [side, paths, payload] of [
-        ['plain', declared.required?.plain ?? [], pair.plainPayload],
-        [engine, declared.required?.wrapped ?? [], pair.wrappedPayload],
+      for (const [side, payload] of [
+        ['plain', pair.plainPayload],
+        [engine as ParityEngine, pair.wrappedPayload],
       ] as const) {
-        for (const path of paths) {
-          if (!isEmptyValue(getAtPath(payload, path))) continue;
-          failures.push(
-            `${side}: turns[${pair.turn}] ${declared.chunkType} payload no longer emits '${path}', ` +
-              `which ${declared.ticket} requires of it`,
-          );
+        for (const problem of declared.validate?.(payload, side) ?? []) {
+          failures.push(`${side}: turns[${pair.turn}] ${declared.chunkType} payload ${problem} (${declared.ticket})`);
         }
       }
       const pathValues = declared.paths.map(path => ({
