@@ -146,6 +146,12 @@ function describeRunError(thrown: unknown): ParityRunError {
 }
 
 export interface ParitySnapshot {
+  /**
+   * The run id this turn ran as (each engine has its own). Never compared:
+   * like a payload `runId` it is expected to differ; declarations validate
+   * envelopes against it (`KnownChunkDifference.validate`).
+   */
+  runId?: string;
   text: string;
   finishReason: string | undefined;
   usage: {
@@ -985,7 +991,7 @@ async function runOnEngine(engine: ParityEngine, scenario: EngineParityScenario)
       }
 
       acc.lastOutput = streamed;
-      const snapshot = await snapshotFromDrainedTurn(acc);
+      const snapshot: ParitySnapshot = { ...(await snapshotFromDrainedTurn(acc)), runId };
       turns.push(snapshot);
       return snapshot;
     },
@@ -1005,7 +1011,7 @@ async function runOnEngine(engine: ParityEngine, scenario: EngineParityScenario)
         acc.error ??= describeRunError(error);
       }
 
-      const snapshot = snapshotFromGenerateResult(acc, result);
+      const snapshot: ParitySnapshot = { ...snapshotFromGenerateResult(acc, result), runId };
       turns.push(snapshot);
       return snapshot;
     },
@@ -1098,7 +1104,13 @@ interface KnownChunkDifference {
    * declaration that tolerates different values must not also tolerate a side
    * dropping a field or emitting a wrong one. Returns the problems found.
    */
-  validate?: (payload: unknown, side: ParityEngine) => readonly string[];
+  validate?: (payload: unknown, side: ParityEngine, runId: string | undefined) => readonly string[];
+  /**
+   * Declared paths that may also match across engines (a run id a scenario
+   * pins for every engine): still removed and validated, but not required to
+   * differ for the declaration to stand.
+   */
+  volatilePaths?: readonly string[];
 }
 
 /** The step that resumes a suspended or approval-gated tool call on each engine. */
@@ -1113,12 +1125,14 @@ const RESUME_STEP_IDS: Record<ParityEngine, string> = {
  * harness-generated run id carries the engine's name) and its own tool-call
  * step; only plain adds the identity digest its resume checks.
  */
-function validResumeEnvelope(payload: unknown, side: ParityEngine): string[] {
+function validResumeEnvelope(payload: unknown, side: ParityEngine, runId: string | undefined): string[] {
   const problems: string[] = [];
   const originRunId = getAtPath(payload, 'originRunId');
   if (typeof originRunId !== 'string' || originRunId.length === 0) problems.push("emits no 'originRunId'");
-  else if (/^parity-(?:plain|durable|evented)-\d+$/.test(originRunId) && !originRunId.startsWith(`parity-${side}-`))
-    problems.push(`names another engine's run in 'originRunId' (${originRunId})`);
+  else if (runId !== undefined ? originRunId !== runId : !originRunId.startsWith(`parity-${side}-`))
+    problems.push(
+      `names run '${originRunId}' in 'originRunId', not its own${runId === undefined ? '' : ` '${runId}'`}`,
+    );
   const stepId = getAtPath(payload, 'stepId');
   if (stepId !== RESUME_STEP_IDS[side]) problems.push(`names step '${String(stepId)}', not '${RESUME_STEP_IDS[side]}'`);
   const digest = getAtPath(payload, 'resumeIdentityDigest');
@@ -1226,6 +1240,8 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
     chunkType,
     paths: ['originRunId', 'stepId', 'resumeIdentityDigest'],
     validate: validResumeEnvelope,
+    // Each engine names its own run, which a scenario may pin for all of them.
+    volatilePaths: ['originRunId'],
   })),
   ...(['tool-call-approval', 'tool-call-resumed'] as const).map(chunkType => ({
     ticket: 'PF-4112',
@@ -1463,6 +1479,8 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
   for (const declared of KNOWN_CHUNK_DIFFERENCES) {
     const pairs: Array<{
       turn: number;
+      plainRunId: string | undefined;
+      wrappedRunId: string | undefined;
       plainPayload: unknown;
       wrappedPayload: unknown;
       wrappedRecord?: Record<string, unknown>;
@@ -1480,6 +1498,8 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
         if (declared.appliesTo && !declared.appliesTo(plainPayload)) return;
         pairs.push({
           turn: i,
+          plainRunId: turn.runId,
+          wrappedRunId: wrapped.runId,
           plainPayload,
           wrappedPayload,
           wrappedRecord:
@@ -1491,19 +1511,21 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
     });
 
     for (const pair of pairs) {
-      for (const [side, payload] of [
-        ['plain', pair.plainPayload],
-        [engine as ParityEngine, pair.wrappedPayload],
+      for (const [side, payload, runId] of [
+        ['plain', pair.plainPayload, pair.plainRunId],
+        [engine as ParityEngine, pair.wrappedPayload, pair.wrappedRunId],
       ] as const) {
-        for (const problem of declared.validate?.(payload, side) ?? []) {
+        for (const problem of declared.validate?.(payload, side, runId) ?? []) {
           failures.push(`${side}: turns[${pair.turn}] ${declared.chunkType} payload ${problem} (${declared.ticket})`);
         }
       }
-      const pathValues = declared.paths.map(path => ({
-        path,
-        plain: getAtPath(pair.plainPayload, path),
-        wrapped: getAtPath(pair.wrappedPayload, path),
-      }));
+      const pathValues = declared.paths
+        .filter(path => !declared.volatilePaths?.includes(path))
+        .map(path => ({
+          path,
+          plain: getAtPath(pair.plainPayload, path),
+          wrapped: getAtPath(pair.wrappedPayload, path),
+        }));
       const missingKeys = (declared.missingKeys ?? []).map(key => {
         const plainRecord =
           pair.plainPayload !== null && typeof pair.plainPayload === 'object'
@@ -1698,6 +1720,8 @@ function compareObservations(
     const fields = new Set([...Object.keys(actual.turns[i]!), ...Object.keys(expected.turns[i]!)]);
     for (const field of [...fields].sort() as Array<keyof ParitySnapshot>) {
       if (ignore.has(field)) continue;
+      // Each engine runs as its own run: see `ParitySnapshot.runId`.
+      if (field === 'runId') continue;
       check(field, `turns[${i}].${field}`, actual.turns[i]![field], expected.turns[i]![field]);
     }
   }

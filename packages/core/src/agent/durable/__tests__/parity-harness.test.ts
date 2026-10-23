@@ -1332,11 +1332,27 @@ describe('expectEngineParity', () => {
     approval(wrongRun).resumeIdentityDigest = 'digest';
     expect(staleKnownDifferences('durable', observe(results.plain!), wrongRun)).toEqual(
       expect.arrayContaining([
-        "durable: turns[0] tool-call-approval payload names another engine's run in 'originRunId' (parity-plain-0) (PF-1703)",
+        "durable: turns[0] tool-call-approval payload names run 'parity-plain-0' in 'originRunId', not its own 'parity-durable-0' (PF-1703)",
         "durable: turns[0] tool-call-approval payload names step 'toolCallStep', not 'durable-tool-call' (PF-1703)",
         "durable: turns[0] tool-call-approval payload now emits 'resumeIdentityDigest' (PF-1703)",
       ]),
     );
+    // Any other wrong run id fails too, whatever its form.
+    for (const wrongId of ['unrelated-run', 'parity-durable-99']) {
+      const wrong = observe(results.durable!);
+      approval(wrong).originRunId = wrongId;
+      expect(staleKnownDifferences('durable', observe(results.plain!), wrong)).toContain(
+        `durable: turns[0] tool-call-approval payload names run '${wrongId}' in 'originRunId', not its own 'parity-durable-0' (PF-1703)`,
+      );
+    }
+    // A run id the scenario pins for every engine is each engine's own: the
+    // same value on both sides does not read as the difference going stale.
+    const pinned = [observe(results.plain!), observe(results.durable!)] as const;
+    for (const observation of pinned) {
+      observation.turns[0]!.runId = 'pinned-run';
+      approval(observation).originRunId = 'pinned-run';
+    }
+    expect(staleKnownDifferences('durable', pinned[0], pinned[1])).toEqual([]);
     const noDigest = observe(results.plain!);
     delete approval(noDigest).resumeIdentityDigest;
     expect(staleKnownDifferences('durable', noDigest, observe(results.durable!))).toContain(
