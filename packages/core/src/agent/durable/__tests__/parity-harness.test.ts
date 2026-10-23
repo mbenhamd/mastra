@@ -1354,6 +1354,36 @@ describe('expectEngineParity', () => {
     expect(
       differsOnlyByEditedArgs({ resumeSchema: sharedDefinition(true) }, { resumeSchema: sharedDefinition(false) }),
     ).toBe(false);
+    // An escaped definition name (RFC 6901 `~1`) another field reaches, and a
+    // definition editedArgs never referenced, are not plain's editedArgs either.
+    const withDefinitions = (names: string[], edited: boolean) =>
+      JSON.stringify({
+        type: 'object',
+        properties: {
+          approved: { type: 'boolean' },
+          reason: { $ref: '#/definitions/reason~1text' },
+          ...(edited ? { editedArgs: { $ref: '#/definitions/editedOnly' } } : {}),
+        },
+        definitions: Object.fromEntries(names.map(name => [name, { type: 'string' }])),
+      });
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: withDefinitions(['reason/text', 'editedOnly'], true) },
+        { resumeSchema: withDefinitions(['reason/text'], false) },
+      ),
+    ).toBe(true);
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: withDefinitions(['reason/text', 'editedOnly'], true) },
+        { resumeSchema: withDefinitions([], false) },
+      ),
+    ).toBe(false);
+    expect(
+      differsOnlyByEditedArgs(
+        { resumeSchema: withDefinitions(['reason/text', 'editedOnly', 'unrelated'], true) },
+        { resumeSchema: withDefinitions(['reason/text'], false) },
+      ),
+    ).toBe(false);
 
     // The predicate alone: the declared shape, and two that are not it.
     expect(

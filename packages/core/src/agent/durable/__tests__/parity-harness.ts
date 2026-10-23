@@ -1118,13 +1118,37 @@ function refsIn(node: unknown, out: string[] = []): string[] {
   return out;
 }
 
-/** The definition a `#/definitions/<name>[/...]` reference points into. */
-const definitionOf = (ref: string) => /^#\/definitions\/([^/]+)(?:\/|$)/.exec(ref)?.[1];
+/**
+ * The definition a `#/definitions/<name>[/...]` reference points into, its
+ * name decoded (URI fragment, then JSON Pointer `~1` and `~0`, RFC 6901).
+ */
+function definitionOf(ref: string): string | undefined {
+  const token = /^#\/definitions\/([^/]+)(?:\/|$)/.exec(ref)?.[1];
+  if (token === undefined) return undefined;
+  try {
+    return decodeURIComponent(token).replaceAll('~1', '/').replaceAll('~0', '~');
+  } catch {
+    return token;
+  }
+}
+
+/** The definitions a schema node reaches, through other definitions too. */
+function reachedDefinitions(node: unknown, definitions: Record<string, unknown>): Set<string> {
+  const reached = new Set<string>();
+  const pending = refsIn(node).map(definitionOf);
+  while (pending.length > 0) {
+    const name = pending.pop();
+    if (name === undefined || reached.has(name) || !Object.hasOwn(definitions, name)) continue;
+    reached.add(name);
+    pending.push(...refsIn(definitions[name]).map(definitionOf));
+  }
+  return reached;
+}
 
 /**
- * A resume schema without its `editedArgs` property and every definition
- * nothing else still reaches (references into a definition's children count,
- * transitively), or `undefined` when it is not a JSON schema string.
+ * A resume schema without its `editedArgs` property and the definitions only
+ * that property reaches (never one any other field still reaches, nor one it
+ * never referenced), or `undefined` when it is not a JSON schema string.
  */
 function withoutEditedArgsProperty(resumeSchema: unknown): string | undefined {
   if (typeof resumeSchema !== 'string') return undefined;
@@ -1134,18 +1158,14 @@ function withoutEditedArgsProperty(resumeSchema: unknown): string | undefined {
       definitions?: Record<string, unknown>;
     };
     if (!schema.properties || !('editedArgs' in schema.properties)) return resumeSchema;
+    const editedArgs = schema.properties.editedArgs;
     delete schema.properties.editedArgs;
     const { definitions, ...rest } = schema;
     if (definitions) {
-      const reached = new Set<string>();
-      const pending = refsIn(rest).map(definitionOf);
-      while (pending.length > 0) {
-        const name = pending.pop();
-        if (name === undefined || reached.has(name) || !(name in definitions)) continue;
-        reached.add(name);
-        pending.push(...refsIn(definitions[name]).map(definitionOf));
+      const stillReached = reachedDefinitions(rest, definitions);
+      for (const name of reachedDefinitions(editedArgs, definitions)) {
+        if (!stillReached.has(name)) delete definitions[name];
       }
-      for (const name of Object.keys(definitions)) if (!reached.has(name)) delete definitions[name];
       if (Object.keys(definitions).length === 0) delete schema.definitions;
     }
     return JSON.stringify(schema);
