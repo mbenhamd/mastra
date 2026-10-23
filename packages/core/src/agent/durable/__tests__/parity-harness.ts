@@ -1317,10 +1317,11 @@ const KNOWN_CHUNK_DIFFERENCES: readonly KnownChunkDifference[] = [
       'emits none (the step-finish side is `FAILED_STEP_WARNINGS_DIFFERENCE`).',
     chunkType: 'finish',
     paths: ['stepResult.warnings'],
-    appliesTo: plainPayload => getAtPath(plainPayload, 'stepResult.reason') === 'error',
-    matches: (plainPayload, wrappedPayload) =>
-      getAtPath(plainPayload, 'stepResult.warnings') === undefined &&
-      isDeepStrictEqual(getAtPath(wrappedPayload, 'stepResult.warnings'), []),
+    // Call-level failures emit `warnings: []` on every engine, plain included.
+    appliesTo: plainPayload =>
+      getAtPath(plainPayload, 'stepResult.reason') === 'error' &&
+      getAtPath(plainPayload, 'stepResult.warnings') === undefined,
+    matches: (_plainPayload, wrappedPayload) => isDeepStrictEqual(getAtPath(wrappedPayload, 'stepResult.warnings'), []),
   },
   {
     ticket: 'COR-1390',
@@ -1590,17 +1591,23 @@ export function staleKnownDifferences(engine: string, plain: EngineObservation, 
           wrappedHas: pair.wrappedRecord ? key in pair.wrappedRecord : false,
         };
       });
+      // A declaration with `matches` names its exact shape, which may be an
+      // empty value against an absent one, so only equality ends it.
       const hasObservedDifference =
         pathValues.some(
           values =>
             !isDeepStrictEqual(values.plain, values.wrapped) &&
-            (!isEmptyValue(values.plain) || !isEmptyValue(values.wrapped)),
+            (declared.matches !== undefined || !isEmptyValue(values.plain) || !isEmptyValue(values.wrapped)),
         ) ||
         missingKeys.some(
           values => values.wrappedHas || (values.plainHas && !isEmptyValue(values.plainValue) && !values.wrappedHas),
         );
       const hasPopulatedField = pathValues.some(values => !isEmptyValue(values.plain) || !isEmptyValue(values.wrapped));
-      const applicable = hasObservedDifference || hasPopulatedField || missingKeys.some(values => values.wrappedHas);
+      const applicable =
+        declared.matches !== undefined ||
+        hasObservedDifference ||
+        hasPopulatedField ||
+        missingKeys.some(values => values.wrappedHas);
       if (!applicable) continue;
 
       for (const { path, plain: plainValue, wrapped: wrappedValue } of pathValues) {

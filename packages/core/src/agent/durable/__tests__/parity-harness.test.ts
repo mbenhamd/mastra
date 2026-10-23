@@ -748,6 +748,14 @@ describe('expectEngineParity', () => {
     expect(finishPaths(undeclaredDifferences('durable', observe(results.plain!), warned))).toEqual([
       'turns[0].chunkPayloads[6].stepResult.warnings',
     ]);
+
+    // Once the wrapped engines stop adding it, the declaration is stale.
+    const converged = observe(results.durable!);
+    delete finishStepResult(converged).warnings;
+    expect(staleKnownDifferences('durable', observe(results.plain!), converged)).toEqual([
+      'durable: the declared finish chunk difference no longer reproduces; ' +
+        'remove it from KNOWN_CHUNK_DIFFERENCES (COR-1390)',
+    ]);
   });
 
   it('compares the error when engines fail mid-stream with different messages', async () => {

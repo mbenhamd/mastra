@@ -277,7 +277,7 @@ function moveErrorLast(turn: ParitySnapshot): ParitySnapshot {
 const STRICT_ORDER: EngineDifference = {
   reason:
     'COR-1390: wrapped engines emit the structured-output error chunk after step-finish and finish, and ' +
-    'finish the step as `stop` (with its usage) where plain finishes it as `error`.',
+    'finish the step as `stop` (with its usage) where plain finishes it as `error` (PF-6339).',
   expect: plain => ({ ...plain, turns: plain.turns.map(moveErrorLast) }),
 };
 
