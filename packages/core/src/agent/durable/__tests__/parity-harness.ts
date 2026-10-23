@@ -1119,17 +1119,19 @@ function refsIn(node: unknown, out: string[] = []): string[] {
 }
 
 /**
- * The definition a `#/definitions/<name>[/...]` reference points into, its
- * name decoded (URI fragment, then JSON Pointer `~1` and `~0`, RFC 6901).
+ * The definition a `#/definitions/<name>[/...]` reference points into: the
+ * URI fragment is decoded first, then the name's JSON Pointer `~1` and `~0`
+ * (RFC 6901 §§4, 6).
  */
 function definitionOf(ref: string): string | undefined {
-  const token = /^#\/definitions\/([^/]+)(?:\/|$)/.exec(ref)?.[1];
-  if (token === undefined) return undefined;
+  let pointer = ref;
   try {
-    return decodeURIComponent(token).replaceAll('~1', '/').replaceAll('~0', '~');
+    pointer = decodeURIComponent(ref);
   } catch {
-    return token;
+    // An undecodable fragment is read as written.
   }
+  const token = /^#\/definitions\/([^/]+)(?:\/|$)/.exec(pointer)?.[1];
+  return token?.replaceAll('~1', '/').replaceAll('~0', '~');
 }
 
 /** The definitions a schema node reaches, through other definitions too. */
