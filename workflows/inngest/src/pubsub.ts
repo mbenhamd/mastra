@@ -514,7 +514,7 @@ export class InngestPubSub extends PubSub {
       });
       subscription.unsubscribe = () => {
         try {
-          void realtimeSubscription.close();
+          realtimeSubscription.close();
         } catch (err) {
           console.error('InngestPubSub unsubscribe error:', err);
         }

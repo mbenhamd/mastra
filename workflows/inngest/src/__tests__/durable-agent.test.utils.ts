@@ -17,6 +17,7 @@ import { Inngest } from 'inngest';
 
 import { createInngestDurableAgenticWorkflowIds } from '../durable-agent/create-inngest-agentic-workflow';
 import { serve as inngestServe } from '../index';
+import type { InngestFlowControlConfig } from '../types';
 import {
   createInngestTestRuntimeConfig,
   createLocalTestEndpoints,
@@ -104,13 +105,15 @@ export async function waitForInngestSync(ms = 500): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function closeServer(server: ServerType): Promise<void> {
+async function closeServer(server: ServerType, { forceClose = false } = {}): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.close(error => {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ERR_SERVER_NOT_RUNNING') resolve();
       else if (error) reject(error);
       else resolve();
     });
+    // Upstream #28162: a dropped-connection test must not wait on kept-alive sockets.
+    if (forceClose && 'closeAllConnections' in server) server.closeAllConnections();
   });
 }
 
@@ -143,13 +146,13 @@ export async function cleanupSharedTestResources<TServer, TRuntime>(params: {
   return { server, runtime, errors };
 }
 
-async function cleanupSharedTestInfrastructureResources(): Promise<unknown[]> {
+async function cleanupSharedTestInfrastructureResources({ forceClose = false } = {}): Promise<unknown[]> {
   const server = sharedServer;
   const runtime = sharedRuntime;
   const cleanup = await cleanupSharedTestResources({
     server,
     runtime,
-    closeServer,
+    closeServer: activeServer => closeServer(activeServer, { forceClose }),
     stopRuntime: activeRuntime => activeRuntime.stop(),
   });
 
@@ -183,7 +186,19 @@ export async function startConnectInngestDevServer(): Promise<InngestTestRuntime
  */
 export async function setupSharedTestInfrastructure({
   observability,
-}: { observability?: NonNullable<ConstructorParameters<typeof Mastra>[0]>['observability'] } = {}): Promise<void> {
+  backgroundTasks,
+  retries,
+}: {
+  observability?: NonNullable<ConstructorParameters<typeof Mastra>[0]>['observability'];
+  backgroundTasks?: NonNullable<ConstructorParameters<typeof Mastra>[0]>['backgroundTasks'];
+  retries?: InngestFlowControlConfig['retries'];
+  /**
+   * Upstream #28161 starts its CLI dev server with `--retry-interval=1` for this.
+   * The fork's policy-owned host runtime always runs with that interval, and
+   * `runtime.ensureReady()` below already waits for function registration.
+   */
+  fastRetries?: boolean;
+} = {}): Promise<void> {
   if (sharedRuntime || sharedServer) {
     throw new Error('Shared Inngest test infrastructure still requires cleanup; retry teardown before setup.');
   }
@@ -197,7 +212,7 @@ export async function setupSharedTestInfrastructure({
 
     // Create the shared workflow
     const { createInngestDurableAgenticWorkflow } = await import('../durable-agent/create-inngest-agentic-workflow');
-    const workflow = createInngestDurableAgenticWorkflow({ inngest });
+    const workflow = createInngestDurableAgenticWorkflow({ inngest, retries });
 
     // Create shared Mastra instance with the workflow pre-registered
     // This is required because Inngest reads workflows at serve() time
@@ -210,6 +225,7 @@ export async function setupSharedTestInfrastructure({
         [workflow.id]: workflow,
       },
       ...(observability ? { observability } : {}),
+      ...(backgroundTasks ? { backgroundTasks } : {}),
       server: {
         apiRoutes: [
           {
@@ -269,12 +285,40 @@ export async function setupSharedTestInfrastructure({
   }
 }
 
+/** Simulate a dropped serve request without stopping its in-flight tool execution. */
+export function dropSharedHandlerConnections(): void {
+  if (!sharedServer || !('closeAllConnections' in sharedServer)) {
+    throw new Error('Shared HTTP handler server is not initialized');
+  }
+  sharedServer.closeAllConnections();
+}
+
+/** Stop the owned scheduler and wait for its process and listening port to close. */
+export async function stopSharedInngestDevServer(): Promise<void> {
+  // Fork: the scheduler is the policy-owned runtime (inngest-test-runtime), not
+  // upstream's CLI child process; an external runtime is not ours to stop.
+  const runtime = sharedRuntime;
+  if (!runtime || runtime.config.mode === 'external') return;
+  await stopInngestDevServer(runtime);
+  if (sharedRuntime === runtime) sharedRuntime = null;
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(`http://localhost:${INNGEST_PORT}/health`, { signal: AbortSignal.timeout(1000) });
+    } catch {
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error('Shared Inngest dev server did not exit and release its port');
+}
+
 /**
  * Teardown shared test infrastructure.
  * Call this once in afterAll for the test suite.
  */
-export async function teardownSharedTestInfrastructure(): Promise<void> {
-  const cleanupErrors = await cleanupSharedTestInfrastructureResources();
+export async function teardownSharedTestInfrastructure({ forceClose = false } = {}): Promise<void> {
+  const cleanupErrors = await cleanupSharedTestInfrastructureResources({ forceClose });
   sharedMastra = null;
   sharedInngest = null;
 

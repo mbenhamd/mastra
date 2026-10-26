@@ -546,6 +546,55 @@ describe('recording file format', () => {
     expect(listLLMRecordings(tempDir)).not.toContain(name);
   });
 
+  // PF-6640 sync: a single recording file whose meta.testName names a suite
+  // (or another test) still replays for every test in the file, as upstream does.
+  it('replays a single recording file regardless of its meta.testName', async () => {
+    const name = 'single-file-suite-meta';
+    const requestBody = { model: 'gpt-4o', input: 'split fixture' };
+    fs.writeFileSync(
+      path.join(tempDir, `${name}.json`),
+      JSON.stringify({
+        meta: {
+          name,
+          testFile: '/tmp/single-file.test.ts',
+          testName: 'SomeSuite',
+          createdAt: '2026-07-15T00:00:00.000Z',
+        },
+        recordings: [
+          {
+            hash: '3bce2e1ae9f70afd',
+            request: { url: 'https://api.openai.com/v1/responses', method: 'POST', body: requestBody, timestamp: 1 },
+            response: {
+              status: 200,
+              statusText: 'OK',
+              headers: { 'content-type': 'application/json' },
+              body: { id: 'single-file-response' },
+              isStreaming: false,
+            },
+          },
+        ],
+      }),
+      'utf-8',
+    );
+
+    process.env.LLM_TEST_MODE = 'replay';
+    const recorder = setupLLMRecording({ name, recordingsDir: tempDir });
+    recorder.start();
+
+    try {
+      const response = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ id: 'single-file-response' });
+    } finally {
+      recorder.stop();
+    }
+  });
+
   describe('per-test divergent replay ordinals', () => {
     const name = 'split-divergent-replay-ordinals';
     const splitDir = path.join(tempDir, name);

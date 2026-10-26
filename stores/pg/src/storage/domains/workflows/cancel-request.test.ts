@@ -54,7 +54,11 @@ function createStagedWorkflow(probe: Probe) {
     inputSchema: topicSchema,
     outputSchema: topicSchema,
     steps: [stageOne, stageTwo],
-    options: { validateInputs: false },
+    // PF-6181 (PF-6640 sync): opt out of upstream #25579's per-run ownership
+    // lease, which would keep the in-process "dead" owner's lease alive and
+    // refuse the survivor's restart with WORKFLOW_RESTART_RUN_OWNED before it
+    // moves the lineage these cases pin.
+    options: { validateInputs: false, autoRestartActiveRuns: false },
   })
     .then(stageOne)
     .then(stageTwo)

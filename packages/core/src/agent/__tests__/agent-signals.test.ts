@@ -800,7 +800,9 @@ describe('Agent signals', () => {
     expect(reminderSignal.toLLMMessage()).toEqual({
       role: 'user',
       content:
-        '<system-reminder enabled="true" path="/tmp/AGENTS.md" type="dynamic-agents-md">Use &lt;safe&gt; content &amp; continue</system-reminder>',
+        // Upstream #27150 (PF-6640 sync): contents reach the model as written; only the
+        // signal's own closing tag is escaped (see signals-format.test.ts).
+        '<system-reminder enabled="true" path="/tmp/AGENTS.md" type="dynamic-agents-md">Use <safe> content & continue</system-reminder>',
     });
     expect(reminderSignal.toDataPart().data.attributes).toEqual({
       type: 'dynamic-agents-md',
@@ -15141,11 +15143,16 @@ describe('Agent signals', () => {
       { resourceId, threadId },
       pubsub,
     );
-    await expect(followUp.accepted).resolves.toMatchObject({ action: 'deliver', runId: reservedRunId });
+    // Upstream #28298 (PF-6640 sync): input sent while the reservation is still admitting is
+    // acknowledged once the admission settles, not before; the pre-assigned run id stays
+    // synchronous. The reservation loses its lease here, so the input is handed to the winner
+    // and acknowledged against it. DECISION NEEDED (fix-H2): fork main acknowledged at once.
+    expect(followUp.runId).toBe(reservedRunId);
 
     const winnerRunId = 'drained-reservation-winner';
     pubsub.owners.set(key, winnerRunId);
     releaseTransfer();
+    await expect(followUp.accepted).resolves.toMatchObject({ action: 'deliver', runId: winnerRunId });
     await waitForCondition(() => runtime.getActiveThreadRunId({ resourceId, threadId }, pubsub) === undefined);
 
     const recoveryRunId = 'drained-reservation-recovery';
@@ -15302,12 +15309,16 @@ describe('Agent signals', () => {
       { resourceId, threadId },
       pubsub,
     );
+    // Upstream #28298 (PF-6640 sync): the acknowledgement waits for the continuation's
+    // admission (here, its lease transfer) to settle. DECISION NEEDED (fix-H2): fork main
+    // acknowledged before the transfer completed.
+    expect(followUp.runId).toBe(continuation.runId);
+    releaseTransfer();
     await expect(followUp.accepted).resolves.toMatchObject({ action: 'deliver', runId: continuation.runId });
     expect(runtime.drainPendingSignals(continuation.runId, pubsub, 'pre-run')).toEqual([
       expect.objectContaining({ contents: 'attach to continuation' }),
     ]);
 
-    releaseTransfer();
     await waitForCondition(() => vi.mocked(agent.stream).mock.calls.length === 1);
     const continuationOwner = pubsub.owners.get(key);
     expect(continuationOwner).toContain(`"${continuation.runId}"`);
@@ -22231,7 +22242,13 @@ describe('Agent signals', () => {
 
       releaseFirst();
       const run = await firstRunPromise;
-      expect(run.value.parts.filter((part: any) => part.data?.contents === 'Hello by run id')).toHaveLength(1);
+      const signalParts = run.value.parts.filter((part: any) => part.data?.contents === 'Hello by run id');
+      // Upstream #28204 (PF-6640 sync): an accepted user message is first shown as pending,
+      // then delivered under the same id.
+      expect(signalParts.map((part: any) => part.type)).toEqual(
+        type === 'user-message' ? ['data-user-message-pending', 'data-user-message'] : ['data-signal'],
+      );
+      expect(new Set(signalParts.map((part: any) => part.data.id)).size).toBe(1);
       await expect(stream.text).resolves.toBe('run id first responserun id signal response');
       expect(streamCount).toBe(2);
       expect(JSON.stringify(prompts[1])).toContain('Hello by run id');

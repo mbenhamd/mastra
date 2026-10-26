@@ -650,7 +650,12 @@ describe('workflow lifecycle watching', () => {
             status: kind === 'restart' ? 'running' : 'success',
             context: {
               input: { status: 'success', payload: {} },
-              'stale-controller-step': { status: 'success', payload: {} },
+              // PF-6640 sync: upstream COR-1354 makes an evented restart continue
+              // after a saved completed entry instead of repeating it, so the
+              // stranded restart shape leaves the step mid-flight (`running`) to
+              // make the fresh generation enter it again.
+              'stale-controller-step':
+                kind === 'restart' ? { status: 'running', payload: {} } : { status: 'success', payload: {} },
             },
             activePaths: [0],
             activeStepsPath: { 'stale-controller-step': [0] },

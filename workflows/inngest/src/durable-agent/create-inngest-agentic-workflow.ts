@@ -28,6 +28,7 @@ import {
   TOOL_PERMISSION_POLICY_REQUIRED_KEY,
   TOOL_PERMISSION_POLICY_STABLE_KEY,
   loadRunStoredMessages,
+  takeRunScorerInstances,
   pruneAgentLoopSnapshot,
 } from '@mastra/core/agent/durable';
 import type {
@@ -42,8 +43,8 @@ import type {
 import { MessageList } from '@mastra/core/agent/message-list';
 import { ErrorCategory, ErrorDomain, getErrorFromUnknown, MastraError } from '@mastra/core/error';
 import type { PubSub } from '@mastra/core/events';
-import { SpanType, InternalSpans } from '@mastra/core/observability';
-import type { AIModelGenerationSpan, ExportedSpan } from '@mastra/core/observability';
+import { InternalSpans } from '@mastra/core/observability';
+import type { AIModelGenerationSpan, ExportedSpan, SpanType } from '@mastra/core/observability';
 import { ChunkFrom } from '@mastra/core/stream';
 import { PUBSUB_SYMBOL } from '@mastra/core/workflows/_constants';
 import type { BaseContext, Inngest } from 'inngest';
@@ -84,6 +85,7 @@ const durableAgenticInputSchema = z.object({
   // steps on a separate worker process, so this snapshot is the only way the
   // rebuild path can recover request-scoped configuration.
   requestContextEntries: z.record(z.string(), z.any()).optional(),
+  inputTripwire: baseIterationStateSchema.shape.inputTripwire,
   // Observability fields (Inngest-specific)
   agentSpanData: z.any().optional(),
   modelSpanData: z.any().optional(),
@@ -287,6 +289,7 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
           iterationCount,
           stepSpanData: llmOutput.stepSpanData,
           completionStartTime: llmOutput.completionStartTime,
+          stepUsage: llmOutput.stepResult?.totalUsage,
         })) as DurableToolCallInput[];
       },
       { id: 'extract-tool-calls' },
@@ -752,13 +755,17 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
       .map(
         async params => {
           const { inputData, getInitData, mastra, requestContext, tracingContext } = params;
+          const initData = getInitData() as DurableAgenticWorkflowInput;
           void executeDurableAgentScorers({
-            initData: getInitData() as DurableAgenticWorkflowInput,
+            initData,
             finalOutput: inputData,
             mastra,
             requestContext,
             tracingContext,
             loadStoredMessages: loadRunStoredMessages(params),
+            // Call-time and defaultOptions scorers are parked in-process by instance; name
+            // resolution alone misses any scorer Mastra never registered (#27579).
+            scorerInstances: takeRunScorerInstances(initData.runId, mastra),
           }).catch(error => mastra?.getLogger?.()?.warn?.(`[DurableAgent] Skipped scorers: ${error}`));
 
           return inputData;

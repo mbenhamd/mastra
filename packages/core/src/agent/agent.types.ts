@@ -922,6 +922,12 @@ export type AgentExecutionOptionsBase<OUTPUT> = {
    * pass the signal as `agent.stream(signal, options)` instead of setting this.
    */
   _initialSignalEchoes?: CreatedAgentSignal[];
+  /**
+   * @internal
+   * HTTP observers detach on reader cancellation without aborting durable
+   * execution. In-process readers retain cancel-aborts behavior by default.
+   */
+  _detachObserverOnCancel?: boolean;
 } & Partial<ObservabilityContext>;
 
 /**

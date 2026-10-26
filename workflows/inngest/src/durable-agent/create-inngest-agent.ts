@@ -39,15 +39,19 @@
 import type { Agent, AgentExecutionOptions, StructuredOutputOptions } from '@mastra/core/agent';
 import {
   AGENT_STREAM_TOPIC,
+  DurableStepIds,
   agentThreadStreamRuntime,
   prepareForDurableExecution,
   createDurableAgentStream,
+  emitChunkEvent,
   emitErrorEvent,
   publishAbortRequest,
   runDurableStreamUntilIdle,
   runResumeDurableStreamUntilIdle,
   deleteBoundRunRegistryEntry as deleteCoreBoundRunRegistryEntry,
   getBoundRunRegistryEntry,
+  getRunStreamSlot,
+  getScopeStreamSlot,
   globalRunRegistry,
   ON_BEFORE_TOOL_EXECUTION_KEY,
   ON_BEFORE_TOOL_EXECUTION_REQUIRED_KEY,
@@ -56,6 +60,7 @@ import {
   snapshotDurableRequestContextEntries,
   getRunRegistryEntry,
   normalizeResumeGenerateArgs,
+  validateModelTimeoutSettings,
 } from '@mastra/core/agent/durable';
 import type {
   AgentStepFinishEventData,
@@ -71,7 +76,14 @@ import { CachingPubSub, isRunLocalTopic } from '@mastra/core/events';
 import type { Event, EventCallback, PubSub, SubscribeOptions } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
-import type { MastraModelOutput, ChunkType, FullOutput, MastraOnFinishCallback } from '@mastra/core/stream';
+import { ChunkFrom } from '@mastra/core/stream';
+import type {
+  MastraModelOutput,
+  ChunkType,
+  FullOutput,
+  MastraOnFinishCallback,
+  ToolCallChunk,
+} from '@mastra/core/stream';
 import { deepMerge } from '@mastra/core/utils';
 import type { ShouldPersistSnapshotFn, Workflow } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
@@ -162,9 +174,10 @@ const RESUME_SNAPSHOT_POLL_MS = 100;
 async function withDefaultOptions<T extends { requestContext?: AgentExecutionOptions<any>['requestContext'] }>(
   agent: Agent<any, any, any>,
   options: T | undefined,
-): Promise<T> {
+): Promise<T & Pick<AgentExecutionOptions, 'modelSettings'>> {
   const defaults = await agent.getDefaultOptions({ requestContext: options?.requestContext });
-  return deepMerge((defaults ?? {}) as Record<string, unknown>, (options ?? {}) as Record<string, unknown>) as T;
+  return deepMerge((defaults ?? {}) as Record<string, unknown>, (options ?? {}) as Record<string, unknown>) as T &
+    Pick<AgentExecutionOptions, 'modelSettings'>;
 }
 
 // =============================================================================
@@ -859,6 +872,84 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     return history.length;
   }
 
+  /**
+   * Tool calls and text from before the suspension, seeded into the resumed stream
+   * so its `toolCalls` and `text` include them without replaying their chunks.
+   * Mirrors core `DurableAgent.#loadSuspendedIteration`. The outer suspension can persist
+   * before the nested execution snapshot catches up, so wait until the nested
+   * snapshot carries every suspended call rather than reading an earlier iteration.
+   */
+  async function loadSuspendedIteration(
+    runId: string,
+    suspendedSnapshot: { context?: Record<string, any>; resumeLabels?: Record<string, unknown> } | undefined,
+  ): Promise<{ toolCalls: ToolCallChunk[]; resumedText?: { priorText: string; stepText: string } }> {
+    const suspendedToolCallIds = Object.keys(suspendedSnapshot?.resumeLabels ?? {});
+    if (suspendedToolCallIds.length === 0) return { toolCalls: [] };
+    const workflowsStore = await mastra?.getStorage()?.getStore('workflows');
+    if (!workflowsStore) return { toolCalls: [] };
+    // Fork: the nested iteration workflow is registered and persisted under
+    // this agent's per-owner id (createInngestDurableAgenticWorkflowIds), which
+    // is also its step id in the loop snapshot.
+    const nestedRunId =
+      suspendedSnapshot?.context?.[workflowIds.AGENTIC_EXECUTION]?.suspendPayload?.__workflow_meta?.runId ?? runId;
+    const load = () =>
+      workflowsStore.loadWorkflowSnapshot({
+        workflowName: workflowIds.AGENTIC_EXECUTION,
+        runId: nestedRunId,
+      });
+    const isCurrent = (s: Awaited<ReturnType<typeof load>>) =>
+      !!s && suspendedToolCallIds.every(id => !!s.resumeLabels?.[id]);
+    let snapshot = await load();
+    const deadline = Date.now() + RESUME_SNAPSHOT_WAIT_MS;
+    while (!isCurrent(snapshot) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, RESUME_SNAPSHOT_POLL_MS));
+      snapshot = await load();
+    }
+    if (!snapshot || !isCurrent(snapshot)) {
+      throw new Error(
+        `Cannot resume run ${runId}: the nested iteration snapshot does not contain suspended tool calls ` +
+          `${suspendedToolCallIds.join(', ')}.`,
+      );
+    }
+    const llmStep = snapshot.context?.[DurableStepIds.LLM_EXECUTION];
+    if (llmStep?.status !== 'success') {
+      throw new Error(
+        `Cannot resume run ${runId}: the nested iteration snapshot does not contain completed LLM tool calls.`,
+      );
+    }
+    // The nested input holds completed iterations; the LLM output holds the
+    // current iteration, which has not reached the accumulator yet.
+    const accumulatedSteps: { text?: string; finishReason?: string; toolCalls?: ToolCallChunk['payload'][] }[] =
+      snapshot.context.input?.accumulatedSteps ?? [];
+    const toolCalls: ToolCallChunk['payload'][] = [
+      ...accumulatedSteps.flatMap(step => step.toolCalls ?? []),
+      ...(llmStep.output?.toolCalls ?? []),
+    ];
+    const resumedText = {
+      priorText: accumulatedSteps
+        .filter(step => step.finishReason !== 'retry')
+        .map(step => step.text ?? '')
+        .join(''),
+      stepText: llmStep.output?.text ?? '',
+    };
+    return {
+      resumedText,
+      toolCalls: toolCalls.map(toolCall => ({
+        type: 'tool-call',
+        runId,
+        from: ChunkFrom.AGENT,
+        payload: {
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.toolName,
+          args: toolCall.args,
+          providerMetadata: toolCall.providerMetadata,
+          providerExecuted: toolCall.providerExecuted,
+          output: toolCall.output,
+        },
+      })),
+    };
+  }
+
   // Fork PubSub rule: with a caller-supplied pubsub, every topic (agent stream,
   // control and workflow events) goes through that exact transport. Without
   // one, each workflow keeps its local InngestPubSub, wrapped in a CachingPubSub
@@ -1343,6 +1434,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         const {
           output,
           cleanup: streamCleanup,
+          fail: failStream,
           ready,
         } = createDurableAgentStream<TOutput>({
           pubsub: streamPubsub,
@@ -1356,7 +1448,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           threadId,
           resourceId,
           structuredOutput: registryEntry.structuredOutput as StructuredOutputOptions<TOutput> | undefined,
-          onChunk: callbackOptions.onChunk,
+          onChunk: chunk => {
+            // Upstream #27907: a parked segment is resumable; its observer's
+            // signal must not abort the next segment.
+            if (chunk.type === 'tool-call-approval' || chunk.type === 'tool-call-suspended') detachExternalAbort();
+            return callbackOptions.onChunk?.(chunk);
+          },
           onStepFinish: callbackOptions.onStepFinish,
           onFinish: async result => {
             try {
@@ -1472,18 +1569,42 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         const workflowExecution = ready.then(
           async () => {
             try {
+              // Upstream #27943: only initial runs open a message; resume
+              // continues the existing stream.
+              await emitChunkEvent(streamPubsub, runId, {
+                type: 'start',
+                runId,
+                from: ChunkFrom.AGENT,
+                payload: { id: workflowInput.agentId, messageId },
+              });
+            } catch (error) {
+              // Nothing was dispatched yet: definite non-admission, so release
+              // the registry/listener state as for a failed subscription.
+              finalizeGlobalRegistry();
+              const failure = error instanceof Error ? error : new Error(String(error));
+              await emitError(runId, failure).catch(() => {});
+              await failStream(failure);
+              return;
+            }
+            try {
               await triggerWorkflow(runId, workflowInput, tracingOptions, resourceId, streamOptions?.actor);
             } catch (error) {
               // Dispatch acknowledgement can be ambiguous, so preserve the
               // binding and any abort tombstone for a possibly queued worker.
-              await emitError(runId, error instanceof Error ? error : new Error(String(error))).catch(() => {});
+              const failure = error instanceof Error ? error : new Error(String(error));
+              await emitError(runId, failure).catch(() => {});
+              // Upstream #27943: fail the caller's stream even when the error
+              // event could not be published.
+              await failStream(failure);
             }
           },
           async error => {
             // Subscription setup failed before dispatch was attempted. This is
             // definite non-admission, so release the registry/listener state.
             finalizeGlobalRegistry();
-            await emitError(runId, error instanceof Error ? error : new Error(String(error))).catch(() => {});
+            const failure = error instanceof Error ? error : new Error(String(error));
+            await emitError(runId, failure).catch(() => {});
+            await failStream(failure);
           },
         );
         const trackedEntry = getBoundRunRegistryEntry(runId, runtimeBindingId);
@@ -1530,6 +1651,15 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     },
 
     async resume(runId, resumeData, resumeOptions): Promise<InngestAgentStreamResult<TOutput>> {
+      if (agentThreadStreamRuntime.isResumeFenced(runId, agent.getPubSub())) {
+        throw new MastraError({
+          id: 'AGENT_RESUME_ABORTED_RUN',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: `InngestAgent "${agent.name}" resume() cannot resume aborted run "${runId}".`,
+          details: { agentName: agent.name, runId },
+        });
+      }
       // Delegate to the resume idle-loop wrapper when `untilIdle` is set.
       // After the resumed segment completes, the wrapper runs
       // `agent.stream([], ...)` continuations against the same thread until
@@ -1617,6 +1747,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
             ...(resumeOptions?.requestContext?.entries() ?? []),
           ]),
         });
+        // Upstream #28030: resume validates timeouts like generation does.
+        validateModelTimeoutSettings(callbackOptions.modelSettings?.timeout);
+        // Upstream #28080/#27582: the resumed segment only receives new pubsub
+        // chunks, so output state from before the suspension is restored from
+        // the suspended iteration snapshot.
+        const { toolCalls: initialToolCalls, resumedText } = await loadSuspendedIteration(runId, suspendedSnapshot);
 
         // Install a fresh abort controller scoped to the resumed segment and
         // attach it to the run-registry entry so the durable LLM step (when
@@ -1697,7 +1833,9 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           pubsub: resumePubsub,
           runId,
           offset: resumeOffset,
+          initialToolCalls,
           messageId: crypto.randomUUID(),
+          resumedText,
           model: {
             modelId: undefined,
             provider: undefined,
@@ -1708,6 +1846,11 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           structuredOutput: existingEntry.structuredOutput as StructuredOutputOptions<TOutput> | undefined,
           onChunk: chunk => {
             resumedChunkSeen = true;
+            // Upstream #27907: a parked segment is resumable; its observer's
+            // signal must not abort the next segment.
+            if (chunk.type === 'tool-call-approval' || chunk.type === 'tool-call-suspended') {
+              detachResumeExternalAbort();
+            }
             return callbackOptions.onChunk?.(chunk);
           },
           onStepFinish: callbackOptions.onStepFinish,
@@ -2385,17 +2528,28 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     // The wrapped Agent's thread/run abort only reaches in-process state; an
     // Inngest run executes on the step worker, which must be told to stop.
     abortThreadStream(abortOptions) {
+      const scopeKey = `${abortOptions.threadId ?? ''}|${abortOptions.resourceId ?? ''}`;
+      const wrapperClose = getScopeStreamSlot(activeStreamUntilIdle, scopeKey, abortOptions.expectedRunId);
+      if (wrapperClose && !abortOptions.localOnly) {
+        wrapperClose();
+        return true;
+      }
       // Resolve the run before the base call: aborting releases the thread
       // lease, after which the thread no longer has an active run to look up.
       const runId = agent.getActiveThreadRunId(abortOptions);
       const aborted = agent.abortThreadStream(abortOptions);
       if (!aborted || !runId) return aborted;
 
-      abortDurableRun(runId);
+      if (!abortOptions.localOnly) abortDurableRun(runId);
       return true;
     },
 
     abortRunStream(runId) {
+      const wrapperClose = getRunStreamSlot(activeStreamUntilIdle, runId);
+      if (wrapperClose) {
+        wrapperClose();
+        return true;
+      }
       const aborted = agent.abortRunStream(runId);
       // Publish regardless of local knowledge: the run is normally executing
       // on an Inngest worker this process cannot see.

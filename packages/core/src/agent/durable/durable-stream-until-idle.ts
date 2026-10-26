@@ -131,11 +131,12 @@ export async function runDurableStreamUntilIdle<OUTPUT = undefined>(
               }
             }),
           );
-          ctx.forceClose();
+          ctx.abort();
         },
       };
     },
     {
+      detachOnCancel: streamOptions?._detachObserverOnCancel === true,
       onInnerResult: (inner: any) => {
         if (typeof inner.cleanup === 'function') innerCleanups.push(inner.cleanup);
         if (typeof inner.abort === 'function') innerAborts.push(inner.abort);
@@ -187,7 +188,8 @@ export async function runResumeDurableStreamUntilIdle<OUTPUT = undefined>(
     DurableAgentStreamResult<OUTPUT>
   >(
     agentForIdleLoop(agent, resolvedDefaultOptions),
-    streamOptions,
+    // The wrapper takes the resumed run's slot up front so it supersedes the run's parked wrapper.
+    { ...streamOptions, runId },
     deps,
     (_opts, _memory, _defaultOptions, mergedOptions) =>
       (agent as any).resume(
@@ -231,11 +233,12 @@ export async function runResumeDurableStreamUntilIdle<OUTPUT = undefined>(
               }
             }),
           );
-          ctx.forceClose();
+          ctx.abort();
         },
       };
     },
     {
+      detachOnCancel: streamOptions?._detachObserverOnCancel === true,
       onInnerResult: (inner: any) => {
         if (typeof inner.cleanup === 'function') innerCleanups.push(inner.cleanup);
         if (typeof inner.abort === 'function') innerAborts.push(inner.abort);

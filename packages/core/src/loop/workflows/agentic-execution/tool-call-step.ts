@@ -15,9 +15,8 @@ import {
   ON_BEFORE_TOOL_EXECUTION_REQUIRED_KEY,
   TOOL_PERMISSION_DENIED_ERROR_NAME,
   TOOL_PERMISSION_POLICY_KEY,
-  type BeforeToolExecutionHook,
-  type ToolPermissionPolicy,
 } from '../../../agent/tool-permission-prefilter';
+import type { BeforeToolExecutionHook, ToolPermissionPolicy } from '../../../agent/tool-permission-prefilter';
 import { MastraFGAPermissions } from '../../../auth/ee';
 import { executeAdoptedBackgroundOperation } from '../../../background-tasks/adoption';
 import type { BackgroundTaskProgressChunk, ToolBackgroundConfig } from '../../../background-tasks/types';
@@ -93,7 +92,8 @@ import {
 } from './eager-tool-execution';
 import type { EagerSuspensionIntent, EagerToolBailout } from './eager-tool-execution';
 import { runBeforeApprovalChecks } from './tool-approval-verdict';
-import { notifyToolDenied, TOOL_DENIED_CALLBACK_KEY, type ToolDeniedCallback } from './tool-permission-notify';
+import { notifyToolDenied, TOOL_DENIED_CALLBACK_KEY } from './tool-permission-notify';
+import type { ToolDeniedCallback } from './tool-permission-notify';
 
 type AddToolMetadataOptions = {
   toolCallId: string;
@@ -174,6 +174,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
   agentId,
   agentVersionId,
   resolvedScopes,
+  returnScorerData,
   mastra,
   requireToolApproval: requireToolApprovalFromFactory,
   requestContext: factoryRequestContext,
@@ -585,9 +586,13 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
 
       // Recalled messages become refs only when memory is a fixed instance: a resume may not
       // repeat the request context that function or inherited memory resolved against.
+      // The snapshot is taken right after the suspension chunk is emitted, possibly before the
+      // output processed it, so it is serialized as if it had been (upstream #27634). The step's
+      // usage is not passed here: `transformChunk` already recorded it on the output out of band
+      // (PF-5349), never on the chunk.
       const serializeStreamStateForSuspend = () =>
         dehydrateStreamState(
-          streamState.serialize(),
+          streamState.serialize({}),
           memoryMessageRefs,
           readScoped(scopeCtx, FIXED_MEMORY_KEY, 'fixedMemory')
             ? readScoped(scopeCtx, MEMORY_KEY, 'memory')
@@ -1635,6 +1640,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 // Persisted unconditionally — [] included — so absence marks a pre-upgrade snapshot,
                 // whose resume adopts the supplied scopes instead of rejecting them.
                 __resolvedScopes: resolvedScopes ?? [],
+                ...(returnScorerData !== undefined ? { __returnScorerData: returnScorerData } : {}),
                 // Persist the inner suspended run id in the workflow snapshot, partitioned per
                 // tool call (resumeLabel = toolCallId). Persisted message metadata exposes the
                 // same id as delegatedRunId for cold reloads, while the snapshot remains the
@@ -1700,6 +1706,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 // Persisted unconditionally — [] included — so absence marks a pre-upgrade snapshot,
                 // whose resume adopts the supplied scopes instead of rejecting them.
                 __resolvedScopes: resolvedScopes ?? [],
+                ...(returnScorerData !== undefined ? { __returnScorerData: returnScorerData } : {}),
                 toolCallId: metadataToolCallId,
                 toolName: inputData.toolName,
                 resumeLabel: options?.resumeLabel,
@@ -1811,6 +1818,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 // Persisted unconditionally — [] included — so absence marks a pre-upgrade snapshot,
                 // whose resume adopts the supplied scopes instead of rejecting them.
                 __resolvedScopes: resolvedScopes ?? [],
+                ...(returnScorerData !== undefined ? { __returnScorerData: returnScorerData } : {}),
               },
               {
                 resumeLabel: inputData.toolCallId,

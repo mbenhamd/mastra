@@ -24,6 +24,7 @@ import {
 import { ChunkFrom } from '../../../stream/types';
 import { PUBSUB_SYMBOL } from '../../../workflows/constants';
 import { createEventedWorkflow, createWorkflow } from '../../../workflows/create';
+import { markNonRedeliverable } from '../../../workflows/evented/helpers';
 import type { ShouldPersistSnapshotFn, WorkflowOptions } from '../../../workflows/types';
 import { createStep } from '../../../workflows/workflow';
 import { AGENT_RESPONSE_RECOVERY_CONTINUATION } from '../../merge-execution-options';
@@ -36,7 +37,7 @@ import {
 import type { ToolPermissionPolicy } from '../../tool-permission-prefilter';
 import { DURABLE_STOP_WHEN_ERROR_ID, DurableStepIds, DurableAgentDefaults } from '../constants';
 import { isExecutionFenceError, isForeignExecutionContext, withExecutionFence } from '../execution-fence';
-import { getBoundRunRegistryEntry, getRunRegistryEntry } from '../run-registry';
+import { getBoundRunRegistryEntry, getRunRegistryEntry, takeRunScorerInstances } from '../run-registry';
 import {
   createTerminalToolResultEnvelope,
   emitChunkEvent,
@@ -71,6 +72,7 @@ import {
   seedMessageListState,
   storeMessageListState,
   buildDeferredStepFinishChunk,
+  expandDurableSteps,
 } from './shared';
 import {
   createDurableBackgroundTaskCheckStep,
@@ -216,6 +218,7 @@ const durableAgenticInputSchema = z.object({
       authToken: z.literal(true).optional(),
     })
     .optional(),
+  inputTripwire: baseIterationStateSchema.shape.inputTripwire,
 });
 
 /**
@@ -671,7 +674,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
               toolResults,
               runId: initData.runId,
               agentId: initData.agentId,
-              messageId: initData.messageId,
+              messageId: llmOutput?.stepResult?.messageId ?? initData.messageId,
               state: llmOutput?.state ?? initData.state,
             };
           },
@@ -963,15 +966,18 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
                 matched = await (condition as (context: any) => boolean | PromiseLike<boolean>)(context);
               } catch (error) {
                 const originalError = getErrorFromUnknown(error);
-                throw new MastraError(
-                  {
-                    id: DURABLE_STOP_WHEN_ERROR_ID,
-                    domain: ErrorDomain.AGENT,
-                    category: ErrorCategory.USER,
-                    text: originalError.message,
-                    details: { name: originalError.name, message: originalError.message },
-                  },
-                  originalError,
+                // A throwing predicate is deterministic; redelivering the event would only rerun it.
+                throw markNonRedeliverable(
+                  new MastraError(
+                    {
+                      id: DURABLE_STOP_WHEN_ERROR_ID,
+                      domain: ErrorDomain.AGENT,
+                      category: ErrorCategory.USER,
+                      text: originalError.message,
+                      details: { name: originalError.name, message: originalError.message },
+                    },
+                    originalError,
+                  ),
                 );
               }
               if (matched) stopWhenMatched = true;
@@ -988,7 +994,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
         pendingFeedbackStop: prevPendingFeedbackStop || terminalHardStop,
         llmWantsToContinue,
         underMaxSteps: ordinaryStepCount < runMaxSteps,
-        steps: state.accumulatedSteps,
+        steps: expandDurableSteps(state.accumulatedSteps),
         stopWhen: stopWhenConditions,
         consumeDelegationBail: () => {
           if (state.delegationBailed) {
@@ -1191,6 +1197,9 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
           // policy may exclude `running`, in which case resume claims cannot
           // be de-duplicated.
           allowUnclaimedResumes: true,
+          // listSuspendedRuns() reads this row's status, so a resume must flip it
+          // off `suspended` even when `running` checkpoints are skipped (#27619).
+          persistResumeClaim: true,
           isOwnershipLostError: isExecutionFenceError,
           isForeignExecution: isForeignExecutionContext,
           persistedRequestContext: this.#persistedRequestContext,
@@ -1272,6 +1281,8 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
             const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
             const logger = mastra?.getLogger?.();
 
+            const steps = expandDurableSteps(state.accumulatedSteps);
+
             // Extract final text from last step
             const lastStep = state.accumulatedSteps[state.accumulatedSteps.length - 1];
             let finalText = lastStep?.text;
@@ -1314,6 +1325,15 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
 
             const messageListState = await readMessageListState(params, state);
 
+            // Read before the finish side effects: saving moves messages out of the input/response
+            // sets, and plain builds its finish envelope before saving too.
+            const finalMessageList = createRunMessageList({}).deserialize(messageListState);
+            const finishMessages = {
+              all: finalMessageList.get.all.aiV5.model(),
+              user: finalMessageList.get.input.aiV5.model(),
+              nonUser: finalMessageList.get.response.aiV5.model(),
+            };
+
             const finishResult = await runDurableFinishSideEffects({
               runId: state.runId,
               initData,
@@ -1326,12 +1346,13 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
                 text: finalText ?? '',
                 usage: state.accumulatedUsage,
                 finishReason: state.lastStepResult?.reason ?? 'unknown',
-                steps: state.accumulatedSteps,
+                steps,
               },
               ...(terminalEnvelope ? { terminalEnvelope, messageId: state.messageId } : {}),
             });
             if (lastStep && finishResult.outputText && finishResult.outputText !== (finalText ?? '')) {
               lastStep.text = finishResult.outputText;
+              steps[steps.length - 1] = { ...steps[steps.length - 1]!, text: finishResult.outputText };
               finalText = finishResult.outputText;
             }
 
@@ -1351,6 +1372,19 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
               }
             }
 
+            // generateTitle.emitEvent: hold FINISH until the title is saved, then stream it as a
+            // transient chunk so consumers see it before the stream closes (as the in-process loop does).
+            if (pubsub && !tripwire && finishResult.titleForStream) {
+              const title = await finishResult.titleForStream;
+              if (title && initData.state?.threadId) {
+                await emitChunkEvent(pubsub, state.runId, {
+                  type: 'data-thread-title',
+                  data: { threadId: initData.state.threadId, title },
+                  transient: true,
+                });
+              }
+            }
+
             const finalOutput = {
               messageListState: finishResult.messageListState,
               messageId: state.messageId,
@@ -1364,6 +1398,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
               output: {
                 text: finalText,
                 usage: state.accumulatedUsage,
+                // Saved with the run, so keep tool outputs compacted; the stream adapter expands them.
                 steps: state.accumulatedSteps,
               },
               state: state.state,
@@ -1391,6 +1426,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
                 stepResult: finalOutput.stepResult,
                 ...(terminalEnvelope ? { terminalToolResult: terminalEnvelope } : {}),
                 ...(terminalStepFinishChunk ? { terminalStepFinishChunk: terminalStepFinishChunk as any } : {}),
+                messages: finishMessages,
               });
             }
 
@@ -1472,6 +1508,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
                   requestContext,
                   tracingContext,
                   loadStoredMessages: loadRunStoredMessages(params),
+                  scorerInstances: takeRunScorerInstances(initData.runId, mastra as Mastra | undefined),
                 }).catch(error => mastra?.getLogger?.()?.warn?.(`[DurableAgent] Skipped scorers: ${error}`));
               } catch (error) {
                 mastra?.getLogger?.()?.warn?.(`[DurableAgent] Skipped scorers: ${error}`);

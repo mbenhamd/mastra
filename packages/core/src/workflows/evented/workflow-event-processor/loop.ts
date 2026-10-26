@@ -5,6 +5,7 @@ import type { Mastra } from '../../../mastra';
 import { isStaleExecutionResult } from '../../../storage/types';
 import type { UpdateWorkflowResultsResult } from '../../../storage/types';
 import { getEntryId, getEntryWorkflow } from '../../step-entry';
+import { WORKFLOW_TERMINAL_FOREACH_RUN_KEY } from '../../terminal-continuation/types';
 import { resolveForeachConcurrency } from '../../utils';
 import { getPersistedRequestContext, resolveCurrentState, runExpectsPersistedRow } from '../helpers';
 import type { StepExecutor } from '../step-executor';
@@ -19,14 +20,17 @@ import type { ProcessorArgs } from '.';
 
 const FOREACH_QUEUED = '__mastra_foreach_queued__';
 
-export function isQueuedForeachIteration(value: unknown): value is { [FOREACH_QUEUED]: true } {
-  return (
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    Object.hasOwn(value, FOREACH_QUEUED) &&
-    (value as Record<string, unknown>)[FOREACH_QUEUED] === true &&
-    Object.keys(value).length === 1
+/**
+ * A queued foreach slot: exactly the engine marker, optionally carrying the
+ * nested child run id a restart must reuse (upstream #26368). A user output
+ * that merely contains the marker key among other fields is not a marker (fork).
+ */
+export function isQueuedForeachIteration(value: unknown): value is { [FOREACH_QUEUED]: true; nestedRunId?: string } {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (!Object.hasOwn(record, FOREACH_QUEUED) || record[FOREACH_QUEUED] !== true) return false;
+  return Object.keys(record).every(
+    key => key === FOREACH_QUEUED || (key === 'nestedRunId' && typeof record.nestedRunId === 'string'),
   );
 }
 
@@ -50,6 +54,28 @@ function isDeletedRunResultWrite(
   stepResults: ProcessorArgs['stepResults'],
 ): boolean {
   return isMissingRecordResult(write) && runExpectsPersistedRow(workflow, parentWorkflow, stepResults);
+}
+
+export async function evaluateLoopCondition(
+  args: Omit<ProcessorArgs, 'workflow'>,
+  step: Extract<StepFlowEntry, { type: 'loop' }>,
+  stepExecutor: StepExecutor,
+  stepResult: StepResult<any, any, any, any>,
+) {
+  return stepExecutor.evaluateCondition({
+    workflowId: args.workflowId,
+    condition: step.condition,
+    runId: args.runId,
+    stepResults: args.stepResults,
+    state: resolveCurrentState({ stepResult, stepResults: args.stepResults, state: args.state }),
+    requestContext: new RequestContext(Object.entries(args.requestContext ?? {}) as any),
+    actor: args.actor,
+    inputData: stepResult.status === 'success' ? stepResult.output : undefined,
+    resumeData: args.resumeData,
+    abortController: new AbortController(),
+    retryCount: args.retryCount ?? 0,
+    iterationCount: (args.stepResults[getEntryId(step.step)]?.metadata?.iterationCount ?? 0) + 1,
+  });
 }
 
 export async function processWorkflowLoop(
@@ -81,6 +107,7 @@ export async function processWorkflowLoop(
     step,
     stepResult,
     ownerWorkflow,
+    savedCondition,
   }: {
     pubsub: PubSub;
     mastra: Mastra;
@@ -93,6 +120,7 @@ export async function processWorkflowLoop(
      * stored request context (PF-6182).
      */
     ownerWorkflow?: ProcessorArgs['workflow'];
+    savedCondition?: boolean;
   },
 ) {
   const lifecycleExecution = { executionGeneration, lifecycleResumeAttempt, lifecycleStepStates };
@@ -100,34 +128,39 @@ export async function processWorkflowLoop(
   // Get current state from stepResult, stepResults or passed state
   const currentState = resolveCurrentState({ stepResult, stepResults, state });
 
-  // Create a proper RequestContext from the plain object passed in ProcessorArgs
-  const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);
-
-  // Get iteration count from step results metadata (same pattern as control-flow.ts)
   const prevIterationCount = stepResults[getEntryId(step.step)]?.metadata?.iterationCount ?? 0;
   const iterationCount = prevIterationCount + 1;
-
-  const loopCondition = await stepExecutor.evaluateCondition({
-    workflowId,
-    condition: step.condition,
-    runId,
-    stepResults,
-    state: currentState,
-    requestContext: reqContext,
-    actor,
-    inputData: prevResult?.status === 'success' ? prevResult.output : undefined,
-    resumeData,
-    abortController: new AbortController(),
-    retryCount,
-    iterationCount,
-  });
+  const loopCondition =
+    savedCondition ??
+    (await evaluateLoopCondition(
+      {
+        workflowId,
+        runId,
+        executionPath,
+        stepResults,
+        activeStepsPath,
+        resumeSteps,
+        resumeData,
+        requestContext,
+        actor,
+        retryCount,
+        state: currentState,
+        prevResult,
+      },
+      step,
+      stepExecutor,
+      stepResult,
+    ));
 
   const previousLoopResult = stepResults[getEntryId(step.step)] ?? stepResult;
   const previousLoopMetadata = previousLoopResult?.metadata ?? {};
   const { nestedRunId: _completedNestedRunId, ...nextIterationMetadata } = previousLoopMetadata;
+  // Upstream #28054 carries the completed body's metadata (its occurrence stamp) into the next
+  // iteration; the completed child run id stays cleared (fork nested ownership).
+  const { nestedRunId: _completedBodyNestedRunId, ...completedBodyMetadata } = stepResult.metadata ?? {};
   const nextIterationResult: StepResult<any, any, any, any> = {
     ...previousLoopResult,
-    metadata: { ...nextIterationMetadata, iterationCount },
+    metadata: { ...nextIterationMetadata, ...completedBodyMetadata, iterationCount },
   };
 
   // When the loop body runs again, it's a fresh iteration — not a resume — so drop any
@@ -182,13 +215,22 @@ export async function processWorkflowLoop(
     state: currentState,
     outputOptions,
   };
+  // Upstream #28054: when the loop decision was committed under a completion
+  // guard (`savedCondition`), the stored body result must stay the completed,
+  // decided occurrence until the next iteration actually starts, so a worker
+  // that dies before publishing it can be recovered from the saved result
+  // without repeating the body. The fork still clears the completed nested
+  // child run id at this boundary (nested ownership) and still fences the
+  // write to this lifetime. Unguarded stores keep the fork's next-iteration row.
+  const persistedNextIteration: StepResult<any, any, any, any> =
+    savedCondition !== undefined ? { ...stepResult, metadata: completedBodyMetadata } : nextIterationResult;
   const persistNextIteration = async () => {
     const workflowsStore = await mastra.getStorage()?.getStore('workflows');
     const write = await workflowsStore?.updateWorkflowResults({
       workflowName: workflowId,
       runId,
       stepId: getEntryId(step.step),
-      result: nextIterationResult,
+      result: persistedNextIteration,
       requestContext: getPersistedRequestContext(requestContext, ownerWorkflow ?? workflow),
       executionGeneration: lifecycleExecution.executionGeneration,
     });
@@ -284,6 +326,9 @@ export async function processWorkflowForEach(
       });
     return true;
   };
+
+  // Restart checkpoints may point at an iteration, but the coordinator advances the workflow path.
+  if (restart) executionPath = [executionPath[0]!];
 
   // Get current state from stepResults or passed state
   const currentState = resolveCurrentState({ stepResults, state });
@@ -639,6 +684,58 @@ export async function processWorkflowForEach(
         : ({ [FOREACH_QUEUED]: true } as { [FOREACH_QUEUED]: true });
     });
 
+    // Drop failure records from the previous attempt so a replayed iteration that fails
+    // again is treated as the first failure and fails the run (upstream #26651).
+    const withoutFailedAttempts = (iterationResult: any) =>
+      iterationResult?.status === 'failed' ? null : iterationResult;
+    currentResult.suspendPayload = {
+      ...currentResult.suspendPayload,
+      __workflow_meta: {
+        ...currentResult.suspendPayload?.__workflow_meta,
+        foreachOutput: Array.isArray(preservedForeachEntries)
+          ? preservedForeachEntries.map(withoutFailedAttempts)
+          : Object.fromEntries(
+              Object.entries(preservedForeachEntries).map(([index, iterationResult]) => [
+                index,
+                withoutFailedAttempts(iterationResult),
+              ]),
+            ),
+      },
+    };
+
+    const restoreWrite = await workflowsStore?.updateWorkflowResults({
+      workflowName: workflowId,
+      runId,
+      stepId,
+      result: currentResult,
+      requestContext: getPersistedRequestContext(requestContext, workflow),
+      executionGeneration: lifecycleExecution.executionGeneration,
+    });
+    if (stopOnStaleWrite(restoreWrite, stepId)) return;
+    stepResults[stepId] = currentResult;
+  }
+
+  if (
+    restart &&
+    !restart.isForeachRestarted &&
+    Array.isArray(currentResult?.output) &&
+    currentResult.output.some((result: any) => result === null)
+  ) {
+    const unfinishedCount = currentResult.output.filter((result: any) => result === null).length;
+    currentResult.output = currentResult.output.map((result: any, index: number) => {
+      if (result !== null) return result;
+      const nestedRunId =
+        currentResult.metadata?.foreachNestedRunIds?.[index] ??
+        // Fork: nested foreach children record their run id in the terminal-continuation map.
+        currentResult.metadata?.__workflow_meta?.[WORKFLOW_TERMINAL_FOREACH_RUN_KEY]?.[String(index)] ??
+        (!currentResult.metadata?.foreachNestedRunIds &&
+        unfinishedCount === 1 &&
+        restart.activeStepsPath?.[stepId]?.[1] === index
+          ? currentResult.metadata?.nestedRunId
+          : undefined);
+      return { [FOREACH_QUEUED]: true, ...(nestedRunId ? { nestedRunId } : {}) };
+    });
+
     const restoreWrite = await workflowsStore?.updateWorkflowResults({
       workflowName: workflowId,
       runId,
@@ -661,7 +758,15 @@ export async function processWorkflowForEach(
       requestContext: reqContext,
     });
     const runningCount = currentResult.output.filter((result: any) => result === null).length;
-    const indicesToRun = queuedIndices.slice(0, Math.max(0, concurrency - runningCount));
+    // Fork: only an engine suspension envelope is a suspended iteration; a user output may carry `status`.
+    const suspendedIndices = currentResult.output.flatMap((result: any, index: number) =>
+      isEventedForeachSuspensionResult(result) ? [index] : [],
+    );
+    const indicesToRun = queuedIndices.slice(0, Math.max(0, concurrency - runningCount - suspendedIndices.length));
+    if (indicesToRun.length === 0 && runningCount === 0 && suspendedIndices.length > 0) {
+      await publishSuspendedState();
+      return;
+    }
 
     if (indicesToRun.length > 0) {
       const updatedOutput = [...currentResult.output];
@@ -696,7 +801,18 @@ export async function processWorkflowForEach(
             executionPath: [executionPath[0]!, index],
             resumeSteps,
             timeTravel,
-            restart,
+            // Only recorded children receive recovery events. Plain steps and slots
+            // that never started still execute normally through the leaf runner.
+            restart:
+              isNestedWorkflow && !timeTravel && currentResult.output[index]?.nestedRunId
+                ? {
+                    ...restart,
+                    activePaths: restart?.activePaths ?? [executionPath[0]!, index],
+                    activeStepsPath: { ...restart?.activeStepsPath, [stepId]: [executionPath[0]!, index] },
+                    stepResults,
+                    isForeachRestarted: true,
+                  }
+                : undefined,
             stepResults,
             prevResult: iterationPrevResult,
             resumeData,
@@ -771,7 +887,15 @@ export async function processWorkflowForEach(
       // into its terminal snapshot. Resume history can remain, but routing and
       // per-iteration suspend payloads are no longer live.
       const { suspendPayload: _suspendPayload, suspendOutput: _suspendOutput, ...completedResult } = result as any;
-      result = completedResult;
+      // Iteration step-ends keep the record 'running' (upstream #27932); only here has every
+      // iteration settled, so the coordinator settles the aggregate as 'success'.
+      result = {
+        ...completedResult,
+        status: 'success',
+        suspendedAt: undefined,
+        startedAt: completedResult.startedAt ?? Date.now(),
+        endedAt: completedResult.status === 'success' && completedResult.endedAt ? completedResult.endedAt : Date.now(),
+      };
       const completedWrite = await workflowsStore?.updateWorkflowResults({
         workflowName: workflowId,
         runId,
@@ -829,7 +953,8 @@ export async function processWorkflowForEach(
       runId,
       stepId: getEntryId(step.step),
       result: {
-        status: 'success',
+        // Iterations are still running; the completion branch above writes success.
+        status: 'running',
         output: dummyResult as any,
         startedAt: Date.now(),
         payload: (prevResult as any)?.output,
@@ -863,7 +988,6 @@ export async function processWorkflowForEach(
           resumeSteps,
           stepResults,
           timeTravel,
-          restart,
           prevResult: iterationPrevResult,
           resumeData,
           activeStepsPath,
@@ -889,9 +1013,9 @@ export async function processWorkflowForEach(
     runId,
     stepId: getEntryId(step.step),
     result: {
-      status: 'success',
+      status: 'running',
       output: (currentResult as any).output,
-      startedAt: Date.now(),
+      startedAt: currentResult?.startedAt ?? Date.now(),
       payload: (prevResult as any)?.output,
     } as any,
     requestContext: getPersistedRequestContext(requestContext, workflow),
@@ -919,7 +1043,6 @@ export async function processWorkflowForEach(
       executionPath: [executionPath[0]!, idx],
       resumeSteps,
       timeTravel,
-      restart,
       stepResults,
       prevResult: iterationPrevResult,
       resumeData,

@@ -2,7 +2,12 @@ import { expect, it } from 'vitest';
 import { z } from 'zod/v4';
 import type { ChunkType } from '../../../../stream/types';
 import { createTool } from '../../../../tools';
-import { createSharedAgent, describeForAllEngines, useLoopScenarioAimock } from '../aimock-scenario';
+import {
+  createSharedAgent,
+  describeForAllEngines,
+  isDurableEngineVariant,
+  useLoopScenarioAimock,
+} from '../aimock-scenario';
 
 /**
  * Token usage when a tool call suspends (#27232).
@@ -70,18 +75,20 @@ const lookupTool = createTool({
 
 type RunHandle = { output?: any; fullStream: AsyncIterable<ChunkType>; runId: string };
 
-// A durable stream stays open while suspended, so its result promises never
-// settle. Give up after a moment so those engines fail on the assertion.
 const settled = <T>(value: Promise<T> | T) =>
   Promise.race([Promise.resolve(value), new Promise<undefined>(r => setTimeout(() => r(undefined), 1000))]);
 
 describeForAllEngines('AIMock loop scenario: token usage when a tool call suspends', engine => {
   const getMock = useLoopScenarioAimock();
-  // The #27425 fix only reached the plain loop's output. On durable and evented
-  // engines a suspended run reports no usage for the step that suspended (not on
-  // the stream result, the generate() result, or the tool-call-suspended chunk).
-  // Resumed totals are still correct there. See #27440.
-  const itFailsOnDurable = engine === 'durable' || engine === 'evented' ? it.fails : it;
+  // PF-6758 / PF-5349 (PF-6640 sync): suspended-step usage keeps fork behaviour (decided in
+  // PF-6758). The fork reports the suspended step's usage out of band
+  // (`_recordPendingSuspendedStepUsage` on the output that ran the step), never on a
+  // chunk. Upstream #27634/#27882/#28351 make durable, evented and Inngest callers read
+  // it from the `tool-call-suspended` / `tool-call-approval` chunk, which the fork does
+  // not carry, so a durable caller's output still has no usage for the suspending step
+  // (as on fork main before this sync, upstream #27440). Resumed totals are correct.
+  // Carrying the out-of-band usage across the durable stream adapter is not adopted (PF-6758).
+  const itFailsOnDurable = isDurableEngineVariant(engine) ? it.fails : it;
 
   async function setup(kind: Kind, { withPriorStep = false } = {}) {
     const llm = getMock();
@@ -116,10 +123,42 @@ describeForAllEngines('AIMock loop scenario: token usage when a tool call suspen
   const resume = (agent: any, kind: Kind, runId: string, toolCallId: string, answer = 'blue'): Promise<RunHandle> =>
     kind === 'suspend' ? agent.resumeStream({ answer }, { runId }) : agent.approveToolCall({ runId, toolCallId });
 
+  if (engine === 'inngest') {
+    for (const kind of ['suspend', 'approval'] as const) {
+      itFailsOnDurable(
+        `[${kind}] Inngest forwards the suspending step's tokens through the tool-call boundary`,
+        async () => {
+          const { agent, toolCallId } = await setup(kind, { withPriorStep: true });
+          const first: RunHandle = await agent.stream('go');
+          const firstOutput = first.output ?? first;
+          const heldUsage = firstOutput.usage;
+          const heldTotalUsage = firstOutput.totalUsage;
+          let suspension: ChunkType | undefined;
+          for await (const chunk of first.fullStream) {
+            if (chunk.type === 'tool-call-suspended' || chunk.type === 'tool-call-approval') {
+              suspension = chunk;
+              break;
+            }
+          }
+
+          expect(suspension).toBeDefined();
+          expect(tokens(suspension?.payload.usage)).toEqual(SUSPENDED);
+          expect(tokens(await settled(heldUsage))).toEqual(add(PRIOR, SUSPENDED));
+          expect(tokens(await settled(heldTotalUsage))).toEqual(add(PRIOR, SUSPENDED));
+
+          const resumed = await drain(await resume(agent, kind, first.runId, toolCallId));
+          expect(await resumed.text).toBe('done');
+          expect(tokens(await resumed.totalUsage)).toEqual(add(PRIOR, SUSPENDED, RESUMED));
+        },
+      );
+    }
+  }
+
   for (const kind of ['suspend', 'approval'] as const) {
     itFailsOnDurable(`[${kind}] stream() reports the suspended step usage`, async () => {
       const { agent } = await setup(kind);
-      const output = await drain(await agent.stream('go'));
+      const run = await agent.stream('go');
+      const output = await drain(run);
 
       expect(tokens(await settled(output.usage))).toEqual(SUSPENDED);
       expect(tokens(await settled(output.totalUsage))).toEqual(SUSPENDED);
@@ -145,16 +184,35 @@ describeForAllEngines('AIMock loop scenario: token usage when a tool call suspen
       expect(tokens(await resumed.totalUsage)).toEqual(add(SUSPENDED, RESUMED));
     });
 
-    itFailsOnDurable(`[${kind}] steps before the suspension count in both suspended and resumed totals`, async () => {
-      const { agent, toolCallId } = await setup(kind, { withPriorStep: true });
-      const first: RunHandle = await agent.stream('go');
-      const firstOutput = await drain(first);
-      expect(tokens(await settled(firstOutput.totalUsage))).toEqual(add(PRIOR, SUSPENDED));
+    itFailsOnDurable(
+      `[${kind}] exposes prior and suspended usage before resume, then counts the step once`,
+      async () => {
+        const { agent, toolCallId } = await setup(kind, { withPriorStep: true });
+        const first: RunHandle = await agent.stream('go');
+        const firstOutput = first.output ?? first;
+        const heldUsage = firstOutput.usage;
+        const heldTotalUsage = firstOutput.totalUsage;
+        const heldFinishReason = firstOutput.finishReason;
+        await drain(first);
 
-      const resumed = await drain(await resume(agent, kind, first.runId, toolCallId));
-      expect(await resumed.text).toBe('done');
-      expect(tokens(await resumed.totalUsage)).toEqual(add(PRIOR, SUSPENDED, RESUMED));
-    });
+        expect(tokens(await settled(heldUsage))).toEqual(add(PRIOR, SUSPENDED));
+        expect(tokens(await settled(heldTotalUsage))).toEqual(add(PRIOR, SUSPENDED));
+        expect(await settled(heldFinishReason)).toBe('suspended');
+
+        const resumed = await drain(await resume(agent, kind, first.runId, toolCallId));
+        expect(await resumed.text).toBe('done');
+        expect(tokens(await resumed.totalUsage)).toEqual(add(PRIOR, SUSPENDED, RESUMED));
+
+        if (isDurableEngineVariant(engine)) {
+          expect(tokens(await firstOutput.usage)).toEqual(add(PRIOR, SUSPENDED, RESUMED));
+          expect(tokens(await firstOutput.totalUsage)).toEqual(add(PRIOR, SUSPENDED, RESUMED));
+          expect(await firstOutput.finishReason).toBe('stop');
+          expect(tokens(await heldUsage)).toEqual(add(PRIOR, SUSPENDED));
+          expect(tokens(await heldTotalUsage)).toEqual(add(PRIOR, SUSPENDED));
+          expect(await heldFinishReason).toBe('suspended');
+        }
+      },
+    );
   }
 
   itFailsOnDurable('keeps the suspended step usage when a resumed tool suspends again', async () => {
@@ -162,9 +220,19 @@ describeForAllEngines('AIMock loop scenario: token usage when a tool call suspen
     const first: RunHandle = await agent.stream('go');
     await drain(first);
 
-    const again = await drain(await resume(agent, 'suspend', first.runId, toolCallId, 'again'));
+    const againRun = await resume(agent, 'suspend', first.runId, toolCallId, 'again');
+    const again = await drain(againRun);
     expect(tokens(await settled(again.usage))).toEqual(SUSPENDED);
     expect(tokens(await settled(again.totalUsage))).toEqual(SUSPENDED);
+    // PF-1875 (PF-6640 sync): the fork refuses to resume a run whose row is still
+    // `running` (it does not poll a live claim), and the re-suspension is persisted
+    // only after the suspension chunk. Upstream #27882 now settles usage on that chunk,
+    // so finish the resumed stream before resuming again, as a caller must.
+    if (!isDurableEngineVariant(engine)) {
+      for await (const _chunk of againRun.fullStream) {
+        // drain to the end so the suspended snapshot is persisted
+      }
+    }
 
     const resumed = await drain(await resume(agent, 'suspend', first.runId, toolCallId));
     expect(await resumed.text).toBe('done');

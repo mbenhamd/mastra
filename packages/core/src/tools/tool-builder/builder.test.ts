@@ -425,7 +425,6 @@ describe('MCP Tool Tracing', () => {
           serverVersion: '1.2.0',
           toolType: 'tool',
           toolDescription: 'List files in a directory',
-          toolCallId: 'test-call-id',
         },
       }),
     );
@@ -480,7 +479,6 @@ describe('MCP Tool Tracing', () => {
           toolCallId: 'test-call-id',
           toolDescription: 'A regular tool',
           toolType: 'tool',
-          toolCallId: 'test-call-id',
         },
       }),
     );
@@ -536,7 +534,6 @@ describe('MCP Tool Tracing', () => {
       serverVersion: undefined,
       toolType: 'tool',
       toolDescription: 'Read a resource',
-      toolCallId: 'test-call-id',
     });
     expect(spanArgs.name).toBe("mcp_tool: 'mcp_read-resource' on 'my-mcp-server'");
   });

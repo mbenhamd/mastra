@@ -28,6 +28,7 @@ import {
   outputProcessorsSupportResult,
   outputProcessorsSupportStream,
 } from '../../processors/runner';
+import { isFailedStreamChunk } from '../../processors/stream-reprocess';
 import type { TerminalToolResult } from '../../tools';
 import type { WorkflowRunStatus } from '../../workflows';
 import { DelayedPromise, consumeStream } from '../aisdk/v5/compat';
@@ -693,7 +694,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     finishReason: undefined,
   };
   #bufferedText: LLMStepResult<OUTPUT>['text'][] = [];
-  /** Length of `#bufferedText` when the current step began; a retried step is cut back to it. */
+  /** Length of `#bufferedText` when the current step began; rejected or retried steps are cut back to it. */
   #bufferedTextAtStepStart = 0;
   #bufferedObject: OUTPUT | undefined;
   #usedFallbackValue = false;
@@ -706,14 +707,29 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     details: Record<string, LLMStepResult<OUTPUT>['reasoning'][number]>;
   };
   #bufferedFiles: LLMStepResult<OUTPUT>['files'] = [];
-  #toolCallArgsDeltas: Record<string, LLMStepResult<OUTPUT>['text'][]> = {};
-  #toolCallDeltaIdNameMap: Record<string, string> = {};
-  #toolCallStreamingMeta: Record<string, ToolCallStreamingMeta> = {};
+  // Records keyed by provider-supplied tool call IDs have no prototype, so IDs like "__proto__"
+  // or "constructor" are plain keys.
+  #toolCallArgsDeltas: Record<string, LLMStepResult<OUTPUT>['text'][]> = Object.create(null);
+  #toolCallDeltaIdNameMap: Record<string, string> = Object.create(null);
+  #toolCallStreamingMeta: Record<string, ToolCallStreamingMeta> = Object.create(null);
+  /** Recorded calls whose input streams again in a retry; the retry's tool-call replaces them. */
+  #replaceableToolCallIds = new Set<string>();
+  /** Calls recorded since the last accepted step; only these can be replaced by a retry. */
+  #attemptToolCallIds = new Set<string>();
   /**
    * Tool calls whose input stream ended without any deltas. Their args only arrive with the
    * final `tool-call` chunk, so they wait here instead of being emitted as a synthetic `{}` call.
    */
-  #pendingToolCalls: Record<string, { meta: ToolCallStreamingMeta; runId: string; from: ToolCallChunk['from'] }> = {};
+  #pendingToolCalls: Record<
+    string,
+    {
+      meta: ToolCallStreamingMeta;
+      args: Record<string, unknown>;
+      streamed: boolean;
+      runId: string;
+      from: ToolCallChunk['from'];
+    }
+  > = Object.create(null);
   #toolCalls: LLMStepResult<OUTPUT>['toolCalls'] = [];
   #toolResults: LLMStepResult<OUTPUT>['toolResults'] = [];
   #warnings: LLMStepResult<OUTPUT>['warnings'] = [];
@@ -756,6 +772,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
    */
   #lastStepUsage: LLMStepResult<OUTPUT>['usage'] | undefined = undefined;
   /**
+   * Set when a suspension settled usage, totalUsage and finishReason early on a stream that
+   * stays open across it (durable, upstream #27882); the next finish replaces them. The
+   * suspended step's usage itself is the out-of-band `#pendingSuspendedStepUsage` (PF-5349).
+   */
+  #suspendedUsageIsProvisional = false;
+  /**
    * Cumulative usage the MODEL_GENERATION spans of earlier suspended legs of this run already
    * recorded. Resumed legs report cumulative totals, so their generation span subtracts this to
    * keep token metrics counted once. Serialized with the run state.
@@ -768,6 +790,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   #providerResultListeners: Array<(result: FullOutput<OUTPUT>) => Promise<void>> = [];
   #providerResultObserved = false;
   #terminalToolResult: TerminalToolResult | undefined;
+  #resumedPriorText = '';
   #transportRef: MastraModelOutputOptions<OUTPUT>['transportRef'] | undefined;
   #transportClosed = false;
 
@@ -837,6 +860,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     messageId,
     initialState,
     initialToolCalls,
+    resumedText,
     finishUsageIsTotal,
   }: {
     model: {
@@ -850,6 +874,11 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     messageId: string;
     initialState?: any;
     initialToolCalls?: ToolCallChunk[];
+    /**
+     * Text a resumed stream segment inherits from before its suspension: the run's text so far
+     * and the suspended step's part of it. Used when no serialized `initialState` is available.
+     */
+    resumedText?: { priorText: string; stepText: string };
     finishUsageIsTotal?: boolean;
   }) {
     super({ component: 'LLM', name: 'MastraModelOutput' });
@@ -914,10 +943,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       // on every part, even when no stream processor consumes it.
       let observabilityContext: ObservabilityContext | undefined;
       const getObservabilityContext = () => (observabilityContext ??= resolveObservabilityContext(options));
+      // Set once the model stream errors or aborts; held parts are then dropped
+      // rather than released, since they belong to a failed (maybe retried) call.
+      let streamFailed = false;
 
       processedStream = stream.pipeThrough(
         new TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>({
           async transform(chunk, controller) {
+            if (isFailedStreamChunk(chunk)) streamFailed = true;
             // Filter out intermediate finish chunks with 'tool-calls' reason
             // These are internal signals that shouldn't reach output processors
             //
@@ -1043,11 +1076,57 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               }
             }
           },
-          flush() {
+          async flush(controller) {
+            // Release parts processors still hold (e.g. a partial BatchPartsProcessor
+            // batch) so a model stream that ends mid-batch doesn't drop its tail.
+            // A failed or aborted stream drops them instead: a retry would duplicate
+            // them, and an abort must not emit content after cancellation.
+            if (streamFailed || options.abortSignal?.aborted) {
+              for (const part of await processorRunner.discardHeldParts(processorStates)) {
+                controller.enqueue(part as ChunkType<OUTPUT>);
+              }
+              processorRunner.endStreamProcessorSpans(processorStates, { keepStepScopedSpans: true });
+              return;
+            }
+            const released = await processorRunner.flushHeldParts(
+              processorStates,
+              getObservabilityContext(),
+              options.requestContext,
+              self.messageList,
+              0,
+              {
+                custom: async (data, writerOptions) => {
+                  persistProcessorDataChunk(self.messageList, writerOptions?.messageId ?? self.messageId, data);
+                  controller.enqueue(data as ChunkType<OUTPUT>);
+                },
+              },
+              options.abortSignal,
+            );
+            for (const r of released) {
+              if (r.blocked) {
+                controller.enqueue({
+                  type: 'tripwire',
+                  payload: {
+                    reason: r.reason || 'Output processor blocked content',
+                    retry: r.tripwireOptions?.retry,
+                    metadata: r.tripwireOptions?.metadata,
+                    processorId: r.processorId,
+                  },
+                } as ChunkType<OUTPUT>);
+                break;
+              }
+              if (r.part != null) {
+                controller.enqueue(r.part as ChunkType<OUTPUT>);
+              }
+            }
             // Only this step's model stream ended; the step's tool results are still to come.
             processorRunner.endStreamProcessorSpans(processorStates, { keepStepScopedSpans: true });
           },
-          cancel() {
+          async cancel() {
+            // The model call was torn down (e.g. a mid-stream disconnect being
+            // retried). What processors hold belongs to it and must not be
+            // released with the next call's parts.
+            await processorRunner.discardHeldParts(processorStates);
             processorRunner.endStreamProcessorSpans(processorStates);
           },
         }),
@@ -1108,17 +1187,29 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       };
       self.#toolCalls.push(synthetic);
       self.#bufferedByStep.toolCalls.push(synthetic);
+      self.#attemptToolCallIds.add(synthetic.payload.toolCallId);
       self.#emitChunk(synthetic);
       controller.enqueue(synthetic);
     };
 
     // A provider that ended a tool input stream without deltas and never sent the final
     // tool-call still gets a (no-args) tool call recorded before the step closes.
-    const flushPendingToolCalls = (controller: TransformStreamDefaultController<ChunkType<OUTPUT>>) => {
-      for (const [toolCallId, { meta, runId, from }] of Object.entries(self.#pendingToolCalls)) {
-        emitSyntheticToolCall(controller, toolCallId, meta, {}, runId, from);
+    const flushPendingToolCall = (
+      controller: TransformStreamDefaultController<ChunkType<OUTPUT>>,
+      toolCallId: string,
+    ) => {
+      const pending = self.#pendingToolCalls[toolCallId];
+      if (!pending) return;
+      delete self.#pendingToolCalls[toolCallId];
+      emitSyntheticToolCall(controller, toolCallId, pending.meta, pending.args, pending.runId, pending.from);
+    };
+    const flushPendingToolCalls = (
+      controller: TransformStreamDefaultController<ChunkType<OUTPUT>>,
+      { onlyStreamed = false }: { onlyStreamed?: boolean } = {},
+    ) => {
+      for (const [toolCallId, pending] of Object.entries(self.#pendingToolCalls)) {
+        if (!onlyStreamed || pending.streamed) flushPendingToolCall(controller, toolCallId);
       }
-      self.#pendingToolCalls = {};
     };
 
     this.#baseStream = processedStream.pipeThrough(
@@ -1126,6 +1217,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
         transform: async (chunk, controller) => {
           let outboundChunk = chunk;
           let suppressChunkEmission = false;
+          // A stream that fails after a tool input finished but before its final tool-call
+          // still records the call built from the streamed args. Calls with no streamed args
+          // stay pending: the error may be retried, and the retry delivers the real tool-call.
+          if (chunk.type === 'error') {
+            flushPendingToolCalls(controller, { onlyStreamed: true });
+          }
+          // A call's outcome must not precede the call itself.
+          if (chunk.type === 'tool-result' || chunk.type === 'tool-error') {
+            flushPendingToolCall(controller, chunk.payload.toolCallId);
+          }
           switch (chunk.type) {
             case 'tool-call-suspended':
             case 'tool-call-approval': {
@@ -1137,6 +1238,9 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 self.#finishCallbackSent = true;
                 await options?.onFinish?.(self.#createSuspendedOnFinishPayload(chunk));
               }
+              // A plain stream ends here, so flush settles usage. A durable stream stays open
+              // across the suspension, so settle the same numbers now. The next finish replaces them.
+              self.#settleSuspendedUsage();
               break;
             }
             case 'data-terminal-tool-result': {
@@ -1225,6 +1329,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               }
               break;
             case 'tool-call-input-streaming-start':
+              // A call recorded in this step whose input streams again comes from a failed attempt being
+              // retried (the failure itself may never reach this stream), so the retry's call replaces it.
+              // Ids reused by a later step are separate calls.
+              if (self.#attemptToolCallIds.has(chunk.payload.toolCallId)) {
+                self.#replaceableToolCallIds.add(chunk.payload.toolCallId);
+              }
               self.#toolCallDeltaIdNameMap[chunk.payload.toolCallId] = chunk.payload.toolName;
               self.#toolCallStreamingMeta[chunk.payload.toolCallId] = {
                 toolName: chunk.payload.toolName,
@@ -1254,24 +1364,25 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               delete self.#toolCallStreamingMeta[toolCallId];
               delete self.#toolCallArgsDeltas[toolCallId];
               delete self.#toolCallDeltaIdNameMap[toolCallId];
+              // PF-2935: truncated streamed JSON is not an executable empty object, so it is never
+              // kept as a pending call that a later flush could synthesize with `{}` args. Only the
+              // provider's authoritative tool-call may follow.
               if (meta && streamedArgsParseFailed) {
                 self.#emitChunk(chunk);
                 controller.enqueue(chunk);
                 return;
               }
-              if (meta && !deltaParts?.length) {
-                // No streamed input (e.g. OpenAI Responses, Anthropic PTC): the args only arrive
-                // with the final tool-call. Emitting a synthetic `{}` call now would let eager tool
-                // execution run the tool with empty input, so let the real tool-call drive emission.
-                self.#pendingToolCalls[toolCallId] = { meta, runId: chunk.runId, from: chunk.from };
-                break;
-              }
               if (meta) {
-                // Emit streaming-end then synthetic so studio receives tool-input-end then tool-input-available before tool-output-available
-                self.#emitChunk(chunk);
-                controller.enqueue(chunk);
-                emitSyntheticToolCall(controller, toolCallId, meta, args, chunk.runId, chunk.from);
-                return;
+                // Let the real tool-call drive emission: it carries the final args (OpenAI Responses
+                // and Anthropic PTC stream none) and the tool payload transform metadata stamped
+                // upstream. A synthetic call from the deltas is only emitted if it never arrives.
+                self.#pendingToolCalls[toolCallId] = {
+                  meta,
+                  args,
+                  streamed: Boolean(deltaParts?.length),
+                  runId: chunk.runId,
+                  from: chunk.from,
+                };
               }
               break;
             }
@@ -1344,10 +1455,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               break;
             }
             case 'tool-call': {
-              // Own-property check: provider-supplied IDs like "constructor" must not hit Object.prototype.
-              const pending = Object.hasOwn(self.#pendingToolCalls, chunk.payload.toolCallId)
-                ? self.#pendingToolCalls[chunk.payload.toolCallId]
-                : undefined;
+              const pending = self.#pendingToolCalls[chunk.payload.toolCallId];
               if (pending) {
                 delete self.#pendingToolCalls[chunk.payload.toolCallId];
                 const { meta } = pending;
@@ -1359,31 +1467,21 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                   chunk.payload.observability = meta.observability;
                 }
               }
-              // Skip if a synthetic tool-call was already created from tool-call-input-streaming-end
-              const existingSynthetic = self.#toolCalls.find(tc => tc.payload.toolCallId === chunk.payload.toolCallId);
-              // In some providers (e.g. Anthropic PTC), args are only present in the final tool-call event.
-              // Synthetic tool-calls built from streaming deltas may have empty args,
-              // so we merge them here if missing.
-              if (existingSynthetic) {
-                // FIX: merge args if synthetic is empty
-                if (chunk.payload.args && Object.keys(existingSynthetic.payload.args || {}).length === 0) {
-                  existingSynthetic.payload.args = chunk.payload.args;
+              // The retry's real call replaces the one recorded from the failed attempt.
+              if (self.#replaceableToolCallIds.delete(chunk.payload.toolCallId)) {
+                self.#attemptToolCallIds.delete(chunk.payload.toolCallId);
+                for (const calls of [self.#toolCalls, self.#bufferedByStep.toolCalls]) {
+                  const index = calls.findLastIndex(tc => tc.payload.toolCallId === chunk.payload.toolCallId);
+                  if (index !== -1) calls.splice(index, 1);
                 }
-
-                // existing logic
-                if (chunk.payload.providerMetadata && !existingSynthetic.payload.providerMetadata) {
-                  existingSynthetic.payload.providerMetadata = chunk.payload.providerMetadata;
-                }
-                if (chunk.payload.dynamic != null && existingSynthetic.payload.dynamic == null) {
-                  existingSynthetic.payload.dynamic = chunk.payload.dynamic;
-                }
-                if (chunk.payload.observability && !existingSynthetic.payload.observability) {
-                  existingSynthetic.payload.observability = chunk.payload.observability;
-                }
+              }
+              // A call already recorded under this id in this step (a repeated tool-call) is not emitted twice.
+              if (self.#attemptToolCallIds.has(chunk.payload.toolCallId)) {
                 return;
               }
               self.#toolCalls.push(chunk);
               self.#bufferedByStep.toolCalls.push(chunk);
+              self.#attemptToolCallIds.add(chunk.payload.toolCallId);
               const toolCallPayload = chunk.payload;
               // @ts-expect-error TODO: What does this mean??? Why is there a nested output, what is the type supposed to be
               if (toolCallPayload?.output?.from === 'AGENT' && toolCallPayload?.output?.type === 'finish') {
@@ -1420,7 +1518,14 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 suppressChunkEmission = true;
               }
 
-              flushPendingToolCalls(controller);
+              // A failed or retried step keeps its no-args calls pending, like an error chunk does.
+              const stepReason = chunk.payload.stepResult.reason as string;
+              const attemptFailed = stepReason === 'retry' || stepReason === 'error';
+              flushPendingToolCalls(controller, { onlyStreamed: attemptFailed });
+              if (!attemptFailed) {
+                self.#attemptToolCallIds.clear();
+                self.#replaceableToolCallIds.clear();
+              }
               self.updateUsageCount(chunk.payload.output.usage);
               // The first step-finish after a suspension is the suspending step's:
               // its usage is now counted, so it is no longer pending.
@@ -1443,12 +1548,10 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               const loopStep = payloadSteps.length > self.#loopStepCount ? currentPayloadStep : undefined;
               self.#loopStepCount = Math.max(self.#loopStepCount, payloadSteps.length);
 
-              // A retried attempt is thrown away (a processor rejected it, or an error processor
-              // answered its API error with a retry), so it contributes no text: neither to
-              // this step nor to the run's text, which would otherwise begin with the failed
-              // attempt's partial output (#26081).
+              // Rejected and retried attempts contribute no text to the step or run,
+              // including onFinish. Preserve text from earlier accepted steps (#26081, COR-1464).
               const isRetriedStep = (chunk.payload.stepResult.reason as string) === 'retry';
-              if (isRetriedStep) {
+              if (stepTripwire || isRetriedStep) {
                 self.#bufferedText.length = Math.min(self.#bufferedText.length, self.#bufferedTextAtStepStart);
               }
 
@@ -1617,6 +1720,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 warnings: self.#warnings,
                 providerMetadata: undefined,
                 response: {
+                  // Durable runs end on this chunk when processOutputResult trips, so no finish
+                  // chunk builds the response messages; keep the rejected draft visible (#27562).
+                  ...(self.#options.resolveFinalPromises && {
+                    messages: self.messageList.get.response.aiV5.model(),
+                    uiMessages:
+                      self.messageList.get.response.aiV5.ui() as LLMStepResult<OUTPUT>['response']['uiMessages'],
+                  }),
                   dbMessages: self.messageList.get.response.db(),
                 },
                 request: {},
@@ -1648,7 +1758,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
               // A tripwire/abort bail ends the run without the final tool-call; don't record a
               // placeholder no-args call for it.
               if ((chunk.payload.stepResult.reason as string) === 'tripwire') {
-                self.#pendingToolCalls = {};
+                self.#pendingToolCalls = Object.create(null);
               } else {
                 flushPendingToolCalls(controller);
               }
@@ -2529,32 +2639,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
           // If stream ends in suspended state (e.g., tool-call-approval), resolve promises with partial results
           // This allows consumers to access data that was produced before the suspension
           if (self.#status === 'suspended') {
-            const reasoningText =
-              self.#bufferedReasoning.length > 0
-                ? self.#bufferedReasoning.map(reasoningPart => reasoningPart.payload.text).join('')
-                : undefined;
-
-            self.resolvePromises({
-              toolResults: self.#toolResults,
-              toolCalls: self.#toolCalls,
-              text: self.#bufferedText.join(''),
-              reasoning: Object.values(self.#bufferedReasoningDetails || {}),
-              reasoningText,
-              sources: self.#bufferedSources,
-              files: self.#bufferedFiles,
-              steps: self.#bufferedSteps,
-              usage: self.#suspendedUsage(),
-              totalUsage: self.#getTotalUsage(self.#suspendedUsage()),
-              warnings: self.#warnings,
-              finishReason: 'suspended',
-              content: self.messageList.get.response.aiV5.stepContent(),
-              object: undefined,
-              request: self.#request,
-              response: {
-                dbMessages: self.messageList.get.response.db(),
-              },
-              providerMetadata: undefined,
-            });
+            self.#resolveSuspendedPromises();
           }
 
           // If stream ends without proper finish/error chunks, reject unresolved promises
@@ -2578,12 +2663,23 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
     if (initialState) {
       this.deserializeState(initialState);
-    } else if (initialToolCalls) {
-      this.#toolCalls = initialToolCalls;
+    } else {
+      if (initialToolCalls) this.#toolCalls = initialToolCalls;
+      if (resumedText) {
+        const { priorText, stepText } = resumedText;
+        this.#resumedPriorText = priorText;
+        this.#bufferedText = [priorText, stepText].filter(Boolean);
+        this.#bufferedTextAtStepStart = priorText ? 1 : 0;
+        this.#bufferedByStep.text = stepText;
+        this.#wasSuspended = true;
+      }
     }
   }
 
   private resolvePromise<KEY extends keyof PromiseResults<OUTPUT>>(key: KEY, value: PromiseResults<OUTPUT>[KEY]) {
+    if (this.#suspendedUsageIsProvisional && (key === 'usage' || key === 'totalUsage' || key === 'finishReason')) {
+      this.#suspendedUsageIsProvisional = false;
+    }
     if (!(key in this.#delayedPromises)) {
       throw new MastraError({
         id: 'MASTRA_MODEL_OUTPUT_INVALID_PROMISE_KEY',
@@ -2600,6 +2696,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       const key = keyString as keyof PromiseResults<OUTPUT>;
       this.resolvePromise(key, data[key]);
     }
+  }
+
+  // Same numbers flush would settle when a plain stream ends on suspension. A durable
+  // stream stays open, so callers waiting on usage would otherwise hang until resume.
+  #settleSuspendedUsage() {
+    const usage = this.#suspendedUsage();
+    this.#delayedPromises.usage.resolve(usage);
+    this.#delayedPromises.totalUsage.resolve(this.#getTotalUsage(usage));
+    this.#delayedPromises.finishReason.resolve('suspended');
+    this.#suspendedUsageIsProvisional = true;
   }
 
   #closeTransportIfNeeded() {
@@ -2872,12 +2978,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
 
     // Calculate text from steps, which respects tripwire (rejected steps return empty text)
     // This ensures rejected responses are excluded from the final text output
-    const textFromSteps = steps.map((step: any) => step.text || '').join('');
+    // A run that suspends mid-step (e.g. awaiting tool approval) has streamed text the step results
+    // don't hold yet. The per-step buffer is reset on every step-finish, so this text is never in `steps`.
+    const textFromSteps =
+      steps.map((step: any) => step.text || '').join('') +
+      (this.#status === 'suspended' ? this.#bufferedByStep.text : '');
 
     const fullOutput: FullOutput<OUTPUT> = {
       // After a tripwire, `text` already holds the resolved output (and a processOutputStream
       // tripwire can end the run before any step completes), so reuse it to stay in sync.
-      text: this.tripwire || steps.length === 0 ? await this.text : textFromSteps,
+      text: this.tripwire || steps.length === 0 ? await this.text : this.#resumedPriorText + textFromSteps,
       usage: await this.usage,
       steps,
       finishReason: await this.finishReason,
@@ -3221,8 +3331,10 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
   }
 
   /** Completed-step usage plus the billed step that suspended (see `#pendingSuspendedStepUsage`). */
-  #suspendedUsage(): LanguageModelUsage {
-    return addPendingStepUsage(this.#usageCount, this.#pendingSuspendedStepUsage);
+  #suspendedUsage(
+    pendingSuspendedStepUsage: PendingStepUsage | undefined = this.#pendingSuspendedStepUsage,
+  ): LanguageModelUsage {
+    return addPendingStepUsage(this.#usageCount, pendingSuspendedStepUsage);
   }
 
   /**
@@ -3309,6 +3421,36 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     };
   }
 
+  /** Resolves the result promises with what the run produced before it suspended. */
+  #resolveSuspendedPromises() {
+    const reasoningText =
+      this.#bufferedReasoning.length > 0
+        ? this.#bufferedReasoning.map(reasoningPart => reasoningPart.payload.text).join('')
+        : undefined;
+
+    this.resolvePromises({
+      toolResults: this.#toolResults,
+      toolCalls: this.#toolCalls,
+      text: this.#bufferedText.join(''),
+      reasoning: Object.values(this.#bufferedReasoningDetails || {}),
+      reasoningText,
+      sources: this.#bufferedSources,
+      files: this.#bufferedFiles,
+      steps: this.#bufferedSteps,
+      usage: this.#suspendedUsage(),
+      totalUsage: this.#getTotalUsage(this.#suspendedUsage()),
+      warnings: this.#warnings,
+      finishReason: 'suspended',
+      content: this.messageList.get.response.aiV5.stepContent(),
+      object: undefined,
+      request: this.#request,
+      response: {
+        dbMessages: this.messageList.get.response.db(),
+      },
+      providerMetadata: undefined,
+    });
+  }
+
   #emitChunk(chunk: ChunkType<OUTPUT>) {
     if (getChunkProducedAt(chunk) === undefined) stampChunkProducedAt(chunk, Date.now());
     // Carry the traceId on every chunk Mastra produces so stream consumers can link chunks to their
@@ -3356,6 +3498,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     this.#bufferedChunks.length = 0;
     this.#bufferedSteps.length = 0;
     this.#bufferedText.length = 0;
+    this.#resumedPriorText = '';
     this.#bufferedTextAtStepStart = 0;
     this.#bufferedTextChunks = {};
     this.#bufferedSources.length = 0;
@@ -3365,10 +3508,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     this.#bufferedFiles.length = 0;
     this.#toolCalls.length = 0;
     this.#toolResults.length = 0;
-    this.#toolCallArgsDeltas = {};
-    this.#toolCallDeltaIdNameMap = {};
-    this.#toolCallStreamingMeta = {};
-    this.#pendingToolCalls = {};
+    this.#toolCallArgsDeltas = Object.create(null);
+    this.#toolCallDeltaIdNameMap = Object.create(null);
+    this.#toolCallStreamingMeta = Object.create(null);
+    this.#pendingToolCalls = Object.create(null);
+    this.#replaceableToolCallIds.clear();
+    this.#attemptToolCallIds.clear();
   }
 
   #createEventedStream() {
@@ -3379,6 +3524,16 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     // removeAllListeners() here would silently kill every other subscriber
     // (see #19743).
     let detach: (() => void) | undefined;
+    // Erroring a ReadableStream discards the chunks still queued for its reader, so a failure that
+    // arrives while this subscriber is behind waits in `pendingError` until `pull` sees the queue empty.
+    let pendingError: { error: unknown } | undefined;
+    const fail = (controller: ReadableStreamDefaultController<ChunkType<OUTPUT>>, error: unknown) => {
+      if ((controller.desiredSize ?? 0) > 0) {
+        controller.error(error);
+      } else {
+        pendingError = { error };
+      }
+    };
 
     return new ReadableStream<ChunkType<OUTPUT>>({
       start(controller) {
@@ -3390,7 +3545,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
         // If stream already finished, close immediately
         if (self.#streamFinished) {
           if (self.#consumeStreamErrored) {
-            controller.error(self.#consumeStreamError);
+            fail(controller, self.#consumeStreamError);
           } else {
             controller.close();
           }
@@ -3413,7 +3568,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
         };
         const errorHandler = (error: unknown) => {
           detachListeners();
-          controller.error(error);
+          fail(controller, error);
         };
 
         self.#emitter.on('chunk', chunkHandler);
@@ -3423,7 +3578,11 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
         detach = detachListeners;
       },
 
-      pull(_controller) {
+      pull(controller) {
+        if (pendingError) {
+          controller.error(pendingError.error);
+          return;
+        }
         // Only start consumption when someone is actively reading the stream
         if (!self.#consumptionStarted) {
           self.consumeStream().catch(error => {
@@ -3443,10 +3602,28 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     return this.#status;
   }
 
-  serializeState() {
+  /**
+   * @param pendingSuspension A suspension chunk the step has emitted but this output may not have
+   * processed yet. Tool suspension snapshots the stream state right after emitting the chunk, so
+   * the state is serialized as if the chunk was processed; otherwise a resumed run would not know
+   * which usage its suspended leg already reported.
+   *
+   * Fork (PF-5349, kept by the PF-5928 sync decision): the suspending step's usage reaches this
+   * output out of band through `_recordPendingSuspendedStepUsage` before the snapshot, never on
+   * the chunk; a `usage` passed here only fills that slot when nothing was recorded.
+   */
+  serializeState(pendingSuspension?: { usage?: LanguageModelUsage }) {
     const { steps, requests } = dedupeStepRequests(packStepMessageMirrors(this.#bufferedSteps));
+    const recordSuspension = pendingSuspension !== undefined;
+    const pendingSuspendedStepUsage = this.#pendingSuspendedStepUsage ?? toPendingStepUsage(pendingSuspension?.usage);
+    // Processing the suspension chunk records exactly this generation usage (see
+    // `#createSuspendedOnFinishPayload`), so the snapshot is the same whether or not the output
+    // has processed the chunk yet (upstream #27634).
+    const generationReportedUsage = recordSuspension
+      ? this.#getTotalUsage(this.#suspendedUsage(pendingSuspendedStepUsage))
+      : this.#generationReportedUsage;
     return {
-      status: this.#status,
+      status: recordSuspension ? 'suspended' : this.#status,
       bufferedSteps: steps,
       bufferedStepRequests: requests,
       bufferedReasoningDetails: this.#bufferedReasoningDetails,
@@ -3462,6 +3639,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       toolCallDeltaIdNameMap: this.#toolCallDeltaIdNameMap,
       toolCallStreamingMeta: this.#toolCallStreamingMeta,
       pendingToolCalls: this.#pendingToolCalls,
+      replaceableToolCallIds: [...this.#replaceableToolCallIds],
+      attemptToolCallIds: [...this.#attemptToolCallIds],
       toolCalls: this.#toolCalls,
       toolResults: this.#toolResults,
       warnings: this.#warnings,
@@ -3470,12 +3649,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
       usageCount: this.#usageCount,
       usageCountMissing: [...this.#usageCountMissing],
       lastStepUsage: this.#lastStepUsage,
-      generationReportedUsage: this.#generationReportedUsage,
+      generationReportedUsage,
       tripwire: this.#tripwire,
-      wasSuspended: this.#wasSuspended,
+      wasSuspended: this.#wasSuspended || recordSuspension,
       terminalToolResult: this.#terminalToolResult,
       loopStepCount: this.#loopStepCount,
-      ...(this.#pendingSuspendedStepUsage ? { pendingSuspendedStepUsage: this.#pendingSuspendedStepUsage } : {}),
+      ...(pendingSuspendedStepUsage ? { pendingSuspendedStepUsage } : {}),
       messageList: this.messageList.serialize(),
     };
   }
@@ -3491,10 +3670,12 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     this.#bufferedSources = state.bufferedSources;
     this.#bufferedReasoning = state.bufferedReasoning;
     this.#bufferedFiles = state.bufferedFiles;
-    this.#toolCallArgsDeltas = state.toolCallArgsDeltas;
-    this.#toolCallDeltaIdNameMap = state.toolCallDeltaIdNameMap;
-    this.#toolCallStreamingMeta = state.toolCallStreamingMeta ?? {};
-    this.#pendingToolCalls = state.pendingToolCalls ?? {};
+    this.#toolCallArgsDeltas = Object.assign(Object.create(null), state.toolCallArgsDeltas);
+    this.#toolCallDeltaIdNameMap = Object.assign(Object.create(null), state.toolCallDeltaIdNameMap);
+    this.#toolCallStreamingMeta = Object.assign(Object.create(null), state.toolCallStreamingMeta);
+    this.#pendingToolCalls = Object.assign(Object.create(null), state.pendingToolCalls);
+    this.#replaceableToolCallIds = new Set(state.replaceableToolCallIds ?? []);
+    this.#attemptToolCallIds = new Set(state.attemptToolCallIds ?? []);
     this.#toolCalls = state.toolCalls;
     this.#toolResults = state.toolResults;
     this.#warnings = state.warnings;

@@ -36,6 +36,7 @@ import type {
   StreamTextResult,
 } from '../llm/model/base.types';
 import { validateModelTimeoutSettings } from '../llm/model/model-settings';
+import type { MastraModelSettings } from '../llm/model/model-settings';
 import { MastraLLMVNext } from '../llm/model/model.loop';
 import { mergeProviderOptions } from '../llm/model/provider-options';
 import type { ProviderOptions } from '../llm/model/provider-options';
@@ -67,18 +68,19 @@ import { getMemoryRunState } from '../memory/run-state';
 import { checkThreadFGA } from '../memory/thread-fga';
 import { parseMemoryRequestContext } from '../memory/types';
 import type { MemoryConfig, MemoryConfigInternal } from '../memory/types';
-import {
-  resolveDeliveryFailureUpdate,
-  resolveNotificationDeliveryDecision,
-  type NotificationDeliveryPolicyInput,
-} from '../notifications/delivery-policy';
+import { resolveDeliveryFailureUpdate, resolveNotificationDeliveryDecision } from '../notifications/delivery-policy';
+import type { NotificationDeliveryPolicyInput } from '../notifications/delivery-policy';
 import { applyNotificationRoutingRequirement } from '../notifications/routing';
 import {
   createNotificationSignal,
   createNotificationSummarySignal,
   summarizeNotifications,
 } from '../notifications/signals';
-import type { NotificationDeliveryDecision, SendNotificationSignalInput } from '../notifications/types';
+import type {
+  NotificationDeliveryDecision,
+  NotificationRecord,
+  SendNotificationSignalInput,
+} from '../notifications/types';
 import type {
   DefinitionSource,
   TracingProperties,
@@ -118,6 +120,8 @@ import { WorkspaceInstructionsProcessor } from '../processors/processors/workspa
 import type { ProcessorState } from '../processors/runner';
 import { ProcessorRunner } from '../processors/runner';
 import { defaultStabilityErrorProcessors, STABILITY_ERROR_PROCESSOR_IDS } from '../processors/stability-defaults';
+import type { ProcessorStepOutput } from '../processors/step-schema';
+import { REPROCESS_PART_KEY, takeHeldParts } from '../processors/stream-reprocess';
 import {
   RequestContext,
   MASTRA_INHERITED_MEMORY_KEY,
@@ -233,7 +237,7 @@ import {
   withoutIdentityAgentScopes,
 } from './scopes';
 import type { AgentScopesSnapshot, ResolvedAgentScopes } from './scopes';
-import type { CreatedAgentSignal } from './signals';
+import type { AgentSignalInput, CreatedAgentSignal } from './signals';
 import { isCreatedAgentSignal, signalSpanAttributes } from './signals';
 import { runStreamUntilIdle, runResumeStreamUntilIdle, STREAM_UNTIL_IDLE_DEFAULT_OPTIONS } from './stream-until-idle';
 import type { SubAgent, SubAgentToolCall, SubAgentToolResult } from './subagent';
@@ -376,8 +380,9 @@ interface StandaloneDurableWrapper {
 const inFlightUnclaimedResumes = new Set<string>();
 
 /**
- * How long a resume claim may stay `pending` (claimed but not started) before a later resume
- * treats it as abandoned by a process that died, and takes the suspension over.
+ * How long a resume claim may stay unstarted (claimed but not started) before a later resume
+ * treats it as abandoned by a process that died, and takes the suspension over. Fork (PF-6640):
+ * a `running` claim is never taken over; see `#claimSuspendedAgenticLoopRun`.
  */
 export const AGENT_RESUME_CLAIM_STALE_MS = 60_000;
 
@@ -1513,19 +1518,56 @@ export class Agent<
     return (runId, scope) => agentThreadStreamRuntime.drainPendingSignals(runId, pubsub, scope);
   }
 
+  /**
+   * Returns a closure that queues a signal on a durable run through
+   * `sendSignal`, so the run's drain delivers it to the next model request.
+   * @internal
+   */
+  __getEnqueuePendingSignal(): (
+    target: { runId: string; resourceId?: string; threadId?: string },
+    signalInput: AgentSignalInput,
+  ) => Promise<CreatedAgentSignal> {
+    return async (target, signalInput) => {
+      // A held processor callback belongs to its original run. Never wake a
+      // new run or follow a newer owner of the same thread after it finishes.
+      if (!agentThreadStreamRuntime.listActiveThreadRuns(this.getPubSub()).some(run => run.runId === target.runId)) {
+        throw new Error(`Cannot send processor signal: run ${target.runId} is no longer active`);
+      }
+      const result = this.sendSignal(signalInput, { runId: target.runId });
+      const accepted = await result.accepted;
+      if (accepted.action !== 'deliver' || accepted.runId !== target.runId) {
+        throw new Error(`Processor signal was not delivered to run ${target.runId}`);
+      }
+      return result.signal;
+    };
+  }
+
   /** @internal */
   __getSubscribePendingSignals(): (runId: string, listener: () => void) => () => void {
     const pubsub = this.getPubSub();
     return (runId, listener) => agentThreadStreamRuntime.subscribePendingSignals(runId, listener, pubsub);
   }
 
-  /** @internal Read one JSON-safe request-context value captured in a suspended run snapshot. */
-  async __getSuspendedRunRequestContextValue({ runId, key }: { runId: string; key: string }): Promise<unknown> {
+  /**
+   * @internal Read one JSON-safe request-context value captured in a suspended run snapshot.
+   * Pass the suspended `toolCallId` to wait (bounded) for its snapshot: a suspension can be
+   * answered while its segment is still persisting the suspended snapshot (PF-6640 sync).
+   */
+  async __getSuspendedRunRequestContextValue({
+    runId,
+    key,
+    toolCallId,
+  }: {
+    runId: string;
+    key: string;
+    toolCallId?: string;
+  }): Promise<unknown> {
     try {
       // Fork: the loader returns the row's storage-owned resource id alongside the snapshot.
       const { snapshot } = await this.#loadAgenticLoopSnapshotOrThrow({
         runId,
         method: '__getSuspendedRunRequestContextValue',
+        ...(toolCallId === undefined ? {} : { waitForToolCallId: toolCallId }),
       });
       return snapshot.requestContext?.[key];
     } catch (error) {
@@ -2666,6 +2708,7 @@ export class Agent<
     const stateSignalProcessors: Processor[] = [];
     const processorPhases = new Set<ProcessorWorkflowPhase>();
     const streamSteps: ReturnType<typeof createStepFromProcessor>[] = [];
+    const streamProcessorIds: string[] = [];
 
     for (const [index, processorOrWorkflow] of validProcessors.entries()) {
       for (const phase of getProcessorWorkflowPhases(processorOrWorkflow)) {
@@ -2684,6 +2727,7 @@ export class Agent<
         step = processorStep;
         if (processor.processOutputStream) {
           streamSteps.push(processorStep);
+          streamProcessorIds.push(processor.id);
         }
         const toolProvider = processor as ProcessorLoadedToolsProvider;
         if (typeof toolProvider.getLoadedToolsForRequestContext === 'function') {
@@ -2720,6 +2764,40 @@ export class Agent<
             result = await step.execute({ inputData: result, ...context });
           }
           return result;
+        };
+        committedWorkflow.__flushOutputStream = async ({ inputData, ...context }) => {
+          const released: ChunkType[] = [];
+          const { processorStates } = inputData as { processorStates?: Map<string, ProcessorState> };
+          // Runs a part through the steps from `start` on. A part a step stashes for
+          // reprocessing re-enters at that step, never upstream, where a holder that
+          // has already released everything would keep it.
+          const runFrom = async (part: ChunkType, start: number): Promise<void> => {
+            let result: ProcessorStepOutput = { ...inputData, part };
+            const stashed: Array<[ChunkType, number]> = [];
+            for (let index = start; index < streamSteps.length && result.part != null; index++) {
+              result = await streamSteps[index]!.execute({ inputData: result, ...context });
+              const custom = processorStates?.get(streamProcessorIds[index]!)?.customState;
+              if (custom?.[REPROCESS_PART_KEY]) {
+                stashed.push([custom[REPROCESS_PART_KEY] as ChunkType, index]);
+                delete custom[REPROCESS_PART_KEY];
+              }
+            }
+            if (result.part != null) released.push(result.part as ChunkType);
+            for (const [next, index] of stashed) await runFrom(next, index);
+          };
+          for (const index of streamSteps.keys()) {
+            const held = await takeHeldParts(processorStates?.get(streamProcessorIds[index]!)?.customState);
+            for (const part of held) await runFrom(part, index + 1);
+          }
+          return released;
+        };
+        committedWorkflow.__discardOutputStream = async processorStates => {
+          // A later processor holds parts that passed the earlier ones first, so it goes first.
+          const kept: ChunkType[] = [];
+          for (const id of [...streamProcessorIds].reverse()) {
+            kept.push(...(await takeHeldParts(processorStates?.get(id)?.customState, { discard: true })));
+          }
+          return kept;
         };
       }
     }
@@ -3890,6 +3968,18 @@ export class Agent<
     });
   }
 
+  /** @internal Validate context-independent timeout settings without invoking dynamic defaults. */
+  public __validateStaticModelTimeoutSettings(modelSettings?: MastraModelSettings): void {
+    const defaults = typeof this.#defaultOptions === 'function' ? undefined : this.#defaultOptions.modelSettings;
+    validateModelTimeoutSettings(
+      (
+        deepMerge(defaults ?? {}, modelSettings ?? {}) as {
+          timeout?: Parameters<typeof validateModelTimeoutSettings>[0];
+        }
+      ).timeout,
+    );
+  }
+
   /**
    * Gets the default options for this agent, resolving function-based options if necessary.
    * These options are used as defaults when calling `stream()` or `generate()` without explicit options.
@@ -4497,10 +4587,19 @@ export class Agent<
     };
   }
 
-  reorderModels(modelIds: string[]) {
+  /**
+   * Reorders a static model list. Returns false when `model` is not an array (including
+   * function-valued models, whose selection is resolved per request and cannot be edited in place).
+   */
+  reorderModels(modelIds: string[]): boolean {
     if (!Array.isArray(this.model)) {
       this.logger.warn('Model is not an array', { agent: this.name });
-      return;
+      return false;
+    }
+
+    if (!(this.model as ModelFallbacks).some(m => modelIds.includes(m.id))) {
+      this.logger.warn('No matching model ids to reorder', { agent: this.name });
+      return false;
     }
 
     // TypeScript sees this.model as ModelWithRetries[] | ModelFallbacks after Array.isArray check.
@@ -4513,6 +4612,7 @@ export class Agent<
       const bPos = bIndex === -1 ? Infinity : bIndex;
       return aPos - bPos;
     });
+    return true;
   }
 
   updateModelInModelList({
@@ -4525,10 +4625,10 @@ export class Agent<
     model?: DynamicArgument<MastraModelConfig>;
     enabled?: boolean;
     maxRetries?: number;
-  }) {
+  }): boolean {
     if (!Array.isArray(this.model)) {
       this.logger.warn('Model is not an array', { agent: this.name });
-      return;
+      return false;
     }
 
     // TypeScript sees this.model as ModelWithRetries[] | ModelFallbacks after Array.isArray check.
@@ -4538,7 +4638,7 @@ export class Agent<
     const modelToUpdate = modelArray.find(m => m.id === id);
     if (!modelToUpdate) {
       this.logger.warn('Model not found', { agent: this.name, modelId: id });
-      return;
+      return false;
     }
 
     this.model = modelArray.map(mdl => {
@@ -4553,6 +4653,7 @@ export class Agent<
       }
       return mdl;
     });
+    return true;
   }
 
   #primitives?: MastraPrimitives;
@@ -6190,7 +6291,10 @@ export class Agent<
           toolToConvert = tool;
         } else {
           const { execute, ...toolRest } = tool;
-          toolToConvert = toolRest;
+          toolToConvert =
+            'renderOnly' in tool && tool.renderOnly
+              ? { ...toolRest, execute: async () => ({ acknowledged: true }) }
+              : toolRest;
         }
         const options: ToolOptions = {
           name: toolName,
@@ -8800,6 +8904,18 @@ export class Agent<
    * Used by resumeStream and resumeGenerate to fail fast at the agent boundary.
    * @internal
    */
+  #throwIfRunAborted(runId: string) {
+    if (agentThreadStreamRuntime.isResumeFenced(runId, this.getPubSub())) {
+      throw new MastraError({
+        id: 'AGENT_RESUME_ABORTED_RUN',
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: `Agent "${this.name}" cannot resume aborted run "${runId}".`,
+        details: { agentName: this.name, runId },
+      });
+    }
+  }
+
   async #loadAgenticLoopSnapshotOrThrow({
     runId,
     method,
@@ -8816,6 +8932,8 @@ export class Agent<
       options?: AgenticLoopResumeOwnershipOptions;
     };
   }): Promise<{ resourceId: string | undefined; snapshot: WorkflowRunState }> {
+    // Upstream (#27791): resuming a run that abortRunStream()/abortThreadStream() fenced fails fast.
+    this.#throwIfRunAborted(runId);
     const effectiveMastra = this.#mastra ?? (await this.#getOrCreateEphemeralMastra());
     const workflowsStore = await effectiveMastra?.getStorage()?.getStore('workflows');
     let workflowRun: { resourceId?: unknown; snapshot?: unknown } | null | undefined;
@@ -8829,6 +8947,8 @@ export class Agent<
         ? (workflowRun.snapshot as WorkflowRunState)
         : undefined;
     const workflowRunStatus = workflowRunSnapshot?.status;
+    // Upstream (#26688): a row that is still `running` (a segment settling into its next
+    // suspension, e.g. a batch resume's sibling) is polled until it settles, bounded by the poll.
     const shouldPoll =
       !workflowRunSnapshot ||
       workflowRunStatus === 'pending' ||
@@ -8865,6 +8985,9 @@ export class Agent<
         })
       : workflowRunSnapshot;
 
+    // Upstream (#27617): an abort that lands while the snapshot loads fences the run; report it
+    // before the fork reserves the thread, whose aborted reservation would fail less clearly.
+    this.#throwIfRunAborted(runId);
     // The run was claimed by another resume while we waited, then finished and was cleaned up.
     if (claimedThenFinished) throw alreadyClaimedResumeError({ agentName: this.name, method, runId });
 
@@ -9556,6 +9679,13 @@ export class Agent<
    * Once it is older than `AGENT_RESUME_CLAIM_STALE_MS`, a later resume hands the suspension back
    * and claims it again. A live claimant that loses the suspension this way fails in `start()`.
    *
+   * Fork (PF-6640 sync): upstream #27791 also holds the claim as a run-ownership lease and lets a
+   * later resume take over a `running` claim whose lease lapsed (re-running the in-flight tool).
+   * That takeover is not adopted: the fork's PF-4389 lineage claim never passes through `pending`,
+   * `start()` clears the claim stamp, and a stranded `running` lineage is recovered only through
+   * the fork's fenced restart path (PF-6181), never by a second resume. A `running` claim is
+   * therefore never taken over here, as upstream does on stores without run fencing.
+   *
    * `claim.release()` is idempotent. The loop calls it when the resumed run ends; resume methods
    * also call it on any failure before or after handing the claim to the loop. It hands the
    * suspension back to later callers only if the resumed run never started executing.
@@ -9577,6 +9707,8 @@ export class Agent<
 
     const effectiveMastra = this.#mastra ?? (await this.#getOrCreateEphemeralMastra());
     const workflowsStore = await effectiveMastra?.getStorage()?.getStore('workflows');
+    // The run may have been aborted while the snapshot was loading or validating; recheck with no await before claiming.
+    this.#throwIfRunAborted(runId);
 
     if (!workflowsStore?.supportsConcurrentUpdates()) {
       if (workflowsStore) {
@@ -9853,6 +9985,16 @@ export class Agent<
         });
       }
       return persisted;
+    }
+    return undefined;
+  }
+
+  /** The run-level `returnScorerData` a suspended run started with, persisted beside its stream state. */
+  #getSnapshotReturnScorerData(existingSnapshot: WorkflowRunState | null | undefined): boolean | undefined {
+    for (const key in existingSnapshot?.context) {
+      const step = existingSnapshot?.context[key];
+      const persisted = step?.status === 'suspended' ? step.suspendPayload?.__returnScorerData : undefined;
+      if (typeof persisted === 'boolean') return persisted;
     }
     return undefined;
   }
@@ -10227,7 +10369,10 @@ export class Agent<
       resolvedModel !== null &&
       'gatewayId' in resolvedModel &&
       resolvedModel.gatewayId === 'mastra';
-    if (resourceId && threadFromArgs && !this.hasOwnMemory() && !isGatewayModel) {
+    // Only warn for ids the caller passed in `memory` args. Reserved request-context ids are set
+    // per request (auth middleware, AgentController) and inherited by every agent in that request,
+    // including internal memory-less agents such as the OM Observer and Reflector.
+    if (options.memory?.resource && options.memory?.thread && !this.hasOwnMemory() && !isGatewayModel) {
       this.logger.warn('No memory is configured but resourceId and threadId were passed in args', { agent: this.name });
     }
 
@@ -11315,6 +11460,7 @@ export class Agent<
       callScopes: options?.scopes,
       defaultScopes: defaultOptions?.scopes,
     });
+    validateModelTimeoutSettings(mergedOptions.modelSettings?.timeout);
 
     // Pin the runId before execution so the replacement tool-surface fence can
     // be keyed (and later cleared/suspended) against a concrete run identifier.
@@ -11361,7 +11507,7 @@ export class Agent<
         text:
           specVersion === 'v1'
             ? `Agent "${this.name}" is using AI SDK v4 model (${provider}:${modelId}) which is not compatible with generate(). Please use AI SDK v5+ models or call the generateLegacy() method instead. See https://mastra.ai/en/docs/streaming/overview for more information.`
-            : `Agent "${this.name}" has a model (${provider}:${modelId}) with unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
+            : `Agent "${this.name}" has a model (${provider}:${modelId}) with unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6), v4 (AI SDK v7). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
         details: {
           agentName: this.name,
           modelId,
@@ -11793,7 +11939,8 @@ export class Agent<
     const runId = agentThreadStreamRuntime.getActiveThreadRunId(options, pubsub);
     const parked = !!runId && agentThreadStreamRuntime.isRunParked(runId, pubsub);
     const aborted = agentThreadStreamRuntime.abortThread(options, pubsub);
-    if (aborted && parked) void this.#deleteAbortedSuspendedRun(runId);
+    // Upstream (#27907): a local-only abort (host disconnect) keeps the parked approval resumable.
+    if (aborted && parked && !options.localOnly) void this.#deleteAbortedSuspendedRun(runId);
     return aborted;
   }
 
@@ -11809,12 +11956,22 @@ export class Agent<
   }
 
   /**
+   * Fork (PF-6640 sync): the cleanup a prepared run keeps for #27791. Built here, not inline in
+   * stream()/resumeStream(), so the closure's context holds only the run id: an inline arrow
+   * shares the caller's context and kept a thread-less run's unconsumed output from being
+   * garbage collected (the prepared run holds this closure until that output is collected).
+   */
+  #abortedSuspendedRunCleanup(runId: string): () => Promise<boolean> {
+    return () => this.#deleteAbortedSuspendedRun(runId);
+  }
+
+  /**
    * An aborted suspended run can never be resumed, so drop its workflow
    * registration and snapshot rows; otherwise it stays listed as suspended.
    */
-  async #deleteAbortedSuspendedRun(runId: string): Promise<void> {
-    const mastra = this.#mastra;
-    if (!mastra) return;
+  async #deleteAbortedSuspendedRun(runId: string): Promise<boolean> {
+    const mastra = this.#mastra ?? this.#ephemeralMastra;
+    if (!mastra) return true;
     const runtimeLoopWorkflowName = (
       this.#threadRuntimeAgent as Partial<Pick<DurableAgentLike, 'durableLoopWorkflowName'>> | undefined
     )?.durableLoopWorkflowName;
@@ -11831,8 +11988,10 @@ export class Agent<
       await Promise.all(
         [...workflowNames].map(workflowName => workflowsStore?.deleteWorkflowRunById({ runId, workflowName })),
       );
+      return true;
     } catch (error) {
       this.logger.warn(`Failed to delete snapshot of aborted suspended run ${runId}`, { runId, error });
+      return false;
     }
   }
 
@@ -11965,12 +12124,19 @@ export class Agent<
       this.getPubSub(),
     );
     const now = new Date();
-    const planned = [];
+    const planned: Array<
+      | { record: NotificationRecord; decision: NotificationDeliveryDecision }
+      | { record: NotificationRecord; error: unknown }
+    > = [];
     for (const record of records) {
-      planned.push({
-        record,
-        decision: await this.resolveNotificationDeliveryDecision({ now, record, threadState }),
-      });
+      try {
+        planned.push({
+          record,
+          decision: await this.resolveNotificationDeliveryDecision({ now, record, threadState }),
+        });
+      } catch (error) {
+        planned.push({ record, error });
+      }
     }
 
     const results: SendAgentNotificationSignalResult<OUTPUT>[] = [];
@@ -11978,7 +12144,29 @@ export class Agent<
     // those are delivered later by the notification dispatch workflow, so the
     // dispatcher schedule (and scheduler) must be lazily activated.
     let needsDispatcher = false;
-    for (const { record, decision } of planned) {
+    for (const entry of planned) {
+      const { record } = entry;
+      if ('error' in entry) {
+        // The record already exists with no schedule, so a throwing policy here
+        // would leave it pending forever: no dispatch pass considers it due.
+        // Fail this attempt and give it a due time, as a dispatch-time throw
+        // does, so the dispatcher retries it up to the attempt limit.
+        const failed = await notifications.updateNotification({
+          id: record.id,
+          threadId: record.threadId,
+          deliverAt: now,
+          ...resolveDeliveryFailureUpdate(record),
+          lastDeliveryAttemptAt: new Date(),
+          lastDeliveryError: entry.error instanceof Error ? entry.error.message : String(entry.error),
+        });
+        needsDispatcher = true;
+        results.push({
+          record: failed,
+          decision: { action: 'defer', deliverAt: now, reason: 'delivery-policy-failed' },
+        });
+        continue;
+      }
+      const { decision } = entry;
       if (decision.action === 'discard') {
         const updated = await notifications.updateNotification({
           id: record.id,
@@ -12596,7 +12784,7 @@ export class Agent<
           text:
             specVersion === 'v1'
               ? `Agent "${this.name}" is using AI SDK v4 model (${provider}:${modelId}) which is not compatible with stream(). Please use AI SDK v5+ models or call the streamLegacy() method instead. See https://mastra.ai/en/docs/streaming/overview for more information.`
-              : `Agent "${this.name}" has a model (${provider}:${modelId}) with unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
+              : `Agent "${this.name}" has a model (${provider}:${modelId}) with unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6), v4 (AI SDK v7). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
           details: {
             agentName: this.name,
             modelId,
@@ -12678,6 +12866,8 @@ export class Agent<
         mergedOptions,
         pubsub,
         this as Agent<any, any, any, any>,
+        // Upstream (#27791): an abort that fences this run's suspension drops its stored rows.
+        this.#abortedSuspendedRunCleanup(mergedOptions.runId!),
       );
       preparedOptionsWithPubSub = { ...preparedOptions, _pubsub: pubsub };
       this.#rememberThreadStreamPubSub(preparedOptionsWithPubSub, pubsub);
@@ -13128,6 +13318,9 @@ export class Agent<
       streamOptions = snapshot.value;
       transferSnapshottedSuspendedToolSurfaceFence(streamOptions, snapshot.requestContextSnapshots);
     }
+    // Upstream (#28030): validate timeouts before touching the persisted run. Only
+    // context-independent settings here; dynamic defaults are checked after preflight.
+    this.__validateStaticModelTimeoutSettings(streamOptions?.modelSettings);
     const pubsub =
       ((streamOptions as any)?._pubsub as PubSub | undefined) ?? this.getPubSub() ?? defaultAgentThreadPubSub;
     const toolSurfaceFenceOwnerId = randomUUID();
@@ -13190,6 +13383,13 @@ export class Agent<
     defaultOptions ??= (await this.getDefaultOptions({
       requestContext: requestContextToUse,
     })) as AgentExecutionOptions<TOutput>;
+    // Upstream (#28030): resolved defaults are validated before any resume work starts.
+    validateModelTimeoutSettings(
+      mergeAgentExecutionOptions(
+        defaultOptions as Record<string, unknown>,
+        (streamOptionsWithPubSub ?? {}) as Record<string, unknown>,
+      ).modelSettings?.timeout,
+    );
     // A default `untilIdle` takes the idle loop too (see `stream`). Nothing is
     // reserved yet. Calls from inside the loop carry its defaults and never
     // re-enter it.
@@ -13315,6 +13515,8 @@ export class Agent<
         defaultOptions as Record<string, unknown>,
         (streamOptionsWithSnapshotTarget ?? {}) as Record<string, unknown>,
       ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+      // Upstream (#28030): resume validates timeouts like generation does.
+      validateModelTimeoutSettings(mergedStreamOptions.modelSettings?.timeout);
       if (mergedStreamOptions.toolsetsMode === 'replace') {
         if (streamOptionsWithSnapshotTarget?.toolsetsMode === 'replace') {
           mergedStreamOptions.toolsets = streamOptionsWithSnapshotTarget.toolsets ?? {};
@@ -13340,6 +13542,12 @@ export class Agent<
       // Scope resolution keeps (or replaces with a run-scoped copy) the context set just above.
       mergedStreamOptions.requestContext ??= ownershipOptions.requestContext;
       fenceRequestContext = mergedStreamOptions.requestContext;
+      // Upstream (#27747): precedence is resume call > the run's own flag > defaultOptions (merged above).
+      const persistedReturnScorerData =
+        streamOptionsWithSnapshotTarget?.returnScorerData === undefined
+          ? this.#getSnapshotReturnScorerData(existingSnapshot)
+          : undefined;
+      if (persistedReturnScorerData !== undefined) mergedStreamOptions.returnScorerData = persistedReturnScorerData;
       // Upstream (#27130): reject resume data that fails the tool's resumeSchema while still suspended.
       await this.#validateToolResumeData({
         snapshot: existingSnapshot,
@@ -13444,7 +13652,7 @@ export class Agent<
           text:
             specVersion === 'v1'
               ? 'V1 models are not supported for resumeStream. Please use streamLegacy instead.'
-              : `Model has unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
+              : `Model has unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6), v4 (AI SDK v7). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
           details: {
             modelId: modelInfo.modelId,
             provider: modelInfo.provider,
@@ -13529,6 +13737,9 @@ export class Agent<
       const preparedOptions = agentThreadStreamRuntime.prepareRunOptions(
         mergedStreamOptions as unknown as AgentExecutionOptions<OUTPUT>,
         pubsub,
+        undefined,
+        // Upstream (#27791): an abort that fences this resumed suspension drops its stored rows.
+        this.#abortedSuspendedRunCleanup(runId),
       );
       preparedOptionsWithPubSub = { ...preparedOptions, _pubsub: pubsub };
       this.#rememberThreadStreamPubSub(preparedOptionsWithPubSub, pubsub);
@@ -13713,6 +13924,8 @@ export class Agent<
       options = snapshot.value;
       transferSnapshottedSuspendedToolSurfaceFence(options, snapshot.requestContextSnapshots);
     }
+    // Upstream (#28030): validate timeouts before touching the persisted run (see resumeStream).
+    this.__validateStaticModelTimeoutSettings(options?.modelSettings);
     const requestContextToUse = options?.requestContext;
     const toolSurfaceFenceOwnerId = randomUUID();
     let defaultOptions: AgentExecutionOptions<TOutput> | undefined;
@@ -13754,6 +13967,8 @@ export class Agent<
       defaultOptions as Record<string, unknown>,
       (options ?? {}) as Record<string, unknown>,
     ) as typeof defaultOptions & { model?: DynamicArgument<MastraModelConfig> };
+    // Upstream (#28030): resume validates timeouts like generation does.
+    validateModelTimeoutSettings(mergedBaseOptions.modelSettings?.timeout);
     mergedBaseOptions.requestContext ??= new RequestContext();
     if (mergedBaseOptions.toolsetsMode === 'replace') {
       if (options?.toolsetsMode === 'replace') {
@@ -13801,6 +14016,10 @@ export class Agent<
     }
     this.#assertAgenticLoopSuspendedToolCall(existingSnapshot, runId, requestedToolCallId);
     const persistedToolSurfaceFence = this.#getAgenticLoopSnapshotToolSurfaceFence(existingSnapshot);
+    // Upstream (#27747): precedence is resume call > the run's own flag > defaultOptions (merged above).
+    const persistedReturnScorerData =
+      options?.returnScorerData === undefined ? this.#getSnapshotReturnScorerData(existingSnapshot) : undefined;
+    if (persistedReturnScorerData !== undefined) mergedBaseOptions.returnScorerData = persistedReturnScorerData;
     // Upstream (#26593): a resumed run keeps the scopes it suspended with. Ownership above is
     // verified against the caller's own options; execution uses the run-scoped copy.
     const { options: mergedOptions, resolved: resolvedScopes } = await this.#resolveRunScopes(mergedBaseOptions, {
@@ -13850,7 +14069,7 @@ export class Agent<
         text:
           specVersion === 'v1'
             ? `Agent "${this.name}" is using AI SDK v4 model (${provider}:${modelId}) which is not compatible with generate(). Please use AI SDK v5+ models or call the generateLegacy() method instead. See https://mastra.ai/en/docs/streaming/overview for more information.`
-            : `Agent "${this.name}" has a model (${provider}:${modelId}) with unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
+            : `Agent "${this.name}" has a model (${provider}:${modelId}) with unrecognized specificationVersion "${specVersion}". Supported versions: v1 (legacy), v2 (AI SDK v5), v3 (AI SDK v6), v4 (AI SDK v7). Please ensure your AI SDK provider is compatible with this version of Mastra.`,
         details: {
           agentName: this.name,
           modelId,
