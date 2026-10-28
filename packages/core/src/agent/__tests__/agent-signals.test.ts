@@ -15452,13 +15452,20 @@ describe('Agent signals', () => {
       const ctx = await startIdleWakeWithFollowUps('pf6944-min-sibling', 1, { queuedIdleSibling: true });
       const [followUpId] = ctx.followUpIds;
       const successorRunId = `${ctx.winnerRunId}-successor`;
+      // The wake's rollback dispatches the queued sibling at once (as on fork main); hold the
+      // sibling's lease acquisition so that it reserves the thread but loses to a later owner.
+      let releaseSiblingAcquire!: () => void;
+      ctx.pubsub.acquireLeaseWait = new Promise<void>(resolve => {
+        releaseSiblingAcquire = resolve;
+      });
       ctx.pubsub.ownerReadDelayMs = 30;
       ctx.loseLease();
-      // The wake's hand-off cannot verify its winner (the lease moved on), so it keeps the
-      // follow-up. Only then does the queued sibling drain; it loses to the new owner too.
+      // The wake's hand-off cannot verify its winner (the sibling holds the local reservation
+      // and the lease moves on), so it keeps the follow-up. The sibling then loses too.
       await waitForCondition(() => ctx.forwardedTo(ctx.winnerRunId).includes(ctx.wakeId));
       ctx.pubsub.owners.set(ctx.key, encodedOwner(successorRunId, 'pf6944-successor-source'));
       await expect(ctx.wake.accepted).resolves.toMatchObject({ action: 'deliver', runId: ctx.winnerRunId });
+      releaseSiblingAcquire();
 
       // The sibling's lease loss forwards the kept follow-up to its verified winner instead of
       // clearing it.
@@ -15473,6 +15480,89 @@ describe('Agent signals', () => {
       expect(ctx.agent.stream).not.toHaveBeenCalled();
       // ... and not also kept for a local run.
       expect(await ctx.nextLocalRunPreRunIds()).toEqual([]);
+    });
+
+    // Loses the wake's lease, then holds the queued idle sibling's own lease acquisition and
+    // queues one follow-up behind the sibling's reservation.
+    async function queueFollowUpBehindSiblingDrain(ctx: Awaited<ReturnType<typeof startIdleWakeWithFollowUps>>) {
+      const sibling = ctx.sibling!;
+      let releaseSiblingAcquire!: () => void;
+      ctx.pubsub.acquireLeaseWait = new Promise<void>(resolve => {
+        releaseSiblingAcquire = resolve;
+      });
+      let markSiblingAcquireStarted!: () => void;
+      const siblingAcquireStarted = new Promise<void>(resolve => {
+        markSiblingAcquireStarted = resolve;
+      });
+      ctx.pubsub.onAcquireLease = markSiblingAcquireStarted;
+      ctx.loseLease();
+      await expect(ctx.wake.accepted).resolves.toMatchObject({ action: 'deliver', runId: ctx.winnerRunId });
+      await siblingAcquireStarted;
+      const scope = { resourceId: ctx.resourceId, threadId: ctx.threadId };
+      expect(ctx.runtime.getActiveThreadRunId(scope, ctx.pubsub)).toBe(sibling.runId);
+      const followUpSignal = { id: `${ctx.wakeId}-sibling-follow-up`, type: 'user-message', contents: 'f' } as const;
+      const followUp = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+      expect(followUp.runId).toBe(sibling.runId);
+      await expect(followUp.accepted).resolves.toMatchObject({ action: 'deliver', runId: sibling.runId });
+      return { sibling, scope, followUpSignal, releaseSiblingAcquire };
+    }
+
+    it('keeps the admission record of a follow-up the queued idle sibling retains, so a retry runs nothing twice', async () => {
+      const ctx = await startIdleWakeWithFollowUps('pf6944-min-sibling-admission', 0, { queuedIdleSibling: true });
+      const { sibling, scope, followUpSignal, releaseSiblingAcquire } = await queueFollowUpBehindSiblingDrain(ctx);
+      // The sibling loses the lease too, and its winner moves on before verification, so the
+      // follow-up stays queued locally.
+      ctx.pubsub.ownerReadDelayMs = 30;
+      releaseSiblingAcquire();
+      await waitForCondition(() => ctx.forwardedTo(ctx.winnerRunId).includes(sibling.signal.id));
+      ctx.pubsub.owners.set(ctx.key, encodedOwner(`${ctx.winnerRunId}-successor`, 'pf6944-successor-source'));
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // A retry of the kept follow-up is a duplicate, not a new wake that runs it a second time ...
+      const retry = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+      void retry.accepted.catch(() => {});
+      expect(retry.runId).toBe(sibling.runId);
+      await expect(retry.accepted).resolves.toMatchObject({ action: 'deliver', runId: sibling.runId });
+      // ... and the same id with different contents is still a conflict.
+      expect(() =>
+        ctx.runtime.sendSignal(ctx.agent, { ...followUpSignal, contents: 'changed' }, scope, ctx.pubsub),
+      ).toThrow('already accepted with a different payload');
+      expect(ctx.agent.stream).not.toHaveBeenCalled();
+      expect(await ctx.nextLocalRunPreRunIds()).toEqual([followUpSignal.id]);
+    });
+
+    it('dispatches the queued idle sibling while the lost wake publish is still unsettled', async () => {
+      const ctx = await startIdleWakeWithFollowUps('pf6944-min-held-publish', 0, { queuedIdleSibling: true });
+      const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
+      vi.spyOn(ctx.pubsub, 'publish').mockImplementation((topic, event) =>
+        event.data?.type === 'signal-enqueued' && event.data?.signal?.id === ctx.wakeId
+          ? new Promise<void>(() => {})
+          : realPublish(topic, event),
+      );
+      ctx.loseLease();
+      // The sibling drains, loses to the same winner and hands its signal over.
+      await vi.waitFor(() => expect(ctx.forwardedTo(ctx.winnerRunId)).toEqual([ctx.sibling!.signal.id]));
+      expect(ctx.agent.stream).not.toHaveBeenCalled();
+    });
+
+    it('keeps a follow-up behind a queued idle sibling whose own forward publish fails', async () => {
+      const ctx = await startIdleWakeWithFollowUps('pf6944-min-sibling-publish-fails', 0, { queuedIdleSibling: true });
+      const { sibling, followUpSignal, releaseSiblingAcquire } = await queueFollowUpBehindSiblingDrain(ctx);
+      const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
+      const publishSpy = vi.spyOn(ctx.pubsub, 'publish').mockImplementation(async (topic, event) => {
+        if (event.data?.type === 'signal-enqueued' && event.data?.signal?.id === sibling.signal.id) {
+          throw new Error('injected sibling publish failure before delivery');
+        }
+        await realPublish(topic, event);
+      });
+      releaseSiblingAcquire();
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // The follow-up is not forwarded past the failed sibling signal ...
+      expect(ctx.forwardedTo(ctx.winnerRunId)).toEqual([ctx.wakeId]);
+      publishSpy.mockRestore();
+      // ... and is kept for the next local run, as the direct wake keeps it on the same failure.
+      expect(await ctx.nextLocalRunPreRunIds()).toEqual([followUpSignal.id]);
     });
 
     it('fences a follow-up whose forward publish fails and keeps the input behind it', async () => {

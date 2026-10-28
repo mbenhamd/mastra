@@ -4866,11 +4866,16 @@ export class AgentThreadStreamRuntime {
     this.#clearSignalAdmissionCleanupIfEmpty(state);
   }
 
-  #forgetSignalAdmissionsForRun(state: AgentThreadRuntimeState, key: string, runId: string): void {
+  #forgetSignalAdmissionsForRun(
+    state: AgentThreadRuntimeState,
+    key: string,
+    runId: string,
+    keepSignalIds?: ReadonlySet<string>,
+  ): void {
     const admissions = state.signalAdmissionsByThread.get(key);
     if (!admissions) return;
     for (const [signalId, retained] of admissions) {
-      if (retained.runId === runId) admissions.delete(signalId);
+      if (retained.runId === runId && !keepSignalIds?.has(signalId)) admissions.delete(signalId);
     }
     if (admissions.size === 0) state.signalAdmissionsByThread.delete(key);
     this.#clearSignalAdmissionCleanupIfEmpty(state);
@@ -4962,6 +4967,12 @@ export class AgentThreadStreamRuntime {
       callerOwnedHandoff?: boolean;
       /** Keep the thread's pending/pre-run queues (see the abortRun follow-up branch). */
       preserveQueuedInput?: boolean;
+      /**
+       * PF-6944: with `rejectOutputWaiters`, keep the admission records of the
+       * input still queued on the thread. That input is kept (and later run or
+       * forwarded), so a retry of its signal id must stay a duplicate/conflict.
+       */
+      retainQueuedInputAdmissions?: boolean;
     } = {},
   ) {
     const ownsThread = state.activeThreadRunIds.get(key) === runId || state.threadKeysByRunId.get(runId) === key;
@@ -5005,7 +5016,14 @@ export class AgentThreadStreamRuntime {
     this.#forgetCallerSignalsForRun(state, runId);
     this.#resolveReservationWaiters(state, runId);
     if (options.rejectOutputWaiters) {
-      this.#forgetSignalAdmissionsForRun(state, key, runId);
+      const queuedSignalIds = options.retainQueuedInputAdmissions
+        ? new Set(
+            [...(state.preRunSignalsByThread.get(key) ?? []), ...(state.pendingSignalsByThread.get(key) ?? [])].map(
+              signal => signal.id,
+            ),
+          )
+        : undefined;
+      this.#forgetSignalAdmissionsForRun(state, key, runId, queuedSignalIds);
       const error = wasAborted
         ? new Error(`Agent thread run id "${runId}" has been aborted`)
         : new Error(`Agent thread run id "${runId}" was rejected`);
@@ -7978,8 +7996,10 @@ export class AgentThreadStreamRuntime {
           clearAbort: true,
           rejectOutputWaiters: true,
           // PF-6944: queued input (including input retained by an earlier idle
-          // wake's lease loss) is forwarded below, never cleared here.
+          // wake's lease loss) is forwarded below, never cleared here, and keeps
+          // its admission records so a retry of it is not admitted again.
           preserveQueuedInput: true,
+          retainQueuedInputAdmissions: true,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(pendingIdle.runId);
@@ -7995,13 +8015,18 @@ export class AgentThreadStreamRuntime {
       this.#notifyThreadEvents(state);
       if (owns.owner) {
         this.#readdressLocallyQueuedSignal(state, key, pendingIdle.signal.id, owns.owner);
-        await this.#publishAndWait(pubsub, key, {
+        const published = await this.#publishAndWait(pubsub, key, {
           type: 'signal-enqueued',
           runId: owns.owner,
           signal: this.#serializeSignal(pendingIdle.signal),
           sourceId: this.#getSourceId(),
-        }).catch(() => {});
-        if (owns.ownerToken) {
+        }).then(
+          () => true,
+          () => false,
+        );
+        // PF-6944: never forward queued input past this signal's failed publish;
+        // it stays queued locally, as on the direct idle wake's same failure.
+        if (published && owns.ownerToken) {
           await this.#forwardRetainedPreRunInput(
             state,
             pubsub,
@@ -11167,24 +11192,21 @@ export class AgentThreadStreamRuntime {
         state.inflightIdleThreadKeysByRunId.get(reservedRunId),
       ].some(existingKey => existingKey !== undefined && existingKey !== reservedKey);
     };
-    // PF-6944: set when a rollback deferred the sibling idle drain to this admission.
-    let resumeIdleDrainOnSettle = false;
     const rollbackLocalReservation = (rejectRun: boolean, announceAbort = rejectRun, preserveOtherRunState = false) => {
       if (preserveOtherRunState) return;
       onRunRejected?.();
       if (reserveBeforeIdleWake) {
         // PF-6944: input sent to this reservation was already acknowledged `deliver`.
         // A rollback that never started the run (lease loss, failed lease operation)
-        // keeps it queued and owns its disposition: the lease-loss branch forwards it
-        // to the verified winner. A sibling idle drain started here could reserve,
-        // lose, and clear that input first, so it resumes once `accepted` settles.
-        resumeIdleDrainOnSettle ||= !rejectRun;
+        // keeps it queued: the lease-loss branch forwards it to the verified winner,
+        // and a sibling idle drain dispatched here keeps (or forwards) it on its own
+        // lease loss instead of clearing it.
         this.#releaseReservedRun(state, pubsub, reservedKey, reservedRunId, {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: rejectRun,
           announceAbort,
-          callerOwnedHandoff: !rejectRun,
+          preserveQueuedInput: !rejectRun,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(reservedRunId);
@@ -11455,12 +11477,7 @@ export class AgentThreadStreamRuntime {
     // Callers that opt in to `accepted` still see the rejection via their own
     // await/catch — `accepted` itself remains rejectable; only this detached branch is
     // swallowed.
-    void accepted
-      .finally(() => {
-        if (resumeIdleDrainOnSettle) void this.#drainPendingIdleSignals(state, pubsub, reservedKey).catch(() => {});
-        this.#releaseUnusedThreadControlSubscription(state, reservedKey);
-      })
-      .catch(() => {});
+    void accepted.finally(() => this.#releaseUnusedThreadControlSubscription(state, reservedKey)).catch(() => {});
 
     const output: Promise<MastraModelOutput<unknown>> = accepted.then(result => {
       if (result.action !== 'wake') {
