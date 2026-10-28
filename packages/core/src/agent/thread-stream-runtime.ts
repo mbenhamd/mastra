@@ -2992,8 +2992,9 @@ export class AgentThreadStreamRuntime {
    * (acknowledged `deliver` at once) to the run that won the lease, the same way
    * the wake signal itself was handed over: `signal-enqueued` to that run id, in
    * arrival order, after the wake's own publish. One detached chain that nothing
-   * waits on. A failed publish drops that input and the rest, as fork main drops
-   * all of it.
+   * waits on. It stops at the first failed publish and hands that input and the
+   * rest to `onUndelivered`; without it they are dropped, as fork main drops all
+   * of it.
    */
   #forwardKeptInput(
     state: AgentThreadRuntimeState,
@@ -3001,22 +3002,28 @@ export class AgentThreadStreamRuntime {
     key: string,
     runId: string,
     signals: CreatedAgentSignal[],
+    onUndelivered?: (undelivered: CreatedAgentSignal[]) => void,
   ): void {
     if (signals.length === 0) return;
-    const chain = signals.reduce<Promise<void>>(
-      (previous, signal) =>
-        previous.then(() => {
-          this.#readdressLocallyQueuedSignal(state, key, signal.id, runId);
-          return this.#publishAndWait(pubsub, key, {
-            type: 'signal-enqueued',
-            runId,
-            signal: this.#serializeSignal(signal),
-            sourceId: this.#getSourceId(),
-          });
-        }),
-      Promise.resolve(),
-    );
-    void chain.catch(() => {});
+    const chain = async () => {
+      for (const [index, signal] of signals.entries()) {
+        this.#readdressLocallyQueuedSignal(state, key, signal.id, runId);
+        const delivered = await this.#publishAndWait(pubsub, key, {
+          type: 'signal-enqueued',
+          runId,
+          signal: this.#serializeSignal(signal),
+          sourceId: this.#getSourceId(),
+        }).then(
+          () => true,
+          () => false,
+        );
+        if (!delivered) {
+          onUndelivered?.(signals.slice(index));
+          return;
+        }
+      }
+    };
+    void chain().catch(() => {});
   }
 
   /** PF-6944: put kept follow-ups back at the head of the thread's pre-run queue. */
@@ -4904,11 +4911,16 @@ export class AgentThreadStreamRuntime {
     this.#clearSignalAdmissionCleanupIfEmpty(state);
   }
 
-  #forgetSignalAdmissionsForRun(state: AgentThreadRuntimeState, key: string, runId: string): void {
+  #forgetSignalAdmissionsForRun(
+    state: AgentThreadRuntimeState,
+    key: string,
+    runId: string,
+    keepSignalIds?: ReadonlySet<string>,
+  ): void {
     const admissions = state.signalAdmissionsByThread.get(key);
     if (!admissions) return;
     for (const [signalId, retained] of admissions) {
-      if (retained.runId === runId) admissions.delete(signalId);
+      if (retained.runId === runId && !keepSignalIds?.has(signalId)) admissions.delete(signalId);
     }
     if (admissions.size === 0) state.signalAdmissionsByThread.delete(key);
     this.#clearSignalAdmissionCleanupIfEmpty(state);
@@ -5000,6 +5012,11 @@ export class AgentThreadStreamRuntime {
       callerOwnedHandoff?: boolean;
       /** Keep the thread's pending/pre-run queues (see the abortRun follow-up branch). */
       preserveQueuedInput?: boolean;
+      /**
+       * PF-6944: with `rejectOutputWaiters`, keep the admission records of these
+       * signal ids (input the caller took off the queue and still delivers).
+       */
+      keepAdmissionsFor?: ReadonlySet<string>;
     } = {},
   ) {
     const ownsThread = state.activeThreadRunIds.get(key) === runId || state.threadKeysByRunId.get(runId) === key;
@@ -5055,7 +5072,7 @@ export class AgentThreadStreamRuntime {
     this.#forgetCallerSignalsForRun(state, runId);
     this.#resolveReservationWaiters(state, runId);
     if (options.rejectOutputWaiters) {
-      this.#forgetSignalAdmissionsForRun(state, key, runId);
+      this.#forgetSignalAdmissionsForRun(state, key, runId, options.keepAdmissionsFor);
       const error = wasAborted
         ? new Error(`Agent thread run id "${runId}" has been aborted`)
         : new Error(`Agent thread run id "${runId}" was rejected`);
@@ -7982,7 +7999,8 @@ export class AgentThreadStreamRuntime {
       // Lost the wake race. Roll back the optimistic local reservation and
       // forward the signal to the winner so it is not dropped, then try the
       // next queued idle signal (which may belong to a different run we can win).
-      // PF-6944: input queued for this reservation follows its signal to the winner.
+      // PF-6944: input queued for this reservation follows its signal to the winner,
+      // and keeps its admission records while it is still delivered.
       const keptInput = state.preRunSignalsByThread.get(key) ?? [];
       state.preRunSignalsByThread.delete(key);
       if (reserveBeforePreflight) {
@@ -7990,6 +8008,7 @@ export class AgentThreadStreamRuntime {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: true,
+          keepAdmissionsFor: new Set(keptInput.map(kept => kept.id)),
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(pendingIdle.runId);
@@ -8012,9 +8031,16 @@ export class AgentThreadStreamRuntime {
           signal: this.#serializeSignal(pendingIdle.signal),
           sourceId: this.#getSourceId(),
         }).then(
-          // PF-6944: never forward input past a failed publish of its own wake signal.
-          () => this.#forwardKeptInput(state, pubsub, key, winnerRunId, keptInput),
-          () => {},
+          // PF-6944: a failed forward requeues the undelivered input for the next local run.
+          () =>
+            this.#forwardKeptInput(state, pubsub, key, winnerRunId, keptInput, undelivered =>
+              this.#requeueKeptInput(state, key, undelivered),
+            ),
+          // PF-6944: never forward input past a failed publish of its own wake signal; it is
+          // dropped as on fork main, together with its admission records.
+          () => {
+            for (const dropped of keptInput) this.#forgetSignalAdmission(state, key, pendingIdle.runId, dropped);
+          },
         );
       } else {
         // PF-6944: no winner to hand it to; keep it for the next local run.
