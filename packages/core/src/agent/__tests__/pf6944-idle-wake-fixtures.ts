@@ -137,6 +137,8 @@ export class ControlledLeasePubSub extends RetainedAsyncCallbackPubSub implement
   transferLeaseWait: Promise<void> | undefined;
   onTransferLease: (() => void) | undefined;
   denyLeaseAcquisition = false;
+  /** The next N lease acquisitions report a loss without an owner (after their wait). */
+  ownerlessLosses = 0;
   denyLeaseTransfer = false;
   rejectPublishedTypes = new Set<string>();
   unsubscribeCount = 0;
@@ -153,6 +155,10 @@ export class ControlledLeasePubSub extends RetainedAsyncCallbackPubSub implement
     this.onAcquireLease?.();
     await this.acquireLeaseWait;
     const current = this.owners.get(key);
+    if (this.ownerlessLosses > 0) {
+      this.ownerlessLosses -= 1;
+      return { acquired: false };
+    }
     if (this.denyLeaseAcquisition) return { acquired: false, owner: current ?? 'competing-run' };
     if (current && current !== owner) return { acquired: false, owner: current };
     this.owners.set(key, owner);
@@ -470,4 +476,257 @@ export async function runRealWinnerFollowUp(retry: boolean) {
     blocking.releaseFirst();
     winnerSubscription.unsubscribe();
   }
+}
+
+/**
+ * Loses the wake's lease; the queued idle sibling's lease acquisition then reports a loss
+ * without an owner, after one follow-up was queued behind the sibling's reservation, so the
+ * sibling requeues it for the next local run.
+ */
+export async function requeueFollowUpBehindOwnerlessSibling(ctx: IdleWakeContext) {
+  const sibling = ctx.sibling!;
+  const scope = { resourceId: ctx.resourceId, threadId: ctx.threadId };
+  let releaseSiblingAcquire!: () => void;
+  const siblingAcquireHeld = new Promise<void>(resolve => {
+    releaseSiblingAcquire = resolve;
+  });
+  const acquireSpy = vi.spyOn(ctx.pubsub, 'acquireLease').mockImplementationOnce(async () => {
+    await siblingAcquireHeld;
+    return { acquired: false };
+  });
+  ctx.loseLease();
+  await expect(ctx.wake.accepted).resolves.toMatchObject({ action: 'deliver', runId: ctx.winnerRunId });
+  await waitForCondition(() => acquireSpy.mock.calls.length === 1);
+  const followUpSignal = { id: `${ctx.wakeId}-sibling-follow-up`, type: 'user-message', contents: 'f' } as const;
+  const followUp = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+  expect(followUp.runId).toBe(sibling.runId);
+  releaseSiblingAcquire();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  return { sibling, scope, followUpSignal };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Model-based check: generated schedules over the three lease-loss routes, counting how often the
+// follow-up F executes, compared with fork main's count for the same schedule.
+
+export type FollowUpSchedule = {
+  /** Which reservation F is queued behind when it loses the lease. */
+  route: 'direct' | 'transfer' | 'queued-idle';
+  /** That reservation's lease loss: to a winning run, or without any owner. */
+  lease: 'winner' | 'no-winner';
+  /** A further queued idle sibling (direct/transfer: behind the wake; queued-idle: behind S). */
+  sibling: 'none' | 'queued';
+  /** Publish of the signal F is queued behind (only with a winner). */
+  wakePublish: 'ok' | 'fail';
+  /** Publish of the further sibling's own signal (only with a sibling). */
+  siblingPublish: 'ok' | 'fail';
+  /** First forward publish of F to the winner (only when that applies). */
+  forward: 'ok' | 'reject-before-delivery' | 'reject-after-delivery';
+  /** A retry of F (same id and contents). */
+  retry: 'none' | 'idle-winner-alive' | 'idle-lease-free' | 'during-local-run' | 'other-instance';
+  /** Whether the retry is sent at once after the loss or after the hand-over settled. */
+  retryTiming: 'settled' | 'early';
+};
+
+const scheduleDimensions = {
+  route: ['direct', 'transfer', 'queued-idle'],
+  lease: ['winner', 'no-winner'],
+  sibling: ['none', 'queued'],
+  wakePublish: ['ok', 'fail'],
+  siblingPublish: ['ok', 'fail'],
+  forward: ['ok', 'reject-before-delivery', 'reject-after-delivery'],
+  retry: ['none', 'idle-winner-alive', 'idle-lease-free', 'during-local-run', 'other-instance'],
+  retryTiming: ['settled', 'early'],
+} as const;
+
+/** Sets dimensions that cannot matter to a canonical value, so equal behaviours share a key. */
+function normalizeSchedule(schedule: FollowUpSchedule): FollowUpSchedule {
+  const normalized = { ...schedule };
+  if (normalized.lease === 'no-winner') normalized.wakePublish = 'ok';
+  if (normalized.lease === 'no-winner' || normalized.wakePublish === 'fail') normalized.forward = 'ok';
+  if (normalized.sibling === 'none') normalized.siblingPublish = 'ok';
+  if (normalized.retry === 'none') normalized.retryTiming = 'settled';
+  return normalized;
+}
+
+export function followUpScheduleKey(schedule: FollowUpSchedule): string {
+  return [
+    schedule.route,
+    schedule.lease,
+    `sibling=${schedule.sibling}`,
+    `wakePublish=${schedule.wakePublish}`,
+    `siblingPublish=${schedule.siblingPublish}`,
+    `forward=${schedule.forward}`,
+    `retry=${schedule.retry}`,
+    `timing=${schedule.retryTiming}`,
+  ].join(' ');
+}
+
+/**
+ * The disclosed at-least-once cases, where F may run once more than the bound. They are labelled
+ * here explicitly, never inferred from an outcome:
+ * - F's forward rejects after it was delivered (the queued idle route then also requeues it);
+ * - a retry after the winner finished (lease free) or from another instance (no shared caller
+ *   cache or admission record), the L17 P3 residual.
+ */
+export function followUpScheduleAllowsOneExtraRun(schedule: FollowUpSchedule): boolean {
+  const forwardRejectsAfterDelivery =
+    schedule.lease === 'winner' && schedule.wakePublish === 'ok' && schedule.forward === 'reject-after-delivery';
+  const retryWithoutSharedRecord =
+    schedule.retry === 'other-instance' ||
+    (schedule.lease === 'winner' && (schedule.retry === 'idle-lease-free' || schedule.retry === 'during-local-run'));
+  return forwardRejectsAfterDelivery || retryWithoutSharedRecord;
+}
+
+/** Deterministic schedules from a fixed seed (mulberry32), normalized. */
+export function generateFollowUpSchedules(seed: number, count: number): FollowUpSchedule[] {
+  let state = seed >>> 0;
+  const next = () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = <T>(values: readonly T[]): T => values[Math.floor(next() * values.length)]!;
+  return Array.from({ length: count }, () =>
+    normalizeSchedule({
+      route: pick(scheduleDimensions.route),
+      lease: pick(scheduleDimensions.lease),
+      sibling: pick(scheduleDimensions.sibling),
+      wakePublish: pick(scheduleDimensions.wakePublish),
+      siblingPublish: pick(scheduleDimensions.siblingPublish),
+      forward: pick(scheduleDimensions.forward),
+      retry: pick(scheduleDimensions.retry),
+      retryTiming: pick(scheduleDimensions.retryTiming),
+    }),
+  );
+}
+
+const settle = (ms = 30) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Runs one schedule on the runtime under test and returns how often F executed: once if the
+ * winning run received it (the winner admits a signal id once), plus every local execution
+ * (a local run started with F, or F drained from a local run's queues). Input still queued at
+ * the end is counted by draining it in one more local run.
+ */
+export async function countFollowUpRuns(schedule: FollowUpSchedule, index: number): Promise<number> {
+  const queuedIdle = schedule.route === 'queued-idle';
+  const ctx = await startIdleWakeWithFollowUps(`pf6944-prop-${index}`, queuedIdle ? 0 : 1, {
+    afterFinishingRun: schedule.route === 'transfer',
+    queuedIdleSibling: queuedIdle || schedule.sibling === 'queued',
+  });
+  const scope = { resourceId: ctx.resourceId, threadId: ctx.threadId };
+  const followUpId = queuedIdle ? `${ctx.wakeId}-sibling-follow-up` : ctx.followUpIds[0]!;
+  const followUpSignal = { id: followUpId, type: 'user-message', contents: 'f' } as const;
+  const furtherSibling =
+    queuedIdle && schedule.sibling === 'queued'
+      ? ctx.runtime.queueMessage(ctx.agent, `pf6944-prop-${index} later sibling`, scope, ctx.pubsub)
+      : undefined;
+  void furtherSibling?.accepted.catch(() => {});
+  const behindId = queuedIdle ? ctx.sibling!.signal.id : ctx.wakeId;
+  const furtherSiblingId = queuedIdle ? furtherSibling?.signal.id : ctx.sibling?.signal.id;
+
+  let forwardFailureUsed = false;
+  const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
+  const publishSpy = vi.spyOn(ctx.pubsub, 'publish').mockImplementation(async (topic, event) => {
+    const data = event.data;
+    if (data?.type === 'signal-enqueued') {
+      const id = data.signal?.id;
+      if (id === behindId && schedule.wakePublish === 'fail') throw new Error('schedule: wake publish fails');
+      if (furtherSiblingId !== undefined && id === furtherSiblingId && schedule.siblingPublish === 'fail') {
+        throw new Error('schedule: sibling publish fails');
+      }
+      if (id === followUpId && data.runId === ctx.winnerRunId && schedule.forward !== 'ok' && !forwardFailureUsed) {
+        forwardFailureUsed = true;
+        if (schedule.forward === 'reject-after-delivery') await realPublish(topic, event);
+        throw new Error(`schedule: forward ${schedule.forward}`);
+      }
+    }
+    await realPublish(topic, event);
+  });
+
+  const streamCalls = () => vi.mocked(ctx.agent.stream).mock.calls;
+  const otherInstance = new AgentThreadStreamRuntime();
+  let retryRuntime: AgentThreadStreamRuntime | undefined;
+  const sendRetry = async () => {
+    if (schedule.retry === 'none') return;
+    if (schedule.retry === 'other-instance') {
+      retryRuntime = otherInstance;
+    } else {
+      retryRuntime = ctx.runtime;
+      if (schedule.retry !== 'idle-winner-alive') ctx.pubsub.owners.delete(ctx.key);
+      if (schedule.retry === 'during-local-run') {
+        const calls = streamCalls().length;
+        const local = ctx.runtime.sendSignal(
+          ctx.agent,
+          { id: `${ctx.wakeId}-local`, type: 'user-message', contents: 'local' },
+          scope,
+          ctx.pubsub,
+        );
+        void local.accepted.catch(() => {});
+        await waitForCondition(() => streamCalls().length > calls, 1000).catch(() => {});
+      }
+    }
+    try {
+      const retry = retryRuntime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+      void retry.accepted.catch(() => {});
+    } catch {
+      // A conflicting or rejected retry runs nothing.
+    }
+  };
+
+  if (queuedIdle) {
+    const gate = { release: () => {} };
+    ctx.pubsub.acquireLeaseWait = new Promise<void>(resolve => {
+      gate.release = resolve;
+    });
+    ctx.loseLease();
+    await ctx.wake.accepted.catch(() => {});
+    await waitForCondition(() => ctx.runtime.getActiveThreadRunId(scope, ctx.pubsub) === ctx.sibling!.runId, 1000);
+    const followUp = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+    void followUp.accepted.catch(() => {});
+    if (schedule.lease === 'no-winner') ctx.pubsub.ownerlessLosses = 1;
+    gate.release();
+  } else {
+    if (schedule.lease === 'no-winner') ctx.pubsub.ownerlessLosses = 1;
+    ctx.loseLease();
+  }
+  if (schedule.retryTiming === 'early') await sendRetry();
+  await settle();
+  if (schedule.retryTiming === 'settled') await sendRetry();
+  await settle();
+  publishSpy.mockRestore();
+  ctx.finishRun();
+
+  // One more local run takes whatever is still queued, unless a local run already holds it.
+  if (!streamCalls().some(([, options]) => (options as { runId?: string }).runId !== undefined)) {
+    ctx.pubsub.owners.delete(ctx.key);
+    const flush = ctx.runtime.sendSignal(
+      ctx.agent,
+      { id: `${ctx.wakeId}-flush`, type: 'user-message', contents: 'flush' },
+      scope,
+      ctx.pubsub,
+    );
+    void flush.accepted.catch(() => {});
+    await waitForCondition(() => streamCalls().length > 0, 1000).catch(() => {});
+  }
+  let local = 0;
+  for (const [signal, options] of streamCalls()) {
+    if ((signal as { id?: string }).id === followUpId) local += 1;
+    const runId = (options as { runId?: string }).runId;
+    if (runId === undefined) continue;
+    for (const runtime of [ctx.runtime, otherInstance]) {
+      for (const scopeName of ['pre-run', 'pending'] as const) {
+        local += runtime
+          .drainPendingSignals(runId, ctx.pubsub, scopeName)
+          .filter(signal => signal.id === followUpId).length;
+      }
+    }
+  }
+  const winner = ctx.forwardedTo(ctx.winnerRunId).includes(followUpId) ? 1 : 0;
+  const owner = ctx.pubsub.owners.get(ctx.key);
+  if (owner) await ctx.pubsub.releaseLease(ctx.key, owner);
+  return winner + local;
 }

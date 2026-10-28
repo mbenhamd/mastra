@@ -22886,6 +22886,85 @@ describe('Agent signals', () => {
     expect(ctx.forwardedTo(ctx.winnerRunId)).toEqual([ctx.wakeId, sibling.signal.id, followUpSignal.id]);
     expect(await deliveriesOf(ctx, followUpSignal.id)).toBe(2);
   });
+
+  it('PF-6944: lets an idle retry run a follow-up that a queued idle sibling requeued without a winner', async () => {
+    const { startIdleWakeWithFollowUps, requeueFollowUpBehindOwnerlessSibling } =
+      await import('./pf6944-idle-wake-fixtures');
+    const ctx = await startIdleWakeWithFollowUps('pf6944-min-idle-retry', 0, { queuedIdleSibling: true });
+    const { scope, followUpSignal, sibling } = await requeueFollowUpBehindOwnerlessSibling(ctx);
+    // The thread is idle and free: a retry of the requeued follow-up runs it, once.
+    ctx.pubsub.owners.delete(ctx.key);
+    const retry = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+    void retry.accepted.catch(() => {});
+    expect(retry.runId).not.toBe(sibling.runId);
+    await waitForCondition(() => vi.mocked(ctx.agent.stream).mock.calls.length === 1);
+    expect(vi.mocked(ctx.agent.stream).mock.calls.map(([signal]) => (signal as { id?: string }).id)).toEqual([
+      followUpSignal.id,
+    ]);
+    // Its stranded queued copy is gone, so the retry's own run does not take it a second time.
+    expect(ctx.runtime.drainPendingSignals(retry.runId, ctx.pubsub, 'pre-run')).toEqual([]);
+    await ctx.pubsub.releaseLease(ctx.key, ctx.pubsub.owners.get(ctx.key)!);
+  });
+
+  it('PF-6944: forgets the record of a requeued follow-up that a later sibling drops on its own failed wake publish', async () => {
+    const { startIdleWakeWithFollowUps, requeueFollowUpBehindOwnerlessSibling } =
+      await import('./pf6944-idle-wake-fixtures');
+    const ctx = await startIdleWakeWithFollowUps('pf6944-min-later-drop', 0, { queuedIdleSibling: true });
+    const scope = { resourceId: ctx.resourceId, threadId: ctx.threadId };
+    const laterSibling = ctx.runtime.queueMessage(ctx.agent, 'pf6944 later sibling', scope, ctx.pubsub);
+    void laterSibling.accepted.catch(() => {});
+    // The later sibling captures the requeued follow-up, loses, and its own wake publish fails.
+    const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
+    const publishSpy = vi.spyOn(ctx.pubsub, 'publish').mockImplementation(async (topic, event) => {
+      if (event.data?.type === 'signal-enqueued' && event.data?.signal?.id === laterSibling.signal.id) {
+        throw new Error('injected later sibling publish failure before delivery');
+      }
+      await realPublish(topic, event);
+    });
+    const { followUpSignal } = await requeueFollowUpBehindOwnerlessSibling(ctx);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    publishSpy.mockRestore();
+    expect(ctx.forwardedTo(ctx.winnerRunId)).toEqual([ctx.wakeId]);
+    // The follow-up was dropped there; a retry is admitted again and runs it, once.
+    ctx.pubsub.owners.delete(ctx.key);
+    const retry = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+    void retry.accepted.catch(() => {});
+    await waitForCondition(() => vi.mocked(ctx.agent.stream).mock.calls.length === 1);
+    expect(vi.mocked(ctx.agent.stream).mock.calls.map(([signal]) => (signal as { id?: string }).id)).toEqual([
+      followUpSignal.id,
+    ]);
+    expect(ctx.runtime.drainPendingSignals(retry.runId, ctx.pubsub, 'pre-run')).toEqual([]);
+    await ctx.pubsub.releaseLease(ctx.key, ctx.pubsub.owners.get(ctx.key)!);
+  });
+
+  it('PF-6944: no schedule runs a follow-up fewer times than fork main, or more than once beyond the disclosed at-least-once cases', async () => {
+    const { countFollowUpRuns, followUpScheduleAllowsOneExtraRun, followUpScheduleKey, generateFollowUpSchedules } =
+      await import('./pf6944-idle-wake-fixtures');
+    const { forkMainFollowUpRuns } = await import('./pf6944-fork-main-follow-up-runs');
+    // Fixed seed; repeated schedules are run once. Fork main's count for each schedule comes from
+    // the committed table (generated from a run of the same schedules on fork main's runtime).
+    const failures: string[] = [];
+    const seen = new Set<string>();
+    for (const [index, schedule] of generateFollowUpSchedules(6944, 400).entries()) {
+      const key = followUpScheduleKey(schedule);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const forkMain = forkMainFollowUpRuns[key];
+      if (forkMain === undefined) {
+        failures.push(`${key}: no fork main count recorded`);
+        continue;
+      }
+      const count = await countFollowUpRuns(schedule, index);
+      // Never fewer runs than fork main; at most once (or fork main's count, if higher), plus one
+      // only in the disclosed at-least-once cases that the generator labels explicitly.
+      const allowed = Math.max(forkMain, 1) + (followUpScheduleAllowsOneExtraRun(schedule) ? 1 : 0);
+      if (count < forkMain || count > allowed) {
+        failures.push(`${key}: branch runs F ${count}x, fork main ${forkMain}x, allowed ${forkMain}..${allowed}`);
+      }
+    }
+    expect(seen.size).toBe(Object.keys(forkMainFollowUpRuns).length);
+    expect(failures).toEqual([]);
+  }, 120_000);
 });
 
 // PF-5928 option A (PM decision, PF-4229 vs upstream #24774): a signal carrying fork
