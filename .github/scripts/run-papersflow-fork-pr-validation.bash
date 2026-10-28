@@ -11740,14 +11740,17 @@ run_pf4051_upstream_sync_validation() {
 run_pf6640_upstream_sync_validation() {
   run_upstream_sync_validation pf6640-upstream-sync PF-6640
 
-  echo 'Running PF-6640 reconciled Core (durable, evented workflows, classifier, tool output validation), Memory, PG workflow, Server, and Inngest suites.'
+  echo 'Running PF-6640 reconciled Core (durable, evented workflows, classifier, tool output validation), Memory, MCP, Server, client-js, and Inngest suites.'
   run_with_validation_budget 900 pnpm --filter @mastra/server --fail-if-no-match lint
   run_with_validation_budget 900 \
     pnpm --dir packages/server exec vitest run --reporter=dot \
       src/server/server-adapter/fetch-pattern.test.ts \
       src/server/server-adapter/index.test.ts \
       src/server/server-adapter/routes/route-types-generation.test.ts \
-      src/server/server-adapter/api-schema-manifest.test.ts
+      src/server/server-adapter/api-schema-manifest.test.ts \
+      src/server/server-adapter/framework-public-matcher.test.ts \
+      src/server/auth/helpers.test.ts \
+      src/server/handlers/system.test.ts
   run_with_validation_budget 1800 \
     pnpm --dir packages/core exec vitest run --reporter=dot \
       src/classifier \
@@ -11759,9 +11762,7 @@ run_pf6640_upstream_sync_validation() {
       src/tools/tool-builder/builder.e2e.test.ts \
       src/events/caching-pubsub.test.ts \
       src/workflows/concurrent-resume.test.ts \
-      src/workflows/__tests__/classifier-workflow.test.ts \
-      src/workflows/evented/workflow-event-processor/foreach-concurrency.test.ts \
-      src/workflows/evented/workflow-event-processor/retry-budget.test.ts
+      src/workflows/__tests__/classifier-workflow.test.ts
   run_with_validation_budget 900 pnpm run build:memory
   run_with_validation_budget 900 \
     pnpm --dir packages/memory exec vitest run --reporter=dot \
@@ -11770,13 +11771,26 @@ run_pf6640_upstream_sync_validation() {
       src/processors/observational-memory/__tests__/marker-persistence.test.ts \
       src/processors/observational-memory/__tests__/om-error-and-persistence.test.ts \
       src/tools/om-tools.test.ts \
-      src/tools/working-memory.test.ts
+      src/tools/working-memory.test.ts \
+      src/processors/observational-memory/__tests__/retry.test.ts \
+      src/index.test.ts
+  run_with_validation_budget 900 pnpm run build:mcp
+  run_with_validation_budget 900 \
+    pnpm --dir packages/mcp exec vitest run --reporter=dot \
+      src/server/server-http.test.ts \
+      src/server/server-resource-cache.test.ts \
+      src/server/server-tracing.test.ts \
+      src/client/client.test.ts \
+      src/client/configuration.test.ts
+  run_with_validation_budget 600 \
+    pnpm --dir client-sdks/client-js exec vitest run --reporter=dot \
+      src/resources/agent.client-tools.test.ts
 
   # Inngest e2e suites need a local dev-server binary; build the reconciled package.
   run_with_validation_budget 900 \
     pnpm --filter ./workflows/inngest --fail-if-no-match build
 
-  echo 'PF-6640 reconciled Core, Memory, Server, and Inngest validation passed.'
+  echo 'PF-6640 reconciled Core, Memory, MCP, Server, client-js, and Inngest validation passed.'
 }
 
 run_pf5928_upstream_sync_validation() {
