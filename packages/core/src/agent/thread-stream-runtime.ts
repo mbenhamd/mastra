@@ -11125,6 +11125,10 @@ export class AgentThreadStreamRuntime {
           clearAbort: true,
           rejectOutputWaiters: rejectRun,
           announceAbort,
+          // PF-6944: input sent to this reservation was already acknowledged `deliver`.
+          // A rollback that never started the run (lease loss, failed lease operation)
+          // keeps it queued; the lease-loss branch forwards it to the verified winner.
+          preserveQueuedInput: !rejectRun,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(reservedRunId);
@@ -11319,7 +11323,6 @@ export class AgentThreadStreamRuntime {
             signal: this.#serializeSignal(signal),
             sourceId: this.#getSourceId(),
           });
-          return { action: 'deliver' as const, runId: winnerRunId };
         } catch (error) {
           // No owner accepted this signal. Remove only this attempt's matching
           // tombstone so a retry can make progress instead of falsely replaying
@@ -11327,6 +11330,43 @@ export class AgentThreadStreamRuntime {
           this.#forgetSignalAdmission(state, reservedKey, reservedRunId, signal);
           throw error;
         }
+        // PF-6944: input sent to this reservation while it was acquiring the lease is
+        // still queued (the rollback above keeps it). Hand it to the winner behind the
+        // wake signal through the same verified, ordered forwarding as the drain's
+        // lease-loss path. If the winner cannot be verified, or a forward is fenced or
+        // fails, the input stays queued locally (or fenced as unresolved) — never dropped.
+        const retainedHead = state.preRunSignalsByThread.get(reservedKey)?.[0];
+        const winnerOwner = lease.owner;
+        if (retainedHead && winnerOwner) {
+          const headQueued = () => state.preRunSignalsByThread.get(reservedKey)?.includes(retainedHead) ?? false;
+          await this.#forwardVerifiedLossHandoff(
+            state,
+            pubsub,
+            reservedKey,
+            { owner: winnerOwner, runId: winnerRunId },
+            {
+              signal: retainedHead,
+              queueKind: 'pre-run',
+              receiptRunId: reservedRunId,
+              commit: () => {
+                const queue = state.preRunSignalsByThread.get(reservedKey);
+                const index = queue?.indexOf(retainedHead) ?? -1;
+                if (index !== -1) {
+                  queue!.splice(index, 1);
+                  if (queue!.length === 0) state.preRunSignalsByThread.delete(reservedKey);
+                }
+              },
+              restore: () => {
+                if (!headQueued()) {
+                  const queue = state.preRunSignalsByThread.get(reservedKey) ?? [];
+                  state.preRunSignalsByThread.set(reservedKey, [retainedHead, ...queue]);
+                }
+              },
+              isCancelled: () => !headQueued(),
+            },
+          );
+        }
+        return { action: 'deliver' as const, runId: winnerRunId };
       }
 
       // We own the lease. Start the renewal timer so it survives runs
