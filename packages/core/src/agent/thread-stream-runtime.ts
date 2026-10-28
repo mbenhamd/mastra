@@ -5005,8 +5005,19 @@ export class AgentThreadStreamRuntime {
       // A caller that owns the handoff drains the surviving queue itself;
       // deleting it here would destroy the work the caller is about to
       // hand off.
+      const discarded = [
+        ...(state.pendingSignalsByThread.get(key) ?? []),
+        ...(state.preRunSignalsByThread.get(key) ?? []),
+      ];
       state.pendingSignalsByThread.delete(key);
       state.preRunSignalsByThread.delete(key);
+      // PF-6944: discarded input may have been admitted under an earlier
+      // reservation that kept it (an idle wake's lease loss). Forget exactly
+      // these records, whichever run they name, so a retry can run it again.
+      for (const discardedSignal of discarded) {
+        const admittedRunId = state.signalAdmissionsByThread.get(key)?.get(discardedSignal.id)?.runId;
+        if (admittedRunId !== undefined) this.#forgetSignalAdmission(state, key, admittedRunId, discardedSignal);
+      }
     }
     if (options.cleanupPrepared) {
       this.#cleanupPreparedRun(state, runId, Boolean(options.rejectOutputWaiters && wasAborted));
@@ -11414,15 +11425,25 @@ export class AgentThreadStreamRuntime {
         // lease-loss path; otherwise it stays queued locally (or fenced) — never dropped.
         // Verification needs the exact raw owner token: the transfer route decodes
         // `owner` to a run id and reports the raw token as `ownerToken`.
+        // The wake's acknowledgement settles after its own publish, as on fork main; it
+        // never waits for this hand-off. The hand-off's failures stay in its fence and
+        // receipt. Its exclusive marker can make a sibling idle drain defer, so the
+        // existing drain is re-triggered once the hand-off has finished.
         const winnerOwner = lease.ownerToken ?? lease.owner;
         if (winnerOwner) {
-          await this.#forwardRetainedPreRunInput(
+          void this.#forwardRetainedPreRunInput(
             state,
             pubsub,
             reservedKey,
             { owner: winnerOwner, runId: winnerRunId },
             reservedRunId,
-          );
+          )
+            .catch(() => {})
+            .then(() => {
+              void this.#drainPendingIdleSignals(state, pubsub, reservedKey).catch(() => {});
+              this.#releaseUnusedThreadControlSubscription(state, reservedKey);
+            })
+            .catch(() => {});
         }
         return { action: 'deliver' as const, runId: winnerRunId };
       }
