@@ -489,7 +489,12 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
     await realPublish(`agent.thread-stream.${encodeURIComponent(ctx.key)}`, {
       type: 'run-completed',
       runId: remoteRunId,
-      data: { type: 'run-completed', runId: remoteRunId, streamId: `${remoteRunId}-stream` },
+      data: {
+        type: 'run-completed',
+        runId: remoteRunId,
+        streamId: `${remoteRunId}-stream`,
+        leaseOwner: encodedOwner(remoteRunId, 'pf6944-remote-source'),
+      },
     });
     await ctx.pubsub.flush();
     await settle(10);
