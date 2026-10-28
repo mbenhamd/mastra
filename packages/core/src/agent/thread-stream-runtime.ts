@@ -2987,6 +2987,44 @@ export class AgentThreadStreamRuntime {
     return !!ids?.has(signalId) && ids.get(signalId) !== runId;
   }
 
+  /**
+   * PF-6944: hand follow-ups that were queued for an idle wake's reservation
+   * (acknowledged `deliver` at once) to the run that won the lease, the same way
+   * the wake signal itself was handed over: `signal-enqueued` to that run id, in
+   * arrival order, after the wake's own publish. One detached chain that nothing
+   * waits on. A failed publish drops that input and the rest, as fork main drops
+   * all of it.
+   */
+  #forwardKeptInput(
+    state: AgentThreadRuntimeState,
+    pubsub: PubSub | undefined,
+    key: string,
+    runId: string,
+    signals: CreatedAgentSignal[],
+  ): void {
+    if (signals.length === 0) return;
+    const chain = signals.reduce<Promise<void>>(
+      (previous, signal) =>
+        previous.then(() => {
+          this.#readdressLocallyQueuedSignal(state, key, signal.id, runId);
+          return this.#publishAndWait(pubsub, key, {
+            type: 'signal-enqueued',
+            runId,
+            signal: this.#serializeSignal(signal),
+            sourceId: this.#getSourceId(),
+          });
+        }),
+      Promise.resolve(),
+    );
+    void chain.catch(() => {});
+  }
+
+  /** PF-6944: put kept follow-ups back at the head of the thread's pre-run queue. */
+  #requeueKeptInput(state: AgentThreadRuntimeState, key: string, signals: CreatedAgentSignal[]): void {
+    if (signals.length === 0) return;
+    state.preRunSignalsByThread.set(key, [...signals, ...(state.preRunSignalsByThread.get(key) ?? [])]);
+  }
+
   #publish(pubsub: PubSub | undefined, key: string, event: AgentThreadStreamRuntimeEvent) {
     void this.#publishAndWait(pubsub, key, event).catch(() => {});
   }
@@ -4866,16 +4904,11 @@ export class AgentThreadStreamRuntime {
     this.#clearSignalAdmissionCleanupIfEmpty(state);
   }
 
-  #forgetSignalAdmissionsForRun(
-    state: AgentThreadRuntimeState,
-    key: string,
-    runId: string,
-    keepSignalIds?: ReadonlySet<string>,
-  ): void {
+  #forgetSignalAdmissionsForRun(state: AgentThreadRuntimeState, key: string, runId: string): void {
     const admissions = state.signalAdmissionsByThread.get(key);
     if (!admissions) return;
     for (const [signalId, retained] of admissions) {
-      if (retained.runId === runId && !keepSignalIds?.has(signalId)) admissions.delete(signalId);
+      if (retained.runId === runId) admissions.delete(signalId);
     }
     if (admissions.size === 0) state.signalAdmissionsByThread.delete(key);
     this.#clearSignalAdmissionCleanupIfEmpty(state);
@@ -4967,12 +5000,6 @@ export class AgentThreadStreamRuntime {
       callerOwnedHandoff?: boolean;
       /** Keep the thread's pending/pre-run queues (see the abortRun follow-up branch). */
       preserveQueuedInput?: boolean;
-      /**
-       * PF-6944: with `rejectOutputWaiters`, keep the admission records of the
-       * input still queued on the thread. That input is kept (and later run or
-       * forwarded), so a retry of its signal id must stay a duplicate/conflict.
-       */
-      retainQueuedInputAdmissions?: boolean;
     } = {},
   ) {
     const ownsThread = state.activeThreadRunIds.get(key) === runId || state.threadKeysByRunId.get(runId) === key;
@@ -5012,8 +5039,9 @@ export class AgentThreadStreamRuntime {
       state.pendingSignalsByThread.delete(key);
       state.preRunSignalsByThread.delete(key);
       // PF-6944: discarded input may have been admitted under an earlier
-      // reservation that kept it (an idle wake's lease loss). Forget exactly
-      // these records, whichever run they name, so a retry can run it again.
+      // reservation that kept it (an idle wake that lost its lease without a
+      // winner). Forget exactly these records, whichever run they name, so a
+      // retry can run it again.
       for (const discardedSignal of discarded) {
         const admittedRunId = state.signalAdmissionsByThread.get(key)?.get(discardedSignal.id)?.runId;
         if (admittedRunId !== undefined) this.#forgetSignalAdmission(state, key, admittedRunId, discardedSignal);
@@ -5027,14 +5055,7 @@ export class AgentThreadStreamRuntime {
     this.#forgetCallerSignalsForRun(state, runId);
     this.#resolveReservationWaiters(state, runId);
     if (options.rejectOutputWaiters) {
-      const queuedSignalIds = options.retainQueuedInputAdmissions
-        ? new Set(
-            [...(state.preRunSignalsByThread.get(key) ?? []), ...(state.pendingSignalsByThread.get(key) ?? [])].map(
-              signal => signal.id,
-            ),
-          )
-        : undefined;
-      this.#forgetSignalAdmissionsForRun(state, key, runId, queuedSignalIds);
+      this.#forgetSignalAdmissionsForRun(state, key, runId);
       const error = wasAborted
         ? new Error(`Agent thread run id "${runId}" has been aborted`)
         : new Error(`Agent thread run id "${runId}" was rejected`);
@@ -7093,46 +7114,6 @@ export class AgentThreadStreamRuntime {
     }
   }
 
-  /**
-   * PF-6944: hand pre-run input that was queued for a reservation which lost
-   * its lease to the verified winner, through the ordered
-   * {@link #forwardVerifiedLossHandoff} (head first, then the surviving
-   * pre-run/pending tail and idle work). The head stays queue-resident until
-   * its publication commits, so a failed verification leaves every item queued
-   * locally for the next local run, and a failed publish fences the thread
-   * through the helper's unresolved-forward retention. Nothing is deleted.
-   */
-  async #forwardRetainedPreRunInput(
-    state: AgentThreadRuntimeState,
-    pubsub: PubSub | undefined,
-    key: string,
-    winner: { owner: string; runId: string },
-    receiptRunId: string,
-  ): Promise<void> {
-    const head = state.preRunSignalsByThread.get(key)?.[0];
-    if (!head) return;
-    const headQueued = () => state.preRunSignalsByThread.get(key)?.includes(head) ?? false;
-    await this.#forwardVerifiedLossHandoff(state, pubsub, key, winner, {
-      signal: head,
-      queueKind: 'pre-run',
-      receiptRunId,
-      commit: () => {
-        const queue = state.preRunSignalsByThread.get(key);
-        const index = queue?.indexOf(head) ?? -1;
-        if (index !== -1) {
-          queue!.splice(index, 1);
-          if (queue!.length === 0) state.preRunSignalsByThread.delete(key);
-        }
-      },
-      restore: () => {
-        if (!headQueued()) {
-          state.preRunSignalsByThread.set(key, [head, ...(state.preRunSignalsByThread.get(key) ?? [])]);
-        }
-      },
-      isCancelled: () => !headQueued(),
-    });
-  }
-
   async #forwardVerifiedLossHandoff(
     state: AgentThreadRuntimeState,
     pubsub: PubSub | undefined,
@@ -8001,16 +7982,14 @@ export class AgentThreadStreamRuntime {
       // Lost the wake race. Roll back the optimistic local reservation and
       // forward the signal to the winner so it is not dropped, then try the
       // next queued idle signal (which may belong to a different run we can win).
+      // PF-6944: input queued for this reservation follows its signal to the winner.
+      const keptInput = state.preRunSignalsByThread.get(key) ?? [];
+      state.preRunSignalsByThread.delete(key);
       if (reserveBeforePreflight) {
         this.#releaseReservedRun(state, pubsub, key, pendingIdle.runId, {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: true,
-          // PF-6944: queued input (including input retained by an earlier idle
-          // wake's lease loss) is forwarded below, never cleared here, and keeps
-          // its admission records so a retry of it is not admitted again.
-          preserveQueuedInput: true,
-          retainQueuedInputAdmissions: true,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(pendingIdle.runId);
@@ -8025,27 +8004,21 @@ export class AgentThreadStreamRuntime {
       state.threadKeysByRunId.delete(pendingIdle.runId);
       this.#notifyThreadEvents(state);
       if (owns.owner) {
-        this.#readdressLocallyQueuedSignal(state, key, pendingIdle.signal.id, owns.owner);
-        const published = await this.#publishAndWait(pubsub, key, {
+        const winnerRunId = owns.owner;
+        this.#readdressLocallyQueuedSignal(state, key, pendingIdle.signal.id, winnerRunId);
+        await this.#publishAndWait(pubsub, key, {
           type: 'signal-enqueued',
-          runId: owns.owner,
+          runId: winnerRunId,
           signal: this.#serializeSignal(pendingIdle.signal),
           sourceId: this.#getSourceId(),
         }).then(
-          () => true,
-          () => false,
+          // PF-6944: never forward input past a failed publish of its own wake signal.
+          () => this.#forwardKeptInput(state, pubsub, key, winnerRunId, keptInput),
+          () => {},
         );
-        // PF-6944: never forward queued input past this signal's failed publish;
-        // it stays queued locally, as on the direct idle wake's same failure.
-        if (published && owns.ownerToken) {
-          await this.#forwardRetainedPreRunInput(
-            state,
-            pubsub,
-            key,
-            { owner: owns.ownerToken, runId: owns.owner },
-            pendingIdle.runId,
-          );
-        }
+      } else {
+        // PF-6944: no winner to hand it to; keep it for the next local run.
+        this.#requeueKeptInput(state, key, keptInput);
       }
       const drained = await this.#drainPendingIdleSignals(
         state,
@@ -11207,17 +11180,11 @@ export class AgentThreadStreamRuntime {
       if (preserveOtherRunState) return;
       onRunRejected?.();
       if (reserveBeforeIdleWake) {
-        // PF-6944: input sent to this reservation was already acknowledged `deliver`.
-        // A rollback that never started the run (lease loss, failed lease operation)
-        // keeps it queued: the lease-loss branch forwards it to the verified winner,
-        // and a sibling idle drain dispatched here keeps (or forwards) it on its own
-        // lease loss instead of clearing it.
         this.#releaseReservedRun(state, pubsub, reservedKey, reservedRunId, {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: rejectRun,
           announceAbort,
-          preserveQueuedInput: !rejectRun,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(reservedRunId);
@@ -11347,7 +11314,7 @@ export class AgentThreadStreamRuntime {
       // but failing closed would silently drop user messages on any Redis blip which
       // is the worse failure mode. Lease TTL + renewal still bound the duplicate
       // window to a single run, and the next clean acquireLease re-serializes callers.
-      let lease: { acquired: boolean; owner?: string; ownerToken?: string };
+      let lease: { acquired: boolean; owner?: string };
       try {
         lease = finishingLeaseOwnerRunId
           ? await this.#acquireOrTransferThreadLease(
@@ -11376,6 +11343,13 @@ export class AgentThreadStreamRuntime {
       if (!lease.acquired) {
         // Lost the wake race to another process. Roll back our optimistic local reservation
         // so we don't trip our own activeThreadRunIds check on a follow-up.
+        // PF-6944: take the input queued for this reservation first (the rollback would
+        // delete it); it follows the wake signal to the winner below.
+        const keptInput =
+          reserveBeforeIdleWake && state.threadKeysByRunId.get(reservedRunId) === reservedKey
+            ? (state.preRunSignalsByThread.get(reservedKey) ?? [])
+            : [];
+        if (keptInput.length > 0) state.preRunSignalsByThread.delete(reservedKey);
         rollbackLocalReservation(false);
         state.leaseOwnerTokensByRunId.delete(reservedRunId);
 
@@ -11385,6 +11359,7 @@ export class AgentThreadStreamRuntime {
         if (activeBehavior === 'discard' || fullLogicalMessageIdentity) {
           onIdleSignalDiscarded?.();
           this.#forgetSignalAdmission(state, reservedKey, reservedRunId, signal);
+          this.#requeueKeptInput(state, reservedKey, keptInput);
           return { action: 'discard' as const };
         }
 
@@ -11395,6 +11370,7 @@ export class AgentThreadStreamRuntime {
           // than acknowledge a delivery that never happens. Nothing was delivered, so
           // drop this attempt's admission tombstone and let a retry make progress.
           this.#forgetSignalAdmission(state, reservedKey, reservedRunId, signal);
+          this.#requeueKeptInput(state, reservedKey, keptInput);
           return { action: 'blocked' as const, reason: 'thread-blocked' as const, runId: winnerRunId };
         }
 
@@ -11404,6 +11380,8 @@ export class AgentThreadStreamRuntime {
         // via waitUntil) don't tear down before the enqueue lands on the broker.
         try {
           if (!winnerRunId) {
+            // PF-6944: no winner to hand it to; keep it for the next local run.
+            this.#requeueKeptInput(state, reservedKey, keptInput);
             throw new Error('Agent thread idle wake lost its lease without an owning run');
           }
           await this.#publishAndWait(pubsub, reservedKey, {
@@ -11412,6 +11390,10 @@ export class AgentThreadStreamRuntime {
             signal: this.#serializeSignal(signal),
             sourceId: this.#getSourceId(),
           });
+          // PF-6944: only after the wake signal's own publish succeeded (a failure drops
+          // the input, as fork main does).
+          this.#forwardKeptInput(state, pubsub, reservedKey, winnerRunId, keptInput);
+          return { action: 'deliver' as const, runId: winnerRunId };
         } catch (error) {
           // No owner accepted this signal. Remove only this attempt's matching
           // tombstone so a retry can make progress instead of falsely replaying
@@ -11419,33 +11401,6 @@ export class AgentThreadStreamRuntime {
           this.#forgetSignalAdmission(state, reservedKey, reservedRunId, signal);
           throw error;
         }
-        // PF-6944: input sent to this reservation while it was acquiring the lease is
-        // still queued (the rollback above keeps it). Hand it to the winner behind the
-        // wake signal through the same verified, ordered forwarding as the drain's
-        // lease-loss path; otherwise it stays queued locally (or fenced) — never dropped.
-        // Verification needs the exact raw owner token: the transfer route decodes
-        // `owner` to a run id and reports the raw token as `ownerToken`.
-        // The wake's acknowledgement settles after its own publish, as on fork main; it
-        // never waits for this hand-off. The hand-off's failures stay in its fence and
-        // receipt. Its exclusive marker can make a sibling idle drain defer, so the
-        // existing drain is re-triggered once the hand-off has finished.
-        const winnerOwner = lease.ownerToken ?? lease.owner;
-        if (winnerOwner) {
-          void this.#forwardRetainedPreRunInput(
-            state,
-            pubsub,
-            reservedKey,
-            { owner: winnerOwner, runId: winnerRunId },
-            reservedRunId,
-          )
-            .catch(() => {})
-            .then(() => {
-              void this.#drainPendingIdleSignals(state, pubsub, reservedKey).catch(() => {});
-              this.#releaseUnusedThreadControlSubscription(state, reservedKey);
-            })
-            .catch(() => {});
-        }
-        return { action: 'deliver' as const, runId: winnerRunId };
       }
 
       // We own the lease. Start the renewal timer so it survives runs
