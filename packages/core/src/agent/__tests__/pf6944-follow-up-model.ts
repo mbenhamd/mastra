@@ -169,11 +169,11 @@ export function enumerateFollowUpSchedules(family: Dimensions): FollowUpSchedule
  *    - a retry from another instance, or after the winner finished (lease free, during a local
  *      run, or routed to another remote run), when a winner may have received F (through the
  *      wake, or through a further sibling that took the requeued F): no shared record (L17 P3);
- * 2. F is still queued locally (requeued without a winner and no further sibling drops it, or
- *    requeued after a rejected queued-idle forward) when its admission record expires or is
- *    evicted before the retry:
- *    the TTL class fork main has for every retried signal.
- * Each class allows one extra run; a schedule in both allows two.
+ * 2. F was kept locally (requeued) and its admission record is lost (TTL or eviction) before the
+ *    retry: requeued without a winner (and no further sibling drops it), or requeued after a
+ *    rejected queued-idle forward; the local copy may already have run when the record is lost.
+ *    This is the TTL class fork main has for every retried signal.
+ * Each class allows one extra run; a schedule in both allows two (the literal sum, never more).
  */
 export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): number {
   const delivered = (mode: PublishMode) => mode === 'ok' || mode === 'held-ok';
@@ -197,8 +197,8 @@ export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): nu
       schedule.lease === 'winner' &&
       delivered(schedule.wakePublish) &&
       schedule.forward !== 'ok');
-  const recordLostWhileQueued = schedule.recordLoss !== 'none' && keptLocally;
-  return (forwardRejectsAfterDelivery || retryWithoutSharedRecord ? 1 : 0) + (recordLostWhileQueued ? 1 : 0);
+  const keptLocallyAndRecordLost = keptLocally && schedule.recordLoss !== 'none';
+  return (forwardRejectsAfterDelivery || retryWithoutSharedRecord ? 1 : 0) + (keptLocallyAndRecordLost ? 1 : 0);
 }
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
