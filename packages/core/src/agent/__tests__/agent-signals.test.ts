@@ -15374,12 +15374,6 @@ describe('Agent signals', () => {
             .filter(data => data.type === 'signal-enqueued' && data.runId === winnerRunId)
             .map(data => data.signal.id),
         ).toEqual(['pf6944-min-real-wake', 'pf6944-min-real-follow-up']);
-        // Nothing stays queued at the sender.
-        expect(
-          sender.cancelQueuedMessages(agent, { ...scope, signalIds: ['pf6944-min-real-follow-up'] }, pubsub)
-            .cancelledSignalIds,
-        ).toEqual([]);
-
         blocking.releaseFirst();
         const output = await winning;
         await output.text;
@@ -15391,6 +15385,15 @@ describe('Agent signals', () => {
         await new Promise(resolve => setTimeout(resolve, 30));
         expect(await countStored(followUpText)).toBe(1);
         expect(await countStored(wakeText)).toBe(1);
+        // Nothing stays queued at the sender. (Checked only after the winner admitted the input:
+        // `cancelQueuedMessages` broadcasts `signals-cancelled`, which a winner applies to input it
+        // has not admitted yet.)
+        expect(
+          sender.cancelQueuedMessages(agent, { ...scope, signalIds: ['pf6944-min-real-follow-up'] }, pubsub)
+            .cancelledSignalIds,
+        ).toEqual([]);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        expect(await countStored(followUpText)).toBe(1);
         await vi.waitFor(() => expect(pubsub.owners.get(key)).toBeUndefined());
       } finally {
         blocking.releaseFirst();
