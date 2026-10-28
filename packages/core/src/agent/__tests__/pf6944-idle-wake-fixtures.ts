@@ -647,7 +647,8 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
     await realPublish(topic, event);
   });
 
-  const streamCalls = () => vi.mocked(ctx.agent.stream).mock.calls;
+  const streamCalls = () =>
+    vi.mocked(ctx.agent.stream).mock.calls as unknown as Array<[unknown, { runId?: string } | undefined]>;
   const otherInstance = new AgentThreadStreamRuntime();
   let retryRuntime: AgentThreadStreamRuntime | undefined;
   const sendRetry = async () => {
@@ -701,7 +702,7 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
   ctx.finishRun();
 
   // One more local run takes whatever is still queued, unless a local run already holds it.
-  if (!streamCalls().some(([, options]) => (options as { runId?: string }).runId !== undefined)) {
+  if (!streamCalls().some(([, options]) => options?.runId !== undefined)) {
     ctx.pubsub.owners.delete(ctx.key);
     const flush = ctx.runtime.sendSignal(
       ctx.agent,
@@ -715,7 +716,7 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
   let local = 0;
   for (const [signal, options] of streamCalls()) {
     if ((signal as { id?: string }).id === followUpId) local += 1;
-    const runId = (options as { runId?: string }).runId;
+    const runId = options?.runId;
     if (runId === undefined) continue;
     for (const runtime of [ctx.runtime, otherInstance]) {
       for (const scopeName of ['pre-run', 'pending'] as const) {
