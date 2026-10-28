@@ -162,31 +162,43 @@ export function enumerateFollowUpSchedules(family: Dimensions): FollowUpSchedule
 }
 
 /**
- * The disclosed at-least-once cases, where F may run once more than the bound. They are labelled
- * here explicitly, never inferred from an outcome:
- * - F's forward rejects after it was delivered (the queued idle route then also requeues it);
- * - a retry from another instance, or after the winner finished (lease free, during a local run,
- *   or routed to another remote run), when a winner received F: no shared record (L17 P3);
- * - F is still queued locally (lost without a winner, or a rejected queued-idle forward, and no
- *   further sibling drops it) when its admission record expires or is evicted before the retry:
- *   the TTL class fork main has for every retried signal.
+ * How many extra runs of F (beyond the bound) a schedule's disclosed at-least-once cases allow.
+ * The cases are labelled here explicitly from the schedule, never inferred from an outcome:
+ * 1. the winning run may hold F while it is also handed on locally or again:
+ *    - F's forward rejects after it was delivered (the queued idle route then also requeues it);
+ *    - a retry from another instance, or after the winner finished (lease free, during a local
+ *      run, or routed to another remote run), when a winner may have received F (through the
+ *      wake, or through a further sibling that took the requeued F): no shared record (L17 P3);
+ * 2. F is still queued locally (requeued without a winner and no further sibling drops it, or
+ *    requeued after a rejected queued-idle forward) when its admission record expires or is
+ *    evicted before the retry:
+ *    the TTL class fork main has for every retried signal.
+ * Each class allows one extra run; a schedule in both allows two.
  */
-export function followUpScheduleAllowsOneExtraRun(schedule: FollowUpSchedule): boolean {
+export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): number {
+  const delivered = (mode: PublishMode) => mode === 'ok' || mode === 'held-ok';
+  const winnerMayHoldF =
+    (schedule.lease === 'winner' && delivered(schedule.wakePublish)) ||
+    (schedule.lease === 'no-winner' && schedule.sibling === 'queued' && delivered(schedule.siblingPublish));
   const forwardRejectsAfterDelivery =
-    schedule.lease === 'winner' &&
-    (schedule.wakePublish === 'ok' || schedule.wakePublish === 'held-ok') &&
-    schedule.forward === 'reject-after-delivery';
+    schedule.lease === 'winner' && delivered(schedule.wakePublish) && schedule.forward === 'reject-after-delivery';
   const retryWithoutSharedRecord =
     schedule.retry === 'other-instance' ||
-    (schedule.lease === 'winner' &&
+    (winnerMayHoldF &&
       (schedule.retry === 'idle-lease-free' ||
         schedule.retry === 'during-local-run' ||
         schedule.retry === 'remote-observed'));
+  // Kept locally: requeued without a winner (unless a further sibling takes it and drops it on its
+  // own failed publish), or requeued by the queued idle route's detached forward chain after a
+  // rejected forward (that requeue comes after the further sibling has taken the queue).
   const keptLocally =
-    (schedule.lease === 'no-winner' || (schedule.route === 'queued-idle' && schedule.forward !== 'ok')) &&
-    !(schedule.sibling === 'queued' && (schedule.siblingPublish === 'fail' || schedule.siblingPublish === 'held-fail'));
+    (schedule.lease === 'no-winner' && !(schedule.sibling === 'queued' && !delivered(schedule.siblingPublish))) ||
+    (schedule.route === 'queued-idle' &&
+      schedule.lease === 'winner' &&
+      delivered(schedule.wakePublish) &&
+      schedule.forward !== 'ok');
   const recordLostWhileQueued = schedule.recordLoss !== 'none' && keptLocally;
-  return forwardRejectsAfterDelivery || retryWithoutSharedRecord || recordLostWhileQueued;
+  return (forwardRejectsAfterDelivery || retryWithoutSharedRecord ? 1 : 0) + (recordLostWhileQueued ? 1 : 0);
 }
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -542,7 +554,7 @@ export async function countFollowUpFamily(family: string): Promise<Record<string
  * failing schedule (empty when all hold):
  * - F never runs fewer times than on fork main, neither by the end of the retry phase nor in total;
  * - F runs at most once in total (or as often as on fork main, if more), plus one only in the
- *   disclosed at-least-once cases that `followUpScheduleAllowsOneExtraRun` labels.
+ *   disclosed at-least-once cases that `followUpScheduleExtraRunsAllowed` labels.
  */
 export async function checkFollowUpFamily(
   family: string,
@@ -558,7 +570,7 @@ export async function checkFollowUpFamily(
       continue;
     }
     const count = await countFollowUpRuns(schedule, familyIndex * 10_000 + index);
-    const allowed = Math.max(expected.total, 1) + (followUpScheduleAllowsOneExtraRun(schedule) ? 1 : 0);
+    const allowed = Math.max(expected.total, 1) + followUpScheduleExtraRunsAllowed(schedule);
     if (count.settled < expected.settled || count.total < expected.total || count.total > allowed) {
       failures.push(
         `${key}: branch runs F ${count.settled}x by the end of the retry phase and ${count.total}x in total; ` +
