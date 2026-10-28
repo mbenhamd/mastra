@@ -7064,6 +7064,46 @@ export class AgentThreadStreamRuntime {
     }
   }
 
+  /**
+   * PF-6944: hand pre-run input that was queued for a reservation which lost
+   * its lease to the verified winner, through the ordered
+   * {@link #forwardVerifiedLossHandoff} (head first, then the surviving
+   * pre-run/pending tail and idle work). The head stays queue-resident until
+   * its publication commits, so a failed verification leaves every item queued
+   * locally for the next local run, and a failed publish fences the thread
+   * through the helper's unresolved-forward retention. Nothing is deleted.
+   */
+  async #forwardRetainedPreRunInput(
+    state: AgentThreadRuntimeState,
+    pubsub: PubSub | undefined,
+    key: string,
+    winner: { owner: string; runId: string },
+    receiptRunId: string,
+  ): Promise<void> {
+    const head = state.preRunSignalsByThread.get(key)?.[0];
+    if (!head) return;
+    const headQueued = () => state.preRunSignalsByThread.get(key)?.includes(head) ?? false;
+    await this.#forwardVerifiedLossHandoff(state, pubsub, key, winner, {
+      signal: head,
+      queueKind: 'pre-run',
+      receiptRunId,
+      commit: () => {
+        const queue = state.preRunSignalsByThread.get(key);
+        const index = queue?.indexOf(head) ?? -1;
+        if (index !== -1) {
+          queue!.splice(index, 1);
+          if (queue!.length === 0) state.preRunSignalsByThread.delete(key);
+        }
+      },
+      restore: () => {
+        if (!headQueued()) {
+          state.preRunSignalsByThread.set(key, [head, ...(state.preRunSignalsByThread.get(key) ?? [])]);
+        }
+      },
+      isCancelled: () => !headQueued(),
+    });
+  }
+
   async #forwardVerifiedLossHandoff(
     state: AgentThreadRuntimeState,
     pubsub: PubSub | undefined,
@@ -7937,6 +7977,9 @@ export class AgentThreadStreamRuntime {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: true,
+          // PF-6944: queued input (including input retained by an earlier idle
+          // wake's lease loss) is forwarded below, never cleared here.
+          preserveQueuedInput: true,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(pendingIdle.runId);
@@ -7949,7 +7992,6 @@ export class AgentThreadStreamRuntime {
       }
       state.drainingIdleSignalsByThread.delete(key);
       state.threadKeysByRunId.delete(pendingIdle.runId);
-      state.preRunSignalsByThread.delete(key);
       this.#notifyThreadEvents(state);
       if (owns.owner) {
         this.#readdressLocallyQueuedSignal(state, key, pendingIdle.signal.id, owns.owner);
@@ -7959,6 +8001,15 @@ export class AgentThreadStreamRuntime {
           signal: this.#serializeSignal(pendingIdle.signal),
           sourceId: this.#getSourceId(),
         }).catch(() => {});
+        if (owns.ownerToken) {
+          await this.#forwardRetainedPreRunInput(
+            state,
+            pubsub,
+            key,
+            { owner: owns.ownerToken, runId: owns.owner },
+            pendingIdle.runId,
+          );
+        }
       }
       const drained = await this.#drainPendingIdleSignals(
         state,
@@ -11116,19 +11167,24 @@ export class AgentThreadStreamRuntime {
         state.inflightIdleThreadKeysByRunId.get(reservedRunId),
       ].some(existingKey => existingKey !== undefined && existingKey !== reservedKey);
     };
+    // PF-6944: set when a rollback deferred the sibling idle drain to this admission.
+    let resumeIdleDrainOnSettle = false;
     const rollbackLocalReservation = (rejectRun: boolean, announceAbort = rejectRun, preserveOtherRunState = false) => {
       if (preserveOtherRunState) return;
       onRunRejected?.();
       if (reserveBeforeIdleWake) {
+        // PF-6944: input sent to this reservation was already acknowledged `deliver`.
+        // A rollback that never started the run (lease loss, failed lease operation)
+        // keeps it queued and owns its disposition: the lease-loss branch forwards it
+        // to the verified winner. A sibling idle drain started here could reserve,
+        // lose, and clear that input first, so it resumes once `accepted` settles.
+        resumeIdleDrainOnSettle ||= !rejectRun;
         this.#releaseReservedRun(state, pubsub, reservedKey, reservedRunId, {
           cleanupPrepared: true,
           clearAbort: true,
           rejectOutputWaiters: rejectRun,
           announceAbort,
-          // PF-6944: input sent to this reservation was already acknowledged `deliver`.
-          // A rollback that never started the run (lease loss, failed lease operation)
-          // keeps it queued; the lease-loss branch forwards it to the verified winner.
-          preserveQueuedInput: !rejectRun,
+          callerOwnedHandoff: !rejectRun,
         });
       } else {
         state.inflightIdleThreadKeysByRunId.delete(reservedRunId);
@@ -11258,7 +11314,7 @@ export class AgentThreadStreamRuntime {
       // but failing closed would silently drop user messages on any Redis blip which
       // is the worse failure mode. Lease TTL + renewal still bound the duplicate
       // window to a single run, and the next clean acquireLease re-serializes callers.
-      let lease: { acquired: boolean; owner?: string };
+      let lease: { acquired: boolean; owner?: string; ownerToken?: string };
       try {
         lease = finishingLeaseOwnerRunId
           ? await this.#acquireOrTransferThreadLease(
@@ -11333,37 +11389,17 @@ export class AgentThreadStreamRuntime {
         // PF-6944: input sent to this reservation while it was acquiring the lease is
         // still queued (the rollback above keeps it). Hand it to the winner behind the
         // wake signal through the same verified, ordered forwarding as the drain's
-        // lease-loss path. If the winner cannot be verified, or a forward is fenced or
-        // fails, the input stays queued locally (or fenced as unresolved) — never dropped.
-        const retainedHead = state.preRunSignalsByThread.get(reservedKey)?.[0];
-        const winnerOwner = lease.owner;
-        if (retainedHead && winnerOwner) {
-          const headQueued = () => state.preRunSignalsByThread.get(reservedKey)?.includes(retainedHead) ?? false;
-          await this.#forwardVerifiedLossHandoff(
+        // lease-loss path; otherwise it stays queued locally (or fenced) — never dropped.
+        // Verification needs the exact raw owner token: the transfer route decodes
+        // `owner` to a run id and reports the raw token as `ownerToken`.
+        const winnerOwner = lease.ownerToken ?? lease.owner;
+        if (winnerOwner) {
+          await this.#forwardRetainedPreRunInput(
             state,
             pubsub,
             reservedKey,
             { owner: winnerOwner, runId: winnerRunId },
-            {
-              signal: retainedHead,
-              queueKind: 'pre-run',
-              receiptRunId: reservedRunId,
-              commit: () => {
-                const queue = state.preRunSignalsByThread.get(reservedKey);
-                const index = queue?.indexOf(retainedHead) ?? -1;
-                if (index !== -1) {
-                  queue!.splice(index, 1);
-                  if (queue!.length === 0) state.preRunSignalsByThread.delete(reservedKey);
-                }
-              },
-              restore: () => {
-                if (!headQueued()) {
-                  const queue = state.preRunSignalsByThread.get(reservedKey) ?? [];
-                  state.preRunSignalsByThread.set(reservedKey, [retainedHead, ...queue]);
-                }
-              },
-              isCancelled: () => !headQueued(),
-            },
+            reservedRunId,
           );
         }
         return { action: 'deliver' as const, runId: winnerRunId };
@@ -11419,7 +11455,12 @@ export class AgentThreadStreamRuntime {
     // Callers that opt in to `accepted` still see the rejection via their own
     // await/catch — `accepted` itself remains rejectable; only this detached branch is
     // swallowed.
-    void accepted.finally(() => this.#releaseUnusedThreadControlSubscription(state, reservedKey)).catch(() => {});
+    void accepted
+      .finally(() => {
+        if (resumeIdleDrainOnSettle) void this.#drainPendingIdleSignals(state, pubsub, reservedKey).catch(() => {});
+        this.#releaseUnusedThreadControlSubscription(state, reservedKey);
+      })
+      .catch(() => {});
 
     const output: Promise<MastraModelOutput<unknown>> = accepted.then(result => {
       if (result.action !== 'wake') {
