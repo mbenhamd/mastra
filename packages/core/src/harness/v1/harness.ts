@@ -5194,7 +5194,7 @@ export class Harness {
       const descendant = this._liveSessions.get(fencedId);
       if (descendant !== undefined) toFence.push(descendant, ...this._liveDescendantsOf(descendant.id));
     }
-    for (const member of toFence) this._fenceLeaseLostDetached(member);
+    this._fenceLeaseLostDetached(toFence);
     for (const descendant of this._liveDescendantsOf(root.id)) descendant._markLeaseRenewed(lease.expiresAt);
     return lease;
   }
@@ -5215,6 +5215,11 @@ export class Harness {
     opts?: { propagateRootDeadline?: boolean },
   ): Promise<number> {
     const storage = this._requireStorage('session lease renewal');
+    // Already fenced or evicted: reject at once. Joining its eviction here could
+    // wait on this very proof (a draft checkpoint the eviction drains).
+    if (session.lifecycleState === 'evicted') {
+      throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+    }
     const root = this._resolveLiveRoot(session);
     if (root === undefined) {
       // Orphan: a live session whose root ownership cannot be proven here. Fence
@@ -5467,32 +5472,43 @@ export class Harness {
   }
 
   /**
-   * Fence a live session as `lease_lost` synchronously — every later lease
-   * proof or extension on it rejects at once — and run the rest of the eviction
-   * (event-persistence drain, workspace release, `session_evicted`) detached.
-   * For callers inside a lease-renewal chain: that cleanup can wait on work
-   * (a draft checkpoint, a workspace `destroy()`) that itself waits on the
-   * chain, so it must not be awaited there. Joined like any eviction through
-   * `_sessionEvictionsInFlight`.
+   * Fence live sessions as `lease_lost` synchronously — every later lease
+   * proof or extension on them rejects at once — and run the rest of each
+   * eviction (event-persistence drain, workspace release, `session_evicted`)
+   * detached. For callers inside a lease-renewal chain: that cleanup can wait
+   * on work (a draft checkpoint, a workspace `destroy()`) that itself waits on
+   * the chain, so it must not be awaited there.
+   *
+   * Every session's eviction barrier is registered and its live entry removed
+   * before any `_markEvicted()` runs: those fire abort listeners synchronously,
+   * and a listener resolving the session again must find the barrier (and
+   * wait for a fresh session), never the evicted object.
    */
-  private _fenceLeaseLostDetached(session: Session): void {
-    if (this._liveSessions.get(session.id) !== session) return;
-    const record = session.getRecord() as SessionRecord;
-    session._markEvicted(record);
-    this._liveSessions.delete(session.id);
+  private _fenceLeaseLostDetached(sessions: readonly Session[]): void {
+    const fenced: Array<{ session: Session; record: SessionRecord; start: () => void }> = [];
+    for (const session of sessions) {
+      if (this._liveSessions.get(session.id) !== session) continue;
+      const record = session.getRecord() as SessionRecord;
+      let start!: () => void;
+      const started = new Promise<void>(resolve => (start = resolve));
+      const prior = this._sessionEvictionsInFlight.get(session.id) ?? Promise.resolve();
+      const cleanup: Promise<void> = Promise.all([prior, started])
+        .then(() => this._completeEviction(session, record, 'lease_lost'))
+        .catch(err => {
+          console.error('[harness/v1] detached lease-lost eviction cleanup failed:', err);
+        })
+        .finally(() => {
+          if (this._sessionEvictionsInFlight.get(session.id) === cleanup) {
+            this._sessionEvictionsInFlight.delete(session.id);
+          }
+        });
+      this._sessionEvictionsInFlight.set(session.id, cleanup);
+      this._liveSessions.delete(session.id);
+      fenced.push({ session, record, start });
+    }
+    for (const { session, record } of fenced) session._markEvicted(record);
     this._stopLeaseRenewalLoopIfIdle();
-    const prior = this._sessionEvictionsInFlight.get(session.id) ?? Promise.resolve();
-    const cleanup: Promise<void> = prior
-      .then(() => this._completeEviction(session, record, 'lease_lost'))
-      .catch(err => {
-        console.error('[harness/v1] detached lease-lost eviction cleanup failed:', err);
-      })
-      .finally(() => {
-        if (this._sessionEvictionsInFlight.get(session.id) === cleanup) {
-          this._sessionEvictionsInFlight.delete(session.id);
-        }
-      });
-    this._sessionEvictionsInFlight.set(session.id, cleanup);
+    for (const { start } of fenced) start();
   }
 
   /** The part of an eviction after the session is fenced out of `_liveSessions`. */

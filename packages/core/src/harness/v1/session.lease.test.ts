@@ -633,7 +633,7 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
   async function fencedChildFixture(opts: Parameters<typeof setupHarness>[0] = {}) {
     const db = new InMemoryDB();
     const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
-    const { harness } = setupHarness({ ...opts, sessions: { storage } });
+    const { harness, agent } = setupHarness({ ...opts, sessions: { storage } });
     const root = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     const sibling = await harness.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: root.id });
     const child = await harness.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: root.id });
@@ -657,7 +657,7 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
       ).resolves.toMatchObject({ status: 'revoked' });
       return key;
     };
-    return { db, storage, harness, root, sibling, child, grandchild, fence };
+    return { db, storage, harness, agent, root, sibling, child, grandchild, fence };
   }
 
   const settlesWithin = <T>(promise: Promise<T>, ms: number) =>
@@ -745,4 +745,63 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
       expect(ownersSeenByCallback).toEqual([harness.ownerId]);
     },
   );
+
+  it('lets an abort listener of the fenced child resolve its thread only to a fresh session', async () => {
+    const { harness, agent, root, child, fence } = await fencedChildFixture();
+    let releaseRun!: () => void;
+    let resolvedInListener: Promise<Session> | undefined;
+    agent.runs.push({
+      holdUntil: new Promise<void>(resolve => (releaseRun = resolve)),
+      onAbort: () => {
+        resolvedInListener ??= harness.session({ resourceId: child.resourceId, threadId: child.threadId });
+      },
+    });
+    const turn = child.message({ content: 'long work' });
+    await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
+    await fence();
+
+    await root.extendLease({ ttlMs: 5 * 60_000 });
+    expect(child.lifecycleState).toBe('evicted');
+    expect(resolvedInListener).toBeDefined();
+    const resolved = await resolvedInListener!;
+    expect(resolved).not.toBe(child);
+    expect(resolved.lifecycleState).toBe('live');
+    releaseRun();
+    await turn.catch(() => {});
+  });
+
+  it('settles a fenced grandchild checkpoint that reaches its lease proof after the fence', async () => {
+    const { db, storage, harness, root, grandchild, fence } = await fencedChildFixture();
+    await fence();
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
+    const save = storage.saveSession.bind(storage);
+    const spy = vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (record.id === grandchild.id) await saveGate;
+      return save(record, opts);
+    });
+    // A competing same-owner write advanced the grandchild's stored version.
+    const key = [...db.harnessSessions.keys()].find(k => k.endsWith(grandchild.id))!;
+    db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, version: db.harnessSessions.get(key)!.version + 1 });
+    const internals = grandchild as unknown as {
+      _recordAssistantDraftDelta(opts: { runId: string; kind: 'text'; delta: string }): void;
+      _startAssistantDraftFlush(): Promise<void>;
+    };
+    internals._recordAssistantDraftDelta({ runId: 'run-draft', kind: 'text', delta: 'partial answer' });
+    const checkpoint = internals._startAssistantDraftFlush();
+    await vi.waitFor(() => expect(spy.mock.calls.some(([record]) => record.id === grandchild.id)).toBe(true));
+
+    // The root renewal fences the revoked child and the grandchild while the
+    // grandchild's save is still pending; the save then conflicts.
+    await root.extendLease({ ttlMs: 5 * 60_000 });
+    expect(grandchild.lifecycleState).toBe('evicted');
+    releaseSave();
+
+    expect(await settlesWithin(checkpoint, 2_000)).toBe('settled');
+    await expect(checkpoint).rejects.toBeInstanceOf(HarnessSessionLockedError);
+    const reacquired = harness.session({ sessionId: grandchild.id });
+    expect(await settlesWithin(reacquired, 2_000)).toBe('settled');
+    expect((await reacquired).lifecycleState).toBe('live');
+    spy.mockRestore();
+  });
 });
