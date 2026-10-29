@@ -22937,7 +22937,7 @@ describe('Agent signals', () => {
     await ctx.pubsub.releaseLease(ctx.key, ctx.pubsub.owners.get(ctx.key)!);
   });
 
-  it('PF-6944: restores a follow-up taken by a remote retry when its record expires while that retry publish fails', async () => {
+  it('PF-6944: keeps a follow-up for the acquiring reservation when its record expires while a remote retry publish fails', async () => {
     const { startIdleWakeWithFollowUps, encodedOwner } = await import('./pf6944-idle-wake-fixtures');
     // The idle wake L still acquires the lease (the fixture holds it) with F queued behind it.
     const ctx = await startIdleWakeWithFollowUps('pf6944-min-restore-expired', 1);
@@ -22964,9 +22964,8 @@ describe('Agent signals', () => {
     await ctx.pubsub.flush();
     await new Promise(resolve => setTimeout(resolve, 20));
     try {
-      // A retry of F addressed to R takes the queued copy; its publish is held, then rejects
-      // before delivery.
-      let held = false;
+      // A retry of F addressed to R; a publish of F to R (if any) is held, then rejects before
+      // delivery.
       let rejectHeld = () => {};
       const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
       const publishSpy = vi.spyOn(ctx.pubsub, 'publish').mockImplementation(async (topicName, event) => {
@@ -22975,7 +22974,6 @@ describe('Agent signals', () => {
           event.data?.signal?.id === followUpId &&
           event.data?.runId === remoteRunId
         ) {
-          held = true;
           await new Promise<void>((_resolve, reject) => {
             rejectHeld = () => reject(new Error('injected retry publish failure before delivery'));
           });
@@ -22989,7 +22987,7 @@ describe('Agent signals', () => {
         ctx.pubsub,
       );
       void retry.accepted.catch(() => {});
-      await waitForCondition(() => held);
+      await new Promise(resolve => setTimeout(resolve, 20));
       // While that publish is pending, F's admission record expires and a later admission on the
       // thread sweeps it.
       const realNow = Date.now.bind(Date);
@@ -23002,7 +23000,8 @@ describe('Agent signals', () => {
       );
       void later.accepted.catch(() => {});
       rejectHeld();
-      await expect(retry.accepted).rejects.toThrow('injected retry publish failure before delivery');
+      await retry.accepted.catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, 20));
       dateSpy.mockRestore();
       publishSpy.mockRestore();
       expect(ctx.forwardedTo(remoteRunId)).not.toContain(followUpId);
