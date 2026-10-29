@@ -5377,12 +5377,15 @@ export class Harness {
     return false;
   }
 
-  /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
-  /** A function, not an inline check: the state can change across an `await`. */
+  /**
+   * Whether `session` has been evicted. A helper rather than an inline check so the
+   * re-check after awaiting the renewal queue isn't narrowed away by the entry check.
+   */
   private static _isEvicted(session: Session): boolean {
     return session.lifecycleState === 'evicted';
   }
 
+  /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
   private _liveDescendantsOf(rootId: string): Session[] {
     const out: Session[] = [];
     const stack: string[] = [rootId];
