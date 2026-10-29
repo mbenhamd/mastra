@@ -1182,8 +1182,6 @@ type ThreadLeaseOperationProvenance = {
 };
 
 export class AgentThreadStreamRuntime {
-  /** PF-6944: per runtime state, remote deliveries in flight that carry a taken kept copy. */
-  #keptDeliveriesInFlight = new WeakMap<AgentThreadRuntimeState, Map<string, Promise<void>>>();
   // Upstream parity (PF-5928): resolved lazily by `#getSourceId()`, from
   // `globalThis.crypto`, when the runtime first participates in a thread. The
   // fork's eager `node:crypto` initializer made the getter's fallback dead code
@@ -3117,78 +3115,56 @@ export class AgentThreadStreamRuntime {
   }
 
   /**
-   * PF-6944: a live local consumer of this thread's queued pre-run input, other than
-   * `exceptRunId`: a reservation that has not registered its run yet (pending or acquiring),
-   * a prepared run, or a queued, in-flight or draining idle entry, all on this thread. A
-   * registered run already made its first model request and does not take pre-run input.
-   */
-  #liveLocalConsumer(state: AgentThreadRuntimeState, key: string, exceptRunId: string): string | undefined {
-    for (const [runId, threadKey] of state.threadKeysByRunId) {
-      if (threadKey === key && runId !== exceptRunId && !state.threadRunsById.has(runId)) return runId;
-    }
-    for (const [runId, run] of state.preparedRunsById) {
-      if (run.threadKey === key && runId !== exceptRunId) return runId;
-    }
-    for (const [runId, threadKey] of state.pendingIdleThreadKeysByRunId) if (threadKey === key) return runId;
-    for (const [runId, threadKey] of state.inflightIdleThreadKeysByRunId) if (threadKey === key) return runId;
-    return state.drainingIdleSignalsByThread.get(key)?.runId;
-  }
-
-  /**
-   * PF-6944: a retry delivered straight to a remote run carries the signal. A stranded
-   * kept copy of it (queued on this thread's pre-run queue with the same payload, and no
-   * live local consumer) is taken off the queue, and the signal's current record is
-   * forgotten so this delivery records it afresh; the signal then exists once.
+   * PF-6944: a retry delivered straight to a remote run carries the signal. A kept
+   * copy of it still queued on this thread's pre-run queue (same payload) is taken
+   * off the queue, and the signal's current record (whichever run it names) is
+   * forgotten so this delivery records it afresh; a kept forward still in flight
+   * then sees that record is no longer its own and does not requeue its copy. The
+   * signal then exists once.
    *
-   * Returns undefined when there is no such copy. Otherwise `restore` undoes the take
-   * when that delivery fails: the copy goes back in admission order (before the first
-   * queued signal created after it), the original record comes back unless a different
-   * record has been admitted since, and the idle drain is triggered so the copy is not
-   * left without a consumer.
+   * Returns `restore`, for when that delivery's publish fails: while the record
+   * the delivery admitted is still the current one (identity), the original record
+   * is put back and the taken copy returns to its place in the pre-run queue, so a
+   * live local reservation still runs it. Otherwise nothing is restored.
    */
-  #takeStrandedKeptInput(
+  #takeQueuedKeptInputForDelivery(
     state: AgentThreadRuntimeState,
-    pubsub: PubSub | undefined,
     key: string,
     signal: AgentSignal,
-  ): { admitted: () => void; restore: () => void } | undefined {
+  ): { admitted: () => void; restore: () => void } {
     const signalId = signal.id;
-    if (signalId === undefined) return undefined;
     const payloadKey = callerSignalPayloadKey(signal);
     const queue = state.preRunSignalsByThread.get(key);
     const index =
       queue?.findIndex(queued => queued.id === signalId && callerSignalPayloadKey(queued) === payloadKey) ?? -1;
-    if (!queue || index === -1) return undefined;
-    const [taken] = queue.splice(index, 1);
-    if (queue.length === 0) state.preRunSignalsByThread.delete(key);
-    const original = state.signalAdmissionsByThread.get(key)?.get(signalId);
+    const taken = queue && index !== -1 ? queue.splice(index, 1)[0] : undefined;
+    if (queue && taken && queue.length === 0) state.preRunSignalsByThread.delete(key);
+    const original = signalId === undefined ? undefined : state.signalAdmissionsByThread.get(key)?.get(signalId);
     this.#forgetCurrentSignalAdmission(state, key, signal);
     let delivery: object | undefined;
     return {
       admitted: () => {
-        delivery = state.signalAdmissionsByThread.get(key)?.get(signalId);
+        delivery = signalId === undefined ? undefined : state.signalAdmissionsByThread.get(key)?.get(signalId);
       },
       restore: () => {
+        if (signalId === undefined) return;
         const admissions = state.signalAdmissionsByThread.get(key);
         const current = admissions?.get(signalId);
-        if (current === undefined || current === delivery) {
-          if (original) {
-            const restored = admissions ?? new Map();
-            restored.set(signalId, original);
-            state.signalAdmissionsByThread.set(key, restored);
-          } else if (current) {
-            admissions!.delete(signalId);
-            if (admissions!.size === 0) state.signalAdmissionsByThread.delete(key);
-            this.#clearSignalAdmissionCleanupIfEmpty(state);
-          }
+        if (current !== delivery) return;
+        if (original && current !== original) {
+          const restored = admissions ?? new Map();
+          restored.set(signalId, original);
+          state.signalAdmissionsByThread.set(key, restored);
+        } else if (current && !original) {
+          admissions!.delete(signalId);
+          if (admissions!.size === 0) state.signalAdmissionsByThread.delete(key);
+          this.#clearSignalAdmissionCleanupIfEmpty(state);
         }
-        const live = state.preRunSignalsByThread.get(key) ?? [];
-        if (!live.includes(taken!)) {
-          const after = live.findIndex(queued => queued.createdAt.getTime() > taken!.createdAt.getTime());
-          live.splice(after === -1 ? live.length : after, 0, taken!);
+        if (taken && !(state.preRunSignalsByThread.get(key) ?? []).includes(taken)) {
+          const live = state.preRunSignalsByThread.get(key) ?? [];
+          live.splice(Math.min(index, live.length), 0, taken);
           state.preRunSignalsByThread.set(key, live);
         }
-        void this.#drainPendingIdleSignals(state, pubsub, key).catch(() => {});
       },
     };
   }
@@ -11105,7 +11081,6 @@ export class AgentThreadStreamRuntime {
           );
         }
         let restoreHandover: (() => void) | undefined;
-        let trackHandover: ((publication: Promise<unknown>) => void) | undefined;
         if (isLocalReservedRun) {
           const disposition = this.#rememberSignalPayloadForRun(state, key, runId, signal);
           if (disposition.disposition === 'conflict') {
@@ -11131,61 +11106,17 @@ export class AgentThreadStreamRuntime {
           // Fork: upstream (#25080) now delivers straight to an observed remote active run
           // instead of the lease-routed idle path; keep the sender's stable-id payload ledger
           // on this path too, so a conflicting replay of an accepted id fails closed here.
-          // PF-6944: a copy of this signal still queued on this thread for a live local
-          // consumer stays there: the retry is a duplicate of that local delivery. A stranded
-          // copy (no live local consumer) is handed to this delivery; a failed publish puts it
-          // back. A second retry while such a delivery is in flight follows its outcome.
-          const queuedHere = (state.preRunSignalsByThread.get(key) ?? []).some(queued => queued.id === signal.id);
-          const localConsumer = queuedHere ? this.#liveLocalConsumer(state, key, runId) : undefined;
-          if (localConsumer !== undefined) {
-            return acceptSignal(
-              {
-                signal,
-                runId: localConsumer,
-                accepted: Promise.resolve({ action: 'deliver' as const, runId: localConsumer }),
-              },
-              localConsumer,
-              false,
-            );
-          }
-          const inFlightKey = `${key}\u0000${signal.id}`;
-          const inFlight = this.#keptDeliveriesInFlight.get(state)?.get(inFlightKey);
-          if (inFlight) {
-            const followedRunId = runId;
-            return acceptSignal(
-              {
-                signal,
-                runId: followedRunId,
-                accepted: inFlight.then(() => ({ action: 'deliver' as const, runId: followedRunId })),
-              },
-              followedRunId,
-              false,
-            );
-          }
-          const handover = this.#takeStrandedKeptInput(state, pubsub, key, signal);
-          // Without a copy to take, the delivery still records the signal afresh, so a kept
-          // forward of it in flight sees its own record replaced and does not requeue a copy.
-          if (!handover) this.#forgetCurrentSignalAdmission(state, key, signal);
+          // PF-6944: a kept copy of this signal still queued on this thread is handed to this
+          // delivery, which carries it (the owner's ledger admits the id once); a failed
+          // publish restores it.
+          const handover = this.#takeQueuedKeptInputForDelivery(state, key, signal);
           const disposition = this.#rememberSignalPayloadForRun(state, key, runId, signal);
           if (disposition.disposition === 'conflict') {
-            handover?.restore();
+            handover.restore();
             throw new Error(`Agent signal id "${signal.id}" was already accepted with a different payload`);
           }
-          if (handover) {
-            handover.admitted();
-            restoreHandover = handover.restore;
-            trackHandover = publication => {
-              const inFlightByKey = this.#keptDeliveriesInFlight.get(state) ?? new Map<string, Promise<void>>();
-              this.#keptDeliveriesInFlight.set(state, inFlightByKey);
-              const settled = publication.then(() => {});
-              inFlightByKey.set(inFlightKey, settled);
-              void settled
-                .catch(() => {})
-                .finally(() => {
-                  if (inFlightByKey.get(inFlightKey) === settled) inFlightByKey.delete(inFlightKey);
-                });
-            };
-          }
+          handover.admitted();
+          restoreHandover = handover.restore;
         }
         const deliveredRunId = runId;
         const publication = this.#publishAndWait(pubsub, key, {
@@ -11195,7 +11126,6 @@ export class AgentThreadStreamRuntime {
           sourceId: this.#getSourceId(),
           preRun: isLocalReservedRun,
         });
-        trackHandover?.(publication);
         void publication.catch(() => restoreHandover?.());
         const accepted = isLocalReservedRun
           ? Promise.resolve({ action: 'deliver' as const, runId: deliveredRunId })
