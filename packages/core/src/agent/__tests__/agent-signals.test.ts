@@ -22971,6 +22971,14 @@ describe('Agent signals', () => {
     expect(await checkFollowUpFamily('retry to the observed live winner', forkMainFollowUpCounts)).toEqual([]);
   }, 120_000);
 
+  it('PF-6944: model: no schedule runs a follow-up fewer times than fork main, or more than once beyond the disclosed at-least-once cases (remote retry while the local reservation acquires)', async () => {
+    const { checkFollowUpFamily } = await import('./pf6944-follow-up-model');
+    const { forkMainFollowUpCounts } = await import('./pf6944-fork-main-follow-up-runs');
+    expect(
+      await checkFollowUpFamily('remote retry while the local reservation acquires', forkMainFollowUpCounts),
+    ).toEqual([]);
+  }, 120_000);
+
   it('PF-6944: model: no schedule runs a follow-up fewer times than fork main, or more than once beyond the disclosed at-least-once cases (record lost by TTL)', async () => {
     const { checkFollowUpFamily } = await import('./pf6944-follow-up-model');
     const { forkMainFollowUpCounts } = await import('./pf6944-fork-main-follow-up-runs');

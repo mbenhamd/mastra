@@ -328,6 +328,8 @@ export async function startIdleWakeWithFollowUps(
     winnerToken,
     forwardedTo,
     loseLease,
+    /** Lets the held lease acquisition proceed without changing the owner. */
+    releaseAcquire: () => releaseAcquire(),
     nextLocalRunPreRunIds,
     finishRun,
   };

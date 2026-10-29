@@ -32,13 +32,22 @@ export type FollowUpSchedule = {
     | 'during-local-run'
     | 'other-instance'
     | 'remote-observed'
-    | 'winner-observed';
+    | 'winner-observed'
+    | 'remote-while-acquiring';
   /** Whether the retry is sent at once after the loss or after the hand-over settled. */
   retryTiming: 'settled' | 'early';
   /** F's admission record is lost before the retry: TTL expiry, or eviction by 1001 newer admissions. */
   recordLoss: 'none' | 'ttl-expiry' | 'eviction';
   /** Before the retry, a run on another thread of this runtime reuses the run id F was queued behind. */
   runIdReuse: 'none' | 'other-thread';
+  /**
+   * Only for `remote-while-acquiring`: the reservation F is queued behind is still acquiring the
+   * lease when this instance observes a remote run and the retry of F is routed to it (addressed
+   * to the thread or to that run), the retry's publish settles as given, and the reservation then
+   * wins the lease.
+   */
+  retryPublish?: 'ok' | 'reject-before-delivery' | 'reject-after-delivery';
+  retryTarget?: 'thread' | 'remote-run';
 };
 
 export type FollowUpCount = {
@@ -61,7 +70,12 @@ const dimensions = {
   runIdReuse: ['none'],
 } as const satisfies { [K in keyof FollowUpSchedule]: readonly FollowUpSchedule[K][] };
 
-type Dimensions = { [K in keyof FollowUpSchedule]: readonly FollowUpSchedule[K][] };
+type Dimensions = {
+  [K in Exclude<keyof FollowUpSchedule, 'retryPublish' | 'retryTarget'>]: readonly FollowUpSchedule[K][];
+} & {
+  retryPublish?: readonly NonNullable<FollowUpSchedule['retryPublish']>[];
+  retryTarget?: readonly NonNullable<FollowUpSchedule['retryTarget']>[];
+};
 
 const anyRetry = [
   'idle-winner-alive',
@@ -92,6 +106,19 @@ export const followUpScheduleFamilies: Record<string, Dimensions> = {
   },
   'retry to an observed remote run': { ...dimensions, retry: ['remote-observed'] },
   // This instance observes the winning run itself, still live, and the retry is routed to it.
+  'remote retry while the local reservation acquires': {
+    ...dimensions,
+    route: ['direct', 'queued-idle'],
+    lease: ['winner'],
+    sibling: ['none'],
+    wakePublish: ['ok'],
+    siblingPublish: ['ok'],
+    forward: ['ok'],
+    retry: ['remote-while-acquiring'],
+    retryTiming: ['settled'],
+    retryPublish: ['ok', 'reject-before-delivery', 'reject-after-delivery'],
+    retryTarget: ['thread', 'remote-run'],
+  },
   'retry to the observed live winner': {
     ...dimensions,
     forward: ['ok', 'reject-before-delivery', 'reject-after-delivery', 'held-reject-before-delivery'],
@@ -121,6 +148,10 @@ export const followUpScheduleFamilies: Record<string, Dimensions> = {
 /** Sets dimensions that cannot matter to a canonical value, so equal behaviours share a key. */
 function normalizeSchedule(schedule: FollowUpSchedule): FollowUpSchedule | undefined {
   const s = { ...schedule };
+  if (s.retry !== 'remote-while-acquiring') {
+    delete s.retryPublish;
+    delete s.retryTarget;
+  }
   if (s.lease === 'no-winner') s.wakePublish = 'ok';
   if (s.lease === 'no-winner' || s.wakePublish === 'fail' || s.wakePublish === 'held-fail') s.forward = 'ok';
   if (s.sibling === 'none') s.siblingPublish = 'ok';
@@ -159,6 +190,8 @@ export function followUpScheduleKey(schedule: FollowUpSchedule): string {
     `timing=${schedule.retryTiming}`,
     `recordLoss=${schedule.recordLoss}`,
     `runIdReuse=${schedule.runIdReuse}`,
+    ...(schedule.retryPublish === undefined ? [] : [`retryPublish=${schedule.retryPublish}`]),
+    ...(schedule.retryTarget === undefined ? [] : [`retryTarget=${schedule.retryTarget}`]),
   ].join(' ');
 }
 
@@ -173,7 +206,7 @@ export function enumerateFollowUpSchedules(family: Dimensions): FollowUpSchedule
       return;
     }
     const dimension = keys[index]!;
-    for (const value of family[dimension]) visit(index + 1, { ...partial, [dimension]: value });
+    for (const value of family[dimension] ?? []) visit(index + 1, { ...partial, [dimension]: value });
   };
   visit(0, {});
   return [...schedules.values()];
@@ -186,8 +219,11 @@ export function enumerateFollowUpSchedules(family: Dimensions): FollowUpSchedule
  *    of F that can reach the winner (through the wake's own forward, which is not rejected before
  *    delivery, or through a further sibling that took the requeued F):
  *    - F's forward rejects after it was delivered (the queued idle route then also requeues it);
- *    - a retry from another instance, or after the winner finished (lease free, during a local
- *      run, or routed to another remote run): no shared record (L17 P3);
+ *    - a retry after the winner finished (lease free, during a local run, or routed to another
+ *      remote run), or from another instance (which also counts when F is kept locally): no
+ *      shared record (L17 P3);
+ *    - a remote retry while the local reservation still acquires, whose publish rejects after it
+ *      delivered (the local copy is restored);
  * 2. F was kept locally (requeued) and its admission record is lost (TTL or eviction) before the
  *    retry; this needs F actually requeued and not dropped by a further sibling: requeued without
  *    a winner, or by the queued idle route's forward chain after a rejected forward, unless a
@@ -197,6 +233,9 @@ export function enumerateFollowUpSchedules(family: Dimensions): FollowUpSchedule
  * Each class allows one extra run; a schedule in both allows two (the literal sum, never more).
  */
 export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): number {
+  // A remote retry while the local reservation still acquires: a retry publish that rejects after
+  // it delivered leaves F at the remote run while its local copy is restored (class 1).
+  if (schedule.retry === 'remote-while-acquiring') return schedule.retryPublish === 'reject-after-delivery' ? 1 : 0;
   const delivered = (mode: PublishMode) => mode === 'ok' || mode === 'held-ok';
   const rejectedBeforeDelivery =
     schedule.forward === 'reject-before-delivery' || schedule.forward === 'held-reject-before-delivery';
@@ -212,12 +251,6 @@ export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): nu
     siblingForwardsRequeuedF;
   const forwardRejectsAfterDelivery =
     schedule.lease === 'winner' && delivered(schedule.wakePublish) && schedule.forward === 'reject-after-delivery';
-  const retryWithoutSharedRecord =
-    schedule.retry === 'other-instance' ||
-    (winnerMayHoldF &&
-      (schedule.retry === 'idle-lease-free' ||
-        schedule.retry === 'during-local-run' ||
-        schedule.retry === 'remote-observed'));
   // Kept locally: requeued without a winner, or requeued by the queued idle route's detached forward
   // chain after a rejected forward; a further sibling whose own publish fails drops it if it takes
   // it, which it does for a requeue without a winner or after a forward rejected before delivery
@@ -229,6 +262,14 @@ export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): nu
       schedule.lease === 'winner' &&
       delivered(schedule.wakePublish) &&
       (schedule.forward === 'reject-after-delivery' || (rejectedBeforeDelivery && !furtherSiblingDrops)));
+  // A retry without a shared record (another instance, or after the winner finished) needs the
+  // original F to be able to reach the winner, or (another instance) to be kept locally.
+  const retryWithoutSharedRecord =
+    (schedule.retry === 'other-instance' && (winnerMayHoldF || keptLocally)) ||
+    (winnerMayHoldF &&
+      (schedule.retry === 'idle-lease-free' ||
+        schedule.retry === 'during-local-run' ||
+        schedule.retry === 'remote-observed'));
   const keptLocallyAndRecordLost = keptLocally && schedule.recordLoss !== 'none';
   return (forwardRejectsAfterDelivery || retryWithoutSharedRecord ? 1 : 0) + (keptLocallyAndRecordLost ? 1 : 0);
 }
@@ -312,11 +353,136 @@ function emulateRuns(
 }
 
 /**
+ * The `remote-while-acquiring` schedules: the reservation L that F is queued behind (the idle wake,
+ * or the queued idle sibling) is still acquiring the lease when this instance observes a remote run
+ * R holding it, and a retry of F is routed to R; its publish settles as the schedule says. R then
+ * finishes and L wins the lease and runs. Counts F's executions like `countFollowUpRuns`.
+ */
+async function countRemoteRetryWhileAcquiring(schedule: FollowUpSchedule, index: number): Promise<FollowUpCount> {
+  const queuedIdle = schedule.route === 'queued-idle';
+  const ctx = await startIdleWakeWithFollowUps(`pf6944-model-${index}`, queuedIdle ? 0 : 1, {
+    queuedIdleSibling: queuedIdle,
+  });
+  const scope = { resourceId: ctx.resourceId, threadId: ctx.threadId };
+  const followUpId = queuedIdle ? `${ctx.wakeId}-sibling-follow-up` : ctx.followUpIds[0]!;
+  const followUpSignal = { id: followUpId, type: 'user-message', contents: followUpId } as const;
+  let executions = 0;
+  const runs = emulateRuns(ctx.runtime, ctx.agent, ctx.pubsub, signalId => {
+    if (signalId === followUpId) executions += 1;
+  });
+  const topic = `agent.thread-stream.${encodeURIComponent(ctx.key)}`;
+  const remoteRunId = `${ctx.wakeId}-remote-run`;
+  const remoteOwner = encodedOwner(remoteRunId, 'pf6944-remote-source');
+  const live = { remote: false };
+  let remoteAdmitted = false;
+  let retryFailureUsed = false;
+  const retryErrors: unknown[] = [];
+  const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
+
+  // L: the idle wake (its acquisition is held by the fixture), or the queued idle sibling.
+  let releaseReservation = () => ctx.releaseAcquire();
+  const reservationRunId = queuedIdle ? ctx.sibling!.runId : ctx.wake.runId;
+  if (queuedIdle) {
+    const gate = { release: () => {} };
+    ctx.pubsub.acquireLeaseWait = new Promise<void>(resolve => {
+      gate.release = resolve;
+    });
+    ctx.loseLease();
+    await ctx.wake.accepted.catch(() => {});
+    await waitUntil(() => ctx.runtime.getActiveThreadRunId(scope, ctx.pubsub) === reservationRunId);
+    const followUp = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+    void followUp.accepted.catch(() => {});
+    releaseReservation = () => gate.release();
+  }
+
+  const publishSpy = vi.spyOn(ctx.pubsub, 'publish').mockImplementation(async (topicName, event) => {
+    const data = event.data;
+    const toRemote = data?.type === 'signal-enqueued' && data.signal?.id === followUpId && data.runId === remoteRunId;
+    if (toRemote && schedule.retryPublish !== 'ok' && !retryFailureUsed) {
+      retryFailureUsed = true;
+      if (schedule.retryPublish === 'reject-after-delivery') {
+        await realPublish(topicName, event);
+        if (live.remote) remoteAdmitted = true;
+      }
+      throw new Error(`schedule: retry publish ${schedule.retryPublish}`);
+    }
+    await realPublish(topicName, event);
+    if (toRemote && live.remote) remoteAdmitted = true;
+  });
+
+  // This instance observes R, which holds the lease, while L still acquires.
+  const subscription = await ctx.runtime.subscribeToThread(ctx.agent, scope, ctx.pubsub);
+  ctx.pubsub.owners.set(ctx.key, remoteOwner);
+  live.remote = true;
+  await realPublish(topic, {
+    type: 'run-registered',
+    runId: remoteRunId,
+    data: {
+      type: 'run-registered',
+      runId: remoteRunId,
+      streamId: `${remoteRunId}-stream`,
+      streamSeq: 1,
+      leaseOwner: remoteOwner,
+      agentId: ctx.agent.id,
+    },
+  });
+  await ctx.pubsub.flush();
+  await settle();
+  const retry = ctx.runtime.sendSignal(
+    ctx.agent,
+    followUpSignal,
+    schedule.retryTarget === 'remote-run' ? { ...scope, runId: remoteRunId } : scope,
+    ctx.pubsub,
+  );
+  void retry.accepted.catch(error => retryErrors.push(error));
+  await settle(10);
+
+  // R finishes; L then wins the lease and runs.
+  live.remote = false;
+  if (ctx.pubsub.owners.get(ctx.key) === remoteOwner) ctx.pubsub.owners.delete(ctx.key);
+  await realPublish(topic, {
+    type: 'run-completed',
+    runId: remoteRunId,
+    data: { type: 'run-completed', runId: remoteRunId, streamId: `${remoteRunId}-stream`, leaseOwner: remoteOwner },
+  });
+  await ctx.pubsub.flush();
+  await settle(10);
+  if (queuedIdle) ctx.pubsub.owners.delete(ctx.key);
+  releaseReservation();
+  await waitUntil(() => runs.openRunIds().includes(reservationRunId));
+  await settle(10);
+  publishSpy.mockRestore();
+  await runs.completeAll();
+  const settled = executions + (remoteAdmitted ? 1 : 0);
+
+  // A later local run on the thread takes whatever is still queued.
+  const owner = ctx.pubsub.owners.get(ctx.key);
+  if (owner) await ctx.pubsub.releaseLease(ctx.key, owner);
+  const later = ctx.runtime.sendSignal(
+    ctx.agent,
+    { id: `${ctx.wakeId}-later`, type: 'user-message', contents: 'later' },
+    scope,
+    ctx.pubsub,
+  );
+  void later.accepted.catch(() => {});
+  await settle(10);
+  await runs.completeAll();
+  const total = executions + (remoteAdmitted ? 1 : 0);
+  subscription.unsubscribe();
+  const unexpected = retryErrors.filter(error => !(error instanceof Error && error.message.startsWith('schedule: ')));
+  if (unexpected.length > 0) {
+    throw new Error(`${followUpScheduleKey(schedule)}: unexpected retry failure: ${unexpected.map(String).join('; ')}`);
+  }
+  return { settled, total };
+}
+
+/**
  * Runs one schedule on the runtime under test and counts F's executions: once if a live winning
  * (or observed remote) run received it, since an owner admits a signal id once, plus every local
  * execution (a run started with F, or F folded from a run's pre-run or pending queue).
  */
 export async function countFollowUpRuns(schedule: FollowUpSchedule, index: number): Promise<FollowUpCount> {
+  if (schedule.retry === 'remote-while-acquiring') return countRemoteRetryWhileAcquiring(schedule, index);
   const queuedIdle = schedule.route === 'queued-idle';
   const ctx = await startIdleWakeWithFollowUps(`pf6944-model-${index}`, queuedIdle ? 0 : 1, {
     afterFinishingRun: schedule.route === 'transfer',
@@ -357,7 +523,9 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
   });
   let holdStarted = false;
   let forwardFailureUsed = false;
-  let retrySent = false;
+  // The original F object, as first published (its send to the reservation it is queued behind).
+  const originalFollowUp = () =>
+    ctx.pubsub.publishedData.find(data => data?.type === 'signal-enqueued' && data.signal?.id === followUpId)?.signal;
   const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
   const applyMode = async (mode: PublishMode, what: string) => {
     if (mode === 'held-ok' || mode === 'held-fail') {
@@ -373,14 +541,14 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
       if (id === behindId) await applyMode(schedule.wakePublish, 'wake');
       if (furtherSiblingId !== undefined && id === furtherSiblingId)
         await applyMode(schedule.siblingPublish, 'sibling');
-      // The injected forward failure applies to the original forward of F, never to a retry's
-      // publish of F (on fork main a retry may be the first publish of F to the winner).
+      // The injected forward failure applies to the original forward of F, identified by
+      // provenance: the published signal is the original F object (a retry sends a new one).
       if (
         id === followUpId &&
         data.runId === ctx.winnerRunId &&
         schedule.forward !== 'ok' &&
         !forwardFailureUsed &&
-        !retrySent
+        data.signal === originalFollowUp()
       ) {
         forwardFailureUsed = true;
         if (schedule.forward === 'held-reject-before-delivery') {
@@ -404,7 +572,6 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
   // Retries: rejected acknowledgements are recorded and must be ones this schedule injected.
   const retryErrors: unknown[] = [];
   const sendRetryOn = (runtime: AgentThreadStreamRuntime, agent: Agent<any, any, any, any>, runId?: string) => {
-    retrySent = true;
     const retry = runtime.sendSignal(
       agent,
       followUpSignal,
@@ -638,7 +805,8 @@ export async function countFollowUpFamily(family: string): Promise<Record<string
 /**
  * Checks every schedule of a family against fork main's counts and returns one readable line per
  * failing schedule (empty when all hold):
- * - F never runs fewer times than on fork main, neither by the end of the retry phase nor in total;
+ * - F runs at least as often as on fork main (counted up to once: repeated runs of one F are
+ *   duplicates, never owed), neither by the end of the retry phase nor in total;
  * - F runs at most once in total (or as often as on fork main, if more), plus one only in the
  *   disclosed at-least-once cases that `followUpScheduleExtraRunsAllowed` labels.
  */
@@ -657,7 +825,9 @@ export async function checkFollowUpFamily(
     }
     const count = await countFollowUpRuns(schedule, familyIndex * 10_000 + index);
     const allowed = Math.max(expected.total, 1) + followUpScheduleExtraRunsAllowed(schedule);
-    if (count.settled < expected.settled || count.total < expected.total || count.total > allowed) {
+    const owedSettled = Math.min(expected.settled, 1);
+    const owedTotal = Math.min(expected.total, 1);
+    if (count.settled < owedSettled || count.total < owedTotal || count.total > allowed) {
       failures.push(
         `${key}: branch runs F ${count.settled}x by the end of the retry phase and ${count.total}x in total; ` +
           `fork main ${expected.settled}x and ${expected.total}x; allowed total ${expected.total}..${allowed}`,

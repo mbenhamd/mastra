@@ -264,6 +264,18 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=ok retryTarget=remote-run':
+    { settled: 2, total: 2 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=ok retryTarget=thread':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-after-delivery retryTarget=remote-run':
+    { settled: 2, total: 2 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-after-delivery retryTarget=thread':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-before-delivery retryTarget=remote-run':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-before-delivery retryTarget=thread':
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
@@ -1099,6 +1111,18 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=ok retryTarget=remote-run':
+    { settled: 2, total: 2 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=ok retryTarget=thread':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-after-delivery retryTarget=remote-run':
+    { settled: 2, total: 2 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-after-delivery retryTarget=thread':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-before-delivery retryTarget=remote-run':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-while-acquiring timing=settled recordLoss=none runIdReuse=none retryPublish=reject-before-delivery retryTarget=thread':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
