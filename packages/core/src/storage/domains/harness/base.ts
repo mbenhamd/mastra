@@ -1474,7 +1474,10 @@ export abstract class HarnessStorage extends StorageDomain {
    * that can hand a session off to another store (execution-closure export)
    * serializes the revocation with that hand-off and throws
    * `HarnessTerminalHandoffFencedError` once the session was handed off: the
-   * fence must then be written where the session now lives. Adapters that
+   * fence must then be written where the session now lives. With
+   * `requireOwnerLeaseLapsed`, the owner's session lease is re-read under the
+   * same serialization (after any in-flight renewal commits) and a live lease
+   * answers `owner_live` without writing a tombstone. Adapters that
    * implement it override `supportsTerminalGrantRevocation`.
    */
   async revokeTerminalGrant(

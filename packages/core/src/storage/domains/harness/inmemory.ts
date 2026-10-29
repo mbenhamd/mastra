@@ -2254,10 +2254,23 @@ export class InMemoryHarness extends HarnessStorage {
     if (!Number.isSafeInteger(now) || now < 0) {
       throw new HarnessTerminalHandoffValidationError('revokedAt', 'must be a non-negative safe integer');
     }
+    if (input.requireOwnerLeaseLapsed && !input.requireOwnerLeaseLapsed.ownerId) {
+      throw new HarnessTerminalHandoffValidationError('requireOwnerLeaseLapsed', 'ownerId is required');
+    }
     // No await below: the lookups and the tombstone write are one atomic step,
-    // as the grant lock makes them in the Postgres adapter.
+    // as the grant and session locks make them in the Postgres adapter.
     const grant = { ...input.executionGrant };
     const tombstoneId = harnessTerminalGrantTombstoneId({ harnessName: namespace, executionGrant: grant });
+    if (input.requireOwnerLeaseLapsed) {
+      const session = this.db.harnessSessions.get(sessionKey(namespace, input.sessionId));
+      if (
+        session?.ownerId === input.requireOwnerLeaseLapsed.ownerId &&
+        session.leaseExpiresAt !== undefined &&
+        session.leaseExpiresAt > now
+      ) {
+        return { status: 'owner_live', grant, tombstoneId, leaseExpiresAt: session.leaseExpiresAt };
+      }
+    }
     const existing = [...this.db.harnessTerminalAdmissions.values()].find(
       candidate =>
         candidate.harnessName === namespace &&

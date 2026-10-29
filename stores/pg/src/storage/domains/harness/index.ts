@@ -6221,6 +6221,9 @@ export class HarnessPG extends HarnessStorage {
     }
     const now = input.revokedAt ?? Date.now();
     assertTerminalClock(now, 'revokedAt');
+    if (input.requireOwnerLeaseLapsed && !input.requireOwnerLeaseLapsed.ownerId) {
+      throw new HarnessTerminalHandoffValidationError('requireOwnerLeaseLapsed', 'ownerId is required');
+    }
     const grant = { ...input.executionGrant };
     const tombstoneId = harnessTerminalGrantTombstoneId({ harnessName, executionGrant: grant });
     const tx = await this.#client.transaction('write');
@@ -6239,11 +6242,26 @@ export class HarnessPG extends HarnessStorage {
       // Lock order: grant -> session, as in admission and commit.
       const sessionRow = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_SESSIONS} SET version = version
-              WHERE harness_name = ? AND id = ? RETURNING owner_id`,
+              WHERE harness_name = ? AND id = ? RETURNING owner_id, lease_expires_at`,
         args: [harnessName, input.sessionId],
       });
       if (sessionRow.rows[0]?.owner_id === EXPORTED_FENCE_AUTHORITY) {
         throw new HarnessTerminalHandoffFencedError(input.sessionId);
+      }
+      // The row lock also waits out an in-flight lease renewal (it holds the
+      // row FOR UPDATE), so this read sees the lease the renewal committed,
+      // not the one the caller saw before deciding the owner had lapsed.
+      if (input.requireOwnerLeaseLapsed && sessionRow.rows[0]) {
+        const ownerId = (sessionRow.rows[0].owner_id ?? null) as string | null;
+        const leaseExpiresAt = sessionRow.rows[0].lease_expires_at;
+        if (
+          ownerId === input.requireOwnerLeaseLapsed.ownerId &&
+          leaseExpiresAt != null &&
+          Number(leaseExpiresAt) > now
+        ) {
+          await tx.commit();
+          return { status: 'owner_live', grant, tombstoneId, leaseExpiresAt: Number(leaseExpiresAt) };
+        }
       }
       const admissionRow = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}

@@ -230,6 +230,14 @@ export interface HarnessTerminalGrantRevocationInput {
   executionGrant: HarnessTerminalExecutionGrant;
   reason: HarnessTerminalError;
   revokedAt?: number;
+  /**
+   * Refuse the revocation (`owner_live`) while `ownerId` still holds a live
+   * lease on the session, checked under the session row lock against
+   * `revokedAt`. A recovery worker that decided from a plain read that the
+   * owner's lease lapsed passes it, so a lease renewal committing after that
+   * read cannot leave the live owner's grant tombstoned.
+   */
+  requireOwnerLeaseLapsed?: { ownerId: string };
 }
 
 /**
@@ -240,6 +248,8 @@ export interface HarnessTerminalGrantRevocationInput {
  *   it. A later `admitTerminalHandoff` for the grant answers `cancelled`.
  * - `duplicate`: the grant was already tombstoned (by an earlier revocation or
  *   cancellation) and has no admission.
+ * - `owner_live`: `requireOwnerLeaseLapsed` was set and its owner still holds
+ *   the session lease (expiring at `leaseExpiresAt`). Nothing changed.
  */
 export type HarnessTerminalGrantRevocationReceipt =
   | {
@@ -253,6 +263,12 @@ export type HarnessTerminalGrantRevocationReceipt =
       grant: HarnessTerminalExecutionGrant;
       tombstoneId: string;
       revokedAt: number;
+    }
+  | {
+      status: 'owner_live';
+      grant: HarnessTerminalExecutionGrant;
+      tombstoneId: string;
+      leaseExpiresAt: number;
     };
 
 export interface HarnessTerminalAdmissionLoadInput {
