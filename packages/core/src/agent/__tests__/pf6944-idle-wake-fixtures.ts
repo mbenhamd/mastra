@@ -506,3 +506,65 @@ export async function requeueFollowUpBehindOwnerlessSibling(ctx: IdleWakeContext
   await new Promise(resolve => setTimeout(resolve, 50));
   return { sibling, scope, followUpSignal };
 }
+
+/**
+ * This instance observes a remote run R of the same agent holding the thread's lease (as it
+ * would from R's `run-registered`), while the context's own reservation may still be acquiring.
+ * `finish()` publishes R's completion and frees the lease.
+ */
+export async function observeRemoteRun(ctx: IdleWakeContext, remoteRunId: string) {
+  const scope = { resourceId: ctx.resourceId, threadId: ctx.threadId };
+  const topic = `agent.thread-stream.${encodeURIComponent(ctx.key)}`;
+  const remoteOwner = encodedOwner(remoteRunId, 'pf6944-remote-source');
+  const subscription = await ctx.runtime.subscribeToThread(ctx.agent, scope, ctx.pubsub);
+  ctx.pubsub.owners.set(ctx.key, remoteOwner);
+  await ctx.pubsub.publish(topic, {
+    type: 'run-registered',
+    runId: remoteRunId,
+    data: {
+      type: 'run-registered',
+      runId: remoteRunId,
+      streamId: `${remoteRunId}-stream`,
+      streamSeq: 1,
+      leaseOwner: remoteOwner,
+      agentId: ctx.agent.id,
+    },
+  });
+  await ctx.pubsub.flush();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  return {
+    unsubscribe: () => subscription.unsubscribe(),
+    async finish() {
+      if (ctx.pubsub.owners.get(ctx.key) === remoteOwner) ctx.pubsub.owners.delete(ctx.key);
+      await ctx.pubsub.publish(topic, {
+        type: 'run-completed',
+        runId: remoteRunId,
+        data: { type: 'run-completed', runId: remoteRunId, streamId: `${remoteRunId}-stream`, leaseOwner: remoteOwner },
+      });
+      await ctx.pubsub.flush();
+      await new Promise(resolve => setTimeout(resolve, 20));
+    },
+  };
+}
+
+/** Holds every publish of the given signal ids to `runId`; `rejectAll()` rejects them, oldest first, before delivery. */
+export function holdPublishesTo(ctx: IdleWakeContext, runId: string, signalIds: readonly string[]) {
+  const pending: Array<{ id: string; reject: () => void }> = [];
+  const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
+  const spy = vi.spyOn(ctx.pubsub, 'publish').mockImplementation(async (topic, event) => {
+    const id = event.data?.signal?.id;
+    if (event.data?.type === 'signal-enqueued' && event.data?.runId === runId && signalIds.includes(id)) {
+      await new Promise<void>((_resolve, reject) => {
+        pending.push({ id, reject: () => reject(new Error(`injected publish failure before delivery: ${id}`)) });
+      });
+    }
+    await realPublish(topic, event);
+  });
+  return {
+    heldIds: () => pending.map(entry => entry.id),
+    rejectAll() {
+      for (const entry of pending.splice(0)) entry.reject();
+    },
+    restore: () => spy.mockRestore(),
+  };
+}

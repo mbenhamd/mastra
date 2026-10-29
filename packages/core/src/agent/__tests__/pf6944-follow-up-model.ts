@@ -235,7 +235,10 @@ export function enumerateFollowUpSchedules(family: Dimensions): FollowUpSchedule
 export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): number {
   // A remote retry while the local reservation still acquires: a retry publish that rejects after
   // it delivered leaves F at the remote run while its local copy is restored (class 1).
-  if (schedule.retry === 'remote-while-acquiring') return schedule.retryPublish === 'reject-after-delivery' ? 1 : 0;
+  // (A retry addressed to the thread is answered locally and never reaches R: no allowance.)
+  if (schedule.retry === 'remote-while-acquiring') {
+    return schedule.retryTarget === 'remote-run' && schedule.retryPublish === 'reject-after-delivery' ? 1 : 0;
+  }
   const delivered = (mode: PublishMode) => mode === 'ok' || mode === 'held-ok';
   const rejectedBeforeDelivery =
     schedule.forward === 'reject-before-delivery' || schedule.forward === 'held-reject-before-delivery';
