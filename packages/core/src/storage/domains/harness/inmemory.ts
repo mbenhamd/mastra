@@ -1416,10 +1416,9 @@ export class InMemoryHarness extends HarnessStorage {
         }
         // A lapsed descendant is re-adopted, unless a grant revocation already
         // acted on that lapse: the recovery that revoked it decided the owner
-        // was gone, so re-adopting would leave a live owner with a fenced grant.
-        if (this.revokedSinceLeaseLapsed(namespace, child, now)) {
-          throw new HarnessStorageLeaseConflictError(child.id, child.ownerId ?? '<unowned>', child.leaseExpiresAt ?? 0);
-        }
+        // was gone. It is left out of the pass (not renewed, not failing it),
+        // so its lease stays lapsed and the root stays renewable.
+        if (this.revokedSinceLeaseLapsed(namespace, child, now)) continue;
         descendants.push(child);
       }
     }

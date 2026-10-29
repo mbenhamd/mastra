@@ -709,7 +709,7 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
     },
   );
 
-  it('fails a subtree renewal paused before a lapsed child that a revocation fenced meanwhile', async () => {
+  it('leaves out a lapsed child that a revocation fenced while the subtree renewal paused before it', async () => {
     // Root and child-b lapse together; child-a stays live and is locked first
     // (descendants lock by id), so the renewal pauses after validating the root.
     const root = await createNativeSession(harness(), 'subtree-root', 'owner-e', 1_000);
@@ -752,10 +752,86 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
     ).resolves.toMatchObject({ status: 'revoked' });
     await blocker.release();
 
-    expect(await renewal).toBeInstanceOf(HarnessStorageLeaseConflictError);
+    // The root and the live sibling renew; the fenced child stays lapsed.
+    expect(await renewal).toBe('renewed');
     const after = await harness().loadSession({ harnessName: HARNESS, sessionId: childB.id });
     expect(after!.leaseExpiresAt).toBe(childB.leaseExpiresAt);
     expect(await tombstoneCount(input.executionGrant.key)).toBe('1');
+    const again = await harness().renewSessionLeaseSubtree({
+      rootSessionId: root.id,
+      ownerId: 'owner-e',
+      ttlMs: 60_000,
+    });
+    expect(again.renewedDescendantCount).toBe(1);
+    expect((await harness().loadSession({ harnessName: HARNESS, sessionId: childB.id }))!.leaseExpiresAt).toBe(
+      childB.leaseExpiresAt,
+    );
+  });
+
+  async function rootWithLapsedChild(target: HarnessStorage, tag: string, ownerId: string) {
+    const root = await createNativeSession(target, `${tag}-root`, ownerId, 60_000);
+    const child = createSampleSessionRecord({
+      id: `${tag}-child`,
+      harnessName: HARNESS,
+      resourceId: root.resourceId,
+      threadId: `thread-${tag}-child`,
+      parentSessionId: root.id,
+    });
+    await target.createOrLoadActiveSession(child, { initialLease: { ownerId, ttlMs: 200 } });
+    await sleep(300);
+    return { root, child: (await target.loadSession({ harnessName: HARNESS, sessionId: child.id }))! };
+  }
+
+  it('does not let a handoff-disabled instance re-adopt a child an enabled instance fenced', async () => {
+    const disabled = terminalStore('pg-harness-owner-live-disabled', schemaName, {
+      terminalHandoff: { enabled: false },
+    });
+    await disabled.init();
+    try {
+      const { root, child } = await rootWithLapsedChild(harness(), 'disabled', 'owner-g');
+      const input = admissionFor(child, 'disabled-child');
+      await expect(
+        harness().revokeTerminalGrant({ ...revocation(input), requireOwnerLeaseLapsed: { ownerId: 'owner-g' } }),
+      ).resolves.toMatchObject({ status: 'revoked' });
+
+      const renewed = await disabled.stores.harness!.renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-g',
+        ttlMs: 60_000,
+      });
+      expect(renewed.renewedDescendantCount).toBe(0);
+      expect((await harness().loadSession({ harnessName: HARNESS, sessionId: child.id }))!.leaseExpiresAt).toBe(
+        child.leaseExpiresAt,
+      );
+    } finally {
+      await disabled.close();
+    }
+  });
+
+  it('re-adopts a lapsed child on a fresh single-connection store without deadlocking on lazy setup', async () => {
+    const freshSchema = `pf6886_fresh_${randomUUID().replaceAll('-', '_')}`;
+    const fresh = terminalStore('pg-harness-owner-live-fresh', freshSchema, { max: 1 });
+    await fresh.init();
+    try {
+      const { root, child } = await rootWithLapsedChild(fresh.stores.harness!, 'fresh', 'owner-h');
+      const renewal = fresh.stores.harness!.renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-h',
+        ttlMs: 60_000,
+      });
+      const outcome = await Promise.race([renewal, sleep(5_000).then(() => 'timed out' as const)]);
+      expect(outcome).toMatchObject({ renewedDescendantCount: 1 });
+      expect(
+        (await fresh.stores.harness!.loadSession({ harnessName: HARNESS, sessionId: child.id }))!.leaseExpiresAt,
+      ).toBeGreaterThan(Date.now());
+    } finally {
+      // Bounded: on a hung renewal the store cannot close and its locks hold.
+      await Promise.race([fresh.close(), sleep(1_000)]);
+      await Promise.race([
+        store.db.none(`DROP SCHEMA IF EXISTS "${freshSchema}" CASCADE`).catch(() => {}),
+        sleep(1_000),
+      ]);
+    }
   });
 
   it.each(['renewSessionLeaseSubtree', 'renewSessionLease'] as const)(

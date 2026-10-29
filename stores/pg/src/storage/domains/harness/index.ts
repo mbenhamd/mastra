@@ -885,6 +885,7 @@ export class HarnessPG extends HarnessStorage {
   #indexes?: CreateIndexOptions[];
   #sessionEventsReady: Promise<void> | undefined;
   #terminalHandoffReady: Promise<void> | undefined;
+  #terminalTombstonesPresent = false;
   #workspaceActionsReady: Promise<void> | undefined;
   #planTasksReady: Promise<void> | undefined;
   #runSummariesReady: Promise<void> | undefined;
@@ -3822,48 +3823,45 @@ export class HarnessPG extends HarnessStorage {
         descendantIds.push(childId);
       }
 
+      // A lapsed descendant is re-adopted unless a grant revocation already
+      // acted on that lapse (a revocation tombstone at or after its expiry).
+      // Such a descendant is left out of the pass, neither renewed nor failing
+      // it: its grant is fenced and its lease stays lapsed, so the root stays
+      // renewable. Locks: root, then descendants by id; the lock waits out a
+      // revocation holding the row and the clock is read after it, so a
+      // revocation that committed meanwhile is seen.
+      let renewedIds = descendantIds;
       if (descendantIds.length > 0) {
-        // Lock order: root, then descendants by id. A lapsed descendant is
-        // re-adopted unless a grant revocation already acted on that lapse; the
-        // lock waits out a revocation holding the row, and the clock is read
-        // after it, so a revocation that committed meanwhile is seen.
         const lockedDescendants = await tx.execute({
-          sql: `SELECT id, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+          sql: `SELECT id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND id IN (${descendantIds.map(() => '?').join(', ')})
                 ORDER BY id
                 FOR NO KEY UPDATE`,
           args: [namespace, ...descendantIds],
         });
         const lockedNow = Date.now();
-        const lapsed = (lockedDescendants.rows as Record<string, unknown>[]).filter(
-          row => row.lease_expires_at != null && Number(row.lease_expires_at) <= lockedNow,
-        );
-        if (lapsed.length > 0 && this.terminalHandoff.enabled) {
-          await this.#ensureTerminalHandoffTables();
-          const revoked = await tx.execute({
-            sql: `SELECT s.id, s.owner_id, s.lease_expires_at FROM ${TABLE_HARNESS_SESSIONS} s
-                  WHERE s.harness_name = ? AND s.id IN (${lapsed.map(() => '?').join(', ')})
+        const lapsedIds = (lockedDescendants.rows as Record<string, unknown>[])
+          .filter(row => row.lease_expires_at != null && Number(row.lease_expires_at) <= lockedNow)
+          .map(row => row.id as string);
+        // Checked whatever this instance's terminal-handoff setting: another
+        // instance may have written the fence. No tombstone table, no fence.
+        if (lapsedIds.length > 0 && (await this.#terminalTombstonesExist(tx))) {
+          const fenced = await tx.execute({
+            sql: `SELECT s.id FROM ${TABLE_HARNESS_SESSIONS} s
+                  WHERE s.harness_name = ? AND s.id IN (${lapsedIds.map(() => '?').join(', ')})
                     AND EXISTS (
                       SELECT 1 FROM ${TABLE_HARNESS_TERMINAL_TOMBSTONES} t
                       WHERE t.harness_name = s.harness_name AND t.session_id = s.id
                         AND t.session_incarnation IS NULL AND t.created_at >= s.lease_expires_at
-                    )
-                  ORDER BY s.id
-                  LIMIT 1`,
-            args: [namespace, ...lapsed.map(row => row.id as string)],
+                    )`,
+            args: [namespace, ...lapsedIds],
           });
-          const revokedRow = revoked.rows[0] as Record<string, unknown> | undefined;
-          if (revokedRow) {
-            throw new HarnessStorageLeaseConflictError(
-              revokedRow.id as string,
-              (revokedRow.owner_id ?? '<unowned>') as string,
-              Number(revokedRow.lease_expires_at),
-            );
-          }
+          const fencedIds = new Set((fenced.rows as Record<string, unknown>[]).map(row => row.id as string));
+          renewedIds = descendantIds.filter(id => !fencedIds.has(id));
         }
       }
 
-      const allIds = [rootSessionId, ...descendantIds];
+      const allIds = [rootSessionId, ...renewedIds];
       const updateResult = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
               SET lease_expires_at = ?
@@ -3885,11 +3883,25 @@ export class HarnessPG extends HarnessStorage {
       }
 
       await tx.commit();
-      return { version: Number(rootRow.version), expiresAt, renewedDescendantCount: descendantIds.length };
+      return { version: Number(rootRow.version), expiresAt, renewedDescendantCount: renewedIds.length };
     } catch (err) {
       if (!tx.closed) await tx.rollback();
       throw err;
     }
+  }
+
+  /**
+   * Whether the terminal tombstone table exists, read on the caller's
+   * transaction (no second pooled connection). Cached once true.
+   */
+  async #terminalTombstonesExist(tx: PgHarnessClient): Promise<boolean> {
+    if (this.#terminalTombstonesPresent) return true;
+    const result = await tx.execute({
+      sql: `SELECT to_regclass(?) IS NOT NULL AS present`,
+      args: [`"${parseSchemaName(this.#schema)}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}"`],
+    });
+    this.#terminalTombstonesPresent = result.rows[0]?.present === true;
+    return this.#terminalTombstonesPresent;
   }
 
   async releaseSessionLease({ sessionId, ownerId, harnessName }: ReleaseSessionLeaseInput): Promise<void> {

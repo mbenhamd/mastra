@@ -1222,9 +1222,12 @@ export abstract class HarnessStorage extends StorageDomain {
    * descendant whose mirror lapsed is re-adopted to the capped expiry (that is
    * the §5.8 repair, not a fence) — unless a pre-admission grant revocation
    * (`revokeTerminalGrant`) for that descendant was written at or after its
-   * lease expiry: the revocation acted on the lapse, so the pass is fenced with
-   * a lease conflict on that descendant. Closed/closing descendants hold no
-   * live lease and are skipped.
+   * lease expiry: the revocation acted on the lapse, so that descendant is left
+   * out of the pass — not renewed (its lease stays lapsed, the tombstone stays)
+   * and not counted in `renewedDescendantCount` — while the root and the other
+   * descendants renew. Adapters check persisted tombstones regardless of their
+   * own terminal-handoff setting. Closed/closing descendants hold no live lease
+   * and are skipped.
    *
    * `renewedDescendantCount` reports how many descendant entries were extended.
    *

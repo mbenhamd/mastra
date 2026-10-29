@@ -3174,7 +3174,7 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
     expect(grandchild?.ownerId).toBe(owner);
   });
 
-  it('does not re-adopt a lapsed descendant whose grant a revocation fenced after the lapse', async () => {
+  it('leaves a lapsed descendant whose grant a revocation fenced after the lapse out of the renewal', async () => {
     const db = new InMemoryDB();
     const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
     const owner = 'owner-A';
@@ -3201,10 +3201,14 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
       }),
     ).resolves.toMatchObject({ status: 'revoked' });
 
-    await expect(
-      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 }),
-    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
-    expect((await storage.loadSession({ sessionId: 'child-1' }))?.leaseExpiresAt).toBe(lapsedAt);
+    // The root stays renewable, pass after pass; the fenced child stays lapsed.
+    for (let pass = 0; pass < 2; pass++) {
+      const renewed = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+      expect(renewed.renewedDescendantCount).toBe(0);
+      expect((await storage.loadSession({ sessionId: 'root' }))?.leaseExpiresAt).toBe(renewed.expiresAt);
+      expect((await storage.loadSession({ sessionId: 'child-1' }))?.leaseExpiresAt).toBe(lapsedAt);
+    }
+    expect([...db.harnessTerminalTombstones.values()].filter(t => t.sessionId === 'child-1')).toHaveLength(1);
   });
 
   it('throws not-found for a missing root', async () => {

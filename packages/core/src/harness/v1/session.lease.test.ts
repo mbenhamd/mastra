@@ -519,3 +519,44 @@ describe('pre-eviction warning (§O3)', () => {
     expect(events).not.toContain('session_eviction_warning');
   });
 });
+
+describe('subtree lease renewal with a revocation-fenced descendant', () => {
+  it('keeps the root renewable and leaves the fenced child lapsed', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const { harness } = setupHarness({ sessions: { storage } });
+    const root = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const rootRecord = (await storage.loadSession({ sessionId: root.id }))!;
+    await storage.createOrLoadActiveSession(
+      {
+        ...rootRecord,
+        id: 'fenced-child',
+        threadId: 'thread-fenced-child',
+        parentSessionId: root.id,
+        origin: 'subagent',
+        version: 0,
+      },
+      { initialLease: { ownerId: harness.ownerId, ttlMs: 60_000 } },
+    );
+    const key = [...db.harnessSessions.keys()].find(k => k.endsWith('fenced-child'))!;
+    const lapsedAt = Date.now() - 1_000;
+    db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, leaseExpiresAt: lapsedAt });
+    await expect(
+      storage.revokeTerminalGrant({
+        harnessName: rootRecord.harnessName,
+        sessionId: 'fenced-child',
+        admissionId: 'admission-fenced-child',
+        executionGrant: { key: 'grant-fenced-child', generation: 1 },
+        reason: { code: 'doxa.turn_released', message: 'owner lapsed' },
+        requireOwnerLeaseLapsed: { ownerId: harness.ownerId },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    for (let pass = 0; pass < 3; pass++) {
+      await root.extendLease({ ttlMs: 5 * 60_000 });
+      expect(root.lifecycleState).toBe('live');
+      expect((await storage.loadSession({ sessionId: 'fenced-child' }))!.leaseExpiresAt).toBe(lapsedAt);
+    }
+    expect([...db.harnessTerminalTombstones.values()].filter(t => t.sessionId === 'fenced-child')).toHaveLength(1);
+  });
+});
