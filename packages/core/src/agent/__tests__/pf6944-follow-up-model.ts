@@ -23,9 +23,16 @@ export type FollowUpSchedule = {
   /** Publish of the further sibling's own signal. `held-*` as above. */
   siblingPublish: PublishMode;
   /** First forward publish of F to the winner. */
-  forward: 'ok' | 'reject-before-delivery' | 'reject-after-delivery';
+  forward: 'ok' | 'reject-before-delivery' | 'reject-after-delivery' | 'held-reject-before-delivery';
   /** A retry of F with its original payload. */
-  retry: 'none' | 'idle-winner-alive' | 'idle-lease-free' | 'during-local-run' | 'other-instance' | 'remote-observed';
+  retry:
+    | 'none'
+    | 'idle-winner-alive'
+    | 'idle-lease-free'
+    | 'during-local-run'
+    | 'other-instance'
+    | 'remote-observed'
+    | 'winner-observed';
   /** Whether the retry is sent at once after the loss or after the hand-over settled. */
   retryTiming: 'settled' | 'early';
   /** F's admission record is lost before the retry: TTL expiry, or eviction by 1001 newer admissions. */
@@ -84,6 +91,12 @@ export const followUpScheduleFamilies: Record<string, Dimensions> = {
     retryTiming: ['settled'],
   },
   'retry to an observed remote run': { ...dimensions, retry: ['remote-observed'] },
+  // This instance observes the winning run itself, still live, and the retry is routed to it.
+  'retry to the observed live winner': {
+    ...dimensions,
+    forward: ['ok', 'reject-before-delivery', 'reject-after-delivery', 'held-reject-before-delivery'],
+    retry: ['winner-observed'],
+  },
   'record lost by TTL': {
     ...dimensions,
     retry: ['idle-winner-alive', 'idle-lease-free', 'during-local-run', 'other-instance'],
@@ -112,6 +125,7 @@ function normalizeSchedule(schedule: FollowUpSchedule): FollowUpSchedule | undef
   if (s.lease === 'no-winner' || s.wakePublish === 'fail' || s.wakePublish === 'held-fail') s.forward = 'ok';
   if (s.sibling === 'none') s.siblingPublish = 'ok';
   if (s.retry === 'none') {
+    if (s.forward === 'held-reject-before-delivery') s.forward = 'reject-before-delivery';
     s.retryTiming = 'settled';
     s.recordLoss = 'none';
     s.runIdReuse = 'none';
@@ -124,8 +138,12 @@ function normalizeSchedule(schedule: FollowUpSchedule): FollowUpSchedule | undef
     s.runIdReuse = 'none';
   }
   const held = (mode: PublishMode) => mode === 'held-ok' || mode === 'held-fail';
-  if (held(s.wakePublish) && held(s.siblingPublish)) return undefined;
-  if (held(s.wakePublish) || held(s.siblingPublish)) s.retryTiming = 'settled';
+  const heldCount =
+    (held(s.wakePublish) ? 1 : 0) +
+    (held(s.siblingPublish) ? 1 : 0) +
+    (s.forward === 'held-reject-before-delivery' ? 1 : 0);
+  if (heldCount > 1) return undefined;
+  if (heldCount === 1) s.retryTiming = 'settled';
   return s;
 }
 
@@ -164,22 +182,34 @@ export function enumerateFollowUpSchedules(family: Dimensions): FollowUpSchedule
 /**
  * How many extra runs of F (beyond the bound) a schedule's disclosed at-least-once cases allow.
  * The cases are labelled here explicitly from the schedule, never inferred from an outcome:
- * 1. the winning run may hold F while it is also handed on locally or again:
+ * 1. the winning run may hold F while it is also handed on locally or again; this needs a forward
+ *    of F that can reach the winner (through the wake's own forward, which is not rejected before
+ *    delivery, or through a further sibling that took the requeued F):
  *    - F's forward rejects after it was delivered (the queued idle route then also requeues it);
  *    - a retry from another instance, or after the winner finished (lease free, during a local
- *      run, or routed to another remote run), when a winner may have received F (through the
- *      wake, or through a further sibling that took the requeued F): no shared record (L17 P3);
+ *      run, or routed to another remote run): no shared record (L17 P3);
  * 2. F was kept locally (requeued) and its admission record is lost (TTL or eviction) before the
- *    retry: requeued without a winner (and no further sibling drops it), or requeued after a
- *    rejected queued-idle forward; the local copy may already have run when the record is lost.
- *    This is the TTL class fork main has for every retried signal.
+ *    retry; this needs F actually requeued and not dropped by a further sibling: requeued without
+ *    a winner, or by the queued idle route's forward chain after a rejected forward, unless a
+ *    further sibling takes it and drops it on its own failed publish; the local copy may already
+ *    have run when the record is lost. This is the TTL class fork main has for every retried
+ *    signal.
  * Each class allows one extra run; a schedule in both allows two (the literal sum, never more).
  */
 export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): number {
   const delivered = (mode: PublishMode) => mode === 'ok' || mode === 'held-ok';
+  const rejectedBeforeDelivery =
+    schedule.forward === 'reject-before-delivery' || schedule.forward === 'held-reject-before-delivery';
+  // A further sibling that takes the requeued F (after a loss without a winner, or after the queued
+  // idle forward rejected before delivery) forwards it to the winner when its own publish succeeds.
+  const siblingForwardsRequeuedF =
+    schedule.sibling === 'queued' &&
+    delivered(schedule.siblingPublish) &&
+    (schedule.lease === 'no-winner' ||
+      (schedule.route === 'queued-idle' && delivered(schedule.wakePublish) && rejectedBeforeDelivery));
   const winnerMayHoldF =
-    (schedule.lease === 'winner' && delivered(schedule.wakePublish)) ||
-    (schedule.lease === 'no-winner' && schedule.sibling === 'queued' && delivered(schedule.siblingPublish));
+    (schedule.lease === 'winner' && delivered(schedule.wakePublish) && !rejectedBeforeDelivery) ||
+    siblingForwardsRequeuedF;
   const forwardRejectsAfterDelivery =
     schedule.lease === 'winner' && delivered(schedule.wakePublish) && schedule.forward === 'reject-after-delivery';
   const retryWithoutSharedRecord =
@@ -188,15 +218,17 @@ export function followUpScheduleExtraRunsAllowed(schedule: FollowUpSchedule): nu
       (schedule.retry === 'idle-lease-free' ||
         schedule.retry === 'during-local-run' ||
         schedule.retry === 'remote-observed'));
-  // Kept locally: requeued without a winner (unless a further sibling takes it and drops it on its
-  // own failed publish), or requeued by the queued idle route's detached forward chain after a
-  // rejected forward (that requeue comes after the further sibling has taken the queue).
+  // Kept locally: requeued without a winner, or requeued by the queued idle route's detached forward
+  // chain after a rejected forward; a further sibling whose own publish fails drops it if it takes
+  // it, which it does for a requeue without a winner or after a forward rejected before delivery
+  // (a forward rejected after delivery requeues after the sibling has taken the queue).
+  const furtherSiblingDrops = schedule.sibling === 'queued' && !delivered(schedule.siblingPublish);
   const keptLocally =
-    (schedule.lease === 'no-winner' && !(schedule.sibling === 'queued' && !delivered(schedule.siblingPublish))) ||
+    (schedule.lease === 'no-winner' && !furtherSiblingDrops) ||
     (schedule.route === 'queued-idle' &&
       schedule.lease === 'winner' &&
       delivered(schedule.wakePublish) &&
-      schedule.forward !== 'ok');
+      (schedule.forward === 'reject-after-delivery' || (rejectedBeforeDelivery && !furtherSiblingDrops)));
   const keptLocallyAndRecordLost = keptLocally && schedule.recordLoss !== 'none';
   return (forwardRejectsAfterDelivery || retryWithoutSharedRecord ? 1 : 0) + (keptLocallyAndRecordLost ? 1 : 0);
 }
@@ -325,6 +357,7 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
   });
   let holdStarted = false;
   let forwardFailureUsed = false;
+  let retrySent = false;
   const realPublish = ctx.pubsub.publish.bind(ctx.pubsub);
   const applyMode = async (mode: PublishMode, what: string) => {
     if (mode === 'held-ok' || mode === 'held-fail') {
@@ -340,8 +373,20 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
       if (id === behindId) await applyMode(schedule.wakePublish, 'wake');
       if (furtherSiblingId !== undefined && id === furtherSiblingId)
         await applyMode(schedule.siblingPublish, 'sibling');
-      if (id === followUpId && data.runId === ctx.winnerRunId && schedule.forward !== 'ok' && !forwardFailureUsed) {
+      // The injected forward failure applies to the original forward of F, never to a retry's
+      // publish of F (on fork main a retry may be the first publish of F to the winner).
+      if (
+        id === followUpId &&
+        data.runId === ctx.winnerRunId &&
+        schedule.forward !== 'ok' &&
+        !forwardFailureUsed &&
+        !retrySent
+      ) {
         forwardFailureUsed = true;
+        if (schedule.forward === 'held-reject-before-delivery') {
+          holdStarted = true;
+          await hold;
+        }
         if (schedule.forward === 'reject-after-delivery') {
           await realPublish(topic, event);
           if (live.winner) admitted.winner = true;
@@ -359,6 +404,7 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
   // Retries: rejected acknowledgements are recorded and must be ones this schedule injected.
   const retryErrors: unknown[] = [];
   const sendRetryOn = (runtime: AgentThreadStreamRuntime, agent: Agent<any, any, any, any>, runId?: string) => {
+    retrySent = true;
     const retry = runtime.sendSignal(
       agent,
       followUpSignal,
@@ -373,6 +419,7 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
   };
   let releaseReuse: (() => void) | undefined;
   let localRunId: string | undefined;
+  let winnerObserved = false;
   const realNow = Date.now.bind(Date);
   let dateSpy: ReturnType<typeof vi.spyOn> | undefined;
   let subscription: { unsubscribe(): void } | undefined;
@@ -425,6 +472,26 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
       case 'other-instance':
         sendRetryOn(otherInstance, otherAgent);
         break;
+      case 'winner-observed': {
+        subscription = await ctx.runtime.subscribeToThread(ctx.agent, scope, ctx.pubsub);
+        winnerObserved = true;
+        await realPublish(`agent.thread-stream.${encodeURIComponent(ctx.key)}`, {
+          type: 'run-registered',
+          runId: ctx.winnerRunId,
+          data: {
+            type: 'run-registered',
+            runId: ctx.winnerRunId,
+            streamId: `${ctx.winnerRunId}-stream`,
+            streamSeq: 1,
+            leaseOwner: ctx.winnerToken,
+            agentId: ctx.agent.id,
+          },
+        });
+        await ctx.pubsub.flush();
+        await settle();
+        sendRetryOn(ctx.runtime, ctx.agent);
+        break;
+      }
       case 'remote-observed': {
         finishWinner();
         subscription = await ctx.runtime.subscribeToThread(ctx.agent, scope, ctx.pubsub);
@@ -468,7 +535,10 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
     if (schedule.lease === 'no-winner') ctx.pubsub.ownerlessLosses = 1;
     ctx.loseLease();
   }
-  const held = schedule.wakePublish.startsWith('held') || schedule.siblingPublish.startsWith('held');
+  const held =
+    schedule.wakePublish.startsWith('held') ||
+    schedule.siblingPublish.startsWith('held') ||
+    schedule.forward === 'held-reject-before-delivery';
   if (held) {
     // The retry arrives while the held publish is pending; the publish settles afterwards.
     await waitUntil(() => holdStarted);
@@ -506,6 +576,22 @@ export async function countFollowUpRuns(schedule: FollowUpSchedule, index: numbe
         runId: remoteRunId,
         streamId: `${remoteRunId}-stream`,
         leaseOwner: encodedOwner(remoteRunId, 'pf6944-remote-source'),
+      },
+    });
+    await ctx.pubsub.flush();
+    await settle(10);
+    await runs.completeAll();
+  }
+  if (winnerObserved) {
+    finishWinner();
+    await realPublish(`agent.thread-stream.${encodeURIComponent(ctx.key)}`, {
+      type: 'run-completed',
+      runId: ctx.winnerRunId,
+      data: {
+        type: 'run-completed',
+        runId: ctx.winnerRunId,
+        streamId: `${ctx.winnerRunId}-stream`,
+        leaseOwner: ctx.winnerToken,
       },
     });
     await ctx.pubsub.flush();

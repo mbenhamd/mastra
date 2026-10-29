@@ -40,6 +40,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -75,6 +79,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct no-winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -134,6 +142,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -169,6 +181,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=held-fail siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
@@ -207,8 +223,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -246,6 +264,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -282,6 +304,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -305,18 +331,22 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
     { settled: 0, total: 0 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -353,6 +383,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=fail siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -412,6 +446,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=held-fail siblingPublish=fail forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=held-fail siblingPublish=fail forward=ok retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
@@ -459,7 +497,7 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
@@ -489,8 +527,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -528,6 +568,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -564,6 +608,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -587,18 +635,22 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -633,7 +685,7 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
@@ -663,8 +715,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -702,6 +756,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -738,6 +796,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -761,18 +823,22 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'direct winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -810,6 +876,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -845,6 +915,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -904,6 +978,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -940,6 +1018,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=held-fail siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=held-fail siblingPublish=ok forward=ok retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
@@ -975,10 +1057,12 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1016,6 +1100,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1052,6 +1140,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1071,22 +1163,26 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=early recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1123,6 +1219,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=fail siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1182,6 +1282,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-fail siblingPublish=fail forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-fail siblingPublish=fail forward=ok retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
@@ -1227,9 +1331,9 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
@@ -1257,10 +1361,12 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1298,6 +1404,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1334,6 +1444,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1353,22 +1467,26 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=early recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1401,9 +1519,9 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
@@ -1431,10 +1549,12 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1472,6 +1592,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1508,6 +1632,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1527,22 +1655,26 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=early recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'queued-idle winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
@@ -1580,6 +1712,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer no-winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1615,6 +1751,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer no-winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer no-winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1674,6 +1814,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer no-winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1709,6 +1853,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=held-fail siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
@@ -1747,8 +1895,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1786,6 +1936,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1822,6 +1976,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -1845,18 +2003,22 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
     { settled: 0, total: 0 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=none wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1893,6 +2055,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=fail siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=fail siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -1952,6 +2118,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=fail siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=held-fail siblingPublish=fail forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=held-fail siblingPublish=fail forward=ok retry=idle-lease-free timing=settled recordLoss=none runIdReuse=none':
@@ -1999,7 +2169,7 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=held-ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
@@ -2029,8 +2199,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=held-ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -2068,6 +2240,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -2104,6 +2280,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -2127,18 +2307,22 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=fail forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=ok retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
     { settled: 1, total: 1 },
@@ -2173,7 +2357,7 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-fail forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=ok retry=during-local-run timing=settled recordLoss=none runIdReuse=none':
@@ -2203,8 +2387,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=held-ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=held-reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
@@ -2242,6 +2428,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=ok retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -2278,6 +2468,10 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-after-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=during-local-run timing=settled recordLoss=eviction runIdReuse=none':
@@ -2301,17 +2495,21 @@ export const forkMainFollowUpCounts: Readonly<Record<string, { settled: number; 
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=none runIdReuse=other-thread':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=idle-winner-alive timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=none timing=settled recordLoss=none runIdReuse=none':
     { settled: 0, total: 0 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=early recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=none runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=other-instance timing=settled recordLoss=ttl-expiry runIdReuse=none':
-    { settled: 0, total: 0 },
+    { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=early recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
   'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=remote-observed timing=settled recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=early recordLoss=none runIdReuse=none':
+    { settled: 1, total: 1 },
+  'transfer winner sibling=queued wakePublish=ok siblingPublish=ok forward=reject-before-delivery retry=winner-observed timing=settled recordLoss=none runIdReuse=none':
     { settled: 1, total: 1 },
 };
