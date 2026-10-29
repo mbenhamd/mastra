@@ -5186,15 +5186,15 @@ export class Harness {
     root._markLeaseRenewed(lease.expiresAt);
     // A descendant storage left out (its grant was revoked after its lease
     // lapsed) is no longer leased: fence it and its live subtree instead of
-    // reporting them renewed.
-    const fenced = new Set(lease.fencedDescendantIds ?? []);
-    for (const fencedId of fenced) {
+    // reporting them renewed. The whole subtree is collected before any fence
+    // (fencing removes members from the live map), fenced synchronously, and
+    // cleaned up detached: this runs inside the root's renewal chain.
+    const toFence: Session[] = [];
+    for (const fencedId of lease.fencedDescendantIds ?? []) {
       const descendant = this._liveSessions.get(fencedId);
-      if (descendant === undefined) continue;
-      for (const member of [descendant, ...this._liveDescendantsOf(descendant.id)]) {
-        if (this._liveSessions.get(member.id) === member) await this._evictLiveSession(member, 'lease_lost');
-      }
+      if (descendant !== undefined) toFence.push(descendant, ...this._liveDescendantsOf(descendant.id));
     }
+    for (const member of toFence) this._fenceLeaseLostDetached(member);
     for (const descendant of this._liveDescendantsOf(root.id)) descendant._markLeaseRenewed(lease.expiresAt);
     return lease;
   }
@@ -5463,7 +5463,44 @@ export class Harness {
     session._markEvicted(record);
     this._liveSessions.delete(session.id);
     this._stopLeaseRenewalLoopIfIdle();
+    await this._completeEviction(session, record, reason);
+  }
 
+  /**
+   * Fence a live session as `lease_lost` synchronously — every later lease
+   * proof or extension on it rejects at once — and run the rest of the eviction
+   * (event-persistence drain, workspace release, `session_evicted`) detached.
+   * For callers inside a lease-renewal chain: that cleanup can wait on work
+   * (a draft checkpoint, a workspace `destroy()`) that itself waits on the
+   * chain, so it must not be awaited there. Joined like any eviction through
+   * `_sessionEvictionsInFlight`.
+   */
+  private _fenceLeaseLostDetached(session: Session): void {
+    if (this._liveSessions.get(session.id) !== session) return;
+    const record = session.getRecord() as SessionRecord;
+    session._markEvicted(record);
+    this._liveSessions.delete(session.id);
+    this._stopLeaseRenewalLoopIfIdle();
+    const prior = this._sessionEvictionsInFlight.get(session.id) ?? Promise.resolve();
+    const cleanup: Promise<void> = prior
+      .then(() => this._completeEviction(session, record, 'lease_lost'))
+      .catch(err => {
+        console.error('[harness/v1] detached lease-lost eviction cleanup failed:', err);
+      })
+      .finally(() => {
+        if (this._sessionEvictionsInFlight.get(session.id) === cleanup) {
+          this._sessionEvictionsInFlight.delete(session.id);
+        }
+      });
+    this._sessionEvictionsInFlight.set(session.id, cleanup);
+  }
+
+  /** The part of an eviction after the session is fenced out of `_liveSessions`. */
+  private async _completeEviction(
+    session: Session,
+    record: SessionRecord,
+    reason: 'lease_lost' | 'pressure' | 'idle',
+  ): Promise<void> {
     if (reason === 'pressure' || reason === 'idle') {
       const storage = this._requireStorage('session.evict()');
       try {

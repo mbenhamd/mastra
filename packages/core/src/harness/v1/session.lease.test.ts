@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { HarnessStorageLeaseConflictError } from '../../storage/domains/harness/base';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
+import type { Workspace } from '../../workspace';
 
 import { setupHarness } from './__test-utils__/setup';
 import {
@@ -21,6 +22,7 @@ import {
   HarnessValidationError,
 } from './errors';
 import type { Session } from './session';
+import type { WorkspaceProvider } from './workspace-provider';
 
 interface SessionLeaseInternals {
   _leaseExtensionDeadline?: number;
@@ -627,4 +629,120 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
       storage.admitTerminalHandoff(fresh, { leaseOwner: { ownerId: harness.ownerId } }),
     ).resolves.toMatchObject({ status: 'created' });
   });
+
+  async function fencedChildFixture(opts: Parameters<typeof setupHarness>[0] = {}) {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const { harness } = setupHarness({ ...opts, sessions: { storage } });
+    const root = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const sibling = await harness.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: root.id });
+    const child = await harness.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: root.id });
+    const grandchild = await harness.session({
+      resourceId: 'u',
+      threadId: { fresh: true },
+      parentSessionId: child.id,
+    });
+    const fence = async () => {
+      const key = [...db.harnessSessions.keys()].find(k => k.endsWith(child.id))!;
+      db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, leaseExpiresAt: Date.now() - 1_000 });
+      await expect(
+        storage.revokeTerminalGrant({
+          harnessName: child.getRecord().harnessName,
+          sessionId: child.id,
+          admissionId: 'admission-revoked',
+          executionGrant: { key: 'grant-revoked', generation: 1 },
+          reason: { code: 'doxa.turn_released', message: 'owner lapsed' },
+          requireOwnerLeaseLapsed: { ownerId: harness.ownerId },
+        }),
+      ).resolves.toMatchObject({ status: 'revoked' });
+      return key;
+    };
+    return { db, storage, harness, root, sibling, child, grandchild, fence };
+  }
+
+  const settlesWithin = <T>(promise: Promise<T>, ms: number) =>
+    Promise.race([
+      promise.then(
+        () => 'settled' as const,
+        () => 'settled' as const,
+      ),
+      new Promise<'pending'>(resolve => setTimeout(() => resolve('pending'), ms)),
+    ]);
+
+  it('does not deadlock when the fenced child proves its lease from its own draft checkpoint', async () => {
+    const { db, root, child, grandchild, fence } = await fencedChildFixture();
+    const key = await fence();
+    // Another same-owner write advanced the child's stored version, so its next
+    // draft checkpoint conflicts and proves the subtree lease through the root.
+    db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, version: db.harnessSessions.get(key)!.version + 1 });
+    const internals = child as unknown as {
+      _recordAssistantDraftDelta(opts: { runId: string; kind: 'text'; delta: string }): void;
+      _startAssistantDraftFlush(): Promise<void>;
+    };
+    internals._recordAssistantDraftDelta({ runId: 'run-draft', kind: 'text', delta: 'partial answer' });
+    const checkpoint = internals._startAssistantDraftFlush();
+
+    expect(await settlesWithin(checkpoint, 2_000)).toBe('settled');
+    await expect(checkpoint).rejects.toBeInstanceOf(HarnessSessionLockedError);
+    expect(child.lifecycleState).toBe('evicted');
+    expect(grandchild.lifecycleState).toBe('evicted');
+    expect(await settlesWithin(root.extendLease({ ttlMs: 5 * 60_000 }), 2_000)).toBe('settled');
+    expect(root.lifecycleState).toBe('live');
+  });
+
+  it.each(['root', 'sibling'] as const)(
+    'renews for a %s promptly while the fenced child workspace teardown is slow, and runs no callback after a takeover',
+    async target => {
+      let releaseDestroy!: () => void;
+      const destroyGate = new Promise<void>(resolve => (releaseDestroy = resolve));
+      const workspace = {
+        id: 'ws',
+        name: 'ws',
+        status: 'ready',
+        createdAt: new Date(),
+        lastAccessedAt: new Date(),
+        async init() {},
+        async destroy() {
+          await destroyGate;
+        },
+      } as unknown as Workspace;
+      const provider: WorkspaceProvider = {
+        providerId: 'slow-destroy',
+        resumable: true,
+        create: async () => workspace,
+        resume: async () => workspace,
+      };
+      const { db, storage, harness, root, sibling, child, grandchild, fence } = await fencedChildFixture({
+        workspace: { kind: 'per-session', provider },
+      });
+      await child.getWorkspace();
+      await fence();
+
+      const ownersSeenByCallback: Array<string | undefined> = [];
+      const subject = target === 'root' ? root : sibling;
+      const extended = subject.withExtendedLease(
+        async () => {
+          ownersSeenByCallback.push((await storage.loadSession({ sessionId: root.id }))!.ownerId);
+        },
+        { ttlMs: 60_000 },
+      );
+      try {
+        expect(await settlesWithin(extended, 1_000)).toBe('settled');
+        expect(child.lifecycleState).toBe('evicted');
+        expect(grandchild.lifecycleState).toBe('evicted');
+
+        // The root lease then lapses and another owner takes it while the
+        // child's teardown is still stuck.
+        const rootKey = [...db.harnessSessions.keys()].find(k => k.endsWith(root.id))!;
+        db.harnessSessions.set(rootKey, { ...db.harnessSessions.get(rootKey)!, leaseExpiresAt: Date.now() - 1 });
+        await storage.acquireSessionLease({ sessionId: root.id, ownerId: 'owner-b', ttlMs: 60_000 });
+      } finally {
+        releaseDestroy();
+      }
+      await extended.catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, 50));
+      // The callback ran once, while this harness still held the root lease.
+      expect(ownersSeenByCallback).toEqual([harness.ownerId]);
+    },
+  );
 });
