@@ -5217,7 +5217,7 @@ export class Harness {
     const storage = this._requireStorage('session lease renewal');
     // Already fenced or evicted: reject at once. Joining its eviction here could
     // wait on this very proof (a draft checkpoint the eviction drains).
-    if (session.lifecycleState === 'evicted') {
+    if (Harness._isEvicted(session)) {
       throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
     }
     const root = this._resolveLiveRoot(session);
@@ -5241,6 +5241,11 @@ export class Harness {
         if (opts?.propagateRootDeadline === true) root._setLeaseExtensionDeadline(lease.expiresAt);
         expiresAt = lease.expiresAt;
       });
+      // Fenced while this proof waited in the queue: reject before any branch
+      // below joins its eviction, which may be draining this very proof's work.
+      if (Harness._isEvicted(session)) {
+        throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+      }
       if (expiresAt === 0) {
         await this._evictLiveSession(session, 'lease_lost');
         throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
@@ -5373,6 +5378,11 @@ export class Harness {
   }
 
   /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
+  /** A function, not an inline check: the state can change across an `await`. */
+  private static _isEvicted(session: Session): boolean {
+    return session.lifecycleState === 'evicted';
+  }
+
   private _liveDescendantsOf(rootId: string): Session[] {
     const out: Session[] = [];
     const stack: string[] = [rootId];

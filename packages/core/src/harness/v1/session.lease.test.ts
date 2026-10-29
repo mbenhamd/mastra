@@ -804,4 +804,80 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
     expect((await reacquired).lifecycleState).toBe('live');
     spy.mockRestore();
   });
+
+  it('settles a checkpoint whose proof was queued before the fence when pressure then evicts the root', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const { harness } = setupHarness({ sessions: { storage, maxLive: 3 } });
+    const root = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const child = await harness.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: root.id });
+    const grandchild = await harness.session({
+      resourceId: 'u',
+      threadId: { fresh: true },
+      parentSessionId: child.id,
+    });
+    const keyOf = (id: string) => [...db.harnessSessions.keys()].find(k => k.endsWith(id))!;
+    db.harnessSessions.set(keyOf(child.id), {
+      ...db.harnessSessions.get(keyOf(child.id))!,
+      leaseExpiresAt: Date.now() - 1_000,
+    });
+    await storage.revokeTerminalGrant({
+      harnessName: child.getRecord().harnessName,
+      sessionId: child.id,
+      admissionId: 'admission-revoked',
+      executionGrant: { key: 'grant-revoked', generation: 1 },
+      reason: { code: 'doxa.turn_released', message: 'owner lapsed' },
+      requireOwnerLeaseLapsed: { ownerId: harness.ownerId },
+    });
+
+    // Two root renewals whose storage responses the test releases one by one.
+    const gates: Array<{ promise: Promise<void>; release: () => void }> = [0, 1].map(() => {
+      let release!: () => void;
+      return { promise: new Promise<void>(resolve => (release = resolve)), release };
+    });
+    const renew = storage.renewSessionLeaseSubtree.bind(storage);
+    let renewCalls = 0;
+    const renewSpy = vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementation(async input => {
+      const gate = gates[renewCalls++];
+      if (gate) await gate.promise;
+      return renew(input);
+    });
+    const first = root.extendLease({ ttlMs: 5 * 60_000 }).catch(() => {});
+    await vi.waitFor(() => expect(renewCalls).toBe(1));
+    const second = root.extendLease({ ttlMs: 5 * 60_000 }).catch(() => {});
+
+    // The grandchild's checkpoint conflicts and queues its proof behind both.
+    db.harnessSessions.set(keyOf(grandchild.id), {
+      ...db.harnessSessions.get(keyOf(grandchild.id))!,
+      version: db.harnessSessions.get(keyOf(grandchild.id))!.version + 1,
+    });
+    const internals = grandchild as unknown as {
+      _recordAssistantDraftDelta(opts: { runId: string; kind: 'text'; delta: string }): void;
+      _startAssistantDraftFlush(): Promise<void>;
+    };
+    internals._recordAssistantDraftDelta({ runId: 'run-draft', kind: 'text', delta: 'partial answer' });
+    const checkpoint = internals._startAssistantDraftFlush();
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // The first renewal fences the child and grandchild.
+    gates[0]!.release();
+    await first;
+    expect(grandchild.lifecycleState).toBe('evicted');
+    await vi.waitFor(() => expect(renewCalls).toBe(2));
+
+    // While the second renewal's response is delayed, pressure evicts the root.
+    for (let i = 0; i < 4 && root.lifecycleState !== 'evicted'; i++) {
+      await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    }
+    await vi.waitFor(() => expect(root.lifecycleState).toBe('evicted'));
+    gates[1]!.release();
+    await second;
+
+    expect(await settlesWithin(checkpoint, 2_000)).toBe('settled');
+    await expect(checkpoint).rejects.toBeInstanceOf(HarnessSessionLockedError);
+    renewSpy.mockRestore();
+    const reacquired = harness.session({ sessionId: grandchild.id });
+    expect(await settlesWithin(reacquired, 2_000)).toBe('settled');
+    expect((await reacquired).lifecycleState).toBe('live');
+  });
 });
