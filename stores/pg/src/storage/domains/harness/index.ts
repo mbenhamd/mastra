@@ -3717,9 +3717,12 @@ export class HarnessPG extends HarnessStorage {
     const tx = await this.#client.transaction('write');
     try {
       const locked = await tx.execute({
+        // NO KEY UPDATE, as the UPDATE it replaces took: it serializes with lease
+        // writes and the revocation's row write, but not with the FOR KEY SHARE
+        // existence guards that message-result writes hold.
         sql: `SELECT owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ?
-              FOR UPDATE`,
+              FOR NO KEY UPDATE`,
         args: [namespace, sessionId],
       });
       const row = locked.rows[0] as Record<string, unknown> | undefined;
@@ -3775,7 +3778,7 @@ export class HarnessPG extends HarnessStorage {
       const rootResult = await tx.execute({
         sql: `SELECT version, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ?
-              FOR UPDATE`,
+              FOR NO KEY UPDATE`,
         args: [namespace, rootSessionId],
       });
       const rootRow = rootResult.rows[0] as Record<string, unknown> | undefined;

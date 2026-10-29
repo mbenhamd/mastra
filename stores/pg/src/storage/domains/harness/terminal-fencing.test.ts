@@ -709,6 +709,29 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
     },
   );
 
+  it.each(['renewSessionLeaseSubtree', 'renewSessionLease'] as const)(
+    'lets %s proceed past a FOR KEY SHARE holder on the session row',
+    async method => {
+      const session = await createNativeSession(harness(), `key-share-${method}`, 'owner-f', 60_000);
+      const blocker = holdRowLock(
+        `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE harness_name = $1 AND id = $2 FOR KEY SHARE`,
+        [HARNESS, session.id],
+      );
+      await blocker.pid;
+      try {
+        const renewal =
+          method === 'renewSessionLeaseSubtree'
+            ? harness().renewSessionLeaseSubtree({ rootSessionId: session.id, ownerId: 'owner-f', ttlMs: 90_000 })
+            : harness().renewSessionLease({ sessionId: session.id, ownerId: 'owner-f', ttlMs: 90_000 });
+        const outcome = await Promise.race([renewal.then(() => 'renewed'), sleep(2_000).then(() => 'blocked')]);
+        expect(outcome).toBe('renewed');
+        await renewal;
+      } finally {
+        await blocker.release();
+      }
+    },
+  );
+
   it('refuses with owner_live when a renewal begun before expiry commits while the revocation waits', async () => {
     // The race: the renewal checks the lease before expiry and stalls, recovery
     // reads the old expiry after it passed, and the renewal commits before the
