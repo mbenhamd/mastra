@@ -3007,16 +3007,21 @@ export class AgentThreadStreamRuntime {
     key: string,
     runId: string,
     signals: CreatedAgentSignal[],
-    options: { readmit?: boolean; onUndelivered?: (undelivered: CreatedAgentSignal[]) => void } = {},
+    options: {
+      readmit?: boolean;
+      onUndelivered?: (undelivered: CreatedAgentSignal[], readmitted: ReadonlyMap<CreatedAgentSignal, object>) => void;
+    } = {},
   ): void {
     if (signals.length === 0) return;
+    // The record each follow-up was re-admitted with, so a later requeue can tell it from a
+    // record a retry created meanwhile.
+    const readmitted = new Map<CreatedAgentSignal, object>();
     const chain = async () => {
       for (const [index, signal] of signals.entries()) {
-        if (
-          options.readmit &&
-          this.#rememberSignalPayloadForRun(state, key, runId, signal).disposition !== 'accepted'
-        ) {
-          continue;
+        if (options.readmit) {
+          if (this.#rememberSignalPayloadForRun(state, key, runId, signal).disposition !== 'accepted') continue;
+          const record = state.signalAdmissionsByThread.get(key)?.get(signal.id);
+          if (record) readmitted.set(signal, record);
         }
         this.#readdressLocallyQueuedSignal(state, key, signal.id, runId);
         const delivered = await this.#publishAndWait(pubsub, key, {
@@ -3029,7 +3034,7 @@ export class AgentThreadStreamRuntime {
           () => false,
         );
         if (!delivered) {
-          options.onUndelivered?.(signals.slice(index));
+          options.onUndelivered?.(signals.slice(index), readmitted);
           return;
         }
       }
@@ -3039,25 +3044,25 @@ export class AgentThreadStreamRuntime {
 
   /**
    * PF-6944: put kept follow-ups back at the head of the thread's pre-run queue.
-   * With `readmitUnder`, each is recorded again under that run id first (or keeps
-   * the record it already has there); one whose id a retry has admitted meanwhile
-   * is left to that retry instead of being queued a second time.
+   * With `readmitUnder`, each is recorded again under that run id first, or keeps
+   * the record the forward chain re-admitted it with (`readmitted`, by identity);
+   * one whose id carries any other record meanwhile was taken by a retry and is
+   * left to that retry instead of being queued a second time.
    */
   #requeueKeptInput(
     state: AgentThreadRuntimeState,
     key: string,
     signals: CreatedAgentSignal[],
     readmitUnder?: string,
+    readmitted?: ReadonlyMap<CreatedAgentSignal, object>,
   ): void {
     const requeued =
       readmitUnder === undefined
         ? signals
         : signals.filter(signal => {
-            const admission = this.#rememberSignalPayloadForRun(state, key, readmitUnder, signal);
-            return (
-              admission.disposition === 'accepted' ||
-              (admission.disposition === 'duplicate' && admission.runId === readmitUnder)
-            );
+            const own = readmitted?.get(signal);
+            if (own !== undefined && state.signalAdmissionsByThread.get(key)?.get(signal.id) === own) return true;
+            return this.#rememberSignalPayloadForRun(state, key, readmitUnder, signal).disposition === 'accepted';
           });
     if (requeued.length === 0) return;
     state.preRunSignalsByThread.set(key, [...requeued, ...(state.preRunSignalsByThread.get(key) ?? [])]);
@@ -3107,6 +3112,26 @@ export class AgentThreadStreamRuntime {
     const [stranded] = queue.splice(index, 1);
     if (queue.length === 0) state.preRunSignalsByThread.delete(key);
     this.#forgetCurrentSignalAdmission(state, key, stranded!);
+  }
+
+  /**
+   * PF-6944: a retry delivered straight to a remote run carries the signal. A kept
+   * copy of it still queued on this thread's pre-run queue (same payload) is taken
+   * off the queue, and the signal's current record (whichever run it names) is
+   * forgotten so this delivery records it afresh; a kept forward still in flight
+   * then sees that record is no longer its own and does not requeue its copy. The
+   * signal then exists once.
+   */
+  #takeQueuedKeptInputForDelivery(state: AgentThreadRuntimeState, key: string, signal: AgentSignal): void {
+    const payloadKey = callerSignalPayloadKey(signal);
+    const queue = state.preRunSignalsByThread.get(key);
+    const index =
+      queue?.findIndex(queued => queued.id === signal.id && callerSignalPayloadKey(queued) === payloadKey) ?? -1;
+    if (queue && index !== -1) {
+      queue.splice(index, 1);
+      if (queue.length === 0) state.preRunSignalsByThread.delete(key);
+    }
+    this.#forgetCurrentSignalAdmission(state, key, signal);
   }
 
   #publish(pubsub: PubSub | undefined, key: string, event: AgentThreadStreamRuntimeEvent) {
@@ -8101,7 +8126,8 @@ export class AgentThreadStreamRuntime {
           () =>
             this.#forwardKeptInput(state, pubsub, key, winnerRunId, keptInput, {
               readmit: true,
-              onUndelivered: undelivered => this.#requeueKeptInput(state, key, undelivered, winnerRunId),
+              onUndelivered: (undelivered, readmitted) =>
+                this.#requeueKeptInput(state, key, undelivered, winnerRunId, readmitted),
             }),
           // PF-6944: never forward input past a failed publish of its own wake signal; it is
           // dropped as on fork main (its records were already forgotten above).
@@ -11044,8 +11070,9 @@ export class AgentThreadStreamRuntime {
           // Fork: upstream (#25080) now delivers straight to an observed remote active run
           // instead of the lease-routed idle path; keep the sender's stable-id payload ledger
           // on this path too, so a conflicting replay of an accepted id fails closed here.
-          // PF-6944: a stranded requeued copy of this signal is handed to this delivery.
-          this.#releaseStrandedKeptInput(state, key, signal);
+          // PF-6944: a requeued copy of this signal still queued on this thread is handed to
+          // this delivery, which carries it (the owner's ledger admits the id once).
+          this.#takeQueuedKeptInputForDelivery(state, key, signal);
           const disposition = this.#rememberSignalPayloadForRun(state, key, runId, signal);
           if (disposition.disposition === 'conflict') {
             throw new Error(`Agent signal id "${signal.id}" was already accepted with a different payload`);
