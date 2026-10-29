@@ -3121,17 +3121,52 @@ export class AgentThreadStreamRuntime {
    * forgotten so this delivery records it afresh; a kept forward still in flight
    * then sees that record is no longer its own and does not requeue its copy. The
    * signal then exists once.
+   *
+   * Returns `restore`, for when that delivery's publish fails: while the record
+   * the delivery admitted is still the current one (identity), the original record
+   * is put back and the taken copy returns to its place in the pre-run queue, so a
+   * live local reservation still runs it. Otherwise nothing is restored.
    */
-  #takeQueuedKeptInputForDelivery(state: AgentThreadRuntimeState, key: string, signal: AgentSignal): void {
+  #takeQueuedKeptInputForDelivery(
+    state: AgentThreadRuntimeState,
+    key: string,
+    signal: AgentSignal,
+  ): { admitted: () => void; restore: () => void } {
+    const signalId = signal.id;
     const payloadKey = callerSignalPayloadKey(signal);
     const queue = state.preRunSignalsByThread.get(key);
     const index =
-      queue?.findIndex(queued => queued.id === signal.id && callerSignalPayloadKey(queued) === payloadKey) ?? -1;
-    if (queue && index !== -1) {
-      queue.splice(index, 1);
-      if (queue.length === 0) state.preRunSignalsByThread.delete(key);
-    }
+      queue?.findIndex(queued => queued.id === signalId && callerSignalPayloadKey(queued) === payloadKey) ?? -1;
+    const taken = queue && index !== -1 ? queue.splice(index, 1)[0] : undefined;
+    if (queue && taken && queue.length === 0) state.preRunSignalsByThread.delete(key);
+    const original = signalId === undefined ? undefined : state.signalAdmissionsByThread.get(key)?.get(signalId);
     this.#forgetCurrentSignalAdmission(state, key, signal);
+    let delivery: object | undefined;
+    return {
+      admitted: () => {
+        delivery = signalId === undefined ? undefined : state.signalAdmissionsByThread.get(key)?.get(signalId);
+      },
+      restore: () => {
+        if (signalId === undefined) return;
+        const admissions = state.signalAdmissionsByThread.get(key);
+        const current = admissions?.get(signalId);
+        if (current !== delivery) return;
+        if (original && current !== original) {
+          const restored = admissions ?? new Map();
+          restored.set(signalId, original);
+          state.signalAdmissionsByThread.set(key, restored);
+        } else if (current && !original) {
+          admissions!.delete(signalId);
+          if (admissions!.size === 0) state.signalAdmissionsByThread.delete(key);
+          this.#clearSignalAdmissionCleanupIfEmpty(state);
+        }
+        if (taken && !(state.preRunSignalsByThread.get(key) ?? []).includes(taken)) {
+          const live = state.preRunSignalsByThread.get(key) ?? [];
+          live.splice(Math.min(index, live.length), 0, taken);
+          state.preRunSignalsByThread.set(key, live);
+        }
+      },
+    };
   }
 
   #publish(pubsub: PubSub | undefined, key: string, event: AgentThreadStreamRuntimeEvent) {
@@ -11045,6 +11080,7 @@ export class AgentThreadStreamRuntime {
             !fullLogicalMessageIdentity,
           );
         }
+        let restoreHandover: (() => void) | undefined;
         if (isLocalReservedRun) {
           const disposition = this.#rememberSignalPayloadForRun(state, key, runId, signal);
           if (disposition.disposition === 'conflict') {
@@ -11070,13 +11106,17 @@ export class AgentThreadStreamRuntime {
           // Fork: upstream (#25080) now delivers straight to an observed remote active run
           // instead of the lease-routed idle path; keep the sender's stable-id payload ledger
           // on this path too, so a conflicting replay of an accepted id fails closed here.
-          // PF-6944: a requeued copy of this signal still queued on this thread is handed to
-          // this delivery, which carries it (the owner's ledger admits the id once).
-          this.#takeQueuedKeptInputForDelivery(state, key, signal);
+          // PF-6944: a kept copy of this signal still queued on this thread is handed to this
+          // delivery, which carries it (the owner's ledger admits the id once); a failed
+          // publish restores it.
+          const handover = this.#takeQueuedKeptInputForDelivery(state, key, signal);
           const disposition = this.#rememberSignalPayloadForRun(state, key, runId, signal);
           if (disposition.disposition === 'conflict') {
+            handover.restore();
             throw new Error(`Agent signal id "${signal.id}" was already accepted with a different payload`);
           }
+          handover.admitted();
+          restoreHandover = handover.restore;
         }
         const deliveredRunId = runId;
         const publication = this.#publishAndWait(pubsub, key, {
@@ -11086,7 +11126,7 @@ export class AgentThreadStreamRuntime {
           sourceId: this.#getSourceId(),
           preRun: isLocalReservedRun,
         });
-        void publication.catch(() => {});
+        void publication.catch(() => restoreHandover?.());
         const accepted = isLocalReservedRun
           ? Promise.resolve({ action: 'deliver' as const, runId: deliveredRunId })
           : publication.then(() => ({ action: 'deliver' as const, runId: deliveredRunId }));
