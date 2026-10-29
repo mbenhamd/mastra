@@ -3822,6 +3822,47 @@ export class HarnessPG extends HarnessStorage {
         descendantIds.push(childId);
       }
 
+      if (descendantIds.length > 0) {
+        // Lock order: root, then descendants by id. A lapsed descendant is
+        // re-adopted unless a grant revocation already acted on that lapse; the
+        // lock waits out a revocation holding the row, and the clock is read
+        // after it, so a revocation that committed meanwhile is seen.
+        const lockedDescendants = await tx.execute({
+          sql: `SELECT id, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+                WHERE harness_name = ? AND id IN (${descendantIds.map(() => '?').join(', ')})
+                ORDER BY id
+                FOR NO KEY UPDATE`,
+          args: [namespace, ...descendantIds],
+        });
+        const lockedNow = Date.now();
+        const lapsed = (lockedDescendants.rows as Record<string, unknown>[]).filter(
+          row => row.lease_expires_at != null && Number(row.lease_expires_at) <= lockedNow,
+        );
+        if (lapsed.length > 0 && this.terminalHandoff.enabled) {
+          await this.#ensureTerminalHandoffTables();
+          const revoked = await tx.execute({
+            sql: `SELECT s.id, s.owner_id, s.lease_expires_at FROM ${TABLE_HARNESS_SESSIONS} s
+                  WHERE s.harness_name = ? AND s.id IN (${lapsed.map(() => '?').join(', ')})
+                    AND EXISTS (
+                      SELECT 1 FROM ${TABLE_HARNESS_TERMINAL_TOMBSTONES} t
+                      WHERE t.harness_name = s.harness_name AND t.session_id = s.id
+                        AND t.session_incarnation IS NULL AND t.created_at >= s.lease_expires_at
+                    )
+                  ORDER BY s.id
+                  LIMIT 1`,
+            args: [namespace, ...lapsed.map(row => row.id as string)],
+          });
+          const revokedRow = revoked.rows[0] as Record<string, unknown> | undefined;
+          if (revokedRow) {
+            throw new HarnessStorageLeaseConflictError(
+              revokedRow.id as string,
+              (revokedRow.owner_id ?? '<unowned>') as string,
+              Number(revokedRow.lease_expires_at),
+            );
+          }
+        }
+      }
+
       const allIds = [rootSessionId, ...descendantIds];
       const updateResult = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_SESSIONS}

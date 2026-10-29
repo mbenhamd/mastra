@@ -1220,8 +1220,11 @@ export abstract class HarnessStorage extends StorageDomain {
    * owner OR when an active descendant has been claimed by a DIFFERENT instance
    * (a split subtree) — in either case it renews nothing. A same-owner
    * descendant whose mirror lapsed is re-adopted to the capped expiry (that is
-   * the §5.8 repair, not a fence). Closed/closing descendants hold no live lease
-   * and are skipped.
+   * the §5.8 repair, not a fence) — unless a pre-admission grant revocation
+   * (`revokeTerminalGrant`) for that descendant was written at or after its
+   * lease expiry: the revocation acted on the lapse, so the pass is fenced with
+   * a lease conflict on that descendant. Closed/closing descendants hold no
+   * live lease and are skipped.
    *
    * `renewedDescendantCount` reports how many descendant entries were extended.
    *

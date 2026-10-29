@@ -1414,6 +1414,12 @@ export class InMemoryHarness extends HarnessStorage {
         if (child.ownerId !== ownerId) {
           throw new HarnessStorageLeaseConflictError(child.id, child.ownerId ?? '<unowned>', child.leaseExpiresAt ?? 0);
         }
+        // A lapsed descendant is re-adopted, unless a grant revocation already
+        // acted on that lapse: the recovery that revoked it decided the owner
+        // was gone, so re-adopting would leave a live owner with a fenced grant.
+        if (this.revokedSinceLeaseLapsed(namespace, child, now)) {
+          throw new HarnessStorageLeaseConflictError(child.id, child.ownerId ?? '<unowned>', child.leaseExpiresAt ?? 0);
+        }
         descendants.push(child);
       }
     }
@@ -1431,6 +1437,26 @@ export class InMemoryHarness extends HarnessStorage {
       );
     }
     return { version: root.version, expiresAt, renewedDescendantCount: descendants.length };
+  }
+
+  /**
+   * Whether a pre-admission grant revocation (a tombstone without an
+   * incarnation) was written for `session` at or after its lapsed lease's expiry.
+   */
+  private revokedSinceLeaseLapsed(namespace: string, session: SessionRecord, now: number): boolean {
+    const expiresAt = session.leaseExpiresAt;
+    if (expiresAt === undefined || expiresAt > now) return false;
+    for (const tombstone of this.db.harnessTerminalTombstones.values()) {
+      if (
+        tombstone.harnessName === namespace &&
+        tombstone.sessionId === session.id &&
+        tombstone.sessionIncarnation === undefined &&
+        tombstone.createdAt >= expiresAt
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async releaseSessionLease({ sessionId, ownerId, harnessName }: ReleaseSessionLeaseInput): Promise<void> {

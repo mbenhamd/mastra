@@ -3174,6 +3174,39 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
     expect(grandchild?.ownerId).toBe(owner);
   });
 
+  it('does not re-adopt a lapsed descendant whose grant a revocation fenced after the lapse', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const owner = 'owner-A';
+    await storage.createOrLoadActiveSession(sampleSession({ id: 'root', threadId: 't-root', origin: 'top-level' }), {
+      initialLease: { ownerId: owner, ttlMs: 30_000 },
+    });
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'child-1', threadId: 't-c1', parentSessionId: 'root', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: 30_000 } },
+    );
+    const key = [...db.harnessSessions.keys()].find(k => k.endsWith('child-1'))!;
+    const lapsedAt = Date.now() - 1_000;
+    db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, leaseExpiresAt: lapsedAt });
+
+    // Recovery saw the child's lease lapse and fenced its grant.
+    await expect(
+      storage.revokeTerminalGrant({
+        harnessName: 'default',
+        sessionId: 'child-1',
+        admissionId: 'admission-child',
+        executionGrant: { key: 'grant-child', generation: 1 },
+        reason: { code: 'doxa.turn_released', message: 'owner lapsed' },
+        requireOwnerLeaseLapsed: { ownerId: owner },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    await expect(
+      storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 }),
+    ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+    expect((await storage.loadSession({ sessionId: 'child-1' }))?.leaseExpiresAt).toBe(lapsedAt);
+  });
+
   it('throws not-found for a missing root', async () => {
     const { storage, owner } = await setupTree();
     await expect(

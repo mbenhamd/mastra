@@ -709,6 +709,55 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
     },
   );
 
+  it('fails a subtree renewal paused before a lapsed child that a revocation fenced meanwhile', async () => {
+    // Root and child-b lapse together; child-a stays live and is locked first
+    // (descendants lock by id), so the renewal pauses after validating the root.
+    const root = await createNativeSession(harness(), 'subtree-root', 'owner-e', 1_000);
+    const childOf = async (id: string, ttlMs: number) => {
+      const record = createSampleSessionRecord({
+        id,
+        harnessName: HARNESS,
+        resourceId: root.resourceId,
+        threadId: `thread-${id}`,
+        parentSessionId: root.id,
+      });
+      await harness().createOrLoadActiveSession(record, { initialLease: { ownerId: 'owner-e', ttlMs } });
+      return (await harness().loadSession({ harnessName: HARNESS, sessionId: id }))!;
+    };
+    const childA = await childOf('subtree-child-a', 60_000);
+    const childB = await childOf('subtree-child-b', 1_000);
+    const input = admissionFor(childB, 'subtree-child-b');
+
+    const blocker = holdRowLock(
+      `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE harness_name = $1 AND id = $2 FOR UPDATE`,
+      [HARNESS, childA.id],
+    );
+    const blockerPid = await blocker.pid;
+    expect(Date.now()).toBeLessThan(root.leaseExpiresAt!);
+    const renewal = harness()
+      .renewSessionLeaseSubtree({ rootSessionId: root.id, ownerId: 'owner-e', ttlMs: 60_000 })
+      .then(
+        () => 'renewed',
+        error => error,
+      );
+    await waitForBlockedBy(blockerPid);
+
+    await sleep(Math.max(0, childB.leaseExpiresAt! - Date.now()) + 50);
+    await expect(
+      harness().revokeTerminalGrant({
+        ...revocation(input),
+        revokedAt: Date.now(),
+        requireOwnerLeaseLapsed: { ownerId: 'owner-e' },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+    await blocker.release();
+
+    expect(await renewal).toBeInstanceOf(HarnessStorageLeaseConflictError);
+    const after = await harness().loadSession({ harnessName: HARNESS, sessionId: childB.id });
+    expect(after!.leaseExpiresAt).toBe(childB.leaseExpiresAt);
+    expect(await tombstoneCount(input.executionGrant.key)).toBe('1');
+  });
+
   it.each(['renewSessionLeaseSubtree', 'renewSessionLease'] as const)(
     'lets %s proceed past a FOR KEY SHARE holder on the session row',
     async method => {
