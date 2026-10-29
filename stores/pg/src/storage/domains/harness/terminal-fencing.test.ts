@@ -661,6 +661,54 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
     expect(await tombstoneCount(input.executionGrant.key)).toBe('1');
   });
 
+  it.each(['renewSessionLeaseSubtree', 'renewSessionLease'] as const)(
+    'fails a %s that waited for a connection across expiry once the revocation fenced the lapsed lease',
+    async method => {
+      // The renewal starts before expiry but cannot reach the session row: the
+      // renewing store's only pooled connection is held.
+      const renewer = terminalStore(`pg-harness-owner-live-${method}`, schemaName, { max: 1 });
+      await renewer.init();
+      let held: { release: () => void } | undefined = await renewer.pool.connect();
+      try {
+        const session = await createNativeSession(harness(), `queued-${method}`, 'owner-d', 1_000);
+        const input = admissionFor(session, `queued-${method}`);
+        expect(Date.now()).toBeLessThan(session.leaseExpiresAt!);
+        const renewal = (
+          method === 'renewSessionLeaseSubtree'
+            ? renewer.stores.harness!.renewSessionLeaseSubtree({
+                rootSessionId: session.id,
+                ownerId: 'owner-d',
+                ttlMs: 60_000,
+              })
+            : renewer.stores.harness!.renewSessionLease({ sessionId: session.id, ownerId: 'owner-d', ttlMs: 60_000 })
+        ).then(
+          () => 'renewed',
+          error => error,
+        );
+
+        await sleep(Math.max(0, session.leaseExpiresAt! - Date.now()) + 50);
+        await expect(
+          harness().revokeTerminalGrant({
+            ...revocation(input),
+            revokedAt: Date.now(),
+            requireOwnerLeaseLapsed: { ownerId: 'owner-d' },
+          }),
+        ).resolves.toMatchObject({ status: 'revoked' });
+        held.release();
+        held = undefined;
+
+        // The lease the revocation saw lapse stays lapsed.
+        expect(await renewal).toBeInstanceOf(HarnessStorageLeaseConflictError);
+        const after = await harness().loadSession({ harnessName: HARNESS, sessionId: session.id });
+        expect(after!.leaseExpiresAt).toBe(session.leaseExpiresAt);
+        expect(await tombstoneCount(input.executionGrant.key)).toBe('1');
+      } finally {
+        held?.release();
+        await renewer.close();
+      }
+    },
+  );
+
   it('refuses with owner_live when a renewal begun before expiry commits while the revocation waits', async () => {
     // The race: the renewal checks the lease before expiry and stalls, recovery
     // reads the old expiry after it passed, and the renewal commits before the

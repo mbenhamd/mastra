@@ -3709,32 +3709,50 @@ export class HarnessPG extends HarnessStorage {
     harnessName,
   }: RenewSessionLeaseInput): Promise<SessionLeaseResult> {
     const namespace = this.#resolveHarnessName(harnessName);
-    const now = Date.now();
-    const expiresAt = now + ttlMs;
 
-    const result = await this.#client.execute({
-      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
-            SET lease_expires_at = ?
-            WHERE harness_name = ?
-              AND id = ?
-              AND owner_id = ?
-              AND lease_expires_at IS NOT NULL
-              AND lease_expires_at > ?
-            RETURNING version`,
-      args: [expiresAt, namespace, sessionId, ownerId, now],
-    });
+    // Lock the row before reading the clock, as `renewSessionLeaseSubtree`
+    // does: a single UPDATE re-checks its WHERE after a lock wait with the
+    // `now` captured before it, so a renewal queued across expiry would renew
+    // a lease a guarded `revokeTerminalGrant` already saw lapse and fenced.
+    const tx = await this.#client.transaction('write');
+    try {
+      const locked = await tx.execute({
+        sql: `SELECT owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+              WHERE harness_name = ? AND id = ?
+              FOR UPDATE`,
+        args: [namespace, sessionId],
+      });
+      const row = locked.rows[0] as Record<string, unknown> | undefined;
+      if (!row) throw new HarnessStorageSessionNotFoundError(sessionId);
+      const now = Date.now();
+      const expiresAt = now + ttlMs;
 
-    if (result.rows.length === 0) {
-      const existing = await this.loadSession({ harnessName: namespace, sessionId });
-      if (!existing) throw new HarnessStorageSessionNotFoundError(sessionId);
-      throw new HarnessStorageLeaseConflictError(
-        sessionId,
-        existing.ownerId ?? '<unowned>',
-        existing.leaseExpiresAt ?? 0,
-      );
+      const result = await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+              SET lease_expires_at = ?
+              WHERE harness_name = ?
+                AND id = ?
+                AND owner_id = ?
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at > ?
+              RETURNING version`,
+        args: [expiresAt, namespace, sessionId, ownerId, now],
+      });
+
+      if (result.rows.length === 0) {
+        throw new HarnessStorageLeaseConflictError(
+          sessionId,
+          (row.owner_id ?? '<unowned>') as string,
+          row.lease_expires_at == null ? 0 : Number(row.lease_expires_at),
+        );
+      }
+
+      await tx.commit();
+      return { version: Number(result.rows[0]!.version), expiresAt };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
     }
-
-    return { version: Number(result.rows[0]!.version), expiresAt };
   }
 
   async renewSessionLeaseSubtree({
@@ -3744,8 +3762,6 @@ export class HarnessPG extends HarnessStorage {
     harnessName,
   }: RenewSessionLeaseSubtreeInput): Promise<SubtreeSessionLeaseResult> {
     const namespace = this.#resolveHarnessName(harnessName);
-    const now = Date.now();
-    const expiresAt = now + ttlMs;
 
     // §5.8 atomic subtree renewal: one transaction locks the root, gathers every
     // ACTIVE (non-closed) descendant under one owner, then renews root + descendants
@@ -3764,6 +3780,11 @@ export class HarnessPG extends HarnessStorage {
       });
       const rootRow = rootResult.rows[0] as Record<string, unknown> | undefined;
       if (!rootRow) throw new HarnessStorageSessionNotFoundError(rootSessionId);
+      // Read the clock only once the row lock is held: a renewal that waited
+      // for a connection or for the lock across expiry must not renew a lease
+      // that a guarded `revokeTerminalGrant` already saw lapse and fenced.
+      const now = Date.now();
+      const expiresAt = now + ttlMs;
       const rootOwner = (rootRow.owner_id ?? null) as string | null;
       const rootExpires = rootRow.lease_expires_at == null ? undefined : Number(rootRow.lease_expires_at);
       if (rootOwner !== ownerId || rootExpires === undefined || rootExpires <= now) {
