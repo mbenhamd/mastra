@@ -3831,17 +3831,27 @@ export class HarnessPG extends HarnessStorage {
       // revocation holding the row and the clock is read after it, so a
       // revocation that committed meanwhile is seen.
       let renewedIds = descendantIds;
+      let fencedIds: string[] = [];
       if (descendantIds.length > 0) {
         const lockedDescendants = await tx.execute({
-          sql: `SELECT id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+          sql: `SELECT id, owner_id, closed_at, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND id IN (${descendantIds.map(() => '?').join(', ')})
                 ORDER BY id
                 FOR NO KEY UPDATE`,
           args: [namespace, ...descendantIds],
         });
         const lockedNow = Date.now();
+        // Only a descendant still ours and open under the lock can be left out;
+        // one that changed owner or closed since the walk stays in the pass, so
+        // the guarded UPDATE below fails it closed as before.
         const lapsedIds = (lockedDescendants.rows as Record<string, unknown>[])
-          .filter(row => row.lease_expires_at != null && Number(row.lease_expires_at) <= lockedNow)
+          .filter(
+            row =>
+              row.owner_id === ownerId &&
+              row.closed_at == null &&
+              row.lease_expires_at != null &&
+              Number(row.lease_expires_at) <= lockedNow,
+          )
           .map(row => row.id as string);
         // Checked whatever this instance's terminal-handoff setting: another
         // instance may have written the fence. No tombstone table, no fence.
@@ -3856,8 +3866,8 @@ export class HarnessPG extends HarnessStorage {
                     )`,
             args: [namespace, ...lapsedIds],
           });
-          const fencedIds = new Set((fenced.rows as Record<string, unknown>[]).map(row => row.id as string));
-          renewedIds = descendantIds.filter(id => !fencedIds.has(id));
+          fencedIds = (fenced.rows as Record<string, unknown>[]).map(row => row.id as string);
+          renewedIds = descendantIds.filter(id => !fencedIds.includes(id));
         }
       }
 
@@ -3883,7 +3893,12 @@ export class HarnessPG extends HarnessStorage {
       }
 
       await tx.commit();
-      return { version: Number(rootRow.version), expiresAt, renewedDescendantCount: renewedIds.length };
+      return {
+        version: Number(rootRow.version),
+        expiresAt,
+        renewedDescendantCount: renewedIds.length,
+        ...(fencedIds.length > 0 ? { fencedDescendantIds: fencedIds } : {}),
+      };
     } catch (err) {
       if (!tx.closed) await tx.rollback();
       throw err;
@@ -3896,9 +3911,11 @@ export class HarnessPG extends HarnessStorage {
    */
   async #terminalTombstonesExist(tx: PgHarnessClient): Promise<boolean> {
     if (this.#terminalTombstonesPresent) return true;
+    // The table name is written into the SQL so the client qualifies it exactly
+    // as it qualifies the fence query (left bare for the default schema, so
+    // search_path resolves both to the same relation).
     const result = await tx.execute({
-      sql: `SELECT to_regclass(?) IS NOT NULL AS present`,
-      args: [`"${parseSchemaName(this.#schema)}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}"`],
+      sql: `SELECT to_regclass('${TABLE_HARNESS_TERMINAL_TOMBSTONES}') IS NOT NULL AS present`,
     });
     this.#terminalTombstonesPresent = result.rows[0]?.present === true;
     return this.#terminalTombstonesPresent;

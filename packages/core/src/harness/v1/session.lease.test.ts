@@ -559,4 +559,72 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
     }
     expect([...db.harnessTerminalTombstones.values()].filter(t => t.sessionId === 'fenced-child')).toHaveLength(1);
   });
+
+  it('fences a live child the renewal left out, so its lease proof fails until it is re-acquired', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const { harness } = setupHarness({ sessions: { storage } });
+    const root = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const child = await harness.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: root.id });
+    const key = [...db.harnessSessions.keys()].find(k => k.endsWith(child.id))!;
+    const lapsedAt = Date.now() - 1_000;
+    db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, leaseExpiresAt: lapsedAt });
+    const childRecord = (await storage.loadSession({ sessionId: child.id }))!;
+    await expect(
+      storage.revokeTerminalGrant({
+        harnessName: childRecord.harnessName,
+        sessionId: child.id,
+        admissionId: 'admission-revoked',
+        executionGrant: { key: 'grant-revoked', generation: 1 },
+        reason: { code: 'doxa.turn_released', message: 'owner lapsed' },
+        requireOwnerLeaseLapsed: { ownerId: harness.ownerId },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    await root.extendLease({ ttlMs: 5 * 60_000 });
+    expect(root.lifecycleState).toBe('live');
+    expect(child.lifecycleState).toBe('evicted');
+    const callback = vi.fn(async () => 'ran');
+    await expect(child.withExtendedLease(callback, { ttlMs: 60_000 })).rejects.toThrow();
+    expect(callback).not.toHaveBeenCalled();
+    expect((await storage.loadSession({ sessionId: child.id }))!.leaseExpiresAt).toBe(lapsedAt);
+
+    // Re-acquiring the child gives it a fresh lease; a fresh grant is admitted.
+    const readopted = await harness.session({ sessionId: child.id });
+    expect(readopted.lifecycleState).toBe('live');
+    const record = (await storage.loadSession({ sessionId: child.id }))!;
+    const fresh = {
+      harnessName: record.harnessName,
+      sessionId: record.id,
+      resourceId: record.resourceId,
+      threadId: record.threadId,
+      sessionIncarnation: record.sessionIncarnation!,
+      admissionId: 'admission-fresh',
+      admissionHash: 'admission-hash-fresh',
+      signalId: 'signal-fresh',
+      runId: 'run-fresh',
+      executionGrant: { key: 'grant-fresh', generation: 1 },
+      finalizerId: 'doxa.chat',
+      finalizerVersion: '1',
+      seed: { admissionId: 'admission-fresh' },
+      createdAt: Date.now(),
+    };
+    await storage.writeMessageResultEvidence({
+      status: 'pending',
+      signalId: fresh.signalId,
+      runId: fresh.runId,
+      operationKind: 'message',
+      admissionId: fresh.admissionId,
+      admissionHash: fresh.admissionHash,
+      harnessName: fresh.harnessName,
+      sessionId: fresh.sessionId,
+      resourceId: fresh.resourceId,
+      threadId: fresh.threadId,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    await expect(
+      storage.admitTerminalHandoff(fresh, { leaseOwner: { ownerId: harness.ownerId } }),
+    ).resolves.toMatchObject({ status: 'created' });
+  });
 });

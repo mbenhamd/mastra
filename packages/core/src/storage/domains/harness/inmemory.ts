@@ -1400,6 +1400,7 @@ export class InMemoryHarness extends HarnessStorage {
       childrenByParent.set(record.parentSessionId, siblings);
     }
     const descendants: SessionRecord[] = [];
+    const fencedDescendantIds: string[] = [];
     const queue = [rootSessionId];
     const visited = new Set<string>([rootSessionId]);
     while (queue.length > 0) {
@@ -1418,7 +1419,10 @@ export class InMemoryHarness extends HarnessStorage {
         // acted on that lapse: the recovery that revoked it decided the owner
         // was gone. It is left out of the pass (not renewed, not failing it),
         // so its lease stays lapsed and the root stays renewable.
-        if (this.revokedSinceLeaseLapsed(namespace, child, now)) continue;
+        if (this.revokedSinceLeaseLapsed(namespace, child, now)) {
+          fencedDescendantIds.push(child.id);
+          continue;
+        }
         descendants.push(child);
       }
     }
@@ -1435,7 +1439,12 @@ export class InMemoryHarness extends HarnessStorage {
         cloneSessionRecord({ ...descendant, leaseExpiresAt: expiresAt }),
       );
     }
-    return { version: root.version, expiresAt, renewedDescendantCount: descendants.length };
+    return {
+      version: root.version,
+      expiresAt,
+      renewedDescendantCount: descendants.length,
+      ...(fencedDescendantIds.length > 0 ? { fencedDescendantIds } : {}),
+    };
   }
 
   /**

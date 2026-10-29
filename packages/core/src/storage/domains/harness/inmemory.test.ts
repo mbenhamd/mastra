@@ -3205,6 +3205,7 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
     for (let pass = 0; pass < 2; pass++) {
       const renewed = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
       expect(renewed.renewedDescendantCount).toBe(0);
+      expect(renewed.fencedDescendantIds).toEqual(['child-1']);
       expect((await storage.loadSession({ sessionId: 'root' }))?.leaseExpiresAt).toBe(renewed.expiresAt);
       expect((await storage.loadSession({ sessionId: 'child-1' }))?.leaseExpiresAt).toBe(lapsedAt);
     }

@@ -18,6 +18,7 @@ import type {
   HarnessTerminalAdmissionInput,
   SessionRecord,
 } from '@mastra/core/storage';
+import { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PostgresStore } from '../..';
@@ -763,6 +764,7 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
       ttlMs: 60_000,
     });
     expect(again.renewedDescendantCount).toBe(1);
+    expect(again.fencedDescendantIds).toEqual([childB.id]);
     expect((await harness().loadSession({ harnessName: HARNESS, sessionId: childB.id }))!.leaseExpiresAt).toBe(
       childB.leaseExpiresAt,
     );
@@ -782,6 +784,101 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
     return { root, child: (await target.loadSession({ harnessName: HARNESS, sessionId: child.id }))! };
   }
 
+  it('fails a subtree renewal whose fenced child changed owner while the renewal paused', async () => {
+    const root = await createNativeSession(harness(), 'owner-move-root', 'owner-i', 60_000);
+    const childOf = async (id: string, ttlMs: number) => {
+      const record = createSampleSessionRecord({
+        id,
+        harnessName: HARNESS,
+        resourceId: root.resourceId,
+        threadId: `thread-${id}`,
+        parentSessionId: root.id,
+      });
+      await harness().createOrLoadActiveSession(record, { initialLease: { ownerId: 'owner-i', ttlMs } });
+      return (await harness().loadSession({ harnessName: HARNESS, sessionId: id }))!;
+    };
+    const childA = await childOf('owner-move-child-a', 60_000);
+    const childB = await childOf('owner-move-child-b', 300);
+
+    // The renewal walks the subtree (child-b still owner-i's) and pauses on child-a.
+    const blocker = holdRowLock(
+      `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE harness_name = $1 AND id = $2 FOR UPDATE`,
+      [HARNESS, childA.id],
+    );
+    const blockerPid = await blocker.pid;
+    const renewal = harness()
+      .renewSessionLeaseSubtree({ rootSessionId: root.id, ownerId: 'owner-i', ttlMs: 60_000 })
+      .then(
+        () => 'renewed',
+        error => error,
+      );
+    await waitForBlockedBy(blockerPid);
+
+    // Meanwhile another owner takes the lapsed child-b, lapses, and is fenced.
+    await sleep(Math.max(0, childB.leaseExpiresAt! - Date.now()) + 50);
+    await harness().acquireSessionLease({ sessionId: childB.id, ownerId: 'owner-x', ttlMs: 200 });
+    await sleep(300);
+    await expect(
+      harness().revokeTerminalGrant({
+        ...revocation(admissionFor(childB, 'owner-move-child-b')),
+        revokedAt: Date.now(),
+        requireOwnerLeaseLapsed: { ownerId: 'owner-x' },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+    await blocker.release();
+
+    // A foreign-owned descendant still fails the whole pass.
+    expect(await renewal).toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  it('probes the tombstone table the fence query resolves through search_path', async () => {
+    const database = `pf6886_sp_${randomUUID().replaceAll('-', '_')}`;
+    await store.db.none(`CREATE DATABASE "${database}"`);
+    const config = TEST_CONFIG as { host: string; port: number; user: string; password: string };
+    const tenant = terminalStore('pg-harness-owner-live-tenant', 'tenant', { database });
+    const pool = new Pool({
+      host: config.host,
+      port: config.port,
+      user: config.user,
+      password: config.password,
+      database,
+      options: '-c search_path=tenant,public',
+    });
+    // Default schema: queries stay unqualified and resolve to tenant's tables.
+    const onPath = new PostgresStore({
+      id: 'pg-harness-owner-live-search-path',
+      pool,
+      enabledDomains: ['harness'],
+      disableInit: true,
+    });
+    try {
+      await tenant.init();
+      await onPath.init();
+      const { root, child } = await rootWithLapsedChild(tenant.stores.harness!, 'search-path', 'owner-j');
+      await expect(
+        tenant.stores.harness!.revokeTerminalGrant({
+          ...revocation(admissionFor(child, 'search-path-child')),
+          requireOwnerLeaseLapsed: { ownerId: 'owner-j' },
+        }),
+      ).resolves.toMatchObject({ status: 'revoked' });
+
+      const renewed = await onPath.stores.harness!.renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-j',
+        ttlMs: 60_000,
+      });
+      expect(renewed).toMatchObject({ renewedDescendantCount: 0, fencedDescendantIds: [child.id] });
+      expect(
+        (await tenant.stores.harness!.loadSession({ harnessName: HARNESS, sessionId: child.id }))!.leaseExpiresAt,
+      ).toBe(child.leaseExpiresAt);
+    } finally {
+      await onPath.close().catch(() => {});
+      await pool.end().catch(() => {});
+      await tenant.close().catch(() => {});
+      await store.db.none(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`).catch(() => {});
+    }
+  });
+
   it('does not let a handoff-disabled instance re-adopt a child an enabled instance fenced', async () => {
     const disabled = terminalStore('pg-harness-owner-live-disabled', schemaName, {
       terminalHandoff: { enabled: false },
@@ -800,6 +897,7 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
         ttlMs: 60_000,
       });
       expect(renewed.renewedDescendantCount).toBe(0);
+      expect(renewed.fencedDescendantIds).toEqual([child.id]);
       expect((await harness().loadSession({ harnessName: HARNESS, sessionId: child.id }))!.leaseExpiresAt).toBe(
         child.leaseExpiresAt,
       );

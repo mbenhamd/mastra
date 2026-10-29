@@ -2090,6 +2090,13 @@ export interface SubtreeSessionLeaseResult extends SessionLeaseResult {
    * repair (re-running subtree renewal extends a lagging mirror), not a fence.
    */
   renewedDescendantCount: number;
+  /**
+   * Lapsed descendants left out of this renewal because a pre-admission grant
+   * revocation (`revokeTerminalGrant`) was written for them at or after their
+   * lease expiry. They were not renewed and their leases stay lapsed; a caller
+   * holding them live must stop treating them as leased. Absent when none.
+   */
+  fencedDescendantIds?: string[];
 }
 
 export interface SaveAttachmentInput {

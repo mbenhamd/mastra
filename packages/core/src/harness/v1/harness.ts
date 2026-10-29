@@ -5184,6 +5184,17 @@ export class Harness {
       ttlMs,
     });
     root._markLeaseRenewed(lease.expiresAt);
+    // A descendant storage left out (its grant was revoked after its lease
+    // lapsed) is no longer leased: fence it and its live subtree instead of
+    // reporting them renewed.
+    const fenced = new Set(lease.fencedDescendantIds ?? []);
+    for (const fencedId of fenced) {
+      const descendant = this._liveSessions.get(fencedId);
+      if (descendant === undefined) continue;
+      for (const member of [descendant, ...this._liveDescendantsOf(descendant.id)]) {
+        if (this._liveSessions.get(member.id) === member) await this._evictLiveSession(member, 'lease_lost');
+      }
+    }
     for (const descendant of this._liveDescendantsOf(root.id)) descendant._markLeaseRenewed(lease.expiresAt);
     return lease;
   }
@@ -5227,6 +5238,11 @@ export class Harness {
       });
       if (expiresAt === 0) {
         await this._evictLiveSession(session, 'lease_lost');
+        throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+      }
+      // The renewal fenced this session (a revocation-fenced descendant, or one
+      // under it): its lease was not renewed, so the proof fails.
+      if (this._liveSessions.get(session.id) !== session) {
         throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
       }
       return expiresAt;
