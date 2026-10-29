@@ -240,6 +240,11 @@ export interface HarnessTerminalGrantRevocationInput {
   requireOwnerLeaseLapsed?: { ownerId: string };
 }
 
+/** A revocation that does not pass `requireOwnerLeaseLapsed`; it never answers `owner_live`. */
+export type HarnessTerminalUnguardedGrantRevocationInput = HarnessTerminalGrantRevocationInput & {
+  requireOwnerLeaseLapsed?: undefined;
+};
+
 /**
  * - `admitted`: the grant was already admitted. Nothing changed; the stored
  *   admission (any status) is returned as is, and settling or cancelling it is
@@ -248,8 +253,9 @@ export interface HarnessTerminalGrantRevocationInput {
  *   it. A later `admitTerminalHandoff` for the grant answers `cancelled`.
  * - `duplicate`: the grant was already tombstoned (by an earlier revocation or
  *   cancellation) and has no admission.
- * - `owner_live`: `requireOwnerLeaseLapsed` was set and its owner still holds
- *   the session lease (expiring at `leaseExpiresAt`). Nothing changed.
+ *
+ * A revocation passing `requireOwnerLeaseLapsed` can also answer
+ * `owner_live`; see `HarnessTerminalGuardedGrantRevocationReceipt`.
  */
 export type HarnessTerminalGrantRevocationReceipt =
   | {
@@ -263,13 +269,26 @@ export type HarnessTerminalGrantRevocationReceipt =
       grant: HarnessTerminalExecutionGrant;
       tombstoneId: string;
       revokedAt: number;
-    }
-  | {
-      status: 'owner_live';
-      grant: HarnessTerminalExecutionGrant;
-      tombstoneId: string;
-      leaseExpiresAt: number;
     };
+
+/**
+ * `owner_live`: `requireOwnerLeaseLapsed` was set and its owner still holds the
+ * session lease (expiring at `leaseExpiresAt`). Nothing changed.
+ */
+export interface HarnessTerminalGrantRevocationOwnerLiveReceipt {
+  status: 'owner_live';
+  grant: HarnessTerminalExecutionGrant;
+  tombstoneId: string;
+  leaseExpiresAt: number;
+}
+
+/**
+ * Receipt of a revocation that may pass `requireOwnerLeaseLapsed`. A
+ * revocation known to omit it answers `HarnessTerminalGrantRevocationReceipt`.
+ */
+export type HarnessTerminalGuardedGrantRevocationReceipt =
+  | HarnessTerminalGrantRevocationReceipt
+  | HarnessTerminalGrantRevocationOwnerLiveReceipt;
 
 export interface HarnessTerminalAdmissionLoadInput {
   harnessName: string;

@@ -104,6 +104,8 @@ import type {
   HarnessTerminalFailReceipt,
   HarnessTerminalGrantRevocationInput,
   HarnessTerminalGrantRevocationReceipt,
+  HarnessTerminalGuardedGrantRevocationReceipt,
+  HarnessTerminalUnguardedGrantRevocationInput,
   HarnessTerminalHandoffOption,
   HarnessTerminalIdentity,
   HarnessTerminalIntent,
@@ -2241,9 +2243,15 @@ export class InMemoryHarness extends HarnessStorage {
     };
   }
 
+  revokeTerminalGrant(
+    input: HarnessTerminalUnguardedGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt>;
+  revokeTerminalGrant(
+    input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt>;
   async revokeTerminalGrant(
     input: HarnessTerminalGrantRevocationInput,
-  ): Promise<HarnessTerminalGrantRevocationReceipt> {
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt> {
     this.assertTerminalHandoffEnabled();
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
     validateHarnessTerminalExecutionGrant(input.executionGrant);

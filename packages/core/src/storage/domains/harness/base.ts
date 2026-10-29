@@ -25,6 +25,8 @@ import {
   type HarnessTerminalFailReceipt,
   type HarnessTerminalGrantRevocationInput,
   type HarnessTerminalGrantRevocationReceipt,
+  type HarnessTerminalGuardedGrantRevocationReceipt,
+  type HarnessTerminalUnguardedGrantRevocationInput,
   type HarnessTerminalHandoffOption,
   type HarnessTerminalIntent,
   type HarnessTerminalIntentLoadInput,
@@ -1480,9 +1482,15 @@ export abstract class HarnessStorage extends StorageDomain {
    * answers `owner_live` without writing a tombstone. Adapters that
    * implement it override `supportsTerminalGrantRevocation`.
    */
+  revokeTerminalGrant(
+    input: HarnessTerminalUnguardedGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt>;
+  revokeTerminalGrant(
+    input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt>;
   async revokeTerminalGrant(
     _input: HarnessTerminalGrantRevocationInput,
-  ): Promise<HarnessTerminalGrantRevocationReceipt> {
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }
 
