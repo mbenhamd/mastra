@@ -3,7 +3,8 @@ import { createEmptyWorkflowSnapshot, createWorkflowTerminalGraphFingerprint } f
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { PostgresStore, WorkflowsPG } from '../../index';
+import type { WorkflowsPG } from '../../index';
+import { PostgresStore } from '../../index';
 
 const connectionString = process.env.DB_URL || 'postgresql://postgres:postgres@localhost:5434/mastra';
 

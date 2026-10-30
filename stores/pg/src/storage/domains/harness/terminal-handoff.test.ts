@@ -19,12 +19,14 @@ import {
   canonicalHarnessTerminalResult,
   harnessTerminalAdmissionId,
   harnessTerminalIntentId,
-  type AgentSignalResultEvidence,
-  type HarnessStorage,
-  type HarnessTerminalAdmissionInput,
-  type HarnessTerminalClaimIdentity,
-  type HarnessTerminalIntent,
-  type SessionRecord,
+} from '@mastra/core/storage';
+import type {
+  AgentSignalResultEvidence,
+  HarnessStorage,
+  HarnessTerminalAdmissionInput,
+  HarnessTerminalClaimIdentity,
+  HarnessTerminalIntent,
+  SessionRecord,
 } from '@mastra/core/storage';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
