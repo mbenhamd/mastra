@@ -131,7 +131,7 @@ await session.queue({
 })
 ```
 
-Use an input-only identity with `signal()` for an active steer. It keeps the active response owner instead of assigning a new response identity. A full pair on an active signal uses discard admission for the competing response, so the active response keeps ownership when it wins the race:
+Use an input-only identity with `signal()` for an active steer. It keeps the active response owner instead of assigning a new response identity. A full pair on an active signal uses discard admission for the competing response. The active response keeps ownership when it wins the race:
 
 ```typescript
 await session.signal({
