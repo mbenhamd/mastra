@@ -102,7 +102,7 @@ A user may want to add to the conversation while the agent is still working. Ins
 const queued = harness.session.followUps.count()
 ```
 
-Queue a follow-up with `harness.followUp({ content })`. To redirect the agent mid-run instead of waiting, use `harness.steer({ content })`. Both build on [signals](/docs/harness/signals).
+Queue a follow-up with `harness.followUp({ content })`. To redirect the agent mid-run instead of waiting, use `harness.steer({ content })`. Both build on [signals](/docs/signals/overview).
 
 ## Native logical message identity
 
@@ -131,7 +131,7 @@ await session.queue({
 })
 ```
 
-Use an input-only identity with `signal()` for an active steer. It keeps the active response owner instead of assigning a new response identity. A full pair on an active signal uses discard admission for the competing response, so the active response keeps ownership when it wins the race:
+Use an input-only identity with `signal()` for an active steer. It keeps the active response owner instead of assigning a new response identity. A full pair on an active signal uses discard admission for the competing response. The active response keeps ownership when it wins the race:
 
 ```typescript
 await session.signal({

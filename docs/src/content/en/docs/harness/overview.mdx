@@ -74,7 +74,7 @@ You could assemble all of this yourself on top of the [Agent class](/docs/agents
 - **Subagents**: Spawn focused child agents with constrained tools for subtasks, optionally forking the parent conversation. See [Subagents](/docs/harness/subagents).
 - **Tool approvals and permissions**: Set confirmation requirements and session-wide exceptions for tools. You can also handle interactive tool suspension. See [Tool approvals](/docs/harness/tool-approvals).
 - **Model management**: Switch models per-mode at runtime and resolve gateway-backed models through Mastra's [model router](/models). Usage is tracked per model.
-- **Follow-ups and steering**: Queue messages while the agent is running, or inject mid-stream instructions to redirect the agent. Built on [signals](/docs/harness/signals).
+- **Follow-ups and steering**: Queue messages while the agent is running, or inject mid-stream instructions to redirect the agent. Built on [signals](/docs/signals/overview).
 - **Event system**: Subscribe to typed events or to coalesced `HarnessDisplayState` snapshots that drive your UI. Typed events include message updates as well as mode and tool-approval changes. See [Events](/reference/harness/harness-class#events).
 - **Observational memory**: Automatic summarization and reflection across threads for long-running agent sessions. See [Observational memory](/docs/memory/observational-memory).
 
