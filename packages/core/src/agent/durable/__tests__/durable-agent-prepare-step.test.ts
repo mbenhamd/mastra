@@ -11,10 +11,10 @@ import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { z } from 'zod';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { expectEngineParity, textOnlyTape, toolCallTape } from '../../../loop/test-utils/aimock/parity';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
-import { expectEngineParity, textOnlyTape, toolCallTape } from './parity-harness';
 
 function createTwoStepToolThenTextModel(toolName: string, finalText: string) {
   let callCount = 0;

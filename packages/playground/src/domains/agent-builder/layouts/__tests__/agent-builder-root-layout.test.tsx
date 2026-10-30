@@ -79,7 +79,7 @@ function renderAgentBuilderRoute(initialEntry: string, basename?: string) {
       },
       {
         path: '/agent-builder',
-        element: <AgentBuilderRootLayout paths={{ agentsLink: () => '/agents' } as never} />,
+        element: <AgentBuilderRootLayout paths={{ agentsLink: () => '/agents' }} />,
         children: [
           {
             path: 'agents',

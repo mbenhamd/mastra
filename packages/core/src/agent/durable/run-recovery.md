@@ -91,7 +91,7 @@ This retry advice applies only to errors propagated by `recover()` for an identi
 
 `recover(runId, { force: true })` takes the run from a live execution. Use it when the owner is known to be gone (a killed container whose claim hasn't expired yet) or stuck.
 
-With storage fencing, the old execution's writes are rejected from the moment the takeover's claim lands. It notices on its next step check or heartbeat (within 10s), aborts its model call and tools, and writes nothing terminal. Its caller's stream receives the new owner's events, because the run topic is shared and older generations are dropped. Without storage fencing, `force` transfers the pubsub lease; the old execution still stops at its next check, but writes it makes before then are not rejected.
+With storage fencing, the old execution's writes are rejected from the moment the takeover's claim lands. It notices on its next step check or heartbeat (within 5s by default), aborts its model call and tools, and writes nothing terminal. Its caller's stream receives the new owner's events, because the run topic is shared and older generations are dropped. Without storage fencing, `force` transfers the pubsub lease; the old execution still stops at its next check, but writes it makes before then are not rejected.
 
 `force` never takes a run this process is executing, and a forced takeover still loses to a concurrent claimer.
 
@@ -104,6 +104,20 @@ Neither recovery nor takeover can undo a side effect. A tool that was running wh
 Recovery and ownership apply the same way on both engines. The evented engine's durable loop is registered as an internal workflow, so its events are published `localOnly` and never leave the process. No sibling worker picks up a crashed run's steps from the bus; the run stays stranded until `recover()` restarts it, as on the default engine.
 
 The evented engine stores each loop iteration as a nested run with its own run id. The nested runs are adopted under the parent's claim, so their writes are fenced by the parent's generation.
+
+## Resume fence (fork divergence from upstream)
+
+Durable agents have no resume fence until PF-6995. Upstream #27617/#27619/#27923 fence a run id after an abort: a later approval, decline or resume is refused (`AGENT_RESUME_ABORTED_RUN`), the suspended rows are deleted, and an abort terminal is published on the run-id topic. The fork does not apply this to `DurableAgent.resume()` (durable and evented engines). An approval or resume after an abort of a parked durable run is accepted and the run continues, as in fork main before the PF-6640 sync.
+
+The plain `Agent` keeps upstream's fence unchanged (`agentThreadStreamRuntime.isResumeFenced`). PF-6995 tracks a durable fence that names the stopped execution, so it can never refuse, delete or close a replacement execution that reuses the run id.
+
+## Lease-lost run stopped at a step boundary (fork divergence from upstream)
+
+Upstream: when a run loses its thread lease, `#abortLeaseLostRun` aborts it. If the agentic loop sees the abort at a step boundary, the run's stream ends with a plain `finish` chunk (`stepResult.reason: 'abort'`) and no `abort` chunk. The thread runtime adds the lease-lost reason only to `abort` chunks, so a controller session reports `agent_end` with reason `complete` instead of `aborted` / `thread-lease-lost`. Which chunk arrives depends on timing: `agent-controller/lease-lost-abort-reason.test.ts` fails intermittently, mostly under CPU pressure.
+
+The sync (PF-6640, PF-2246) rewrites that `finish` into `{ type: 'abort', payload: { reason: 'thread-lease-lost' } }` in the thread runtime's broadcast, only for a run whose lease-lost marker it consumes (the same marker the abort-chunk path consumes). Fork main has no lease-loss abort, so this exists only on top of upstream's code. Evidence: the test fails under `CPUQuota=15%` without the rewrite and passes with it (PF-6640 sync notes, round 3).
+
+Re-evaluate on the next upstream sync; remove the rewrite if upstream fixes it.
 
 ## Known gaps
 

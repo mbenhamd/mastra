@@ -46,6 +46,7 @@ import { defineLazyWriter } from '../../../../workflows/utils';
 import { createStep } from '../../../../workflows/workflow';
 import { stopGoalActivity } from '../../../goal';
 import type { MessageList } from '../../../message-list';
+import type { MastraDBMessage } from '../../../message-list/state/types';
 import type { SaveQueueManager } from '../../../save-queue';
 import { resolveDeclineReason } from '../../../tool-approval';
 import {
@@ -69,7 +70,12 @@ import { createToolSurfaceFence, materializeToolSurfaceFence } from '../../../to
 import { TripWire } from '../../../trip-wire';
 import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
-import { assertExecutionNotSuperseded, assertExecutionOwned, isExecutionFenceError } from '../../execution-fence';
+import {
+  assertExecutionNotSuperseded,
+  assertExecutionOwned,
+  getExecutionOwnershipGuard,
+  isExecutionFenceError,
+} from '../../execution-fence';
 import { authorizeDurableMemory, getDurableMemoryAuthorizationChecks } from '../../memory-fga';
 import {
   clearResumeInFlight,
@@ -111,7 +117,7 @@ const durableToolCallInputSchema = z.object({
   iterationCount: z.number().int().nonnegative().optional(),
   toolCallId: z.string(),
   toolName: z.string(),
-  args: z.record(z.string(), z.any()),
+  args: z.record(z.string(), z.any()).optional(),
   providerMetadata: z.record(z.string(), z.any()).optional(),
   providerExecuted: z.boolean().optional(),
   output: z.any().optional(),
@@ -322,8 +328,12 @@ async function processChunkThroughOutputProcessors(
     // `processorDataParts` for persistence by the mapping step. The slot is
     // cleared in `finally` below so a late write streams without being
     // attributed to another step's output.
+    // Each step execution now hands its tool step an ownership-fenced PubSub
+    // wrapper (upstream #27791), so the PubSub identity changes per step. Key the
+    // stable writer on the run only and publish through the current step's
+    // (fenced) PubSub, which the slot below refreshes per invocation.
     let writerCache = registryEntry?.outputProcessorWriter;
-    if (pubsub && (!writerCache || writerCache.pubsub !== pubsub || writerCache.runId !== runId)) {
+    if (pubsub && (!writerCache || writerCache.runId !== runId)) {
       const cache: NonNullable<RunRegistryEntry['outputProcessorWriter']> = {
         pubsub,
         runId,
@@ -339,7 +349,7 @@ async function processChunkThroughOutputProcessors(
               cache.collect?.({ type: data.type, data: data.data, messageId: writerOptions?.messageId });
             }
             try {
-              await emitChunkEvent(pubsub, runId, data as ChunkType);
+              await emitChunkEvent(cache.pubsub, runId, data as ChunkType);
             } catch (error) {
               throw new DurableChunkPublishError(error);
             }
@@ -349,7 +359,10 @@ async function processChunkThroughOutputProcessors(
       writerCache = cache;
       if (registryEntry) registryEntry.outputProcessorWriter = cache;
     }
-    if (writerCache) writerCache.collect = collectDataPart;
+    if (writerCache) {
+      writerCache.collect = collectDataPart;
+      if (pubsub) writerCache.pubsub = pubsub;
+    }
     const streamWriter: ProcessorStreamWriter | undefined = pubsub ? writerCache?.writer : undefined;
 
     return await processAndEmitChunk(chunk, {
@@ -474,6 +487,8 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         getStepResult,
       } = params;
 
+      const ownership = getExecutionOwnershipGuard(params);
+
       // Access pubsub via symbol
       const pubsub = (params as any)[PUBSUB_SYMBOL] as PubSub | undefined;
 
@@ -525,6 +540,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       // to persist into the authoritative messageList (#19375 parity port).
       const processorDataParts: Array<{ type: string; data?: unknown; messageId?: string }> = [];
       const collectProcessorDataPart = (part: { type: string; data?: unknown; messageId?: string }) => {
+        ownership?.throwIfLost();
         processorDataParts.push(part);
       };
 
@@ -871,6 +887,24 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         };
       }
 
+      // Preserve parse failure as a tool error, before approval hooks or argument spreading.
+      if (args === null || args === undefined) {
+        const error = serializeError(
+          new Error(
+            `Tool "${toolName}" received invalid arguments — the provided JSON could not be parsed. Please provide valid JSON arguments.`,
+          ),
+        );
+        if (pubsub) {
+          await emitChunkEvent(pubsub, runId, {
+            type: 'tool-error',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: { toolCallId, toolName, args, error },
+          });
+        }
+        return { ...typedInput, error };
+      }
+
       // Get memory-related state for message persistence. Fall back to the
       // values rebuilt from Mastra above (cross-process worker), so workspace
       // tools receive their `workspace` and message flushing still works.
@@ -908,16 +942,28 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         else await clearAndPublish();
       };
       let resumeMessageList = messageList;
-      // A durable engine can replay the completed LLM step on a cold resume,
-      // so its runtime rehydration never runs before this suspended tool step.
-      // The suspension metadata was flushed to memory before suspending.
-      if (!resumeMessageList && workflowResumeData !== undefined && memory && state?.threadId) {
+      // Observational memory loads history in the LLM step, which a cold resume skips.
+      // Recover the persisted invocation before clearing or replacing its metadata.
+      const hasInvocation = (msg: MastraDBMessage) =>
+        msg.role === 'assistant' &&
+        (msg.content?.parts ?? []).some(
+          part => part?.type === 'tool-invocation' && part.toolInvocation?.toolCallId === toolCallId,
+        );
+      if (
+        workflowResumeData !== undefined &&
+        memory &&
+        state?.threadId &&
+        !messageList?.get.all.db().some(hasInvocation)
+      ) {
         const { messages } = await memory.recall({
           threadId: state.threadId,
           resourceId: state.resourceId,
           perPage: false,
         });
-        if (messages.length) {
+        if (messageList) {
+          const invocation = [...messages].reverse().find(hasInvocation);
+          if (invocation) messageList.add(invocation, 'memory');
+        } else if (messages.length) {
           resumeMessageList = createRunMessageList({
             mastra,
             threadId: state.threadId,
@@ -949,7 +995,8 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       const assertNotSuperseded = () =>
         assertExecutionNotSuperseded({ runId, agentId: initData.agentId, requestContext, mastra: mastra as Mastra });
 
-      const doFlush = async (messagesToFlush = messageList) => {
+      // Remote workers have no registry message list; persist updates through the recovered resume list.
+      const doFlush = async (messagesToFlush = messageList ?? resumeMessageList) => {
         if (
           saveQueueManager &&
           messagesToFlush &&
@@ -1120,7 +1167,8 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         approvalToolName?: string;
         approvalArgs?: unknown;
       }) => {
-        if (!messageList) return;
+        const metadataMessageList = messageList ?? resumeMessageList;
+        if (!metadataMessageList) return;
         const metadataKey = opts.type === 'suspension' ? 'suspendedTools' : 'pendingToolApprovals';
         const entry = {
           version: 1,
@@ -1151,7 +1199,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             (part: any) => part?.type === 'tool-invocation' && part.toolInvocation?.toolCallId === toolCallId,
           );
 
-        const responseMessages = messageList.get.response.db();
+        const responseMessages = metadataMessageList.get.response.db();
         const lastAssistantMessage = [...responseMessages].reverse().find(carriesToolCall);
         if (lastAssistantMessage?.content) {
           let metadata: Record<string, any>;
@@ -1176,7 +1224,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         // the entry into the assistant message that carries this tool call via
         // updateMessageMetadataByToolCallId, which also re-marks the message
         // unsaved so the following flush persists this write too.
-        const allMessages = messageList.get.all.db();
+        const allMessages = metadataMessageList.get.all.db();
         const target = [...allMessages].reverse().find(carriesToolCall);
         if (!target?.content) {
           logger?.warn?.(
@@ -1189,7 +1237,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             ? (target.content.metadata as Record<string, any>)
             : {};
         const existingEntries = (existingMeta[metadataKey] ?? {}) as Record<string, any>;
-        messageList.updateMessageMetadataByToolCallId(toolCallId, {
+        metadataMessageList.updateMessageMetadataByToolCallId(toolCallId, {
           [metadataKey]: { ...existingEntries, [toolCallId]: entry },
         });
       };
@@ -1634,6 +1682,12 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
         // Persist active goal time before exposing the approval wait.
         await stopGoalActivity({ agentId: initData.agentId, runId });
 
+        // Add approval metadata to message before persisting
+        addToolMetadata({ type: 'approval', approvalSource: 'tool-gate', resumeSchema });
+
+        // Flush messages before suspension
+        await doFlush();
+
         // Emit approval chunk via PubSub (mirrors base agent's controller.enqueue).
         // Apply the tool payload transform first so display targets never see raw
         // args on the approval prompt (parity with the main loop's approval chunk).
@@ -1681,12 +1735,6 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             }),
           );
         }
-
-        // Add approval metadata to message before persisting
-        addToolMetadata({ type: 'approval', approvalSource: 'tool-gate', resumeSchema });
-
-        // Flush messages before suspension
-        await doFlush();
 
         // End the trace's open spans as suspended before pausing.
         endSpansAsSuspended({ toolCallId, toolName, reason: 'approval' });
@@ -1810,7 +1858,25 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       }
 
       if (isResumingFromSuspension) {
-        const cleanupTarget = isResumableTool ? resolvedSuspensionIdentity : { toolCallId, toolName };
+        // Auto-resume re-calls a plain tool under a new toolCallId and names the original via
+        // `suspendedToolCallId`; resolve it so the original entry is cleared (mirrors tool-call-step.ts).
+        const plainResumeIdentity =
+          !isResumableTool && hasModelResumeData
+            ? resolveFrameworkSuspendedToolIdentity({
+                toolCallId,
+                toolName,
+                resumeSource: 'model',
+                // Fork: `args` was stripped of the model's suspended identity up front; read
+                // the extracted claims (as the delegated lookup above does).
+                modelSuppliedSuspendedToolCallId,
+                modelSuppliedSuspendedToolRunId,
+                suspendData,
+                messages: messageList?.get.all.db() ?? [],
+              })
+            : undefined;
+        const cleanupTarget = isResumableTool
+          ? resolvedSuspensionIdentity
+          : (plainResumeIdentity ?? { toolCallId, toolName });
         if (cleanupTarget) {
           await removeToolMetadata(cleanupTarget, resolvedSuspensionIdentity?.type ?? 'suspension');
         }
@@ -1856,7 +1922,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
 
       // Forward abort signal from the run registry so tools can observe
       // cancellation (mirrors the non-durable tool-call-step).
-      const toolAbortSignal = registryEntry?.abortSignal;
+      const toolAbortSignal = ownership?.composeSignal(registryEntry?.abortSignal) ?? registryEntry?.abortSignal;
 
       // Provide outputWriter so context.writer.write() / context.writer.custom()
       // emit chunks through pubsub (matching the regular agent's tool streaming).
@@ -1943,6 +2009,18 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
             // Tool is requesting approval during execution
             await stopGoalActivity({ agentId: initData.agentId, runId });
 
+            // Add approval metadata to message before persisting
+            addToolMetadata({
+              type: 'approval',
+              approvalSource: 'tool-execution',
+              resumeSchema: approvalResumeSchema,
+              delegatedRunId,
+              approvalToolName,
+              approvalArgs,
+            });
+
+            await doFlush();
+
             if (pubsub) {
               const approvalChunk = await applyToolPayloadTransformToChunk(
                 {
@@ -1988,18 +2066,6 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               );
             }
 
-            // Add approval metadata to message before persisting
-            addToolMetadata({
-              type: 'approval',
-              approvalSource: 'tool-execution',
-              resumeSchema: approvalResumeSchema,
-              delegatedRunId,
-              approvalToolName,
-              approvalArgs,
-            });
-
-            await doFlush();
-
             endSpansAsSuspended({ toolCallId, toolName: approvalToolName, reason: 'approval' });
 
             return suspend(
@@ -2035,6 +2101,17 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               resumeSchema: suspendOptions?.resumeSchema,
             };
 
+            // Add suspension metadata to message before persisting
+            addToolMetadata({
+              type: 'suspension',
+              approval: approvalGrant?.approval,
+              suspendPayload,
+              resumeSchema: suspendOptions?.resumeSchema,
+              delegatedRunId,
+            });
+
+            await doFlush();
+
             if (pubsub) {
               const suspensionChunk = await applyToolPayloadTransformToChunk(
                 {
@@ -2064,17 +2141,6 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               await publishAfterPersist(() => emitChunkEvent(pubsub, runId, suspensionChunk));
               await publishAfterPersist(() => emitSuspendedEvent(pubsub, runId, suspendedEventData));
             }
-
-            // Add suspension metadata to message before persisting
-            addToolMetadata({
-              type: 'suspension',
-              approval: approvalGrant?.approval,
-              suspendPayload,
-              resumeSchema: suspendOptions?.resumeSchema,
-              delegatedRunId,
-            });
-
-            await doFlush();
 
             endSpansAsSuspended({ toolCallId, toolName, reason: 'suspension' });
 
@@ -2579,6 +2645,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
       let mappingFailure: { error: unknown } | undefined;
 
       try {
+        ownership?.throwIfLost();
         const outcome = await executeToolCall({
           tool: tool as any,
           args: cleanedArgs,
@@ -2586,11 +2653,13 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
           toolCallId,
           toolName,
           abortSignal: toolAbortSignal,
+          assertNotBailedOut: () => ownership?.throwIfLost(),
           // Run-activity tracking brackets live execution (durable-only bookkeeping).
           acquireExecution: () => markRunActive(runId),
           logger: logger as any,
         });
 
+        ownership?.throwIfLost();
         if (outcome.status === 'aborted') {
           // Mid-flight cancellation: leave the call incomplete (no result/error,
           // no chunk emission) so the mapping step doesn't fake-complete it on
@@ -2701,6 +2770,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                 : undefined,
               abortSignal: toolAbortSignal,
             });
+            ownership?.throwIfLost();
             // Sync any processor mutation back so the emitted chunk and the
             // serialized step output both carry the post-processor value.
             const postProcessorResult = readToolResultFromMessageList(messageList, toolCallId);
@@ -2708,6 +2778,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               result = postProcessorResult;
             }
           } catch (processorError) {
+            ownership?.throwIfLost();
             if (processorError instanceof TripWire) {
               // Blocked: emit a tripwire chunk instead of the tool-result and
               // leave the call incomplete (no result). llm-mapping skips
@@ -2776,6 +2847,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                 payload: { toolCallId, toolName, args, result, providerMetadata, providerExecuted },
               },
               {
+                transformInput: { args, providerMetadata: typedInput.providerMetadata },
                 policy: toolPayloadTransform,
                 toolTransform: (tool as { transform?: any })?.transform,
                 tools: toolsForTransform,
@@ -2800,6 +2872,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               collectProcessorDataPart,
             );
           } catch (emitError) {
+            ownership?.throwIfLost();
             if (emitError instanceof DurableOutputProcessorError) {
               throw emitError;
             }
@@ -2822,6 +2895,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
           ...(consumeDelegationBailSignal() ? { delegationBailed: true } : {}),
         };
       } catch (error) {
+        ownership?.throwIfLost();
         if (mappingFailure?.error === error) {
           return {
             ...typedInput,
@@ -2876,6 +2950,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
               collectProcessorDataPart,
             );
           } catch (emitError) {
+            ownership?.throwIfLost();
             if (emitError instanceof DurableOutputProcessorError) {
               throw emitError;
             }

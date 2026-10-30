@@ -158,7 +158,6 @@ describe('headless goal parity', () => {
         addUserMessage: vi.fn(),
         showInfo: vi.fn(),
         showError: vi.fn(),
-        addUserMessage: vi.fn(),
       } as any;
 
       await startGoalWithDefaults(ctx, 'finish the task');

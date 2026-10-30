@@ -47,7 +47,7 @@ import { MessageList } from '../message-list';
 import type { MastraDBMessage, MessageListInput } from '../message-list';
 import { SaveQueueManager } from '../save-queue';
 import { applyResolvedAgentScopes, resolveAgentScopes } from '../scopes';
-import type { CreatedAgentSignal } from '../signals';
+import type { AgentSignalInput, CreatedAgentSignal } from '../signals';
 import { mastraDBMessageToSignal, signalSpanAttributes } from '../signals';
 import { ON_BEFORE_TOOL_EXECUTION_KEY, TOOL_PERMISSION_POLICY_KEY } from '../tool-permission-prefilter';
 import {
@@ -72,6 +72,7 @@ import {
 } from '../workflows/prepare-stream/client-tool-output-hooks';
 import { authorizeDurableMemory } from './memory-fga';
 import { recordRunSavedMessages } from './run-message-refs';
+import { setRunScorerInstances } from './run-registry';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry, SerializableStructuredOutput } from './types';
 import {
   createRuntimeDependencyFingerprint,
@@ -364,6 +365,10 @@ interface DurablePreparationAgent {
   getToolPayloadTransform?(): ToolPayloadTransformPolicy | undefined;
   __getDrainPendingSignals(): (runId: string, scope?: 'pending' | 'pre-run') => CreatedAgentSignal[];
   __getSubscribePendingSignals(): (runId: string, listener: () => void) => () => void;
+  __getEnqueuePendingSignal(): (
+    target: { runId: string; resourceId?: string; threadId?: string },
+    signalInput: AgentSignalInput,
+  ) => Promise<CreatedAgentSignal>;
   __getGoalConfig(): GoalConfig | undefined;
   __hasFixedMemory(): boolean;
   __getMaxRetriesConfigured?(): boolean;
@@ -1145,6 +1150,19 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         logger?.debug?.(`[DurableAgent] Error getting scorers: ${error}`);
       }
     }
+    if (scorers) {
+      // Workflow input carries scorers by name only; keep the instances so a
+      // scorer Mastra has never registered still runs in this process (#27579).
+      setRunScorerInstances(
+        runId,
+        Object.fromEntries(
+          Object.entries(scorers).flatMap(([key, entry]) =>
+            entry?.scorer && typeof entry.scorer === 'object' ? [[key, entry.scorer]] : [],
+          ),
+        ),
+        mastra,
+      );
+    }
 
     // 9. Create SaveQueueManager (memory + memoryConfig were resolved in step 6)
     const saveQueueManager = memory
@@ -1323,10 +1341,11 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         fixedMemory: typedAgent.__hasFixedMemory(),
       },
       messageId,
-      agentSpanData: agentSpan?.exportSpan(),
-      modelSpanData: modelSpan?.exportSpan(),
+      agentSpanData: agentSpan?.snapshot?.() ?? agentSpan?.exportSpan(),
+      modelSpanData: modelSpan?.snapshot?.() ?? modelSpan?.exportSpan(),
       requestContextEntries: requestContextEntriesSnapshot,
       requiredRequestContextCapabilities,
+      inputTripwire: tripwireData,
     });
 
     // 14. Create registry entry for non-serializable state.
@@ -1399,6 +1418,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       // Non-serializable; cross-process engines lose it and signals go undelivered.
       drainPendingSignals: scope => typedAgent.__getDrainPendingSignals()(runId, scope),
       subscribePendingSignals: listener => typedAgent.__getSubscribePendingSignals()(runId, listener),
+      enqueuePendingSignal: signalInput =>
+        typedAgent.__getEnqueuePendingSignal()({ runId, resourceId, threadId }, signalInput),
       // Thread title generation — mirrors the non-durable `#executeOnFinish` branch,
       // which was never ported to the durable finish step (so `generateTitle` never
       // fired for durable/evented agents). Parked here because the agent instance is
@@ -1416,7 +1437,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
             const { shouldGenerate, model, instructions, minMessages } = agent.resolveTitleGenerationConfig(
               mergedConfig?.generateTitle as Parameters<typeof agent.resolveTitleGenerationConfig>[0],
             );
-            if (!shouldGenerate || thread?.title) return;
+            if (!shouldGenerate || thread?.title) return undefined;
 
             const titleMessageList = new MessageList().deserialize(messageListState);
             // Only messages of the thread being titled — resource-scoped memory can
@@ -1426,10 +1447,10 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
               threadId,
               titleMessageList.get.all.ui(),
             );
-            if (uiMessages.length < (minMessages ?? 1)) return;
+            if (uiMessages.length < (minMessages ?? 1)) return undefined;
 
             const userMessage = agent.getMostRecentUserMessage(uiMessages);
-            if (!userMessage) return;
+            if (!userMessage) return undefined;
 
             const title = await agent.genTitle(
               userMessage,
@@ -1439,17 +1460,21 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
               instructions,
               uiMessages,
             );
-            if (!title) return;
+            if (!title) return undefined;
 
             // Title-only late write. Prefer updateThread when the thread record
             // already exists so its original createdAt is preserved (createThread
             // rebuilds the record with a fresh createdAt). Fall back to createThread
             // for the first-turn case where the record may not be persisted yet.
-            if (thread) {
+            // genTitle is a model round trip, so another writer may have created the
+            // thread meanwhile; re-read before createThread, which upserts the whole
+            // row and would drop that writer's metadata (upstream #27606).
+            const currentThread = thread ?? (await memory.getThreadById?.({ threadId }));
+            if (currentThread) {
               await memory.updateThread({
                 id: threadId,
                 title,
-                metadata: thread.metadata ?? {},
+                metadata: currentThread.metadata ?? {},
                 memoryConfig,
                 observationalMemorySourceWriteGuard: sourceWriteGuard,
               });
@@ -1463,9 +1488,16 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
               });
             }
 
-            await execOptions?.memory?.onTitleGenerated?.(title);
+            // The finish step invokes `onTitleGenerated` (below) once the title is saved.
+            return title;
           }
         : undefined,
+      // generate() returns JSON, so only stream() runs carry the title chunk (as in #executeOnFinish).
+      streamThreadTitle:
+        methodType === 'stream' &&
+        !!memory &&
+        !!agent.resolveTitleGenerationConfig(memory.getMergedThreadConfig(memoryConfig).generateTitle).emitEvent,
+      onTitleGenerated: execOptions?.memory?.onTitleGenerated,
       // Signal messages already in the messageList at run start (from persisted
       // history). Echoed as data-signal parts on the first LLM step so the client
       // sees them without refetching. Spliced once, never re-emitted.

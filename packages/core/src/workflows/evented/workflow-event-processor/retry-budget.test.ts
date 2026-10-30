@@ -7,6 +7,7 @@ import type { Event, EventCallback } from '../../../events/types';
 import { Mastra } from '../../../mastra';
 import { MockStore } from '../../../storage/mock';
 import { createEmptyWorkflowSnapshot } from '../../../storage/workflow-snapshot';
+import { markNonRedeliverable } from '../helpers';
 import { WorkflowEventProcessor } from '.';
 
 function makeStartEvent(workflowId: string, runId: string, deliveryAttempt?: number): Event {
@@ -298,6 +299,41 @@ describe('WorkflowEventProcessor transport-owned retry budget', () => {
     await expect(processor.handle(event)).resolves.toEqual({ ok: false, retry: true });
     expect(AlwaysThrowsProcessor.dispatchCalls).toBe(1);
     expect(pubsub.terminalPublishes).toBe(0);
+
+    await mastra.shutdown();
+  });
+
+  // Upstream #28215, on the fork's transport-owned budget: a deterministic failure
+  // terminalizes on its first delivery instead of spending the redelivery budget.
+  // PF-1758 (PF-6640 sync): upstream #28218's local pending-failure map is not adopted;
+  // the fork's retry budget is transport-owned and stateless, and the transport-owned
+  // terminal-publication retry above covers a failed workflow.fail publish. Bounding
+  // terminal-publication retries is follow-up PF-6865.
+  it('fails a non-redeliverable handler error on its first delivery', async () => {
+    const pubsub = new FailingTerminalPubSub();
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: { wf: makeWorkflow('wf') } as any,
+      pubsub,
+    });
+    await persistRun(mastra, 'wf', 'run-nonredeliverable');
+
+    class DeterministicFailureProcessor extends WorkflowEventProcessor {
+      public dispatchCalls = 0;
+      override async loadData(): Promise<undefined> {
+        this.dispatchCalls++;
+        throw markNonRedeliverable(new Error('stopWhen exploded'));
+      }
+    }
+
+    const processor = new DeterministicFailureProcessor({ mastra });
+    await expect(processor.handle(makeStartEvent('wf', 'run-nonredeliverable', 1))).resolves.toEqual({
+      ok: false,
+      retry: false,
+    });
+    expect(processor.dispatchCalls).toBe(1);
+    expect(pubsub.terminalPublishes).toBe(1);
 
     await mastra.shutdown();
   });

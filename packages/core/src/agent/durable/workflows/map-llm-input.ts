@@ -44,6 +44,9 @@ export function mapDurableIterationToLLMInput(
     modelSpanData: state.modelSpanData,
     completionStartTime: state.completionStartTime,
     requestContextEntries: state.requestContextEntries,
+    // Upstream #27730: a worker process reads the input tripwire from the
+    // iteration payload when its in-process registry has no entry.
+    inputTripwire: state.inputTripwire,
     requiredRequestContextCapabilities: state.requiredRequestContextCapabilities,
   };
 }

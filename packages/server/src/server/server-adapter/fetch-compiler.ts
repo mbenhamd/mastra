@@ -56,8 +56,8 @@ import {
   MASTRA_IS_STUDIO_KEY,
   isReservedRequestContextKey,
   isStudioClientTypeHeader,
-  type MastraAuthMode,
 } from '../constants';
+import type { MastraAuthMode } from '../constants';
 import { formatZodError, isZodError } from '../handlers/error';
 import { normalizeRoutePath } from '../utils';
 import { canonicalizeBunRouteKey, compileFetchRoutePattern, isStaticRoutePattern } from './fetch-pattern';

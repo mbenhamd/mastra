@@ -13,10 +13,19 @@ Use `MastraModelGatewayInterface` when you want to provide a plain object gatewa
 
 ## Class overview
 
+Install the OpenAI-compatible provider used in this example:
+
+```bash npm2yarn
+npm install @ai-sdk/openai-compatible
+```
+
 ```typescript
-import { MastraModelGateway, type ProviderConfig } from '@mastra/core/llm'
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible-v5'
-import type { LanguageModelV2 } from '@ai-sdk/provider-v5'
+import {
+  MastraModelGateway,
+  type GatewayLanguageModel,
+  type ProviderConfig,
+} from '@mastra/core/llm'
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 
 class MyCustomGateway extends MastraModelGateway {
   readonly id = 'custom'
@@ -51,7 +60,7 @@ class MyCustomGateway extends MastraModelGateway {
     modelId: string
     providerId: string
     apiKey: string
-  }): Promise<LanguageModelV2> {
+  }): Promise<GatewayLanguageModel> {
     const baseURL = this.buildUrl(`${providerId}/${modelId}`)
     return createOpenAICompatible({
       name: providerId,
@@ -268,7 +277,7 @@ gateways before `defaultGateways` when custom routing should take precedence.
 The built-in static `ModelsDevGateway` path checks configured credentials without
 provider discovery or model generation. A custom gateway's `resolveAuth()` hook
 may perform its own I/O, and `true` only means that configuration or credentials
-were found; it does not verify that the provider will accept them. Expected
+were found. It doesn't verify that the provider will accept them. Expected
 missing-auth states return `false`, while unexpected gateway failures propagate.
 
 ```typescript

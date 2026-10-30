@@ -74,6 +74,37 @@ export function withoutAuthToken<T extends Record<string, any> | undefined>(requ
   return rest as T;
 }
 
+export function restoreLiveRequestContext(
+  stored: Record<string, unknown> | undefined,
+  live: Record<string, unknown>,
+): Record<string, unknown> {
+  const restored = { ...withoutAuthToken(stored ?? live) };
+  if (MASTRA_AUTH_TOKEN_KEY in live) restored[MASTRA_AUTH_TOKEN_KEY] = live[MASTRA_AUTH_TOKEN_KEY];
+  // PF-6182: the authenticated organization stays live in events and is never
+  // recovered from a stored context (getPersistedRequestContext drops it).
+  delete restored[MASTRA_AUTH_ORGANIZATION_KEY];
+  if (Object.hasOwn(live, MASTRA_AUTH_ORGANIZATION_KEY)) {
+    restored[MASTRA_AUTH_ORGANIZATION_KEY] = live[MASTRA_AUTH_ORGANIZATION_KEY];
+  }
+  return restored;
+}
+
+const NON_REDELIVERABLE = Symbol.for('mastra.evented.nonRedeliverable');
+
+/**
+ * Marks an error as deterministic (for example a throwing user callback), so the
+ * evented processor fails the workflow on the first delivery instead of having
+ * the transport redeliver the event and rerun the callback.
+ */
+export function markNonRedeliverable<T extends Error>(error: T): T {
+  Object.defineProperty(error, NON_REDELIVERABLE, { value: true });
+  return error;
+}
+
+export function isNonRedeliverable(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as any)[NON_REDELIVERABLE] === true;
+}
+
 /**
  * Interface for tripwire chunks in the stream.
  * These chunks are emitted when a processor triggers a tripwire.

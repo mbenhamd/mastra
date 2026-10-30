@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   mergeWorkflowStepResult,
+  assertWorkflowStepGuard,
+  isWorkflowStepConflictError,
   normalizePerPage,
   TABLE_WORKFLOW_SNAPSHOT,
   TABLE_WORKFLOW_SNAPSHOT_HANDOFF,
@@ -160,6 +162,8 @@ import type {
   RenewRunOwnershipResult,
   RunFence,
   RunOwnershipRecord,
+  WorkflowStepStartGuard,
+  WorkflowStepCompletionGuard,
   UpdateWorkflowStateOptions,
   StorageListWorkflowRunsInput,
   WorkflowRun,
@@ -6771,6 +6775,10 @@ export class WorkflowsPG extends WorkflowsStorage {
     };
   }
 
+  supportsWorkflowStepGuards(): boolean {
+    return true;
+  }
+
   async updateWorkflowResults({
     workflowName,
     runId,
@@ -6780,6 +6788,8 @@ export class WorkflowsPG extends WorkflowsStorage {
     executionGeneration,
     state,
     fence: explicitFence,
+    startGuard,
+    completionGuard,
   }: {
     workflowName: string;
     runId: string;
@@ -6789,6 +6799,8 @@ export class WorkflowsPG extends WorkflowsStorage {
     executionGeneration?: string;
     state?: Record<string, any>;
     fence?: RunFence;
+    startGuard?: WorkflowStepStartGuard;
+    completionGuard?: WorkflowStepCompletionGuard;
   }): Promise<UpdateWorkflowResultsResult> {
     const fence = resolveRunFence(this, explicitFence, runId);
     try {
@@ -6810,6 +6822,7 @@ export class WorkflowsPG extends WorkflowsStorage {
         }
 
         if (!existingSnapshotResult) {
+          assertWorkflowStepGuard({ snapshot: null, stepId, startGuard, completionGuard });
           // No run record to merge into: roll back the provisional revision the
           // upsert lock created so a step result never leaves revision evidence
           // for a run that has no snapshot.
@@ -6837,9 +6850,35 @@ export class WorkflowsPG extends WorkflowsStorage {
           return STALE_EXECUTION_RESULT;
         }
 
-        // Merge the new step result using element-wise array merging
-        // (critical for concurrent foreach iteration results)
-        mergeWorkflowStepResult({ snapshot, stepId, result, requestContext, state });
+        // PF-6640 sync: the fork generation CAS runs before the upstream (#28054)
+        // occurrence guard, so a delayed write from a deleted execution lifetime
+        // stops on the stale sentinel and never receives a reopened lifetime's
+        // stored result or snapshot through a WorkflowStepConflictError.
+        assertWorkflowStepGuard({ snapshot, stepId, startGuard, completionGuard });
+
+        if (completionGuard?.pruneOnly) {
+          snapshot.context[stepId] = {
+            ...result,
+            metadata: { ...snapshot.context[stepId]?.metadata, ...result.metadata, __continuationStarted: true },
+          };
+        } else {
+          // Merge the new step result using element-wise array merging
+          // (critical for concurrent foreach iteration results)
+          mergeWorkflowStepResult({ snapshot, stepId, result, requestContext, state });
+        }
+        const previous = startGuard?.previousStep;
+        const previousResult = previous && snapshot.context[previous.stepId];
+        if (
+          previous &&
+          previous.stepId !== stepId &&
+          previousResult?.status === 'success' &&
+          previousResult.metadata?.startedBy === previous.eventId
+        ) {
+          snapshot.context[previous.stepId] = {
+            ...previous.result,
+            metadata: { ...previousResult.metadata, ...previous.result.metadata, __continuationStarted: true },
+          };
+        }
 
         // Upsert the snapshot within the same transaction
         const now = new Date();
@@ -6860,7 +6899,8 @@ export class WorkflowsPG extends WorkflowsStorage {
       if (
         error instanceof WorkflowSnapshotHandoffFenceError ||
         isWorkflowSnapshotHandoffSchemaError(error) ||
-        isRunFenceConflictError(error)
+        isRunFenceConflictError(error) ||
+        isWorkflowStepConflictError(error)
       )
         throw error;
       throw new MastraError(

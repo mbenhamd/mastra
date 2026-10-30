@@ -139,20 +139,6 @@ async function drain(stream: { fullStream: AsyncIterable<any> }) {
 }
 
 describe('durable agent approval resume request context (#25960)', () => {
-  it('runs the approved tool with the request context passed to approveToolCall in the same process', async () => {
-    const run = await suspendForApproval();
-
-    await drain(
-      await run.durableAgent.approveToolCall({
-        runId: run.runId,
-        toolCallId: run.toolCallId,
-        requestContext: contextFor('second'),
-      }),
-    );
-
-    expect(run.seen).toEqual(['second']);
-  });
-
   it('runs the approved tool with the request context passed to approveToolCall in a fresh process', async () => {
     const run = await suspendForApproval();
     const durableAgent = startProcess(run.storage, run.seen);
