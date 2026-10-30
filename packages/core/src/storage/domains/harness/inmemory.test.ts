@@ -3185,6 +3185,11 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
       sampleSession({ id: 'child-1', threadId: 't-c1', parentSessionId: 'root', origin: 'subagent' }),
       { initialLease: { ownerId: owner, ttlMs: 30_000 } },
     );
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'grandchild', threadId: 't-gc', parentSessionId: 'child-1', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: 30_000 } },
+    );
+    const grandchildExpiry = (await storage.loadSession({ sessionId: 'grandchild' }))?.leaseExpiresAt;
     const key = [...db.harnessSessions.keys()].find(k => k.endsWith('child-1'))!;
     const lapsedAt = Date.now() - 1_000;
     db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, leaseExpiresAt: lapsedAt });
@@ -3205,7 +3210,9 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
     for (let pass = 0; pass < 2; pass++) {
       const renewed = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
       expect(renewed.renewedDescendantCount).toBe(0);
-      expect(renewed.fencedDescendantIds).toEqual(['child-1']);
+      // The fenced child's whole subtree is out of the pass.
+      expect(renewed.fencedDescendantIds).toEqual(['child-1', 'grandchild']);
+      expect((await storage.loadSession({ sessionId: 'grandchild' }))?.leaseExpiresAt).toBe(grandchildExpiry);
       expect((await storage.loadSession({ sessionId: 'root' }))?.leaseExpiresAt).toBe(renewed.expiresAt);
       expect((await storage.loadSession({ sessionId: 'child-1' }))?.leaseExpiresAt).toBe(lapsedAt);
     }

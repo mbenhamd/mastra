@@ -3795,50 +3795,45 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessStorageLeaseConflictError(rootSessionId, rootOwner ?? '<unowned>', rootExpires ?? 0);
       }
 
-      // Walk parentSessionId via a recursive CTE.
+      // Walk parentSessionId via a recursive CTE. Closed/closing rows are kept
+      // in the walk result (with their parent) so the subtree below a fenced
+      // descendant can be found; only open rows hold a lease to renew.
       const descendantsResult = await tx.execute({
         // UNION (not UNION ALL) row-dedupes the frontier so a parent_session_id
         // cycle (the storage boundary does not hard-enforce parentage immutability)
         // terminates instead of recursing until the engine's depth cap. Mirrors the
         // visited-set guard the in-memory adapter uses.
-        sql: `WITH RECURSIVE subtree(id, owner_id, closed_at, closing_at) AS (
-                SELECT id, owner_id, closed_at, closing_at FROM ${TABLE_HARNESS_SESSIONS}
+        sql: `WITH RECURSIVE subtree(id, parent_session_id, owner_id, closed_at, closing_at) AS (
+                SELECT id, parent_session_id, owner_id, closed_at, closing_at FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND parent_session_id = ?
                 UNION
-                SELECT s.id, s.owner_id, s.closed_at, s.closing_at FROM ${TABLE_HARNESS_SESSIONS} s
+                SELECT s.id, s.parent_session_id, s.owner_id, s.closed_at, s.closing_at FROM ${TABLE_HARNESS_SESSIONS} s
                 JOIN subtree ON s.parent_session_id = subtree.id
                 WHERE s.harness_name = ?
               )
-              SELECT id, owner_id FROM subtree WHERE closed_at IS NULL AND closing_at IS NULL`,
+              SELECT id, parent_session_id, owner_id, closed_at, closing_at FROM subtree`,
         args: [namespace, rootSessionId, namespace],
       });
-
-      const descendantIds: string[] = [];
-      for (const row of descendantsResult.rows as Record<string, unknown>[]) {
-        const childId = row.id as string;
-        const childOwner = (row.owner_id ?? null) as string | null;
-        if (childOwner !== ownerId) {
-          throw new HarnessStorageLeaseConflictError(childId, childOwner ?? '<unowned>', 0);
-        }
-        descendantIds.push(childId);
-      }
+      const walked = descendantsResult.rows as Record<string, unknown>[];
+      const openRows = walked.filter(row => row.closed_at == null && row.closing_at == null);
+      const ownedOpenIds = openRows.filter(row => row.owner_id === ownerId).map(row => row.id as string);
 
       // A lapsed descendant is re-adopted unless a grant revocation already
       // acted on that lapse (a revocation tombstone at or after its expiry).
-      // Such a descendant is left out of the pass, neither renewed nor failing
-      // it: its grant is fenced and its lease stays lapsed, so the root stays
-      // renewable. Locks: root, then descendants by id; the lock waits out a
-      // revocation holding the row and the clock is read after it, so a
-      // revocation that committed meanwhile is seen.
-      let renewedIds = descendantIds;
-      let fencedIds: string[] = [];
-      if (descendantIds.length > 0) {
+      // Such a descendant and every open session below it are left out of the
+      // pass, neither renewed nor failing it: the fenced descendant's lease
+      // stays lapsed, and the Harness fences exactly the reported set. Locks:
+      // root, then owned descendants by id; the lock waits out a revocation
+      // holding the row and the clock is read after it, so a revocation that
+      // committed meanwhile is seen.
+      const fencedRoots = new Set<string>();
+      if (ownedOpenIds.length > 0) {
         const lockedDescendants = await tx.execute({
           sql: `SELECT id, owner_id, closed_at, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
-                WHERE harness_name = ? AND id IN (${descendantIds.map(() => '?').join(', ')})
+                WHERE harness_name = ? AND id IN (${ownedOpenIds.map(() => '?').join(', ')})
                 ORDER BY id
                 FOR NO KEY UPDATE`,
-          args: [namespace, ...descendantIds],
+          args: [namespace, ...ownedOpenIds],
         });
         const lockedNow = Date.now();
         // Only a descendant still ours and open under the lock can be left out;
@@ -3866,10 +3861,41 @@ export class HarnessPG extends HarnessStorage {
                     )`,
             args: [namespace, ...lapsedIds],
           });
-          fencedIds = (fenced.rows as Record<string, unknown>[]).map(row => row.id as string);
-          renewedIds = descendantIds.filter(id => !fencedIds.includes(id));
+          for (const row of fenced.rows as Record<string, unknown>[]) fencedRoots.add(row.id as string);
         }
       }
+
+      // Everything below a fenced descendant is out of the pass with it.
+      const excluded = new Set<string>(fencedRoots);
+      if (fencedRoots.size > 0) {
+        const childrenOf = new Map<string, string[]>();
+        for (const row of walked) {
+          const parent = row.parent_session_id as string;
+          childrenOf.set(parent, [...(childrenOf.get(parent) ?? []), row.id as string]);
+        }
+        const stack = [...fencedRoots];
+        while (stack.length > 0) {
+          for (const childId of childrenOf.get(stack.pop()!) ?? []) {
+            if (excluded.has(childId)) continue;
+            excluded.add(childId);
+            stack.push(childId);
+          }
+        }
+      }
+
+      // §5.8 all-or-nothing for the rest: a foreign-owned or unowned open
+      // descendant outside a fenced subtree fails the whole pass.
+      const renewedIds: string[] = [];
+      for (const row of openRows) {
+        const childId = row.id as string;
+        if (excluded.has(childId)) continue;
+        const childOwner = (row.owner_id ?? null) as string | null;
+        if (childOwner !== ownerId) {
+          throw new HarnessStorageLeaseConflictError(childId, childOwner ?? '<unowned>', 0);
+        }
+        renewedIds.push(childId);
+      }
+      const fencedIds = openRows.map(row => row.id as string).filter(id => excluded.has(id));
 
       const allIds = [rootSessionId, ...renewedIds];
       const updateResult = await tx.execute({

@@ -2091,10 +2091,11 @@ export interface SubtreeSessionLeaseResult extends SessionLeaseResult {
    */
   renewedDescendantCount: number;
   /**
-   * Lapsed descendants left out of this renewal because a pre-admission grant
-   * revocation (`revokeTerminalGrant`) was written for them at or after their
-   * lease expiry. They were not renewed and their leases stay lapsed; a caller
-   * holding them live must stop treating them as leased. Absent when none.
+   * Active descendants left out of this renewal: each lapsed descendant with a
+   * pre-admission grant revocation (`revokeTerminalGrant`) written at or after
+   * its lease expiry, plus every open session below it. None of them was
+   * renewed; a caller holding any of them live must stop treating it as
+   * leased. Absent when none.
    */
   fencedDescendantIds?: string[];
 }

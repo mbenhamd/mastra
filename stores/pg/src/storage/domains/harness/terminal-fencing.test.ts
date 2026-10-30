@@ -879,6 +879,38 @@ describe('HarnessPG revocation re-checks the admitting owner lease under the ses
     }
   });
 
+  it('leaves the whole subtree below a fenced child out of the renewal', async () => {
+    const { root, child } = await rootWithLapsedChild(harness(), 'fenced-subtree', 'owner-k');
+    const grandchild = createSampleSessionRecord({
+      id: 'fenced-subtree-grandchild',
+      harnessName: HARNESS,
+      resourceId: root.resourceId,
+      threadId: 'thread-fenced-subtree-grandchild',
+      parentSessionId: child.id,
+    });
+    await harness().createOrLoadActiveSession(grandchild, { initialLease: { ownerId: 'owner-k', ttlMs: 60_000 } });
+    const grandchildExpiry = (await harness().loadSession({ harnessName: HARNESS, sessionId: grandchild.id }))!
+      .leaseExpiresAt;
+    await expect(
+      harness().revokeTerminalGrant({
+        ...revocation(admissionFor(child, 'fenced-subtree-child')),
+        requireOwnerLeaseLapsed: { ownerId: 'owner-k' },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    for (let pass = 0; pass < 2; pass++) {
+      const renewed = await harness().renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-k',
+        ttlMs: 60_000,
+      });
+      expect(renewed).toMatchObject({ renewedDescendantCount: 0, fencedDescendantIds: [child.id, grandchild.id] });
+      expect((await harness().loadSession({ harnessName: HARNESS, sessionId: grandchild.id }))!.leaseExpiresAt).toBe(
+        grandchildExpiry,
+      );
+    }
+  });
+
   it('does not let a handoff-disabled instance re-adopt a child an enabled instance fenced', async () => {
     const disabled = terminalStore('pg-harness-owner-live-disabled', schemaName, {
       terminalHandoff: { enabled: false },

@@ -5184,15 +5184,16 @@ export class Harness {
       ttlMs,
     });
     root._markLeaseRenewed(lease.expiresAt);
-    // A descendant storage left out (its grant was revoked after its lease
-    // lapsed) is no longer leased: fence it and its live subtree instead of
-    // reporting them renewed. The whole subtree is collected before any fence
+    // Descendants storage left out (a descendant whose grant was revoked after
+    // its lease lapsed, and every open session below it) are no longer leased:
+    // fence exactly that set instead of reporting them renewed, so storage and
+    // the Harness agree on the boundary. They are collected before any fence
     // (fencing removes members from the live map), fenced synchronously, and
     // cleaned up detached: this runs inside the root's renewal chain.
     const toFence: Session[] = [];
     for (const fencedId of lease.fencedDescendantIds ?? []) {
       const descendant = this._liveSessions.get(fencedId);
-      if (descendant !== undefined) toFence.push(descendant, ...this._liveDescendantsOf(descendant.id));
+      if (descendant !== undefined) toFence.push(descendant);
     }
     this._fenceLeaseLostDetached(toFence);
     for (const descendant of this._liveDescendantsOf(root.id)) descendant._markLeaseRenewed(lease.expiresAt);

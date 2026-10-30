@@ -880,4 +880,22 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
     expect(await settlesWithin(reacquired, 2_000)).toBe('settled');
     expect((await reacquired).lifecycleState).toBe('live');
   });
+
+  it('evicts the live grandchild below a fenced child as lease_lost and stops renewing it in storage', async () => {
+    const { storage, root, child, grandchild, fence } = await fencedChildFixture();
+    await fence();
+    const evictions: unknown[] = [];
+    grandchild.subscribe(event => {
+      if (event.type === 'session_evicted') evictions.push((event as { reason?: unknown }).reason);
+    });
+    const grandchildExpiry = (await storage.loadSession({ sessionId: grandchild.id }))!.leaseExpiresAt;
+
+    for (let pass = 0; pass < 2; pass++) {
+      await root.extendLease({ ttlMs: 5 * 60_000 });
+      expect((await storage.loadSession({ sessionId: grandchild.id }))!.leaseExpiresAt).toBe(grandchildExpiry);
+    }
+    expect(child.lifecycleState).toBe('evicted');
+    expect(grandchild.lifecycleState).toBe('evicted');
+    await vi.waitFor(() => expect(evictions).toEqual(['lease_lost']));
+  });
 });

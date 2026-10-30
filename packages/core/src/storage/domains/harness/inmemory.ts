@@ -1408,8 +1408,10 @@ export class InMemoryHarness extends HarnessStorage {
       for (const child of childrenByParent.get(parentId) ?? []) {
         if (visited.has(child.id)) continue;
         visited.add(child.id);
-        queue.push(child.id);
-        if (child.closedAt !== undefined || child.closingAt !== undefined) continue; // closed/closing → no live lease
+        if (child.closedAt !== undefined || child.closingAt !== undefined) {
+          queue.push(child.id); // closed/closing → no live lease, but its children may hold one
+          continue;
+        }
         // A descendant owned by a different instance means the subtree was
         // split — fence rather than silently renew a foreign lease.
         if (child.ownerId !== ownerId) {
@@ -1417,12 +1419,22 @@ export class InMemoryHarness extends HarnessStorage {
         }
         // A lapsed descendant is re-adopted, unless a grant revocation already
         // acted on that lapse: the recovery that revoked it decided the owner
-        // was gone. It is left out of the pass (not renewed, not failing it),
-        // so its lease stays lapsed and the root stays renewable.
+        // was gone. It and every open session below it are left out of the
+        // pass (not renewed, not failing it), so the root stays renewable.
         if (this.revokedSinceLeaseLapsed(namespace, child, now)) {
           fencedDescendantIds.push(child.id);
+          const below = [child.id];
+          while (below.length > 0) {
+            for (const nested of childrenByParent.get(below.shift()!) ?? []) {
+              if (visited.has(nested.id)) continue;
+              visited.add(nested.id);
+              below.push(nested.id);
+              if (nested.closedAt === undefined && nested.closingAt === undefined) fencedDescendantIds.push(nested.id);
+            }
+          }
           continue;
         }
+        queue.push(child.id);
         descendants.push(child);
       }
     }
