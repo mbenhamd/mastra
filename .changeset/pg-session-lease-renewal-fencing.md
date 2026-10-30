@@ -6,4 +6,4 @@ Fixed a race between session lease renewal and grant revocation. A renewal that 
 
 Fixed lease renewals being blocked by concurrent writes to the same session's message results.
 
-Subtree lease renewal now skips a child session whose grant was revoked after its lease lapsed, and every session below it. The skipped sessions are listed in `fencedDescendantIds`. The root and the other children still renew.
+Subtree lease renewal now skips a child session whose grant was revoked after its lease lapsed, and every open session below it. The skipped sessions are listed in `fencedDescendantIds`. The root and the other children still renew.

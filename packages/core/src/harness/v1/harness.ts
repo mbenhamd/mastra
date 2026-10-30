@@ -5198,6 +5198,9 @@ export class Harness {
     const toFence = new Set<Session>();
     for (const fencedId of lease.fencedDescendantIds ?? []) {
       const descendant = this._liveSessions.get(fencedId);
+      // A re-acquired session is skipped, but the sessions storage reported
+      // below it are still fenced: storage did not extend their leases in this
+      // pass, so they must not be marked renewed below (safe-direction fence).
       if (descendant === undefined || descendant !== liveAtRequest.get(fencedId)) continue;
       toFence.add(descendant);
       for (const below of this._liveDescendantsOf(descendant.id)) toFence.add(below);

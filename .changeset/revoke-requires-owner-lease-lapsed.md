@@ -20,6 +20,6 @@ if (receipt.status === 'owner_live') {
 }
 ```
 
-Calls without the option keep their previous receipt type; `owner_live` only appears in the type when the option may be set.
+Calls without the option keep their previous receipt type; `owner_live` only appears in the type when the option may be set. A call passing a variable typed as `HarnessTerminalGrantRevocationInput` (rather than an object literal) gets the wider receipt, so an exhaustive `switch` on its status must handle `owner_live`. With the option set and the owner still live, `owner_live` is returned even for a grant that is already admitted or revoked.
 
-Subtree lease renewals now report `fencedDescendantIds`: child sessions that were not renewed because their grant was revoked after their lease lapsed, plus every session below them. The Harness evicts those sessions, and any session created below them in the meantime, with the `lease_lost` reason, so lease extensions on them fail. The root and its other children keep renewing.
+Subtree lease renewals now report `fencedDescendantIds`: child sessions that were not renewed because their grant was revoked after their lease lapsed, plus every open session below them. The Harness evicts those sessions, and any session created below them in the meantime, with the `lease_lost` reason, so lease extensions on them fail. The root and its other children keep renewing.

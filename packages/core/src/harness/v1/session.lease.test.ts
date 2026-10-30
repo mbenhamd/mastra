@@ -919,7 +919,7 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
   });
 
   it('keeps a fenced child that was re-acquired while the renewal was in flight', async () => {
-    const { storage, harness, root, child, fence } = await fencedChildFixture();
+    const { storage, harness, root, child, grandchild, fence } = await fencedChildFixture();
     await fence();
     const renew = storage.renewSessionLeaseSubtree.bind(storage);
     let replacement: Session | undefined;
@@ -942,5 +942,8 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
     expect(replacement).toBeDefined();
     expect(replacement).not.toBe(child);
     expect(replacement!.lifecycleState).toBe('live');
+    // Storage left the grandchild out of this renewal, so it is fenced rather
+    // than reported renewed; it is re-acquired with a fresh lease when next used.
+    expect(grandchild.lifecycleState).toBe('evicted');
   });
 });

@@ -6383,7 +6383,7 @@ export class HarnessPG extends HarnessStorage {
         throw new HarnessTerminalHandoffFencedError(input.sessionId);
       }
       // The row lock also waits out an in-flight lease renewal (it holds the
-      // row FOR UPDATE), so this read sees the lease the renewal committed,
+      // row FOR NO KEY UPDATE), so this read sees the lease the renewal committed,
       // not the one the caller saw before deciding the owner had lapsed.
       if (input.requireOwnerLeaseLapsed && sessionRow.rows[0]) {
         const ownerId = (sessionRow.rows[0].owner_id ?? null) as string | null;
