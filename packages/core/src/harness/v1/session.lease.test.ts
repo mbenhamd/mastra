@@ -898,4 +898,49 @@ describe('subtree lease renewal with a revocation-fenced descendant', () => {
     expect(grandchild.lifecycleState).toBe('evicted');
     await vi.waitFor(() => expect(evictions).toEqual(['lease_lost']));
   });
+
+  it('fences a session created below the fenced child after storage built its report', async () => {
+    const { storage, harness, root, child, fence } = await fencedChildFixture();
+    await fence();
+    const renew = storage.renewSessionLeaseSubtree.bind(storage);
+    let late: Session | undefined;
+    const spy = vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementation(async input => {
+      const lease = await renew(input);
+      // Admitted under the child after the walk, before the Harness applies it.
+      late ??= await harness.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: child.id });
+      return lease;
+    });
+
+    await root.extendLease({ ttlMs: 5 * 60_000 });
+    spy.mockRestore();
+    expect(late).toBeDefined();
+    expect(child.lifecycleState).toBe('evicted');
+    expect(late!.lifecycleState).toBe('evicted');
+  });
+
+  it('keeps a fenced child that was re-acquired while the renewal was in flight', async () => {
+    const { storage, harness, root, child, fence } = await fencedChildFixture();
+    await fence();
+    const renew = storage.renewSessionLeaseSubtree.bind(storage);
+    let replacement: Session | undefined;
+    const spy = vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementation(async input => {
+      const lease = await renew(input);
+      if (replacement === undefined) {
+        // The reported child is evicted and re-acquired with a fresh lease
+        // before the stale report reaches the Harness.
+        await (harness as unknown as { _evictLiveSession(s: Session, r: 'idle'): Promise<void> })._evictLiveSession(
+          child,
+          'idle',
+        );
+        replacement = await harness.session({ sessionId: child.id });
+      }
+      return lease;
+    });
+
+    await root.extendLease({ ttlMs: 5 * 60_000 });
+    spy.mockRestore();
+    expect(replacement).toBeDefined();
+    expect(replacement).not.toBe(child);
+    expect(replacement!.lifecycleState).toBe('live');
+  });
 });

@@ -5177,6 +5177,10 @@ export class Harness {
     ttlMs: number,
   ): Promise<SubtreeSessionLeaseResult> {
     const record = root.getRecord();
+    // The live objects the storage report will describe: a session evicted and
+    // re-acquired while the renewal is in flight is a new object with a fresh
+    // lease, which the report predates.
+    const liveAtRequest = new Map(this._liveSessions);
     const lease = await storage.renewSessionLeaseSubtree({
       harnessName: record.harnessName,
       rootSessionId: root.id,
@@ -5186,16 +5190,19 @@ export class Harness {
     root._markLeaseRenewed(lease.expiresAt);
     // Descendants storage left out (a descendant whose grant was revoked after
     // its lease lapsed, and every open session below it) are no longer leased:
-    // fence exactly that set instead of reporting them renewed, so storage and
-    // the Harness agree on the boundary. They are collected before any fence
+    // fence them instead of reporting them renewed. A session created below a
+    // fenced one after storage walked the subtree is fenced with it, as storage
+    // leaves that whole subtree out. They are collected before any fence
     // (fencing removes members from the live map), fenced synchronously, and
     // cleaned up detached: this runs inside the root's renewal chain.
-    const toFence: Session[] = [];
+    const toFence = new Set<Session>();
     for (const fencedId of lease.fencedDescendantIds ?? []) {
       const descendant = this._liveSessions.get(fencedId);
-      if (descendant !== undefined) toFence.push(descendant);
+      if (descendant === undefined || descendant !== liveAtRequest.get(fencedId)) continue;
+      toFence.add(descendant);
+      for (const below of this._liveDescendantsOf(descendant.id)) toFence.add(below);
     }
-    this._fenceLeaseLostDetached(toFence);
+    this._fenceLeaseLostDetached([...toFence]);
     for (const descendant of this._liveDescendantsOf(root.id)) descendant._markLeaseRenewed(lease.expiresAt);
     return lease;
   }
