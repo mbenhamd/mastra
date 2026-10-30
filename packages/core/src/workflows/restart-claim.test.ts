@@ -281,7 +281,14 @@ describe('restart lifecycle claim', () => {
       inputSchema: z.object({ item: z.string() }),
       outputSchema: z.object({ done: z.boolean() }),
       steps: [workStep],
-      options: { validateInputs: false },
+      // PF-6181 (PF-6640 sync): upstream #25579 now also takes a per-run
+      // ownership lease (mastra_workflow_run_owners) before a restart, so in a
+      // single process the racing loser is refused earlier with
+      // WORKFLOW_RESTART_RUN_OWNED. The lease is the outer layer; these races
+      // pin the fork's lifecycle compare-and-set, which still fences callers
+      // the lease admits (an expired or forced lease, another process).
+      // Opting out of the lease isolates that fence.
+      options: { validateInputs: false, autoRestartActiveRuns: false },
     })
       .then(workStep)
       .commit();

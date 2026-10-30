@@ -17,6 +17,7 @@ import type {
 } from '../processors';
 import { isProcessorWorkflow, TokenLimiterProcessor } from '../processors';
 import { MemoryInputFilter, MessageHistory, WorkingMemory, SemanticRecall } from '../processors/memory';
+import { assertEmbeddingDimension } from '../processors/memory/embedding-dimension';
 import type { RequestContext } from '../request-context';
 import type {
   MastraCompositeStore,
@@ -136,6 +137,8 @@ export abstract class MastraMemory extends MastraBase {
   vector?: MastraVector;
   embedder?: MastraEmbeddingModel<string>;
   embedderOptions?: MastraEmbeddingOptions;
+  /** Configured embedder output dimension; when set, the dimension probe is skipped. */
+  protected readonly embeddingDimension?: number;
   protected threadConfig: MemoryConfigInternal = { ...memoryDefaultOptions };
   private readonly hasExplicitLastMessages: boolean;
   #mastra?: Mastra;
@@ -146,6 +149,19 @@ export abstract class MastraMemory extends MastraBase {
     this.hasExplicitLastMessages = config.options?.lastMessages !== undefined;
 
     if (config.options) this.threadConfig = this.getMergedThreadConfig(config.options);
+
+    if (
+      config.embeddingDimension !== undefined &&
+      !(Number.isInteger(config.embeddingDimension) && config.embeddingDimension > 0)
+    ) {
+      throw new MastraError({
+        id: 'MASTRA_MEMORY_INVALID_EMBEDDING_DIMENSION',
+        domain: ErrorDomain.MASTRA_MEMORY,
+        category: 'USER',
+        text: `embeddingDimension must be a positive integer, received ${String(config.embeddingDimension)}.`,
+      });
+    }
+    this.embeddingDimension = config.embeddingDimension;
 
     // DEPRECATION: Block old processors config
     if (config.processors) {
@@ -318,11 +334,12 @@ https://mastra.ai/en/docs/memory/overview`,
   private _embeddingDimensionPromise?: Promise<number | undefined>;
 
   /**
-   * Probe the embedder to determine its actual output dimension.
-   * The result is cached so subsequent calls are free.
+   * Determine the embedder's output dimension: the configured `embeddingDimension` when set,
+   * otherwise probe the embedder. The probe result is cached so subsequent calls are free.
    */
   protected async getEmbeddingDimension(): Promise<number | undefined> {
     if (!this.embedder) return undefined;
+    if (this.embeddingDimension !== undefined) return this.embeddingDimension;
     if (!this._embeddingDimensionPromise) {
       this._embeddingDimensionPromise = (async () => {
         try {
@@ -373,6 +390,8 @@ https://mastra.ai/en/docs/memory/overview`,
     if (this.isSelfEmbedding) {
       return `memory${separator}messages${separator}selfembed`;
     }
+    assertEmbeddingDimension(this.embeddingDimension, dimensions);
+
     const defaultDimensions = 1536;
     const usedDimensions = dimensions ?? defaultDimensions;
     const isDefault = usedDimensions === defaultDimensions;
@@ -1086,6 +1105,7 @@ https://mastra.ai/en/docs/memory/overview`,
             vector: this.vector,
             embedder: this.embedder,
             embedderOptions: this.embedderOptions,
+            embeddingDimension: this.embeddingDimension,
             indexName,
             ...semanticConfig,
           }),
@@ -1228,6 +1248,7 @@ https://mastra.ai/en/docs/memory/overview`,
             vector: this.vector,
             embedder: this.embedder,
             embedderOptions: this.embedderOptions,
+            embeddingDimension: this.embeddingDimension,
             indexName,
             ...semanticRecallConfig,
           }),

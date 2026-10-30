@@ -1,4 +1,5 @@
 import { ReadableStream } from 'node:stream/web';
+import { expandDurableSteps } from '@internal/core/durable';
 import { MastraError } from '../../error';
 import { withAck } from '../../events/acking-callback';
 import type { PubSub } from '../../events/pubsub';
@@ -22,6 +23,7 @@ import type {
   LanguageModelUsage,
   StepStartPayload,
   ToolCallChunk,
+  ToolResultChunk,
 } from '../../stream/types';
 import type { TerminalToolResult } from '../../tools/types';
 import type { AgentExecutionOptionsBase } from '../agent.types';
@@ -35,6 +37,7 @@ import type {
   AgentChunkEventData,
   AgentStepFinishEventData,
   DurableAgentStepFinishResult,
+  DurableToolCallOutput,
   AgentFinishEventData,
   AgentErrorEventData,
   AgentSuspendedEventData,
@@ -107,6 +110,7 @@ async function withBufferedStepResponses(
 ): Promise<unknown[]> {
   const buffered = ((await output.steps.catch(() => undefined)) ?? []) as Record<string, unknown>[];
   if (!runSteps?.length) return buffered;
+  runSteps = expandDurableSteps(runSteps);
   // An aborted run ends with a step that never finished, so it was never buffered.
   const trailingAborted =
     (runSteps.at(-1) as { finishReason?: string } | undefined)?.finishReason === 'abort' &&
@@ -156,6 +160,8 @@ export interface DurableAgentStreamOptions<OUTPUT = undefined> {
   messageId: string;
   /** Tool calls emitted before a resumed stream segment started. */
   initialToolCalls?: ToolCallChunk[];
+  /** Text the run streamed before the suspension a resumed stream segment continues. */
+  resumedText?: { priorText: string; stepText: string };
   /** Model information for the output */
   model: {
     modelId: string | undefined;
@@ -283,6 +289,8 @@ export interface DurableAgentStreamResult<OUTPUT = undefined> {
   fail: (error: Error) => Promise<void>;
   /** Wait for pubsub events already delivered to this adapter to finish processing. */
   waitForEventDelivery: () => Promise<void>;
+  /** Accepted deliveries, including hidden ownership markers, for observation reconciliation. */
+  readonly activityVersion: number;
   /** Promise that resolves when subscription is established */
   ready: Promise<void>;
 }
@@ -362,6 +370,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
     runId,
     messageId,
     initialToolCalls,
+    resumedText,
     model,
     threadId,
     resourceId,
@@ -679,11 +688,15 @@ export function createDurableAgentStream<OUTPUT = undefined>(
 
   const keepGeneration = createRunGenerationFilter({ minGeneration, rereadMinGeneration });
 
+  let pendingRejection: Error | undefined;
   // Ends this reader's stream with an error, then fires onError once.
   const deliverError = async (error: Error, delivery?: AgentErrorEventData['delivery']) => {
     if (!controller || terminated) return;
     if (delivery === 'reject') {
-      safeError(controller, error);
+      // Erroring a ReadableStream discards chunks still queued for the reader, so with
+      // chunks queued, hold the rejection until `pull` finds the queue drained.
+      if ((controller.desiredSize ?? 0) > 0) safeError(controller, error);
+      else pendingRejection = error;
     } else {
       // Ordinary durable failures remain deferred error chunks so the stream
       // closes normally even when no finish event follows.
@@ -701,6 +714,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
     }
   };
   let onChunkDelivery = Promise.resolve();
+  let activityVersion = 0;
 
   const handleEvent = async (event: Event) => {
     // After a terminal event the stream is closed and its callbacks have fired.
@@ -719,6 +733,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
       if (!controller || terminated) return;
     }
     if (!keep || !settleOnTerminalEvent(streamEvent as unknown as Event)) return;
+    activityVersion++;
 
     // Any event proves the producer is alive — restart the idle countdown.
     armIdleTimer();
@@ -882,6 +897,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
               output: data.output,
               stepResult: data.stepResult,
               ...(data.terminalToolResult ? { terminalToolResult: data.terminalToolResult.data } : {}),
+              ...(data.messages ? { messages: data.messages } : {}),
             },
           } as ChunkType<OUTPUT>);
           safeClose(controller);
@@ -918,7 +934,28 @@ export function createDurableAgentStream<OUTPUT = undefined>(
             }
           } else if (onFinish) {
             try {
-              const steps = (await withBufferedStepResponses(data.output?.steps, output)) as any[];
+              const steps = ((await withBufferedStepResponses(data.output?.steps, output)) as any[]).map(step => ({
+                ...step,
+                // Persisted step records store raw results; only the public callback exposes chunks.
+                toolResults: (step?.toolResults ?? []).map(
+                  (toolResult: DurableToolCallOutput | ToolResultChunk): ToolResultChunk =>
+                    'payload' in toolResult
+                      ? toolResult
+                      : {
+                          type: 'tool-result',
+                          runId,
+                          from: ChunkFrom.AGENT,
+                          payload: {
+                            toolCallId: toolResult.toolCallId,
+                            toolName: toolResult.toolName,
+                            args: toolResult.args,
+                            result: toolResult.result,
+                            providerExecuted: toolResult.providerExecuted,
+                            providerMetadata: toolResult.providerMetadata,
+                          },
+                        },
+                ),
+              }));
               const allToolResults = steps.flatMap((s: any) => s?.toolResults ?? []);
               const allToolCalls = steps.flatMap((s: any) => s?.toolCalls ?? []);
               // The structured object is parsed while the output drains the (now closed) chunk
@@ -933,8 +970,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
                 object,
                 usedFallbackValue: output.usedFallbackValue,
                 error: output.error,
-                // Every step's streamed text, retried attempts included — matches the main loop,
-                // whose onFinish text is everything the run streamed.
+                // Aggregate accepted step text, excluding rejected attempts, like the main loop.
                 text: steps.length > 0 ? steps.map((s: any) => s?.text ?? '').join('') : (data.output?.text ?? ''),
                 steps,
                 toolResults: allToolResults,
@@ -1138,10 +1174,17 @@ export function createDurableAgentStream<OUTPUT = undefined>(
         })
         .catch(error => {
           logError(`[DurableAgentStream] Failed to subscribe to ${topic}:`, error);
-          markTerminated();
           rejectReady(error);
-          ctrl.error(error);
+          // Replay may already have ended the stream; keep its terminal outcome.
+          if (terminated) return;
+          markTerminated();
+          // Replay may have queued chunks before the subscription failed; keep them.
+          if ((ctrl.desiredSize ?? 0) > 0) safeError(ctrl, error);
+          else pendingRejection = error;
         });
+    },
+    pull(ctrl) {
+      if (pendingRejection && (ctrl.desiredSize ?? 0) > 0) safeError(ctrl, pendingRejection);
     },
     cancel() {
       detach();
@@ -1191,6 +1234,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
     messageList,
     messageId,
     initialToolCalls,
+    resumedText,
     finishUsageIsTotal: true,
     options: {
       runId,
@@ -1230,6 +1274,9 @@ export function createDurableAgentStream<OUTPUT = undefined>(
     detach,
     fail,
     waitForEventDelivery,
+    get activityVersion() {
+      return activityVersion;
+    },
     ready,
   };
 }

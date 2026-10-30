@@ -181,7 +181,7 @@ await durableAgent.resume(
 )
 ```
 
-The durable state stores only a monotonic "policy required" marker. If a worker lacks the resolver, or the resolver throws or returns an invalid decision, tool execution is denied. The resolver is called again after an approval or in-tool suspension resume, including a resume with an `undefined` payload; a policy change takes effect before the side effect.
+The durable state stores only a monotonic "policy required" marker. If a worker lacks the resolver, or the resolver throws or returns an invalid decision, tool execution is denied. The resolver is called again after an approval or in-tool suspension resume, including a resume with an `undefined` payload. A policy change takes effect before the side effect.
 
 When a live `RequestContext` policy and `resolveToolPermission` are both available, Mastra evaluates both. The strictest result wins: `deny` takes precedence over `ask`, and `ask` takes precedence over `allow`. A throw or invalid result from either evaluator is a denial.
 
@@ -259,6 +259,8 @@ Returns: [`Promise<InngestAgentStreamResult>`](#inngestagentstreamresult)
 #### `resume(runId, resumeData, options?)`
 
 Resumes a suspended Inngest run, for example after a tool approval. Loads the workflow snapshot from storage and finds the suspended step before sending a resume event to Inngest.
+
+The resumed output includes the tool calls and text from before the suspension. To restore them, `resume()` waits up to 10 seconds for the stored snapshot to include every suspended tool call. If the snapshot is still incomplete, `resume()` rejects with `Cannot resume run <runId>: ...` and doesn't send a resume event. The run stays suspended, so you can call `resume()` again.
 
 ```typescript
 const { output, cleanup } = await durableAgent.resume(

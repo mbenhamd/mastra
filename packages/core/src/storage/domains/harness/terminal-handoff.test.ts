@@ -17,10 +17,12 @@ import {
   canonicalHarnessTerminalResult,
   harnessTerminalAdmissionId,
   harnessTerminalIntentId,
-  type AgentSignalResultEvidence,
-  type HarnessTerminalAdmissionInput,
-  type HarnessTerminalIntent,
-  type SessionRecord,
+} from './index';
+import type {
+  AgentSignalResultEvidence,
+  HarnessTerminalAdmissionInput,
+  HarnessTerminalIntent,
+  SessionRecord,
 } from './index';
 
 function session(overrides: Partial<SessionRecord> = {}): SessionRecord {

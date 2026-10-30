@@ -1,5 +1,7 @@
 import type { JournalEntry, LLMock } from '@copilotkit/aimock';
 import type { AgentConfig, ToolsInput } from '../../../agent';
+import type { MessageListInput } from '../../../agent/message-list';
+import type { MastraServerCache } from '../../../cache';
 import type { PubSub } from '../../../events/pubsub';
 import type { MastraMemory } from '../../../memory';
 import type { RequestContext } from '../../../request-context';
@@ -51,6 +53,12 @@ export interface LoopScenarioResult {
    * `mastra.backgroundTaskManager` for background task assertions or shutdown.
    */
   mastra?: any;
+  /**
+   * The error thrown while {@link runLoopScenario} drained `fullStream`. Only
+   * returned when {@link RunLoopScenarioOptions.expectStreamError} is set;
+   * otherwise the harness rethrows it.
+   */
+  streamError?: unknown;
 }
 
 /**
@@ -127,8 +135,8 @@ export interface RunLoopScenarioOptions {
    * Runs once before the loop starts.
    */
   fixtures: (llm: LLMock) => void;
-  /** The user prompt that kicks off the loop. */
-  prompt: string;
+  /** The input that kicks off the loop: a user prompt, or messages (e.g. ending on an assistant prefill). */
+  prompt: string | MessageListInput;
   /**
    * Default options for the agent (e.g. `autoResumeSuspendedTools`).
    * Applied to the Agent constructor via `defaultOptions` config.
@@ -176,6 +184,8 @@ export interface RunLoopScenarioOptions {
    * pass `false` to test tool-level `requireApproval`, or a function to decide per tool call.
    */
   requireToolApproval?: boolean | ((context: { toolName: string; args?: unknown }) => boolean);
+  /** Close a durable stream on approval suspension so its output promises settle. */
+  closeOnSuspend?: boolean;
   /**
    * Stop condition for the loop. Forwarded to `agent.stream({ stopWhen })`.
    * Use this to bound long/looping tool scenarios.
@@ -380,6 +390,8 @@ export interface RunLoopScenarioOptions {
    * or `semanticRecall` (enable/disable semantic recall).
    */
   memoryOptions?: { lastMessages?: number | false; semanticRecall?: boolean };
+  /** Forwarded to `agent.stream({ memory: { onTitleGenerated } })`. */
+  onTitleGenerated?: (title: string) => void | Promise<void>;
   /**
    * Workspace attached to the agent. Passed into tool execution context so tools
    * can read `workspace.filesystem` / `workspace.sandbox` mid-loop.
@@ -391,6 +403,8 @@ export interface RunLoopScenarioOptions {
    * Use for testing the signal integration (subscribe → sendMessage → receive response).
    */
   pubsub?: PubSub;
+  /** Shared cache for durable/evented pubsub scenarios. */
+  cache?: MastraServerCache;
   /**
    * When set, {@link runLoopScenario} iterates `output.fullStream` itself
    * (instead of the default `consumeStream` drain) and returns every emitted
@@ -398,6 +412,13 @@ export interface RunLoopScenarioOptions {
    * fidelity assertions (text-delta ordering, reasoning chunks, etc.).
    */
   collectChunks?: boolean;
+  /**
+   * The scenario deliberately makes the stream throw (provider error, tripwire,
+   * abort, …). When set, a drain error is returned on
+   * {@link LoopScenarioResult.streamError}; when unset, {@link runLoopScenario}
+   * rethrows it with the original error as `cause`.
+   */
+  expectStreamError?: boolean;
   /**
    * When set, {@link runLoopScenario} returns the output WITHOUT consuming the
    * stream. The test must manually drain `output.fullStream` after publishing

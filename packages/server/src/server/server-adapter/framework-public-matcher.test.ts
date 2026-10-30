@@ -1,7 +1,8 @@
-import { Mastra } from '@mastra/core/mastra';
+import type { Mastra } from '@mastra/core/mastra';
 import { describe, expect, it, vi } from 'vitest';
 import { SERVER_ROUTES } from './routes';
-import { MastraServer, type ServerRouteSelector } from './index';
+import { MastraServer } from './index';
+import type { ServerRouteSelector } from './index';
 
 class TestMastraServer extends MastraServer<any, any, any> {
   stream = vi.fn();

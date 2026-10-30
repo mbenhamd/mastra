@@ -34,9 +34,11 @@ type AgentConfiguredExecutionHooks = Partial<Record<'onIterationComplete' | 'pre
 export function omitLogicalMessageIdentity<T extends Record<string, any>>(
   options: T,
 ): Omit<T, 'logicalMessageIdentity'> {
-  const { logicalMessageIdentity, ...sanitized } = options;
-  void logicalMessageIdentity;
-  return sanitized as Omit<T, 'logicalMessageIdentity'>;
+  // PF-6640 sync: copy property descriptors, not values, so accessor defaults
+  // (for example a `modelSettings` getter) stay live as they do upstream.
+  const descriptors = Object.getOwnPropertyDescriptors(options) as Record<string, PropertyDescriptor>;
+  delete descriptors.logicalMessageIdentity;
+  return Object.defineProperties({}, descriptors) as Omit<T, 'logicalMessageIdentity'>;
 }
 
 /**

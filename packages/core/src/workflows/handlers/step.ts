@@ -1199,7 +1199,14 @@ function iterationWriteView(params: {
   const { executionContext, stepId, execResults } = params;
   const isIteration = executionContext.foreachIndex !== undefined || params.iterationCount !== undefined;
   if (!isIteration) return { stepResults: params.stepResults, executionContext };
-  if (execResults.status !== 'success') {
+  // Upstream #27932 (adopted for the default engine too): a suspended foreach iteration
+  // does not settle the entry while siblings may still run, so its write keeps the
+  // entry `running` like a successful iteration. The entry-end write records the
+  // aggregate suspension (with its foreach index) once every admitted sibling settles.
+  const keepsEntryRunning =
+    execResults.status === 'success' ||
+    (execResults.status === 'suspended' && executionContext.foreachIndex !== undefined);
+  if (!keepsEntryRunning) {
     return { stepResults: { ...params.stepResults, [stepId]: execResults }, executionContext };
   }
   return {

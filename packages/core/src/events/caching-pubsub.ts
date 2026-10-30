@@ -8,6 +8,7 @@ import type {
   IndexedReplaySubscribeOptions,
   LeaseProvider,
 } from './pubsub';
+import { cachedLogTtlMs } from './topics';
 import type { Event, EventCallback, PublishEvent, SubscribeOptions } from './types';
 
 export interface CachingPubSubIndexedReplayOptions {
@@ -62,18 +63,9 @@ export interface CachingPubSubOptions {
    */
   shouldCache?: (topic: string) => boolean;
   /**
-   * Optional bus to follow for topics this cache serves.
-   *
-   * Publishers that don't go through this `CachingPubSub` (e.g. the evented
-   * workflow engine, which publishes agent-stream events on `mastra.pubsub`
-   * from whichever worker executes a step) never hit `publish()` here, so
-   * their events are neither cached nor — when `source` is a different
-   * transport than `inner` — delivered to local subscribers at all. Setting
-   * `source` makes this cache a follower: whenever a topic has local
-   * subscribers, the cache also subscribes to `source`, assigns indices to and
-   * caches events that haven't passed through a caching layer yet, and (when
-   * `source` and `inner` are genuinely different transports) republishes them
-   * into `inner` for live delivery. See {@link CachingPubSub.__setSource}.
+   * @deprecated No longer used. Evented steps now cache their frames when they
+   * publish, so nothing needs to be copied in from another PubSub. Accepted and
+   * ignored for compatibility.
    */
   source?: PubSub;
 }
@@ -87,6 +79,25 @@ export interface CachingPubSubOptions {
  *
  * This enables resumable streams - clients can disconnect and reconnect
  * without missing events.
+ *
+ * ## One append path
+ *
+ * Without `indexedReplay` (the best-effort mode), every cached publish goes through {@link MastraServerCache.listPushIndexed},
+ * which allocates the frame's index and appends it. The
+ * cache list is therefore the run's log — position and index always agree —
+ * and the transport only carries the live tail of that log. Subscribers hold a
+ * single integer cursor and backfill any gap they observe from the log rather
+ * than relying on transport replay.
+ *
+ * If caching a frame fails, it is published without an index and delivered
+ * live only.
+ *
+ * ## Exact indexed replay (fork, PF-2007/PF-2168)
+ *
+ * With `indexedReplay`, cursor allocation and retention are one atomic
+ * indexed-log operation bound to a log generation; a publish that cannot be
+ * retained fails, and subscribers fail closed on cursor gaps, generation
+ * changes and identity mismatches instead of resynchronising.
  *
  * ## Batching
  *
@@ -121,10 +132,6 @@ export class CachingPubSub extends PubSub {
   /** Maps original callbacks to their wrapped versions for proper unsubscribe */
   private callbackMap = new Map<EventCallback, EventCallback>();
   private subscriptionDrains = new Map<EventCallback, () => Promise<void>>();
-  /** Bus this cache follows for externally-published events. See {@link __setSource}. */
-  private source?: PubSub;
-  /** Per-topic follower subscriptions on {@link source}, refcounted by local subscribers. */
-  private followers = new Map<string, { source: PubSub; cb: EventCallback; refs: number }>();
 
   constructor(
     private readonly inner: PubSub,
@@ -154,32 +161,13 @@ export class CachingPubSub extends PubSub {
         maxEntries: options.indexedReplay.maxEvents,
       };
     }
-    if (options.source) this.__setSource(options.source);
   }
 
   /**
-   * Set (or replace) the source bus this cache follows.
-   *
-   * Exists separately from the constructor because the natural source is often
-   * not known at construction time: a durable agent builds its `CachingPubSub`
-   * lazily, but `mastra.pubsub` only becomes available at registration.
-   * Replacing the source only affects topics that start being followed
-   * afterwards — existing follower subscriptions stay on the bus they were
-   * created against until released.
-   * @internal
+   * @deprecated No longer used; see {@link CachingPubSubOptions.source}. Kept as
+   * a no-op for compatibility.
    */
-  __setSource(source: PubSub | undefined): void {
-    // Following ourselves is meaningless and hazardous: every publish on such
-    // a source already flows through this.publish(), so any un-indexed event
-    // the follower would observe is one publish() *deliberately* declined to
-    // cache (the `localOnly` bypass, or `shouldCache`) — re-caching it would
-    // resurrect the run-local cache leak (#21668). The `__self()` probe sees
-    // through the `mastra.pubsub` proxy, which breaks plain reference
-    // equality while still targeting this very instance (the reuse-not-
-    // double-wrap configuration, #18148).
-    if (source === this || source?.__self?.() === this) return;
-    this.source = source;
-  }
+  __setSource(_source: PubSub | undefined): void {}
 
   /** Unwrap to the inner transport so aliasing checks see through this decorator. */
   override __rawBus(): PubSub {
@@ -215,16 +203,14 @@ export class CachingPubSub extends PubSub {
   }
 
   /**
-   * Stable key used to deduplicate an event across the cache-replay and
-   * live-delivery paths.
-   *
-   * The sequential `index` is the authoritative ordering key. Inner transports
-   * also preserve the identity assigned by `CachingPubSub.publish`, but the
-   * index remains the stronger deduplication key because it represents the
-   * event's exact position in retained history.
+   * Log a warning using the configured logger or console.warn.
    */
-  private dedupKey(event: Event): string {
-    return event.index !== undefined ? `i:${event.index}` : `id:${event.id}`;
+  private logWarn(message: string): void {
+    if (this.logger) {
+      this.logger.warn(message);
+    } else {
+      console.warn(message);
+    }
   }
 
   /** Restore values that JSON-backed cache adapters cannot retain by prototype. */
@@ -292,118 +278,6 @@ export class CachingPubSub extends PubSub {
 
   private getIndexedLogKey(topic: string): string {
     return `${this.keyPrefix}${topic}:indexed-log:v1`;
-  }
-
-  /**
-   * Whether {@link source} is backed by the same transport as {@link inner}.
-   *
-   * When they alias (e.g. the test harness passes one `EventEmitterPubSub`
-   * both to the agent and to `Mastra`, or the agent adopted `mastra.pubsub`
-   * as its inner bus), local subscribers already receive source-published
-   * events through their inner subscription — the follower must then only
-   * cache, never republish, or every event would be delivered twice.
-   */
-  private isSourceAliased(source: PubSub): boolean {
-    return source.__rawBus() === this.inner.__rawBus();
-  }
-
-  /**
-   * Start following {@link source} for a topic (idempotent, refcounted).
-   * Called on every local subscription entry point; released on unsubscribe
-   * and torn down on {@link clearTopic}.
-   *
-   * The follower's contract:
-   * - On an aliased source, events that carry an `index` are this cache's own
-   *   publish echo (or its own republish) — ack and ignore them. This is both
-   *   the dedup and the republish loop guard.
-   * - On a non-aliased source, an `index` means the event passed through a
-   *   *foreign* caching tier (e.g. a user-supplied `CachingPubSub` handed to
-   *   `new Mastra({ pubsub })` while this agent runs its own cache tier).
-   *   That tier's cache is not the one this instance replays from, so the
-   *   event is treated like an un-indexed one: cached here under a fresh
-   *   index (replacing the foreign index) and republished into `inner`.
-   *   Dropping it instead would lose the event for local subscribers entirely
-   *   — the exact stream-loss failure `source` following exists to prevent
-   *   (#20646).
-   * - Un-indexed events were published directly on the source bus (e.g. by
-   *   the evented workflow engine, possibly from another process). Assign an
-   *   index, cache them (subject to `shouldCache`), and — only when source and
-   *   inner are different transports — republish the indexed copy into `inner`
-   *   so local subscribers receive it live. On an aliased bus the original
-   *   delivery already reached them.
-   *
-   * Subscribes with `startFrom: 'latest'`: the follower's job is to mirror
-   * live traffic into the cache, not to re-ingest a persistent backend's
-   * retained history — re-reading from 'earliest' after a process restart
-   * would re-cache already-cached events under fresh indices.
-   */
-  private async retainFollower(topic: string): Promise<void> {
-    const source = this.source;
-    if (!source) return;
-    const existing = this.followers.get(topic);
-    if (existing) {
-      existing.refs++;
-      return;
-    }
-
-    const followerCb: EventCallback = async (event, ack) => {
-      try {
-        const aliased = this.isSourceAliased(source);
-        if (event.index !== undefined && aliased) {
-          return await ack?.();
-        }
-        let outbound: Event = event;
-        if (this.shouldCache?.(topic) !== false) {
-          // Same single-round-trip op as publish() (#22477): the follower sits
-          // on the identical per-chunk hot path for engine-originated events.
-          // The stored copy carries the allocated index, preserving the
-          // "indexed ⇒ already cached" dedup contract.
-          try {
-            const index = await this.cache.listPushIndexed(this.getCacheKey(topic), this.getCounterKey(topic), event);
-            outbound = { ...event, index };
-          } catch (error) {
-            this.logError(`[CachingPubSub] Failed to cache followed event for ${topic}`, error);
-          }
-        }
-        if (!aliased) {
-          // Inner implementations regenerate `id` but preserve `index`, same
-          // as the publish() path — live and cached copies dedup by index.
-          await this.inner.publish(topic, outbound);
-        }
-        await ack?.();
-      } catch (error) {
-        this.logError(`[CachingPubSub] Follower failed for ${topic}`, error);
-        await ack?.();
-      }
-    };
-
-    // Record synchronously so concurrent retains don't double-subscribe.
-    const entry = { source, cb: followerCb, refs: 1 };
-    this.followers.set(topic, entry);
-    try {
-      await source.subscribe(topic, followerCb, { startFrom: 'latest' });
-    } catch (error) {
-      this.followers.delete(topic);
-      this.logError(`[CachingPubSub] Failed to follow source for ${topic}`, error);
-    }
-  }
-
-  /** Drop one follower reference for a topic; unsubscribe from source at zero. */
-  private async releaseFollower(topic: string): Promise<void> {
-    const entry = this.followers.get(topic);
-    if (!entry) return;
-    entry.refs--;
-    if (entry.refs > 0) return;
-    this.followers.delete(topic);
-    await entry.source.unsubscribe(topic, entry.cb).catch?.(() => {});
-  }
-
-  /** Tear down a topic's follower unconditionally (stream completion). */
-  private async stopFollowing(topic: string): Promise<void> {
-    const entry = this.followers.get(topic);
-    if (!entry) return;
-    this.followers.delete(topic);
-    await entry.source.unsubscribe(topic, entry.cb).catch?.(() => {});
   }
 
   /**
@@ -500,7 +374,7 @@ export class CachingPubSub extends PubSub {
     // network-backed caches can do it in a single round-trip (issue #22477).
     let index: number | undefined;
     try {
-      index = await this.cache.listPushIndexed(cacheKey, counterKey, baseEvent);
+      index = await this.cache.listPushIndexed(cacheKey, counterKey, baseEvent, cachedLogTtlMs(topic));
     } catch (error) {
       this.logError(`[CachingPubSub] Failed to cache event for ${topic}`, error);
     }
@@ -521,7 +395,6 @@ export class CachingPubSub extends PubSub {
    * Subscribe to live events on a topic (no replay).
    */
   async subscribe(topic: string, cb: EventCallback, options?: SubscribeOptions): Promise<void> {
-    await this.retainFollower(topic);
     await this.inner.subscribe(topic, cb, options);
   }
 
@@ -537,11 +410,9 @@ export class CachingPubSub extends PubSub {
    * Subscribe to a topic with replay starting from a specific index.
    * More efficient than full replay when the client knows their last position.
    *
-   * Order of operations:
-   * 1. Subscribe to live events FIRST — buffer deliveries during bootstrap
-   * 2. Fetch and deliver cached history in order
-   * 3. Drain the buffer, skipping events already delivered via history
-   * 4. Switch to passthrough with an index watermark for steady-state dedup
+   * With `indexedReplay` the subscription is exact and fails closed (see
+   * `subscribeFromExactOffset`); otherwise it keeps one cursor and backfills
+   * gaps from the cached log (see `subscribeFromBestEffortOffset`).
    *
    * @param topic - The topic to subscribe to
    * @param offset - Start replaying from this index (0-based)
@@ -553,99 +424,221 @@ export class CachingPubSub extends PubSub {
     cb: EventCallback,
     options?: IndexedReplaySubscribeOptions,
   ): Promise<void> {
-    // Follow the source (if any) before attaching locally: events the source
-    // delivers between now and the live subscription below land in the cache
-    // and are picked up by the history fetch.
-    await this.retainFollower(topic);
     if (this.indexedLog && this.indexedLogRetention) {
       return this.subscribeFromExactOffset(topic, offset, cb, options);
     }
     return this.subscribeFromBestEffortOffset(topic, offset, cb);
   }
 
+  /**
+   * Best-effort replay (no `indexedReplay`), upstream #27352:
+   *
+   * The subscriber keeps one cursor, `next`, and every frame it receives is
+   * reconciled against it:
+   * - `index < next` — already delivered (transport replay, retry, or a
+   *   duplicate) → dropped.
+   * - `index === next` — the next frame in the log → delivered.
+   * - `index > next` — frames arrived out of order. Because a frame is appended
+   *   to the log before it is published, the missing frames are already in the
+   *   log, so they are read back in order and delivered before this one. That
+   *   holds even when the transport replays nothing at all.
+   *
+   * One exception to the first rule: a frame numbered `0` whose counter shows
+   * the log restarted. That means the retained log expired or was cleared and
+   * a new run segment began numbering at 0; the cursor resyncs and the frame is
+   * delivered, instead of silently dropping the whole new segment. Nack
+   * redeliveries (`deliveryAttempt > 1`) also bypass reconciliation, since a
+   * retry of an already-cursor-advanced frame still has to reach the consumer.
+   *
+   * When the log no longer holds the missing range (no shared cache, or the
+   * TTL lapsed) there is nothing to replay; the cursor resynchronises to the
+   * frame in hand so live delivery continues.
+   *
+   * @param topic - The topic to subscribe to
+   * @param offset - Start replaying from this index (0-based)
+   * @param cb - Callback invoked for each event
+   */
   private async subscribeFromBestEffortOffset(topic: string, offset: number, cb: EventCallback): Promise<void> {
-    // --- Phase 1: subscribe live, buffer everything during bootstrap ---
-    let bootstrapping = true;
-    const buffer: Array<{
-      event: Event;
-      ack?: Parameters<EventCallback>[1];
-      nack?: Parameters<EventCallback>[2];
-    }> = [];
-    let lastDelivered = -1;
+    const cacheKey = this.getCacheKey(topic);
 
-    const wrappedCb: EventCallback = async (event, ack, nack) => {
-      // Drop events strictly before the requested offset on the live path.
-      // Dropped deliveries are still acknowledged: the consumer will never see
-      // them, so leaving them unacknowledged would strand them on the backend.
-      if (typeof event.index === 'number' && event.index < offset) {
-        await ack?.();
-        return;
+    let next = offset;
+    let closed = false;
+    // Set only while a backfill (or the initial history read) is in flight.
+    // Frames delivered meanwhile must wait, or the cursor could advance past a
+    // frame that has not been handed to the consumer yet. In the common case
+    // (a frame that is next) delivery stays synchronous.
+    let pending: Promise<void> | null = null;
+    let deferred = false;
+    // True until the transport's `subscribe()` resolves (retained replay window).
+    let attaching = true;
+
+    const emit = (event: Event, ack?: () => Promise<void>, nack?: () => Promise<void>) => {
+      if (typeof event.index === 'number') next = event.index + 1;
+      return cb(event, ack, nack);
+    };
+
+    /** Deliver everything the log holds between the cursor and `target`. */
+    const backfill = async (target: number) => {
+      if (target <= next) return;
+      const entries = (await this.cache.listFromTo(cacheKey, next)).map(entry => this.retainedEvent(entry));
+      for (const entry of entries) {
+        if (closed) return;
+        const seq = entry.index;
+        if (typeof seq !== 'number' || seq < next) continue;
+        if (seq >= target) return;
+        await emit(entry);
+      }
+    };
+
+    const reconcile = (event: Event, ack?: () => Promise<void>, nack?: () => Promise<void>): void | Promise<void> => {
+      // A nack-redelivery carries the same index but `deliveryAttempt > 1`;
+      // the consumer must see it again to retry processing.
+      if (event.deliveryAttempt !== undefined && event.deliveryAttempt > 1) {
+        return cb(event, ack, nack);
       }
 
-      if (bootstrapping) {
-        buffer.push({ event, ack, nack });
-        return;
+      const seq = event.index;
+      if (typeof seq !== 'number') {
+        // No numbering (the frame failed to cache): live-only delivery.
+        return cb(event, ack, nack);
       }
 
-      // Steady-state: skip events we already delivered via history or buffer drain.
-      // Allow nack-redelivered messages through — they carry the same index but
-      // deliveryAttempt > 1, and the consumer must see them to retry processing.
-      const isRetry = typeof event.deliveryAttempt === 'number' && event.deliveryAttempt > 1;
-      if (typeof event.index === 'number' && event.index <= lastDelivered && !isRetry) {
-        await ack?.();
-        return;
+      // Already delivered (a retained transport copy of a frame the log
+      // provided). Acknowledge it so it does not stay pending on the backend.
+      if (seq < next) {
+        if (seq !== 0) return ack?.();
+
+        // Index 0 while the cursor has already advanced means the log this
+        // subscriber was reading is gone: it expired (or was cleared) and the
+        // run resumed, restarting numbering at 0. Dropping it would swallow
+        // every frame of the new segment, since all of their indices sit below
+        // the stale cursor. Confirm against the counter — it restarts with the
+        // log, so in a continuous log it can never be below our cursor.
+        deferred = true;
+        return (async () => {
+          // A cache read failure must not turn a duplicate into a nack loop;
+          // fall through to the drop path in that case.
+          const allocated = await this.cache.get(this.getCounterKey(topic)).catch(() => undefined);
+          if (closed) return ack?.();
+
+          if (typeof allocated === 'number' && allocated < next) {
+            this.logWarn(
+              `[CachingPubSub] Log for ${topic} restarted at 0 while the subscriber cursor was at ${next}; ` +
+                `the retained log expired or was cleared. Resyncing from the start of the new segment.`,
+            );
+            next = 0;
+            await emit(event, ack, nack);
+            return;
+          }
+
+          // A late copy of this log's real first frame: nothing to resync.
+          await ack?.();
+        })();
       }
 
-      if (typeof event.index === 'number' && event.index > lastDelivered) {
-        lastDelivered = event.index;
+      if (seq > next) {
+        // Frames arrived out of order. The log already holds the missing ones,
+        // so this has to wait for them; queue later frames behind it.
+        deferred = true;
+        return (async () => {
+          await backfill(seq);
+          if (closed) return;
+          if (seq < next) {
+            // The log supplied this frame; the transport copy is a duplicate.
+            await ack?.();
+            return;
+          }
+          // Nothing left in the log for the gap; resume from this frame.
+          next = seq;
+          await emit(event, ack, nack);
+        })();
       }
-      await cb(event, ack, nack);
+
+      return emit(event, ack, nack);
+    };
+
+    const failDelivery = async (error: unknown, nack?: () => Promise<void>) => {
+      this.logError(`[CachingPubSub] Subscriber failed for ${topic}`, error);
+      await nack?.().catch(() => {});
+    };
+
+    /**
+     * Track a delivery chain so later frames queue behind it.
+     *
+     * The clear has to be conditional: a newer chain may already have replaced
+     * `pending`, and nulling it then would let the next frame reconcile
+     * concurrently with the in-flight one (two backfills racing on the same
+     * range, delivering the gap twice or out of order).
+     */
+    const track = (run: Promise<void>, nack?: () => Promise<void>) => {
+      const tracked = run.catch(error => failDelivery(error, nack));
+      pending = tracked;
+      void tracked.then(() => {
+        if (pending === tracked) pending = null;
+      });
+      return tracked;
+    };
+
+    const wrappedCb: EventCallback = (event, ack, nack) => {
+      if (closed) {
+        // Nobody will process this delivery; acknowledge so it is not stranded.
+        return ack?.();
+      }
+
+      if (pending) {
+        return track(
+          pending.then(() => reconcile(event, ack, nack)),
+          nack,
+        );
+      }
+
+      deferred = false;
+      const result = reconcile(event, ack, nack);
+      // While attaching, a direct delivery the transport did not await must
+      // also finish before the history read starts delivering later frames.
+      if (!deferred && !(attaching && result instanceof Promise)) return result;
+
+      // A gap triggered a backfill: hold later frames until it completes.
+      return track(result as Promise<void>, nack);
     };
 
     this.callbackMap.set(cb, wrappedCb);
-    await this.inner.subscribe(topic, wrappedCb);
-
     try {
-      // --- Phase 2: fetch and deliver cached history ---
-      // `seen` records the index-based dedup key AND the event id. The id
-      // matters on an aliased source bus: the follower caches an indexed COPY
-      // of an event whose original live delivery carries no index, so the two
-      // only correlate by id (same emitter delivery → same id). Distinct
-      // events never share ids, so the extra key can't over-suppress.
-      const seen = new Set<string>();
-      const history = await this.getHistory(topic, offset);
-      for (const event of history) {
-        seen.add(this.dedupKey(event));
-        if (event.id) seen.add(`id:${event.id}`);
-        if (typeof event.index === 'number') {
-          lastDelivered = event.index;
-        }
-        await cb(event);
-      }
+      // Subscribe before reading history so no frame is missed. Live frames
+      // arriving during the read queue behind it.
+      await this.inner.subscribe(topic, wrappedCb);
+      attaching = false;
 
-      // --- Phase 3: drain buffer, suppressing duplicates history already covered ---
-      for (const { event, ack, nack } of buffer) {
-        if (seen.has(this.dedupKey(event)) || (event.id && seen.has(`id:${event.id}`))) {
-          // Acknowledge the suppressed duplicate so it doesn't stay pending.
-          await ack?.();
-          continue;
+      // A transport that replays retained frames without awaiting the callback
+      // can start a delivery chain (a backfill) before `subscribe()` resolves.
+      // Read history only after that chain settles, so the two never deliver
+      // at the same time.
+      const inFlight = pending;
+      let releaseHistory!: () => void;
+      const historyGate = new Promise<void>(resolve => {
+        releaseHistory = resolve;
+      });
+      pending = historyGate;
+      try {
+        await inFlight;
+        const entries = (await this.cache.listFromTo(cacheKey, next)).map(entry => this.retainedEvent(entry));
+        for (const entry of entries) {
+          if (closed) return;
+          const seq = entry.index;
+          if (typeof seq !== 'number' || seq < next) continue;
+          await emit(entry);
         }
-        seen.add(this.dedupKey(event));
-        if (event.id) seen.add(`id:${event.id}`);
-        if (typeof event.index === 'number') {
-          lastDelivered = event.index;
-        }
-        await cb(event, ack, nack);
+      } finally {
+        // Only release our own gate: a live frame that arrived during the read
+        // may already have queued behind it and replaced `pending`.
+        if (pending === historyGate) pending = null;
+        releaseHistory();
       }
-
-      // --- Phase 4: flip to passthrough ---
-      bootstrapping = false;
-      buffer.length = 0;
     } catch (error) {
-      // Rollback: unsubscribe wrappedCb so it doesn't strand in bootstrap mode
+      // Rollback so the callback isn't stranded on the inner transport.
+      closed = true;
       this.callbackMap.delete(cb);
       await this.inner.unsubscribe(topic, wrappedCb).catch(() => {});
-      await this.releaseFollower(topic);
       throw error;
     }
   }
@@ -927,10 +920,6 @@ export class CachingPubSub extends PubSub {
       this.callbackMap.delete(cb);
       this.subscriptionDrains.delete(cb);
       await this.inner.unsubscribe(topic, wrappedCb).catch(() => {});
-      // The shared subscribeFromOffset wrapper retained a follower before
-      // dispatching here; a failed exact-offset bootstrap must release that
-      // ref, mirroring the best-effort path's rollback.
-      await this.releaseFollower(topic);
       throw error;
     }
   }
@@ -945,7 +934,6 @@ export class CachingPubSub extends PubSub {
     this.subscriptionDrains.delete(cb);
     await this.inner.unsubscribe(topic, wrappedCb);
     await drain?.();
-    await this.releaseFollower(topic);
   }
 
   /**
@@ -1015,9 +1003,12 @@ export class CachingPubSub extends PubSub {
         }
       }
     }
-    const cacheKey = this.getCacheKey(topic);
-    const events = await this.cache.listFromTo(cacheKey, offset);
-    return events.map(event => this.retainedEvent(event));
+    // The list is the log: entry position and `index` are allocated together, so
+    // a slice from `offset` is the events from that index on (upstream #27352).
+    const events = await this.cache.listFromTo(this.getCacheKey(topic), offset);
+    return events
+      .map(event => this.retainedEvent(event))
+      .filter(event => typeof event.index !== 'number' || event.index >= offset);
   }
 
   override async getIndexedReplayRange(topic: string): Promise<IndexedReplayRange | undefined> {
@@ -1091,9 +1082,6 @@ export class CachingPubSub extends PubSub {
 
   override async clearTopic(topic: string): Promise<void> {
     try {
-      // Stop mirroring the source first — a follower running past the clear
-      // would repopulate the cache the caller is trying to free.
-      await this.stopFollowing(topic);
       await this.clearTopicOrThrow(topic);
     } catch (error) {
       // Honor the base-class contract: clearTopic is best-effort and callers
@@ -1119,6 +1107,11 @@ export class CachingPubSub extends PubSub {
    */
   getInner(): PubSub {
     return this.inner;
+  }
+
+  /** The cache holding this bus's retained frames. */
+  getCache(): MastraServerCache {
+    return this.cache;
   }
 }
 

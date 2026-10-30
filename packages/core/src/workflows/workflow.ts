@@ -50,7 +50,8 @@ import {
   endOutputStreamSpanOutsideStep,
   findOwnModelStepSpan,
 } from '../processors/runner';
-import { createProcessorSendSignal } from '../processors/send-signal';
+import type { ProcessorLateSignalSink } from '../processors/send-signal';
+import { createProcessorSendSignal, PROCESSOR_LATE_SIGNAL_SINK } from '../processors/send-signal';
 import {
   resolveProcessorSpanAttributes,
   resolveProcessorSpanName,
@@ -72,6 +73,7 @@ import { standardSchemaToJSONSchema, toStandardSchema } from '../schema';
 import type { InferPublicSchema, InferStandardSchemaOutput, PublicSchema, StandardSchemaWithJSON } from '../schema';
 import type { StorageListWorkflowRunsInput } from '../storage';
 import type { WorkflowsStorage } from '../storage/domains/workflows/base';
+import type { RunOwnershipRecord } from '../storage/run-fencing';
 import { WorkflowRunOutput } from '../stream/RunOutput';
 import type { ChunkType, LanguageModelUsage, ProviderMetadata } from '../stream/types';
 import { ChunkFrom } from '../stream/types';
@@ -122,6 +124,8 @@ import { derivePredicateLabel, evaluatePredicate } from './predicate';
 import type { Predicate } from './predicate';
 import { claimWorkflowRestart, workflowRestartNotClaimedError } from './restart-claim';
 import { claimWorkflowResume } from './resume-claim';
+import { claimWorkflowRunOwnership } from './run-ownership';
+import type { WorkflowRunOwnership } from './run-ownership';
 import { validateCron } from './scheduler/cron';
 import type { WorkflowScheduleConfig } from './scheduler/types';
 import type {
@@ -520,7 +524,13 @@ export function createStep<const QUESTIONS extends ClassifierQuestions, TStepInp
  * Creates a step from a Processor - wraps a Processor as a workflow step
  * Note: We require at least one processor method to distinguish from StepParams
  */
-export function createStep<TProcessorId extends string>(
+export function createStep<
+  TProcessorId extends string,
+  // Inferred from the previous step when chained, so a processor step accepts another processor step's output.
+  TInput extends
+    | InferPublicSchema<typeof ProcessorStepInputSchema>
+    | InferPublicSchema<typeof ProcessorStepOutputSchema> = InferPublicSchema<typeof ProcessorStepInputSchema>,
+>(
   processor:
     | (Processor<TProcessorId> & { processInput: Function })
     | (Processor<TProcessorId> & { processInputStream: Function })
@@ -533,7 +543,7 @@ export function createStep<TProcessorId extends string>(
 ): Step<
   `processor:${TProcessorId}`,
   unknown,
-  InferPublicSchema<typeof ProcessorStepInputSchema>,
+  TInput,
   InferPublicSchema<typeof ProcessorStepOutputSchema>,
   unknown,
   unknown,
@@ -887,7 +897,12 @@ export function createStepFromProcessor<TProcessorId extends string>(
       requestContext,
       tracingContext,
       outputWriter,
-    }: Parameters<ProcessorStepExecutor<ProcessorStepInput | ProcessorStepOutput>>[0]) => {
+      mastra,
+      runId: workflowRunId,
+    }: Parameters<ProcessorStepExecutor<ProcessorStepInput | ProcessorStepOutput>>[0] & {
+      mastra?: Mastra;
+      runId?: string;
+    }) => {
       // Cast to output type for easier property access - the discriminated union
       // ensures type safety at the schema level, but inside the execute function
       // we need access to all possible properties
@@ -896,6 +911,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
         llmRequestProcessorIds?: ReadonlySet<string>;
         abortSignal?: AbortSignal;
         agent?: Agent;
+        lateSignalSink?: ProcessorLateSignalSink;
       };
       const {
         phase,
@@ -939,6 +955,8 @@ export function createStepFromProcessor<TProcessorId extends string>(
         abortSignal,
         // Agent reference so processors can access the running agent (e.g. on signal/schedule wake)
         agent,
+        // Receives sendSignal calls made after the creating durable step returned
+        lateSignalSink,
       } = input;
 
       // Create a minimal abort function that throws TripWire
@@ -1220,6 +1238,9 @@ export function createStepFromProcessor<TProcessorId extends string>(
                 messageList: processorMessageList,
                 writer: processorWriter,
                 rotateResponseMessageId: rotateCurrentResponseMessageId,
+                lateSink:
+                  (workflowRunId ? mastra?.__getRunScope(workflowRunId)?.get(PROCESSOR_LATE_SIGNAL_SINK) : undefined) ??
+                  lateSignalSink,
               }),
             }
           : {}),
@@ -1228,6 +1249,7 @@ export function createStepFromProcessor<TProcessorId extends string>(
       // Pass-through data that should flow to the next processor in a chain
       // This enables processor workflows to use .then(), .parallel(), .branch(), etc.
       const passThrough = {
+        lateSignalSink,
         phase,
         runId: agentRunId,
         // Auto-create MessageList from messages if not provided
@@ -1442,10 +1464,13 @@ export function createStepFromProcessor<TProcessorId extends string>(
 
               // Preserve messages in return - passThrough doesn't include messages,
               // so we must explicitly include it to avoid losing it for subsequent steps.
+              // Unless the processor returned its own array, hand on the list as it is now: it may have
+              // removed or added messages through the messageList, and a later processor that returns
+              // the stale array would otherwise put removed messages back.
               return {
                 ...passThrough,
-                messages,
                 ...validatedResult,
+                messages: validatedResult.messages ?? checkedMessageList.get.all.db(),
                 runId: agentRunId,
                 systemMessages: checkedMessageList.getSystemMessages(),
                 ...(currentMessageId ? { messageId: validatedResult.messageId ?? currentMessageId } : {}),
@@ -2095,6 +2120,7 @@ export class Workflow<
       shouldPersistSnapshot: options.shouldPersistSnapshot ?? (this.type === 'processor' ? () => false : () => true),
       evaluatePersistencePredicateBeforeDurableOperation: options.evaluatePersistencePredicateBeforeDurableOperation,
       allowUnclaimedResumes: options.allowUnclaimedResumes,
+      persistResumeClaim: options.persistResumeClaim,
       isOwnershipLostError: options.isOwnershipLostError,
       isForeignExecution: options.isForeignExecution,
       persistedRequestContext: options.persistedRequestContext,
@@ -2671,7 +2697,7 @@ export class Workflow<
       >;
     }
 
-    const newMappingConfig: Record<string, any> = Object.entries(mappingConfig).reduce(
+    const newMappingConfig: Record<string, any> = Object.entries(mappingConfig).reduce<Record<string, any>>(
       (a, [key, mapping]) => {
         const m: any = mapping;
         if (m.value !== undefined) {
@@ -2715,7 +2741,7 @@ export class Workflow<
         }
         return a;
       },
-      {} as Record<string, any>,
+      {},
     );
 
     type MappedOutputSchema = any;
@@ -3187,6 +3213,8 @@ export class Workflow<
         pubsub:
           options?.pubsub ??
           (transientExecution && isProcessorExecution ? transientProcessorPubSub : this.#mastra?.pubsub),
+        recoverable:
+          this.engineType === 'default' && this.#options.autoRestartActiveRuns !== false && this.type !== 'processor',
       });
       return createdRun;
     };
@@ -3518,11 +3546,25 @@ export class Workflow<
     const unwatch = useSharedPubsub
       ? () => {}
       : run.watch(event => {
-          void pubsub.publish('nested-watch', {
-            type: 'nested-watch',
-            runId: run.runId,
-            data: { event, workflowId: this.id },
-          });
+          // The nested run emits on its own in-process pubsub, so it can keep
+          // stepping after the parent's transport has closed (for example a
+          // durable thread-title generation still running at Mastra shutdown).
+          // The republish is fire-and-forget: log its failure here instead of
+          // leaving an unhandled rejection (PF-6640 sync).
+          pubsub
+            .publish('nested-watch', {
+              type: 'nested-watch',
+              runId: run.runId,
+              data: { event, workflowId: this.id },
+            })
+            .catch(error => {
+              this.logger.warn('Failed to republish nested workflow event to the parent run', {
+                workflowId: this.id,
+                runId: run.runId,
+                eventType: event.type,
+                error,
+              });
+            });
         });
 
     if (retryCount && retryCount > 0 && isResume && requestContext) {
@@ -3802,6 +3844,13 @@ export class Workflow<
         await run.restart();
         this.logger.debug('Restarted workflow run', { workflowId: this.id, runId: runSnapshot.runId });
       } catch (error) {
+        if (error instanceof MastraError && error.id === 'WORKFLOW_RESTART_RUN_OWNED') {
+          this.logger.debug('Skipped restarting workflow run owned by a live process', {
+            workflowId: this.id,
+            runId: runSnapshot.runId,
+          });
+          return;
+        }
         this.logger.error('Failed to restart workflow run', { workflowId: this.id, runId: runSnapshot.runId, error });
       }
     });
@@ -4219,6 +4268,8 @@ export class Run<
 
   #observerHandlers: (() => void)[] = [];
 
+  #recoverable: boolean;
+
   get mastra() {
     return this.#mastra;
   }
@@ -4263,6 +4314,8 @@ export class Run<
     transientExecution?: boolean;
     /** Optional pubsub instance. If not provided, a new EventEmitterPubSub is created. */
     pubsub?: PubSub;
+    /** Whether the boot-time recovery sweep may restart this run, so it must hold an ownership lease while it executes. */
+    recoverable?: boolean;
   }) {
     this.workflowId = params.workflowId;
     this.runId = params.runId;
@@ -4286,6 +4339,7 @@ export class Run<
     this.workflowRunStatus = 'pending';
     this.workflowEngineType = params.workflowEngineType;
     this.transientExecution = params.transientExecution ?? false;
+    this.#recoverable = params.recoverable ?? false;
   }
 
   public get abortController(): AbortController {
@@ -5548,6 +5602,8 @@ export class Run<
       onDispatched?.();
 
       const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+        // Upstream #25579: hold the boot-recovery ownership lease while this process drives the run.
+        this.#executeOwned(() =>
         this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
           workflowId: this.workflowId,
           runId: this.runId,
@@ -5579,6 +5635,7 @@ export class Run<
             ),
           isCancellationAdmitted: this.isCancellationAdmitted,
         }),
+        ),
       );
 
       if (
@@ -6076,7 +6133,7 @@ export class Run<
           ...observabilityContext,
           tracingOptions,
           outputWriter: async chunk => {
-            void controller.enqueue(chunk);
+            controller.enqueue(chunk);
           },
           isVNext: true,
           forEachIndex,
@@ -6309,6 +6366,39 @@ export class Run<
     } & Partial<ObservabilityContext> = {},
   ): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
     return this._restart(args);
+  }
+
+  /**
+   * Takes the storage ownership lease for runs the boot-time recovery sweep could restart, so a
+   * sweep on another replica skips this run while this process drives it. Nested runs are covered
+   * by their parent's lease, and runs that never persist a `running` snapshot are never swept.
+   */
+  async #claimOwnership(force: boolean): Promise<WorkflowRunOwnership | { owner: RunOwnershipRecord | null }> {
+    const shouldPersistSnapshot =
+      this.executionEngine.getRunPersistenceOverride(this.runId) ?? this.executionEngine.options.shouldPersistSnapshot;
+    if (
+      !this.#recoverable ||
+      this.parentWorkflow ||
+      !shouldPersistSnapshot({ workflowStatus: 'running', stepResults: {} })
+    ) {
+      return { release: async () => {} };
+    }
+    return claimWorkflowRunOwnership({
+      store: await this.#mastra?.getStorage()?.getStore('workflows'),
+      runId: this.runId,
+      force,
+      logger: this.#mastra?.getLogger(),
+    });
+  }
+
+  async #executeOwned<T>(execute: () => Promise<T>): Promise<T> {
+    const ownership = await this.#claimOwnership(true);
+    if (!('release' in ownership)) return execute();
+    try {
+      return await execute();
+    } finally {
+      await ownership.release();
+    }
   }
 
   /**
@@ -6773,6 +6863,8 @@ export class Run<
     // releases an unused claim and claims the parent synchronously; the fork does neither.)
     params.onExecutionStarted?.();
     const executionResultPromise = this.#withActiveExecution(executionGeneration, () =>
+      // Upstream #25579: hold the boot-recovery ownership lease while this process drives the run.
+      this.#executeOwned(() =>
       this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
         workflowId: this.workflowId,
         runId: this.runId,
@@ -6807,6 +6899,7 @@ export class Run<
         commitTerminalStatus: status => this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
         isCancellationAdmitted: this.isCancellationAdmitted,
       }),
+      ),
     ).then(
       result => {
         if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
@@ -6946,6 +7039,23 @@ export class Run<
 
     const restartData = createRestartExecutionParams({ snapshot, graph: this.executionGraph });
 
+    const ownership = await this.#claimOwnership(false);
+    if (!('release' in ownership)) {
+      throw new MastraError({
+        id: 'WORKFLOW_RESTART_RUN_OWNED',
+        domain: ErrorDomain.MASTRA_WORKFLOW,
+        category: ErrorCategory.USER,
+        text:
+          `Workflow "${this.workflowId}" run "${this.runId}" is still being executed by another process, so it was not restarted. ` +
+          `Restart it after that process stops renewing its ownership lease.`,
+        details: {
+          workflowId: this.workflowId,
+          runId: this.runId,
+          leaseExpiresAt: ownership.owner?.leaseExpiresAt?.toISOString() ?? null,
+        },
+      });
+    }
+
     const requestContextToUse = requestContext ?? new RequestContext();
     for (const [key, value] of Object.entries(snapshot.requestContext ?? {})) {
       if (key !== MASTRA_AUTH_ORGANIZATION_KEY && !(requestContextToUse as RequestContext).has(key)) {
@@ -6986,40 +7096,48 @@ export class Run<
       });
     } catch (error) {
       workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
+      // The restart never executes: hand the boot-recovery lease back (upstream #25579).
+      await ownership.release();
       throw error;
     }
 
     this.adoptLifecycleExecution(lifecycleExecution);
     this.workflowRunSpan = workflowSpan;
 
-    const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
-      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-        workflowId: this.workflowId,
-        runId: this.runId,
-        parentWorkflow: this.parentWorkflow,
-        ...lifecycleExecution,
-        resourceId: this.resourceId,
-        disableScorers: this.disableScorers,
-        graph: this.executionGraph,
-        serializedStepGraph: this.serializedStepGraph,
-        restart: restartData,
-        pubsub: this.pubsub,
-        retryConfig: this.retryConfig,
-        requestContext: requestContextToUse as RequestContext,
-        actor,
-        abortController: this.abortController,
-        outputWriter,
-        outputOptions,
-        workflowSpan,
-        commitTerminalStatus: status =>
-          this.commitTerminalStatus(
-            lifecycleExecution.executionGeneration,
-            status,
-            lifecycleExecution.lifecycleResumeAttempt,
-          ),
-        isCancellationAdmitted: this.isCancellationAdmitted,
-      }),
-    );
+    let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
+    try {
+      result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+        this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+          workflowId: this.workflowId,
+          runId: this.runId,
+          parentWorkflow: this.parentWorkflow,
+          ...lifecycleExecution,
+          resourceId: this.resourceId,
+          disableScorers: this.disableScorers,
+          graph: this.executionGraph,
+          serializedStepGraph: this.serializedStepGraph,
+          restart: restartData,
+          pubsub: this.pubsub,
+          retryConfig: this.retryConfig,
+          requestContext: requestContextToUse as RequestContext,
+          actor,
+          abortController: this.abortController,
+          outputWriter,
+          outputOptions,
+          workflowSpan,
+          commitTerminalStatus: status =>
+            this.commitTerminalStatus(
+              lifecycleExecution.executionGeneration,
+              status,
+              lifecycleExecution.lifecycleResumeAttempt,
+            ),
+          isCancellationAdmitted: this.isCancellationAdmitted,
+        }),
+      );
+    } finally {
+      // Upstream #25579: the restart held the boot-recovery ownership lease while it ran.
+      await ownership.release();
+    }
 
     if (
       result.status !== 'suspended' &&
@@ -7209,6 +7327,8 @@ export class Run<
     let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
     try {
       result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
+        // Upstream #25579: hold the boot-recovery ownership lease while this process drives the run.
+        this.#executeOwned(() =>
         this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
           workflowId: this.workflowId,
           runId: this.runId,
@@ -7235,7 +7355,8 @@ export class Run<
               lifecycleExecution.lifecycleResumeAttempt,
             ),
           isCancellationAdmitted: this.isCancellationAdmitted,
-        }),
+          }),
+        ),
       );
     } catch (error) {
       await releaseTimeTravelClaimIfUnused();
@@ -7365,7 +7486,7 @@ export class Run<
           ...observabilityContext,
           tracingOptions,
           outputWriter: async chunk => {
-            void controller.enqueue(chunk);
+            controller.enqueue(chunk);
           },
           outputOptions,
           perStep,

@@ -1,9 +1,13 @@
 import type { OutputResult, Processor, ProcessorSpanPhase } from '..';
-import { getLogicalMessageId, MessageList, type MastraDBMessage } from '../../agent/message-list';
+import { getLogicalMessageId, MessageList } from '../../agent/message-list';
+import type { MastraDBMessage } from '../../agent/message-list';
 import { isTransientSignalMessage, isUserAuthoredMessage } from '../../agent/signals';
 import { materializeTerminalToolResult } from '../../loop/shared/terminal-tool-result';
-import { loadMessageHistory, parseMemoryRequestContext } from '../../memory';
+// Direct modules, not the memory barrel: the barrel re-exports MockMemory, whose
+// `extends MastraMemory` breaks when this processor is reached mid-cycle.
+import { loadMessageHistory } from '../../memory/load-message-history';
 import { getMemoryTokenBoundary, isAfterMemoryTokenBoundary } from '../../memory/message-history-config';
+import { parseMemoryRequestContext } from '../../memory/types';
 import {
   removeWorkingMemoryTags,
   removeWorkingMemoryToolInvocationParts,
@@ -388,83 +392,79 @@ export class MessageHistory implements Processor {
     this.assertSourceWriteReady(this.getSourceWriteGuard(messageList));
     const memoryRunState = parseMemoryRequestContext(requestContext)?.runState?.();
 
+    // The runner records failures on this span and ends it.
     const span = this.memorySpan(observabilityContext);
     span?.update({ attributes: { lastMessages: this.lastMessages } });
 
-    try {
-      // 1. Fetch historical messages from storage (as DB format)
-      const storedBoundary = getMemoryTokenBoundary(parseMemoryRequestContext(requestContext)?.thread);
-      const boundary =
-        this.tokenLimit &&
-        storedBoundary?.maxTokens === this.tokenLimit.maxTokens &&
-        storedBoundary.atMaxRemoveTokens === this.tokenLimit.atMaxRemoveTokens
-          ? storedBoundary
-          : undefined;
-      const cacheKey = `history:${threadId}:${resourceId ?? ''}:${this.lastMessages ?? 'all'}:${JSON.stringify(boundary)}`;
-      const loadMessages = async () => {
-        if (this.tokenLimit) {
-          const result = await loadMessageHistory({
-            storage: this.storage,
-            threadId,
-            resourceId,
-            boundary,
-            maxMessages: typeof this.lastMessages === 'number' ? this.lastMessages : undefined,
-            maxTokens: this.tokenLimit.maxTokens,
-            atMaxRemoveTokens: this.tokenLimit.atMaxRemoveTokens,
-            tokenCounter: this.tokenCounter,
-            includeOverflow: true,
-          });
-          return [...result.overflow, ...result.messages].reverse();
-        }
-
-        const result = await this.storage.listMessages({
+    // 1. Fetch historical messages from storage (as DB format)
+    const storedBoundary = getMemoryTokenBoundary(parseMemoryRequestContext(requestContext)?.thread);
+    const boundary =
+      this.tokenLimit &&
+      storedBoundary?.maxTokens === this.tokenLimit.maxTokens &&
+      storedBoundary.atMaxRemoveTokens === this.tokenLimit.atMaxRemoveTokens
+        ? storedBoundary
+        : undefined;
+    const cacheKey = `history:${threadId}:${resourceId ?? ''}:${this.lastMessages ?? 'all'}:${JSON.stringify(boundary)}`;
+    const loadMessages = async () => {
+      if (this.tokenLimit) {
+        const result = await loadMessageHistory({
+          storage: this.storage,
           threadId,
           resourceId,
-          page: 0,
-          perPage: this.lastMessages,
-          orderBy: { field: 'createdAt', direction: 'DESC' },
-          // Last-N history read only consumes `messages`; skip the COUNT(*) work.
-          includeTotal: false,
+          boundary,
+          maxMessages: typeof this.lastMessages === 'number' ? this.lastMessages : undefined,
+          maxTokens: this.tokenLimit.maxTokens,
+          atMaxRemoveTokens: this.tokenLimit.atMaxRemoveTokens,
+          tokenCounter: this.tokenCounter,
+          includeOverflow: true,
         });
-        return result.messages;
-      };
-      const messages = memoryRunState ? await memoryRunState.load(cacheKey, loadMessages) : await loadMessages();
+        return [...result.overflow, ...result.messages].reverse();
+      }
 
-      // 2. Filter out system messages (they should never be stored in DB)
-      const filteredMessages = messages.filter((msg: MastraDBMessage) => {
-        return msg.role !== 'system' && (!boundary || isAfterMemoryTokenBoundary(msg, boundary));
-      });
-
-      // A background task's result is written into its original tool-call message, which keeps
-      // its dispatch-time createdAt. The continuation turn that reports the result must still see
-      // it, so load those messages even when they fall outside the history window.
-      const pinnedMessages = await this.loadContinuationToolCallMessages(
-        requestContext,
+      const result = await this.storage.listMessages({
         threadId,
         resourceId,
-        filteredMessages,
-      );
-      if (pinnedMessages.length) {
-        const fitted = await this.fitPinnedMessages(filteredMessages, pinnedMessages);
-        filteredMessages.splice(0, filteredMessages.length, ...fitted.history, ...fitted.pinned);
-        filteredMessages.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      }
+        page: 0,
+        perPage: this.lastMessages,
+        orderBy: { field: 'createdAt', direction: 'DESC' },
+        // Last-N history read only consumes `messages`; skip the COUNT(*) work.
+        includeTotal: false,
+      });
+      return result.messages;
+    };
+    const messages = memoryRunState ? await memoryRunState.load(cacheKey, loadMessages) : await loadMessages();
 
-      // 3. Add stored history in chronological order. MessageList layers any matching
-      // input copy onto the stored message so memory remains the authoritative base.
-      const chronologicalMessages = filteredMessages.reverse();
+    // 2. Filter out system messages (they should never be stored in DB)
+    const filteredMessages = messages.filter((msg: MastraDBMessage) => {
+      return msg.role !== 'system' && (!boundary || isAfterMemoryTokenBoundary(msg, boundary));
+    });
 
-      for (const msg of chronologicalMessages) {
-        messageList.add(msg, 'memory');
-      }
-
-      span?.update({ attributes: { messageCount: chronologicalMessages.length } });
-
-      return messageList;
-    } catch (error) {
-      // The runner records the failure on this span and ends it.
-      throw error;
+    // A background task's result is written into its original tool-call message, which keeps
+    // its dispatch-time createdAt. The continuation turn that reports the result must still see
+    // it, so load those messages even when they fall outside the history window.
+    const pinnedMessages = await this.loadContinuationToolCallMessages(
+      requestContext,
+      threadId,
+      resourceId,
+      filteredMessages,
+    );
+    if (pinnedMessages.length) {
+      const fitted = await this.fitPinnedMessages(filteredMessages, pinnedMessages);
+      filteredMessages.splice(0, filteredMessages.length, ...fitted.history, ...fitted.pinned);
+      filteredMessages.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     }
+
+    // 3. Add stored history in chronological order. MessageList layers any matching
+    // input copy onto the stored message so memory remains the authoritative base.
+    const chronologicalMessages = filteredMessages.reverse();
+
+    for (const msg of chronologicalMessages) {
+      messageList.add(msg, 'memory');
+    }
+
+    span?.update({ attributes: { messageCount: chronologicalMessages.length } });
+
+    return messageList;
   }
 
   /**
@@ -512,23 +512,41 @@ export class MessageHistory implements Processor {
             );
             newMessage.content.toolInvocations = removeWorkingMemoryToolInvocations(newMessage.content.toolInvocations);
           }
-          const workingMemoryFilteredParts = new Set(removeWorkingMemoryToolInvocationParts(newMessage.content.parts));
+          const originalParts = newMessage.content.parts;
+          const filteredParts = removeWorkingMemoryToolInvocationParts(originalParts);
+          const workingMemoryFilteredParts = new Set(filteredParts);
+          // Upstream #27787 replaces the first surviving tool call of a step with a copy that
+          // carries Gemini's skip-validator signature. The fork keeps parts by identity (sealed
+          // boundaries), so map each replacement back to the original part it stands for.
+          const originalPartSet = new Set(originalParts);
+          const replacementByOriginal = new Map<(typeof originalParts)[number], (typeof originalParts)[number]>();
+          for (const filtered of filteredParts) {
+            if (originalPartSet.has(filtered) || filtered.type !== 'tool-invocation') continue;
+            const original = originalParts.find(
+              part =>
+                part.type === 'tool-invocation' &&
+                !workingMemoryFilteredParts.has(part) &&
+                part.toolInvocation.toolCallId === filtered.toolInvocation.toolCallId,
+            );
+            if (original) replacementByOriginal.set(original, filtered);
+          }
           const sealedBoundaryPart = getSealedMessageBoundary(m)?.part;
           let retainedBoundaryPart: typeof sealedBoundaryPart;
           const persistedParts: typeof newMessage.content.parts = [];
-          for (const part of newMessage.content.parts) {
+          for (const originalPart of originalParts) {
+            const part = replacementByOriginal.get(originalPart) ?? originalPart;
             if (!workingMemoryFilteredParts.has(part)) {
               if (part.type === 'tool-invocation') {
                 removedToolInvocationCoveredByPolicy ||= policyFiltersTool(part.toolInvocation.toolName);
               }
-              if (part === sealedBoundaryPart) retainedBoundaryPart = persistedParts.at(-1);
+              if (originalPart === sealedBoundaryPart) retainedBoundaryPart = persistedParts.at(-1);
               continue;
             }
             if (part.type === `tool-invocation`) {
               const shouldRemove = part.toolInvocation.state === `partial-call`;
               if (shouldRemove) {
                 removedToolInvocationCoveredByPolicy ||= policyFiltersTool(part.toolInvocation.toolName);
-                if (part === sealedBoundaryPart) retainedBoundaryPart = persistedParts.at(-1);
+                if (originalPart === sealedBoundaryPart) retainedBoundaryPart = persistedParts.at(-1);
                 continue;
               }
             }
@@ -541,7 +559,7 @@ export class MessageHistory implements Processor {
               persistedPart = { ...part, text: cleaned !== text ? cleaned.trim() : text };
             }
             persistedParts.push(persistedPart);
-            if (part === sealedBoundaryPart) retainedBoundaryPart = persistedPart;
+            if (originalPart === sealedBoundaryPart) retainedBoundaryPart = persistedPart;
           }
           newMessage.content.parts = persistedParts;
 
@@ -721,24 +739,20 @@ export class MessageHistory implements Processor {
       return messageList;
     }
 
+    // The runner records failures on this span and ends it.
     const span = this.memorySpan(observabilityContext);
     span?.update({ attributes: { messageCount: messagesToSave.length } });
 
-    try {
-      await this.persistMessages({
-        messages: messagesToSave,
-        threadId,
-        resourceId,
-        observationalMemorySourceWriteGuard: this.getSourceWriteGuard(messageList),
-      });
-      // add extra 1ms latency to make sure the next generate has not the same input
-      await new Promise(resolve => setTimeout(resolve, 10));
+    await this.persistMessages({
+      messages: messagesToSave,
+      threadId,
+      resourceId,
+      observationalMemorySourceWriteGuard: this.getSourceWriteGuard(messageList),
+    });
+    // add extra 1ms latency to make sure the next generate has not the same input
+    await new Promise(resolve => setTimeout(resolve, 10));
 
-      return messageList;
-    } catch (error) {
-      // The runner records the failure on this span and ends it.
-      throw error;
-    }
+    return messageList;
   }
 
   /**

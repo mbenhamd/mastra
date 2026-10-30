@@ -10,6 +10,7 @@ import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
 import type { MastraEmbeddingModel, MastraEmbeddingOptions, MastraVector } from '../../vector';
 import { globalEmbeddingCache } from './embedding-cache';
+import { assertEmbeddingDimension, isEmbeddingDimensionMismatchError } from './embedding-dimension';
 
 const DEFAULT_TOP_K = 4;
 const DEFAULT_MESSAGE_RANGE = 1; // Will be used for both before and after
@@ -86,6 +87,12 @@ export interface SemanticRecallOptions {
    * ```
    */
   embedderOptions?: MastraEmbeddingOptions;
+
+  /**
+   * Expected embedding dimension. When set, an embedding of any other length throws
+   * before the vector index is created or queried.
+   */
+  embeddingDimension?: number;
 }
 
 /**
@@ -129,6 +136,7 @@ export class SemanticRecall implements Processor {
   private indexName?: string;
   private logger?: IMastraLogger;
   private embedderOptions?: MastraEmbeddingOptions;
+  private embeddingDimension?: number;
 
   // xxhash-wasm hasher instance (initialized as a promise)
   private hasher = xxhash();
@@ -155,6 +163,7 @@ export class SemanticRecall implements Processor {
     this.indexName = options.indexName;
     this.logger = options.logger;
     this.embedderOptions = options.embedderOptions;
+    this.embeddingDimension = options.embeddingDimension;
 
     // Normalize messageRange to object format
     if (typeof options.messageRange === 'number') {
@@ -248,6 +257,7 @@ export class SemanticRecall implements Processor {
       }
       return messageList;
     } catch (error) {
+      if (isEmbeddingDimensionMismatchError(error)) throw error;
       // Log error but don't fail the request
       this.logger?.error('[SemanticRecall] Error during semantic search:', { error });
       return messageList;
@@ -601,6 +611,8 @@ export class SemanticRecall implements Processor {
       return;
     }
 
+    assertEmbeddingDimension(this.embeddingDimension, dimension);
+
     // Check cache first - if already validated in this process, skip
     const cached = this.indexValidationCache.get(indexName);
     if (cached?.dimension === dimension) {
@@ -759,6 +771,7 @@ export class SemanticRecall implements Processor {
         });
       }
     } catch (error) {
+      if (isEmbeddingDimensionMismatchError(error)) throw error;
       // Log error but don't fail the entire operation
       this.logger?.error('[SemanticRecall] Error in processOutputResult:', { error });
     }

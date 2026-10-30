@@ -27,7 +27,7 @@ import {
   parseMultiThreadObserverOutput,
   describeDegenerateOutput,
 } from './observer-agent';
-import { assertCompleteModelResponse, withRetry } from './retry';
+import { assertCompleteModelResponse, RETRY_CONFIG, withRetry } from './retry';
 import { createTemporaryOmMemoryContext } from './temporary-memory';
 import type { TokenCounter } from './token-counter';
 import { withOmTracingSpan } from './tracing';
@@ -355,7 +355,7 @@ export class ObserverRunner {
 
     const doGenerate = async () => {
       return withRetry(
-        operationAbortSignal =>
+        (attemptSignal, onActivity) =>
           withOmTracingSpan({
             phase: 'observer',
             model: resolvedModel.model,
@@ -386,7 +386,8 @@ export class ObserverRunner {
                     modelSettings: { ...this.observationConfig.modelSettings, maxRetries: 0 },
                     providerOptions: this.observationConfig.providerOptions as any,
                     ...(attemptMemory ? { memory: attemptMemory } : {}),
-                    abortSignal: operationAbortSignal,
+                    abortSignal: attemptSignal,
+                    onChunk: onActivity,
                     ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                     ...childObservabilityContext,
                   });
@@ -403,16 +404,17 @@ export class ObserverRunner {
                     observedMessageCount: messagesToObserve.length,
                     providerOptionProviders: Object.keys(this.observationConfig.providerOptions ?? {}),
                     hasRequestContext: Boolean(internalRequestContext),
-                    aborted: operationAbortSignal?.aborted ?? false,
+                    aborted: attemptSignal.aborted,
                   });
                   if (abortSignal?.aborted || !isOmModelExecutionFailure(error)) throw error;
                   throw new OmModelExecutionError('observer-model', error);
                 }
-              }, operationAbortSignal),
+              }, attemptSignal),
           }),
         {
           label: 'observer',
           abortSignal,
+          idleTimeoutMs: RETRY_CONFIG.modelCallIdleTimeoutMs,
           maxRetries: this.observationConfig.maxRetries,
         },
       );
@@ -704,7 +706,7 @@ export class ObserverRunner {
 
     const doGenerate = async () => {
       return withRetry(
-        operationAbortSignal =>
+        (attemptSignal, onActivity) =>
           withOmTracingSpan({
             phase: 'observer-multi-thread',
             model: resolvedModel.model,
@@ -733,7 +735,8 @@ export class ObserverRunner {
                     // OM owns the retry budget; avoid multiplying provider attempts.
                     modelSettings: { ...this.observationConfig.modelSettings, maxRetries: 0 },
                     providerOptions: this.observationConfig.providerOptions as any,
-                    abortSignal: operationAbortSignal,
+                    abortSignal: attemptSignal,
+                    onChunk: onActivity,
                     ...(internalRequestContext ? { requestContext: internalRequestContext } : {}),
                     ...childObservabilityContext,
                   });
@@ -752,16 +755,17 @@ export class ObserverRunner {
                     },
                     providerOptionProviders: Object.keys(this.observationConfig.providerOptions ?? {}),
                     hasRequestContext: Boolean(internalRequestContext),
-                    aborted: operationAbortSignal?.aborted ?? false,
+                    aborted: attemptSignal.aborted,
                   });
                   if (abortSignal?.aborted || !isOmModelExecutionFailure(error)) throw error;
                   throw new OmModelExecutionError('observer-model', error);
                 }
-              }, operationAbortSignal),
+              }, attemptSignal),
           }),
         {
           label: 'observer-multi-thread',
           abortSignal,
+          idleTimeoutMs: RETRY_CONFIG.modelCallIdleTimeoutMs,
           maxRetries: this.observationConfig.maxRetries,
         },
       );

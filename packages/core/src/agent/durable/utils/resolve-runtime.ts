@@ -370,8 +370,11 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   const hasHydratedEntry = isHydratedRegistryEntry(globalEntry);
   if (globalEntry && hasHydratedEntry && input.options?.toolSurfaceFence !== undefined) {
     // This also rejects stale persisted name ceilings whose concrete tool was
-    // omitted or replaced with an accessor/undefined registry value.
-    createToolSurfaceFence(globalEntry.tools, input.options.toolSurfaceFence);
+    // omitted or replaced with an accessor/undefined registry value. Validate
+    // against the run's full catalog: `tools` may hold the previous step's
+    // processor-narrowed snapshot (#22933), which legitimately omits names the
+    // ceiling still allows (PF-2040: processors narrow the provided view).
+    createToolSurfaceFence(globalEntry.baseTools ?? globalEntry.tools, input.options.toolSurfaceFence);
   }
   if (!hasHydratedEntry && input.runtimeResolution === 'registry-required') {
     throw new MastraError({

@@ -37,8 +37,8 @@ import {
   AGENT_EXECUTION_OPTION_COMPOSERS,
   AGENT_RESPONSE_RECOVERY_CONTINUATION,
   AGENT_RESPONSE_RECOVERY_STEP,
-  type AgentExecutionOptionComposers,
 } from '../../agent/merge-execution-options';
+import type { AgentExecutionOptionComposers } from '../../agent/merge-execution-options';
 import { normalizeLogicalMessageInputIdentity, normalizeLogicalMessageIdentity } from '../../agent/message-list';
 import type { LogicalMessageIdentity, LogicalMessageSignalIdentity } from '../../agent/message-list';
 import { createSignal } from '../../agent/signals';
@@ -10187,7 +10187,7 @@ export class Session {
         streamStarted = true;
       }
       const full = await Promise.race([completion, activeTurnWaiter.promise]);
-      try {
+      {
         if (full.finishReason === 'suspended') {
           await this._captureMessageSuspendWithTokenUsage(
             full,
@@ -10232,8 +10232,6 @@ export class Session {
             activeTurnWaiter.promise,
           ]);
         }
-      } catch (err) {
-        throw err;
       }
       this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
       agentEndEmitted = true;

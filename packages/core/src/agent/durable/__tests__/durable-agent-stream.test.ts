@@ -879,6 +879,50 @@ describe('DurableAgent streaming execution', () => {
       expect(await memory.getThreadById({ threadId: 'existing-preparation-thread' })).not.toBeNull();
     });
 
+    it('records the effective owner in both live registries while streaming', async () => {
+      const runId = 'stream-effective-owner';
+      let liveOwners: (string | undefined)[] = [];
+      const doStream = vi.fn(async () => {
+        liveOwners = [durableAgent.runRegistry.get(runId)?.agentId, globalRunRegistry.get(runId)?.agentId];
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+            { type: 'text-start', id: 'text-1' },
+            { type: 'text-delta', id: 'text-1', delta: 'Done' },
+            { type: 'text-end', id: 'text-1' },
+            {
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+          ]),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+        };
+      });
+
+      const mockModel = new MockLanguageModelV2({ doStream });
+      const baseAgent = new Agent({
+        id: 'wrapped-stream-agent',
+        name: 'Stream Owner Agent',
+        instructions: 'Respond briefly',
+        model: mockModel as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub, id: 'public-stream-agent' });
+
+      const { output, cleanup } = await durableAgent.stream('Say hello', { runId });
+
+      try {
+        await output.consumeStream();
+
+        expect(durableAgent.id).not.toBe(baseAgent.id);
+        expect(liveOwners).toEqual([durableAgent.id, durableAgent.id]);
+        expect(doStream).toHaveBeenCalledTimes(1);
+      } finally {
+        cleanup();
+      }
+    });
+
     it('should allow input processors to clear activeTools for LLM request and tool execution', async () => {
       let callCount = 0;
       const doStream = vi.fn(async () => {
@@ -1371,7 +1415,7 @@ describe('DurableAgent memory integration', () => {
 
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const { threadId, resourceId, cleanup } = await durableAgent.stream('Test', {
+    const { threadId, resourceId, cleanup, output } = await durableAgent.stream('Test', {
       memory: {
         thread: 'thread-123',
         resource: 'user-456',
@@ -1381,6 +1425,10 @@ describe('DurableAgent memory integration', () => {
     expect(threadId).toBe('thread-123');
     expect(resourceId).toBe('user-456');
 
+    // PF-6640 (sync): drain the run before cleanup. Each step now re-checks its
+    // ownership against storage, so an undrained run outlives the test and its
+    // late steps reseed this file's deterministic run id in the next test.
+    await output.consumeStream();
     cleanup();
   });
 
@@ -1396,7 +1444,7 @@ describe('DurableAgent memory integration', () => {
 
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const { runId, cleanup } = await durableAgent.stream('Test', {
+    const { runId, cleanup, output } = await durableAgent.stream('Test', {
       memory: {
         thread: 'my-thread',
         resource: 'my-user',
@@ -1409,6 +1457,10 @@ describe('DurableAgent memory integration', () => {
       resourceId: 'my-user',
     });
 
+    // PF-6640 (sync): drain the run before cleanup. Each step now re-checks its
+    // ownership against storage, so an undrained run outlives the test and its
+    // late steps reseed this file's deterministic run id in the next test.
+    await output.consumeStream();
     cleanup();
   });
 
@@ -1424,11 +1476,15 @@ describe('DurableAgent memory integration', () => {
 
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const { threadId, resourceId, cleanup } = await durableAgent.stream('Test');
+    const { threadId, resourceId, cleanup, output } = await durableAgent.stream('Test');
 
     expect(threadId).toBeUndefined();
     expect(resourceId).toBeUndefined();
 
+    // PF-6640 (sync): drain the run before cleanup. Each step now re-checks its
+    // ownership against storage, so an undrained run outlives the test and its
+    // late steps reseed this file's deterministic run id in the next test.
+    await output.consumeStream();
     cleanup();
   });
 
@@ -1444,7 +1500,7 @@ describe('DurableAgent memory integration', () => {
 
     const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
 
-    const { threadId, cleanup } = await durableAgent.stream('Test', {
+    const { threadId, cleanup, output } = await durableAgent.stream('Test', {
       memory: {
         thread: { id: 'thread-from-object' },
         resource: 'user-123',
@@ -1453,6 +1509,10 @@ describe('DurableAgent memory integration', () => {
 
     expect(threadId).toBe('thread-from-object');
 
+    // PF-6640 (sync): drain the run before cleanup. Each step now re-checks its
+    // ownership against storage, so an undrained run outlives the test and its
+    // late steps reseed this file's deterministic run id in the next test.
+    await output.consumeStream();
     cleanup();
   });
 });

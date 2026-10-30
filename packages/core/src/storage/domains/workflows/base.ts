@@ -86,6 +86,7 @@ import type {
   ListWorkflowRunsByThreadForErasureResult,
   WorkflowExecutionState,
 } from '../../types';
+import type { WorkflowStepStartGuard, WorkflowStepCompletionGuard } from '../../workflow-step-guard';
 import { StorageDomain } from '../base';
 
 export abstract class WorkflowsStorage extends StorageDomain {
@@ -329,6 +330,11 @@ export abstract class WorkflowsStorage extends StorageDomain {
     return { status: 'unsupported' };
   }
 
+  /** Atomic occurrence checks for evented step writes and replay-safe continuation. */
+  supportsWorkflowStepGuards(): boolean {
+    return false;
+  }
+
   /**
    * Whether this adapter implements run ownership: the claim/renew/release
    * operations below, and rejecting writes whose fence is no longer the run's
@@ -425,6 +431,8 @@ export abstract class WorkflowsStorage extends StorageDomain {
      */
     state?: Record<string, any>;
     fence?: RunFence;
+    startGuard?: WorkflowStepStartGuard;
+    completionGuard?: WorkflowStepCompletionGuard;
   }): Promise<UpdateWorkflowResultsResult>;
 
   abstract updateWorkflowState({

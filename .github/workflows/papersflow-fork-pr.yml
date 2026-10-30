@@ -139,6 +139,7 @@ jobs:
             "$VALIDATION_LANE" == 'pf2247-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf3020-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf4051-upstream-sync' || \
+            "$VALIDATION_LANE" == 'pf6640-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf5928-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf4402-upstream-sync' || \
             "$VALIDATION_LANE" == 'pf3375-upstream-sync' || \
@@ -234,6 +235,20 @@ jobs:
             exit 1
           fi
           /bin/bash "$pf2576_policy_script" --self-test-pf2576-upstream-sync
+
+          pf6640_policy_script="${RUNNER_TEMP}/pf6640-policy-self-test.bash"
+          if grep -Fq -- '--self-test-pf6640-upstream-sync' "$policy_script"; then
+            cp "$policy_script" "$pf6640_policy_script"
+          elif [[ "$HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" && \
+            "$HEAD_REF" == 'ci/pf-6640-upstream-sync-validation' && \
+            "$BASE_REF" == 'main' ]]; then
+            echo 'Bootstrapping the PF-6640 exact-merge fixtures from this same-repository policy PR.'
+            /usr/bin/git show "${HEAD_SHA}:${script_path}" > "$pf6640_policy_script"
+          else
+            echo 'The trusted base does not contain the PF-6640 admission fixtures.' >&2
+            exit 1
+          fi
+          /bin/bash "$pf6640_policy_script" --self-test-pf6640-upstream-sync
 
           pf5928_policy_script="${RUNNER_TEMP}/pf5928-policy-self-test.bash"
           if grep -Fq -- '--self-test-pf5928-upstream-sync' "$policy_script"; then
@@ -595,6 +610,10 @@ jobs:
             pf2576-upstream-sync)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
                 --validate-pf2576-upstream-sync
+              ;;
+            pf6640-upstream-sync)
+              /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \
+                --validate-pf6640-upstream-sync
               ;;
             pf5928-upstream-sync)
               /bin/bash "${RUNNER_TEMP}/run-papersflow-fork-pr-validation.bash" \

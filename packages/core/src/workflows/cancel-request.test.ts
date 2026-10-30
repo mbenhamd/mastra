@@ -64,7 +64,12 @@ function createStagedWorkflow(probe: Probe) {
     inputSchema: z.object({ topic: z.string() }),
     outputSchema: z.object({ topic: z.string() }),
     steps: [stageOne, stageTwo],
-    options: { validateInputs: false },
+    // PF-6181 (PF-6640 sync): upstream #25579's per-run ownership lease would
+    // keep the in-process "dead" owner's lease alive, so a survivor's restart
+    // is refused with WORKFLOW_RESTART_RUN_OWNED before it can move the
+    // lineage. These cases simulate an owner whose process is gone (its lease
+    // expired), so they opt out of the lease and pin the lineage fences.
+    options: { validateInputs: false, autoRestartActiveRuns: false },
   })
     .then(stageOne)
     .then(stageTwo)

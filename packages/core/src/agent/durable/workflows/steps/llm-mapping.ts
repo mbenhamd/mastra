@@ -1,3 +1,4 @@
+import { compactDurableStepContent } from '@internal/core/durable';
 import { z } from 'zod';
 import { MastraFGAPermissions } from '../../../../auth/ee';
 import type { PubSub } from '../../../../events/pubsub';
@@ -10,8 +11,8 @@ import {
   resolveTerminalToolResult,
 } from '../../../../loop/shared/terminal-tool-result';
 import type { Mastra } from '../../../../mastra';
-import { SpanType } from '../../../../observability';
-import type { ExportedSpan } from '../../../../observability';
+import type { SpanType, ExportedSpan } from '../../../../observability';
+import { extractUsageMetrics } from '../../../../observability/usage';
 import { persistProcessorDataChunk } from '../../../../stream/base/output';
 import { ChunkFrom } from '../../../../stream/types';
 import {
@@ -64,6 +65,7 @@ const durableLLMMappingOutputSchema = z.object({
     toolCalls: z.array(z.any()).optional(),
     usage: z.any(),
     steps: z.array(z.any()),
+    content: z.array(z.any()).optional(),
   }),
   state: z.any(),
   delegationBailed: z.boolean().optional(),
@@ -528,6 +530,9 @@ export function createDurableLLMMappingStep() {
             totalTokens: undefined,
           },
           steps: [], // Steps are accumulated at the loop level
+          // Recorded on the step record; stopWhen reads it, and the deferred
+          // step-finish chunk returns it as stream.steps content.
+          content: compactDurableStepContent(messageList.get.response.aiV5.modelContent(-1), toolResults),
         },
         state: {
           ...state,
@@ -557,7 +562,7 @@ export function createDurableLLMMappingStep() {
               toolCalls: llmOutput.toolCalls,
             },
             attributes: {
-              usage: pendingPayload?.output?.usage,
+              usage: extractUsageMetrics(pendingPayload?.output?.usage, pendingPayload?.metadata?.providerMetadata),
               finishReason: pendingPayload?.stepResult?.reason,
               isContinued: pendingPayload?.stepResult?.isContinued,
             },

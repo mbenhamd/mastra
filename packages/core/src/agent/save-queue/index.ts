@@ -13,10 +13,12 @@ export interface FlushMessagesOptions {
   /**
    * Runs inside the thread's save queue, immediately before unsaved messages
    * are drained. A rejection skips the save, leaves the messages unsaved, and
-   * rejects the flush with that error. Storage errors are still logged, not
-   * thrown, except a run fence conflict, which rejects the flush like the guard.
+   * rejects the flush with that error. Unless throwOnError is enabled, storage
+   * errors are logged, except a run fence conflict, which rejects like the guard.
    */
   beforePersist?: () => Promise<void>;
+  /** Reject this flush on storage failure without rejecting the shared queue. */
+  throwOnError?: boolean;
 }
 
 export class SaveQueueManager {
@@ -96,19 +98,21 @@ export class SaveQueueManager {
       strictSnapshot?: UnsavedMessageSnapshot;
       observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard;
       beforePersist?: FlushMessagesOptions['beforePersist'];
+      throwOnError?: FlushMessagesOptions['throwOnError'];
     },
   ) {
     const prev = this.saveQueues.get(threadId) || Promise.resolve();
     const beforePersist = options?.beforePersist;
-    let guardFailed = false;
-    let guardError: unknown;
+    const throwOnError = options?.throwOnError ?? false;
+    let saveFailed = false;
+    let saveError: unknown;
     const operation = prev.then(async () => {
       if (beforePersist) {
         try {
           await beforePersist();
         } catch (err) {
-          guardFailed = true;
-          guardError = err;
+          saveFailed = true;
+          saveError = err;
           return;
         }
       }
@@ -124,11 +128,10 @@ export class SaveQueueManager {
     });
     const next = operation
       .catch(err => {
-        // Storage refused the write because the guarded run lost ownership.
-        // That is the guard failing late, so the caller must see it too.
-        if (beforePersist && isRunFenceConflictError(err)) {
-          guardFailed = true;
-          guardError = err;
+        // Strict callers need storage failures too; the queue itself must still resolve.
+        if (throwOnError || (beforePersist && isRunFenceConflictError(err))) {
+          saveFailed = true;
+          saveError = err;
           return;
         }
         this.logger?.error?.('Error in enqueueSave', { err, threadId });
@@ -142,14 +145,14 @@ export class SaveQueueManager {
     // Fork: strict saves are fail-closed; storage errors propagate to the caller.
     if (options?.strictSnapshot) {
       return operation.then(() => {
-        if (guardFailed) throw guardError;
+        if (saveFailed) throw saveError;
       });
     }
     // The queue chain itself never rejects, so later saves aren't poisoned;
-    // only this caller sees the guard's rejection.
-    if (!beforePersist) return next;
+    // only this caller sees the guard or strict save rejection.
+    if (!beforePersist && !throwOnError) return next;
     return next.then(() => {
-      if (guardFailed) throw guardError;
+      if (saveFailed) throw saveError;
     });
   }
 
@@ -192,6 +195,9 @@ export class SaveQueueManager {
     const snapshot = messageList.snapshotUnsavedMessages({ detached: true });
     const newMessages = filterMessagesForPersistence(snapshot.messages);
     if (newMessages.length > 0 && this.memory) {
+      // Fork: the snapshot is acknowledged only after storage confirms the write
+      // (below), so a failed save leaves these messages unsaved for a later retry
+      // (the same guarantee upstream #27549 gets from drainUnsavedMessagesForSave().restore).
       const saved = await this.memory.saveMessages({
         messages: newMessages,
         memoryConfig,
@@ -271,7 +277,10 @@ export class SaveQueueManager {
   ) {
     if (!threadId) return;
     this.clearDebounce(threadId);
-    return this.enqueueSave(threadId, messageList, memoryConfig, { beforePersist: options?.beforePersist });
+    return this.enqueueSave(threadId, messageList, memoryConfig, {
+      beforePersist: options?.beforePersist,
+      throwOnError: options?.throwOnError,
+    });
   }
 
   /**
