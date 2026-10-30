@@ -104,6 +104,8 @@ import type {
   HarnessTerminalFailReceipt,
   HarnessTerminalGrantRevocationInput,
   HarnessTerminalGrantRevocationReceipt,
+  HarnessTerminalGuardedGrantRevocationReceipt,
+  HarnessTerminalUnguardedGrantRevocationInput,
   HarnessTerminalHandoffOption,
   HarnessTerminalIdentity,
   HarnessTerminalIntent,
@@ -1398,6 +1400,7 @@ export class InMemoryHarness extends HarnessStorage {
       childrenByParent.set(record.parentSessionId, siblings);
     }
     const descendants: SessionRecord[] = [];
+    const fencedDescendantIds: string[] = [];
     const queue = [rootSessionId];
     const visited = new Set<string>([rootSessionId]);
     while (queue.length > 0) {
@@ -1405,13 +1408,33 @@ export class InMemoryHarness extends HarnessStorage {
       for (const child of childrenByParent.get(parentId) ?? []) {
         if (visited.has(child.id)) continue;
         visited.add(child.id);
-        queue.push(child.id);
-        if (child.closedAt !== undefined || child.closingAt !== undefined) continue; // closed/closing → no live lease
+        if (child.closedAt !== undefined || child.closingAt !== undefined) {
+          queue.push(child.id); // closed/closing → no live lease, but its children may hold one
+          continue;
+        }
         // A descendant owned by a different instance means the subtree was
         // split — fence rather than silently renew a foreign lease.
         if (child.ownerId !== ownerId) {
           throw new HarnessStorageLeaseConflictError(child.id, child.ownerId ?? '<unowned>', child.leaseExpiresAt ?? 0);
         }
+        // A lapsed descendant is re-adopted, unless a grant revocation already
+        // acted on that lapse: the recovery that revoked it decided the owner
+        // was gone. It and every open session below it are left out of the
+        // pass (not renewed, not failing it), so the root stays renewable.
+        if (this.revokedSinceLeaseLapsed(namespace, child, now)) {
+          fencedDescendantIds.push(child.id);
+          const below = [child.id];
+          while (below.length > 0) {
+            for (const nested of childrenByParent.get(below.shift()!) ?? []) {
+              if (visited.has(nested.id)) continue;
+              visited.add(nested.id);
+              below.push(nested.id);
+              if (nested.closedAt === undefined && nested.closingAt === undefined) fencedDescendantIds.push(nested.id);
+            }
+          }
+          continue;
+        }
+        queue.push(child.id);
         descendants.push(child);
       }
     }
@@ -1428,7 +1451,33 @@ export class InMemoryHarness extends HarnessStorage {
         cloneSessionRecord({ ...descendant, leaseExpiresAt: expiresAt }),
       );
     }
-    return { version: root.version, expiresAt, renewedDescendantCount: descendants.length };
+    return {
+      version: root.version,
+      expiresAt,
+      renewedDescendantCount: descendants.length,
+      // Sorted, so the report does not depend on walk order.
+      ...(fencedDescendantIds.length > 0 ? { fencedDescendantIds: [...fencedDescendantIds].sort() } : {}),
+    };
+  }
+
+  /**
+   * Whether a pre-admission grant revocation (a tombstone without an
+   * incarnation) was written for `session` at or after its lapsed lease's expiry.
+   */
+  private revokedSinceLeaseLapsed(namespace: string, session: SessionRecord, now: number): boolean {
+    const expiresAt = session.leaseExpiresAt;
+    if (expiresAt === undefined || expiresAt > now) return false;
+    for (const tombstone of this.db.harnessTerminalTombstones.values()) {
+      if (
+        tombstone.harnessName === namespace &&
+        tombstone.sessionId === session.id &&
+        tombstone.sessionIncarnation === undefined &&
+        tombstone.createdAt >= expiresAt
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async releaseSessionLease({ sessionId, ownerId, harnessName }: ReleaseSessionLeaseInput): Promise<void> {
@@ -2241,9 +2290,15 @@ export class InMemoryHarness extends HarnessStorage {
     };
   }
 
+  revokeTerminalGrant(
+    input: HarnessTerminalUnguardedGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt>;
+  revokeTerminalGrant(
+    input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt>;
   async revokeTerminalGrant(
     input: HarnessTerminalGrantRevocationInput,
-  ): Promise<HarnessTerminalGrantRevocationReceipt> {
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt> {
     this.assertTerminalHandoffEnabled();
     const namespace = resolveHarnessName(input.harnessName, this.harnessName);
     validateHarnessTerminalExecutionGrant(input.executionGrant);
@@ -2254,10 +2309,23 @@ export class InMemoryHarness extends HarnessStorage {
     if (!Number.isSafeInteger(now) || now < 0) {
       throw new HarnessTerminalHandoffValidationError('revokedAt', 'must be a non-negative safe integer');
     }
+    if (input.requireOwnerLeaseLapsed && !input.requireOwnerLeaseLapsed.ownerId) {
+      throw new HarnessTerminalHandoffValidationError('requireOwnerLeaseLapsed', 'ownerId is required');
+    }
     // No await below: the lookups and the tombstone write are one atomic step,
-    // as the grant lock makes them in the Postgres adapter.
+    // as the grant and session locks make them in the Postgres adapter.
     const grant = { ...input.executionGrant };
     const tombstoneId = harnessTerminalGrantTombstoneId({ harnessName: namespace, executionGrant: grant });
+    if (input.requireOwnerLeaseLapsed) {
+      const session = this.db.harnessSessions.get(sessionKey(namespace, input.sessionId));
+      if (
+        session?.ownerId === input.requireOwnerLeaseLapsed.ownerId &&
+        session.leaseExpiresAt !== undefined &&
+        session.leaseExpiresAt > now
+      ) {
+        return { status: 'owner_live', grant, tombstoneId, leaseExpiresAt: session.leaseExpiresAt };
+      }
+    }
     const existing = [...this.db.harnessTerminalAdmissions.values()].find(
       candidate =>
         candidate.harnessName === namespace &&

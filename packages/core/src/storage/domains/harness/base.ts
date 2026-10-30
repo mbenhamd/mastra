@@ -25,6 +25,8 @@ import type {
   HarnessTerminalFailReceipt,
   HarnessTerminalGrantRevocationInput,
   HarnessTerminalGrantRevocationReceipt,
+  HarnessTerminalGuardedGrantRevocationReceipt,
+  HarnessTerminalUnguardedGrantRevocationInput,
   HarnessTerminalHandoffOption,
   HarnessTerminalIntent,
   HarnessTerminalIntentLoadInput,
@@ -1218,7 +1220,16 @@ export abstract class HarnessStorage extends StorageDomain {
    * owner OR when an active descendant has been claimed by a DIFFERENT instance
    * (a split subtree) — in either case it renews nothing. A same-owner
    * descendant whose mirror lapsed is re-adopted to the capped expiry (that is
-   * the §5.8 repair, not a fence). Closed/closing descendants hold no live lease
+   * the §5.8 repair, not a fence) — unless a pre-admission grant revocation
+   * (`revokeTerminalGrant`) for that descendant was written at or after its
+   * lease expiry: the revocation acted on the lapse, so that descendant and
+   * every open session below it are left out of the pass — not renewed, not
+   * counted in `renewedDescendantCount`, and listed (sorted by id) in
+   * `fencedDescendantIds` —
+   * while the root and the other descendants renew. A foreign-owned or
+   * unowned descendant below a fenced one is left out with it rather than
+   * failing the pass. Adapters check persisted tombstones regardless of their
+   * own terminal-handoff setting. Closed/closing descendants hold no live lease
    * and are skipped.
    *
    * `renewedDescendantCount` reports how many descendant entries were extended.
@@ -1474,12 +1485,21 @@ export abstract class HarnessStorage extends StorageDomain {
    * that can hand a session off to another store (execution-closure export)
    * serializes the revocation with that hand-off and throws
    * `HarnessTerminalHandoffFencedError` once the session was handed off: the
-   * fence must then be written where the session now lives. Adapters that
+   * fence must then be written where the session now lives. With
+   * `requireOwnerLeaseLapsed`, the owner's session lease is re-read under the
+   * same serialization (after any in-flight renewal commits) and a live lease
+   * answers `owner_live` without writing a tombstone. Adapters that
    * implement it override `supportsTerminalGrantRevocation`.
    */
+  revokeTerminalGrant(
+    input: HarnessTerminalUnguardedGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt>;
+  revokeTerminalGrant(
+    input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt>;
   async revokeTerminalGrant(
     _input: HarnessTerminalGrantRevocationInput,
-  ): Promise<HarnessTerminalGrantRevocationReceipt> {
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt> {
     throw new HarnessTerminalHandoffUnsupportedError();
   }
 

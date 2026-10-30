@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { createEmptyWorkflowSnapshot, createWorkflowTerminalGraphFingerprint } from '@mastra/core/storage';
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { PostgresStore, WorkflowsPG } from '../../index';
+import type { WorkflowsPG } from '../../index';
+import { PostgresStore } from '../../index';
 import { createTerminalRecoveryEnvelope } from './terminalization-test-utils';
 
 const connectionString = process.env.DB_URL || 'postgresql://postgres:postgres@localhost:5434/mastra';

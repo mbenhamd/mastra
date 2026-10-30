@@ -3174,6 +3174,51 @@ describe('InMemoryHarness renewSessionLeaseSubtree (§5.8)', () => {
     expect(grandchild?.ownerId).toBe(owner);
   });
 
+  it('leaves a lapsed descendant whose grant a revocation fenced after the lapse out of the renewal', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db, terminalHandoff: { enabled: true } });
+    const owner = 'owner-A';
+    await storage.createOrLoadActiveSession(sampleSession({ id: 'root', threadId: 't-root', origin: 'top-level' }), {
+      initialLease: { ownerId: owner, ttlMs: 30_000 },
+    });
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'child-1', threadId: 't-c1', parentSessionId: 'root', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: 30_000 } },
+    );
+    await storage.createOrLoadActiveSession(
+      sampleSession({ id: 'grandchild', threadId: 't-gc', parentSessionId: 'child-1', origin: 'subagent' }),
+      { initialLease: { ownerId: owner, ttlMs: 30_000 } },
+    );
+    const grandchildExpiry = (await storage.loadSession({ sessionId: 'grandchild' }))?.leaseExpiresAt;
+    const key = [...db.harnessSessions.keys()].find(k => k.endsWith('child-1'))!;
+    const lapsedAt = Date.now() - 1_000;
+    db.harnessSessions.set(key, { ...db.harnessSessions.get(key)!, leaseExpiresAt: lapsedAt });
+
+    // Recovery saw the child's lease lapse and fenced its grant.
+    await expect(
+      storage.revokeTerminalGrant({
+        harnessName: 'default',
+        sessionId: 'child-1',
+        admissionId: 'admission-child',
+        executionGrant: { key: 'grant-child', generation: 1 },
+        reason: { code: 'doxa.turn_released', message: 'owner lapsed' },
+        requireOwnerLeaseLapsed: { ownerId: owner },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    // The root stays renewable, pass after pass; the fenced child stays lapsed.
+    for (let pass = 0; pass < 2; pass++) {
+      const renewed = await storage.renewSessionLeaseSubtree({ rootSessionId: 'root', ownerId: owner, ttlMs: 60_000 });
+      expect(renewed.renewedDescendantCount).toBe(0);
+      // The fenced child's whole subtree is out of the pass.
+      expect(renewed.fencedDescendantIds).toEqual(['child-1', 'grandchild']);
+      expect((await storage.loadSession({ sessionId: 'grandchild' }))?.leaseExpiresAt).toBe(grandchildExpiry);
+      expect((await storage.loadSession({ sessionId: 'root' }))?.leaseExpiresAt).toBe(renewed.expiresAt);
+      expect((await storage.loadSession({ sessionId: 'child-1' }))?.leaseExpiresAt).toBe(lapsedAt);
+    }
+    expect([...db.harnessTerminalTombstones.values()].filter(t => t.sessionId === 'child-1')).toHaveLength(1);
+  });
+
   it('throws not-found for a missing root', async () => {
     const { storage, owner } = await setupTree();
     await expect(

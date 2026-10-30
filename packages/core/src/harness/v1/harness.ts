@@ -5177,6 +5177,10 @@ export class Harness {
     ttlMs: number,
   ): Promise<SubtreeSessionLeaseResult> {
     const record = root.getRecord();
+    // The live objects the storage report will describe: a session evicted and
+    // re-acquired while the renewal is in flight is a new object with a fresh
+    // lease, which the report predates.
+    const liveAtRequest = new Map(this._liveSessions);
     const lease = await storage.renewSessionLeaseSubtree({
       harnessName: record.harnessName,
       rootSessionId: root.id,
@@ -5184,6 +5188,24 @@ export class Harness {
       ttlMs,
     });
     root._markLeaseRenewed(lease.expiresAt);
+    // Descendants storage left out (a descendant whose grant was revoked after
+    // its lease lapsed, and every open session below it) are no longer leased:
+    // fence them instead of reporting them renewed. A session created below a
+    // fenced one after storage walked the subtree is fenced with it, as storage
+    // leaves that whole subtree out. They are collected before any fence
+    // (fencing removes members from the live map), fenced synchronously, and
+    // cleaned up detached: this runs inside the root's renewal chain.
+    const toFence = new Set<Session>();
+    for (const fencedId of lease.fencedDescendantIds ?? []) {
+      const descendant = this._liveSessions.get(fencedId);
+      // A re-acquired session is skipped, but the sessions storage reported
+      // below it are still fenced: storage did not extend their leases in this
+      // pass, so they must not be marked renewed below (safe-direction fence).
+      if (descendant === undefined || descendant !== liveAtRequest.get(fencedId)) continue;
+      toFence.add(descendant);
+      for (const below of this._liveDescendantsOf(descendant.id)) toFence.add(below);
+    }
+    this._fenceLeaseLostDetached([...toFence]);
     for (const descendant of this._liveDescendantsOf(root.id)) descendant._markLeaseRenewed(lease.expiresAt);
     return lease;
   }
@@ -5204,6 +5226,11 @@ export class Harness {
     opts?: { propagateRootDeadline?: boolean },
   ): Promise<number> {
     const storage = this._requireStorage('session lease renewal');
+    // Already fenced or evicted: reject at once. Joining its eviction here could
+    // wait on this very proof (a draft checkpoint the eviction drains).
+    if (Harness._isEvicted(session)) {
+      throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+    }
     const root = this._resolveLiveRoot(session);
     if (root === undefined) {
       // Orphan: a live session whose root ownership cannot be proven here. Fence
@@ -5225,8 +5252,18 @@ export class Harness {
         if (opts?.propagateRootDeadline === true) root._setLeaseExtensionDeadline(lease.expiresAt);
         expiresAt = lease.expiresAt;
       });
+      // Fenced while this proof waited in the queue: reject before any branch
+      // below joins its eviction, which may be draining this very proof's work.
+      if (Harness._isEvicted(session)) {
+        throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+      }
       if (expiresAt === 0) {
         await this._evictLiveSession(session, 'lease_lost');
+        throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
+      }
+      // The renewal fenced this session (a revocation-fenced descendant, or one
+      // under it): its lease was not renewed, so the proof fails.
+      if (this._liveSessions.get(session.id) !== session) {
         throw new HarnessSessionLockedError(session.id, 'unknown', session.getRecord().leaseExpiresAt ?? 0);
       }
       return expiresAt;
@@ -5351,6 +5388,14 @@ export class Harness {
     return false;
   }
 
+  /**
+   * Whether `session` has been evicted. A helper rather than an inline check so the
+   * re-check after awaiting the renewal queue isn't narrowed away by the entry check.
+   */
+  private static _isEvicted(session: Session): boolean {
+    return session.lifecycleState === 'evicted';
+  }
+
   /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
   private _liveDescendantsOf(rootId: string): Session[] {
     const out: Session[] = [];
@@ -5447,7 +5492,55 @@ export class Harness {
     session._markEvicted(record);
     this._liveSessions.delete(session.id);
     this._stopLeaseRenewalLoopIfIdle();
+    await this._completeEviction(session, record, reason);
+  }
 
+  /**
+   * Fence live sessions as `lease_lost` synchronously — every later lease
+   * proof or extension on them rejects at once — and run the rest of each
+   * eviction (event-persistence drain, workspace release, `session_evicted`)
+   * detached. For callers inside a lease-renewal chain: that cleanup can wait
+   * on work (a draft checkpoint, a workspace `destroy()`) that itself waits on
+   * the chain, so it must not be awaited there.
+   *
+   * Every session's eviction barrier is registered and its live entry removed
+   * before any `_markEvicted()` runs: those fire abort listeners synchronously,
+   * and a listener resolving the session again must find the barrier (and
+   * wait for a fresh session), never the evicted object.
+   */
+  private _fenceLeaseLostDetached(sessions: readonly Session[]): void {
+    const fenced: Array<{ session: Session; record: SessionRecord; start: () => void }> = [];
+    for (const session of sessions) {
+      if (this._liveSessions.get(session.id) !== session) continue;
+      const record = session.getRecord() as SessionRecord;
+      let start!: () => void;
+      const started = new Promise<void>(resolve => (start = resolve));
+      const prior = this._sessionEvictionsInFlight.get(session.id) ?? Promise.resolve();
+      const cleanup: Promise<void> = Promise.all([prior, started])
+        .then(() => this._completeEviction(session, record, 'lease_lost'))
+        .catch(err => {
+          console.error('[harness/v1] detached lease-lost eviction cleanup failed:', err);
+        })
+        .finally(() => {
+          if (this._sessionEvictionsInFlight.get(session.id) === cleanup) {
+            this._sessionEvictionsInFlight.delete(session.id);
+          }
+        });
+      this._sessionEvictionsInFlight.set(session.id, cleanup);
+      this._liveSessions.delete(session.id);
+      fenced.push({ session, record, start });
+    }
+    for (const { session, record } of fenced) session._markEvicted(record);
+    this._stopLeaseRenewalLoopIfIdle();
+    for (const { start } of fenced) start();
+  }
+
+  /** The part of an eviction after the session is fenced out of `_liveSessions`. */
+  private async _completeEviction(
+    session: Session,
+    record: SessionRecord,
+    reason: 'lease_lost' | 'pressure' | 'idle',
+  ): Promise<void> {
     if (reason === 'pressure' || reason === 'idle') {
       const storage = this._requireStorage('session.evict()');
       try {

@@ -1787,6 +1787,25 @@ describe('native chat terminal handoff', () => {
         HarnessTerminalHandoffUnsupportedError,
       );
     });
+
+    it('refuses while the named owner still holds the session lease, and fences once it lapsed', async () => {
+      const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+      await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+      const lease = await storage.acquireSessionLease({ sessionId: 'session-1', ownerId: 'owner-1', ttlMs: 30_000 });
+      const input = admission();
+      const guarded = { ...revocation(input), requireOwnerLeaseLapsed: { ownerId: 'owner-1' } };
+
+      await expect(storage.revokeTerminalGrant({ ...guarded, revokedAt: lease.expiresAt - 1 })).resolves.toEqual({
+        status: 'owner_live',
+        grant: input.executionGrant,
+        tombstoneId: expect.any(String),
+        leaseExpiresAt: lease.expiresAt,
+      });
+      await expect(storage.revokeTerminalGrant({ ...guarded, revokedAt: lease.expiresAt })).resolves.toMatchObject({
+        status: 'revoked',
+        revokedAt: lease.expiresAt,
+      });
+    });
   });
 
   describe('lease-fenced dispatch compare-and-swap', () => {

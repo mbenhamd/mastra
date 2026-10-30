@@ -10,6 +10,7 @@ import {
   TABLE_HARNESS_SESSIONS,
   TABLE_HARNESS_TERMINAL_ADMISSIONS,
   TABLE_HARNESS_TERMINAL_TOMBSTONES,
+  harnessTerminalGrantTombstoneId,
 } from '@mastra/core/storage';
 import type {
   AgentSignalResultEvidence,
@@ -17,6 +18,7 @@ import type {
   HarnessTerminalAdmissionInput,
   SessionRecord,
 } from '@mastra/core/storage';
+import { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PostgresStore } from '../..';
@@ -540,5 +542,496 @@ describe('HarnessPG lease-fenced dispatch compare-and-swap', () => {
         stamped.applied ? { status: 'pending' } : { status: 'failed', error: INTERRUPTED },
       );
     }
+  });
+});
+
+describe('HarnessPG revocation re-checks the admitting owner lease under the session lock', () => {
+  const schemaName = `pf6886_owner_live_${randomUUID().replaceAll('-', '_')}`;
+  const store = terminalStore('pg-harness-owner-live-store', schemaName);
+  const harness = () => store.stores.harness!;
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  beforeAll(async () => {
+    await store.init();
+  });
+
+  beforeEach(async () => {
+    await harness().dangerouslyClearAll();
+  });
+
+  afterAll(async () => {
+    await store.db.none(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`).catch(() => {});
+    await store.close();
+  });
+
+  async function tombstoneCount(grantKey: string): Promise<string> {
+    const row = await store.db.one<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM "${schemaName}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}" WHERE grant_key = $1`,
+      [grantKey],
+    );
+    return row.count;
+  }
+
+  // Polled by PID so other sessions on the database cannot satisfy the wait.
+  async function waitForBlockedBy(blockerPid: number): Promise<number> {
+    for (let attempt = 0; attempt < 300; attempt++) {
+      const blocked = await store.db.oneOrNone<{ pid: number }>(
+        `SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1`,
+        [blockerPid],
+      );
+      if (blocked) return blocked.pid;
+      await sleep(10);
+    }
+    throw new Error(`expected a backend blocked by ${blockerPid}`);
+  }
+
+  // Holds row locks in a separate transaction until `release()`.
+  function holdRowLock(sql: string, args: unknown[]) {
+    let release!: () => void;
+    const released = new Promise<void>(resolve => (release = resolve));
+    let ready!: (pid: number) => void;
+    const pid = new Promise<number>(resolve => (ready = resolve));
+    const done = store.db.tx(async t => {
+      await t.none(sql, args);
+      ready((await t.one<{ pid: number }>('SELECT pg_backend_pid() AS pid')).pid);
+      await released;
+      // Abort, so a held INSERT leaves nothing behind.
+      throw new Error('release');
+    });
+    return { pid, release: () => (release(), done.catch(() => {})) };
+  }
+
+  it('refuses with owner_live once a renewal committed before the revocation', async () => {
+    const session = await createNativeSession(harness(), 'renew-first', 'owner-a', 200);
+    const input = admissionFor(session, 'renew-first');
+    await sleep(300);
+    // Recovery's plain read saw the lease lapse ...
+    const seen = await harness().loadSession({ harnessName: HARNESS, sessionId: session.id });
+    expect(seen!.leaseExpiresAt! <= Date.now()).toBe(true);
+    // ... and the owner re-acquires and renews before recovery revokes.
+    await harness().acquireSessionLease({ sessionId: session.id, ownerId: 'owner-a', ttlMs: 60_000 });
+    const renewed = await harness().renewSessionLeaseSubtree({
+      rootSessionId: session.id,
+      ownerId: 'owner-a',
+      ttlMs: 60_000,
+    });
+
+    await expect(
+      harness().revokeTerminalGrant({ ...revocation(input), requireOwnerLeaseLapsed: { ownerId: 'owner-a' } }),
+    ).resolves.toEqual({
+      status: 'owner_live',
+      grant: input.executionGrant,
+      tombstoneId: expect.any(String),
+      leaseExpiresAt: renewed.expiresAt,
+    });
+    expect(await tombstoneCount(input.executionGrant.key)).toBe('0');
+  });
+
+  it('tombstones when it holds the session row first and the lease really lapsed; the renewal then fails', async () => {
+    const session = await createNativeSession(harness(), 'revoke-first', 'owner-b', 200);
+    const input = admissionFor(session, 'revoke-first');
+    await sleep(300);
+
+    // Stall the revocation after it locked the session row: its tombstone
+    // INSERT waits on an uncommitted row with the same id.
+    const tombstoneId = harnessTerminalGrantTombstoneId(input);
+    const blocker = holdRowLock(
+      `INSERT INTO "${schemaName}"."${TABLE_HARNESS_TERMINAL_TOMBSTONES}"
+         (id, harness_name, grant_key, grant_generation, session_id, admission_id, reason_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, '{}', 0)`,
+      [tombstoneId, HARNESS, input.executionGrant.key, input.executionGrant.generation, session.id, input.admissionId],
+    );
+    const blockerPid = await blocker.pid;
+    const revoked = harness().revokeTerminalGrant({
+      ...revocation(input),
+      requireOwnerLeaseLapsed: { ownerId: 'owner-b' },
+    });
+    const revokePid = await waitForBlockedBy(blockerPid);
+    const renewal = harness()
+      .renewSessionLeaseSubtree({ rootSessionId: session.id, ownerId: 'owner-b', ttlMs: 60_000 })
+      .then(
+        () => 'renewed',
+        error => error,
+      );
+    // The renewal waits on the session row the revocation holds.
+    await waitForBlockedBy(revokePid);
+    await blocker.release();
+
+    await expect(revoked).resolves.toMatchObject({ status: 'revoked', tombstoneId });
+    expect(await renewal).toBeInstanceOf(HarnessStorageLeaseConflictError);
+    expect(await tombstoneCount(input.executionGrant.key)).toBe('1');
+  });
+
+  it.each(['renewSessionLeaseSubtree', 'renewSessionLease'] as const)(
+    'fails a %s that waited for a connection across expiry once the revocation fenced the lapsed lease',
+    async method => {
+      // The renewal starts before expiry but cannot reach the session row: the
+      // renewing store's only pooled connection is held.
+      const renewer = terminalStore(`pg-harness-owner-live-${method}`, schemaName, { max: 1 });
+      await renewer.init();
+      let held: { release: () => void } | undefined = await renewer.pool.connect();
+      try {
+        const session = await createNativeSession(harness(), `queued-${method}`, 'owner-d', 1_000);
+        const input = admissionFor(session, `queued-${method}`);
+        expect(Date.now()).toBeLessThan(session.leaseExpiresAt!);
+        const renewal = (
+          method === 'renewSessionLeaseSubtree'
+            ? renewer.stores.harness!.renewSessionLeaseSubtree({
+                rootSessionId: session.id,
+                ownerId: 'owner-d',
+                ttlMs: 60_000,
+              })
+            : renewer.stores.harness!.renewSessionLease({ sessionId: session.id, ownerId: 'owner-d', ttlMs: 60_000 })
+        ).then(
+          () => 'renewed',
+          error => error,
+        );
+
+        await sleep(Math.max(0, session.leaseExpiresAt! - Date.now()) + 50);
+        await expect(
+          harness().revokeTerminalGrant({
+            ...revocation(input),
+            revokedAt: Date.now(),
+            requireOwnerLeaseLapsed: { ownerId: 'owner-d' },
+          }),
+        ).resolves.toMatchObject({ status: 'revoked' });
+        held.release();
+        held = undefined;
+
+        // The lease the revocation saw lapse stays lapsed.
+        expect(await renewal).toBeInstanceOf(HarnessStorageLeaseConflictError);
+        const after = await harness().loadSession({ harnessName: HARNESS, sessionId: session.id });
+        expect(after!.leaseExpiresAt).toBe(session.leaseExpiresAt);
+        expect(await tombstoneCount(input.executionGrant.key)).toBe('1');
+      } finally {
+        held?.release();
+        await renewer.close();
+      }
+    },
+  );
+
+  it('leaves out a lapsed child that a revocation fenced while the subtree renewal paused before it', async () => {
+    // Root and child-b lapse together; child-a stays live and is locked first
+    // (descendants lock by id), so the renewal pauses after validating the root.
+    const root = await createNativeSession(harness(), 'subtree-root', 'owner-e', 1_000);
+    const childOf = async (id: string, ttlMs: number) => {
+      const record = createSampleSessionRecord({
+        id,
+        harnessName: HARNESS,
+        resourceId: root.resourceId,
+        threadId: `thread-${id}`,
+        parentSessionId: root.id,
+      });
+      await harness().createOrLoadActiveSession(record, { initialLease: { ownerId: 'owner-e', ttlMs } });
+      return (await harness().loadSession({ harnessName: HARNESS, sessionId: id }))!;
+    };
+    const childA = await childOf('subtree-child-a', 60_000);
+    const childB = await childOf('subtree-child-b', 1_000);
+    const input = admissionFor(childB, 'subtree-child-b');
+
+    const blocker = holdRowLock(
+      `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE harness_name = $1 AND id = $2 FOR UPDATE`,
+      [HARNESS, childA.id],
+    );
+    const blockerPid = await blocker.pid;
+    expect(Date.now()).toBeLessThan(root.leaseExpiresAt!);
+    const renewal = harness()
+      .renewSessionLeaseSubtree({ rootSessionId: root.id, ownerId: 'owner-e', ttlMs: 60_000 })
+      .then(
+        () => 'renewed',
+        error => error,
+      );
+    await waitForBlockedBy(blockerPid);
+
+    await sleep(Math.max(0, childB.leaseExpiresAt! - Date.now()) + 50);
+    await expect(
+      harness().revokeTerminalGrant({
+        ...revocation(input),
+        revokedAt: Date.now(),
+        requireOwnerLeaseLapsed: { ownerId: 'owner-e' },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+    await blocker.release();
+
+    // The root and the live sibling renew; the fenced child stays lapsed.
+    expect(await renewal).toBe('renewed');
+    const after = await harness().loadSession({ harnessName: HARNESS, sessionId: childB.id });
+    expect(after!.leaseExpiresAt).toBe(childB.leaseExpiresAt);
+    expect(await tombstoneCount(input.executionGrant.key)).toBe('1');
+    const again = await harness().renewSessionLeaseSubtree({
+      rootSessionId: root.id,
+      ownerId: 'owner-e',
+      ttlMs: 60_000,
+    });
+    expect(again.renewedDescendantCount).toBe(1);
+    expect(again.fencedDescendantIds).toEqual([childB.id]);
+    expect((await harness().loadSession({ harnessName: HARNESS, sessionId: childB.id }))!.leaseExpiresAt).toBe(
+      childB.leaseExpiresAt,
+    );
+  });
+
+  async function rootWithLapsedChild(target: HarnessStorage, tag: string, ownerId: string) {
+    const root = await createNativeSession(target, `${tag}-root`, ownerId, 60_000);
+    const child = createSampleSessionRecord({
+      id: `${tag}-child`,
+      harnessName: HARNESS,
+      resourceId: root.resourceId,
+      threadId: `thread-${tag}-child`,
+      parentSessionId: root.id,
+    });
+    await target.createOrLoadActiveSession(child, { initialLease: { ownerId, ttlMs: 200 } });
+    await sleep(300);
+    return { root, child: (await target.loadSession({ harnessName: HARNESS, sessionId: child.id }))! };
+  }
+
+  it('fails a subtree renewal whose fenced child changed owner while the renewal paused', async () => {
+    const root = await createNativeSession(harness(), 'owner-move-root', 'owner-i', 60_000);
+    const childOf = async (id: string, ttlMs: number) => {
+      const record = createSampleSessionRecord({
+        id,
+        harnessName: HARNESS,
+        resourceId: root.resourceId,
+        threadId: `thread-${id}`,
+        parentSessionId: root.id,
+      });
+      await harness().createOrLoadActiveSession(record, { initialLease: { ownerId: 'owner-i', ttlMs } });
+      return (await harness().loadSession({ harnessName: HARNESS, sessionId: id }))!;
+    };
+    const childA = await childOf('owner-move-child-a', 60_000);
+    const childB = await childOf('owner-move-child-b', 300);
+
+    // The renewal walks the subtree (child-b still owner-i's) and pauses on child-a.
+    const blocker = holdRowLock(
+      `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE harness_name = $1 AND id = $2 FOR UPDATE`,
+      [HARNESS, childA.id],
+    );
+    const blockerPid = await blocker.pid;
+    const renewal = harness()
+      .renewSessionLeaseSubtree({ rootSessionId: root.id, ownerId: 'owner-i', ttlMs: 60_000 })
+      .then(
+        () => 'renewed',
+        error => error,
+      );
+    await waitForBlockedBy(blockerPid);
+
+    // Meanwhile another owner takes the lapsed child-b, lapses, and is fenced.
+    await sleep(Math.max(0, childB.leaseExpiresAt! - Date.now()) + 50);
+    await harness().acquireSessionLease({ sessionId: childB.id, ownerId: 'owner-x', ttlMs: 200 });
+    await sleep(300);
+    await expect(
+      harness().revokeTerminalGrant({
+        ...revocation(admissionFor(childB, 'owner-move-child-b')),
+        revokedAt: Date.now(),
+        requireOwnerLeaseLapsed: { ownerId: 'owner-x' },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+    await blocker.release();
+
+    // A foreign-owned descendant still fails the whole pass.
+    expect(await renewal).toBeInstanceOf(HarnessStorageLeaseConflictError);
+  });
+
+  it('probes the tombstone table the fence query resolves through search_path', async () => {
+    const database = `pf6886_sp_${randomUUID().replaceAll('-', '_')}`;
+    await store.db.none(`CREATE DATABASE "${database}"`);
+    const config = TEST_CONFIG as { host: string; port: number; user: string; password: string };
+    const tenant = terminalStore('pg-harness-owner-live-tenant', 'tenant', { database });
+    const pool = new Pool({
+      host: config.host,
+      port: config.port,
+      user: config.user,
+      password: config.password,
+      database,
+      options: '-c search_path=tenant,public',
+    });
+    // Default schema: queries stay unqualified and resolve to tenant's tables.
+    const onPath = new PostgresStore({
+      id: 'pg-harness-owner-live-search-path',
+      pool,
+      enabledDomains: ['harness'],
+      disableInit: true,
+    });
+    try {
+      await tenant.init();
+      await onPath.init();
+      const { root, child } = await rootWithLapsedChild(tenant.stores.harness!, 'search-path', 'owner-j');
+      await expect(
+        tenant.stores.harness!.revokeTerminalGrant({
+          ...revocation(admissionFor(child, 'search-path-child')),
+          requireOwnerLeaseLapsed: { ownerId: 'owner-j' },
+        }),
+      ).resolves.toMatchObject({ status: 'revoked' });
+
+      const renewed = await onPath.stores.harness!.renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-j',
+        ttlMs: 60_000,
+      });
+      expect(renewed).toMatchObject({ renewedDescendantCount: 0, fencedDescendantIds: [child.id] });
+      expect(
+        (await tenant.stores.harness!.loadSession({ harnessName: HARNESS, sessionId: child.id }))!.leaseExpiresAt,
+      ).toBe(child.leaseExpiresAt);
+    } finally {
+      await onPath.close().catch(() => {});
+      await pool.end().catch(() => {});
+      await tenant.close().catch(() => {});
+      await store.db.none(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`).catch(() => {});
+    }
+  });
+
+  it('leaves the whole subtree below a fenced child out of the renewal', async () => {
+    const { root, child } = await rootWithLapsedChild(harness(), 'fenced-subtree', 'owner-k');
+    const grandchild = createSampleSessionRecord({
+      id: 'fenced-subtree-grandchild',
+      harnessName: HARNESS,
+      resourceId: root.resourceId,
+      threadId: 'thread-fenced-subtree-grandchild',
+      parentSessionId: child.id,
+    });
+    await harness().createOrLoadActiveSession(grandchild, { initialLease: { ownerId: 'owner-k', ttlMs: 60_000 } });
+    const grandchildExpiry = (await harness().loadSession({ harnessName: HARNESS, sessionId: grandchild.id }))!
+      .leaseExpiresAt;
+    await expect(
+      harness().revokeTerminalGrant({
+        ...revocation(admissionFor(child, 'fenced-subtree-child')),
+        requireOwnerLeaseLapsed: { ownerId: 'owner-k' },
+      }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+
+    for (let pass = 0; pass < 2; pass++) {
+      const renewed = await harness().renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-k',
+        ttlMs: 60_000,
+      });
+      expect(renewed).toMatchObject({ renewedDescendantCount: 0, fencedDescendantIds: [child.id, grandchild.id] });
+      expect((await harness().loadSession({ harnessName: HARNESS, sessionId: grandchild.id }))!.leaseExpiresAt).toBe(
+        grandchildExpiry,
+      );
+    }
+  });
+
+  it('does not let a handoff-disabled instance re-adopt a child an enabled instance fenced', async () => {
+    const disabled = terminalStore('pg-harness-owner-live-disabled', schemaName, {
+      terminalHandoff: { enabled: false },
+    });
+    await disabled.init();
+    try {
+      const { root, child } = await rootWithLapsedChild(harness(), 'disabled', 'owner-g');
+      const input = admissionFor(child, 'disabled-child');
+      await expect(
+        harness().revokeTerminalGrant({ ...revocation(input), requireOwnerLeaseLapsed: { ownerId: 'owner-g' } }),
+      ).resolves.toMatchObject({ status: 'revoked' });
+
+      const renewed = await disabled.stores.harness!.renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-g',
+        ttlMs: 60_000,
+      });
+      expect(renewed.renewedDescendantCount).toBe(0);
+      expect(renewed.fencedDescendantIds).toEqual([child.id]);
+      expect((await harness().loadSession({ harnessName: HARNESS, sessionId: child.id }))!.leaseExpiresAt).toBe(
+        child.leaseExpiresAt,
+      );
+    } finally {
+      await disabled.close();
+    }
+  });
+
+  it('re-adopts a lapsed child on a fresh single-connection store without deadlocking on lazy setup', async () => {
+    const freshSchema = `pf6886_fresh_${randomUUID().replaceAll('-', '_')}`;
+    const fresh = terminalStore('pg-harness-owner-live-fresh', freshSchema, { max: 1 });
+    await fresh.init();
+    try {
+      const { root, child } = await rootWithLapsedChild(fresh.stores.harness!, 'fresh', 'owner-h');
+      const renewal = fresh.stores.harness!.renewSessionLeaseSubtree({
+        rootSessionId: root.id,
+        ownerId: 'owner-h',
+        ttlMs: 60_000,
+      });
+      const outcome = await Promise.race([renewal, sleep(5_000).then(() => 'timed out' as const)]);
+      expect(outcome).toMatchObject({ renewedDescendantCount: 1 });
+      expect(
+        (await fresh.stores.harness!.loadSession({ harnessName: HARNESS, sessionId: child.id }))!.leaseExpiresAt,
+      ).toBeGreaterThan(Date.now());
+    } finally {
+      // Bounded: on a hung renewal the store cannot close and its locks hold.
+      await Promise.race([fresh.close(), sleep(1_000)]);
+      await Promise.race([
+        store.db.none(`DROP SCHEMA IF EXISTS "${freshSchema}" CASCADE`).catch(() => {}),
+        sleep(1_000),
+      ]);
+    }
+  });
+
+  it.each(['renewSessionLeaseSubtree', 'renewSessionLease'] as const)(
+    'lets %s proceed past a FOR KEY SHARE holder on the session row',
+    async method => {
+      const session = await createNativeSession(harness(), `key-share-${method}`, 'owner-f', 60_000);
+      const blocker = holdRowLock(
+        `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE harness_name = $1 AND id = $2 FOR KEY SHARE`,
+        [HARNESS, session.id],
+      );
+      await blocker.pid;
+      try {
+        const renewal =
+          method === 'renewSessionLeaseSubtree'
+            ? harness().renewSessionLeaseSubtree({ rootSessionId: session.id, ownerId: 'owner-f', ttlMs: 90_000 })
+            : harness().renewSessionLease({ sessionId: session.id, ownerId: 'owner-f', ttlMs: 90_000 });
+        const outcome = await Promise.race([renewal.then(() => 'renewed'), sleep(2_000).then(() => 'blocked')]);
+        expect(outcome).toBe('renewed');
+        await renewal;
+      } finally {
+        await blocker.release();
+      }
+    },
+  );
+
+  it('refuses with owner_live when a renewal begun before expiry commits while the revocation waits', async () => {
+    // The race: the renewal checks the lease before expiry and stalls, recovery
+    // reads the old expiry after it passed, and the renewal commits before the
+    // revocation reaches the session row.
+    const session = await createNativeSession(harness(), 'renew-stalled', 'owner-c', 1_000);
+    const child = createSampleSessionRecord({
+      id: 'renew-stalled-child',
+      harnessName: HARNESS,
+      resourceId: session.resourceId,
+      threadId: 'thread-renew-stalled-child',
+      parentSessionId: session.id,
+    });
+    await harness().createOrLoadActiveSession(child, { initialLease: { ownerId: 'owner-c', ttlMs: 60_000 } });
+    const input = admissionFor(session, 'renew-stalled');
+
+    // The renewal locks the root FOR UPDATE, passes its expiry check and stalls
+    // on the child row this transaction holds.
+    const blocker = holdRowLock(
+      `SELECT id FROM "${schemaName}"."${TABLE_HARNESS_SESSIONS}" WHERE harness_name = $1 AND id = $2 FOR UPDATE`,
+      [HARNESS, child.id],
+    );
+    const blockerPid = await blocker.pid;
+    const renewal = harness().renewSessionLeaseSubtree({
+      rootSessionId: session.id,
+      ownerId: 'owner-c',
+      ttlMs: 60_000,
+    });
+    const renewalPid = await waitForBlockedBy(blockerPid);
+
+    await sleep(Math.max(0, session.leaseExpiresAt! - Date.now()) + 50);
+    const seen = await harness().loadSession({ harnessName: HARNESS, sessionId: session.id });
+    expect(seen!.leaseExpiresAt).toBe(session.leaseExpiresAt);
+    expect(seen!.leaseExpiresAt! <= Date.now()).toBe(true);
+
+    const revoked = harness().revokeTerminalGrant({
+      ...revocation(input),
+      revokedAt: Date.now(),
+      requireOwnerLeaseLapsed: { ownerId: 'owner-c' },
+    });
+    // The revocation waits on the root row the renewal holds.
+    await waitForBlockedBy(renewalPid);
+    await blocker.release();
+
+    const renewed = await renewal;
+    await expect(revoked).resolves.toMatchObject({ status: 'owner_live', leaseExpiresAt: renewed.expiresAt });
+    expect(await tombstoneCount(input.executionGrant.key)).toBe('0');
   });
 });

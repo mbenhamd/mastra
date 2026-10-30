@@ -204,6 +204,8 @@ import type {
   HarnessTerminalCancelReceipt,
   HarnessTerminalGrantRevocationInput,
   HarnessTerminalGrantRevocationReceipt,
+  HarnessTerminalGuardedGrantRevocationReceipt,
+  HarnessTerminalUnguardedGrantRevocationInput,
   HarnessTerminalClaimIdentity,
   HarnessTerminalClaimInput,
   HarnessTerminalClaimReceipt,
@@ -883,6 +885,7 @@ export class HarnessPG extends HarnessStorage {
   #indexes?: CreateIndexOptions[];
   #sessionEventsReady: Promise<void> | undefined;
   #terminalHandoffReady: Promise<void> | undefined;
+  #terminalTombstonesPresent = false;
   #workspaceActionsReady: Promise<void> | undefined;
   #planTasksReady: Promise<void> | undefined;
   #runSummariesReady: Promise<void> | undefined;
@@ -3707,32 +3710,53 @@ export class HarnessPG extends HarnessStorage {
     harnessName,
   }: RenewSessionLeaseInput): Promise<SessionLeaseResult> {
     const namespace = this.#resolveHarnessName(harnessName);
-    const now = Date.now();
-    const expiresAt = now + ttlMs;
 
-    const result = await this.#client.execute({
-      sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
-            SET lease_expires_at = ?
-            WHERE harness_name = ?
-              AND id = ?
-              AND owner_id = ?
-              AND lease_expires_at IS NOT NULL
-              AND lease_expires_at > ?
-            RETURNING version`,
-      args: [expiresAt, namespace, sessionId, ownerId, now],
-    });
+    // Lock the row before reading the clock, as `renewSessionLeaseSubtree`
+    // does: a single UPDATE re-checks its WHERE after a lock wait with the
+    // `now` captured before it, so a renewal queued across expiry would renew
+    // a lease a guarded `revokeTerminalGrant` already saw lapse and fenced.
+    const tx = await this.#client.transaction('write');
+    try {
+      const locked = await tx.execute({
+        // NO KEY UPDATE, as the UPDATE it replaces took: it serializes with lease
+        // writes and the revocation's row write, but not with the FOR KEY SHARE
+        // existence guards that message-result writes hold.
+        sql: `SELECT owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+              WHERE harness_name = ? AND id = ?
+              FOR NO KEY UPDATE`,
+        args: [namespace, sessionId],
+      });
+      const row = locked.rows[0] as Record<string, unknown> | undefined;
+      if (!row) throw new HarnessStorageSessionNotFoundError(sessionId);
+      const now = Date.now();
+      const expiresAt = now + ttlMs;
 
-    if (result.rows.length === 0) {
-      const existing = await this.loadSession({ harnessName: namespace, sessionId });
-      if (!existing) throw new HarnessStorageSessionNotFoundError(sessionId);
-      throw new HarnessStorageLeaseConflictError(
-        sessionId,
-        existing.ownerId ?? '<unowned>',
-        existing.leaseExpiresAt ?? 0,
-      );
+      const result = await tx.execute({
+        sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
+              SET lease_expires_at = ?
+              WHERE harness_name = ?
+                AND id = ?
+                AND owner_id = ?
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at > ?
+              RETURNING version`,
+        args: [expiresAt, namespace, sessionId, ownerId, now],
+      });
+
+      if (result.rows.length === 0) {
+        throw new HarnessStorageLeaseConflictError(
+          sessionId,
+          (row.owner_id ?? '<unowned>') as string,
+          row.lease_expires_at == null ? 0 : Number(row.lease_expires_at),
+        );
+      }
+
+      await tx.commit();
+      return { version: Number(result.rows[0]!.version), expiresAt };
+    } catch (err) {
+      if (!tx.closed) await tx.rollback();
+      throw err;
     }
-
-    return { version: Number(result.rows[0]!.version), expiresAt };
   }
 
   async renewSessionLeaseSubtree({
@@ -3742,8 +3766,6 @@ export class HarnessPG extends HarnessStorage {
     harnessName,
   }: RenewSessionLeaseSubtreeInput): Promise<SubtreeSessionLeaseResult> {
     const namespace = this.#resolveHarnessName(harnessName);
-    const now = Date.now();
-    const expiresAt = now + ttlMs;
 
     // §5.8 atomic subtree renewal: one transaction locks the root, gathers every
     // ACTIVE (non-closed) descendant under one owner, then renews root + descendants
@@ -3757,46 +3779,131 @@ export class HarnessPG extends HarnessStorage {
       const rootResult = await tx.execute({
         sql: `SELECT version, owner_id, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
               WHERE harness_name = ? AND id = ?
-              FOR UPDATE`,
+              FOR NO KEY UPDATE`,
         args: [namespace, rootSessionId],
       });
       const rootRow = rootResult.rows[0] as Record<string, unknown> | undefined;
       if (!rootRow) throw new HarnessStorageSessionNotFoundError(rootSessionId);
+      // Read the clock only once the row lock is held: a renewal that waited
+      // for a connection or for the lock across expiry must not renew a lease
+      // that a guarded `revokeTerminalGrant` already saw lapse and fenced.
+      const now = Date.now();
+      const expiresAt = now + ttlMs;
       const rootOwner = (rootRow.owner_id ?? null) as string | null;
       const rootExpires = rootRow.lease_expires_at == null ? undefined : Number(rootRow.lease_expires_at);
       if (rootOwner !== ownerId || rootExpires === undefined || rootExpires <= now) {
         throw new HarnessStorageLeaseConflictError(rootSessionId, rootOwner ?? '<unowned>', rootExpires ?? 0);
       }
 
-      // Walk parentSessionId via a recursive CTE.
+      // Walk parentSessionId via a recursive CTE. Closed/closing rows are kept
+      // in the walk result (with their parent) so the subtree below a fenced
+      // descendant can be found; only open rows hold a lease to renew.
       const descendantsResult = await tx.execute({
         // UNION (not UNION ALL) row-dedupes the frontier so a parent_session_id
         // cycle (the storage boundary does not hard-enforce parentage immutability)
         // terminates instead of recursing until the engine's depth cap. Mirrors the
         // visited-set guard the in-memory adapter uses.
-        sql: `WITH RECURSIVE subtree(id, owner_id, closed_at, closing_at) AS (
-                SELECT id, owner_id, closed_at, closing_at FROM ${TABLE_HARNESS_SESSIONS}
+        sql: `WITH RECURSIVE subtree(id, parent_session_id, owner_id, closed_at, closing_at) AS (
+                SELECT id, parent_session_id, owner_id, closed_at, closing_at FROM ${TABLE_HARNESS_SESSIONS}
                 WHERE harness_name = ? AND parent_session_id = ?
                 UNION
-                SELECT s.id, s.owner_id, s.closed_at, s.closing_at FROM ${TABLE_HARNESS_SESSIONS} s
+                SELECT s.id, s.parent_session_id, s.owner_id, s.closed_at, s.closing_at FROM ${TABLE_HARNESS_SESSIONS} s
                 JOIN subtree ON s.parent_session_id = subtree.id
                 WHERE s.harness_name = ?
               )
-              SELECT id, owner_id FROM subtree WHERE closed_at IS NULL AND closing_at IS NULL`,
+              SELECT id, parent_session_id, owner_id, closed_at, closing_at FROM subtree`,
         args: [namespace, rootSessionId, namespace],
       });
+      const walked = descendantsResult.rows as Record<string, unknown>[];
+      const openRows = walked.filter(row => row.closed_at == null && row.closing_at == null);
+      const ownedOpenIds = openRows.filter(row => row.owner_id === ownerId).map(row => row.id as string);
 
-      const descendantIds: string[] = [];
-      for (const row of descendantsResult.rows as Record<string, unknown>[]) {
+      // A lapsed descendant is re-adopted unless a grant revocation already
+      // acted on that lapse (a revocation tombstone at or after its expiry).
+      // Such a descendant and every open session below it are left out of the
+      // pass, neither renewed nor failing it: the fenced descendant's lease
+      // stays lapsed, and the Harness fences exactly the reported set. Locks:
+      // root, then owned descendants by id; the lock waits out a revocation
+      // holding the row and the clock is read after it, so a revocation that
+      // committed meanwhile is seen.
+      const fencedRoots = new Set<string>();
+      if (ownedOpenIds.length > 0) {
+        const lockedDescendants = await tx.execute({
+          sql: `SELECT id, owner_id, closed_at, lease_expires_at FROM ${TABLE_HARNESS_SESSIONS}
+                WHERE harness_name = ? AND id IN (${ownedOpenIds.map(() => '?').join(', ')})
+                ORDER BY id
+                FOR NO KEY UPDATE`,
+          args: [namespace, ...ownedOpenIds],
+        });
+        const lockedNow = Date.now();
+        // Only a descendant still ours and open under the lock can be left out;
+        // one that changed owner or closed since the walk stays in the pass, so
+        // the guarded UPDATE below fails it closed as before.
+        const lapsedIds = (lockedDescendants.rows as Record<string, unknown>[])
+          .filter(
+            row =>
+              row.owner_id === ownerId &&
+              row.closed_at == null &&
+              row.lease_expires_at != null &&
+              Number(row.lease_expires_at) <= lockedNow,
+          )
+          .map(row => row.id as string);
+        // Checked whatever this instance's terminal-handoff setting: another
+        // instance may have written the fence. No tombstone table, no fence.
+        if (lapsedIds.length > 0 && (await this.#terminalTombstonesExist(tx))) {
+          const fenced = await tx.execute({
+            sql: `SELECT s.id FROM ${TABLE_HARNESS_SESSIONS} s
+                  WHERE s.harness_name = ? AND s.id IN (${lapsedIds.map(() => '?').join(', ')})
+                    AND EXISTS (
+                      SELECT 1 FROM ${TABLE_HARNESS_TERMINAL_TOMBSTONES} t
+                      WHERE t.harness_name = s.harness_name AND t.session_id = s.id
+                        AND t.session_incarnation IS NULL AND t.created_at >= s.lease_expires_at
+                    )`,
+            args: [namespace, ...lapsedIds],
+          });
+          for (const row of fenced.rows as Record<string, unknown>[]) fencedRoots.add(row.id as string);
+        }
+      }
+
+      // Everything below a fenced descendant is out of the pass with it.
+      const excluded = new Set<string>(fencedRoots);
+      if (fencedRoots.size > 0) {
+        const childrenOf = new Map<string, string[]>();
+        for (const row of walked) {
+          const parent = row.parent_session_id as string;
+          const siblings = childrenOf.get(parent);
+          if (siblings) siblings.push(row.id as string);
+          else childrenOf.set(parent, [row.id as string]);
+        }
+        const stack = [...fencedRoots];
+        while (stack.length > 0) {
+          for (const childId of childrenOf.get(stack.pop()!) ?? []) {
+            if (excluded.has(childId)) continue;
+            excluded.add(childId);
+            stack.push(childId);
+          }
+        }
+      }
+
+      // §5.8 all-or-nothing for the rest: a foreign-owned or unowned open
+      // descendant outside a fenced subtree fails the whole pass.
+      const renewedIds: string[] = [];
+      for (const row of openRows) {
         const childId = row.id as string;
+        if (excluded.has(childId)) continue;
         const childOwner = (row.owner_id ?? null) as string | null;
         if (childOwner !== ownerId) {
           throw new HarnessStorageLeaseConflictError(childId, childOwner ?? '<unowned>', 0);
         }
-        descendantIds.push(childId);
+        renewedIds.push(childId);
       }
+      // Sorted, so the report does not depend on walk order.
+      const fencedIds = openRows
+        .map(row => row.id as string)
+        .filter(id => excluded.has(id))
+        .sort();
 
-      const allIds = [rootSessionId, ...descendantIds];
+      const allIds = [rootSessionId, ...renewedIds];
       const updateResult = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
               SET lease_expires_at = ?
@@ -3818,11 +3925,32 @@ export class HarnessPG extends HarnessStorage {
       }
 
       await tx.commit();
-      return { version: Number(rootRow.version), expiresAt, renewedDescendantCount: descendantIds.length };
+      return {
+        version: Number(rootRow.version),
+        expiresAt,
+        renewedDescendantCount: renewedIds.length,
+        ...(fencedIds.length > 0 ? { fencedDescendantIds: fencedIds } : {}),
+      };
     } catch (err) {
       if (!tx.closed) await tx.rollback();
       throw err;
     }
+  }
+
+  /**
+   * Whether the terminal tombstone table exists, read on the caller's
+   * transaction (no second pooled connection). Cached once true.
+   */
+  async #terminalTombstonesExist(tx: PgHarnessClient): Promise<boolean> {
+    if (this.#terminalTombstonesPresent) return true;
+    // The table name is written into the SQL so the client qualifies it exactly
+    // as it qualifies the fence query (left bare for the default schema, so
+    // search_path resolves both to the same relation).
+    const result = await tx.execute({
+      sql: `SELECT to_regclass('${TABLE_HARNESS_TERMINAL_TOMBSTONES}') IS NOT NULL AS present`,
+    });
+    this.#terminalTombstonesPresent = result.rows[0]?.present === true;
+    return this.#terminalTombstonesPresent;
   }
 
   async releaseSessionLease({ sessionId, ownerId, harnessName }: ReleaseSessionLeaseInput): Promise<void> {
@@ -6209,9 +6337,15 @@ export class HarnessPG extends HarnessStorage {
     }
   }
 
+  revokeTerminalGrant(
+    input: HarnessTerminalUnguardedGrantRevocationInput,
+  ): Promise<HarnessTerminalGrantRevocationReceipt>;
+  revokeTerminalGrant(
+    input: HarnessTerminalGrantRevocationInput,
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt>;
   async revokeTerminalGrant(
     input: HarnessTerminalGrantRevocationInput,
-  ): Promise<HarnessTerminalGrantRevocationReceipt> {
+  ): Promise<HarnessTerminalGuardedGrantRevocationReceipt> {
     this.#assertTerminalHandoffEnabled();
     await this.#ensureTerminalHandoffTables();
     validateHarnessTerminalExecutionGrant(input.executionGrant);
@@ -6221,6 +6355,9 @@ export class HarnessPG extends HarnessStorage {
     }
     const now = input.revokedAt ?? Date.now();
     assertTerminalClock(now, 'revokedAt');
+    if (input.requireOwnerLeaseLapsed && !input.requireOwnerLeaseLapsed.ownerId) {
+      throw new HarnessTerminalHandoffValidationError('requireOwnerLeaseLapsed', 'ownerId is required');
+    }
     const grant = { ...input.executionGrant };
     const tombstoneId = harnessTerminalGrantTombstoneId({ harnessName, executionGrant: grant });
     const tx = await this.#client.transaction('write');
@@ -6239,11 +6376,26 @@ export class HarnessPG extends HarnessStorage {
       // Lock order: grant -> session, as in admission and commit.
       const sessionRow = await tx.execute({
         sql: `UPDATE ${TABLE_HARNESS_SESSIONS} SET version = version
-              WHERE harness_name = ? AND id = ? RETURNING owner_id`,
+              WHERE harness_name = ? AND id = ? RETURNING owner_id, lease_expires_at`,
         args: [harnessName, input.sessionId],
       });
       if (sessionRow.rows[0]?.owner_id === EXPORTED_FENCE_AUTHORITY) {
         throw new HarnessTerminalHandoffFencedError(input.sessionId);
+      }
+      // The row lock also waits out an in-flight lease renewal (it holds the
+      // row FOR NO KEY UPDATE), so this read sees the lease the renewal committed,
+      // not the one the caller saw before deciding the owner had lapsed.
+      if (input.requireOwnerLeaseLapsed && sessionRow.rows[0]) {
+        const ownerId = (sessionRow.rows[0].owner_id ?? null) as string | null;
+        const leaseExpiresAt = sessionRow.rows[0].lease_expires_at;
+        if (
+          ownerId === input.requireOwnerLeaseLapsed.ownerId &&
+          leaseExpiresAt != null &&
+          Number(leaseExpiresAt) > now
+        ) {
+          await tx.commit();
+          return { status: 'owner_live', grant, tombstoneId, leaseExpiresAt: Number(leaseExpiresAt) };
+        }
       }
       const admissionRow = await tx.execute({
         sql: `SELECT * FROM ${TABLE_HARNESS_TERMINAL_ADMISSIONS}

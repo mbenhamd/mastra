@@ -3,7 +3,8 @@ import { TABLE_WORKFLOW_SNAPSHOT, createEmptyWorkflowSnapshot } from '@mastra/co
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { PostgresStore, WorkflowsPG } from '../../index';
+import type { WorkflowsPG } from '../../index';
+import { PostgresStore } from '../../index';
 import { connectionString } from '../../test-utils';
 
 const THREAD = 'thread-target';

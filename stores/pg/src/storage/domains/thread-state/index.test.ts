@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
 import { MastraError } from '@mastra/core/error';
-import { encodeThreadStateScope, type ThreadStateKey, type ThreadStateStorage } from '@mastra/core/storage';
+import { encodeThreadStateScope } from '@mastra/core/storage';
+import type { ThreadStateKey, ThreadStateStorage } from '@mastra/core/storage';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { exportSchemas, PostgresStore } from '../..';

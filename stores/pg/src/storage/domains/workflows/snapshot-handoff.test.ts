@@ -7,7 +7,8 @@ import {
 } from '@mastra/core/storage';
 import type { WorkflowRunState, WorkflowTerminalRecoveryAncestryV1 } from '@mastra/core/workflows';
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
-import { PostgresStore, WorkflowsPG } from '../../index';
+import type { WorkflowsPG } from '../../index';
+import { PostgresStore } from '../../index';
 
 const NESTED_PARENT_GRAPH: WorkflowRunState['serializedStepGraph'] = [
   { type: 'step', step: { id: 'nested', component: 'WORKFLOW' } },
