@@ -2095,7 +2095,7 @@ export interface SubtreeSessionLeaseResult extends SessionLeaseResult {
    * pre-admission grant revocation (`revokeTerminalGrant`) written at or after
    * its lease expiry, plus every open session below it. None of them was
    * renewed; a caller holding any of them live must stop treating it as
-   * leased. Absent when none.
+   * leased. Sorted by id (plain string order). Absent when none.
    */
   fencedDescendantIds?: string[];
 }

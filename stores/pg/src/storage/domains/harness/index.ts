@@ -3871,7 +3871,9 @@ export class HarnessPG extends HarnessStorage {
         const childrenOf = new Map<string, string[]>();
         for (const row of walked) {
           const parent = row.parent_session_id as string;
-          childrenOf.set(parent, [...(childrenOf.get(parent) ?? []), row.id as string]);
+          const siblings = childrenOf.get(parent);
+          if (siblings) siblings.push(row.id as string);
+          else childrenOf.set(parent, [row.id as string]);
         }
         const stack = [...fencedRoots];
         while (stack.length > 0) {
@@ -3895,7 +3897,11 @@ export class HarnessPG extends HarnessStorage {
         }
         renewedIds.push(childId);
       }
-      const fencedIds = openRows.map(row => row.id as string).filter(id => excluded.has(id));
+      // Sorted, so the report does not depend on walk order.
+      const fencedIds = openRows
+        .map(row => row.id as string)
+        .filter(id => excluded.has(id))
+        .sort();
 
       const allIds = [rootSessionId, ...renewedIds];
       const updateResult = await tx.execute({

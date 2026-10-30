@@ -1455,7 +1455,8 @@ export class InMemoryHarness extends HarnessStorage {
       version: root.version,
       expiresAt,
       renewedDescendantCount: descendants.length,
-      ...(fencedDescendantIds.length > 0 ? { fencedDescendantIds } : {}),
+      // Sorted, so the report does not depend on walk order.
+      ...(fencedDescendantIds.length > 0 ? { fencedDescendantIds: [...fencedDescendantIds].sort() } : {}),
     };
   }
 

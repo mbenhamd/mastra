@@ -1224,7 +1224,8 @@ export abstract class HarnessStorage extends StorageDomain {
    * (`revokeTerminalGrant`) for that descendant was written at or after its
    * lease expiry: the revocation acted on the lapse, so that descendant and
    * every open session below it are left out of the pass — not renewed, not
-   * counted in `renewedDescendantCount`, and listed in `fencedDescendantIds` —
+   * counted in `renewedDescendantCount`, and listed (sorted by id) in
+   * `fencedDescendantIds` —
    * while the root and the other descendants renew. A foreign-owned or
    * unowned descendant below a fenced one is left out with it rather than
    * failing the pass. Adapters check persisted tombstones regardless of their
