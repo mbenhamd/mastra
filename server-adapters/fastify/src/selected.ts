@@ -9,6 +9,7 @@ import {
   MastraServer as MastraServerBase,
   checkRouteFGA,
   getCustomHTTPExceptionResponse,
+  getHTTPErrorResponse,
   isSafeObjectKey,
   isZodError,
   normalizeQueryParams,
@@ -1172,27 +1173,14 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
           return;
         }
 
-        // Check if it's an HTTPException or MastraError with a status code
-        let status = 500;
-        if (error && typeof error === 'object') {
-          // Check for direct status property (HTTPException)
-          if ('status' in error) {
-            status = (error as any).status;
-          }
-          // Check for MastraError with status in details
-          else if (
-            'details' in error &&
-            error.details &&
-            typeof error.details === 'object' &&
-            'status' in error.details
-          ) {
-            status = (error.details as any).status;
-          }
-        }
-        if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) {
-          status = 500;
-        }
-        await reply.status(status).send({ error: error instanceof Error ? error.message : 'Unknown error' });
+        // Upstream #28202: one shared status/body mapping (keeps allowlisted causes).
+        // Fork: a status outside the HTTP range still falls back to 500.
+        const { status: mappedStatus, body } = getHTTPErrorResponse(error);
+        const status =
+          typeof mappedStatus === 'number' && Number.isInteger(mappedStatus) && mappedStatus >= 100 && mappedStatus <= 599
+            ? mappedStatus
+            : 500;
+        await reply.status(status).send(body);
       }
     };
 
@@ -1329,12 +1317,14 @@ export class MastraServer extends MastraServerBase<FastifyInstance, FastifyReque
         }
 
         // Check FGA authorization (EE feature)
+        // Path params last: the custom handler reads them from the URL, so query/body
+        // values must not be able to change which resource FGA checks.
         const fgaError = await checkRouteFGA(this.mastra, serverRoute, requestContext, {
-          ...(request.params as Record<string, string>),
           ...(request.query as Record<string, string>),
           ...(typeof request.body === 'object' && request.body !== null
             ? (request.body as Record<string, unknown>)
             : {}),
+          ...(request.params as Record<string, string>),
         });
         if (fgaError) {
           return reply.status(fgaError.status).send({ error: fgaError.error, message: fgaError.message });

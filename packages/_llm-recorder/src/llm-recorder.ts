@@ -804,6 +804,10 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
   let existingMeta: RecordingMeta | undefined;
   if (recordingExists) {
     const willRecord = mode === 'record' || mode === 'update';
+    // Only split per-test files are scoped to their test. A single recording
+    // file's meta.testName is informational (a suite name, or the last test
+    // that wrote it) and must not filter replay, matching upstream.
+    const scopeByTestName = splitRecordingPaths.length > 0;
     for (const sourcePath of recordingPaths) {
       try {
         const file = loadRecordingFile(sourcePath, options.name);
@@ -811,7 +815,7 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
         savedRecordings.push(
           ...prepareReplayRecordings(file.recordings, options.transformRequest).map(recording => ({
             ...recording,
-            ...(file.meta.testName ? { testName: file.meta.testName } : {}),
+            ...(scopeByTestName && file.meta.testName ? { testName: file.meta.testName } : {}),
           })),
         );
       } catch (err) {
@@ -1040,10 +1044,13 @@ export function setupLLMRecording(options: LLMRecorderOptions): LLMRecorderInsta
           currentTestName && hasTestScopedRecordings
             ? savedRecordings.filter(recording => recording.testName === currentTestName)
             : savedRecordings;
-        let exactReplayCounts = exactReplayCountsByTest.get(currentTestName);
+        // Single-file recordings keep upstream's file-wide record order; only
+        // split per-test fixtures get per-test ordinals.
+        const ordinalScope = hasTestScopedRecordings ? currentTestName : undefined;
+        let exactReplayCounts = exactReplayCountsByTest.get(ordinalScope);
         if (!exactReplayCounts) {
           exactReplayCounts = new Map<string, number>();
-          exactReplayCountsByTest.set(currentTestName, exactReplayCounts);
+          exactReplayCountsByTest.set(ordinalScope, exactReplayCounts);
         }
         const recording = findRecording(replayRecordings, hash, url, body, fuzzyUsedHashes, exactReplayCounts);
 

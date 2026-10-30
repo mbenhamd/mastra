@@ -262,6 +262,17 @@ export async function processWorkflowParallel(
     }
   }
 
+  // Upstream #27852 (PF-6640 sync): a restart continues an unfinished parallel
+  // without repeating a branch whose result was already saved. The fork keeps
+  // a finished branch in the persisted active-step paths, so skip it by its
+  // stored `success` record; the aggregation reads that saved result.
+  if (isRestartedEntry) {
+    const unfinished = [...pathsToRun].filter(id => stepResults?.[id]?.status !== 'success');
+    if (unfinished.length > 0) {
+      for (const id of [...pathsToRun]) if (!unfinished.includes(id)) pathsToRun.delete(id);
+    }
+  }
+
   const branches = step.steps.flatMap((nestedStep, idx) => {
     if (!pathsToRun.has(getSingleStepEntryId(nestedStep))) return [];
     return [
@@ -365,17 +376,22 @@ export async function processWorkflowConditional(
   // Create a proper RequestContext from the plain object passed in ProcessorArgs
   const reqContext = new RequestContext(Object.entries(requestContext ?? {}) as any);
 
-  const idxs = await stepExecutor.evaluateConditions({
-    workflowId,
-    step,
-    runId,
-    stepResults,
-    state: currentState,
-    requestContext: reqContext,
-    actor,
-    input: prevResult?.status === 'success' ? prevResult.output : undefined,
-    resumeData,
-  });
+  const savedRoute = step.steps
+    .map(child => stepResults[getSingleStepEntryId(child)]?.metadata?.__restartConditional)
+    .find(route => route?.index === executionPath[0]);
+  const idxs: number[] =
+    savedRoute?.branches ??
+    (await stepExecutor.evaluateConditions({
+      workflowId,
+      step,
+      runId,
+      stepResults,
+      state: currentState,
+      requestContext: reqContext,
+      actor,
+      input: prevResult?.status === 'success' ? prevResult.output : undefined,
+      resumeData,
+    }));
 
   const truthyIdxs: Record<number, boolean> = {};
   for (let i = 0; i < idxs.length; i++) {

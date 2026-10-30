@@ -81,7 +81,8 @@ async function createHarness(options: Parameters<typeof createInspector>[0] = {}
   const inspector = createInspector(options);
   let observerCallback: ((entries: PerformanceEntry[]) => void) | null = null;
   const observer = { observe: vi.fn(), disconnect: vi.fn() };
-  let idSequence = 0;
+  // Unique per call: a restart within the same millisecond would otherwise reuse the run directory name.
+  let nextId = 0;
   const diagnostics = new ProcessMemoryDiagnostics(
     {
       parentDirectory,
@@ -95,7 +96,7 @@ async function createHarness(options: Parameters<typeof createInspector>[0] = {}
         observerCallback = callback;
         return observer;
       },
-      randomId: () => `test-id-${++idSequence}`,
+      randomId: () => `test-id-${++nextId}`,
     },
   );
   return {

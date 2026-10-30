@@ -1137,6 +1137,7 @@ class MastraScorer<
       name: `scorer run: '${this.id}'`,
       entityType: EntityType.SCORER,
       entityId: this.id,
+      entityName: this.name,
       input: {
         input: serializeScorerSpanValue(prepared.input),
         output: serializeScorerSpanValue(prepared.output),
@@ -1375,6 +1376,7 @@ class MastraScorer<
             name: `scorer step: '${scorerStep.name}'`,
             entityType: EntityType.SCORER,
             entityId: this.config.id ?? this.config.name,
+            entityName: this.name,
             input: spanContext,
             attributes: {
               step: scorerStep.name,

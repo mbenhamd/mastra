@@ -139,11 +139,13 @@ function agentE2ETests({ version }: { version: 'v1' | 'v2' }) {
         weather: expect.any(String),
         temperature: expect.any(Number),
         humidity: expect.any(Number),
-        // .optional().nullable() fields: compat layer transforms null → undefined
-        barometricPressure: undefined,
         // .nullable() (without .optional()) stays null
         precipitation: null,
       });
+      // PF-4393 (PF-6640 sync): the fork compat layer deletes an optional field the
+      // provider returned as null instead of writing an own `undefined` property,
+      // which deep-JSON admission rejects. .optional().nullable() fields end up absent.
+      expect(resultObject).not.toHaveProperty('barometricPressure');
       expect(resultObject?.windSpeed === undefined || typeof resultObject?.windSpeed === 'string').toBe(true);
     });
   });

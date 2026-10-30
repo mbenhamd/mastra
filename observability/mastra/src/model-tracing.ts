@@ -1173,8 +1173,8 @@ export class ModelSpanTracker {
    * Export the current step span for later rebuilding (durable execution).
    * Returns undefined if no step span is active.
    */
-  exportCurrentStep(): ReturnType<Span<SpanType.MODEL_STEP>['exportSpan']> | undefined {
-    return runSpanOperation(() => this.#currentStepSpan?.exportSpan());
+  exportCurrentStep(): ReturnType<Span<SpanType.MODEL_STEP>['snapshot']> | undefined {
+    return runSpanOperation(() => this.#currentStepSpan?.snapshot());
   }
 
   /**

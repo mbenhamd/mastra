@@ -30,7 +30,9 @@ class TestWorkflowEventProcessor extends WorkflowEventProcessor {
 function createProcessor() {
   const publish = vi.fn().mockResolvedValue(undefined);
   const processor = new TestWorkflowEventProcessor({
-    mastra: { pubsub: { publish } } as any,
+    // PF-6640 sync: upstream #28054's suspend cleanup reads the workflows store; this
+    // processor has no storage, so the read yields nothing to clean up.
+    mastra: { pubsub: { publish }, getStorage: () => undefined } as any,
   });
 
   return { processor, publish };

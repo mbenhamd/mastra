@@ -31,6 +31,7 @@ import { MessageList } from '../../message-list';
 import { DurableStepIds } from '../constants';
 import { createDurableAgent } from '../create-durable-agent';
 import type { DurableAgent } from '../durable-agent';
+import { globalRunRegistry } from '../run-registry';
 import { emitChunkEvent, emitFinishEvent } from '../stream-adapter';
 import { serializeModelConfig } from '../utils/serialize-state';
 
@@ -65,7 +66,7 @@ async function seedSuspendedRun(
   versions?: Record<string, unknown>,
 ) {
   const workflows = (await store.getStore('workflows'))!;
-  // Fork (PF) cold-recovery fences compare the persisted input against the
+  // Fork (PF-1875) cold-recovery fences compare the persisted input against the
   // live runtime (tool surface, model binding, options) and require a
   // consistent outer/nested snapshot pair, so the seeded input mirrors what
   // real preparation persists (see recover-run.test.ts makeSnapshot).
@@ -111,7 +112,7 @@ async function seedSuspendedRun(
   }
 }
 
-// Fork (PF) cold-resume ownership fence: a cold resume must prove the exact
+// Fork (PF-1875) cold-resume ownership fence: a cold resume must prove the exact
 // persisted resource and thread; the seeded runs below use t-1/r-1.
 const coldOwner = { memory: { resource: 'r-1', thread: 't-1' } };
 
@@ -126,7 +127,7 @@ describe('durable agent version pinning across suspend/resume', () => {
     await pubsub.close();
   });
 
-  function setup() {
+  function setup(id?: string) {
     const store = new InMemoryStore();
     const baseAgent = new Agent({
       id: 'versioned-durable-agent',
@@ -134,7 +135,7 @@ describe('durable agent version pinning across suspend/resume', () => {
       instructions: 'You find users.',
       model: createTextModel('Resumed!') as LanguageModelV2,
     });
-    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub, id });
     const mastra = new Mastra({ agents: { versionedDurableAgent: durableAgent }, storage: store, logger: false });
 
     // Simulates the editor's `applyStoredOverrides`: fork, stamp the resolved
@@ -180,7 +181,7 @@ describe('durable agent version pinning across suspend/resume', () => {
   });
 
   it('cold-resumes on the version the run suspended on, not the current one', async () => {
-    const { store, durableAgent, resolveSpy } = setup();
+    const { store, baseAgent, durableAgent, resolveSpy } = setup('public-versioned-agent');
     const runId = 'version-pin-cold-run';
     await seedSuspendedRun(store, runId, durableAgent.id, { threadId: 't-1', resourceId: 'r-1' }, 'v1');
 
@@ -191,10 +192,21 @@ describe('durable agent version pinning across suspend/resume', () => {
     expect(resolveSpy).toHaveBeenCalledWith(expect.anything(), { versionId: 'v1' });
     // The pinned fork (not the original instance) rehydrated and owns the run.
     const fork = (await resolveSpy.mock.results[0]!.value) as DurableAgent;
+    expect(fork).not.toBe(durableAgent);
+    expect(fork.id).toBe(durableAgent.id);
+    expect(fork.id).not.toBe(baseAgent.id);
+    expect(fork.runRegistry.get(runId)?.agentId).toBe(durableAgent.id);
+    expect(globalRunRegistry.get(runId)?.agentId).toBe(durableAgent.id);
     expect(fork.runRegistry.has(runId)).toBe(true);
     expect(durableAgent.runRegistry.has(runId)).toBe(false);
     expect(result.runId).toBe(runId);
-    result.cleanup();
+    try {
+      const observation = await durableAgent.observe(runId);
+      observation.detach();
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      result.cleanup();
+    }
   });
 
   it('hands the tool-call resume marker to the pinned version (#27365)', async () => {
@@ -230,7 +242,7 @@ describe('durable agent version pinning across suspend/resume', () => {
   it('keeps an explicit call-site versionId as the operator escape hatch', async () => {
     const { store, durableAgent, resolveSpy } = setup();
     const runId = 'explicit-version-cold-run';
-    // Fork (PF): version selectors are part of the run's recovery contract and
+    // Fork (PF-5928): version selectors are part of the run's recovery contract and
     // cannot change across a resume, so the explicit selector must be the one
     // the run was started with. The escape hatch still wins over the v1 pin.
     const explicitVersions = { agents: { [durableAgent.id]: { versionId: 'v9' } } };

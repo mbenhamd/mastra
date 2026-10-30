@@ -34,11 +34,14 @@ function canResetWithPendingMarker(val: unknown, iterationResult: unknown): bool
     return true;
   }
 
+  // A queued slot may also carry the nested child run id a restart reuses (upstream #26368).
   if (
     isRecord(val) &&
     Object.hasOwn(val, FOREACH_QUEUED_MARKER_KEY) &&
     val[FOREACH_QUEUED_MARKER_KEY] === true &&
-    Object.keys(val).length === 1
+    Object.keys(val).every(
+      key => key === FOREACH_QUEUED_MARKER_KEY || (key === 'nestedRunId' && typeof val.nestedRunId === 'string'),
+    )
   ) {
     return true;
   }
@@ -196,6 +199,18 @@ export function mergeWorkflowStepResult({
     writable: true,
     value: nextResult,
   });
+
+  // Concurrent child starts and completions carry partial/stale foreach metadata.
+  // Preserve the durable identity of every sibling, not just the last writer's child.
+  if (existingResult?.metadata?.foreachNestedRunIds || result.metadata?.foreachNestedRunIds) {
+    snapshot.context[stepId].metadata = {
+      ...snapshot.context[stepId].metadata,
+      foreachNestedRunIds: {
+        ...existingResult?.metadata?.foreachNestedRunIds,
+        ...snapshot.context[stepId].metadata?.foreachNestedRunIds,
+      },
+    };
+  }
 
   if (state !== undefined) {
     snapshot.context.__state = state;

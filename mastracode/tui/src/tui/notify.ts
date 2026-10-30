@@ -54,7 +54,7 @@ function sendSystemNotification(reason: NotificationReason, message?: string): v
     // Feeding the script on stdin via the documented `-` program-file marker
     // makes every later value data, even when model or tool output starts with
     // an osascript option such as `-e`.
-    const script = 'on run argv\n' + 'display notification (item 1 of argv) with title (item 2 of argv)\n' + 'end run';
+    const script = 'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run';
     try {
       const child = spawn('/usr/bin/osascript', ['-', body, title], { stdio: ['pipe', 'ignore', 'ignore'] });
       child.on('error', () => {

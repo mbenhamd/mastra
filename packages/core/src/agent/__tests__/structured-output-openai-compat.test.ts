@@ -156,15 +156,23 @@ describe('OpenAI compat layer in agent.ts with structured output', () => {
     });
 
     expect(responseFormat?.type).toBe('json');
+    // PF-4393 (PF-6640 sync): the fork applies the OpenAI compat layer to the
+    // structured-output wire schema, so an optional object is sent as a strict
+    // nullable union whose object branch is closed with every key required.
     expect(responseFormat?.schema).toMatchObject({
       type: 'object',
       required: ['name', 'optionalNote', 'nested'],
       additionalProperties: false,
       properties: {
         nested: {
-          type: 'object',
-          required: ['maybeCount'],
-          additionalProperties: false,
+          anyOf: [
+            {
+              type: 'object',
+              required: ['maybeCount'],
+              additionalProperties: false,
+            },
+            { type: 'null' },
+          ],
         },
       },
     });

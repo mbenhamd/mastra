@@ -800,7 +800,9 @@ describe('Agent signals', () => {
     expect(reminderSignal.toLLMMessage()).toEqual({
       role: 'user',
       content:
-        '<system-reminder enabled="true" path="/tmp/AGENTS.md" type="dynamic-agents-md">Use &lt;safe&gt; content &amp; continue</system-reminder>',
+        // Upstream #27150 (PF-6640 sync): contents reach the model as written; only the
+        // signal's own closing tag is escaped (see signals-format.test.ts).
+        '<system-reminder enabled="true" path="/tmp/AGENTS.md" type="dynamic-agents-md">Use <safe> content & continue</system-reminder>',
     });
     expect(reminderSignal.toDataPart().data.attributes).toEqual({
       type: 'dynamic-agents-md',
@@ -15874,6 +15876,20 @@ describe('Agent signals', () => {
     });
     await pubsub.flush();
     expect(options.abortSignal?.aborted).toBe(false);
+    // Fork fail-closed rule (PF-6640 sync, as fork main): with the lease transferred and the
+    // lease owner unreadable, the stale request's token cannot be verified, so it stops nothing.
+    const failedLeaseRead = vi.spyOn(pubsub, 'getLeaseOwner').mockRejectedValue(new Error('lease backend unavailable'));
+    await pubsub.publish(`agent.thread-stream.${encodeURIComponent(key)}`, {
+      type: 'run-abort-requested',
+      runId,
+      data: { type: 'run-abort-requested', runId, streamId, leaseOwner },
+    });
+    await pubsub.flush();
+    await waitForCondition(() => failedLeaseRead.mock.calls.length > 0);
+    await nextTick();
+    await nextTick();
+    failedLeaseRead.mockRestore();
+    expect(options.abortSignal?.aborted).toBe(false);
     pubsub.owners.set(key, leaseOwner);
     // The real remote abort, addressed to the expected run (upstream), reaches
     // the owner only through the authenticated lease-owner path (fork).
@@ -19838,9 +19854,14 @@ describe('Agent signals', () => {
       const run = await runPromise;
       expect(run.value.runId).toBe(firstRunId);
       expect(run.value.text).toBe('response');
-      expect(run.value.parts.filter((part: any) => part.data?.contents === 'thread targeted follow up')).toHaveLength(
-        1,
+      const followUpParts = run.value.parts.filter((part: any) => part.data?.contents === 'thread targeted follow up');
+      // Upstream #28204 (PF-6640 sync): an accepted user message is first shown as pending, then
+      // delivered under the same id. PF-6997 (split A): fork-main ack timing accepts input sent to
+      // the local reserved run at once, so its pending part is published too.
+      expect(followUpParts.map((part: any) => part.type)).toEqual(
+        type === 'user-message' ? ['data-user-message-pending', 'data-user-message'] : ['data-signal'],
       );
+      expect(new Set(followUpParts.map((part: any) => part.data.id)).size).toBe(1);
       expect(prompts).toHaveLength(1);
       expect(JSON.stringify(prompts[0])).toContain('thread targeted follow up');
 
@@ -22231,7 +22252,13 @@ describe('Agent signals', () => {
 
       releaseFirst();
       const run = await firstRunPromise;
-      expect(run.value.parts.filter((part: any) => part.data?.contents === 'Hello by run id')).toHaveLength(1);
+      const signalParts = run.value.parts.filter((part: any) => part.data?.contents === 'Hello by run id');
+      // Upstream #28204 (PF-6640 sync): an accepted user message is first shown as pending,
+      // then delivered under the same id.
+      expect(signalParts.map((part: any) => part.type)).toEqual(
+        type === 'user-message' ? ['data-user-message-pending', 'data-user-message'] : ['data-signal'],
+      );
+      expect(new Set(signalParts.map((part: any) => part.data.id)).size).toBe(1);
       await expect(stream.text).resolves.toBe('run id first responserun id signal response');
       expect(streamCount).toBe(2);
       expect(JSON.stringify(prompts[1])).toContain('Hello by run id');
@@ -22593,6 +22620,58 @@ describe('Agent signals', () => {
     // Neither the wake's hand-off nor the sibling's forwards it; it is dropped, as on fork main.
     expect(ctx.forwardedTo(ctx.winnerRunId)).toEqual([ctx.sibling!.signal.id]);
     expect(await deliveriesOf(ctx, followUpId)).toBe(0);
+  });
+
+  it('PF-6944: keeps a follow-up queued with its record when the queued idle sibling loses to a retake token, so its retry runs nothing twice', async () => {
+    // PF-6640 sync only: upstream #28079 adds the retake-owner branch to the pending-idle drain,
+    // which fork main lacks. Fixtures: ./pf6944-idle-wake-fixtures.ts.
+    const { startIdleWakeWithFollowUps, queueFollowUpBehindSiblingDrain } = await import('./pf6944-idle-wake-fixtures');
+    const ctx = await startIdleWakeWithFollowUps('pf6944-sync-retake-drain', 0, { queuedIdleSibling: true });
+    const { sibling, scope, followUpSignal, releaseSiblingAcquire } = await queueFollowUpBehindSiblingDrain(ctx);
+    const ran: string[] = [];
+    const streamedIds = () =>
+      vi.mocked(ctx.agent.stream).mock.calls.map(([signal]) => (signal as { id?: string }).id ?? '');
+    const takeQueued = (runId: string) => {
+      for (const scopeName of ['pre-run', 'pending'] as const) {
+        ran.push(...ctx.runtime.drainPendingSignals(runId, ctx.pubsub, scopeName).map(signal => signal.id ?? ''));
+      }
+    };
+
+    // The sibling's lease acquisition finds the thread under a retake token. An unreadable owner
+    // ends upstream's wait for the handover at once, so the drain takes the retake branch.
+    ctx.pubsub.owners.set(ctx.key, `${ctx.winnerRunId}\u0000retake\u0000pf6944-sync-retake`);
+    ctx.pubsub.ownerReadFailures = 1;
+    releaseSiblingAcquire();
+    await vi.waitFor(() => expect(ctx.runtime.getActiveThreadRunId(scope, ctx.pubsub)).toBeUndefined());
+    await new Promise(resolve => setTimeout(resolve, 50));
+    // Nothing is forwarded to the token and nothing runs: the sibling and its follow-up stay queued.
+    expect(ctx.forwardedTo(ctx.winnerRunId)).toEqual([ctx.wakeId]);
+    expect(streamedIds()).toEqual([]);
+
+    // The retake settles; the next local run takes the kept follow-up in its first request.
+    ctx.pubsub.owners.delete(ctx.key);
+    const next = ctx.runtime.sendSignal(
+      ctx.agent,
+      { id: 'pf6944-sync-retake-next', type: 'user-message', contents: 'n' },
+      scope,
+      ctx.pubsub,
+    );
+    await expect(next.accepted).resolves.toMatchObject({ action: 'wake', runId: next.runId });
+    // A retry of the follow-up while that run holds the thread is a duplicate of the kept copy's
+    // record (re-recorded under the sibling's run id when it was requeued), not new input.
+    const retry = ctx.runtime.sendSignal(ctx.agent, followUpSignal, scope, ctx.pubsub);
+    await expect(retry.accepted).resolves.toMatchObject({ action: 'deliver', runId: sibling.runId });
+    takeQueued(next.runId);
+    expect(ran).toEqual([followUpSignal.id]);
+
+    // The sibling wake is still queued and runs on the next trigger, without a second copy.
+    await ctx.pubsub.releaseLease(ctx.key, ctx.pubsub.owners.get(ctx.key)!);
+    ctx.runtime.releaseThreadRunReservation(next.runId, ctx.pubsub);
+    await vi.waitFor(() => expect(streamedIds()).toContain(sibling.signal.id));
+    takeQueued(sibling.runId);
+    expect(streamedIds()).toEqual(['pf6944-sync-retake-next', sibling.signal.id]);
+    // The follow-up ran exactly once.
+    expect([...ran, ...streamedIds()].filter(id => id === followUpSignal.id)).toHaveLength(1);
   });
 
   it('PF-6944: does not forward a follow-up past a failed publish of its queued idle sibling signal', async () => {

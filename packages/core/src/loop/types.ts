@@ -38,6 +38,7 @@ import type { RequestContext } from '../request-context';
 import type { PendingStepUsage } from '../stream/pending-step-usage';
 import type {
   ChunkType,
+  LanguageModelUsage,
   MastraOnFinishCallback,
   MastraOnStepFinishCallback,
   MastraStreamTransformOptions,
@@ -392,7 +393,11 @@ export type LoopRun<Tools extends ToolSet = ToolSet, OUTPUT = undefined> = LoopO
   _internal: StreamInternal;
   rotateResponseMessageId: (sealMessageId?: string) => string;
   streamState: {
-    serialize: () => any;
+    /**
+     * Pass a suspension chunk the step just emitted so the state reflects it. Its usage only
+     * fills the out-of-band slot below when nothing was recorded there.
+     */
+    serialize: (pendingSuspension?: { usage?: LanguageModelUsage }) => any;
     /**
      * @internal Record the usage of the model step whose tool call is about to
      * suspend the run, so the suspended result (and its serialized state, for a

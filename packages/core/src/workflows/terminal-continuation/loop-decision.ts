@@ -327,7 +327,7 @@ export function materializeWorkflowTerminalLoopConditionFrame(
   // The loop decision itself is not known yet. An exit decision is used only
   // to reuse the canonical child merge projection; both loop outcomes produce
   // the same context/state/request-context values and consecutive count.
-  const exitConditionResult = request.loopType === 'dowhile' ? false : true;
+  const exitConditionResult = request.loopType !== 'dowhile';
   const previewContract = planWorkflowTerminalParentContinuation({
     ...plannerInput,
     evaluatedDecision: completeWorkflowTerminalLoopDecision(request, exitConditionResult),

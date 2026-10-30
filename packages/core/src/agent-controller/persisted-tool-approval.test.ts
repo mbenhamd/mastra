@@ -180,7 +180,10 @@ describe('Session.respondToPersistedToolApproval', () => {
     await session.respondToPersistedToolApproval({ runId: run!.runId, toolCallId: 'call-1', approved: true });
 
     expect(approve).toHaveBeenCalledTimes(1);
-    expect(approve).toHaveBeenCalledWith(expect.objectContaining({ runId: run!.runId, toolCallId: 'call-1' }));
+    // PF-6640 sync: the parked gate now forwards upstream's re-arm `onDispatch`
+    // callback (approval gate reconciliation) as a second argument; the
+    // identity is still the exact owning run.
+    expect(approve.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ runId: run!.runId, toolCallId: 'call-1' }));
   }, 30_000);
 
   it('rejects an approval whose run id matches no stored run even when the tool-call id does', async () => {

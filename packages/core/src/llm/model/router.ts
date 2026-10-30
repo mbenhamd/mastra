@@ -280,6 +280,29 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
     return (modelSupportedUrls as Record<string, RegExp[]>) ?? {};
   }
 
+  /**
+   * Resolves the provider id of the model this router calls, e.g. `groq.chat` or `openai.responses`.
+   * `provider` only names the gateway's provider (`groq`, `openai`), which doesn't tell a Chat
+   * Completions endpoint from a Responses one. Returns `undefined` when the model can't be resolved
+   * (e.g. a missing API key); the model call reports that error itself.
+   */
+  async resolveApiProviderId(): Promise<string | undefined> {
+    try {
+      const resolved = this.#manager.resolveModelId(this.config.routerId);
+      const auth = await this.resolveAuth(resolved.providerId, resolved.modelId);
+      const model = await this.resolveLanguageModel({
+        apiKey: auth.apiKey ?? '',
+        auth,
+        headers: mergeHeaders(this.config.headers, auth.headers),
+        trackStreamTransport: false,
+        ...resolved,
+      });
+      return model.provider;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** @internal */
   _getStreamTransport(): StreamTransport | undefined {
     return this.#lastStreamTransport;
@@ -554,6 +577,7 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
     headers,
     transport,
     responsesWebSocket,
+    trackStreamTransport = true,
   }: {
     modelId: string;
     providerId: string;
@@ -562,6 +586,8 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
     headers?: Record<string, string>;
     transport?: OpenAITransport;
     responsesWebSocket?: ResponsesWebSocketOptions;
+    /** Set false to resolve without replacing the transport handle the next stream reads. */
+    trackStreamTransport?: boolean;
   }): Promise<GatewayLanguageModel> {
     const resolvedTransport: OpenAITransport = transport ?? 'fetch';
     const websocketKey =
@@ -584,7 +610,7 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
       api: this.config.api || 'chat',
     });
     if (cache.modelInstances.has(key)) {
-      this.setStreamTransportFromCache({ cache, resolvedTransport, key, responsesWebSocket });
+      if (trackStreamTransport) this.setStreamTransportFromCache({ cache, resolvedTransport, key, responsesWebSocket });
       return cache.modelInstances.get(key)!;
     }
 
@@ -607,7 +633,7 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
               supportsStructuredOutputs: true,
             }).chatModel(modelId);
       cache.modelInstances.set(key, modelInstance);
-      this.setStreamTransportHandle({ resolvedTransport, responsesWebSocket });
+      if (trackStreamTransport) this.setStreamTransportHandle({ resolvedTransport, responsesWebSocket });
       return modelInstance;
     }
 
@@ -642,7 +668,9 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
     if (gatewayTransport) {
       cache.gatewayStreamTransports.set(key, gatewayTransport);
     }
-    this.setStreamTransportHandle({ resolvedTransport, transport: gatewayTransport, responsesWebSocket });
+    if (trackStreamTransport) {
+      this.setStreamTransportHandle({ resolvedTransport, transport: gatewayTransport, responsesWebSocket });
+    }
     return modelInstance;
   }
 
@@ -681,4 +709,15 @@ export class ModelRouterLanguageModel implements MastraLanguageModelV2 {
 
 function readGatewayStreamTransport(model: GatewayLanguageModel): GatewayStreamTransportHandle | undefined {
   return (model as GatewayLanguageModelWithStreamTransport)[MASTRA_GATEWAY_STREAM_TRANSPORT];
+}
+
+/**
+ * Returns the provider id of the API a model sends requests to, e.g. `openai.chat` or
+ * `anthropic.messages`. Router models resolve the model they will call; other models report
+ * their own `provider`.
+ */
+export async function resolveApiProviderId(model: unknown): Promise<string | undefined> {
+  if (model instanceof ModelRouterLanguageModel) return model.resolveApiProviderId();
+  const provider = (model as { provider?: unknown } | null | undefined)?.provider;
+  return typeof provider === 'string' && provider.length > 0 ? provider : undefined;
 }

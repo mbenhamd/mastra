@@ -26,8 +26,17 @@ export const RETRY_CONFIG = {
   maxDelayMs: 2_000,
   /** Random jitter as a fraction of the computed delay (e.g. 0.2 = ±20%). */
   jitter: 0.2,
-  /** Total deadline for attempts plus backoff. */
+  /** Total deadline for attempts plus backoff (fork, PF-2246). */
   timeoutMs: 60_000,
+  /**
+   * How long one observer, reflector, or extraction model call may go without streaming any
+   * output before it is aborted and retried. Without it a provider that accepts the request but
+   * never answers stalls the call forever, and the retry schedule above never gets a chance to run.
+   * It measures inactivity, not total duration, so a long reply that keeps streaming is never cut
+   * off. It is generous because reasoning models can think silently before their first token.
+   * The operation deadline (`timeoutMs`) still bounds the whole call including retries.
+   */
+  modelCallIdleTimeoutMs: 300_000,
 };
 
 const TRANSIENT_MESSAGE_SUBSTRINGS = [
@@ -48,6 +57,21 @@ const TRANSIENT_MESSAGE_SUBSTRINGS = [
 ];
 
 const INCOMPLETE_FINISH_REASONS = new Set(['other', 'unknown']);
+
+/**
+ * A model call that streamed nothing for `RETRY_CONFIG.modelCallIdleTimeoutMs`. Retryable, and
+ * deliberately not an AbortError so `withRetry` doesn't treat it as cancellation.
+ *
+ * @internal
+ */
+export class OmModelCallTimeoutError extends Error {
+  readonly isRetryable = true;
+
+  constructor(label: string, idleTimeoutMs: number) {
+    super(`${label} call produced no output for ${idleTimeoutMs}ms`);
+    this.name = 'OmModelCallTimeoutError';
+  }
+}
 
 /**
  * A model reply that ended before the model finished. Carries the AI SDK's
@@ -236,6 +260,63 @@ export interface WithRetryOptions {
   timeoutMs?: number;
   /** Retry override. Omit to use the shared retry schedule. */
   maxRetries?: number;
+  /**
+   * Abort and retry an attempt that reports no activity for this long. The attempt
+   * reports activity by calling the `onActivity` callback it receives, typically on
+   * every streamed chunk. Only for model calls: a timed-out storage write may still
+   * land, so retrying it is unsafe.
+   */
+  idleTimeoutMs?: number;
+}
+
+/** Called by an attempt whenever it makes progress, resetting the idle timer. */
+export type OnAttemptActivity = () => void;
+
+/**
+ * Run one attempt, failing with a retryable `OmModelCallTimeoutError` if it
+ * goes `idleTimeoutMs` without calling `onActivity`. `fn` gets a signal that
+ * aborts on timeout or on the caller's signal, so the underlying request is
+ * cancelled too.
+ */
+async function attemptWithIdleTimeout<T>(
+  fn: (signal: AbortSignal, onActivity: OnAttemptActivity) => Promise<T>,
+  label: string,
+  idleTimeoutMs: number,
+  abortSignal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  let rejectOnAbort!: (reason: unknown) => void;
+  const callerAborted = new Promise<never>((_, reject) => {
+    rejectOnAbort = reject;
+  });
+  const onAbort = () => {
+    controller.abort(abortSignal?.reason);
+    rejectOnAbort(abortSignal?.reason ?? new Error('The operation was aborted.'));
+  };
+  abortSignal?.addEventListener('abort', onAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectOnIdle!: (reason: unknown) => void;
+  const idle = new Promise<never>((_, reject) => {
+    rejectOnIdle = reject;
+  });
+  const armIdleTimer = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const error = new OmModelCallTimeoutError(label, idleTimeoutMs);
+      rejectOnIdle(error);
+      controller.abort(error);
+    }, idleTimeoutMs);
+  };
+  const onActivity = () => {
+    if (!controller.signal.aborted) armIdleTimer();
+  };
+  armIdleTimer();
+  try {
+    return await Promise.race([fn(controller.signal, onActivity), idle, callerAborted]);
+  } finally {
+    clearTimeout(timer);
+    abortSignal?.removeEventListener('abort', onAbort);
+  }
 }
 
 export class ObservationalMemoryOperationTimeoutError extends Error {
@@ -267,14 +348,19 @@ function raceWithAbort<T>(operation: Promise<T>, abortSignal: AbortSignal): Prom
  *
  * @internal
  */
-export async function withRetry<T>(fn: (abortSignal: AbortSignal) => Promise<T>, opts: WithRetryOptions): Promise<T> {
-  const { label, abortSignal } = opts;
+export async function withRetry<T>(
+  fn: (signal: AbortSignal, onActivity: OnAttemptActivity) => Promise<T>,
+  opts: WithRetryOptions,
+): Promise<T> {
+  const { label, abortSignal, idleTimeoutMs } = opts;
   const maxRetries = opts.maxRetries ?? RETRY_CONFIG.maxRetries;
   const timeoutMs = opts.timeoutMs ?? RETRY_CONFIG.timeoutMs;
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
     throw new Error(`Observational Memory ${label} timeoutMs must be a finite non-negative number`);
   }
 
+  // Fork (PF-2246): one deadline for the whole logical operation. Every attempt
+  // (and its idle-timeout controller) is chained to this signal.
   const operationController = new AbortController();
   const onCallerAbort = () => operationController.abort(abortSignal?.reason);
   if (abortSignal?.aborted) {
@@ -296,13 +382,16 @@ export async function withRetry<T>(fn: (abortSignal: AbortSignal) => Promise<T>,
         throw abortReason(operationSignal);
       }
       try {
-        return await raceWithAbort(
-          Promise.resolve().then(() => fn(operationSignal)),
-          operationSignal,
-        );
+        // Upstream #27489: an attempt that streams nothing for `idleTimeoutMs`
+        // is aborted with a retryable OmModelCallTimeoutError.
+        const attemptRun =
+          idleTimeoutMs === undefined
+            ? Promise.resolve().then(() => fn(operationSignal, () => {}))
+            : attemptWithIdleTimeout(fn, label, idleTimeoutMs, operationSignal);
+        return await raceWithAbort(attemptRun, operationSignal);
       } catch (error) {
         if (operationSignal.aborted) throw abortReason(operationSignal);
-        if (isAbortError(error)) throw error;
+        if (!(error instanceof OmModelCallTimeoutError) && hasAbortInChain(error)) throw error;
         if (attempt >= maxRetries || !isTransientLLMError(error)) {
           if (attempt > 0) {
             omDebug(

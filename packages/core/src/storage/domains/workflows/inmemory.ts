@@ -140,10 +140,10 @@ import {
   classifyWorkflowSnapshotThreadErasure,
   classifyWorkflowTerminalEnvelopeThreadErasure,
   isWorkflowSnapshotThreadErasureContentFree,
-  type WorkflowThreadErasureRowClass,
   WORKFLOW_SNAPSHOT_THREAD_ERASURE_LOOP_WORKFLOWS,
   workflowRunThreadErasureSharedRunIds,
 } from '../../workflow-snapshot-handoff';
+import type { WorkflowThreadErasureRowClass } from '../../workflow-snapshot-handoff';
 import type { InMemoryDB, WorkflowTerminalParentRevisionState } from '../inmemory-db';
 import { WorkflowsStorage } from './base';
 import {
