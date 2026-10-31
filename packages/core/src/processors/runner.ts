@@ -1904,7 +1904,11 @@ export class ProcessorRunner {
               }),
           });
         } else {
-          held = await takeHeldParts(processorStates.get(processorOrWorkflow.id)?.customState);
+          held = await takeHeldParts(
+            processorStates.get(processorOrWorkflow.id)?.customState,
+            undefined,
+            processorOrWorkflow.id,
+          );
         }
       } catch (error) {
         if (error instanceof TripWire) {
@@ -1967,7 +1971,11 @@ export class ProcessorRunner {
     for (const processorOrWorkflow of [...this.outputProcessors].reverse()) {
       const parts = isProcessorWorkflow(processorOrWorkflow)
         ? ((await processorOrWorkflow.__discardOutputStream?.(this.processorStates)) ?? [])
-        : await takeHeldParts(processorStates.get(processorOrWorkflow.id)?.customState, { discard: true });
+        : await takeHeldParts(
+            processorStates.get(processorOrWorkflow.id)?.customState,
+            { discard: true },
+            processorOrWorkflow.id,
+          );
       kept.push(...(parts as ChunkType<OUTPUT>[]));
     }
     return kept;
