@@ -862,6 +862,7 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
     initialToolCalls,
     resumedText,
     finishUsageIsTotal,
+    onTracingTripwire,
   }: {
     model: {
       modelId: string | undefined;
@@ -880,6 +881,8 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
      */
     resumedText?: { priorText: string; stepText: string };
     finishUsageIsTotal?: boolean;
+    /** Internal tracing state, never serialized into finish chunks. */
+    onTracingTripwire?: import('../../loop/types').LoopOptions['onTracingTripwire'];
   }) {
     super({ component: 'LLM', name: 'MastraModelOutput' });
     if (options.logger) {
@@ -1702,6 +1705,13 @@ export class MastraModelOutput<OUTPUT = undefined> extends MastraBase {
                 metadata: chunk.payload?.metadata,
                 processorId: chunk.payload?.processorId,
               };
+              // No `finish` chunk follows, so `onFinish` never runs: let the owner close its spans.
+              // Tracing must not change how the stream settles.
+              try {
+                onTracingTripwire?.(self.#tripwire, self.#usageCount, self.#bufferedText.join(''));
+              } catch (error) {
+                self.logger?.warn('Error recording tripwire tracing', error);
+              }
               self.#finishReason = 'other';
               // The tripwire terminates the stream without a `finish` chunk, so settle the
               // status here; otherwise the run stays 'running' forever.

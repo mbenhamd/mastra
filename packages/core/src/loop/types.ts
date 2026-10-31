@@ -43,6 +43,7 @@ import type {
   MastraOnStepFinishCallback,
   MastraStreamTransformOptions,
   ModelManagerModelConfig,
+  StepTripwireData,
   StreamChunkType,
   StreamTransportRef,
 } from '../stream/types';
@@ -319,6 +320,11 @@ export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
   downloadRetries?: number;
   downloadConcurrency?: number;
   modelSpanTracker?: IModelSpanTracker;
+  /**
+   * @internal Observes a terminal stream tripwire without invoking user lifecycle hooks.
+   * A tripwire chunk ends the stream with no `finish` chunk, so `onFinish` never runs.
+   */
+  onTracingTripwire?: (tripwire: StepTripwireData, usage: LanguageModelUsage, text: string) => void;
   requireToolApproval?: RequireToolApproval;
   autoResumeSuspendedTools?: boolean;
   agentId: string;
