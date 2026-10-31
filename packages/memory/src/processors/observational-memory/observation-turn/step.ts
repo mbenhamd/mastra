@@ -643,6 +643,7 @@ export class ObservationStep {
     let obsResult;
     try {
       obsResult = await om.observe({
+        abortSignal: this.turn.abortSignal,
         threadId,
         resourceId,
         messages: pendingMessages,

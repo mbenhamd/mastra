@@ -33,10 +33,14 @@ export const RETRY_CONFIG = {
    * output before it is aborted and retried. Without it a provider that accepts the request but
    * never answers stalls the call forever, and the retry schedule above never gets a chance to run.
    * It measures inactivity, not total duration, so a long reply that keeps streaming is never cut
-   * off. It is generous because reasoning models can think silently before their first token.
+   * off. Reasoning models can think silently before their first token, but `reasoning-delta`
+   * chunks count as output.
    * The operation deadline (`timeoutMs`) still bounds the whole call including retries.
+   *
+   * Fork (PF-7205): upstream uses 300s, which never fires inside the fork's 60s operation deadline,
+   * so one hung attempt used the whole budget. 20s leaves room for a retry inside that deadline.
    */
-  modelCallIdleTimeoutMs: 300_000,
+  modelCallIdleTimeoutMs: 20_000,
 };
 
 const TRANSIENT_MESSAGE_SUBSTRINGS = [

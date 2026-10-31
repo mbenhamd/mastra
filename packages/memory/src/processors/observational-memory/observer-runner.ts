@@ -11,7 +11,7 @@ import type { ProviderMetadata } from '@mastra/core/stream';
 
 import type { Memory } from '../..';
 import { omDebug } from './debug';
-import { formatOmError, isOmModelExecutionFailure, OmModelExecutionError } from './error';
+import { formatOmError, isOmModelExecutionFailure, isOmOwnTimeout, OmModelExecutionError } from './error';
 import { getBuiltInExtractedValues, mergeExtractedValues, mergeExtractionFailures } from './extracted-values';
 import { extractStructuredValues } from './extraction-runner';
 import type { Extractor } from './extractor';
@@ -131,6 +131,18 @@ function filterObserverExtractors(
   return configuredExtractors.filter(
     extractor => extractor.slug !== 'current-task' && extractor.slug !== 'suggested-response',
   );
+}
+
+/**
+ * Fork (PF-7205): when OM's own deadline or per-attempt timeout ends the Observer call, report it as
+ * an observer-model failure so `failurePolicy: 'continue'` can defer observation and let the step
+ * reach the actor model. A caller abort is rethrown unchanged and stays fatal.
+ */
+function rethrowOwnTimeoutAsObserverFailure(error: unknown, abortSignal: AbortSignal | undefined): never {
+  if (!abortSignal?.aborted && isOmOwnTimeout(error)) {
+    throw new OmModelExecutionError('observer-model', error);
+  }
+  throw error;
 }
 
 export class ObserverRunner {
@@ -417,7 +429,7 @@ export class ObserverRunner {
           idleTimeoutMs: RETRY_CONFIG.modelCallIdleTimeoutMs,
           maxRetries: this.observationConfig.maxRetries,
         },
-      );
+      ).catch(error => rethrowOwnTimeoutAsObserverFailure(error, abortSignal));
     };
 
     let result = await doGenerate();
@@ -768,7 +780,7 @@ export class ObserverRunner {
           idleTimeoutMs: RETRY_CONFIG.modelCallIdleTimeoutMs,
           maxRetries: this.observationConfig.maxRetries,
         },
-      );
+      ).catch(error => rethrowOwnTimeoutAsObserverFailure(error, abortSignal));
     };
 
     let result = await doGenerate();

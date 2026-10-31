@@ -11,10 +11,11 @@ import { ProcessorStepSchema } from '@mastra/core/processors';
 import { InMemoryStore } from '@mastra/core/storage';
 import { createTool } from '@mastra/core/tools';
 import { createWorkflow } from '@mastra/core/workflows';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { z } from 'zod';
 
 import { Memory } from '../../../index';
+import { RETRY_CONFIG } from '../retry';
 
 // =============================================================================
 // Mock Models
@@ -231,6 +232,17 @@ function createTransientFailingObserverModel(onAttempt: () => void) {
       throw new TypeError('fetch failed');
     },
   };
+}
+
+/** A provider that accepts the request and never answers; like fetch, it settles only on abort. */
+function createHangingObserverModel(onAttempt: () => void) {
+  const hang = ({ abortSignal }: { abortSignal?: AbortSignal }) => {
+    onAttempt();
+    return new Promise<never>((_, reject) => {
+      abortSignal?.addEventListener('abort', () => reject(abortSignal.reason), { once: true });
+    });
+  };
+  return { ...createFailingObserverModel(), doGenerate: hang, doStream: hang };
 }
 
 function createMockReflectorModel() {
@@ -591,6 +603,83 @@ describe('OM Error State', { timeout: 30_000 }, () => {
     );
     // The blocked step never ran, so its text is not saved.
     expect(parts.some((part: any) => part.type === 'text' && part.text === longResponseText)).toBe(false);
+  });
+});
+
+describe('OM hung Observer under failurePolicy continue', { timeout: 30_000 }, () => {
+  const originalConfig = { ...RETRY_CONFIG };
+
+  beforeEach(() => {
+    // Shrink OM's own operation deadline so a hung Observer ends in milliseconds; keep the idle
+    // limit above it so the deadline is what ends the call.
+    RETRY_CONFIG.timeoutMs = 200;
+    RETRY_CONFIG.modelCallIdleTimeoutMs = 60_000;
+  });
+
+  afterEach(() => {
+    Object.assign(RETRY_CONFIG, originalConfig);
+  });
+
+  function createHangingObserverAgent(onAttempt: () => void) {
+    return new Agent({
+      id: 'test-hung-observer-agent',
+      name: 'Test Hung Observer Agent',
+      instructions: 'You are a helpful assistant. Always use the test tool first.',
+      model: createMockOmModel(longResponseText) as any,
+      tools: { test: omTriggerTool },
+      memory: new Memory({
+        storage: new InMemoryStore(),
+        options: {
+          observationalMemory: {
+            enabled: true,
+            observation: {
+              model: createHangingObserverModel(onAttempt) as any,
+              messageTokens: 20,
+              bufferTokens: false,
+              maxRetries: 0,
+              failurePolicy: 'continue',
+            },
+            reflection: { model: createMockReflectorModel() as any, observationTokens: 50000 },
+          },
+        },
+      }),
+    });
+  }
+
+  it('defers observation and reaches the model when OM times the Observer out', async () => {
+    let attempts = 0;
+    const agent = createHangingObserverAgent(() => attempts++);
+
+    const result = await agent.generate('Hello, I need help.', {
+      memory: { thread: 'test-hung-observer', resource: 'test-resource' },
+    });
+
+    expect(attempts).toBeGreaterThan(0);
+    expect(result.tripwire).toBeUndefined();
+    expect(result.text).toBe(longResponseText);
+  });
+
+  it('keeps a caller abort fatal and does not observe again while failing the step', async () => {
+    const controller = new AbortController();
+    let attempts = 0;
+    const agent = createHangingObserverAgent(() => {
+      attempts++;
+      setTimeout(() => controller.abort(new Error('caller cancelled')), 10);
+    });
+
+    const outcome = await agent
+      .generate('Hello, I need help.', {
+        memory: { thread: 'test-hung-observer-abort', resource: 'test-resource' },
+        abortSignal: controller.signal,
+      })
+      .then(
+        result => ({ text: result.text }),
+        () => ({ text: undefined }),
+      );
+
+    // The step never reached the model, and the Observer ran once: no end-of-turn observation.
+    expect(outcome.text).not.toBe(longResponseText);
+    expect(attempts).toBe(1);
   });
 });
 

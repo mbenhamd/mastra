@@ -7,13 +7,11 @@ import { modelSupportsTemperature, resolveModelConfig } from '@mastra/core/llm';
 import type { Mastra } from '@mastra/core/mastra';
 import { getThreadOMMetadata, setThreadOMMetadata } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
-import {
-  DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES,
-  filterToolCallMessages,
-  MessageHistory,
-  type MessageHistoryToolCallFilterOptions,
-  type ProcessorContext,
-  type ProcessorStreamWriter,
+import { DEFAULT_PERSISTED_MODEL_OUTPUT_BYTES, filterToolCallMessages, MessageHistory } from '@mastra/core/processors';
+import type {
+  MessageHistoryToolCallFilterOptions,
+  ProcessorContext,
+  ProcessorStreamWriter,
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import type {
@@ -4605,6 +4603,11 @@ ${formattedMessages}
     writer?: ProcessorStreamWriter;
     observabilityContext?: ObservabilityContext;
     sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+    /**
+     * Cancels the Observer call. An abort here stays fatal under `failurePolicy: 'continue'`;
+     * OM's own deadline or per-attempt timeout does not (fork, PF-7205).
+     */
+    abortSignal?: AbortSignal;
   }): Promise<{
     observed: boolean;
     reflected: boolean;
@@ -4671,6 +4674,7 @@ ${formattedMessages}
           writer: opts.writer,
           observabilityContext: opts.observabilityContext,
           sourceWriteGuard: opts.sourceWriteGuard,
+          abortSignal: opts.abortSignal,
         }).run();
         observed = result.observed;
         observationUsage = result.usage;
