@@ -409,6 +409,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
       state.__omObservabilityContext = observabilityContext;
       this.turn.observabilityContext = observabilityContext;
       this.turn.actorModelContext = actorModelContext;
+      this.turn.abortSignal = abortSignal;
       this.turn.responseMessageId = responseMessageId;
 
       // ── Run step preparation (activation, threshold, observation, filtering) ──
@@ -425,8 +426,10 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
             : `Encountered error during memory observation: ${err.message}`;
           // A tripwire skips output processors, so end the turn here to save the user message and
           // finished steps. The step that failed never reached the model, so nothing blocked is saved.
+          // Skip end-of-turn observation: this step's own observation just failed, and running the
+          // Observer again would only delay the failure (fork, PF-7205).
           const failedTurn = this.turn;
-          await failedTurn.end().catch(() => {});
+          await failedTurn.end(undefined, { skipObservation: true }).catch(() => {});
           if (this.turn === failedTurn) {
             this.turn = undefined;
           }

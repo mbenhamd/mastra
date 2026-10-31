@@ -71,6 +71,12 @@ export class ObservationTurn {
   /** Optional observability context for nested OM spans. */
   observabilityContext?: ObservabilityContext;
 
+  /**
+   * The run's abort signal. Updated by the processor before prepare(). Step-time sync observation
+   * passes it to the Observer so a caller abort cancels the call and stays fatal (fork, PF-7205).
+   */
+  abortSignal?: AbortSignal;
+
   /** Optional agent that owns this processor turn. */
   agent?: ProcessorContext['agent'];
 
@@ -239,8 +245,15 @@ export class ObservationTurn {
    * (any failure under `abort`; non-model failures such as storage or cancellation under `continue`).
    * Unsaved messages are persisted first. The turn stays sealed after a rejection, so do not call
    * `end()` again; start a new turn instead.
+   *
+   * Pass `skipObservation: true` to only save messages, with no end-of-turn observation or idle
+   * buffering. The processor does this when a step's own observation failed (fork, PF-7205): running
+   * the Observer again there only delays the failure.
    */
-  async end(messageList: MessageList = this.messageList): Promise<TurnResult> {
+  async end(
+    messageList: MessageList = this.messageList,
+    options: { skipObservation?: boolean } = {},
+  ): Promise<TurnResult> {
     if (this._ended) throw new Error('Turn already ended');
     this._ended = true;
 
@@ -250,6 +263,10 @@ export class ObservationTurn {
     const unsavedMessages = [...unsavedInput, ...unsavedOutput];
     if (unsavedMessages.length > 0) {
       await this.om.persistMessages(unsavedMessages, this.threadId, this.resourceId, this._sourceWriteGuard);
+    }
+
+    if (options.skipObservation) {
+      return { record: this._record! };
     }
 
     // When the agent goes idle, start buffering any unobserved messages in the background.

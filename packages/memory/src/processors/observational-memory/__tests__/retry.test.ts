@@ -434,4 +434,15 @@ describe('withRetry idleTimeoutMs', () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(state).toEqual({ status: 'resolved', value: 'slow' });
   });
+
+  it('retries a hung model call within the default operation deadline', async () => {
+    // Model call sites pass the default idle limit; one hung attempt must not use the whole deadline.
+    let attempts = 0;
+    const fn = vi.fn(async (signal: AbortSignal) => (++attempts === 1 ? hang(signal) : 'ok'));
+    const state = track(withRetry(fn, { label: 'observer', idleTimeoutMs: RETRY_CONFIG.modelCallIdleTimeoutMs }));
+    await vi.advanceTimersByTimeAsync(RETRY_CONFIG.timeoutMs - 1);
+    expect(state).toEqual({ status: 'resolved', value: 'ok' });
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(fn.mock.calls[0]![0].reason).toBeInstanceOf(OmModelCallTimeoutError);
+  });
 });

@@ -1,4 +1,9 @@
-import { hasAbortInChain, isTransientLLMError } from './retry';
+import {
+  hasAbortInChain,
+  isTransientLLMError,
+  ObservationalMemoryOperationTimeoutError,
+  OmModelCallTimeoutError,
+} from './retry';
 
 const AI_API_CALL_ERROR_MARKER = Symbol.for('vercel.ai.error.AI_APICallError');
 
@@ -27,6 +32,15 @@ export function isOmModelExecutionFailure(error: unknown): boolean {
   }
 
   return false;
+}
+
+/**
+ * Fork (PF-7205): true for the error `withRetry` ends a model call with when OM's own operation
+ * deadline or per-attempt idle timeout fired. That is a model failure, not a cancellation, but only
+ * while the caller's own signal has not aborted; callers check that, because a caller abort stays fatal.
+ */
+export function isOmOwnTimeout(error: unknown): boolean {
+  return error instanceof ObservationalMemoryOperationTimeoutError || error instanceof OmModelCallTimeoutError;
 }
 
 export type OmFailurePolicy = 'abort' | 'continue';
