@@ -2796,7 +2796,7 @@ export class Agent<
           // A later processor holds parts that passed the earlier ones first, so it goes first.
           const kept: ChunkType[] = [];
           for (const id of [...streamProcessorIds].reverse()) {
-            kept.push(...(await takeHeldParts(processorStates?.get(id)?.customState, { discard: true }, id)));
+            kept.push(...(await takeHeldParts(processorStates?.get(id)?.customState, { discard: true })));
           }
           return kept;
         };

@@ -64,10 +64,16 @@ export class BatchPartsProcessor implements Processor<'batch-parts'> {
     if (!state.timeoutTriggered) {
       state.timeoutTriggered = false;
     }
+    // A subclass that overrides processOutputStream decides what to publish after this batch, like
+    // a processor composing this one: the end-of-stream release must not bypass it (a discard still
+    // clears the batch).
     state[FLUSH_HELD_PARTS_KEY] ??= Object.assign(
       (options?: { discard?: boolean }) =>
         options?.discard ? this.discardAll(state as BatchPartsState) : this.releaseAll(state as BatchPartsState),
-      { ownerId: this.id },
+      {
+        ownerId: this.id,
+        releasable: this.processOutputStream === BatchPartsProcessor.prototype.processOutputStream,
+      },
     ) satisfies FlushHeldParts;
 
     // Emit any pending non-text part that was deferred from the previous call

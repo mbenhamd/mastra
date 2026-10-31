@@ -39,10 +39,12 @@ export type FlushHeldParts = ((options?: { discard?: boolean }) => Promise<Chunk
    * Id of the processor that registered the hook. A processor that runs another processor
    * inside its own `processOutputStream` and passes it its `state` (e.g. one that holds text
    * in a `BatchPartsProcessor` until its own check passes) gets the inner processor's hook on
-   * its state; the runner only calls a hook its holder registered, so the inner batch is not
-   * released past the outer processor's check.
+   * its state; the runner only releases through a hook its holder registered, so the inner
+   * batch is not released past the outer processor's check. Discards are not limited.
    */
   ownerId?: string;
+  /** `false` when the registering processor publishes the held parts itself; only discards then run the hook. */
+  releasable?: boolean;
 };
 
 /** Whether a part marks its model stream as errored or aborted (held parts are then discarded). */
@@ -66,6 +68,14 @@ export async function takeHeldParts(
 ): Promise<ChunkType[]> {
   const flush = state?.[FLUSH_HELD_PARTS_KEY] as FlushHeldParts | undefined;
   if (!flush) return [];
-  if (holderId !== undefined && flush.ownerId !== undefined && flush.ownerId !== holderId) return [];
+  // Only a release is limited to the holder's own hook. A discard (failed or aborted stream)
+  // always clears the hold, including a nested one, so nothing stale reaches the next reply.
+  if (
+    !options?.discard &&
+    (flush.releasable === false ||
+      (holderId !== undefined && flush.ownerId !== undefined && flush.ownerId !== holderId))
+  ) {
+    return [];
+  }
   return await flush(options);
 }

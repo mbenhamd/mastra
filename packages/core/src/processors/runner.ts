@@ -1971,11 +1971,7 @@ export class ProcessorRunner {
     for (const processorOrWorkflow of [...this.outputProcessors].reverse()) {
       const parts = isProcessorWorkflow(processorOrWorkflow)
         ? ((await processorOrWorkflow.__discardOutputStream?.(this.processorStates)) ?? [])
-        : await takeHeldParts(
-            processorStates.get(processorOrWorkflow.id)?.customState,
-            { discard: true },
-            processorOrWorkflow.id,
-          );
+        : await takeHeldParts(processorStates.get(processorOrWorkflow.id)?.customState, { discard: true });
       kept.push(...(parts as ChunkType<OUTPUT>[]));
     }
     return kept;
