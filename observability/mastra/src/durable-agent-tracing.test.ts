@@ -1654,3 +1654,61 @@ describe('durable-agent observability — full span tree (real exporter)', () =>
     expect(testExporter.getIncompleteSpans()).toHaveLength(0);
   });
 });
+
+describe('processor tripwire ending a step closes the agent span (real exporter)', () => {
+  let testExporter: TestExporter;
+  beforeEach(() => {
+    testExporter = new TestExporter();
+  });
+
+  // Mirrors Observational Memory: a failed observation calls `abort()` in
+  // `processInputStep`, so the step ends with a tripwire chunk and no `finish`.
+  const observationFailure = 'Encountered error during memory observation: observer timed out';
+  const tripwireAgent = () =>
+    new Agent({
+      id: 'a',
+      name: 'a',
+      instructions: 'x',
+      model: textModel('The model should never run.') as any,
+      inputProcessors: [
+        {
+          id: 'observation-guard',
+          processInputStep: ({ abort }) => abort(observationFailure),
+        },
+      ],
+    });
+
+  function expectClosedAgentRun() {
+    const agentRuns = testExporter.getSpansByType('agent_run' as any);
+    expect(agentRuns, 'agent_run must be exported as ended').toHaveLength(1);
+    expect(agentRuns[0]?.endTime).toBeDefined();
+    expect(testExporter.getIncompleteSpans().map(entry => entry.span?.type)).toEqual([]);
+    return agentRuns[0];
+  }
+
+  it.each(['regular', 'evented-execution'] as const)('%s Agent', async variant => {
+    if (variant === 'evented-execution') vi.stubEnv('MASTRA_EVENTED_EXECUTION', 'true');
+    try {
+      const agent = buildRegularMastra(testExporter, tripwireAgent());
+      const output = await agent.stream('hi');
+      await output.consumeStream();
+      expect(output.tripwire).toMatchObject({ reason: observationFailure });
+      await settle(testExporter);
+      const agentRun = expectClosedAgentRun();
+      expect(agentRun?.attributes).toMatchObject({
+        tripwireAbort: { reason: observationFailure, processorId: 'observation-guard' },
+      });
+      expect(agentRun?.output).toMatchObject({ tripwire: { reason: observationFailure } });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  // Durable runs end through their final workflow step, which closes the tree
+  // without the tripwire details; this guards the closure only.
+  it.each(['durable', 'evented'] as const)('%s Agent', async variant => {
+    const { wrapped } = buildMastra(testExporter, tripwireAgent(), variant);
+    await runToCompletion(wrapped, 'hi', testExporter);
+    expectClosedAgentRun();
+  });
+});

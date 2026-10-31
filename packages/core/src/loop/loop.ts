@@ -190,6 +190,7 @@ export function loop<Tools extends ToolSet = ToolSet, OUTPUT = undefined>({
       hideSignals,
     },
     initialState: initialStreamState,
+    onTracingTripwire: rest.onTracingTripwire,
   });
 
   return createDestructurableOutput(modelOutput);

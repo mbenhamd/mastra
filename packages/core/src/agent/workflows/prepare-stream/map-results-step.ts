@@ -10,7 +10,7 @@ import { createObservabilityContext } from '../../../observability';
 import type { Span, SpanType } from '../../../observability';
 import { StructuredOutputProcessor } from '../../../processors';
 import type { RequestContext } from '../../../request-context';
-import type { MastraOnFinishCallbackContext } from '../../../stream/types';
+import type { MastraOnFinishCallbackContext, StepTripwireData } from '../../../stream/types';
 import type { Step } from '../../../workflows/step';
 import type { InnerAgentExecutionOptions } from '../../agent.types';
 import type { MastraDBMessage, MessageList } from '../../message-list';
@@ -316,6 +316,22 @@ export function createMapResultsStep<OUTPUT = undefined>({
       mcp: options.mcp,
       ...createObservabilityContext({ currentSpan: agentSpan }),
       agentRunSpan: agentSpan,
+      // A step tripwire (e.g. a processInputStep `abort()`) ends the stream without `onFinish`,
+      // so end the tree here with the same tripwire details as the run-start tripwire above.
+      onTracingTripwire: (tripwire: StepTripwireData, text: string) => {
+        agentSpan?.end({
+          endTree: true,
+          output: { text, tripwire },
+          attributes: {
+            tripwireAbort: {
+              reason: tripwire.reason,
+              processorId: tripwire.processorId,
+              retry: tripwire.retry,
+              metadata: tripwire.metadata,
+            },
+          },
+        });
+      },
       runId,
       toolChoice: result.toolChoice,
       tools: result.tools,

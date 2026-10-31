@@ -159,6 +159,7 @@ export class MastraLLMVNext extends MastraBase {
     workspace,
     _toolContextMastra,
     agentRunSpan,
+    onTracingTripwire,
     ...rest
   }: ModelLoopStreamArgs<Tools, OUTPUT>): MastraModelOutput<OUTPUT> {
     const observabilityContext = resolveObservabilityContext(rest);
@@ -236,6 +237,15 @@ export class MastraLLMVNext extends MastraBase {
     try {
       const loopOptions: LoopOptions<Tools, OUTPUT> = {
         mastra: this.#mastra,
+        // A tripwire ends the stream without `onFinish`; end the generation, then notify the owner.
+        onTracingTripwire: (tripwire, usage, text) => {
+          modelSpanTracker?.endGeneration({
+            usage,
+            output: { text },
+            attributes: { finishReason: 'other' },
+          });
+          onTracingTripwire?.(tripwire, text);
+        },
         _toolContextMastra,
         resumeContext,
         runId,
