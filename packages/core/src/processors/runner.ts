@@ -1904,7 +1904,11 @@ export class ProcessorRunner {
               }),
           });
         } else {
-          held = await takeHeldParts(processorStates.get(processorOrWorkflow.id)?.customState);
+          held = await takeHeldParts(
+            processorStates.get(processorOrWorkflow.id)?.customState,
+            undefined,
+            processorOrWorkflow.id,
+          );
         }
       } catch (error) {
         if (error instanceof TripWire) {

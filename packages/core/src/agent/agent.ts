@@ -2786,7 +2786,8 @@ export class Agent<
             for (const [next, index] of stashed) await runFrom(next, index);
           };
           for (const index of streamSteps.keys()) {
-            const held = await takeHeldParts(processorStates?.get(streamProcessorIds[index]!)?.customState);
+            const holderId = streamProcessorIds[index]!;
+            const held = await takeHeldParts(processorStates?.get(holderId)?.customState, undefined, holderId);
             for (const part of held) await runFrom(part, index + 1);
           }
           return released;
