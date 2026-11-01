@@ -267,6 +267,95 @@ describe('builtin submitPlan → Harness round-trip', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Pending payloads are JSON: omitted optional arguments stay absent
+// ---------------------------------------------------------------------------
+
+describe('builtin askUser / submitPlan pending payloads omit absent optional arguments', () => {
+  // `toEqual` ignores keys whose value is `undefined`; `toStrictEqual` does
+  // not, so these lock that no own `undefined` key is stored (a strict JSON
+  // consumer reads such a payload as non-JSON).
+  it('stores a question without options or selectionMode as just the question', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-q',
+      suspendPayload: { toolCallId: 'tc-q', toolName: askUser.id, args: { question: 'which corpus?' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+
+    const payload = session.getRecord().pendingResume!.payload;
+    expect(payload).toStrictEqual({ question: 'which corpus?' });
+    expect(JSON.parse(JSON.stringify(payload))).toStrictEqual(payload);
+  });
+
+  it('stores a question with options but no selectionMode without a selectionMode key', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-o',
+      suspendPayload: {
+        toolCallId: 'tc-o',
+        toolName: askUser.id,
+        args: { question: 'which corpus?', options: [{ label: 'Library' }, { label: 'OpenAlex' }] },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+
+    expect(session.getRecord().pendingResume!.payload).toStrictEqual({
+      question: 'which corpus?',
+      options: [{ label: 'Library' }, { label: 'OpenAlex' }],
+    });
+  });
+
+  it('stores a plan without a title as just the plan', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-p',
+      suspendPayload: { toolCallId: 'tc-p', toolName: submitPlan.id, args: { plan: 'do A then B' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'plan it' });
+
+    expect(session.getRecord().pendingResume!.payload).toStrictEqual({ plan: 'do A then B' });
+  });
+
+  it('stores the next question the resumed run asks the same way (resume path)', async () => {
+    const { harness, agent } = setupHarness();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-r',
+      suspendPayload: {
+        toolCallId: 'tc-r1',
+        toolName: askUser.id,
+        args: { question: 'first?', options: [{ label: 'a' }, { label: 'b' }], selectionMode: 'multi_select' },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    expect(session.getRecord().pendingResume!.payload).toStrictEqual({
+      question: 'first?',
+      options: [{ label: 'a' }, { label: 'b' }],
+      selectionMode: 'multi_select',
+    });
+
+    // The resumed segment asks again, this time a free-text question.
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-r',
+      suspendPayload: { toolCallId: 'tc-r2', toolName: askUser.id, args: { question: 'and then?' } },
+    });
+    await session.respondToQuestion({ answer: ['a'] });
+
+    const next = session.getRecord().pendingResume!;
+    expect(next.toolCallId).toBe('tc-r2');
+    expect(next.payload).toStrictEqual({ question: 'and then?' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // taskWrite + taskCheck
 // ---------------------------------------------------------------------------
 
