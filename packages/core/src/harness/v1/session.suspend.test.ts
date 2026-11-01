@@ -51,6 +51,8 @@ interface RunSpec {
   totalUsage?: { inputTokens: number; outputTokens: number; totalTokens: number };
   chunks?: Array<Record<string, unknown>>;
   terminalToolResult?: unknown;
+  /** The run streams `chunks`, then its FullOutput rejects with this error. */
+  failAfterStream?: Error;
 }
 
 interface ResumeCall {
@@ -110,6 +112,7 @@ class FakeAgent extends Agent<any, any, any> {
         terminalToolResult: spec.terminalToolResult,
       },
       chunks: spec.chunks?.map(chunk => ({ ...chunk, runId })),
+      ...(spec.failAfterStream ? { failAfterStream: spec.failAfterStream } : {}),
     });
   }
 
@@ -2037,6 +2040,53 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     expect(result.finishReason).toBe('stop');
     expect(agent.resumeCalls).toHaveLength(2);
     expect(session.getRecord().pendingResume).toBeUndefined();
+  });
+
+  it('does not re-offer an approval whose tool already ran when the continuation then fails', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-EX',
+      suspendPayload: { toolCallId: 'tc-EX', toolName: 'delete_collection', args: { id: 'c-1' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    await session.message({ content: 'go' });
+    const responseIdentity = pendingResponseIdentity(session.getRecord().pendingResume!);
+    const events: { type: string; retryable?: boolean; finishReason?: string }[] = [];
+    session.subscribe(e => events.push(e as (typeof events)[number]));
+
+    // The approved tool runs and returns its result; the continuation model
+    // call then fails before the resumed segment produces a FullOutput.
+    agent.enqueueRun({
+      finishReason: 'error',
+      runId: 'run-EX',
+      chunks: [
+        {
+          type: 'tool-result',
+          payload: { toolCallId: 'tc-EX', toolName: 'delete_collection', result: { deleted: true } },
+        },
+      ],
+      failAfterStream: new Error('continuation model call failed'),
+    });
+    await expect(
+      session.respondToToolApproval({ ...responseIdentity, responseId: 'approve-1', approved: true }),
+    ).rejects.toBeTruthy();
+
+    // The interaction is consumed, not restored as answerable: a reload or a
+    // second client finds nothing to answer, and the receipt is final.
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(session.getRecord().inboxResponseReceipts?.['approve-1']).toMatchObject({
+      status: 'failed',
+      retryable: false,
+    });
+    expect(events).toContainEqual(expect.objectContaining({ type: 'resume_failed', retryable: false }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'agent_end', finishReason: 'error' }));
+
+    // Another client answering the same item gets no second execution.
+    await expect(
+      session.respondToToolApproval({ ...responseIdentity, responseId: 'approve-2', approved: true }),
+    ).rejects.toBeTruthy();
+    expect(agent.resumeCalls).toHaveLength(1);
   });
 
   it('a failed in-process resume does not permanently park the queue (F2 liveness)', async () => {
