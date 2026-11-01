@@ -2058,6 +2058,7 @@ describe('Session — respondToToolApproval / Suspension / Question / PlanApprov
     // The approved tool runs and returns its result; the continuation model
     // call then fails before the resumed segment produces a FullOutput.
     agent.enqueueRun({
+      finishReason: 'error',
       runId: 'run-EX',
       chunks: [
         {

@@ -17338,7 +17338,6 @@ export class Session {
         this._emitAbortedToolEnds({ force: true });
       }
       full = this._materializeHarnessRunOutput(pending.runId, full);
-      this._forgetResumedCallExecuted(pending);
       const resumedQueuedItemId = this._queuedItemIdForPendingResume(pending);
       if (full.finishReason !== 'suspended' && resumedQueuedItemId !== undefined) {
         await Promise.race([
@@ -17346,6 +17345,9 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
       }
+      // Only now is the failure path below out of reach: a queue-completion
+      // write that rejects must still find the answered call marked executed.
+      this._forgetResumedCallExecuted(pending);
     } catch (err) {
       // The answered call itself already ran in this resumed segment (its
       // tool result or tool error was recorded) and only the continuation
