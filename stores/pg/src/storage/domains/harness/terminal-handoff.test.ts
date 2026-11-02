@@ -1484,6 +1484,39 @@ describe('HarnessPG native terminal handoff', () => {
     ).rejects.toBeInstanceOf(HarnessTerminalHandoffIdentityConflictError);
   });
 
+  it('commits a raw NUL-bearing result against evidence already stored in its jsonb form (PF-7406)', async () => {
+    const session = await createNativeSession(harness(), 'nul-session');
+    const input = admissionFor(session, 'nul');
+    await harness().writeMessageResultEvidence(pendingEvidence(input));
+    await harness().admitTerminalHandoff(input);
+    const completed = {
+      ...pendingEvidence(input),
+      status: 'completed' as const,
+      runId: input.runId,
+      result: { text: 'tool output a\u0000b\uD800c' },
+      updatedAt: Date.now(),
+    };
+    // The session settled its evidence first; jsonb keeps it without the NUL
+    // and with U+FFFD for the unpaired surrogate.
+    await expect(harness().writeMessageResultEvidence(completed)).resolves.toMatchObject({ applied: true });
+    await expect(
+      harness().loadMessageResultEvidence({
+        harnessName: input.harnessName,
+        sessionId: input.sessionId,
+        resourceId: input.resourceId,
+        threadId: input.threadId,
+        signalId: input.signalId,
+      }),
+    ).resolves.toMatchObject({ status: 'completed', result: { text: 'tool output ab�c' } });
+
+    // The committer still holds the raw result; it is the same outcome.
+    const committed = await harness().commitTerminalHandoff({
+      ...commitInput(input, 'nul'),
+      resultEvidence: completed,
+    });
+    expect(committed.status).toBe('committed');
+  });
+
   it('lets only one worker claim the terminal message dispatch compare-and-swap', async () => {
     const session = await createNativeSession(harness(), 'session-dispatch-cas');
     const input = admissionFor(session, 'dispatch-cas');
