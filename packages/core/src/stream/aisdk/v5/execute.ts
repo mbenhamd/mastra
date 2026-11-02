@@ -229,40 +229,75 @@ export function resolveJsonPromptInjection(
 export function sendsNativeResponseFormat(
   structuredOutput: { schema?: unknown; model?: unknown; jsonPromptInjection?: JsonPromptInjection } | undefined,
   model: { provider: string; modelId: string },
+  providerOptions?: SharedProviderOptions,
 ): boolean {
   if (!structuredOutput?.schema || structuredOutput.model) return false;
-  return !resolveDirectStructuredOutputInjection(structuredOutput.jsonPromptInjection, model, () => {
-    const responseFormat = getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0], {
-      model: { provider: model.provider, modelId: model.modelId, supportsStructuredOutputs: true },
-    });
-    return responseFormat.type === 'json' ? responseFormat.schema : undefined;
-  });
+  return !resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, () =>
+    jsonSchemaOf(
+      getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0], {
+        model: { provider: model.provider, modelId: model.modelId, supportsStructuredOutputs: true },
+      }),
+    ),
+  ).mode;
+}
+
+function jsonSchemaOf(responseFormat: ReturnType<typeof getResponseFormat> | undefined): unknown {
+  return responseFormat?.type === 'json' ? responseFormat.schema : undefined;
+}
+
+/**
+ * An explicit `providerOptions.anthropic.structuredOutputMode` of `'outputFormat'` or `'jsonTool'`
+ * chooses how `@ai-sdk/anthropic` carries the schema, so Mastra keeps the native response format for
+ * it. `'auto'` is the provider's default and leaves the fallback in place. The provider also merges a
+ * custom provider-name key over `anthropic`; the fallback only applies to `anthropic` / `anthropic.*`
+ * providers, whose provider-options key is `anthropic`.
+ */
+function choosesAnthropicStructuredOutputMode(providerOptions: SharedProviderOptions | undefined): boolean {
+  const options = (providerOptions as Record<string, unknown> | undefined)?.anthropic;
+  if (!options || typeof options !== 'object') return false;
+  const mode = (options as { structuredOutputMode?: unknown }).structuredOutputMode;
+  return mode === 'outputFormat' || mode === 'jsonTool';
 }
 
 /**
  * Resolves how a direct (no structuring model) structured-output step carries its schema: through
- * the prompt (`'system'` / `'inline'`) or as a native response format (`undefined`).
+ * the prompt (`'system'` / `'inline'`) or as a native response format (`mode: undefined`).
  *
- * Anthropic's native output format is strict, so a schema it cannot carry (see
- * {@link exceedsAnthropicStructuredOutput}) falls back to inline prompt injection, the same mode
- * `'auto'` picks for models without native support. Mastra validates the generated text against the
- * schema either way. An explicit `jsonPromptInjection: false` keeps the native format.
+ * Anthropic's native output format is strict, so a schema it cannot carry falls back to inline prompt
+ * injection, the same mode `'auto'` picks for models without native support. Free-form objects are
+ * looked for in the schema before the provider compat layer rewrites it (that layer merges a root
+ * union of objects into one closed object, which drops a `z.record()` branch) as well as in the wire
+ * schema; the limits are counted on the wire schema, which is what Anthropic would receive. The
+ * fallback injects the schema from before the compat layer, so records stay open in the prompt.
+ * Mastra validates the generated text against the schema either way. An explicit
+ * `jsonPromptInjection: false` or Anthropic `structuredOutputMode` keeps the native format.
  */
 function resolveDirectStructuredOutputInjection(
-  jsonPromptInjection: JsonPromptInjection,
+  structuredOutput: { schema?: unknown; jsonPromptInjection?: JsonPromptInjection },
   model: { provider: string; modelId: string },
-  getJsonSchema: () => unknown,
-): 'system' | 'inline' | undefined {
+  providerOptions: SharedProviderOptions | undefined,
+  getWireSchema: () => unknown,
+): { mode: 'system' | 'inline' | undefined; schema?: unknown } {
+  const { jsonPromptInjection } = structuredOutput;
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
   const resolved = resolveJsonPromptInjection(
     jsonPromptInjection,
     jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
   );
-  if (resolved) return resolved === true ? 'system' : resolved;
-  if (jsonPromptInjection !== false && isAnthropicProvider(model.provider)) {
-    return exceedsAnthropicStructuredOutput(getJsonSchema()) ? 'inline' : undefined;
+  if (resolved) return { mode: resolved === true ? 'system' : resolved };
+  if (
+    jsonPromptInjection === false ||
+    !isAnthropicProvider(model.provider) ||
+    choosesAnthropicStructuredOutputMode(providerOptions)
+  ) {
+    return { mode: undefined };
   }
-  return undefined;
+  const sourceSchema = jsonSchemaOf(
+    getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0]),
+  );
+  return hasFreeFormObject(sourceSchema) || exceedsAnthropicStructuredOutput(getWireSchema())
+    ? { mode: 'inline', schema: sourceSchema }
+    : { mode: undefined };
 }
 
 type InjectJsonInstructionArgs = Parameters<typeof injectJsonInstructionIntoMessagesV3>[0];
@@ -739,7 +774,7 @@ export function execute<OUTPUT = undefined>({
     toolChoice,
     activeTools,
     targetVersion,
-    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, model),
+    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, model, providerOptions),
   });
 
   const responseFormat = structuredOutput?.schema
@@ -755,15 +790,22 @@ export function execute<OUTPUT = undefined>({
   let prompt = inputMessages;
   const jsonPromptInjection = structuredOutput?.jsonPromptInjection;
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
-  const responseJsonSchema = () => (responseFormat?.type === 'json' ? responseFormat.schema : undefined);
-  const resolvedJsonPromptInjection =
-    structuredOutputMode === 'direct'
-      ? resolveDirectStructuredOutputInjection(jsonPromptInjection, model, responseJsonSchema)
-      : resolveJsonPromptInjection(
-          jsonPromptInjection,
-          jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
-        );
+  const directInjection =
+    structuredOutputMode === 'direct' && structuredOutput
+      ? resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, () =>
+          jsonSchemaOf(responseFormat),
+        )
+      : undefined;
+  const resolvedJsonPromptInjection = directInjection
+    ? directInjection.mode
+    : resolveJsonPromptInjection(
+        jsonPromptInjection,
+        jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
+      );
   const injectionMode = resolvedJsonPromptInjection === true ? 'system' : resolvedJsonPromptInjection;
+  // The Anthropic fallback injects the schema from before the provider compat layer; every other
+  // injection keeps the wire schema it injected before.
+  const injectedSchema = directInjection?.schema ?? jsonSchemaOf(responseFormat);
 
   // For direct mode (no model provided for structuring agent), inject JSON schema instruction if opting out of native response format with jsonPromptInjection
   if (structuredOutputMode === 'direct' && responseFormat?.type === 'json' && injectionMode) {
@@ -774,7 +816,7 @@ export function execute<OUTPUT = undefined>({
       injectionMode === 'inline'
         ? injectJsonInstructionIntoLatestUserMessage({
             messages: inputMessages,
-            schema: responseFormat.schema,
+            schema: injectedSchema,
             instructions: compactInstructions,
           })
         : injectJsonInstructionIntoMessages({
@@ -784,7 +826,7 @@ export function execute<OUTPUT = undefined>({
             // suffix, which would otherwise be appended when `schema` is nullish.
             ...(compactInstructions
               ? { schema: undefined, schemaPrefix: undefined, schemaSuffix: compactInstructions }
-              : { schema: responseFormat.schema }),
+              : { schema: injectedSchema as typeof responseFormat.schema }),
           });
   }
 
@@ -853,7 +895,9 @@ export function execute<OUTPUT = undefined>({
     providerResponseFormat?.type === 'json'
       ? providerResponseFormat.schema
       : responseSchemaInline
-        ? responseSchema
+        ? injectionMode !== undefined
+          ? injectedSchema
+          : responseSchema
         : undefined;
   const preparationBeforeProviderCallbackMs = Math.max(0, Date.now() - preparationStartedAtMs);
 

@@ -189,7 +189,7 @@ export class MastraLLMVNext extends MastraBase {
           tools,
           toolChoice,
           activeTools: activeTools as string[] | undefined,
-          stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, firstModel),
+          stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, firstModel, providerOptions),
         })
       : undefined;
 

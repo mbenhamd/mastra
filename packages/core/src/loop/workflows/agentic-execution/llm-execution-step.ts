@@ -2489,7 +2489,11 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 toolChoice: currentStep.toolChoice,
                 activeTools: currentStep.activeTools as string[] | undefined,
                 specificationVersion: currentStep.model.specificationVersion,
-                stripToolsWhenNone: sendsNativeResponseFormat(currentStep.structuredOutput, currentStep.model),
+                stripToolsWhenNone: sendsNativeResponseFormat(
+                  currentStep.structuredOutput,
+                  currentStep.model,
+                  currentStep.providerOptions,
+                ),
               })
             : undefined;
           modelSpanTracker?.setInferenceContext?.({

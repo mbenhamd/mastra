@@ -1893,7 +1893,11 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     toolChoice: currentToolChoice,
                     activeTools: currentActiveTools,
                     specificationVersion: currentModel.specificationVersion,
-                    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, currentModel),
+                    stripToolsWhenNone: sendsNativeResponseFormat(
+                      structuredOutput,
+                      currentModel,
+                      currentProviderOptions,
+                    ),
                   })
                 : undefined,
             );

@@ -1137,6 +1137,29 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
     expect(promptText(options)).toContain('field0');
   });
 
+  // The Anthropic compat layer merges a root union of objects into one closed object, which drops
+  // the record branch from the wire schema; detection and the injected schema use the source schema.
+  it('falls back for a root union of a record and an object and injects the open record', async () => {
+    const unionSchema = z.union([z.record(z.string(), z.string()), z.object({ error: z.boolean() })]);
+    const { options, model } = await capture('anthropic.messages', unionSchema);
+
+    expect(options.responseFormat).toBeUndefined();
+    expect(promptText(options)).toContain('propertyNames');
+    expect(sendsNativeResponseFormat({ schema: unionSchema }, model)).toBe(false);
+  });
+
+  it.each(['jsonTool', 'outputFormat'])(
+    'keeps the native response format when providerOptions.anthropic.structuredOutputMode is %s',
+    async structuredOutputMode => {
+      const providerOptions = { anthropic: { structuredOutputMode } };
+      const { options, model } = await capture('anthropic.messages', recordSchema, providerOptions);
+
+      expect(options.responseFormat?.type).toBe('json');
+      expect(options.responseFormat.schema.properties.fields).toBeDefined();
+      expect(sendsNativeResponseFormat({ schema: recordSchema }, model, providerOptions)).toBe(true);
+    },
+  );
+
   it('keeps the strict native output format for schemas within limits without free-form objects', async () => {
     const { options, model } = await capture('anthropic.messages', schema);
 
