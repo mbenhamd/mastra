@@ -1704,6 +1704,76 @@ describe('HarnessPG', () => {
     });
   });
 
+  it('stores a completed result and a session event that carry NUL and an unpaired surrogate (PF-7406)', async () => {
+    // jsonb refuses `\u0000` (22P05) and unpaired surrogates (22P02). A tool
+    // result carrying one must not fail the turn that produced it.
+    const harness = store.stores.harness!;
+    await harness.saveSession(createSampleSessionRecord({ id: 'session-nul', threadId: 'thread-nul' }), {
+      ownerId: 'nul-owner',
+      ifVersion: 0,
+    });
+    const evidence = {
+      harnessName: 'default',
+      sessionId: 'session-nul',
+      resourceId: 'resource-1',
+      threadId: 'thread-nul',
+      signalId: 'signal-nul',
+      runId: 'run-nul',
+      admissionId: 'admission-nul',
+      admissionHash: 'hash-nul',
+      operationKind: 'signal' as const,
+      status: 'completed' as const,
+      result: { text: 'brief', toolResults: [{ abstract: 'a\u0000b\uD800c', ['k\u0000ey']: 1 }] },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    await expect(harness.writeMessageResultEvidence(evidence)).resolves.toEqual({ created: true, applied: true });
+    // A replay of the same input matches its stored, normalized row.
+    await expect(harness.writeMessageResultEvidence(evidence)).resolves.toMatchObject({
+      created: false,
+      applied: false,
+    });
+    const expected = { text: 'brief', toolResults: [{ abstract: 'ab�c', key: 1 }] };
+    await expect(
+      harness.loadMessageResultEvidence({
+        sessionId: 'session-nul',
+        resourceId: 'resource-1',
+        threadId: 'thread-nul',
+        signalId: 'signal-nul',
+      }),
+    ).resolves.toMatchObject({ status: 'completed', result: expected });
+    const stored = await store.db.one<{ result: string }>(
+      `SELECT result::text AS result FROM mastra_harness_message_results WHERE signal_id = $1`,
+      ['signal-nul'],
+    );
+    expect(JSON.parse(stored.result)).toEqual(expected);
+
+    await harness.appendSessionEvent({
+      harnessName: 'default',
+      sessionId: 'session-nul',
+      resourceId: 'resource-1',
+      threadId: 'thread-nul',
+      eventId: 'harness-v1:epoch-nul:1',
+      epoch: 'epoch-nul',
+      sequence: 1,
+      event: { type: 'tool_end', id: 'harness-v1:epoch-nul:1', timestamp: 1000, result: 'x\u0000y' },
+      emittedAt: 1000,
+      storedAt: 1001,
+    });
+    const events = await harness.listSessionEvents({
+      harnessName: 'default',
+      sessionId: 'session-nul',
+      resourceId: 'resource-1',
+      threadId: 'thread-nul',
+      epoch: 'epoch-nul',
+      afterSequence: 0,
+      limit: 10,
+    });
+    expect(events.map(event => event.event)).toEqual([
+      { type: 'tool_end', id: 'harness-v1:epoch-nul:1', timestamp: 1000, result: 'xy' },
+    ]);
+  });
+
   it('locks competing signal dispatch claims and migrates a legacy run row', async () => {
     const harness = store.stores.harness!;
     // Result evidence is written only while its session exists (PF-5374).

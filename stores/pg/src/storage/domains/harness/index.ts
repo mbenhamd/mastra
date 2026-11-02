@@ -238,6 +238,7 @@ import type { DbClient, QueryValues, TxClient } from '../../client';
 import { PgDB, generateIndexSQL, generateTableSQL, resolvePgConfig } from '../../db';
 import type { PgDomainConfig } from '../../db';
 import { POSTGRES_IDENTIFIER_MAX_LENGTH, truncateIdentifier } from '../../db/constraint-utils';
+import { toPgJson, toPgText } from '../../db/sanitize-json';
 import { EXPORTED_FENCE_AUTHORITY } from '../../exported-fence';
 
 type HarnessWakeupClaimStatus = Extract<HarnessWakeupItem['status'], 'due' | 'claimed' | 'failed'>;
@@ -2371,7 +2372,7 @@ export class HarnessPG extends HarnessStorage {
         'dead',
         updatedAt,
         updatedAt,
-        JSON.stringify({ code: 'session_projection.deleted', message: 'Session lifetime was deleted' }),
+        toPgJson({ code: 'session_projection.deleted', message: 'Session lifetime was deleted' }),
         updatedAt,
         harnessName,
         sessionId,
@@ -2431,7 +2432,7 @@ export class HarnessPG extends HarnessStorage {
         intent.revision,
         intent.payloadDigest,
         intent.payloadBytes,
-        JSON.stringify(intent.payload),
+        toPgJson(intent.payload),
         intent.status,
         intent.attempts,
         intent.claimId ?? null,
@@ -2440,7 +2441,7 @@ export class HarnessPG extends HarnessStorage {
         intent.appliedAt ?? null,
         intent.failedAt ?? null,
         intent.deadAt ?? null,
-        intent.lastError ? JSON.stringify(intent.lastError) : null,
+        intent.lastError ? toPgJson(intent.lastError) : null,
         intent.createdAt,
         intent.updatedAt,
       ],
@@ -2996,7 +2997,7 @@ export class HarnessPG extends HarnessStorage {
                     error = CASE WHEN status = 'completed' THEN ?::jsonb ELSE NULL END
                 WHERE harness_name = ? AND session_id = ?`,
           args: [
-            JSON.stringify({
+            toPgJson({
               code: HARNESS_MESSAGE_RESULT_ERASED_CODE,
               message: 'The result was erased with its session',
             }),
@@ -3342,7 +3343,7 @@ export class HarnessPG extends HarnessStorage {
           input.now + input.claimTtlMs,
           input.now,
           input.now,
-          JSON.stringify({ code: 'session_projection.max_attempts', message: 'Maximum projection attempts reached' }),
+          toPgJson({ code: 'session_projection.max_attempts', message: 'Maximum projection attempts reached' }),
           input.now,
           ...updateArgs,
         ],
@@ -3513,7 +3514,7 @@ export class HarnessPG extends HarnessStorage {
           failedAt,
           terminal ? failedAt : null,
           nextAttemptAt,
-          JSON.stringify(input.error),
+          toPgJson(input.error),
           failedAt,
           intent.id,
           'claimed',
@@ -3656,7 +3657,7 @@ export class HarnessPG extends HarnessStorage {
         TABLE_HARNESS_SESSION_PROJECTION_INTENTS
       } SET status = ?, dead_at = ?, failed_at = ?, claim_id = NULL, claim_expires_at = NULL,
             next_attempt_at = NULL, last_error = ?, updated_at = ? WHERE id = ?`,
-      args: ['dead', now, now, JSON.stringify({ code, message }), now, intent.id],
+      args: ['dead', now, now, toPgJson({ code, message }), now, intent.id],
     });
     await this.#releaseProjectionCapacityTx(tx, intent, now);
   }
@@ -3994,7 +3995,7 @@ export class HarnessPG extends HarnessStorage {
     }
     const owner = this.#requireAttachmentByteOwner(sessionId, attachmentId);
     const storageNamespace = this.#attachmentStorageNamespace(owner, sessionId, attachmentId);
-    const semanticJson = JSON.stringify(semantic ?? { kind: 'file' });
+    const semanticJson = toPgJson(semantic ?? { kind: 'file' });
     let operation: PgAttachmentOperation;
     let incarnation: string;
 
@@ -4180,10 +4181,10 @@ export class HarnessPG extends HarnessStorage {
             semantic?.kind ?? 'file',
             semantic?.primitiveType ?? null,
             semantic?.elementType ?? null,
-            semantic?.renderer ? JSON.stringify(semantic.renderer) : null,
+            semantic?.renderer ? toPgJson(semantic.renderer) : null,
             semantic?.schemaId ?? null,
-            semantic?.metadata ? JSON.stringify(semantic.metadata) : null,
-            semantic?.object ? JSON.stringify(semantic.object) : null,
+            semantic?.metadata ? toPgJson(semantic.metadata) : null,
+            semantic?.object ? toPgJson(semantic.object) : null,
             Date.now(),
             incarnation,
             savedBlobRef,
@@ -4957,7 +4958,7 @@ export class HarnessPG extends HarnessStorage {
         input.source,
         input.bytes,
         input.sha256,
-        input.semantic ? JSON.stringify(input.semantic) : null,
+        input.semantic ? toPgJson(input.semantic) : null,
         input.blobRef,
         0,
         now,
@@ -5051,7 +5052,7 @@ export class HarnessPG extends HarnessStorage {
         observedNextAttemptAt ?? 0,
         Date.now() + 1_000,
         Date.now(),
-        JSON.stringify({ code: 'external_unknown' }),
+        toPgJson({ code: 'external_unknown' }),
         operationId,
         ...claimArgs,
       ],
@@ -5064,7 +5065,7 @@ export class HarnessPG extends HarnessStorage {
             SET status = ?, claim_id = NULL, claim_expires_at = NULL, next_attempt_at = NULL,
                 updated_at = ?, completed_at = ?, last_error = ?
             WHERE id = ? AND claim_id = ?`,
-      args: ['cleaned', Date.now(), Date.now(), JSON.stringify({ code: 'orphan_cleaned' }), operationId, claimId],
+      args: ['cleaned', Date.now(), Date.now(), toPgJson({ code: 'orphan_cleaned' }), operationId, claimId],
     });
   }
 
@@ -5148,7 +5149,7 @@ export class HarnessPG extends HarnessStorage {
       sql: `UPDATE ${TABLE_HARNESS_ATTACHMENT_OPERATIONS}
             SET claim_expires_at = ?, next_attempt_at = ?, updated_at = ?, last_error = ?
             WHERE id = ? AND claim_id = ? AND status = ?`,
-      args: [now + delay, now + delay, now, JSON.stringify({ code }), operationId, claimId, 'claimed'],
+      args: [now + delay, now + delay, now, toPgJson({ code }), operationId, claimId, 'claimed'],
     });
   }
 
@@ -5449,19 +5450,19 @@ export class HarnessPG extends HarnessStorage {
             updated.modelId ?? null,
             updated.operationKind ?? null,
             namespacedRecord.status,
-            updated.dispatch === undefined ? null : JSON.stringify(updated.dispatch),
+            updated.dispatch === undefined ? null : toPgJson(updated.dispatch),
             // A pending rewrite keeps a staged terminal completion.
             namespacedRecord.status,
             'result' in namespacedRecord &&
             namespacedRecord.result !== undefined &&
             !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
-              ? JSON.stringify(namespacedRecord.result)
+              ? toPgJson(namespacedRecord.result)
               : null,
             messageEvidenceErrorColumn(namespacedRecord),
             namespacedRecord.updatedAt,
             id,
             current.operationKind ?? null,
-            current.dispatch === undefined ? null : JSON.stringify(current.dispatch),
+            current.dispatch === undefined ? null : toPgJson(current.dispatch),
             current.runId ?? null,
           ],
         });
@@ -5492,11 +5493,11 @@ export class HarnessPG extends HarnessStorage {
             namespacedRecord.admissionHash ?? null,
             namespacedRecord.operationKind ?? null,
             namespacedRecord.status,
-            namespacedRecord.dispatch === undefined ? null : JSON.stringify(namespacedRecord.dispatch),
+            namespacedRecord.dispatch === undefined ? null : toPgJson(namespacedRecord.dispatch),
             'result' in namespacedRecord &&
             namespacedRecord.result !== undefined &&
             !(namespacedRecord.status === 'completed' && namespacedRecord.erased === true)
-              ? JSON.stringify(namespacedRecord.result)
+              ? toPgJson(namespacedRecord.result)
               : null,
             messageEvidenceErrorColumn(namespacedRecord),
             namespacedRecord.createdAt,
@@ -5741,7 +5742,7 @@ export class HarnessPG extends HarnessStorage {
       sql: `UPDATE ${TABLE_HARNESS_MESSAGE_RESULTS}
             SET status = 'failed', error = ?, updated_at = ?
             WHERE id = ? AND status = 'pending'`,
-      args: [JSON.stringify({ code: cancelled.code, message: cancelled.message }), Date.now(), evidenceId],
+      args: [toPgJson({ code: cancelled.code, message: cancelled.message }), Date.now(), evidenceId],
     });
   }
 
@@ -5837,7 +5838,7 @@ export class HarnessPG extends HarnessStorage {
     const harnessName = this.#resolveHarnessName(input.identity.harnessName);
     const identity = { ...input.identity, harnessName };
     validateHarnessTerminalIdentity(identity);
-    const stagedResult = JSON.stringify(input.result);
+    const stagedResult = toPgJson(input.result);
     if (stagedResult === undefined) {
       throw new HarnessTerminalHandoffValidationError('result', 'must be JSON-serializable');
     }
@@ -6188,9 +6189,9 @@ export class HarnessPG extends HarnessStorage {
             resultEvidence.modelId ?? null,
             resultEvidence.operationKind ?? null,
             resultEvidence.status,
-            resultEvidence.dispatch === undefined ? null : JSON.stringify(resultEvidence.dispatch),
-            resultEvidence.status === 'completed' ? JSON.stringify(resultEvidence.result) : null,
-            resultEvidence.status === 'failed' ? JSON.stringify(resultEvidence.error) : null,
+            resultEvidence.dispatch === undefined ? null : toPgJson(resultEvidence.dispatch),
+            resultEvidence.status === 'completed' ? toPgJson(resultEvidence.result) : null,
+            resultEvidence.status === 'failed' ? toPgJson(resultEvidence.error) : null,
             resultEvidence.updatedAt,
             evidenceId,
           ],
@@ -6918,11 +6919,11 @@ export class HarnessPG extends HarnessStorage {
         args: [
           input.next.state === 'reserved' ? null : input.next.runId,
           operationKind,
-          JSON.stringify(input.next),
+          toPgJson(input.next),
           input.updatedAt,
           id,
           current.operationKind ?? null,
-          current.dispatch === undefined ? null : JSON.stringify(current.dispatch),
+          current.dispatch === undefined ? null : toPgJson(current.dispatch),
           current.runId ?? null,
         ],
       });
@@ -7024,8 +7025,8 @@ export class HarnessPG extends HarnessStorage {
           terminal.modelId ?? current.modelId ?? null,
           operationKind,
           terminal.status,
-          terminal.status === 'completed' ? JSON.stringify(terminal.result) : null,
-          terminal.status === 'failed' ? JSON.stringify(terminal.error) : null,
+          terminal.status === 'completed' ? toPgJson(terminal.result) : null,
+          terminal.status === 'failed' ? toPgJson(terminal.error) : null,
           input.updatedAt,
           id,
           current.operationKind ?? null,
@@ -7098,7 +7099,7 @@ export class HarnessPG extends HarnessStorage {
         record.eventId,
         record.epoch,
         record.sequence,
-        JSON.stringify(record.event),
+        toPgJson(record.event),
         record.emittedAt,
         record.storedAt,
         namespace,
@@ -7208,18 +7209,18 @@ export class HarnessPG extends HarnessStorage {
         record.threadId,
         record.actionKind,
         record.operation ?? null,
-        JSON.stringify(record.action),
+        toPgJson(record.action),
         record.policyDecision,
-        JSON.stringify(record.policyReasons),
-        JSON.stringify(record.matchedRules),
-        record.path === undefined ? null : JSON.stringify(record.path),
-        record.toPath === undefined ? null : JSON.stringify(record.toPath),
-        record.cwd === undefined ? null : JSON.stringify(record.cwd),
-        record.actor === undefined ? null : JSON.stringify(record.actor),
+        toPgJson(record.policyReasons),
+        toPgJson(record.matchedRules),
+        record.path === undefined ? null : toPgJson(record.path),
+        record.toPath === undefined ? null : toPgJson(record.toPath),
+        record.cwd === undefined ? null : toPgJson(record.cwd),
+        record.actor === undefined ? null : toPgJson(record.actor),
         record.requestId ?? null,
         record.traceId ?? null,
         record.spanId ?? null,
-        record.result === undefined ? null : JSON.stringify(record.result),
+        record.result === undefined ? null : toPgJson(record.result),
         record.createdAt,
         namespace,
         record.sessionId,
@@ -7946,9 +7947,9 @@ export class HarnessPG extends HarnessStorage {
         await this.writeOperationAdmissionTombstone(tombstone);
         const nextReceipts = { ...(session.queueAdmissionReceipts ?? {}) };
         delete nextReceipts[queuedItemId!];
-        const nextReceiptJson = Object.keys(nextReceipts).length > 0 ? JSON.stringify(nextReceipts) : null;
+        const nextReceiptJson = Object.keys(nextReceipts).length > 0 ? toPgJson(nextReceipts) : null;
         const originalReceiptJson =
-          row.queue_admission_receipts == null ? null : JSON.stringify(row.queue_admission_receipts);
+          row.queue_admission_receipts == null ? null : toPgJson(row.queue_admission_receipts);
         const updateResult = await this.#client.execute({
           sql: `UPDATE ${TABLE_HARNESS_SESSIONS}
                 SET queue_admission_receipts = ?
@@ -10979,28 +10980,28 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     record.ownsThread,
     record.modeId,
     record.modelId,
-    JSON.stringify(record.subagentModelOverrides ?? {}),
-    JSON.stringify(record.permissionRules),
+    toPgJson(record.subagentModelOverrides ?? {}),
+    toPgJson(record.permissionRules),
     record.permissionRulesSeedHash ?? null,
-    JSON.stringify(record.sessionGrants),
-    JSON.stringify({
+    toPgJson(record.sessionGrants),
+    toPgJson({
       ...record.tokenUsage,
       ...(record.accountedTerminalRunIds !== undefined
         ? { accountedTerminalRunIds: record.accountedTerminalRunIds }
         : {}),
     }),
-    JSON.stringify(record.pendingQueue),
-    record.pendingResume ? JSON.stringify(record.pendingResume) : null,
-    record.currentRun ? JSON.stringify(record.currentRun) : null,
-    record.assistantDrafts ? JSON.stringify(record.assistantDrafts) : null,
+    toPgJson(record.pendingQueue),
+    record.pendingResume ? toPgJson(record.pendingResume) : null,
+    record.currentRun ? toPgJson(record.currentRun) : null,
+    record.assistantDrafts ? toPgJson(record.assistantDrafts) : null,
     pendingResumeExpiryIndexValue(record),
-    record.queueAdmissionReceipts ? JSON.stringify(record.queueAdmissionReceipts) : null,
-    record.inboxResponseReceipts ? JSON.stringify(record.inboxResponseReceipts) : null,
-    record.expiredPendingInteractions ? JSON.stringify(record.expiredPendingInteractions) : null,
-    record.observationalMemory ? JSON.stringify(record.observationalMemory) : null,
-    record.goal ? JSON.stringify(record.goal) : null,
-    record.workspace ? JSON.stringify(record.workspace) : null,
-    JSON.stringify(record.state ?? {}),
+    record.queueAdmissionReceipts ? toPgJson(record.queueAdmissionReceipts) : null,
+    record.inboxResponseReceipts ? toPgJson(record.inboxResponseReceipts) : null,
+    record.expiredPendingInteractions ? toPgJson(record.expiredPendingInteractions) : null,
+    record.observationalMemory ? toPgJson(record.observationalMemory) : null,
+    record.goal ? toPgJson(record.goal) : null,
+    record.workspace ? toPgJson(record.workspace) : null,
+    toPgJson(record.state ?? {}),
     record.createdAt,
     record.lastActivityAt,
     record.closingAt ?? null,
@@ -11009,7 +11010,7 @@ function sessionColumnValues(record: SessionRecord, version: number): { names: s
     version,
     record.ownerId ?? null,
     record.leaseExpiresAt ?? null,
-    record.cancelRequest ? JSON.stringify(record.cancelRequest) : null,
+    record.cancelRequest ? toPgJson(record.cancelRequest) : null,
   ];
   return { names: [...SESSION_COLUMN_NAMES], values };
 }
@@ -11180,13 +11181,13 @@ function providerCallbackBindingColumnValues(record: HarnessProviderCallbackBind
       record.selectorValue,
       record.harnessName,
       record.channelId,
-      JSON.stringify(record.origin),
+      toPgJson(record.origin),
       record.status,
       record.createdAt,
       record.updatedAt,
       record.replacedAt ?? null,
       record.replacedByBindingId ?? null,
-      record.lastError ? JSON.stringify(record.lastError) : null,
+      record.lastError ? toPgJson(record.lastError) : null,
     ],
   };
 }
@@ -11366,11 +11367,11 @@ function channelInboxColumnValues(record: ChannelInboxItem): { names: string[]; 
     record.claimId ?? null,
     record.claimExpiresAt ?? null,
     record.nextAttemptAt ?? null,
-    JSON.stringify(record.requestContext),
+    toPgJson(record.requestContext),
     record.content,
-    JSON.stringify(record.attachments),
-    record.rawFiles ? JSON.stringify(record.rawFiles) : null,
-    record.lastError ? JSON.stringify(record.lastError) : null,
+    toPgJson(record.attachments),
+    record.rawFiles ? toPgJson(record.rawFiles) : null,
+    record.lastError ? toPgJson(record.lastError) : null,
   ];
   return { names: [...CHANNEL_INBOX_COLUMN_NAMES], values };
 }
@@ -11490,11 +11491,11 @@ function harnessWakeupColumnValues(record: HarnessWakeupItem): { names: string[]
     record.claimId ?? null,
     record.claimExpiresAt ?? null,
     record.nextAttemptAt ?? null,
-    record.requestContext === undefined ? null : JSON.stringify(record.requestContext),
+    record.requestContext === undefined ? null : toPgJson(record.requestContext),
     record.content,
-    JSON.stringify(record.attachments),
-    record.result === undefined ? null : JSON.stringify(record.result),
-    record.lastError === undefined ? null : JSON.stringify(record.lastError),
+    toPgJson(record.attachments),
+    record.result === undefined ? null : toPgJson(record.result),
+    record.lastError === undefined ? null : toPgJson(record.lastError),
   ];
   return { names: [...HARNESS_WAKEUP_COLUMN_NAMES], values };
 }
@@ -11579,7 +11580,7 @@ function channelActionTokenColumnValues(record: ChannelActionToken): { names: st
     record.bindingGeneration,
     record.runId,
     record.pendingRequestedAt,
-    JSON.stringify(record.audience),
+    toPgJson(record.audience),
     record.metadataHash,
     record.transportHash,
     record.keyId ?? null,
@@ -11670,10 +11671,10 @@ function channelActionReceiptColumnValues(record: ChannelActionReceipt): { names
     record.kind,
     record.runId,
     record.pendingRequestedAt,
-    JSON.stringify(record.audience),
-    record.verifiedActor ? JSON.stringify(record.verifiedActor) : null,
+    toPgJson(record.audience),
+    record.verifiedActor ? toPgJson(record.verifiedActor) : null,
     record.responseHash,
-    JSON.stringify(record.response),
+    toPgJson(record.response),
     record.status,
     record.conflictReason ?? null,
     record.attempts,
@@ -11684,8 +11685,8 @@ function channelActionReceiptColumnValues(record: ChannelActionReceipt): { names
     record.appliedAt ?? null,
     record.failedAt ?? null,
     record.deadAt ?? null,
-    record.result === undefined ? null : JSON.stringify(record.result),
-    record.lastError ? JSON.stringify(record.lastError) : null,
+    record.result === undefined ? null : toPgJson(record.result),
+    record.lastError ? toPgJson(record.lastError) : null,
     record.createdAt,
     record.updatedAt,
   ];
@@ -11779,12 +11780,12 @@ function channelOutboxColumnValues(record: ChannelOutboxItem): { names: string[]
     record.threadId,
     record.sessionId ?? null,
     record.owningSessionId ?? null,
-    record.source ? JSON.stringify(record.source) : null,
-    JSON.stringify(record.target),
+    record.source ? toPgJson(record.source) : null,
+    toPgJson(record.target),
     record.kind,
     record.operationKind,
     record.operationName ?? null,
-    JSON.stringify(record.payload),
+    toPgJson(record.payload),
     record.deliverySemantics,
     record.status,
     record.attempts,
@@ -11795,8 +11796,8 @@ function channelOutboxColumnValues(record: ChannelOutboxItem): { names: string[]
     record.failedAt ?? null,
     record.deadAt ?? null,
     record.providerMessageId ?? null,
-    record.providerReceipt ? JSON.stringify(record.providerReceipt) : null,
-    record.lastError ? JSON.stringify(record.lastError) : null,
+    record.providerReceipt ? toPgJson(record.providerReceipt) : null,
+    record.lastError ? toPgJson(record.lastError) : null,
     record.createdAt,
     record.updatedAt,
   ];
@@ -12298,6 +12299,9 @@ function validateAttachmentBlobRef(value: unknown, sessionId: string, attachment
 
 function stableJson(value: unknown): string {
   if (value === undefined) return 'null';
+  // Strings compare in their persisted jsonb form (`toPgJson` drops NUL and
+  // replaces unpaired surrogates), so a replay matches the row it wrote.
+  if (typeof value === 'string') return JSON.stringify(toPgText(value));
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) {
     // Match JSON.stringify: undefined array elements serialize as null.
@@ -12308,7 +12312,7 @@ function stableJson(value: unknown): string {
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, entry]) => entry !== undefined)
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`);
+    .map(([key, entry]) => `${JSON.stringify(toPgText(key))}:${stableJson(entry)}`);
   return `{${entries.join(',')}}`;
 }
 
@@ -12514,11 +12518,11 @@ function planTaskColumnValues(task: HarnessPlanTask): { names: string[]; values:
     task.content,
     task.activeForm ?? null,
     task.priority ?? null,
-    task.blockedBy === undefined ? null : JSON.stringify(task.blockedBy),
+    task.blockedBy === undefined ? null : toPgJson(task.blockedBy),
     task.origin ?? null,
     task.delegatedSubagentSessionId ?? null,
     task.delegatedSubagentTypeId ?? null,
-    task.metadata === undefined ? null : JSON.stringify(task.metadata),
+    task.metadata === undefined ? null : toPgJson(task.metadata),
     task.createdAt,
     task.updatedAt,
     task.startedAt ?? null,
@@ -12600,8 +12604,8 @@ function runSummaryColumnValues(summary: HarnessRunSummary): { names: string[]; 
     summary.startedAt ?? null,
     summary.completedAt,
     summary.durationMs ?? null,
-    JSON.stringify(summary.usage),
-    summary.toolRollup === undefined ? null : JSON.stringify(summary.toolRollup),
+    toPgJson(summary.usage),
+    summary.toolRollup === undefined ? null : toPgJson(summary.toolRollup),
     summary.createdAt,
   ];
   return { names, values };
@@ -12669,10 +12673,10 @@ function messageEvidenceErrorColumn(record: AgentSignalResultEvidence): string |
   // for an erased record, so the marker is never ambiguous.
   if (record.status === 'completed') {
     return record.erased === true
-      ? JSON.stringify({ code: HARNESS_MESSAGE_RESULT_ERASED_CODE, message: 'The result was erased with its session' })
+      ? toPgJson({ code: HARNESS_MESSAGE_RESULT_ERASED_CODE, message: 'The result was erased with its session' })
       : null;
   }
-  return 'error' in record ? JSON.stringify(record.error) : null;
+  return 'error' in record ? toPgJson(record.error) : null;
 }
 
 function rowToMessageResultEvidence(row: Record<string, unknown>): AgentSignalResultEvidence {
@@ -13770,13 +13774,13 @@ function channelInboxComparableValues(record: ChannelInboxItem): unknown[] {
 
 /**
  * Normalize a live value to the shape its JSONB column persists. The write
- * path runs `JSON.stringify`, which lowers `Date` and other `toJSON`-able
- * objects to strings — `stableJsonString` alone would reduce a live `Date`
- * to `{}` and a replay of identical input would false-conflict against the
- * stored row.
+ * path runs `toPgJson`, which lowers `Date` and other `toJSON`-able objects
+ * to strings and drops what jsonb refuses (NUL, unpaired surrogates) —
+ * `stableJsonString` alone would reduce a live `Date` to `{}` and a replay of
+ * identical input would false-conflict against the stored row.
  */
 function persistedJsonValue<T>(value: T): T {
-  return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
+  return value === undefined ? value : (JSON.parse(toPgJson(value)) as T);
 }
 
 function stableJsonString(value: unknown): string {
@@ -13784,13 +13788,15 @@ function stableJsonString(value: unknown): string {
 }
 
 function canonicalJsonValue(value: unknown): unknown {
+  // Strings compare in their persisted jsonb form, as `stableJson` does.
+  if (typeof value === 'string') return toPgText(value);
   if (Array.isArray(value)) return value.map(canonicalJsonValue);
   if (value && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .filter(([, entry]) => entry !== undefined)
         .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, entry]) => [key, canonicalJsonValue(entry)]),
+        .map(([key, entry]) => [toPgText(key), canonicalJsonValue(entry)]),
     );
   }
   return value;
