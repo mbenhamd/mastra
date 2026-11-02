@@ -88,11 +88,46 @@ function isRetryableModelError(error: unknown): boolean {
  * `additionalProperties: false`.
  */
 export function hasFreeFormObject(schema: unknown): boolean {
-  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
-  const node = schema as Record<string, unknown>;
+  return someSchemaNode(schema, declaresFreeFormKeys);
+}
+
+/**
+ * Whether Anthropic's strict output format would close an object that accepts arbitrary keys. On
+ * top of {@link hasFreeFormObject}, this counts objects that are open by JSON Schema default: an
+ * object with no (or empty) `properties` and no `additionalProperties` / `patternProperties`, such
+ * as a raw `{ type: 'object' }` record field. An object that declares properties and omits
+ * `additionalProperties` is not counted: strict mode dropping its extra keys is the intended
+ * behaviour, and it keeps every declared field. OpenAI's non-strict decision keeps using
+ * {@link hasFreeFormObject}.
+ */
+export function hasAnthropicFreeFormObject(schema: unknown): boolean {
+  return someSchemaNode(schema, node => declaresFreeFormKeys(node) || isImplicitlyOpenObject(node));
+}
+
+function declaresFreeFormKeys(node: Record<string, unknown>): boolean {
   const additional = node.additionalProperties;
   if (additional === true || (additional && typeof additional === 'object')) return true;
-  if (node.patternProperties || node.propertyNames) return true;
+  return Boolean(node.patternProperties || node.propertyNames);
+}
+
+function isImplicitlyOpenObject(node: Record<string, unknown>): boolean {
+  const types = Array.isArray(node.type) ? node.type : [node.type];
+  if (!types.includes('object') || 'additionalProperties' in node || node.patternProperties) return false;
+  const properties = node.properties;
+  return (
+    properties === undefined ||
+    (Boolean(properties) &&
+      typeof properties === 'object' &&
+      !Array.isArray(properties) &&
+      Object.keys(properties as object).length === 0)
+  );
+}
+
+/** Whether `predicate` holds for the schema or any of its subschemas. */
+function someSchemaNode(schema: unknown, predicate: (node: Record<string, unknown>) => boolean): boolean {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  const node = schema as Record<string, unknown>;
+  if (predicate(node)) return true;
 
   // Only descend into keywords that hold subschemas. Data keywords (`default`, `const`,
   // `enum`, `examples`) and property names are not schemas and must not trigger a match.
@@ -109,7 +144,7 @@ export function hasFreeFormObject(schema: unknown): boolean {
   if (Array.isArray(items)) subschemas.push(...items);
   else if (items) subschemas.push(items);
   if (Array.isArray(node.prefixItems)) subschemas.push(...node.prefixItems);
-  return subschemas.some(hasFreeFormObject);
+  return subschemas.some(subschema => someSchemaNode(subschema, predicate));
 }
 
 /**
@@ -163,7 +198,7 @@ const isAnthropicProvider = (provider: string) => /^anthropic(\.|$)/.test(provid
  * return `{}`) or exceeds {@link ANTHROPIC_STRUCTURED_OUTPUT_LIMITS} (the request is rejected).
  */
 export function exceedsAnthropicStructuredOutput(schema: unknown): boolean {
-  if (hasFreeFormObject(schema)) return true;
+  if (hasAnthropicFreeFormObject(schema)) return true;
   const { optional, union } = countStructuredOutputParameters(schema);
   return (
     optional > ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.optionalParameters ||
@@ -267,10 +302,15 @@ function choosesAnthropicStructuredOutputMode(providerOptions: SharedProviderOpt
  * injection, the same mode `'auto'` picks for models without native support. Free-form objects are
  * looked for in the schema before the provider compat layer rewrites it (that layer merges a root
  * union of objects into one closed object, which drops a `z.record()` branch) as well as in the wire
- * schema; the limits are counted on the wire schema, which is what Anthropic would receive. The
- * fallback injects the schema from before the compat layer, so records stay open in the prompt.
- * Mastra validates the generated text against the schema either way. An explicit
- * `jsonPromptInjection: false` or Anthropic `structuredOutputMode` keeps the native format.
+ * schema; the limits are counted on the wire schema, which is what Anthropic would receive.
+ * Mastra validates the generated text against the schema either way.
+ *
+ * On Anthropic, an explicit `structuredOutputMode` of `'outputFormat'` or `'jsonTool'` keeps the
+ * native format, and it also wins over `jsonPromptInjection: 'auto'` (which otherwise resolves to
+ * inline injection for models without registered native support). Whenever Anthropic gets the schema
+ * through `'auto'` or the fallback, the prompt carries the schema from before the compat layer, so
+ * records stay open. Explicit `true` / `'system'` / `'inline'` still inject the wire schema as
+ * before, and `jsonPromptInjection: false` keeps the native format.
  */
 function resolveDirectStructuredOutputInjection(
   structuredOutput: { schema?: unknown; jsonPromptInjection?: JsonPromptInjection },
@@ -279,24 +319,26 @@ function resolveDirectStructuredOutputInjection(
   getWireSchema: () => unknown,
 ): { mode: 'system' | 'inline' | undefined; schema?: unknown } {
   const { jsonPromptInjection } = structuredOutput;
+  if (jsonPromptInjection === false) return { mode: undefined };
+  const anthropic = isAnthropicProvider(model.provider);
+  const providerChoosesMode = anthropic && choosesAnthropicStructuredOutputMode(providerOptions);
+  if (jsonPromptInjection === 'auto' && providerChoosesMode) return { mode: undefined };
+
+  const sourceSchema = () =>
+    jsonSchemaOf(getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0]));
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
   const resolved = resolveJsonPromptInjection(
     jsonPromptInjection,
     jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
   );
-  if (resolved) return { mode: resolved === true ? 'system' : resolved };
-  if (
-    jsonPromptInjection === false ||
-    !isAnthropicProvider(model.provider) ||
-    choosesAnthropicStructuredOutputMode(providerOptions)
-  ) {
-    return { mode: undefined };
+  if (resolved) {
+    const mode = resolved === true ? 'system' : resolved;
+    return anthropic && jsonPromptInjection === 'auto' ? { mode, schema: sourceSchema() } : { mode };
   }
-  const sourceSchema = jsonSchemaOf(
-    getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0]),
-  );
-  return hasFreeFormObject(sourceSchema) || exceedsAnthropicStructuredOutput(getWireSchema())
-    ? { mode: 'inline', schema: sourceSchema }
+  if (!anthropic || providerChoosesMode) return { mode: undefined };
+  const schema = sourceSchema();
+  return hasAnthropicFreeFormObject(schema) || exceedsAnthropicStructuredOutput(getWireSchema())
+    ? { mode: 'inline', schema }
     : { mode: undefined };
 }
 
