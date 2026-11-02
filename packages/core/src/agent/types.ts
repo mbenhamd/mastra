@@ -504,7 +504,11 @@ export type StructuredOutputOptionsBase<OUTPUT = {}> = {
    * true and 'system' inject JSON instructions into the leading system message.
    * 'inline' appends JSON instructions to the latest user message.
    * 'auto' uses native structured output when supported and inline injection otherwise.
-   * false or omitted uses the provider's native response format.
+   * Omitted uses the provider's native response format, except on Anthropic: omitted or
+   * 'auto', a schema with a free-form object or beyond Anthropic's strict-output limits
+   * (more than 24 optional or 16 union-typed parameters) cannot be carried by the strict
+   * format, so it is injected inline instead (`instructions`, when set, in its place).
+   * false always uses the provider's native response format.
    */
   jsonPromptInjection?: boolean | 'system' | 'inline' | 'auto';
 
