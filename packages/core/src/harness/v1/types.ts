@@ -13,7 +13,7 @@ import type { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import type { LogicalMessageIdentity, LogicalMessageSignalIdentity } from '../../agent/message-list';
 import type { CreatedAgentSignal } from '../../agent/signals';
-import type { ToolsInput } from '../../agent/types';
+import type { StructuredOutputOptions, ToolsInput } from '../../agent/types';
 import type { ChannelProvider } from '../../channels';
 import type { Mastra } from '../../mastra';
 import type { RequestContext } from '../../request-context';
@@ -2073,6 +2073,12 @@ export interface MessageOptionsStructured<S extends z.ZodTypeAny> extends Messag
   output: S;
   sync: true;
   stream?: false;
+  /**
+   * Forwarded to the agent's `structuredOutput.jsonPromptInjection`: inject the JSON schema into
+   * the prompt instead of sending it as the provider's native response format. Omitted → the
+   * agent's default resolution.
+   */
+  jsonPromptInjection?: StructuredOutputOptions<unknown>['jsonPromptInjection'];
 }
 
 export type MessageOptions<S extends z.ZodTypeAny = z.ZodTypeAny> =

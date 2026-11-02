@@ -4,7 +4,14 @@ import { z } from 'zod/v4';
 import { coreFeatures } from '../../../features';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
 import { MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS } from '../../../observability/content-free-measurement';
-import { execute, hasFreeFormObject, resolveJsonPromptInjection, usesOpenAIStrictJsonSchema } from './execute';
+import {
+  countStructuredOutputParameters,
+  execute,
+  hasFreeFormObject,
+  resolveJsonPromptInjection,
+  sendsNativeResponseFormat,
+  usesOpenAIStrictJsonSchema,
+} from './execute';
 import { testUsage } from './test-utils';
 
 const inputMessages = [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'Summarize the plan.' }] }];
@@ -1054,6 +1061,109 @@ describe('execute OpenAI strict-mode schema preparation (issue #23795)', () => {
   it('decides model-router models by provider id', () => {
     expect(usesOpenAIStrictJsonSchema(new ModelRouterLanguageModel('anthropic/claude-sonnet-4-5'))).toBe(false);
     expect(usesOpenAIStrictJsonSchema(new ModelRouterLanguageModel('openai/gpt-4o'))).toBe(true);
+  });
+});
+
+// PF-7309: Anthropic's native output format is strict. It rewrites free-form objects to
+// `additionalProperties: false` (so records come back `{}`) and rejects schemas over its
+// complexity limits, so those schemas are injected into the prompt instead.
+describe('execute Anthropic structured-output fallback (PF-7309)', () => {
+  const recordSchema = z.object({ studyId: z.string(), fields: z.record(z.string(), z.string()) });
+  const manyOptionalSchema = z.object(
+    Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`field${i}`, z.string().optional()])),
+  );
+  const manyUnionSchema = z.object(
+    Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`field${i}`, z.union([z.string(), z.number()])])),
+  );
+
+  async function capture(provider: string, structuredOutputSchema: any, providerOptions?: Record<string, any>) {
+    let captured: any;
+    const model = new MockLanguageModelV2({
+      provider,
+      modelId: 'claude-haiku-5-5',
+      doStream: async (options: any) => {
+        captured = options;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'text-start', id: 'text-1' },
+            { type: 'text-delta', id: 'text-1', delta: '{}' },
+            { type: 'text-end', id: 'text-1' },
+            { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+          ]),
+          request: { body: '' },
+          response: { headers: {} },
+          warnings: [] as any[],
+        };
+      },
+    });
+    await readStream(
+      execute({
+        runId: 'test-run-id-anthropic',
+        model: model as any,
+        inputMessages,
+        onResult: () => {},
+        methodType: 'stream',
+        providerOptions,
+        structuredOutput: { schema: structuredOutputSchema },
+      }),
+    );
+    return { options: captured, model };
+  }
+
+  function promptText(options: any): string {
+    return JSON.stringify(options.prompt);
+  }
+
+  it.each(['anthropic.messages', 'anthropic'])(
+    'injects a record-bearing schema into the prompt instead of the strict output format (%s)',
+    async provider => {
+      const { options, model } = await capture(provider, recordSchema);
+
+      expect(options.responseFormat).toBeUndefined();
+      expect(promptText(options)).toContain('fields');
+      expect(promptText(options)).toContain('additionalProperties');
+      expect(sendsNativeResponseFormat({ schema: recordSchema }, model)).toBe(false);
+    },
+  );
+
+  it.each([
+    ['more than 24 optional parameters', manyOptionalSchema],
+    ['more than 16 union-typed parameters', manyUnionSchema],
+  ])('falls back to prompt injection for a schema with %s', async (_, overLimitSchema) => {
+    const { options } = await capture('anthropic.messages', overLimitSchema);
+
+    expect(options.responseFormat).toBeUndefined();
+    expect(promptText(options)).toContain('field0');
+  });
+
+  it('keeps the strict native output format for schemas within limits without free-form objects', async () => {
+    const { options, model } = await capture('anthropic.messages', schema);
+
+    expect(options.responseFormat?.type).toBe('json');
+    expect(options.responseFormat.schema.properties.suggestions).toBeDefined();
+    expect(sendsNativeResponseFormat({ schema }, model)).toBe(true);
+  });
+
+  it('leaves OpenAI record schemas on the non-strict native response format', async () => {
+    const { options } = await capture('openai.responses', recordSchema);
+
+    expect(options.responseFormat?.type).toBe('json');
+    expect(options.responseFormat.schema.properties.fields.additionalProperties).toEqual({ type: 'string' });
+    expect(options.providerOptions?.openai?.strictJsonSchema).toBe(false);
+  });
+
+  it('counts optional and union-typed parameters across nested subschemas', () => {
+    expect(
+      countStructuredOutputParameters({
+        type: 'object',
+        required: ['a'],
+        properties: {
+          a: { type: ['string', 'null'] },
+          b: { anyOf: [{ type: 'string' }, { type: 'object', properties: { c: { type: 'string' } } }] },
+        },
+      }),
+    ).toEqual({ optional: 2, union: 2 });
   });
 });
 

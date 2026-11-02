@@ -112,6 +112,65 @@ export function hasFreeFormObject(schema: unknown): boolean {
   return subschemas.some(hasFreeFormObject);
 }
 
+/**
+ * Anthropic structured-output complexity limits. They apply to the combined total across every
+ * strict schema in one request (`output_config.format` and `strict: true` tools); a request over
+ * either limit is rejected before generation.
+ * @see https://platform.claude.com/docs/en/build-with-claude/structured-outputs ("Optional
+ * parameters: 24", "Parameters with union types: 16" — `anyOf` or type arrays)
+ */
+export const ANTHROPIC_STRUCTURED_OUTPUT_LIMITS = { optionalParameters: 24, unionParameters: 16 } as const;
+
+/**
+ * Counts the parameters Anthropic's structured-output limits are measured in: properties not listed
+ * in their object's `required`, and subschemas that use `anyOf`/`oneOf` (the Anthropic provider
+ * sends `oneOf` as `anyOf`) or a type array. Walks the same subschema keywords as
+ * {@link hasFreeFormObject}.
+ */
+export function countStructuredOutputParameters(schema: unknown): { optional: number; union: number } {
+  const totals = { optional: 0, union: 0 };
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const node = value as Record<string, unknown>;
+    if (Array.isArray(node.anyOf) || Array.isArray(node.oneOf) || (Array.isArray(node.type) && node.type.length > 1)) {
+      totals.union++;
+    }
+    const properties = node.properties;
+    if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
+      const required = new Set(Array.isArray(node.required) ? node.required : []);
+      for (const key of Object.keys(properties)) if (!required.has(key)) totals.optional++;
+    }
+    for (const key of ['properties', '$defs', 'definitions'] as const) {
+      const map = node[key];
+      if (map && typeof map === 'object' && !Array.isArray(map)) Object.values(map).forEach(visit);
+    }
+    for (const key of ['anyOf', 'oneOf', 'allOf', 'prefixItems'] as const) {
+      const list = node[key];
+      if (Array.isArray(list)) list.forEach(visit);
+    }
+    if (Array.isArray(node.items)) node.items.forEach(visit);
+    else visit(node.items);
+  };
+  visit(schema);
+  return totals;
+}
+
+const isAnthropicProvider = (provider: string) => /^anthropic(\.|$)/.test(provider);
+
+/**
+ * Whether Anthropic's strict native output format cannot carry this JSON schema: it either has a
+ * free-form object (the provider rewrites it to `additionalProperties: false`, so the model can only
+ * return `{}`) or exceeds {@link ANTHROPIC_STRUCTURED_OUTPUT_LIMITS} (the request is rejected).
+ */
+export function exceedsAnthropicStructuredOutput(schema: unknown): boolean {
+  if (hasFreeFormObject(schema)) return true;
+  const { optional, union } = countStructuredOutputParameters(schema);
+  return (
+    optional > ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.optionalParameters ||
+    union > ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.unionParameters
+  );
+}
+
 function readStrictJsonSchemaOption(options: unknown): boolean | undefined {
   if (!options || typeof options !== 'object') return undefined;
   const strictJsonSchema = (options as { strictJsonSchema?: unknown }).strictJsonSchema;
@@ -172,12 +231,38 @@ export function sendsNativeResponseFormat(
   model: { provider: string; modelId: string },
 ): boolean {
   if (!structuredOutput?.schema || structuredOutput.model) return false;
-  const { jsonPromptInjection } = structuredOutput;
+  return !resolveDirectStructuredOutputInjection(structuredOutput.jsonPromptInjection, model, () => {
+    const responseFormat = getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0], {
+      model: { provider: model.provider, modelId: model.modelId, supportsStructuredOutputs: true },
+    });
+    return responseFormat.type === 'json' ? responseFormat.schema : undefined;
+  });
+}
+
+/**
+ * Resolves how a direct (no structuring model) structured-output step carries its schema: through
+ * the prompt (`'system'` / `'inline'`) or as a native response format (`undefined`).
+ *
+ * Anthropic's native output format is strict, so a schema it cannot carry (see
+ * {@link exceedsAnthropicStructuredOutput}) falls back to inline prompt injection, the same mode
+ * `'auto'` picks for models without native support. Mastra validates the generated text against the
+ * schema either way. An explicit `jsonPromptInjection: false` keeps the native format.
+ */
+function resolveDirectStructuredOutputInjection(
+  jsonPromptInjection: JsonPromptInjection,
+  model: { provider: string; modelId: string },
+  getJsonSchema: () => unknown,
+): 'system' | 'inline' | undefined {
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
-  return !resolveJsonPromptInjection(
+  const resolved = resolveJsonPromptInjection(
     jsonPromptInjection,
     jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
   );
+  if (resolved) return resolved === true ? 'system' : resolved;
+  if (jsonPromptInjection !== false && isAnthropicProvider(model.provider)) {
+    return exceedsAnthropicStructuredOutput(getJsonSchema()) ? 'inline' : undefined;
+  }
+  return undefined;
 }
 
 type InjectJsonInstructionArgs = Parameters<typeof injectJsonInstructionIntoMessagesV3>[0];
@@ -670,10 +755,14 @@ export function execute<OUTPUT = undefined>({
   let prompt = inputMessages;
   const jsonPromptInjection = structuredOutput?.jsonPromptInjection;
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
-  const resolvedJsonPromptInjection = resolveJsonPromptInjection(
-    jsonPromptInjection,
-    jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
-  );
+  const responseJsonSchema = () => (responseFormat?.type === 'json' ? responseFormat.schema : undefined);
+  const resolvedJsonPromptInjection =
+    structuredOutputMode === 'direct'
+      ? resolveDirectStructuredOutputInjection(jsonPromptInjection, model, responseJsonSchema)
+      : resolveJsonPromptInjection(
+          jsonPromptInjection,
+          jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
+        );
   const injectionMode = resolvedJsonPromptInjection === true ? 'system' : resolvedJsonPromptInjection;
 
   // For direct mode (no model provided for structuring agent), inject JSON schema instruction if opting out of native response format with jsonPromptInjection
