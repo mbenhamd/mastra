@@ -41,6 +41,22 @@ import type { SubagentDefinition } from './types';
 export const SPAWN_SUBAGENT_TOOL_ID = 'spawn_subagent';
 
 /**
+ * The per-type card list shown to the parent model by both delegation tools
+ * (`spawn_subagent` and `task_delegate`), so they describe types identically.
+ */
+export function formatSubagentTypeList(
+  typeIds: readonly string[],
+  getType: (id: string) => { description: string } | undefined,
+): string {
+  return typeIds
+    .map(id => {
+      const def = getType(id);
+      return def ? `- **${id}**: ${def.description}` : `- **${id}**`;
+    })
+    .join('\n');
+}
+
+/**
  * Build a `spawn_subagent` tool scoped to a single parent session + turn.
  * Returns `undefined` when the harness has no subagent types registered
  * so the tool registry stays clean.
@@ -61,12 +77,7 @@ export function createSpawnSubagentTool(parent: Session) {
     'Delegate a focused task to a specialized subagent. The subagent runs ' +
     'independently with a constrained toolset, then returns a verified structured outcome. ' +
     'Available agent types:\n' +
-    typeIds
-      .map(id => {
-        const def = harness._getSubagentType(id);
-        return def ? `- **${id}**: ${def.description}` : `- **${id}**`;
-      })
-      .join('\n');
+    formatSubagentTypeList(typeIds, id => harness._getSubagentType(id));
 
   const inputSchema = z.object({
     agentType: z.enum(typeIds as [string, ...string[]]).describe('Which registered subagent type to spawn.'),
