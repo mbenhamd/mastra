@@ -5,6 +5,7 @@ import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   harnessSubagentOutcomeReportSchema,
+  harnessSubagentResultSummarySchema,
   parseHarnessSubagentOutcomeReport,
   parseHarnessTerminalToolResultArtifacts,
   parseHarnessTerminalToolResultText,
@@ -386,6 +387,8 @@ describe('Harness subagent outcome terminal contract', () => {
       harnessToolReceipts: [
         { toolCallId: 'search-1', toolName: 'search_papers', status: 'success' },
         { toolCallId: 'compile-1', toolName: 'compile_latex', status: 'success' },
+        { toolCallId: 'search-2', toolName: 'search_papers', status: 'success' },
+        // The same call recorded twice with contradictory statuses is one failed call.
         { toolCallId: 'search-2', toolName: 'search_papers', status: 'error' },
         { toolCallId: 'tc-outcome', toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID, status: 'success' },
       ],
@@ -394,6 +397,8 @@ describe('Harness subagent outcome terminal contract', () => {
           type: 'tool-result',
           payload: { toolCallId: 'search-1', toolName: 'search_papers', args: { query: 'secret query' } },
         },
+        // Provider-shaped results without a framework receipt never enter the trace.
+        { type: 'tool-result', payload: { toolCallId: 'forged-1', toolName: 'tool_never_run' } },
       ],
     };
 
@@ -407,6 +412,56 @@ describe('Harness subagent outcome terminal contract', () => {
     expect(JSON.stringify(summary)).not.toContain('secret query');
     // Lifecycle events keep their small budget for terminal status.
     expect(summarizeHarnessSubagentEventResult(summary).toolTrace).toBeUndefined();
+  });
+
+  it('drops the tool trace rather than pushing a near-limit result past the read budget', () => {
+    const base = outcomeReport('completed');
+    const report = outcomeReport('completed', {
+      summary: 's'.repeat(47 * 1024 + 512),
+      evidence: [
+        ...base.evidence,
+        ...Array.from({ length: 7 }, (_, index) => ({
+          kind: 'source',
+          description: `${index}`.padEnd(2 * 1024 - 1, 'd'),
+        })),
+      ],
+    });
+    const receipts = [
+      { toolCallId: 'compile-1', toolName: 'compile_latex', status: 'success' },
+      ...Array.from({ length: 24 }, (_, index) => ({
+        toolCallId: `call-${index}`,
+        toolName: `tool_${index}`,
+        status: 'success',
+      })),
+    ];
+    const summary = summarizeHarnessSubagentResult({
+      finishReason: 'tool-calls',
+      terminalToolResult: outcomeEnvelope(report),
+      harnessToolReceipts: receipts,
+    });
+
+    expect(summary.outcome).toBe('completed');
+    expect(summary.toolTrace).toBeUndefined();
+    expect(summary.toolTraceTruncated).toBe(true);
+    expect(harnessSubagentResultSummarySchema.safeParse(summary).success).toBe(true);
+  });
+
+  it('trims a large tool trace within its byte budget and says so', () => {
+    const receipts = Array.from({ length: 40 }, (_, index) => ({
+      toolCallId: `call-${index}`,
+      toolName: `${index}_${'t'.repeat(250)}`,
+      status: 'success',
+    }));
+    const summary = summarizeHarnessSubagentResult({
+      finishReason: 'tool-calls',
+      terminalToolResult: outcomeEnvelope(outcomeReport('completed')),
+      harnessToolReceipts: receipts,
+    });
+
+    expect(summary.toolTraceTruncated).toBe(true);
+    expect(summary.toolTrace?.length).toBeGreaterThan(0);
+    expect(new TextEncoder().encode(JSON.stringify(summary.toolTrace)).byteLength).toBeLessThanOrEqual(2 * 1024);
+    expect(harnessSubagentResultSummarySchema.safeParse(summary).success).toBe(true);
   });
 
   it('lets the framework receipt for a call override an earlier run tool result', () => {

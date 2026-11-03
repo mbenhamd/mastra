@@ -139,24 +139,41 @@ const harnessSubagentUsageSchema = z
 
 /** Maximum distinct tools listed in a subagent result's tool trace. */
 export const MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES = 24;
+/**
+ * Serialized trace budget. It keeps a completed result with a near-maximal
+ * summary and evidence inside the 64 KiB terminal envelope.
+ */
+export const MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES = 2 * 1024;
+/** Room kept free for the settlement and plan-task view wrapping a summary. */
+const MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES = 4 * 1024;
+const MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH = 128;
 
 /**
- * Per-tool call and error counts from framework receipts, in first-call
- * order. It tells the parent what the child covered (and what failed) without
- * re-searching; raw tool inputs and outputs are never included.
+ * Per-tool distinct-call and error counts from framework receipts, in the
+ * order the framework recorded them. It tells the parent what the child
+ * covered (and what failed) without re-searching; raw tool inputs and
+ * outputs are never included.
  */
 export const harnessSubagentToolTraceSchema = z
   .array(
     z
       .object({
-        toolName: z.string().min(1).max(MAX_HARNESS_SUBAGENT_LABEL_LENGTH),
+        toolName: z.string().min(1).max(MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH),
         calls: z.number().int().positive(),
         errors: z.number().int().nonnegative(),
       })
       .strict(),
   )
   .min(1)
-  .max(MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES);
+  .max(MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES)
+  .superRefine((trace, ctx) => {
+    if (new TextEncoder().encode(JSON.stringify(trace)).byteLength > MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `subagent tool trace exceeds ${MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES} UTF-8 bytes`,
+      });
+    }
+  });
 
 export type HarnessSubagentToolTrace = z.infer<typeof harnessSubagentToolTraceSchema>;
 
@@ -390,22 +407,43 @@ function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
-function summarizeToolTrace(value: unknown): { trace?: HarnessSubagentToolTrace; truncated: boolean } {
-  const { receipts, overflow } = collectToolReceipts(value);
-  const byTool = new Map<string, { calls: number; errors: number }>();
-  for (const receipt of receipts) {
-    const toolName = receipt.toolName.slice(0, MAX_HARNESS_SUBAGENT_LABEL_LENGTH);
-    const entry = byTool.get(toolName) ?? { calls: 0, errors: 0 };
-    entry.calls += 1;
-    if (receipt.status === 'error') entry.errors += 1;
-    byTool.set(toolName, entry);
+/**
+ * Only framework-minted receipts feed the trace. Run tool-result fallbacks
+ * stay available to evidence verification but are provider-shaped, so they
+ * never inflate what the parent is told the child did. A call is counted
+ * once, and as an error when any receipt for it failed.
+ */
+function summarizeToolTrace(
+  value: unknown,
+  maxBytes: number,
+): { trace?: HarnessSubagentToolTrace; truncated: boolean } {
+  const source = isRecord(value) ? value : undefined;
+  if (source === undefined) return { truncated: false };
+  const callsByTool = new Map<string, Map<string, boolean>>();
+  for (const candidate of itemArray(source[HARNESS_SUBAGENT_TOOL_RECEIPTS_FIELD])) {
+    const receipt = normalizeToolReceipt(candidate);
+    if (receipt === undefined) continue;
+    const toolName = receipt.toolName.slice(0, MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH);
+    const calls = callsByTool.get(toolName) ?? new Map<string, boolean>();
+    calls.set(receipt.toolCallId, calls.get(receipt.toolCallId) === true || receipt.status === 'error');
+    callsByTool.set(toolName, calls);
   }
-  if (byTool.size === 0) return { truncated: false };
-  const trace = [...byTool].slice(0, MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES).map(([toolName, counts]) => ({
-    toolName,
-    ...counts,
-  }));
-  return { trace, truncated: overflow || byTool.size > trace.length };
+  if (callsByTool.size === 0) return { truncated: false };
+  const trace: HarnessSubagentToolTrace = [];
+  let bytes = 2;
+  for (const [toolName, calls] of callsByTool) {
+    if (trace.length >= MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES) break;
+    const entry = { toolName, calls: calls.size, errors: [...calls.values()].filter(Boolean).length };
+    const entryBytes = new TextEncoder().encode(JSON.stringify(entry)).byteLength + 1;
+    if (bytes + entryBytes > maxBytes) break;
+    bytes += entryBytes;
+    trace.push(entry);
+  }
+  const overflow = source[HARNESS_SUBAGENT_TOOL_RECEIPTS_OVERFLOW_FIELD] === true;
+  return {
+    ...(trace.length > 0 ? { trace } : {}),
+    truncated: overflow || callsByTool.size > trace.length,
+  };
 }
 
 const USAGE_KEYS = [
@@ -472,13 +510,12 @@ export function summarizeHarnessSubagentResult(
     };
   }
   const usage = summarizeUsage(record?.totalUsage ?? record?.usage);
-  const toolTrace = summarizeToolTrace(value);
   const artifacts =
     status === 'success' && report?.outcome === 'completed'
       ? parseHarnessTerminalToolResultArtifacts(record?.terminalToolResult)
       : undefined;
 
-  return {
+  const summary: HarnessSubagentResultSummary = {
     status,
     ...(report ? { outcome: report.outcome } : {}),
     text: text.value,
@@ -487,13 +524,25 @@ export function summarizeHarnessSubagentResult(
     stepCount: arrayLength(record?.steps),
     toolCallCount: arrayLength(record?.toolCalls),
     toolResultCount: arrayLength(record?.toolResults),
-    ...(toolTrace.trace ? { toolTrace: toolTrace.trace } : {}),
-    ...(toolTrace.truncated ? { toolTraceTruncated: true } : {}),
     ...(usage ? { usage } : {}),
     ...(artifacts ? { artifacts } : {}),
     ...(report ? { evidence: report.evidence } : {}),
     ...(report?.issue ? { issue: report.issue } : {}),
     ...(error ? { error } : {}),
+  };
+  // The trace only uses room the rest of the summary leaves inside the 64 KiB
+  // terminal envelope, keeping headroom for the settlement and plan-task view
+  // that wrap it; a near-limit answer keeps no trace rather than breaking reads.
+  const summaryBytes = new TextEncoder().encode(JSON.stringify(summary)).byteLength;
+  const traceBudget = Math.min(
+    MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES,
+    MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES - MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES - summaryBytes,
+  );
+  const toolTrace = summarizeToolTrace(value, traceBudget);
+  return {
+    ...summary,
+    ...(toolTrace.trace ? { toolTrace: toolTrace.trace } : {}),
+    ...(toolTrace.truncated ? { toolTraceTruncated: true } : {}),
   };
 }
 
