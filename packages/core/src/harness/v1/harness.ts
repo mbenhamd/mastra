@@ -5405,6 +5405,20 @@ export class Harness {
     return this._liveSessions.get(session.id) !== session && session._internalEvictedByLeaseLoss;
   }
 
+  /** Resolves `true` once `work` settles, or `false` if `deadlineAt` passes first. */
+  private async _settleBeforeDeadline(work: Promise<unknown>, deadlineAt: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<false>(resolve => {
+      timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()));
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([work.then(() => true as const), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
   private _liveDescendantsOf(rootId: string): Session[] {
     const out: Session[] = [];
@@ -6642,6 +6656,26 @@ export class Harness {
       } catch (err) {
         recordDrainFailure(session, err);
         continue;
+      }
+    }
+    // PF-7538: an eviction that started during the drain (a fenced save, or a
+    // lease renewal that discovered lease loss while shutdown waited on a
+    // session) must finish its event persistence and workspace release before
+    // shutdown reports success and the caller tears storage down. Bounded by
+    // the drain deadline like every other drain wait. Eviction cleanup stays
+    // best-effort (`allSettled`), as for the evictions awaited before the drain.
+    while (this._sessionEvictionsInFlight.size > 0) {
+      const [pendingSessionId] = this._sessionEvictionsInFlight.keys();
+      const settled = await this._settleBeforeDeadline(
+        Promise.allSettled([...this._sessionEvictionsInFlight.values()]),
+        drainDeadlineAt,
+      );
+      if (!settled) {
+        eventPersistenceError ??= {
+          sessionId: pendingSessionId!,
+          error: new HarnessValidationError('shutdown()', 'Session eviction did not settle before shutdown deadline'),
+        };
+        break;
       }
     }
     // Sessions fenced during the drain (directly, or as members of a fenced

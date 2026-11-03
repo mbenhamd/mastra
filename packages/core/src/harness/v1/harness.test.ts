@@ -5215,6 +5215,56 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     await expect(b.shutdown()).resolves.toBeUndefined();
   });
 
+  it('waits for a lease-loss eviction that started during the drain to persist its events', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-renewal-fenced' });
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // Block the eviction's `session_evicted` ledger append on a gate.
+    let openGate!: () => void;
+    const gate = new Promise<void>(resolve => (openGate = resolve));
+    let evictedAppendDone = false;
+    const appendSessionEvent = storage.appendSessionEvent.bind(storage);
+    vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async record => {
+      if (record.sessionId === session.id && (record.event as { type?: string }).type === 'session_evicted') {
+        await gate;
+        await appendSessionEvent(record);
+        evictedAppendDone = true;
+        return;
+      }
+      return appendSessionEvent(record);
+    });
+
+    // An already-running lease renewal discovers the lease loss while shutdown
+    // waits on this session's drain.
+    const internals = a as unknown as {
+      _renewLiveSessionLeaseSubtree(storage: InMemoryHarness, root: unknown): Promise<void>;
+    };
+    const waitForDrain = session._waitForShutdownDrain.bind(session);
+    vi.spyOn(session, '_waitForShutdownDrain').mockImplementation(async deadlineAt => {
+      void internals._renewLiveSessionLeaseSubtree(storage, session);
+      while (session.lifecycleState !== 'evicted') await new Promise(resolve => setTimeout(resolve, 1));
+      return waitForDrain(deadlineAt);
+    });
+
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await vi.waitFor(() => expect(session.lifecycleState).toBe('evicted'));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(shutdownSettled).toBe(false);
+
+    openGate();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(evictedAppendDone).toBe(true);
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
   it('keeps a pressure eviction waiting for an in-flight assistant-draft checkpoint', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
