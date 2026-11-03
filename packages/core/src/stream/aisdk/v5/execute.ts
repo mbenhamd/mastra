@@ -237,12 +237,18 @@ function isStrictOutputCarriable(schema: unknown): boolean {
     if (!STRICT_VALUE_KEYWORDS.has(key) && !STRICT_STRUCTURE_KEYWORDS.has(key)) return false;
   }
   if (!['type', 'enum', 'const', 'anyOf', 'oneOf'].some(key => key in node)) return false;
+  // Anthropic rejects complex values inside enums; `const` is held to the same rule.
+  if ('enum' in node && (!Array.isArray(node.enum) || !node.enum.every(isPrimitiveJsonValue))) return false;
+  if ('const' in node && !isPrimitiveJsonValue(node.const)) return false;
 
   const types = Array.isArray(node.type) ? node.type : [node.type];
   if ('properties' in node || 'required' in node || 'additionalProperties' in node || types.includes('object')) {
     if (!types.includes('object') || node.additionalProperties !== false) return false;
-    const properties = node.properties ?? {};
-    if (typeof properties !== 'object' || Array.isArray(properties)) return false;
+    // `@ai-sdk/anthropic` drops `additionalProperties` from an object without properties, so only an
+    // object that lists its properties stays closed on the wire.
+    const properties = node.properties;
+    if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return false;
+    if (Object.keys(properties).length === 0) return false;
     if (!Object.values(properties).every(isStrictOutputCarriable)) return false;
   }
   // An array admits any value unless one carriable `items` schema constrains it.
@@ -261,6 +267,10 @@ function isStrictOutputCarriable(schema: unknown): boolean {
     if (!Object.values(map).every(isStrictOutputCarriable)) return false;
   }
   return true;
+}
+
+function isPrimitiveJsonValue(value: unknown): boolean {
+  return value === null || ['string', 'number', 'boolean'].includes(typeof value);
 }
 
 /**
@@ -323,25 +333,28 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
-/** The tools whose input schemas count toward Anthropic's request-wide strict-schema limits. */
-type StrictToolSource = { tools?: unknown; activeTools?: readonly string[] };
+/** The step's tool selection, whose strict tools count toward Anthropic's request-wide limits. */
+type StrictToolSource = { tools?: unknown; activeTools?: readonly string[]; toolChoice?: unknown };
 
-function strictToolInputSchemas({ tools, activeTools }: StrictToolSource): unknown[] {
+/**
+ * The input schemas of the `strict: true` tools the candidate native request would send: the same
+ * {@link prepareToolsAndToolChoice} call that builds the request, with the step's `toolChoice` and
+ * `activeTools` and the native-format stripping (`toolChoice: 'none'` drops every tool).
+ */
+function strictToolInputSchemas({ tools, activeTools, toolChoice }: StrictToolSource): unknown[] {
   if (!tools || typeof tools !== 'object') return [];
-  const strictTools = Object.fromEntries(
-    Object.entries(tools as Record<string, unknown>).filter(
-      ([name, tool]) =>
-        (tool as { strict?: unknown } | undefined)?.strict === true && (!activeTools || activeTools.includes(name)),
-    ),
-  );
-  if (Object.keys(strictTools).length === 0) return [];
+  if (!Object.values(tools).some(tool => (tool as { strict?: unknown } | undefined)?.strict === true)) return [];
+  type PrepareArgs = Parameters<typeof prepareToolsAndToolChoice>[0];
   const prepared = prepareToolsAndToolChoice({
-    tools: strictTools as Parameters<typeof prepareToolsAndToolChoice>[0]['tools'],
-    toolChoice: undefined,
-    activeTools: undefined,
+    tools: tools as PrepareArgs['tools'],
+    toolChoice: toolChoice as PrepareArgs['toolChoice'],
+    activeTools: activeTools as PrepareArgs['activeTools'],
     targetVersion: 'v2',
+    stripToolsWhenNone: true,
   });
-  return (prepared.tools ?? []).map(tool => (tool as { inputSchema?: unknown }).inputSchema);
+  return (prepared.tools ?? [])
+    .filter(tool => (tool as { strict?: unknown }).strict === true)
+    .map(tool => (tool as { inputSchema?: unknown }).inputSchema);
 }
 
 /**
@@ -1006,7 +1019,11 @@ export function execute<OUTPUT = undefined>({
     toolChoice,
     activeTools,
     targetVersion,
-    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, model, providerOptions, { tools, activeTools }),
+    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, model, providerOptions, {
+      tools,
+      activeTools,
+      toolChoice,
+    }),
   });
 
   const responseFormat = structuredOutput?.schema
@@ -1024,7 +1041,11 @@ export function execute<OUTPUT = undefined>({
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
   const directInjection =
     structuredOutputMode === 'direct' && structuredOutput
-      ? resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, { tools, activeTools })
+      ? resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, {
+          tools,
+          activeTools,
+          toolChoice,
+        })
       : undefined;
   const resolvedJsonPromptInjection = directInjection
     ? directInjection.mode

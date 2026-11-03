@@ -74,8 +74,12 @@ export function composeStepInput(
 function withSourceDecision(current: any, next: any): any {
   if (!next?.schema) return next;
   const recorded = next.sourceDecision ?? current?.sourceDecision;
-  if (recorded?.fingerprint && recorded.fingerprint === structuredOutputSchemaFingerprint(next.schema)) {
-    return next.sourceDecision === recorded ? next : { ...next, sourceDecision: recorded };
+  const live = recordStructuredOutputSourceDecision(next.schema);
+  if (!live || !recorded?.fingerprint || recorded.fingerprint !== live.fingerprint) {
+    return { ...next, sourceDecision: live };
   }
-  return { ...next, sourceDecision: recordStructuredOutputSourceDecision(next.schema) };
+  // Equal content only ever downgrades: a reload of a fallback keeps it, and a live schema from a
+  // library whose openness Mastra cannot read (equal JSON, different vendor) still falls back.
+  const strictOutputCannotCarry = recorded.strictOutputCannotCarry || live.strictOutputCannotCarry;
+  return { ...next, sourceDecision: { ...recorded, strictOutputCannotCarry } };
 }

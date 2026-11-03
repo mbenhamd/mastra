@@ -200,15 +200,19 @@ const mutateSchema = (schema: unknown) => ({
 });
 const when = '2026-11-03T00:00:00.000Z';
 
-const lookupTool = (strict: boolean) => () => ({
-  lookup: createTool({
-    id: 'lookup',
-    description: 'Look something up',
-    inputSchema: z.object({ query: z.string().optional() }),
-    ...(strict ? { strict: true } : {}),
-    execute: async () => 'ok',
-  }),
-});
+const lookupTool =
+  (strict: boolean, optionalArguments = 1) =>
+  () => ({
+    lookup: createTool({
+      id: 'lookup',
+      description: 'Look something up',
+      inputSchema: z.object(
+        Object.fromEntries(Array.from({ length: optionalArguments }, (_, i) => [`query${i}`, z.string().optional()])),
+      ),
+      ...(strict ? { strict: true } : {}),
+      execute: async () => 'ok',
+    }),
+  });
 const thirteenFields = (prefix: string) =>
   z.object(Object.fromEntries(Array.from({ length: 13 }, (_, i) => [`${prefix}${i}`, z.string()])));
 
@@ -253,6 +257,9 @@ type Row = {
   providerOptions?: Record<string, any>;
   inputProcessors?: any[];
   tools?: () => Record<string, any>;
+  toolChoice?: 'none';
+  /** The request carries no tool definitions (they were stripped). */
+  noRequestTools?: boolean;
   /** A separate structuring model (`structuredOutput.model`). */
   structuringModel?: string;
   /** The record node inside the injected schema, when the row has a record. */
@@ -577,6 +584,58 @@ const rows: Row[] = [
     expected: 'anthropic-strict',
   },
   {
+    // Equal JSON from an unverified vendor: the processor's live schema still falls back.
+    name: 'input processor swaps a verified schema for an unverified vendor with equal JSON',
+    model: anthropic,
+    schema: z.object({ summary: z.string() }),
+    inputProcessors: [replaceSchema(unverifiedVendorSchema)],
+    populated: { summary: 's' },
+    expected: 'prompt',
+  },
+  {
+    // The adapter drops `additionalProperties` from an object without properties.
+    name: 'nullable object without properties',
+    model: anthropic,
+    schema: {
+      type: 'object',
+      properties: { meta: { type: ['object', 'null'], additionalProperties: false } },
+      required: ['meta'],
+      additionalProperties: false,
+    },
+    populated: { meta: null },
+    expected: 'prompt',
+  },
+  {
+    name: 'object-valued enum',
+    model: anthropic,
+    schema: {
+      type: 'object',
+      properties: { value: { enum: [{ kind: 'a' }, { kind: 'b' }] } },
+      required: ['value'],
+      additionalProperties: false,
+    },
+    populated: { value: { kind: 'a' } },
+    expected: 'prompt',
+  },
+  {
+    name: 'converse: primitive enum',
+    model: anthropic,
+    schema: z.object({ status: z.enum(['open', 'closed']), score: z.number() }),
+    populated: { status: 'open', score: 1 },
+    expected: 'anthropic-strict',
+  },
+  {
+    // Native output strips the tools under toolChoice 'none', so the strict tool is not budgeted.
+    name: "toolChoice 'none' with a strict tool of 25 optional arguments stays native and drops the tool",
+    model: anthropic,
+    schema: withinLimitsSchema,
+    tools: lookupTool(true, 25),
+    toolChoice: 'none',
+    populated: { summary: 's', tags: ['a'] },
+    expected: 'anthropic-strict',
+    noRequestTools: true,
+  },
+  {
     name: 'durable: unverified standard-schema vendor (closed-looking object)',
     model: anthropic,
     schema: unverifiedVendorSchema,
@@ -690,6 +749,7 @@ function rowOptions(row: Row) {
   return {
     structuredOutput: { schema: row.schema, ...(row.structuringModel ? { model: row.structuringModel } : {}) },
     providerOptions: row.providerOptions,
+    ...(row.toolChoice ? { toolChoice: row.toolChoice } : {}),
   } as any;
 }
 
@@ -801,6 +861,7 @@ describe('structured output through the real provider adapters (PF-7309)', () =>
         expect(injected).toBeUndefined();
         break;
     }
+    if (row.noRequestTools) expect(body.tools).toBeUndefined();
     if (persisted) {
       // The durable payload records the decision and persists a schema that keeps the caller's
       // openness, so a reloaded run (recovery, cold structuring) validates the populated reply.
