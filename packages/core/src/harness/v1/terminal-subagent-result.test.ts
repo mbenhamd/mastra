@@ -472,6 +472,46 @@ describe('Harness subagent outcome terminal contract', () => {
     expect(overflowed.toolTraceTruncated).toBe(true);
   });
 
+  it('keeps a near-limit budget-exhausted partial result inside the read and event budgets', () => {
+    const encoder = new TextEncoder();
+    const summary = summarizeHarnessSubagentResult(
+      {
+        finishReason: 'tool-calls',
+        // Truncated to the 48 KiB answer budget.
+        text: 's'.repeat(60 * 1024),
+        steps: Array.from({ length: 40 }, () => ({})),
+        totalUsage: { inputTokens: 900_000, outputTokens: 100_000, totalTokens: 1_000_000 },
+        harnessToolReceipts: Array.from({ length: 24 }, (_, index) => ({
+          toolCallId: `call-${index}`,
+          toolName: `${index}_${'t'.repeat(120)}`,
+          status: 'success',
+        })),
+      },
+      {
+        isError: true,
+        error: { code: 'harness.subagent_budget_exhausted', message: 'Reached its step budget.' },
+        budgetExhausted: { budget: 'steps', limit: 40, used: 40 },
+      },
+    );
+
+    expect(summary).toMatchObject({
+      status: 'error',
+      textTruncated: true,
+      budgetExhausted: { budget: 'steps', limit: 40, used: 40 },
+      error: { code: 'harness.subagent_budget_exhausted' },
+    });
+    expect(harnessSubagentResultSummarySchema.safeParse(summary).success).toBe(true);
+    // Room stays free for the settlement and plan-task view wrapping the summary.
+    expect(encoder.encode(JSON.stringify(summary)).byteLength).toBeLessThanOrEqual(60 * 1024);
+
+    const event = summarizeHarnessSubagentEventResult(summary);
+    expect(event.budgetExhausted).toEqual({ budget: 'steps', limit: 40, used: 40 });
+    expect(event.usage).toEqual({ inputTokens: 900_000, outputTokens: 100_000, totalTokens: 1_000_000 });
+    expect(event.toolTrace).toBeUndefined();
+    expect(encoder.encode(event.text).byteLength).toBeLessThanOrEqual(4 * 1024);
+    expect(encoder.encode(JSON.stringify(event)).byteLength).toBeLessThanOrEqual(8 * 1024);
+  });
+
   it('trims a large tool trace within its byte budget and says so', () => {
     const receipts = Array.from({ length: 40 }, (_, index) => ({
       toolCallId: `call-${index}`,

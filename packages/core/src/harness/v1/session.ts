@@ -261,6 +261,8 @@ import {
 } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
+import { createHarnessSubagentBudgetMeter, harnessSubagentBudgetExhaustedError } from './subagent-budget';
+import type { HarnessSubagentBudgetExhaustion, HarnessSubagentBudgetMeter } from './subagent-budget';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
@@ -517,7 +519,10 @@ type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepare
  * ignores continuation results for terminal tool delivery, and error, abort,
  * safety, and output-length finishes are left alone.
  */
-function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessExecutionHookErrorReporter): {
+function createHarnessEmptySynthesisOptions(
+  reportConfiguredHookError: HarnessExecutionHookErrorReporter,
+  subagentBudget?: HarnessSubagentBudgetMeter,
+): {
   [AGENT_EXECUTION_OPTION_COMPOSERS]: () => AgentExecutionOptionComposers;
 } {
   return {
@@ -555,6 +560,18 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
             }
 
             if (context.toolResults.length > 0) segmentHasToolResults = true;
+            // A per-type subagent budget is a framework stop at this step
+            // boundary. Configured observers still see the iteration, but
+            // neither they nor their feedback can reopen it (the loop logs and
+            // ignores a throwing hook, which would otherwise skip this stop).
+            if (subagentBudget?.observe(context) === true) {
+              try {
+                await configured?.(context);
+              } catch (error) {
+                reportConfiguredHookError('onIterationComplete', error);
+              }
+              return { continue: false };
+            }
             ordinaryBudgetExhausted ||= context.iteration >= HARNESS_SESSION_MAX_STEPS;
             const needsRecovery =
               context.isFinal &&
@@ -2177,7 +2194,26 @@ export class Session {
       } catch {
         // Diagnostics must never suppress the caller-visible recovery.
       }
-    });
+    }, this._subagentBudgetMeter());
+  }
+
+  /**
+   * One budget meter per child session, shared by every run segment (resume
+   * after HITL included) so a suspension cannot reset the count. Undefined for
+   * top-level sessions and for types without a budget.
+   */
+  private _subagentBudget?: HarnessSubagentBudgetMeter;
+  private _subagentBudgetMeter(): HarnessSubagentBudgetMeter | undefined {
+    const typeId = this._record.subagentTypeId;
+    if (this._subagentBudget === undefined && typeId !== undefined) {
+      this._subagentBudget = createHarnessSubagentBudgetMeter(this._harness._getSubagentType(typeId));
+    }
+    return this._subagentBudget;
+  }
+
+  /** @internal — the budget that stopped this child, if one did. */
+  _internalSubagentBudgetExhaustion(): HarnessSubagentBudgetExhaustion | undefined {
+    return this._subagentBudget?.exhausted;
   }
 
   // -------------------------------------------------------------------------
@@ -22529,6 +22565,7 @@ export class Session {
     let outcome: DelegatedSubagentOutcome = 'failed';
     let rawResult: unknown;
     let publicError: { code: string; message: string } | undefined;
+    let budgetExhausted: HarnessSubagentBudgetExhaustion | undefined;
     // §SA2 — fold the detached child's live progress into the parent's display
     // projection (the delegate path has no event bridge of its own, unlike the
     // spawn tool). Unsubscribed in the finally below.
@@ -22676,7 +22713,15 @@ export class Session {
         // `tool-calls`, so requiring `stop` would reject every real first-call
         // terminal delivery.
         outcome = child._record.cancelRequest === undefined && report !== undefined ? report.outcome : 'failed';
-        if (outcome !== 'completed') {
+        // The framework stopped the child at its per-type budget before it
+        // reported an outcome: a typed partial result, not a generic failure.
+        budgetExhausted =
+          child._record.cancelRequest === undefined && report === undefined
+            ? child._internalSubagentBudgetExhaustion()
+            : undefined;
+        if (budgetExhausted !== undefined) {
+          publicError = harnessSubagentBudgetExhaustedError(agentType, budgetExhausted);
+        } else if (outcome !== 'completed') {
           publicError = {
             code:
               child._record.cancelRequest !== undefined
@@ -22716,6 +22761,7 @@ export class Session {
       const summary = summarizeHarnessSubagentResult(rawResult, {
         isError: outcome !== 'completed',
         ...(publicError !== undefined ? { error: publicError } : {}),
+        ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
       });
       // Close the terminal child BEFORE clearing its durable plan link. If the
       // process dies after close, recovery can still settle from signal evidence;

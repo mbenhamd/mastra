@@ -1629,6 +1629,32 @@ export interface SubagentDefinition {
   allowInline?: boolean;
 
   /**
+   * Provider-step budget for one child of this type, for both inline
+   * `spawn_subagent` and durable `task_delegate` children. The Harness counts
+   * every completed provider step of the child and stops the child at the step
+   * boundary where it reaches this count while the model would continue. The
+   * parent then receives a `harness.subagent_budget_exhausted` error result
+   * whose bounded summary carries the partial text, tool trace, usage and
+   * `budgetExhausted`; it is never reported as success. A step that ends the
+   * child (for example its outcome report) is never counted as exhaustion.
+   * The Harness-wide per-turn ceiling of 1,000 steps still applies.
+   * Positive integer. Omitted ⇒ no per-type step budget.
+   *
+   * The meter lives with the child session in this process: a delegated
+   * child re-driven after a process restart starts a fresh budget.
+   */
+  maxSteps?: number;
+
+  /**
+   * Total-token budget for one child of this type, enforced like `maxSteps`
+   * from provider-reported usage (`totalTokens`, or input + output tokens when
+   * a provider omits the total). The check runs after each completed step, so
+   * the step that crosses the budget finishes, then the child stops. Positive
+   * integer. Omitted ⇒ no per-type token budget.
+   */
+  maxTotalTokens?: number;
+
+  /**
    * Extra tools layered onto this subagent type's surface, on top of its mode's
    * tools + the harness built-ins (subject to the same workspace-tool profile and
    * permission gate as any other tool). To strictly CONSTRAIN a subagent to a

@@ -183,6 +183,19 @@ export const harnessSubagentToolTraceSchema = z
 
 export type HarnessSubagentToolTrace = z.infer<typeof harnessSubagentToolTraceSchema>;
 
+/**
+ * The per-type budget that stopped a child before it reported an outcome
+ * (`SubagentDefinition.maxSteps` / `maxTotalTokens`). Present only on a
+ * `harness.subagent_budget_exhausted` error summary.
+ */
+export const harnessSubagentBudgetExhaustedSchema = z
+  .object({
+    budget: z.enum(['steps', 'tokens']),
+    limit: z.number().int().positive(),
+    used: z.number().finite().nonnegative(),
+  })
+  .strict();
+
 export const harnessSubagentResultSummarySchema = z
   .object({
     status: z.enum(['success', 'error']),
@@ -196,6 +209,7 @@ export const harnessSubagentResultSummarySchema = z
     toolTrace: harnessSubagentToolTraceSchema.optional(),
     toolTraceTruncated: z.boolean().optional(),
     usage: harnessSubagentUsageSchema.optional(),
+    budgetExhausted: harnessSubagentBudgetExhaustedSchema.optional(),
     artifacts: harnessSubagentTerminalArtifactsSchema.optional(),
     evidence: z.array(harnessSubagentOutcomeEvidenceSchema).max(MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS).optional(),
     evidenceTruncated: z.boolean().optional(),
@@ -504,6 +518,7 @@ export function summarizeHarnessSubagentResult(
   options: {
     isError?: boolean;
     error?: { code: string; message: string };
+    budgetExhausted?: z.infer<typeof harnessSubagentBudgetExhaustedSchema>;
   } = {},
 ): HarnessSubagentResultSummary {
   const record = isRecord(value) ? value : undefined;
@@ -551,6 +566,7 @@ export function summarizeHarnessSubagentResult(
     toolCallCount: arrayLength(record?.toolCalls),
     toolResultCount: arrayLength(record?.toolResults),
     ...(usage ? { usage } : {}),
+    ...(status === 'error' && options.budgetExhausted ? { budgetExhausted: { ...options.budgetExhausted } } : {}),
     ...(artifacts ? { artifacts } : {}),
     ...(report ? { evidence: report.evidence } : {}),
     ...(report?.issue ? { issue: report.issue } : {}),

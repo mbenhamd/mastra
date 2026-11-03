@@ -23,6 +23,8 @@ import { HarnessSubagentDepthExceededError, HarnessValidationError } from './err
 import { projectHarnessPublicError } from './events';
 import { projectInheritedRequestContextApp } from './request-context-input';
 import type { Session } from './session';
+import { harnessSubagentBudgetExhaustedError } from './subagent-budget';
+import type { HarnessSubagentBudgetExhaustion } from './subagent-budget';
 import { liveSubagentTracingContext } from './subagent-tracing';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
@@ -374,6 +376,7 @@ export function createSpawnSubagentTool(parent: Session) {
         let rawResult: unknown;
         let isError = false;
         let publicError: { code: string; message: string } | undefined;
+        let budgetExhausted: HarnessSubagentBudgetExhaustion | undefined;
         try {
           // Registering the active-map entry happens before this final fence.
           // If invalidation begins after the check, reset/Stop discovery sees
@@ -396,6 +399,7 @@ export function createSpawnSubagentTool(parent: Session) {
             (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
           );
           const report = verifyHarnessSubagentTerminalCompletion(rawResult);
+          const exhaustion = child._internalSubagentBudgetExhaustion();
           // §S3.3 — an inline spawn_subagent has NO independent driver to resume a
           // human-in-the-loop suspension, and the child is auto-closed below. A
           // default `message()` RESOLVES (not rejects) with finishReason
@@ -428,6 +432,12 @@ export function createSpawnSubagentTool(parent: Session) {
               code: 'harness.subagent_cancelled',
               message: `Subagent "${agentType}" was cancelled before it reported a terminal outcome`,
             };
+          } else if (report === undefined && exhaustion !== undefined) {
+            // The framework stopped the child at its per-type budget: a typed,
+            // partial result, never a silent success or a generic incomplete.
+            budgetExhausted = exhaustion;
+            isError = true;
+            publicError = harnessSubagentBudgetExhaustedError(agentType, budgetExhausted);
           } else if (report === undefined) {
             // Provider finish reasons describe the transport/model turn, not
             // whether the assigned task was achieved. A bare stop is no more
@@ -479,7 +489,11 @@ export function createSpawnSubagentTool(parent: Session) {
           }
         }
 
-        const result = summarizeHarnessSubagentResult(rawResult, { isError, error: publicError });
+        const result = summarizeHarnessSubagentResult(rawResult, {
+          isError,
+          error: publicError,
+          ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
+        });
         // A child can resolve normally with finishReason=error/aborted. Do not
         // mislabel that as a successful tool result merely because it did not
         // reject the in-process promise.
