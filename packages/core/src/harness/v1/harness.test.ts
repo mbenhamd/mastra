@@ -5265,6 +5265,110 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     await expect(b.shutdown()).resolves.toBeUndefined();
   });
 
+  const tick = (ms = 25) => new Promise(resolve => setTimeout(resolve, ms));
+  type RenewalProbe = { _renewLiveSessionLeases(): Promise<void> };
+
+  it('keeps a renewal-detected lease-loss eviction waiting for an independent in-flight draft save', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-renewal-draft' });
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // A's draft checkpoint is already awaiting storage...
+    let openSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (openSave = resolve));
+    let gateArmed = false;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (gateArmed && record.id === session.id) {
+        gateArmed = false;
+        await saveGate;
+      }
+      return saveSession(record, opts);
+    });
+    dirtyAssistantDraft(session);
+    gateArmed = true;
+    let draftSaveSettled = false;
+    void (session as unknown as { _startAssistantDraftFlush(): Promise<void> })
+      ._startAssistantDraftFlush()
+      .catch(() => undefined)
+      .finally(() => {
+        draftSaveSettled = true;
+      });
+
+    // ...when a background renewal, not that save, discovers the lease loss.
+    void (a as unknown as RenewalProbe)._renewLiveSessionLeases();
+    await vi.waitFor(() => expect(session.lifecycleState).toBe('evicted'));
+
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await tick();
+    expect(shutdownSettled).toBe(false);
+
+    openSave();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(draftSaveSettled).toBe(true);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('quiesces an in-flight lease renewal before the final shutdown phase', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-renewal-final-phase' });
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // A's renewal is already in flight in storage when shutdown starts.
+    let openRenewal!: () => void;
+    const renewalGate = new Promise<void>(resolve => (openRenewal = resolve));
+    const renewSubtree = storage.renewSessionLeaseSubtree.bind(storage);
+    vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementationOnce(async input => {
+      await renewalGate;
+      return renewSubtree(input);
+    });
+    // Every `session_evicted` ledger append for the session waits on a gate.
+    let openAppend!: () => void;
+    const appendGate = new Promise<void>(resolve => (openAppend = resolve));
+    const appendSessionEvent = storage.appendSessionEvent.bind(storage);
+    vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async record => {
+      if (record.sessionId === session.id && (record.event as { type?: string }).type === 'session_evicted') {
+        await appendGate;
+      }
+      return appendSessionEvent(record);
+    });
+    const evictionReasons: string[] = [];
+    a.subscribe(event => {
+      if (event.type === 'session_evicted' && event.sessionId === session.id) evictionReasons.push(event.reason);
+    });
+    const releaseSessionLease = vi.spyOn(storage, 'releaseSessionLease');
+
+    const renewal = (a as unknown as RenewalProbe)._renewLiveSessionLeases();
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await tick();
+    openRenewal();
+    await vi.waitFor(() => expect(evictionReasons).toContain('lease_lost'));
+    await tick();
+    expect(shutdownSettled).toBe(false);
+
+    openAppend();
+    await expect(shutdown).resolves.toBeUndefined();
+    await renewal;
+    expect(evictionReasons).toEqual(['lease_lost']);
+    expect(releaseSessionLease).not.toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: session.id, ownerId: a.ownerId }),
+    );
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
   it('keeps a pressure eviction waiting for an in-flight assistant-draft checkpoint', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });

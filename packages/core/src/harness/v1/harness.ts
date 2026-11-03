@@ -1057,6 +1057,8 @@ export class Harness {
   /** Per-id teardown barrier so resolution cannot rehydrate while an old live
    * handle is still flushing events/releasing its lease/workspace. */
   private readonly _sessionEvictionsInFlight = new Map<string, Promise<void>>();
+  /** PF-7538: background lease work shutdown quiesces before its final phase. */
+  private readonly _backgroundLeaseWorkInFlight = new Set<Promise<void>>();
   /** Short critical-section tail for maxLive reserve/evict decisions. */
   private _liveMaterializationReservationTail: Promise<void> = Promise.resolve();
   /**
@@ -4805,6 +4807,10 @@ export class Harness {
    */
   async _tickChannelInboxRecovery(): Promise<void> {
     if (this._shutdown || this._channelInboxRecoveryRunning) return;
+    return this._trackBackgroundLeaseWork(this._runChannelInboxRecoveryPass());
+  }
+
+  private async _runChannelInboxRecoveryPass(): Promise<void> {
     this._channelInboxRecoveryRunning = true;
     try {
       for (const binding of this._channelRegistry.list()) {
@@ -5078,7 +5084,25 @@ export class Harness {
     }
   }
 
-  private async _renewLiveSessionLeases(): Promise<void> {
+  private _renewLiveSessionLeases(): Promise<void> {
+    return this._trackBackgroundLeaseWork(this._renewLiveSessionLeasesOnce());
+  }
+
+  /**
+   * PF-7538: register a background pass that can fence sessions (lease-loss
+   * eviction) or write their storage, so shutdown can wait for it before its
+   * final phase. Returns the pass unchanged.
+   */
+  private _trackBackgroundLeaseWork(work: Promise<void>): Promise<void> {
+    this._backgroundLeaseWorkInFlight.add(work);
+    work.then(
+      () => this._backgroundLeaseWorkInFlight.delete(work),
+      () => this._backgroundLeaseWorkInFlight.delete(work),
+    );
+    return work;
+  }
+
+  private async _renewLiveSessionLeasesOnce(): Promise<void> {
     if (this._shutdown || this._liveSessions.size === 0) {
       this._stopLeaseRenewalLoopIfIdle();
       return;
@@ -6622,7 +6646,7 @@ export class Harness {
     }
     const drainTimeoutMs = opts?.drainTimeoutMs ?? this._closeTimeoutMs;
     const drainDeadlineAt = Date.now() + drainTimeoutMs;
-    let eventPersistenceError: { sessionId: string; error: unknown } | undefined;
+    let eventPersistenceError: { sessionId?: string; error: unknown } | undefined;
     // PF-7538: a session another owner adopted is fenced, not failed. Its save
     // (or an ancestor's) already evicted it as `lease_lost`: dropped from
     // `_liveSessions`, timers cleared, bridge torn down, queue no longer
@@ -6656,6 +6680,28 @@ export class Harness {
       } catch (err) {
         recordDrainFailure(session, err);
         continue;
+      }
+    }
+    // PF-7538: quiesce background lease work before the final phase. Its timers
+    // stopped when shutdown began, but a lease-renewal or channel-recovery pass
+    // already running can still discover lease loss and fence a session. Wait
+    // for those passes (and the evictions they await) here, bounded by the
+    // drain deadline, so no new lease-loss eviction starts after the eviction
+    // wait and the fenced filter below. The expiry sweep needs no wait here:
+    // shutdown already awaited its in-flight pass before draining, and it
+    // starts no new pass once `_shutdown` is set.
+    if (this._backgroundLeaseWorkInFlight.size > 0) {
+      const settled = await this._settleBeforeDeadline(
+        Promise.allSettled([...this._backgroundLeaseWorkInFlight]),
+        drainDeadlineAt,
+      );
+      if (!settled) {
+        eventPersistenceError ??= {
+          error: new HarnessValidationError(
+            'shutdown()',
+            'Background lease renewal did not settle before shutdown deadline',
+          ),
+        };
       }
     }
     // PF-7538: an eviction that started during the drain (a fenced save, or a

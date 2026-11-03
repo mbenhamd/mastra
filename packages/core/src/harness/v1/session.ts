@@ -1809,6 +1809,8 @@ export class Session {
   private _assistantDraftFlushInFlight: Promise<void> | undefined;
   /** PF-7538: set when the Harness fenced this session because another owner holds its lease. */
   private _evictedByLeaseLoss = false;
+  /** PF-7538: > 0 while a `_flushUpdate` link awaits an eviction it raised itself. */
+  private _flushLinkEvictionDepth = 0;
   /**
    * §SA3 — shared parent-local reservation count for inline `spawn_subagent`
    * and durable `task_delegate` work. It includes the create/link window so two
@@ -3244,12 +3246,13 @@ export class Session {
       }
       const inFlight = this._assistantDraftFlushInFlight;
       if (inFlight !== undefined) {
-        // PF-7538: a lease-lost eviction raised from inside this very
-        // checkpoint's save drains event persistence (and so this barrier)
-        // before the checkpoint can settle. Awaiting it there never resolves,
-        // and the checkpoint cannot commit without the lease anyway. Pressure
-        // and idle evictions still hold the lease, so they keep awaiting it.
-        if (this._state === 'evicted' && this._evictedByLeaseLoss) return;
+        // PF-7538: an eviction raised from inside a `_flushUpdate` link drains
+        // event persistence (and so this barrier) while that link is still
+        // running. The in-flight checkpoint is that link or queued behind it
+        // on `_flushChain`, so awaiting it there never resolves. Every other
+        // eviction (renewal-detected lease loss, pressure, idle) keeps
+        // awaiting the checkpoint; a fenced checkpoint settles on its own.
+        if (this._state === 'evicted' && this._flushLinkEvictionDepth > 0) return;
         await inFlight;
         continue;
       }
@@ -20933,6 +20936,20 @@ export class Session {
   }
 
   /**
+   * PF-7538: run an eviction raised from inside a `_flushUpdate` link, marking
+   * it reentrant so the assistant-draft barrier does not await the flush chain
+   * that this link is blocking.
+   */
+  private async _evictFromFlushLink(evict: () => Promise<unknown>): Promise<void> {
+    this._flushLinkEvictionDepth++;
+    try {
+      await evict();
+    } finally {
+      this._flushLinkEvictionDepth--;
+    }
+  }
+
+  /**
    * Apply an update to the in-memory record, CAS-write to storage, and
    * adopt the returned version. Single point of truth so every setter
    * stays consistent with the lease + version contract (§5.8).
@@ -20967,7 +20984,7 @@ export class Session {
           leaseExpiresAt !== undefined &&
           leaseExpiresAt <= Date.now()
         ) {
-          await this._harness._internalEvictLiveSessionLeaseLost(this);
+          await this._evictFromFlushLink(() => this._harness._internalEvictLiveSessionLeaseLost(this));
           throw new HarnessSessionLockedError(this.id, 'unknown', leaseExpiresAt);
         }
         if (opts?.ifVersion !== undefined && this._record.version !== opts.ifVersion) {
@@ -21147,7 +21164,7 @@ export class Session {
           // conflict). Fence the WHOLE live subtree rather than only this session
           // or retrying into a contested record.
           if (err instanceof HarnessStorageLeaseConflictError) {
-            await this._harness._internalEvictSubtreeLeaseLost(this);
+            await this._evictFromFlushLink(() => this._harness._internalEvictSubtreeLeaseLost(this));
             throw new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt);
           }
           if (!(err instanceof HarnessStorageVersionConflictError) || attempt >= maxRetries) {
@@ -21159,16 +21176,18 @@ export class Session {
           // ownership loss or subtree split. The helper renews root + active
           // descendants and fences the whole subtree (throwing locked/not-found)
           // if ownership can't be proven.
-          await this._harness._internalRenewProveSubtree(
-            this,
-            this._getEffectiveLeaseTtlMs(this._harness._internalLeaseTtlMs),
+          await this._evictFromFlushLink(() =>
+            this._harness._internalRenewProveSubtree(
+              this,
+              this._getEffectiveLeaseTtlMs(this._harness._internalLeaseTtlMs),
+            ),
           );
           const reloaded = await this._storage.loadSession({
             harnessName: this._record.harnessName,
             sessionId: this.id,
           });
           if (!reloaded) {
-            await this._harness._internalEvictLiveSessionLeaseLost(this);
+            await this._evictFromFlushLink(() => this._harness._internalEvictLiveSessionLeaseLost(this));
             throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
           }
           // Adopt the concurrent durable state under our proven lease, then loop
