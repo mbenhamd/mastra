@@ -11,6 +11,7 @@ import { isSupportedLanguageModel, supportedLanguageModelSpecifications } from '
 import { MastraError } from '../error';
 import { resolveModelConfig } from '../llm';
 import type { IMastraLogger } from '../logger';
+import { mergeStructuredOutputSourceDecision } from '../loop/shared/compose-step-input';
 import type { MastraMemory } from '../memory/memory';
 import { parseMemoryRequestContext } from '../memory/types';
 import {
@@ -2415,7 +2416,15 @@ export class ProcessorRunner {
         if (result.modelSettings !== undefined) workflowStepResult.modelSettings = result.modelSettings;
         if (result.structuredOutput !== undefined) workflowStepResult.structuredOutput = result.structuredOutput;
         if (result.retryCount !== undefined) workflowStepResult.retryCount = result.retryCount;
+        const structuredOutputBefore = stepInput.structuredOutput;
         Object.assign(stepInput, workflowStepResult);
+        // PF-7309: decide the structured-output schema after every processor, not only after the chain.
+        if (workflowStepResult.structuredOutput !== undefined) {
+          stepInput.structuredOutput = mergeStructuredOutputSourceDecision(
+            structuredOutputBefore,
+            stepInput.structuredOutput,
+          );
+        }
         await this.runWorkflowComputeStateSignals({
           workflow,
           messageList,
@@ -2602,7 +2611,15 @@ export class ProcessorRunner {
         if (systemMessages) {
           messageList.replaceAllSystemMessages(systemMessages);
         }
+        const structuredOutputBefore = stepInput.structuredOutput;
         Object.assign(stepInput, rest);
+        // PF-7309: decide the structured-output schema after every processor, not only after the chain.
+        if ('structuredOutput' in rest && rest.structuredOutput !== undefined) {
+          stepInput.structuredOutput = mergeStructuredOutputSourceDecision(
+            structuredOutputBefore,
+            stepInput.structuredOutput,
+          );
+        }
 
         await this.runComputeStateSignal({
           processor,

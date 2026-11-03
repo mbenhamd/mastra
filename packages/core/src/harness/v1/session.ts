@@ -9393,7 +9393,10 @@ export class Session {
         const result = await Promise.race([
           agent.generate(opts.content, {
             ...baseExecOptions,
-            structuredOutput: { schema: opts.output as never },
+            structuredOutput: {
+              schema: opts.output as never,
+              ...(opts.jsonPromptInjection !== undefined ? { jsonPromptInjection: opts.jsonPromptInjection } : {}),
+            },
           }),
           activeTurnWaiter.promise,
         ]);
