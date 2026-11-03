@@ -207,12 +207,16 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     const db = new InMemoryDB();
     const a = buildHarness(db, 'wake');
     const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    // The process dies after the fenced settlement write, before any delivery.
-    vi.spyOn(parentA as any, '_deliverDelegationSettlementNotice').mockResolvedValue(undefined);
+    // The process dies after the fenced settlement write, before the reminder
+    // row lands: every parent-thread write fails on instance A.
+    vi.spyOn(a.parentAgent, 'getMemory').mockResolvedValue({
+      saveMessages: () => Promise.reject(new Error('storage down')),
+    } as never);
     const { taskId, releaseChild } = await delegateFromParentTurn(parentA, a.parentAgent, a.childAgent);
 
     releaseChild();
     await poll(async () => (await planRow(parentA, taskId))?.status === 'completed');
+    await settle();
     expect(owedNotice(await planRow(parentA, taskId))).toMatchObject({ mode: 'wake' });
     expect(reminderCalls(a.parentAgent)).toHaveLength(0);
     crashParent(db, parentA);
@@ -230,6 +234,44 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     expect(reminderCalls(c.parentAgent)).toHaveLength(0);
     expect(reminderCalls(b.parentAgent)).toHaveLength(1);
     await c.harness.shutdown();
+  });
+
+  it('a settlement during a parent turn is delivered into that run, and the harness adds no wake', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    let releaseParent!: () => void;
+    parentAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseParent = r)), finishReason: 'stop' });
+    const turn = parent.message({ content: 'go' });
+    await poll(() => parentAgent.streamCalls.length === 1);
+    const deliverSpy = vi.spyOn(parentAgent, 'sendSignal');
+    const tools = createPlanTaskTools(parent);
+    const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'quick work' } as any, toolCtx)) as any;
+    await tools[TASK_DELEGATE_TOOL_ID]!.execute!({ taskId: task.taskId, agentType: 'worker' } as any, toolCtx);
+
+    // The child settles while the parent turn is still running.
+    await poll(async () => (await planRow(parent, task.taskId))?.status === 'completed');
+    await poll(() => deliverSpy.mock.calls.length > 0);
+    expect(deliverSpy.mock.calls[0]![1]).toMatchObject({ ifActive: { behavior: 'deliver' } });
+    await expect(deliverSpy.mock.results[0]!.value.accepted).resolves.toMatchObject({ action: 'deliver' });
+    // Owed until the run that received it ended and the row is durable.
+    expect(owedNotice(await planRow(parent, task.taskId))).toMatchObject({ mode: 'wake' });
+
+    releaseParent();
+    await turn;
+    await poll(async () => owedNotice(await planRow(parent, task.taskId)) === undefined);
+    await settle();
+    const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+    expect(messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'))).toHaveLength(1);
+    // MockAgent never drains signals mid-run, so the native runtime hands the
+    // delivered, unconsumed reminder to one follow-up run. The harness adds no
+    // wake of its own: the only later call carries the same reminder signal.
+    await poll(() => !parent.isRunning());
+    const followUps = parentAgent.streamCalls.slice(1);
+    expect(followUps).toHaveLength(1);
+    expect(followUps[0]!.messages).toMatchObject({ tagName: 'system-reminder' });
+    expect(String((followUps[0]!.messages as { contents?: unknown }).contents)).toContain(task.taskId);
+    await harness.shutdown();
   });
 
   it('a parent Stop that cancels the child sends no wake and owes no notice', async () => {

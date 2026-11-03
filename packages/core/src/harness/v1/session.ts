@@ -14401,6 +14401,15 @@ export class Session {
     content: string,
     opts?: SessionInjectSystemReminderOptions,
   ): Promise<SessionInjectSystemReminderResult> {
+    return this._injectSystemReminder(content, opts);
+  }
+
+  /** `signalId` lets a harness-owned reminder reuse the id of its already-persisted row. */
+  private async _injectSystemReminder(
+    content: string,
+    opts?: SessionInjectSystemReminderOptions,
+    signalId?: string,
+  ): Promise<SessionInjectSystemReminderResult> {
     this._assertLive('injectSystemReminder()');
     this._assertOpenForTurn('injectSystemReminder()');
     if (typeof content !== 'string' || content.length === 0) {
@@ -14478,6 +14487,7 @@ export class Session {
         dispatched = agent.sendSignal(
           {
             type: 'system-reminder',
+            ...(signalId !== undefined ? { id: signalId } : {}),
             contents: content,
             ...(opts?.attributes ? { attributes: opts.attributes } : {}),
             ...(opts?.metadata ? { metadata: opts.metadata } : {}),
@@ -14567,6 +14577,7 @@ export class Session {
     const dispatched = agent.sendSignal(
       {
         type: 'system-reminder',
+        ...(signalId !== undefined ? { id: signalId } : {}),
         contents: content,
         ...(opts?.attributes ? { attributes: opts.attributes } : {}),
         ...(opts?.metadata ? { metadata: opts.metadata } : {}),
@@ -22793,6 +22804,8 @@ export class Session {
     if (this._state === 'closed') return false;
     const noticeMode =
       notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest);
+    // A Stop that starts after this point must still suppress the wake.
+    const noticeAdmissionEpoch = this._activeWorkAdmissionEpoch;
     try {
       const durableResult =
         result ??
@@ -22820,7 +22833,9 @@ export class Session {
         }),
       );
       if (reconcileResult.reconciled) this._notifyDisplayRefresh();
-      if (reconcileResult.notice !== undefined) void this._deliverDelegationSettlementNotice(reconcileResult.notice);
+      if (reconcileResult.notice !== undefined) {
+        void this._deliverDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch);
+      }
       return reconcileResult.reconciled;
     } catch {
       // Keep a live recovery path even when no future parent message or hydrate
@@ -22854,20 +22869,27 @@ export class Session {
 
   /**
    * Deliver one owed settlement notice as a `system-reminder` signal, at most
-   * once per child session id + settlement digest.
+   * once per child session id + settlement digest (`key`, hashed into a
+   * deterministic signal id, so every redelivery rewrites one message row).
    *
-   * - `remind`, or `wake` while a parent turn is in progress: send with a
-   *   deterministic signal id. An active run receives it; an idle thread
-   *   persists it for the next turn without waking (the native `persist` idle
-   *   behaviour). The durable notice is acknowledged only after the write, and
-   *   a repeat after a crash rewrites the same message id instead of adding one.
-   * - `wake` on an idle parent: acknowledge first, then wake a follow-up turn,
-   *   so a crash or a concurrent deliverer can never start a second turn.
+   * 1. Send the reminder. An active parent run receives it mid-turn; the notice
+   *    stays owed until that run ended and the row is persisted (re-sent with
+   *    the same id, which upserts). An idle thread persists it without waking
+   *    (the native `persist` signal behaviour).
+   * 2. Acknowledge the owed notice with a version-fenced write. Only the winner
+   *    continues, so concurrent deliverers cannot both act on it.
+   * 3. With `wake`, a parent that was idle at delivery, is still idle, and saw no
+   *    Stop since settlement starts one follow-up turn with the same signal id.
+   *    A crash after step 2 loses at most that wake; the persisted reminder
+   *    still reaches the next turn.
    *
    * A cancelled parent drops the notice. A closed or torn-down parent leaves it
-   * owed; restart reconcile delivers it on the next live hydrate.
+   * owed for restart reconcile. A transient failure re-arms reconciliation.
    */
-  private async _deliverDelegationSettlementNotice(notice: PendingDelegationSettlementNotice): Promise<void> {
+  private async _deliverDelegationSettlementNotice(
+    notice: PendingDelegationSettlementNotice,
+    admissionEpoch: number,
+  ): Promise<void> {
     const key = `${notice.subagentSessionId}:${notice.digest}`;
     if (this._state !== 'live' || this.isClosing || this._delegationNoticesInFlight.has(key)) return;
     this._delegationNoticesInFlight.add(key);
@@ -22884,58 +22906,64 @@ export class Session {
         await acknowledge();
         return;
       }
+      const signalId = `harness-delegation-notice-${sha256CanonicalJson({ sessionId: this.id, key }).slice(0, 32)}`;
       const content = delegationSettlementNoticeText(notice);
       const attributes = { type: 'delegated-task-settled' };
       const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-      const persistOrDeliver = async () => {
-        const agent = this._harness.getAgentForMode(this._record.modeId);
-        const sent = agent.sendSignal(
+      const send = (activeBehavior: 'persist' | 'deliver', deliveredRunId?: string) => {
+        // The active turn may run a per-turn mode override on another agent.
+        const agent = this._harness.getAgentForMode(this._currentRunModeId ?? this._record.modeId);
+        return agent.sendSignal(
           {
             type: 'system-reminder',
-            id: `harness-delegation-notice-${sha256CanonicalJson({ sessionId: this.id, key }).slice(0, 32)}`,
+            id: signalId,
             contents: content,
             attributes,
-            metadata,
+            // The runtime replays a same-id, same-payload send from its admission
+            // cache; naming the run that already received it makes the durable
+            // re-send a distinct admission that rewrites the same row.
+            metadata: deliveredRunId === undefined ? metadata : { ...metadata, deliveredRunId },
           },
           {
             resourceId: this.resourceId,
             threadId: this.threadId,
+            ifActive: { behavior: activeBehavior },
             ifIdle: {
               behavior: 'persist',
               streamOptions: { memory: { thread: this.threadId, resource: this.resourceId } } as never,
             },
           },
         );
-        await sent.accepted;
-        await sent.persisted;
       };
-      // Only a fully idle parent wakes. A running turn, parked interaction, or
-      // queued turn will read the persisted reminder on its own run.
+      const first = send('deliver');
+      const accepted = await first.accepted;
+      if (accepted.action === 'persist') {
+        await first.persisted;
+      } else {
+        // Delivered into a run (or not admitted): the run's own message save is
+        // not an acknowledgement boundary. Persist the row once that run ended.
+        const deliveredRunId = accepted.action === 'deliver' ? accepted.runId : undefined;
+        if (deliveredRunId !== undefined) await this._awaitRunCompletion(deliveredRunId).catch(() => undefined);
+        const durable = send('persist', deliveredRunId ?? 'undelivered');
+        await durable.accepted;
+        await durable.persisted;
+      }
+      if (!(await acknowledge())) return;
       const wakeIdle =
         notice.mode === 'wake' &&
+        accepted.action === 'persist' &&
+        this._state === 'live' &&
+        !this.isClosing &&
+        this._record.cancelRequest === undefined &&
         !this.isRunning() &&
-        this._activeWorkInvalidationsInFlight === 0 &&
+        this._activeWorkAdmissionIsCurrent(admissionEpoch) &&
         this._record.pendingResume === undefined &&
         (this._record.pendingQueue ?? []).length === 0;
-      if (wakeIdle) {
-        // The fenced acknowledgement is the claim: only its winner wakes.
-        if (!(await acknowledge())) return;
-        try {
-          await this.injectSystemReminder(content, { attributes, metadata });
-          return;
-        } catch {
-          // A wake that cannot start (lost an idle race, session closing) still
-          // leaves the reminder for the parent's next turn when it stays open.
-        }
-        if (this._state !== 'live' || this._record.cancelRequest !== undefined) return;
-        await persistOrDeliver();
-        return;
-      }
-      await persistOrDeliver();
-      await acknowledge();
+      if (wakeIdle) await this._injectSystemReminder(content, { attributes, metadata }, signalId);
     } catch {
-      // Best-effort: an unacknowledged notice stays durable and the next
-      // reconcile pass redelivers it under the same dedupe key.
+      // An unacknowledged notice stays durable; re-arm reconciliation so a live
+      // idle parent is not stranded until its next hydrate.
+      this._scheduleDelegationReconcileRetry(1);
     } finally {
       this._delegationNoticesInFlight.delete(key);
     }
@@ -23143,7 +23171,7 @@ export class Session {
       return;
     }
 
-    for (const owedNotice of owedNotices) void this._deliverDelegationSettlementNotice(owedNotice);
+    for (const owedNotice of owedNotices) void this._deliverDelegationSettlementNotice(owedNotice, admissionEpoch);
 
     let needsRetry = false;
     for (const task of delegated) {
