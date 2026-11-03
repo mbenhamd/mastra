@@ -8,9 +8,9 @@
  *   - `wait`   — block up to a bounded timeout for one or more children to settle;
  *   - `send`   — interleave a bounded instruction into a running child's run;
  *   - `cancel` — cancel one owned child. The cancel commits on the child's own
- *     record, so it survives restarts; a child leased by another process is
- *     taken over only after that lease lapses (bounded wait), never written
- *     under the other owner's lease.
+ *     record, so it survives restarts. A child whose lease another process
+ *     still holds is reported unavailable; nothing is written under the other
+ *     owner's lease.
  *
  * Ownership is the durable `parentSessionId` edge: a session acts only on its
  * own children (descendants deeper than that are reached through their own
@@ -46,15 +46,8 @@ export const SUBAGENT_CONTROL_MAX_WAIT_TARGETS = 16;
 export const SUBAGENT_CONTROL_MAX_MESSAGE_CHARS = 4_000;
 export const SUBAGENT_CONTROL_STATUS_LIMIT = 25;
 const SUBAGENT_CONTROL_TASK_PREVIEW_CHARS = 500;
-/**
- * Longest `cancel` waits for another process's lease on the child to lapse
- * before it reports the child unavailable (above the default 30 s lease TTL).
- */
-export const SUBAGENT_CONTROL_MAX_LEASE_WAIT_MS = 35_000;
 const WAIT_POLL_INTERVAL_MS = 100;
 const WAIT_POLL_MAX_INTERVAL_MS = 1_000;
-const LEASE_EXPIRY_SLACK_MS = 25;
-const CANCEL_ATTEMPTS = 3;
 
 const subagentStatusEnum = z.enum(['running', 'awaiting_input', 'idle', 'completed', 'blocked', 'failed', 'closed']);
 type SubagentStatus = z.infer<typeof subagentStatusEnum>;
@@ -199,11 +192,6 @@ function preview(text: string): string {
     : `${text.slice(0, SUBAGENT_CONTROL_TASK_PREVIEW_CHARS - 1)}…`;
 }
 
-/** Read at call time (a property check would be narrowed across awaits). */
-function isAborted(signal: AbortSignal | undefined): boolean {
-  return signal?.aborted === true;
-}
-
 function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise(resolve => {
     if (signal?.aborted) return resolve();
@@ -344,6 +332,8 @@ export function createSubagentControlTool(parent: Session) {
     const views: SubagentView[] = [];
     const foreign: string[] = [];
     for (const id of ids) {
+      // ids are newest-first: one view past the limit is enough to flag truncation.
+      if (opts.limit !== undefined && views.length > opts.limit) break;
       const { record, live } = await loadChildRecord(id);
       if (isOwnChild(record)) {
         views.push(project(id, record, live, activeById.get(id), delegated.get(id)));
@@ -447,7 +437,7 @@ export function createSubagentControlTool(parent: Session) {
     return { action: 'send', subagentSessionId: childId, delivered: true, status: view.status };
   }
 
-  async function cancel(childId: string, signal: AbortSignal | undefined): Promise<SubagentControlOutput> {
+  async function cancel(childId: string): Promise<SubagentControlOutput> {
     const before = await resolveChildren([childId]);
     if (before.foreign.length > 0) return foreignError(before.foreign);
     const view = before.views[0]!;
@@ -462,43 +452,41 @@ export function createSubagentControlTool(parent: Session) {
     }
     // A repeated cancel still runs: it resumes an incomplete descendant cascade.
     const wasRequested = view.cancelRequested;
-    const leaseWaitDeadline = Date.now() + SUBAGENT_CONTROL_MAX_LEASE_WAIT_MS;
     let delivery = await parent._internalCancelOwnedSubagent(childId, SUBAGENT_CONTROL_CANCEL_REASON);
-    for (let attempt = 1; delivery === 'unavailable' && attempt < CANCEL_ATTEMPTS; attempt++) {
-      const stored = await storage.loadSession({ harnessName, sessionId: childId });
-      if (stored === null || stored.closedAt !== undefined) {
-        return {
-          action: 'cancel',
-          subagentSessionId: childId,
-          cancel: 'already_settled',
-          settled: true,
-          status: 'closed',
-        };
-      }
-      if (stored.cancelRequest !== undefined && !wasRequested) {
-        // The child committed the cancel; only its descendant discovery failed.
-        delivery = 'delivered_incomplete';
-        break;
-      }
-      // Another process's lease: never write under it (its holder would then
-      // fail its own CAS writes, including close). Wait, bounded, for it to
-      // lapse — a live holder renewing it is fenced by its own subtree renewal.
-      const heldUntil =
-        stored.ownerId !== undefined && stored.ownerId !== parent._internalOwnerId ? (stored.leaseExpiresAt ?? 0) : 0;
-      if (heldUntil > Date.now()) {
-        if (heldUntil + LEASE_EXPIRY_SLACK_MS > leaseWaitDeadline || isAborted(signal)) break;
-        await abortable(heldUntil - Date.now() + LEASE_EXPIRY_SLACK_MS, signal);
-        if (isAborted(signal)) break;
-      }
-      delivery = await parent._internalCancelOwnedSubagent(childId, SUBAGENT_CONTROL_CANCEL_REASON);
+    const stored = await storage.loadSession({ harnessName, sessionId: childId });
+    if (
+      stored === null ||
+      ((stored.closedAt !== undefined || stored.closingAt !== undefined) && !stored.cancelRequest)
+    ) {
+      // The cascade skips a gone/closed child without writing anything.
+      return {
+        action: 'cancel',
+        subagentSessionId: childId,
+        cancel: 'already_settled',
+        settled: true,
+        status: 'closed',
+      };
+    }
+    if (delivery === 'unavailable' && stored.cancelRequest !== undefined && !wasRequested) {
+      // The child committed the cancel; only its own descendant discovery failed.
+      delivery = 'delivered_incomplete';
     }
     if (delivery === 'unavailable') {
+      // Never write under another process's lease: its holder would then fail
+      // its own CAS writes, including close. A foreign owner below a live parent
+      // is a split subtree that the parent's lease renewal fences, so there is
+      // nothing useful to wait for here.
+      const heldElsewhere =
+        stored.ownerId !== undefined &&
+        stored.ownerId !== parent._internalOwnerId &&
+        (stored.leaseExpiresAt ?? 0) > Date.now();
       return {
         isError: true,
         errorName: 'HarnessSubagentCancelUnavailableError',
         code: 'harness.subagent_cancel_unavailable',
-        message:
-          'The subagent is held by another process and could not be cancelled yet; nothing was changed. Retry the cancel later.',
+        message: heldElsewhere
+          ? 'The subagent is held by another process and could not be cancelled from here; this call recorded no cancel. Retry later.'
+          : 'The subagent could not be reached to cancel it; this call recorded no cancel. Retry later.',
         subagentSessionId: childId,
       };
     }
@@ -542,7 +530,7 @@ export function createSubagentControlTool(parent: Session) {
           case 'send':
             return await send(input.subagentSessionId!, input.message!);
           case 'cancel':
-            return await cancel(input.subagentSessionId!, ctx?.abortSignal);
+            return await cancel(input.subagentSessionId!);
         }
       } catch (err) {
         const publicError = projectHarnessPublicError(err);

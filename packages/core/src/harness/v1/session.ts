@@ -14593,24 +14593,32 @@ export class Session {
       {
         resourceId: this.resourceId,
         threadId: this.threadId,
-        ifIdle: {
-          behavior: 'wake',
-          // The active-delivery race can still land idle; a wake here starts a
-          // REAL streamed turn, so it must carry the step ceiling and the
-          // silent-turn nudge like every other wake site — empty options ran
-          // the turn at the provider's 5-step default with no memory identity.
-          streamOptions: {
-            memory: { thread: this.threadId, resource: this.resourceId },
-            maxSteps: HARNESS_SESSION_MAX_STEPS,
-            ...this._createEmptySynthesisOptions(),
-            ...(this._currentTurnSourceWriteGuard
-              ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-              : {}),
-            ...this._subagentTracingOptions(),
-          } as never,
-        },
+        // PF-7473: an interleave-only reminder must never start a run, even
+        // when the active run ends between routing and dispatch.
+        ifIdle:
+          internal?.requireActiveRun === true
+            ? { behavior: 'discard' }
+            : {
+                behavior: 'wake',
+                // The active-delivery race can still land idle; a wake here starts a
+                // REAL streamed turn, so it must carry the step ceiling and the
+                // silent-turn nudge like every other wake site — empty options ran
+                // the turn at the provider's 5-step default with no memory identity.
+                streamOptions: {
+                  memory: { thread: this.threadId, resource: this.resourceId },
+                  maxSteps: HARNESS_SESSION_MAX_STEPS,
+                  ...this._createEmptySynthesisOptions(),
+                  ...(this._currentTurnSourceWriteGuard
+                    ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
+                    : {}),
+                  ...this._subagentTracingOptions(),
+                } as never,
+              },
       },
     );
+    if (internal?.requireActiveRun === true && (await dispatched.accepted).action !== 'deliver') {
+      throw new HarnessValidationError('injectSystemReminder()', 'the active run ended before the reminder landed');
+    }
 
     return {
       id: dispatched.signal.id,
