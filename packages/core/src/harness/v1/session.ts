@@ -20936,6 +20936,19 @@ export class Session {
   }
 
   /**
+   * @internal PF-7538 — settle every link already queued on `_flushChain`
+   * (failures are swallowed by the chain itself). Lets shutdown confirm that a
+   * fenced session has no storage write outstanding.
+   */
+  async _internalSettleFlushChain(): Promise<void> {
+    let chain: Promise<void>;
+    do {
+      chain = this._flushChain;
+      await chain;
+    } while (chain !== this._flushChain);
+  }
+
+  /**
    * PF-7538: run an eviction raised from inside a `_flushUpdate` link, marking
    * it reentrant so the assistant-draft barrier does not await the flush chain
    * that this link is blocking.
@@ -20978,6 +20991,12 @@ export class Session {
       // serialize on the flush chain, so a conflict here means another owner).
       const maxRetries = opts?.ifVersion !== undefined ? 0 : 1;
       for (let attempt = 0; ; attempt++) {
+        // PF-7538: a link queued on `_flushChain` before an eviction runs
+        // after it. Re-check here, as the pre-enqueue guard above does, so a
+        // fenced (or otherwise evicted) session never writes storage again.
+        if (this._state === 'evicted') {
+          throw new HarnessSessionClosedError(this.id);
+        }
         const leaseExpiresAt = this._record.leaseExpiresAt;
         if (
           (this._state === 'live' || this._state === 'closing') &&

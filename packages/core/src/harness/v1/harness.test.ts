@@ -5369,6 +5369,50 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     await expect(b.shutdown()).resolves.toBeUndefined();
   });
 
+  it('never lets a draft checkpoint queued behind the fenced save reach storage', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-queued-draft' });
+    dirtyTokenUsage(session);
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // Hold shutdown's token-usage save in storage, and record any draft save.
+    let openTokenSave!: () => void;
+    const tokenGate = new Promise<void>(resolve => (openTokenSave = resolve));
+    let tokenSaveEntered!: () => void;
+    const tokenSaveInStorage = new Promise<void>(resolve => (tokenSaveEntered = resolve));
+    let tokenSaveHeld = false;
+    let draftSavesReachingStorage = 0;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (record.id === session.id && record.assistantDrafts?.['run-fenced'] !== undefined) draftSavesReachingStorage++;
+      if (record.id === session.id && !tokenSaveHeld) {
+        tokenSaveHeld = true;
+        tokenSaveEntered();
+        await tokenGate;
+      }
+      return saveSession(record, opts);
+    });
+
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 });
+    await tokenSaveInStorage;
+    // The draft timer fires now and queues its checkpoint behind that save.
+    dirtyAssistantDraft(session);
+    void (session as unknown as { _startAssistantDraftFlush(): Promise<void> })
+      ._startAssistantDraftFlush()
+      .catch(() => undefined);
+
+    openTokenSave();
+    await expect(shutdown).resolves.toBeUndefined();
+    await tick();
+    expect(session.lifecycleState).toBe('evicted');
+    expect(draftSavesReachingStorage).toBe(0);
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
   it('keeps a pressure eviction waiting for an in-flight assistant-draft checkpoint', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
@@ -5376,10 +5420,13 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     let releaseSave!: () => void;
     const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
     let gateArmed = false;
+    let saveEntered!: () => void;
+    const checkpointInStorage = new Promise<void>(resolve => (saveEntered = resolve));
     const saveSession = storage.saveSession.bind(storage);
     vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
       if (gateArmed) {
         gateArmed = false;
+        saveEntered();
         await saveGate;
       }
       return saveSession(record, opts);
@@ -5391,6 +5438,8 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     };
     gateArmed = true;
     const checkpoint = internals._startAssistantDraftFlush();
+    // The eviction lands while the checkpoint's save is already in storage.
+    await checkpointInStorage;
     internals._markEvicted(session.getRecord(), 'pressure');
 
     let barrierSettled = false;

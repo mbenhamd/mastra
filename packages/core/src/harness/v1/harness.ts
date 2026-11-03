@@ -6724,6 +6724,27 @@ export class Harness {
         break;
       }
     }
+    // PF-7538: a fenced session's queued `_flushUpdate` links now settle
+    // without touching storage, but one already inside a storage call when the
+    // fence landed may still be pending. Settle every fenced session's flush
+    // chain (bounded by the drain deadline) so no write of theirs is
+    // outstanding once shutdown reports success.
+    const fencedSessions = sessions.filter(session => this._isFencedByLeaseLoss(session));
+    if (fencedSessions.length > 0) {
+      const settled = await this._settleBeforeDeadline(
+        Promise.all(fencedSessions.map(session => session._internalSettleFlushChain())),
+        drainDeadlineAt,
+      );
+      if (!settled) {
+        eventPersistenceError ??= {
+          sessionId: fencedSessions[0]!.id,
+          error: new HarnessValidationError(
+            'shutdown()',
+            'Fenced session writes did not settle before shutdown deadline',
+          ),
+        };
+      }
+    }
     // Sessions fenced during the drain (directly, or as members of a fenced
     // subtree) belong to their new owner: no restore, no shutdown eviction
     // marker, no lease release.
