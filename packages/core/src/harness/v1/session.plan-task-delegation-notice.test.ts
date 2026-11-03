@@ -391,6 +391,14 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await poll(async () => (await planRow(parentA, taskId))?.status === 'completed');
     await poll(() => (parentA as any)._delegationNoticesInFlight.size === 0);
 
+    // A failed suppression write fails the Stop instead of reporting success.
+    const mutate = parentA._internalStorage.mutatePlanTasksForSession.bind(parentA._internalStorage);
+    const failOnce = vi
+      .spyOn(parentA._internalStorage, 'mutatePlanTasksForSession')
+      .mockRejectedValueOnce(new Error('plan write failed'));
+    await expect(parentA.abortActiveWork({ reason: 'user_requested' })).rejects.toThrow('plan write failed');
+    expect(owedNotice(await planRow(parentA, taskId))).toMatchObject({ mode: 'wake' });
+    failOnce.mockImplementation(mutate);
     await parentA.abortActiveWork({ reason: 'user_requested' });
     expect(owedNotice(await planRow(parentA, taskId))).toMatchObject({ mode: 'remind' });
     crashParent(db, parentA);

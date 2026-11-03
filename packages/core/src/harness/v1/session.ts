@@ -6012,11 +6012,15 @@ export class Session {
         [...activeIds, ...delegatedIds],
         opts?.reason ?? 'parent_work_aborted',
       );
+      let wakeSuppressionError: unknown;
       if (this._harness._getSubagentDelegatedSettlementNotice() === 'wake') {
         // Owed settlement wakes must not outlive this Stop, even across a
-        // restart. Best-effort: the in-process epoch still guards this process.
+        // restart. A failed write is reported like an incomplete cascade; the
+        // in-process epoch still guards this process meanwhile.
         await this._serializePlanTaskWrite(() => planTaskDowngradeDelegationWakeNotices(this._planTaskPort())).catch(
-          () => undefined,
+          (error: unknown) => {
+            wakeSuppressionError = error;
+          },
         );
       }
       if (opts?.discardPendingInteraction !== false) {
@@ -6026,6 +6030,7 @@ export class Session {
       // invalidation epoch changed but became visible after the first abort.
       this._abortActiveTurn('agent_aborted');
       if (discoveryError !== undefined) throw discoveryError;
+      if (wakeSuppressionError !== undefined) throw wakeSuppressionError;
       if (cancellation.unavailable.length > 0) {
         throw new HarnessValidationError(
           'abortActiveWork()',
