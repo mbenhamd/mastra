@@ -4,11 +4,11 @@ import {
   applyCompatLayer,
   DeepSeekSchemaCompatLayer,
   GoogleSchemaCompatLayer,
+  JSON_SCHEMA_LIBRARY_OPTIONS,
   MetaSchemaCompatLayer,
   OpenAIReasoningSchemaCompatLayer,
   OpenAISchemaCompatLayer,
 } from '@mastra/schema-compat';
-import { JSON_SCHEMA_LIBRARY_OPTIONS } from '@mastra/schema-compat/schema';
 import type { z as z3 } from 'zod/v3';
 import type { z as z4 } from 'zod/v4';
 import type { PublicSchema, StandardSchemaWithJSON } from '../../schema';
