@@ -554,7 +554,12 @@ export class OpenAISchemaCompatLayer extends SchemaCompatLayer {
       if (!Array.isArray(value)) {
         return value;
       }
-      return value.map(item => this.#traverse(item, resolved.items as Record<string, unknown>));
+      // An array without an `items` schema (or with `items: true`) accepts any items.
+      const items = resolved.items;
+      if (!items || typeof items !== 'object') {
+        return value;
+      }
+      return value.map(item => this.#traverse(item, items as Record<string, unknown>));
     }
 
     const isObjectType =

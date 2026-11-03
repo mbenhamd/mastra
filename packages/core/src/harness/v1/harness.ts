@@ -1033,6 +1033,7 @@ export class Harness {
   private readonly _subagentMaxDepth: number;
   private readonly _subagentInheritedRequestContextAppKeys: readonly string[];
   private readonly _subagentInheritRootSessionGrants: boolean;
+  private readonly _subagentDelegatedSettlementNotice: 'remind' | 'wake' | 'none';
   /** §SA3 — per-parent concurrent `spawn_subagent` cap; `undefined` = no limit. */
   private readonly _subagentMaxConcurrent?: number;
   /** Durable wall-clock budget for one task_delegate attempt. */
@@ -1293,6 +1294,11 @@ export class Harness {
       throw new HarnessConfigError('subagents.inheritRootSessionGrants', 'must be a boolean');
     }
     this._subagentInheritRootSessionGrants = config.subagents?.inheritRootSessionGrants === true;
+    const onDelegatedSettlement = config.subagents?.onDelegatedSettlement ?? 'none';
+    if (onDelegatedSettlement !== 'none' && onDelegatedSettlement !== 'remind' && onDelegatedSettlement !== 'wake') {
+      throw new HarnessConfigError('subagents.onDelegatedSettlement', "must be 'remind', 'wake', or 'none'");
+    }
+    this._subagentDelegatedSettlementNotice = onDelegatedSettlement;
     this._subagentDelegationTimeoutMs =
       config.subagents?.delegationTimeoutMs ?? DEFAULT_PLAN_TASK_DELEGATION_TIMEOUT_MS;
     if (
@@ -2076,6 +2082,11 @@ export class Harness {
   /** @internal — absolute task_delegate deadlines derive from this durable attempt budget. */
   _getSubagentDelegationTimeoutMs(): number {
     return this._subagentDelegationTimeoutMs;
+  }
+
+  /** @internal — how a parent session is told that a detached delegation settled. */
+  _getSubagentDelegatedSettlementNotice(): 'remind' | 'wake' | 'none' {
+    return this._subagentDelegatedSettlementNotice;
   }
 
   /** @internal — Session reads the resolved mode for per-turn overlays. */
