@@ -11,7 +11,7 @@ import {
 import type { z as z3 } from 'zod/v3';
 import type { z as z4 } from 'zod/v4';
 import type { PublicSchema, StandardSchemaWithJSON } from '../../schema';
-import { isStandardSchemaWithJSON, standardSchemaToJSONSchema } from '../../schema';
+import { isStandardSchemaWithJSON, standardSchemaToJSONSchema, toStandardSchema } from '../../schema';
 
 export type PartialSchemaOutput<OUTPUT = undefined> = OUTPUT extends undefined ? undefined : Partial<OUTPUT>;
 
@@ -130,6 +130,24 @@ export function getTransformedSchema<OUTPUT = undefined>(
       }) as JSONSchema7)
     : asJsonSchema(schema);
 
+  return wrapForOutputFormat(jsonSchema);
+}
+
+/**
+ * The response schema as the caller wrote it: the schema's own JSON Schema, read without the
+ * library override or a provider compat layer (both close objects, e.g. the override sets
+ * `additionalProperties: false` on any object with `properties`), with the same output-format
+ * wrapping as {@link getTransformedSchema}. A plain JSON Schema or AI SDK schema comes back as the
+ * caller supplied it; a Zod schema comes from its own converter.
+ */
+export function getSourceResponseSchema(schema?: PublicSchema): JSONSchema7 | undefined {
+  if (!schema) return undefined;
+  // toStandardSchema returns an already-normalized schema as-is, so this reads the caller's wrapper.
+  const jsonSchema = toStandardSchema(schema)['~standard'].jsonSchema.input({ target: 'draft-07' }) as JSONSchema7;
+  return wrapForOutputFormat(JSON.parse(JSON.stringify(jsonSchema)) as JSONSchema7)?.jsonSchema;
+}
+
+function wrapForOutputFormat(jsonSchema: JSONSchema7 | undefined) {
   if (!jsonSchema) {
     return undefined;
   }

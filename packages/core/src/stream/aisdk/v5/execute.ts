@@ -24,8 +24,9 @@ import type { LoopOptions } from '../../../loop/types';
 import type { ModelInferenceFinishPayload, PreparedModelRequestMetrics } from '../../../observability';
 import { createExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import type { ExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
+import type { PublicSchema } from '../../../schema';
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
-import { getResponseFormat } from '../../base/schema';
+import { getResponseFormat, getSourceResponseSchema } from '../../base/schema';
 import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
 import { attachModelStreamTransport, readModelStreamTransport } from '../../types';
 import { prepareToolsAndToolChoice, preparedToolKey } from './compat';
@@ -193,11 +194,14 @@ export function countStructuredOutputParameters(schema: unknown): { optional: nu
 const isAnthropicProvider = (provider: string) => /^anthropic(\.|$)/.test(provider);
 
 /**
- * Whether Anthropic's strict native output format cannot carry this JSON schema: it either has a
- * free-form object (the provider rewrites it to `additionalProperties: false`, so the model can only
- * return `{}`) or exceeds {@link ANTHROPIC_STRUCTURED_OUTPUT_LIMITS} (the request is rejected).
+ * The single PF-7309 decision: whether Anthropic's strict native output format cannot carry the
+ * caller's response schema. It is made on the source schema ({@link getSourceResponseSchema}), never
+ * on a normalized or compat-converted one, because those converters close objects. The schema needs
+ * the prompt when it has a free-form object, explicit or implicitly open (`@ai-sdk/anthropic` rewrites
+ * every object to `additionalProperties: false`, so the model could only return `{}`), or exceeds
+ * {@link ANTHROPIC_STRUCTURED_OUTPUT_LIMITS} (the request would be rejected).
  */
-export function exceedsAnthropicStructuredOutput(schema: unknown): boolean {
+export function anthropicStrictOutputCannotCarry(schema: unknown): boolean {
   if (hasAnthropicFreeFormObject(schema)) return true;
   const { optional, union } = countStructuredOutputParameters(schema);
   return (
@@ -267,13 +271,7 @@ export function sendsNativeResponseFormat(
   providerOptions?: SharedProviderOptions,
 ): boolean {
   if (!structuredOutput?.schema || structuredOutput.model) return false;
-  return !resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, () =>
-    jsonSchemaOf(
-      getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0], {
-        model: { provider: model.provider, modelId: model.modelId, supportsStructuredOutputs: true },
-      }),
-    ),
-  ).mode;
+  return !resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions).mode;
 }
 
 function jsonSchemaOf(responseFormat: ReturnType<typeof getResponseFormat> | undefined): unknown {
@@ -298,25 +296,22 @@ function choosesAnthropicStructuredOutputMode(providerOptions: SharedProviderOpt
  * Resolves how a direct (no structuring model) structured-output step carries its schema: through
  * the prompt (`'system'` / `'inline'`) or as a native response format (`mode: undefined`).
  *
- * Anthropic's native output format is strict, so a schema it cannot carry falls back to inline prompt
- * injection, the same mode `'auto'` picks for models without native support. Free-form objects are
- * looked for in the schema before the provider compat layer rewrites it (that layer merges a root
- * union of objects into one closed object, which drops a `z.record()` branch) as well as in the wire
- * schema; the limits are counted on the wire schema, which is what Anthropic would receive.
- * Mastra validates the generated text against the schema either way.
+ * Anthropic's native output format is strict, so a schema it cannot carry
+ * ({@link anthropicStrictOutputCannotCarry}, decided on the source schema) falls back to inline
+ * prompt injection, the same mode `'auto'` picks for models without native support. Mastra validates
+ * the generated text against the schema either way.
  *
- * On Anthropic, an explicit `structuredOutputMode` of `'outputFormat'` or `'jsonTool'` keeps the
- * native format, and it also wins over `jsonPromptInjection: 'auto'` (which otherwise resolves to
- * inline injection for models without registered native support). Whenever Anthropic gets the schema
- * through `'auto'` or the fallback, the prompt carries the schema from before the compat layer, so
- * records stay open. Explicit `true` / `'system'` / `'inline'` still inject the wire schema as
- * before, and `jsonPromptInjection: false` keeps the native format.
+ * Precedence on Anthropic: `jsonPromptInjection: false` keeps the native format; an explicit
+ * `structuredOutputMode` of `'outputFormat'` or `'jsonTool'` keeps it too, and also wins over
+ * `jsonPromptInjection: 'auto'` (which otherwise resolves to inline injection for models without
+ * registered native support). Whenever Anthropic gets the schema through `'auto'` or the fallback,
+ * the prompt carries the source schema, so records stay open. Explicit `true` / `'system'` /
+ * `'inline'` still inject the wire schema as before.
  */
 function resolveDirectStructuredOutputInjection(
   structuredOutput: { schema?: unknown; jsonPromptInjection?: JsonPromptInjection },
   model: { provider: string; modelId: string },
   providerOptions: SharedProviderOptions | undefined,
-  getWireSchema: () => unknown,
 ): { mode: 'system' | 'inline' | undefined; schema?: unknown } {
   const { jsonPromptInjection } = structuredOutput;
   if (jsonPromptInjection === false) return { mode: undefined };
@@ -324,8 +319,7 @@ function resolveDirectStructuredOutputInjection(
   const providerChoosesMode = anthropic && choosesAnthropicStructuredOutputMode(providerOptions);
   if (jsonPromptInjection === 'auto' && providerChoosesMode) return { mode: undefined };
 
-  const sourceSchema = () =>
-    jsonSchemaOf(getResponseFormat(structuredOutput.schema as Parameters<typeof getResponseFormat>[0]));
+  const sourceSchema = () => getSourceResponseSchema(structuredOutput.schema as PublicSchema);
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
   const resolved = resolveJsonPromptInjection(
     jsonPromptInjection,
@@ -337,9 +331,7 @@ function resolveDirectStructuredOutputInjection(
   }
   if (!anthropic || providerChoosesMode) return { mode: undefined };
   const schema = sourceSchema();
-  return hasAnthropicFreeFormObject(schema) || exceedsAnthropicStructuredOutput(getWireSchema())
-    ? { mode: 'inline', schema }
-    : { mode: undefined };
+  return anthropicStrictOutputCannotCarry(schema) ? { mode: 'inline', schema } : { mode: undefined };
 }
 
 type InjectJsonInstructionArgs = Parameters<typeof injectJsonInstructionIntoMessagesV3>[0];
@@ -834,9 +826,7 @@ export function execute<OUTPUT = undefined>({
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
   const directInjection =
     structuredOutputMode === 'direct' && structuredOutput
-      ? resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, () =>
-          jsonSchemaOf(responseFormat),
-        )
+      ? resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions)
       : undefined;
   const resolvedJsonPromptInjection = directInjection
     ? directInjection.mode

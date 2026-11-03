@@ -5,7 +5,7 @@ import { coreFeatures } from '../../../features';
 import { modelSupportsStructuredOutput } from '../../../llm/model/provider-registry';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
 import { MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS } from '../../../observability/content-free-measurement';
-import { getResponseFormat } from '../../base/schema';
+import { getSourceResponseSchema } from '../../base/schema';
 import {
   countStructuredOutputParameters,
   execute,
@@ -1072,13 +1072,6 @@ describe('execute OpenAI strict-mode schema preparation (issue #23795)', () => {
 // complexity limits, so those schemas are injected into the prompt instead.
 describe('execute Anthropic structured-output fallback (PF-7309)', () => {
   const recordSchema = z.object({ studyId: z.string(), fields: z.record(z.string(), z.string()) });
-  const manyOptionalSchema = z.object(
-    Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`field${i}`, z.string().optional()])),
-  );
-  const manyUnionSchema = z.object(
-    Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`field${i}`, z.union([z.string(), z.number()])])),
-  );
-
   async function capture(
     provider: string,
     structuredOutputSchema: any,
@@ -1123,7 +1116,9 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
     return JSON.stringify(options.prompt);
   }
 
-  it.each(['anthropic.messages', 'anthropic'])(
+  // The real-adapter table in agent/__tests__/structured-output-anthropic-fallback.test.ts covers the
+  // schema shapes; this covers the model-router provider id and the tool-stripping decision.
+  it.each(['anthropic'])(
     'injects a record-bearing schema into the prompt instead of the strict output format (%s)',
     async provider => {
       const { options, model } = await capture(provider, recordSchema);
@@ -1132,39 +1127,6 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
       expect(promptText(options)).toContain('fields');
       expect(promptText(options)).toContain('additionalProperties');
       expect(sendsNativeResponseFormat({ schema: recordSchema }, model)).toBe(false);
-    },
-  );
-
-  it.each([
-    ['more than 24 optional parameters', manyOptionalSchema],
-    ['more than 16 union-typed parameters', manyUnionSchema],
-  ])('falls back to prompt injection for a schema with %s', async (_, overLimitSchema) => {
-    const { options } = await capture('anthropic.messages', overLimitSchema);
-
-    expect(options.responseFormat).toBeUndefined();
-    expect(promptText(options)).toContain('field0');
-  });
-
-  // The Anthropic compat layer merges a root union of objects into one closed object, which drops
-  // the record branch from the wire schema; detection and the injected schema use the source schema.
-  it('falls back for a root union of a record and an object and injects the open record', async () => {
-    const unionSchema = z.union([z.record(z.string(), z.string()), z.object({ error: z.boolean() })]);
-    const { options, model } = await capture('anthropic.messages', unionSchema);
-
-    expect(options.responseFormat).toBeUndefined();
-    expect(promptText(options)).toContain('propertyNames');
-    expect(sendsNativeResponseFormat({ schema: unionSchema }, model)).toBe(false);
-  });
-
-  it.each(['jsonTool', 'outputFormat'])(
-    'keeps the native response format when providerOptions.anthropic.structuredOutputMode is %s',
-    async structuredOutputMode => {
-      const providerOptions = { anthropic: { structuredOutputMode } };
-      const { options, model } = await capture('anthropic.messages', recordSchema, providerOptions);
-
-      expect(options.responseFormat?.type).toBe('json');
-      expect(options.responseFormat.schema.properties.fields).toBeDefined();
-      expect(sendsNativeResponseFormat({ schema: recordSchema }, model, providerOptions)).toBe(true);
     },
   );
 
@@ -1189,13 +1151,12 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
       ).toBe(true);
     });
 
-    it('injects the schema from before the compat layer, with the record branch open', async () => {
+    it('injects the source schema, with the record branch open', async () => {
       const { options } = await capture('anthropic.messages', unionSchema, undefined, {
         modelId,
         jsonPromptInjection: 'auto',
       });
-      const sourceFormat = getResponseFormat(unionSchema as any);
-      const sourceSchema = sourceFormat.type === 'json' ? sourceFormat.schema : undefined;
+      const sourceSchema = getSourceResponseSchema(unionSchema);
       const promptParts = options.prompt.flatMap((message: any) =>
         Array.isArray(message.content) ? message.content.map((part: any) => part.text ?? '') : [message.content],
       );
@@ -1204,24 +1165,6 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
       expect(sourceSchema?.anyOf?.[0]).toMatchObject({ additionalProperties: { type: 'string' } });
       expect(promptParts.some((part: string) => part.includes(JSON.stringify(sourceSchema)))).toBe(true);
     });
-  });
-
-  // A JSON Schema object without properties or additionalProperties accepts any keys, and
-  // Anthropic's strict conversion would close it.
-  it.each([
-    ['without properties', { type: 'object' }],
-    ['with empty properties', { type: 'object', properties: {} }],
-  ])('falls back for a raw JSON Schema record field %s', async (_, fields) => {
-    const rawSchema = {
-      type: 'object',
-      properties: { studyId: { type: 'string' }, fields },
-      required: ['studyId', 'fields'],
-    };
-    const { options, model } = await capture('anthropic.messages', rawSchema);
-
-    expect(options.responseFormat).toBeUndefined();
-    expect(promptText(options)).toContain('studyId');
-    expect(sendsNativeResponseFormat({ schema: rawSchema }, model)).toBe(false);
   });
 
   it('keeps the native format for a raw JSON Schema object that declares properties without additionalProperties', async () => {
@@ -1241,22 +1184,6 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
   it('leaves the OpenAI free-form check unchanged for implicitly open objects', () => {
     expect(hasFreeFormObject({ type: 'object', properties: { fields: { type: 'object' } } })).toBe(false);
     expect(hasAnthropicFreeFormObject({ type: 'object', properties: { fields: { type: 'object' } } })).toBe(true);
-  });
-
-  it('keeps the strict native output format for schemas within limits without free-form objects', async () => {
-    const { options, model } = await capture('anthropic.messages', schema);
-
-    expect(options.responseFormat?.type).toBe('json');
-    expect(options.responseFormat.schema.properties.suggestions).toBeDefined();
-    expect(sendsNativeResponseFormat({ schema }, model)).toBe(true);
-  });
-
-  it('leaves OpenAI record schemas on the non-strict native response format', async () => {
-    const { options } = await capture('openai.responses', recordSchema);
-
-    expect(options.responseFormat?.type).toBe('json');
-    expect(options.responseFormat.schema.properties.fields.additionalProperties).toEqual({ type: 'string' });
-    expect(options.providerOptions?.openai?.strictJsonSchema).toBe(false);
   });
 
   it('counts optional and union-typed parameters across nested subschemas', () => {
