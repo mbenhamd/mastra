@@ -1083,6 +1083,8 @@ export class Harness {
    * have not settled, labelled `method(sessionId)` for the shutdown timeout.
    */
   private readonly _storageCallsInFlight = new Map<Promise<unknown>, string>();
+  /** PF-7538: the last shutdown released its leases but timed out waiting on storage calls. */
+  private _shutdownFinalBarrierFailed = false;
   private readonly _trackedStorageByRaw = new WeakMap<HarnessStorage, HarnessStorage>();
   private readonly _rawStorageByTracked = new WeakMap<HarnessStorage, HarnessStorage>();
   /** PF-7538: background lease work shutdown quiesces before its final phase. */
@@ -6621,7 +6623,19 @@ export class Harness {
    * `session()` rejects. Idempotent.
    */
   async shutdown(opts?: ShutdownOptions): Promise<void> {
-    if (this._shutdown) return;
+    if (this._shutdown) {
+      // PF-7538: a shutdown whose final storage barrier timed out already
+      // released its leases; a retry re-runs only that barrier (bounded) and
+      // resolves once nothing is pending, instead of reporting success early.
+      if (this._shutdownFinalBarrierFailed) {
+        const pendingStorage = await this._settleStorageCallsBeforeDeadline(
+          Date.now() + (opts?.drainTimeoutMs ?? this._closeTimeoutMs),
+        );
+        if (pendingStorage !== undefined) throw pendingStorage;
+        this._shutdownFinalBarrierFailed = false;
+      }
+      return;
+    }
     this._shutdown = true;
     // PF-7538: every session live when shutdown begins is held to the final
     // storage-work barrier below, even if it is fenced (and leaves
@@ -6708,7 +6722,11 @@ export class Harness {
       }
       if (this._isFencedByLeaseLoss(session)) continue;
       try {
-        await session._flushEventPersistence();
+        // PF-7538: bounded by the drain deadline like the steps above.
+        if (!(await this._settleBeforeDeadline(session._flushEventPersistence(), drainDeadlineAt))) {
+          recordDrainFailure(session, this._shutdownTimeoutError('Session event persistence'));
+          continue;
+        }
       } catch (err) {
         recordDrainFailure(session, err);
         continue;
@@ -6729,10 +6747,7 @@ export class Harness {
       );
       if (!settled) {
         eventPersistenceError ??= {
-          error: new HarnessValidationError(
-            'shutdown()',
-            'Background lease renewal did not settle before shutdown deadline',
-          ),
+          error: this._shutdownTimeoutError('Background lease renewal'),
         };
       }
     }
@@ -6751,7 +6766,7 @@ export class Harness {
       if (!settled) {
         eventPersistenceError ??= {
           sessionId: pendingSessionId!,
-          error: new HarnessValidationError('shutdown()', 'Session eviction did not settle before shutdown deadline'),
+          error: this._shutdownTimeoutError('Session eviction'),
         };
         break;
       }
@@ -6770,10 +6785,7 @@ export class Harness {
       );
       if (!settled) {
         eventPersistenceError = {
-          error: new HarnessValidationError(
-            'shutdown()',
-            'Session storage work did not settle before shutdown deadline',
-          ),
+          error: this._shutdownTimeoutError('Session storage work'),
         };
       }
     }
@@ -6821,7 +6833,14 @@ export class Harness {
         this._shutdownEvictedSessionIds.add(session.id);
       }
       try {
-        await session._flushEventPersistence();
+        // PF-7538: bounded by the drain deadline; a timeout restores and throws.
+        if (!(await this._settleBeforeDeadline(session._flushEventPersistence(), drainDeadlineAt))) {
+          eventPersistenceError ??= {
+            sessionId: session.id,
+            error: this._shutdownTimeoutError('Terminal event persistence'),
+          };
+          break;
+        }
       } catch (err) {
         eventPersistenceError ??= { sessionId: session.id, error: err };
         continue;
@@ -6859,15 +6878,22 @@ export class Harness {
       });
     }
 
+    let finalFailure: HarnessValidationError | undefined;
     for (const session of sessions) {
-      try {
-        await storage.releaseSessionLease({
-          harnessName: session.getRecord().harnessName,
-          sessionId: session.id,
-          ownerId: this.ownerId,
-        });
-      } catch {
-        // Best-effort: leases TTL out anyway.
+      if (finalFailure === undefined) {
+        // Best-effort (leases TTL out anyway), but bounded by the drain
+        // deadline (PF-7538): a hung release fails shutdown, named.
+        const released = await this._settleBeforeDeadline(
+          storage
+            .releaseSessionLease({
+              harnessName: session.getRecord().harnessName,
+              sessionId: session.id,
+              ownerId: this.ownerId,
+            })
+            .catch(() => undefined),
+          drainDeadlineAt,
+        );
+        if (!released) finalFailure = this._shutdownTimeoutError('Session lease release');
       }
 
       const bridge = this._sessionEventBridges.get(session.id);
@@ -6887,16 +6913,22 @@ export class Harness {
       // Best-effort: workspace teardown errors are swallowed (provider-owned;
       // §2.7/§10.2 define no public workspace event).
     }
-    // PF-7538: shutdown's own lease releases above were each awaited, so the
-    // set now holds only calls something else started during that last step.
-    // Never report success with one pending. Leases are already released, so
-    // a timeout here fails shutdown (naming the calls) without restoring.
-    const pendingStorage = await this._settleStorageCallsBeforeDeadline(drainDeadlineAt);
     this._untrackBoundStorage();
-    if (pendingStorage !== undefined) throw pendingStorage;
     // §10.2: harness-scoped process-shutdown marker. No sessionId → delivered to
     // `harness.subscribe(...)` only, never per-session SSE replay. Sessions persist.
+    // Emitted before the final storage barrier (PF-7538) so storage work a
+    // listener starts is waited too.
     this._emitter.emit({ type: 'harness_shutdown' });
+    // PF-7538: shutdown's own lease releases above were each awaited, so the
+    // set now holds only calls something else started (including listeners
+    // above). Never report success with one pending. Leases are already
+    // released, so a timeout fails shutdown (naming the calls) without
+    // restoring; a retry re-runs this barrier.
+    finalFailure ??= await this._settleStorageCallsBeforeDeadline(drainDeadlineAt);
+    if (finalFailure !== undefined) {
+      this._shutdownFinalBarrierFailed = true;
+      throw finalFailure;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -7608,14 +7640,22 @@ export class Harness {
         Promise.allSettled([...this._storageCallsInFlight.keys()]),
         deadlineAt,
       );
-      if (!settled) {
-        return new HarnessValidationError(
-          'shutdown()',
-          `Storage calls did not settle before shutdown deadline: ${[...this._storageCallsInFlight.values()].join(', ')}`,
-        );
-      }
+      if (!settled) return this._shutdownTimeoutError('Storage calls');
     }
     return undefined;
+  }
+
+  /**
+   * PF-7538: a shutdown deadline error naming what did not settle and every
+   * storage call still pending on this harness's tracked handle.
+   */
+  private _shutdownTimeoutError(what: string): HarnessValidationError {
+    const pending = [...this._storageCallsInFlight.values()];
+    return new HarnessValidationError(
+      'shutdown()',
+      `${what} did not settle before shutdown deadline` +
+        (pending.length > 0 ? `; pending storage calls: ${pending.join(', ')}` : ''),
+    );
   }
 
   private _requireRawStorage(callsite: string): HarnessStorage {

@@ -5842,6 +5842,103 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
 
+  it('a retry after the final storage barrier timed out waits for the pending call before resolving', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-final-barrier-retry' });
+    const stuck = storageGate();
+    let armed = false;
+    const loadSession = storage.loadSession.bind(storage);
+    vi.spyOn(storage, 'loadSession').mockImplementation(async input => {
+      if (armed && input.sessionId === session.id) {
+        stuck.enter();
+        await stuck.opened;
+      }
+      return loadSession(input);
+    });
+    // A public read starts while shutdown releases its lease.
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      armed = true;
+      void harness.loadSession({ sessionId: session.id }).catch(() => undefined);
+      return releaseSessionLease(input);
+    });
+
+    await expect(harness.shutdown({ drainTimeoutMs: 300 })).rejects.toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`loadSession(${session.id})`),
+    });
+
+    let retrySettled = false;
+    const retry = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      retrySettled = true;
+    });
+    await tick();
+    expect(retrySettled).toBe(false);
+    stuck.open();
+    await expect(retry).resolves.toBeUndefined();
+  });
+
+  it('fails shutdown within the drain deadline when a lease release never settles, naming it', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-hung-release' });
+    const hung = storageGate();
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      hung.enter();
+      await hung.opened;
+      return releaseSessionLease(input);
+    });
+
+    const outcome = await Promise.race([
+      harness.shutdown({ drainTimeoutMs: 300 }).then(
+        () => 'resolved',
+        (err: unknown) => err,
+      ),
+      tick(2_000).then(() => 'still pending after 2s'),
+    ]);
+    expect(outcome).toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`releaseSessionLease(${session.id})`),
+    });
+
+    hung.open();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('waits for storage work a harness_shutdown listener starts', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    await harness.session({ resourceId: 'u', threadId: 't-listener-read' });
+    const read = storageGate();
+    let readSettled = false;
+    const listSessions = storage.listSessions.bind(storage);
+    vi.spyOn(storage, 'listSessions').mockImplementation(async input => {
+      read.enter();
+      await read.opened;
+      try {
+        return await listSessions(input);
+      } finally {
+        readSettled = true;
+      }
+    });
+    harness.subscribe(event => {
+      if (event.type === 'harness_shutdown') void harness.listSessions({ resourceId: 'u' }).catch(() => undefined);
+    });
+
+    let shutdownSettled = false;
+    const shutdown = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await read.waitEntered();
+    await tick();
+    expect(shutdownSettled).toBe(false);
+    read.open();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(readSettled).toBe(true);
+  });
+
   it('lets a draft checkpoint queued behind a slow save persist under a pressure eviction', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
