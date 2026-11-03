@@ -1,5 +1,6 @@
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { RunProcessInputStepResult } from '../../processors';
+import { recordStructuredOutputSourceDecision } from '../../stream/aisdk/v5/execute';
 
 /**
  * Shape of the per-step LLM input fields that an input-processor (or
@@ -56,5 +57,21 @@ export function composeStepInput(
     // processor returned undefined for any of them.
     messageId: processInputStepResult.messageId ?? current.messageId,
     model: processInputStepResult.model ?? current.model,
+    ...('structuredOutput' in processInputStepResult
+      ? { structuredOutput: withSourceDecision(current.structuredOutput, processInputStepResult.structuredOutput) }
+      : {}),
   };
+}
+
+/**
+ * PF-7309: the structured-output source decision follows the schema the step actually uses. A
+ * processor that keeps the schema keeps its recorded decision; one that supplies a different schema
+ * gets a decision recorded from that schema (a carried-over decision for the old schema is replaced).
+ */
+function withSourceDecision(current: any, next: any): any {
+  if (!next?.schema) return next;
+  if (next.schema === current?.schema) {
+    return next.sourceDecision || !current?.sourceDecision ? next : { ...next, sourceDecision: current.sourceDecision };
+  }
+  return { ...next, sourceDecision: recordStructuredOutputSourceDecision(next.schema) };
 }

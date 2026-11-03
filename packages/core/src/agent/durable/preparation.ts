@@ -32,6 +32,7 @@ import type { VersionOverrides } from '../../request-context';
 import { getRequestContextInputValues } from '../../request-context/input-source';
 import { toStandardSchema } from '../../schema';
 import { assertObservationalMemorySourceWriteGuardSupported } from '../../storage';
+import { recordStructuredOutputSourceDecision } from '../../stream/aisdk/v5/execute';
 import { asJsonSchema } from '../../stream/base/schema';
 import { normalizeToolPayloadTransformPolicy } from '../../tools/payload-transform';
 import type { CoreTool, ToolHooks, ToolPayloadTransformPolicy } from '../../tools/types';
@@ -1204,6 +1205,8 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
           // Always convert to plain JSON Schema: this crosses step boundaries as JSON, and a
           // live Zod/standard-schema instance does not survive that round trip.
           schema: asJsonSchema(structuredOutputSchema),
+          // PF-7309: recorded from the caller's schema before serialization closes its objects.
+          sourceDecision: so.sourceDecision ?? recordStructuredOutputSourceDecision(so.schema),
         };
       }
     }

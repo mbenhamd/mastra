@@ -8,6 +8,7 @@ import {
   OpenAIReasoningSchemaCompatLayer,
   OpenAISchemaCompatLayer,
 } from '@mastra/schema-compat';
+import { JSON_SCHEMA_LIBRARY_OPTIONS } from '@mastra/schema-compat/schema';
 import type { z as z3 } from 'zod/v3';
 import type { z as z4 } from 'zod/v4';
 import type { PublicSchema, StandardSchemaWithJSON } from '../../schema';
@@ -133,18 +134,36 @@ export function getTransformedSchema<OUTPUT = undefined>(
   return wrapForOutputFormat(jsonSchema);
 }
 
+type JsonSchemaOverrideContext = Parameters<typeof JSON_SCHEMA_LIBRARY_OPTIONS.override>[0];
+
 /**
- * The response schema as the caller wrote it: the schema's own JSON Schema, read without the
- * library override or a provider compat layer (both close objects, e.g. the override sets
- * `additionalProperties: false` on any object with `properties`), with the same output-format
- * wrapping as {@link getTransformedSchema}. A plain JSON Schema or AI SDK schema comes back as the
- * caller supplied it; a Zod schema comes from its own converter.
+ * Mastra's JSON Schema override (dates, `catchall(z.unknown())`) without its object-closing step:
+ * an `additionalProperties: false` the override added to an object that did not declare
+ * `additionalProperties` is taken back, so objects stay as open as the caller wrote them. Every other
+ * Mastra conversion, including `unrepresentable: 'any'`, still applies.
+ */
+function sourceJsonSchemaOverride(ctx: JsonSchemaOverrideContext): undefined {
+  const declaredAdditionalProperties = 'additionalProperties' in ctx.jsonSchema;
+  JSON_SCHEMA_LIBRARY_OPTIONS.override(ctx);
+  if (!declaredAdditionalProperties && ctx.jsonSchema.additionalProperties === false) {
+    delete ctx.jsonSchema.additionalProperties;
+  }
+  return undefined;
+}
+
+/**
+ * The response schema as the caller wrote it: Mastra's own JSON Schema conversion minus the step
+ * that closes objects (and without a provider compat layer), with the same output-format wrapping
+ * as {@link getTransformedSchema}. A plain JSON Schema or AI SDK schema keeps the caller's
+ * openness; a Zod schema comes from Mastra's Zod conversion.
  */
 export function getSourceResponseSchema(schema?: PublicSchema): JSONSchema7 | undefined {
   if (!schema) return undefined;
-  // toStandardSchema returns an already-normalized schema as-is, so this reads the caller's wrapper.
-  const jsonSchema = toStandardSchema(schema)['~standard'].jsonSchema.input({ target: 'draft-07' }) as JSONSchema7;
-  return wrapForOutputFormat(JSON.parse(JSON.stringify(jsonSchema)) as JSONSchema7)?.jsonSchema;
+  const jsonSchema = standardSchemaToJSONSchema(toStandardSchema(schema), {
+    io: 'input',
+    override: sourceJsonSchemaOverride,
+  });
+  return wrapForOutputFormat(jsonSchema)?.jsonSchema;
 }
 
 function wrapForOutputFormat(jsonSchema: JSONSchema7 | undefined) {

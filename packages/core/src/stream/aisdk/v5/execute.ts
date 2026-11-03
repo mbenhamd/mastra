@@ -7,7 +7,7 @@ import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import { APICallError } from '@internal/ai-sdk-v5';
 import type { IdGenerator, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import { prepareJsonSchemaForOpenAIStrictMode } from '@mastra/schema-compat';
-import type { StructuredOutputOptions } from '../../../agent/types';
+import type { StructuredOutputOptions, StructuredOutputSourceDecision } from '../../../agent/types';
 import { validateModelTimeoutSettings } from '../../../llm/model/model-settings';
 import type { ModelMethodType } from '../../../llm/model/model.loop.types';
 import { modelSupportsStructuredOutput, modelSupportsTemperature } from '../../../llm/model/provider-registry';
@@ -210,6 +210,17 @@ export function anthropicStrictOutputCannotCarry(schema: unknown): boolean {
   );
 }
 
+/**
+ * Records the {@link StructuredOutputSourceDecision} for a caller's schema. Called once where the
+ * schema enters Mastra: the Agent API boundary, durable preparation (before the schema is
+ * serialized), and `composeStepInput` when an input processor replaces the schema.
+ */
+export function recordStructuredOutputSourceDecision(schema: unknown): StructuredOutputSourceDecision | undefined {
+  if (!schema) return undefined;
+  const source = getSourceResponseSchema(schema as PublicSchema);
+  return { schema: source, strictOutputCannotCarry: anthropicStrictOutputCannotCarry(source) };
+}
+
 function readStrictJsonSchemaOption(options: unknown): boolean | undefined {
   if (!options || typeof options !== 'object') return undefined;
   const strictJsonSchema = (options as { strictJsonSchema?: unknown }).strictJsonSchema;
@@ -266,7 +277,14 @@ export function resolveJsonPromptInjection(
  * injected into the prompt instead, tools are kept so providers retain tool history (#25908).
  */
 export function sendsNativeResponseFormat(
-  structuredOutput: { schema?: unknown; model?: unknown; jsonPromptInjection?: JsonPromptInjection } | undefined,
+  structuredOutput:
+    | {
+        schema?: unknown;
+        model?: unknown;
+        jsonPromptInjection?: JsonPromptInjection;
+        sourceDecision?: StructuredOutputSourceDecision;
+      }
+    | undefined,
   model: { provider: string; modelId: string },
   providerOptions?: SharedProviderOptions,
 ): boolean {
@@ -296,10 +314,12 @@ function choosesAnthropicStructuredOutputMode(providerOptions: SharedProviderOpt
  * Resolves how a direct (no structuring model) structured-output step carries its schema: through
  * the prompt (`'system'` / `'inline'`) or as a native response format (`mode: undefined`).
  *
- * Anthropic's native output format is strict, so a schema it cannot carry
- * ({@link anthropicStrictOutputCannotCarry}, decided on the source schema) falls back to inline
+ * Anthropic's native output format is strict, so a schema it cannot carry falls back to inline
  * prompt injection, the same mode `'auto'` picks for models without native support. Mastra validates
- * the generated text against the schema either way.
+ * the generated text against the schema either way. The decision is the recorded
+ * `structuredOutput.sourceDecision` ({@link recordStructuredOutputSourceDecision}); only a caller
+ * that reaches `execute` without one (a direct `execute` call) has it recorded here, from the schema
+ * it passed.
  *
  * Precedence on Anthropic: `jsonPromptInjection: false` keeps the native format; an explicit
  * `structuredOutputMode` of `'outputFormat'` or `'jsonTool'` keeps it too, and also wins over
@@ -309,7 +329,11 @@ function choosesAnthropicStructuredOutputMode(providerOptions: SharedProviderOpt
  * `'inline'` still inject the wire schema as before.
  */
 function resolveDirectStructuredOutputInjection(
-  structuredOutput: { schema?: unknown; jsonPromptInjection?: JsonPromptInjection },
+  structuredOutput: {
+    schema?: unknown;
+    jsonPromptInjection?: JsonPromptInjection;
+    sourceDecision?: StructuredOutputSourceDecision;
+  },
   model: { provider: string; modelId: string },
   providerOptions: SharedProviderOptions | undefined,
 ): { mode: 'system' | 'inline' | undefined; schema?: unknown } {
@@ -319,7 +343,8 @@ function resolveDirectStructuredOutputInjection(
   const providerChoosesMode = anthropic && choosesAnthropicStructuredOutputMode(providerOptions);
   if (jsonPromptInjection === 'auto' && providerChoosesMode) return { mode: undefined };
 
-  const sourceSchema = () => getSourceResponseSchema(structuredOutput.schema as PublicSchema);
+  const decision = () =>
+    structuredOutput.sourceDecision ?? recordStructuredOutputSourceDecision(structuredOutput.schema);
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
   const resolved = resolveJsonPromptInjection(
     jsonPromptInjection,
@@ -327,11 +352,11 @@ function resolveDirectStructuredOutputInjection(
   );
   if (resolved) {
     const mode = resolved === true ? 'system' : resolved;
-    return anthropic && jsonPromptInjection === 'auto' ? { mode, schema: sourceSchema() } : { mode };
+    return anthropic && jsonPromptInjection === 'auto' ? { mode, schema: decision()?.schema } : { mode };
   }
   if (!anthropic || providerChoosesMode) return { mode: undefined };
-  const schema = sourceSchema();
-  return anthropicStrictOutputCannotCarry(schema) ? { mode: 'inline', schema } : { mode: undefined };
+  const recorded = decision();
+  return recorded?.strictOutputCannotCarry ? { mode: 'inline', schema: recorded.schema } : { mode: undefined };
 }
 
 type InjectJsonInstructionArgs = Parameters<typeof injectJsonInstructionIntoMessagesV3>[0];

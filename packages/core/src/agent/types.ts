@@ -531,9 +531,27 @@ export type StructuredOutputOptionsBase<OUTPUT = {}> = {
   providerOptions?: ProviderOptions;
 } & FallbackFields<OUTPUT>;
 
+/**
+ * @internal Recorded once from the caller's schema where it enters Mastra (the Agent API
+ * boundary, durable preparation, or an input processor that replaces the schema), before any
+ * normalization closes its objects. JSON-safe, so durable runs persist it and a resumed step reads
+ * it instead of re-deriving it from the serialized schema.
+ */
+export interface StructuredOutputSourceDecision {
+  /** The caller's response schema as JSON Schema, wrapped for the output format; what prompt injection sends. */
+  schema?: JSONSchema7;
+  /**
+   * Whether Anthropic's strict output format cannot carry it: a free-form object (explicit or
+   * open by JSON Schema default) or more than 24 optional / 16 union-typed parameters.
+   */
+  strictOutputCannotCarry: boolean;
+}
+
 export type StructuredOutputOptions<OUTPUT = {}> = StructuredOutputOptionsBase<OUTPUT> & {
   /** Zod schema to validate the output against */
   schema: StandardSchemaWithJSON<OUTPUT>;
+  /** @internal See {@link StructuredOutputSourceDecision}. */
+  sourceDecision?: StructuredOutputSourceDecision;
 };
 
 export type PublicStructuredOutputOptions<OUTPUT = {}> = StructuredOutputOptionsBase<OUTPUT> & {
