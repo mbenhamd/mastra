@@ -1831,6 +1831,28 @@ export function readPendingDelegationSettlementNotice(
 }
 
 /**
+ * Durably downgrade every owed `wake` notice to `remind` (same digest, so the
+ * dedupe key is unchanged). A parent Stop calls this so a notice that survives
+ * a restart cannot wake the parent after that Stop. Returns the count changed.
+ */
+export async function planTaskDowngradeDelegationWakeNotices(port: PlanTaskSessionPort): Promise<number> {
+  const ops: PlanTaskMutationOp[] = [];
+  for (const task of await loadAllTasks(port)) {
+    if (readPendingDelegationSettlementNotice(task)?.mode !== 'wake') continue;
+    const envelope = JSON.parse(JSON.stringify(task.metadata)) as Record<string, Record<string, Record<string, any>>>;
+    envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement!.notice.mode = 'remind';
+    ops.push({
+      kind: 'update',
+      taskId: task.taskId,
+      ifVersion: task.version,
+      patch: { metadata: envelope as JsonValue },
+    });
+  }
+  if (ops.length > 0) await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
+  return ops.length;
+}
+
+/**
  * Remove an owed parent notice with a version-fenced write. Returns true only
  * for the caller whose write removed it, so concurrent deliverers of the same
  * notice cannot both act on it. A notice already removed, replaced by a newer

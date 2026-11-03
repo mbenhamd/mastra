@@ -379,6 +379,32 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await harness.shutdown();
   });
 
+  it('a Stop before a restart durably suppresses the owed wake', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db, 'wake');
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    vi.spyOn(a.parentAgent, 'getMemory').mockResolvedValue({
+      saveMessages: () => Promise.reject(new Error('storage down')),
+    } as never);
+    const { taskId, releaseChild } = await delegateFromParentTurn(parentA, a.parentAgent, a.childAgent);
+    releaseChild();
+    await poll(async () => (await planRow(parentA, taskId))?.status === 'completed');
+    await poll(() => (parentA as any)._delegationNoticesInFlight.size === 0);
+
+    await parentA.abortActiveWork({ reason: 'user_requested' });
+    expect(owedNotice(await planRow(parentA, taskId))).toMatchObject({ mode: 'remind' });
+    crashParent(db, parentA);
+    await a.harness.shutdown().catch(() => {});
+
+    const b = buildHarness(db, 'wake');
+    const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+    await (parentB as any)._reconcileDelegationsOnHydrate(0);
+    await deliveryFinished(parentB, taskId);
+    expect(reminderCalls(b.parentAgent)).toHaveLength(0);
+    expect(b.parentAgent.streamCalls).toHaveLength(0);
+    await b.harness.shutdown();
+  });
+
   it('a Stop after the reminder was persisted suppresses the pending wake', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

@@ -247,6 +247,7 @@ import {
   planTaskComplete,
   planTaskDecompose,
   planTaskDelegate,
+  planTaskDowngradeDelegationWakeNotices,
   planTaskReconcileDelegation,
   planTaskReparent,
   planTaskReset,
@@ -6011,6 +6012,13 @@ export class Session {
         [...activeIds, ...delegatedIds],
         opts?.reason ?? 'parent_work_aborted',
       );
+      if (this._harness._getSubagentDelegatedSettlementNotice() === 'wake') {
+        // Owed settlement wakes must not outlive this Stop, even across a
+        // restart. Best-effort: the in-process epoch still guards this process.
+        await this._serializePlanTaskWrite(() => planTaskDowngradeDelegationWakeNotices(this._planTaskPort())).catch(
+          () => undefined,
+        );
+      }
       if (opts?.discardPendingInteraction !== false) {
         await this._discardPendingInteractionForAbort(opts?.reason ?? 'parent_work_aborted');
       }
@@ -22959,6 +22967,9 @@ export class Session {
         modeId: this._currentRunModeId ?? this._record.modeId,
         modelId: this._record.modelId,
         abortSignal: new AbortController().signal,
+        ...(this._currentTurnRequestContext !== undefined
+          ? { persistedRequestContext: this._currentTurnRequestContext }
+          : {}),
       });
       const memory = await agent.getMemory({ requestContext });
       if (memory !== undefined && memory !== null) {
