@@ -26,7 +26,7 @@ import { createExactJsonMeasurementSnapshot } from '../../../observability/conte
 import type { ExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import type { PublicSchema } from '../../../schema';
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
-import { getResponseFormat, getSourceResponseSchema } from '../../base/schema';
+import { getResponseFormat, getSemanticResponseSchema } from '../../base/schema';
 import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
 import { attachModelStreamTransport, readModelStreamTransport } from '../../types';
 import { prepareToolsAndToolChoice, preparedToolKey } from './compat';
@@ -92,36 +92,10 @@ export function hasFreeFormObject(schema: unknown): boolean {
   return someSchemaNode(schema, declaresFreeFormKeys);
 }
 
-/**
- * Whether Anthropic's strict output format would close an object that accepts arbitrary keys. On
- * top of {@link hasFreeFormObject}, this counts objects that are open by JSON Schema default: an
- * object with no (or empty) `properties` and no `additionalProperties` / `patternProperties`, such
- * as a raw `{ type: 'object' }` record field. An object that declares properties and omits
- * `additionalProperties` is not counted: strict mode dropping its extra keys is the intended
- * behaviour, and it keeps every declared field. OpenAI's non-strict decision keeps using
- * {@link hasFreeFormObject}.
- */
-export function hasAnthropicFreeFormObject(schema: unknown): boolean {
-  return someSchemaNode(schema, node => declaresFreeFormKeys(node) || isImplicitlyOpenObject(node));
-}
-
 function declaresFreeFormKeys(node: Record<string, unknown>): boolean {
   const additional = node.additionalProperties;
   if (additional === true || (additional && typeof additional === 'object')) return true;
   return Boolean(node.patternProperties || node.propertyNames);
-}
-
-function isImplicitlyOpenObject(node: Record<string, unknown>): boolean {
-  const types = Array.isArray(node.type) ? node.type : [node.type];
-  if (!types.includes('object') || 'additionalProperties' in node || node.patternProperties) return false;
-  const properties = node.properties;
-  return (
-    properties === undefined ||
-    (Boolean(properties) &&
-      typeof properties === 'object' &&
-      !Array.isArray(properties) &&
-      Object.keys(properties as object).length === 0)
-  );
 }
 
 /** Whether `predicate` holds for the schema or any of its subschemas. */
@@ -193,32 +167,130 @@ export function countStructuredOutputParameters(schema: unknown): { optional: nu
 
 const isAnthropicProvider = (provider: string) => /^anthropic(\.|$)/.test(provider);
 
+/** Keywords that only annotate or constrain a value; `@ai-sdk/anthropic` keeps or describes them. */
+const STRICT_VALUE_KEYWORDS = new Set([
+  '$schema',
+  '$id',
+  '$comment',
+  'title',
+  'description',
+  'default',
+  'examples',
+  'deprecated',
+  'readOnly',
+  'writeOnly',
+  'x-date',
+  'type',
+  'enum',
+  'const',
+  'format',
+  'pattern',
+  'minLength',
+  'maxLength',
+  'minimum',
+  'maximum',
+  'exclusiveMinimum',
+  'exclusiveMaximum',
+  'multipleOf',
+  'minItems',
+  'maxItems',
+  'uniqueItems',
+]);
+/** Structural keywords whose subschemas are checked in turn. */
+const STRICT_STRUCTURE_KEYWORDS = new Set([
+  'properties',
+  'required',
+  'additionalProperties',
+  'items',
+  'anyOf',
+  'oneOf',
+  '$ref',
+  '$defs',
+  'definitions',
+]);
+
 /**
- * The single PF-7309 decision: whether Anthropic's strict native output format cannot carry the
- * caller's response schema. It is made on the source schema ({@link getSourceResponseSchema}), never
- * on a normalized or compat-converted one, because those converters close objects. The schema needs
- * the prompt when it has a free-form object, explicit or implicitly open (`@ai-sdk/anthropic` rewrites
- * every object to `additionalProperties: false`, so the model could only return `{}`), or exceeds
- * {@link ANTHROPIC_STRUCTURED_OUTPUT_LIMITS} (the request would be rejected).
+ * Whether Anthropic's strict output format provably carries a schema node and everything under it.
+ * True only for recognised shapes, so any keyword or shape not listed here means "not carriable":
+ * - every keyword is a value keyword ({@link STRICT_VALUE_KEYWORDS}) or a structural one
+ *   ({@link STRICT_STRUCTURE_KEYWORDS});
+ * - the node has a `type`, `enum`, `const`, `anyOf`, `oneOf` or `$ref` (an empty schema accepts
+ *   anything, which strict output cannot express);
+ * - an object node is typed `object`, closed (`additionalProperties: false`) and every property
+ *   schema is carriable; a typeless node with `properties` / `required` / `additionalProperties` is not;
+ * - an array node's `items` is one carriable schema (no tuples, `additionalItems` or `prefixItems`);
+ * - every `anyOf` / `oneOf` branch and `$defs` / `definitions` entry is carriable.
+ * So `allOf` (intersections), `patternProperties`, `propertyNames`, `unevaluated*`, `not`,
+ * conditionals and open objects (records, catchall, passthrough, loose objects, or JSON Schema
+ * objects without `additionalProperties: false`) are not carriable.
  */
-export function anthropicStrictOutputCannotCarry(schema: unknown): boolean {
-  if (hasAnthropicFreeFormObject(schema)) return true;
+function isStrictOutputCarriable(schema: unknown): boolean {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  const node = schema as Record<string, unknown>;
+  for (const key of Object.keys(node)) {
+    if (!STRICT_VALUE_KEYWORDS.has(key) && !STRICT_STRUCTURE_KEYWORDS.has(key)) return false;
+  }
+  if (!['type', 'enum', 'const', 'anyOf', 'oneOf', '$ref'].some(key => key in node)) return false;
+
+  const types = Array.isArray(node.type) ? node.type : [node.type];
+  if ('properties' in node || 'required' in node || 'additionalProperties' in node || types.includes('object')) {
+    if (!types.includes('object') || node.additionalProperties !== false) return false;
+    const properties = node.properties ?? {};
+    if (typeof properties !== 'object' || Array.isArray(properties)) return false;
+    if (!Object.values(properties).every(isStrictOutputCarriable)) return false;
+  }
+  if ('items' in node && (Array.isArray(node.items) || !isStrictOutputCarriable(node.items))) return false;
+  for (const key of ['anyOf', 'oneOf'] as const) {
+    if (key in node && (!Array.isArray(node[key]) || !(node[key] as unknown[]).every(isStrictOutputCarriable))) {
+      return false;
+    }
+  }
+  for (const key of ['$defs', 'definitions'] as const) {
+    const map = node[key];
+    if (map === undefined) continue;
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return false;
+    if (!Object.values(map).every(isStrictOutputCarriable)) return false;
+  }
+  return '$ref' in node ? typeof node.$ref === 'string' : true;
+}
+
+/**
+ * The single PF-7309 decision: whether Anthropic's strict native output format provably carries the
+ * caller's response schema. It is made on {@link getSemanticResponseSchema} (each object as open as
+ * the caller's schema library makes it), never on a normalized or compat-converted schema, because
+ * those converters close objects. Strict is allowed only when the schema is carriable
+ * ({@link isStrictOutputCarriable}) and within {@link ANTHROPIC_STRUCTURED_OUTPUT_LIMITS};
+ * anything else goes through the prompt.
+ */
+export function anthropicStrictOutputCarries(schema: unknown): boolean {
+  if (!isStrictOutputCarriable(schema)) return false;
   const { optional, union } = countStructuredOutputParameters(schema);
   return (
-    optional > ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.optionalParameters ||
-    union > ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.unionParameters
+    optional <= ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.optionalParameters &&
+    union <= ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.unionParameters
   );
 }
 
 /**
- * Records the {@link StructuredOutputSourceDecision} for a caller's schema. Called once where the
- * schema enters Mastra: the Agent API boundary, durable preparation (before the schema is
- * serialized), and `composeStepInput` when an input processor replaces the schema.
+ * Records the {@link StructuredOutputSourceDecision} for a caller's schema: the semantic response
+ * schema (what prompt injection sends) and whether strict output carries it.
  */
 export function recordStructuredOutputSourceDecision(schema: unknown): StructuredOutputSourceDecision | undefined {
   if (!schema) return undefined;
-  const source = getSourceResponseSchema(schema as PublicSchema);
-  return { schema: source, strictOutputCannotCarry: anthropicStrictOutputCannotCarry(source) };
+  const semantic = getSemanticResponseSchema(schema as PublicSchema);
+  return { schema: semantic, strictOutputCannotCarry: !anthropicStrictOutputCarries(semantic) };
+}
+
+/**
+ * The decision for structured-output options entering Mastra (the Agent API boundary, durable
+ * preparation, a structuring pass): one already recorded upstream is kept, otherwise it is recorded
+ * from the options' schema.
+ */
+export function structuredOutputSourceDecision(structuredOutput: {
+  schema?: unknown;
+  sourceDecision?: StructuredOutputSourceDecision;
+}): StructuredOutputSourceDecision | undefined {
+  return structuredOutput.sourceDecision ?? recordStructuredOutputSourceDecision(structuredOutput.schema);
 }
 
 function readStrictJsonSchemaOption(options: unknown): boolean | undefined {

@@ -5,11 +5,11 @@ import { coreFeatures } from '../../../features';
 import { modelSupportsStructuredOutput } from '../../../llm/model/provider-registry';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
 import { MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS } from '../../../observability/content-free-measurement';
-import { getSourceResponseSchema } from '../../base/schema';
+import { getSemanticResponseSchema } from '../../base/schema';
 import {
   countStructuredOutputParameters,
   execute,
-  hasAnthropicFreeFormObject,
+  anthropicStrictOutputCarries,
   hasFreeFormObject,
   resolveJsonPromptInjection,
   sendsNativeResponseFormat,
@@ -1156,7 +1156,7 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
         modelId,
         jsonPromptInjection: 'auto',
       });
-      const sourceSchema = getSourceResponseSchema(unionSchema);
+      const sourceSchema = getSemanticResponseSchema(unionSchema);
       const promptParts = options.prompt.flatMap((message: any) =>
         Array.isArray(message.content) ? message.content.map((part: any) => part.text ?? '') : [message.content],
       );
@@ -1167,7 +1167,8 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
     });
   });
 
-  it('keeps the native format for a raw JSON Schema object that declares properties without additionalProperties', async () => {
+  // A raw JSON Schema object is closed only by an explicit `additionalProperties: false`.
+  it('falls back for a raw JSON Schema object that declares properties without additionalProperties', async () => {
     const rawSchema = {
       type: 'object',
       properties: {
@@ -1178,12 +1179,13 @@ describe('execute Anthropic structured-output fallback (PF-7309)', () => {
     };
     const { options } = await capture('anthropic.messages', rawSchema);
 
-    expect(options.responseFormat?.type).toBe('json');
+    expect(options.responseFormat).toBeUndefined();
   });
 
   it('leaves the OpenAI free-form check unchanged for implicitly open objects', () => {
-    expect(hasFreeFormObject({ type: 'object', properties: { fields: { type: 'object' } } })).toBe(false);
-    expect(hasAnthropicFreeFormObject({ type: 'object', properties: { fields: { type: 'object' } } })).toBe(true);
+    const schema = { type: 'object', properties: { fields: { type: 'object' } } };
+    expect(hasFreeFormObject(schema)).toBe(false);
+    expect(anthropicStrictOutputCarries(schema)).toBe(false);
   });
 
   it('counts optional and union-typed parameters across nested subschemas', () => {

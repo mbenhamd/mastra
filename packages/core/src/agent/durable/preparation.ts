@@ -32,8 +32,8 @@ import type { VersionOverrides } from '../../request-context';
 import { getRequestContextInputValues } from '../../request-context/input-source';
 import { toStandardSchema } from '../../schema';
 import { assertObservationalMemorySourceWriteGuardSupported } from '../../storage';
-import { recordStructuredOutputSourceDecision } from '../../stream/aisdk/v5/execute';
-import { asJsonSchema } from '../../stream/base/schema';
+import { structuredOutputSourceDecision } from '../../stream/aisdk/v5/execute';
+import { getSemanticJsonSchema } from '../../stream/base/schema';
 import { normalizeToolPayloadTransformPolicy } from '../../tools/payload-transform';
 import type { CoreTool, ToolHooks, ToolPayloadTransformPolicy } from '../../tools/types';
 import type { DynamicArgument } from '../../types';
@@ -1203,10 +1203,12 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
           // have it through the run registry's live config.
           fallbackValue: isJsonSafe(so.fallbackValue) ? so.fallbackValue : undefined,
           // Always convert to plain JSON Schema: this crosses step boundaries as JSON, and a
-          // live Zod/standard-schema instance does not survive that round trip.
-          schema: asJsonSchema(structuredOutputSchema),
-          // PF-7309: recorded from the caller's schema before serialization closes its objects.
-          sourceDecision: so.sourceDecision ?? recordStructuredOutputSourceDecision(so.schema),
+          // live Zod/standard-schema instance does not survive that round trip. PF-7309: the
+          // semantic schema keeps every object as open as the caller's schema library makes it,
+          // so recovered runs, cold structuring passes and validation see the caller's records.
+          schema: getSemanticJsonSchema(so.schema),
+          // PF-7309: the strict-output decision, recorded before serialization; steps read it.
+          sourceDecision: structuredOutputSourceDecision(so),
         };
       }
     }

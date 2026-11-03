@@ -1,12 +1,12 @@
 /**
  * PF-7309: Anthropic's native output format is strict. `@ai-sdk/anthropic` rewrites every object to
- * `additionalProperties: false`, so a free-form record (explicit, or an object that is open by JSON
- * Schema default) can only come back as `{}`, and a schema over Anthropic's complexity limits is
- * rejected. Those schemas are injected into the prompt instead, as the caller wrote them.
+ * `additionalProperties: false`, so any schema that is not provably carriable (an open object, a
+ * tuple, an intersection, ...) or that is over Anthropic's complexity limits goes through the prompt
+ * instead, as the caller wrote it. A schema strict output provably carries stays native strict.
  *
- * Every row drives an Agent (regular or durable) through the real provider adapter against a local
- * HTTP server and inspects the request body the adapter sends, so the assertions see exactly what
- * would reach the provider API.
+ * Every row drives the real entry point (Agent, durable Agent, recovered durable run, or Harness)
+ * through the real provider adapter against a local HTTP server and inspects the request body the
+ * adapter sends, so the assertions see exactly what would reach the provider API.
  */
 import { once } from 'node:events';
 import { createServer } from 'node:http';
@@ -16,10 +16,19 @@ import { createOpenAI } from '@ai-sdk/openai-v6';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../../events/event-emitter';
+import { Harness } from '../../harness/v1/harness';
 import { Mastra } from '../../mastra';
+import { toStandardSchema } from '../../schema';
+import { InMemoryStore } from '../../storage';
+import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
+import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { MockStore } from '../../storage/mock';
+import { createOutputHandler } from '../../stream/base/output-format-handlers';
 import { createTool } from '../../tools';
 import { Agent } from '../agent';
+import type { RestartResult } from '../durable/__tests__/restart-harness';
+import { createRestartScenario, DEFAULT_TIMEOUT_MS, findRow } from '../durable/__tests__/restart-harness';
+import { DurableStepIds } from '../durable/constants';
 import { createDurableAgent } from '../durable/create-durable-agent';
 import { globalRunRegistry } from '../durable/run-registry';
 
@@ -28,6 +37,8 @@ let reply: unknown;
 /** Replaces the default Anthropic reply for one test (used by the approval resume test). */
 let anthropicReplyOverride: ((body: any) => unknown[] | undefined) | undefined;
 const requestBodies: any[] = [];
+/** While set, the server leaves Anthropic requests unanswered (a model call in flight at a crash). */
+let holdRequests = false;
 
 function anthropicResponse(body: any) {
   const usesJsonTool = Array.isArray(body.tools) && body.tools.some((tool: any) => tool.name === 'json');
@@ -97,6 +108,7 @@ const server = createServer((request, response) => {
   request.on('end', () => {
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     requestBodies.push(body);
+    if (holdRequests) return;
     if (request.url?.endsWith('/chat/completions')) {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify(openAIResponse(body)));
@@ -119,6 +131,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  server.closeAllConnections();
   server.close();
   await once(server, 'close');
 });
@@ -127,9 +140,14 @@ beforeEach(() => {
   pubsub = new EventEmitterPubSub();
   requestBodies.length = 0;
   anthropicReplyOverride = undefined;
+  holdRequests = false;
+  // Router models (a cold structuring pass resolves `anthropic/...`) reach the local server too.
+  vi.stubEnv('ANTHROPIC_BASE_URL', baseURL);
+  vi.stubEnv('ANTHROPIC_API_KEY', 'test-key');
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   globalRunRegistry.clear();
   await pubsub.close();
 });
@@ -171,9 +189,18 @@ const replaceSchema = (schema: unknown) => ({
   id: 'replace-structured-output-schema',
   processInputStep: ({ structuredOutput }: any) => ({ structuredOutput: { ...structuredOutput, schema } }),
 });
+/** An input processor that assigns a new schema on the step's own structured-output object. */
+const mutateSchema = (schema: unknown) => ({
+  id: 'mutate-structured-output-schema',
+  processInputStep: ({ structuredOutput }: any) => {
+    structuredOutput.schema = schema;
+    return { structuredOutput };
+  },
+});
 const when = '2026-11-03T00:00:00.000Z';
 
 type Expected = 'prompt' | 'anthropic-strict' | 'anthropic-json-tool' | 'openai-non-strict';
+type Via = 'agent' | 'durable' | 'recovered' | 'harness';
 type Row = {
   name: string;
   model: () => any;
@@ -183,15 +210,17 @@ type Row = {
   object?: unknown;
   providerOptions?: Record<string, any>;
   inputProcessors?: any[];
+  /** A separate structuring model (`structuredOutput.model`). */
+  structuringModel?: string;
   /** The record node inside the injected schema, when the row has a record. */
   record?: (schema: any) => any;
   expected: Expected;
-  durable?: boolean;
+  via?: Via;
 };
 
 const fallbackRows: Row[] = [
   {
-    name: 'z.record property',
+    name: 'plain z.object with a z.record field',
     model: anthropic,
     schema: recordSchema,
     populated: populatedRecord,
@@ -223,6 +252,14 @@ const fallbackRows: Row[] = [
     expected: 'prompt',
   },
   {
+    name: 'raw JSON Schema typeless { properties: {} } record',
+    model: anthropic,
+    schema: rawRecordSchema({ properties: {} }),
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+  },
+  {
     name: 'raw JSON Schema additionalProperties: true record',
     model: anthropic,
     schema: rawRecordSchema({ type: 'object', additionalProperties: true }),
@@ -236,6 +273,57 @@ const fallbackRows: Row[] = [
     schema: rawRecordSchema({ type: 'object', additionalProperties: { type: 'string' } }),
     populated: populatedRecord,
     record: schema => schema.properties.fields,
+    expected: 'prompt',
+  },
+  {
+    name: 'z.object().passthrough()',
+    model: anthropic,
+    schema: z.object({ studyId: z.string() }).passthrough(),
+    populated: { studyId: 's1', outcome: 'mortality' },
+    record: schema => schema,
+    expected: 'prompt',
+  },
+  {
+    name: 'z.object().catchall(z.string())',
+    model: anthropic,
+    schema: z.object({ studyId: z.string() }).catchall(z.string()),
+    populated: { studyId: 's1', outcome: 'mortality' },
+    record: schema => schema,
+    expected: 'prompt',
+  },
+  {
+    name: 'z.looseObject()',
+    model: anthropic,
+    schema: z.looseObject({ studyId: z.string() }),
+    populated: { studyId: 's1', outcome: 'mortality' },
+    record: schema => schema,
+    expected: 'prompt',
+  },
+  {
+    name: 'implicitly open intersection (looseObject.and(object))',
+    model: anthropic,
+    schema: z.looseObject({ id: z.string() }).and(z.object({ known: z.string() })),
+    populated: { id: '1', known: 'k', outcome: 'mortality' },
+    expected: 'prompt',
+  },
+  {
+    name: 'tuple .rest(z.record)',
+    model: anthropic,
+    schema: z.object({ parts: z.tuple([z.string()]).rest(z.record(z.string(), z.string())) }),
+    populated: { parts: ['a', { outcome: 'mortality' }] },
+    expected: 'prompt',
+  },
+  {
+    name: 'raw JSON Schema root tuple with additionalItems record',
+    model: anthropic,
+    schema: {
+      type: 'array',
+      items: [{ type: 'string' }],
+      additionalItems: { type: 'object', additionalProperties: { type: 'string' } },
+    },
+    populated: { elements: ['a', { outcome: 'mortality' }] },
+    object: ['a', { outcome: 'mortality' }],
+    record: schema => schema.properties.elements.additionalItems,
     expected: 'prompt',
   },
   {
@@ -254,6 +342,54 @@ const fallbackRows: Row[] = [
   },
 ];
 
+/** Schemas strict output provably carries: they stay native strict on every path. */
+const converseRows: Row[] = [
+  {
+    name: 'converse: plain z.object within limits',
+    model: anthropic,
+    schema: withinLimitsSchema,
+    populated: { summary: 's', tags: ['a'] },
+    expected: 'anthropic-strict',
+  },
+  {
+    name: 'converse: nested plain z.objects',
+    model: anthropic,
+    schema: z.object({
+      study: z.object({ id: z.string(), arm: z.object({ name: z.string() }) }),
+      outcomes: z.array(z.object({ label: z.string(), value: z.number().optional() })),
+    }),
+    populated: { study: { id: 's1', arm: { name: 'a' } }, outcomes: [{ label: 'x', value: 1 }] },
+    expected: 'anthropic-strict',
+  },
+  {
+    name: 'converse: raw JSON Schema closed everywhere',
+    model: anthropic,
+    schema: {
+      type: 'object',
+      properties: {
+        studyId: { type: 'string' },
+        arm: {
+          type: 'object',
+          properties: { name: { type: 'string' } },
+          required: ['name'],
+          additionalProperties: false,
+        },
+      },
+      required: ['studyId', 'arm'],
+      additionalProperties: false,
+    },
+    populated: { studyId: 's1', arm: { name: 'a' } },
+    expected: 'anthropic-strict',
+  },
+  {
+    name: 'converse: z.strictObject',
+    model: anthropic,
+    schema: z.strictObject({ summary: z.string() }),
+    populated: { summary: 's' },
+    expected: 'anthropic-strict',
+  },
+];
+
 const jsonToolRow: Row = {
   name: "record with structuredOutputMode 'jsonTool'",
   model: anthropic,
@@ -263,8 +399,11 @@ const jsonToolRow: Row = {
   expected: 'anthropic-json-tool',
 };
 
+const rawOpenRecord = rawRecordSchema({ type: 'object', properties: {} });
+
 const rows: Row[] = [
   ...fallbackRows,
+  ...converseRows,
   jsonToolRow,
   {
     name: "record with structuredOutputMode 'outputFormat'",
@@ -280,13 +419,6 @@ const rows: Row[] = [
     schema: recordSchema,
     populated: populatedRecord,
     expected: 'openai-non-strict',
-  },
-  {
-    name: 'within limits, no record (native strict)',
-    model: anthropic,
-    schema: withinLimitsSchema,
-    populated: { summary: 's', tags: ['a'] },
-    expected: 'anthropic-strict',
   },
   {
     // The decision follows the schema the step actually sends, not the one passed to generate().
@@ -306,7 +438,16 @@ const rows: Row[] = [
     populated: { summary: 's', tags: ['a'] },
     expected: 'anthropic-strict',
   },
-  // Mastra's conversion represents dates and custom types; the source read must keep that.
+  {
+    name: 'input processor assigns a record schema in place',
+    model: anthropic,
+    schema: withinLimitsSchema,
+    inputProcessors: [mutateSchema(recordSchema)],
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+  },
+  // Mastra's conversion represents dates and custom types; the decision must keep that.
   {
     name: 'z.date() with a record',
     model: anthropic,
@@ -345,41 +486,147 @@ const rows: Row[] = [
     expected: 'prompt',
   },
   // The durable Agent serializes the schema between steps; the decision recorded before
-  // serialization must still apply.
-  ...fallbackRows.map(row => ({ ...row, name: `durable: ${row.name}`, durable: true })),
-  { ...jsonToolRow, name: `durable: ${jsonToolRow.name}`, durable: true },
+  // serialization, and the persisted schema, must keep the caller's openness.
+  ...[...fallbackRows, ...converseRows, jsonToolRow].map(row => ({
+    ...row,
+    name: `durable: ${row.name}`,
+    via: 'durable' as const,
+  })),
+  // A worker restart: the run is recovered from its persisted snapshot with no live registry.
+  {
+    name: "recovered durable run: raw { type: 'object', properties: {} } record",
+    model: anthropic,
+    schema: rawOpenRecord,
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+    via: 'recovered',
+  },
+  {
+    name: 'recovered durable run: converse plain z.object',
+    model: anthropic,
+    schema: withinLimitsSchema,
+    populated: { summary: 's', tags: ['a'] },
+    expected: 'anthropic-strict',
+    via: 'recovered',
+  },
+  {
+    // The finish-time structuring pass resolves its model from the persisted config.
+    name: 'recovered durable run: structuredOutput.model structuring pass with a raw { properties: {} } record',
+    model: anthropic,
+    schema: rawOpenRecord,
+    structuringModel: 'anthropic/claude-haiku-5-5',
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+    via: 'recovered',
+  },
+  {
+    name: 'Harness message({ output, sync: true }): plain z.object with a z.record field',
+    model: anthropic,
+    schema: recordSchema,
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+    via: 'harness',
+  },
+  {
+    name: 'Harness message({ output, sync: true }): converse plain z.object',
+    model: anthropic,
+    schema: withinLimitsSchema,
+    populated: { summary: 's', tags: ['a'] },
+    expected: 'anthropic-strict',
+    via: 'harness',
+  },
 ];
 
-async function runRow(row: Row) {
-  const agent = new Agent({
-    id: 'pf7309-agent',
-    name: 'pf7309-agent',
-    instructions: 'test',
-    model: row.model(),
-    inputProcessors: row.inputProcessors,
-  });
-  const options = { structuredOutput: { schema: row.schema }, providerOptions: row.providerOptions } as any;
-  if (!row.durable) return { object: (await agent.generate('extract', options)).object };
+function makeAgent(row: Row, id = 'pf7309-agent') {
+  return new Agent({ id, name: id, instructions: 'test', model: row.model(), inputProcessors: row.inputProcessors });
+}
 
-  const durableAgent = createDurableAgent({ agent, pubsub });
-  const prepared = await durableAgent.prepare('extract', options);
-  const run = await durableAgent.stream('extract', options);
-  const full = await run.output.getFullOutput();
-  run.cleanup();
+function rowOptions(row: Row) {
   return {
-    object: full.object,
-    recorded: (prepared.workflowInput.options.structuredOutput as any)?.sourceDecision,
-  };
+    structuredOutput: { schema: row.schema, ...(row.structuringModel ? { model: row.structuringModel } : {}) },
+    providerOptions: row.providerOptions,
+  } as any;
+}
+
+let recoveredRuns = 0;
+
+/**
+ * A worker restart: graph 1 (its own module graph, store and run registry) starts the durable run
+ * and crashes while the model call is in flight; graph 2 recovers the run from the persisted rows
+ * alone. The restart harness reports the recovered stream's chunks rather than the object.
+ */
+async function runRecovered(row: Row) {
+  const runId = `pf7309-recovered-${++recoveredRuns}`;
+  const scenario = createRestartScenario({
+    kind: 'durable',
+    runId,
+    build: ({ core }) =>
+      new core.Agent({ id: 'pf7309-recovered', name: 'pf7309-recovered', instructions: 'test', model: row.model() }),
+  });
+  try {
+    holdRequests = true;
+    const original = await scenario.start(({ agent }) => agent.stream('extract', { runId, ...rowOptions(row) }));
+    await vi.waitFor(() => expect(requestBodies).toHaveLength(1), { timeout: DEFAULT_TIMEOUT_MS });
+    const checkpoint = await original.checkpoint();
+    holdRequests = false;
+    const recovered = await scenario.restart(checkpoint);
+    const root = findRow(checkpoint, DurableStepIds.AGENTIC_LOOP, runId);
+    return {
+      object: undefined,
+      persisted: (root?.snapshot.context as any)?.input?.options?.structuredOutput,
+      recovered,
+    };
+  } finally {
+    await scenario.stop();
+  }
+}
+
+async function runRow(row: Row): Promise<{ object: unknown; persisted?: any; recovered?: RestartResult }> {
+  switch (row.via ?? 'agent') {
+    case 'agent':
+      return { object: (await makeAgent(row).generate('extract', rowOptions(row))).object };
+    case 'durable': {
+      const durableAgent = createDurableAgent({ agent: makeAgent(row), pubsub });
+      const prepared = await durableAgent.prepare('extract', rowOptions(row));
+      globalRunRegistry.clear();
+      requestBodies.length = 0;
+      const run = await durableAgent.stream('extract', rowOptions(row));
+      const full = await run.output.getFullOutput();
+      run.cleanup();
+      return { object: full.object, persisted: prepared.workflowInput.options.structuredOutput };
+    }
+    case 'recovered':
+      return runRecovered(row);
+    case 'harness': {
+      const harness = new Harness({
+        agents: { default: makeAgent(row, 'default') } as any,
+        storage: new InMemoryStore(),
+        modes: [{ id: 'default', agentId: 'default' }],
+        defaultModeId: 'default',
+        sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      });
+      try {
+        const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+        return { object: await session.message({ content: 'extract', output: row.schema, sync: true }) };
+      } finally {
+        await harness.shutdown();
+      }
+    }
+  }
 }
 
 describe('structured output through the real provider adapters (PF-7309)', () => {
   it.each(rows)('$name', async row => {
     reply = row.populated;
 
-    const { object, recorded } = await runRow(row);
+    const { object, persisted, recovered } = await runRow(row);
 
-    expect(requestBodies).toHaveLength(1);
-    const [body] = requestBodies;
+    // A structuring pass adds a request; a recovered run repeats the call the crash interrupted.
+    expect(requestBodies).toHaveLength(1 + (row.structuringModel ? 1 : 0) + (recovered ? 1 : 0));
+    const body = requestBodies.at(-1);
     const { strictFormat, jsonTool, injected } = sentFormat(body);
     switch (row.expected) {
       case 'prompt':
@@ -406,19 +653,28 @@ describe('structured output through the real provider adapters (PF-7309)', () =>
         expect(injected).toBeUndefined();
         break;
     }
-    if (row.durable) {
-      // The serialized run carries the decision recorded from the caller's schema. For the
-      // jsonTool row it says the strict format cannot carry the schema; the explicit provider
-      // mode then keeps the JSON tool.
-      expect(recorded?.strictOutputCannotCarry).toBe(true);
-      if (row.record) expect(row.record(recorded.schema).additionalProperties).not.toBe(false);
+    if (persisted) {
+      // The durable payload records the decision and persists a schema that keeps the caller's
+      // openness, so a reloaded run (recovery, cold structuring) validates the populated reply.
+      expect(persisted.sourceDecision?.strictOutputCannotCarry).toBe(row.expected !== 'anthropic-strict');
+      if (row.record) expect(row.record(persisted.sourceDecision.schema).additionalProperties).not.toBe(false);
+      const reloaded = await createOutputHandler({
+        schema: toStandardSchema(persisted.schema),
+      }).validateAndTransformFinal(JSON.stringify(row.populated));
+      expect(reloaded.success).toBe(true);
     }
-    expect(object).toEqual(row.object ?? row.populated);
+    if (recovered) {
+      // The recovered run validated the populated reply against the reloaded schema.
+      expect(recovered.executionError).toBeUndefined();
+      expect(recovered.streamErrors).toEqual([]);
+      expect(recovered.chunkTypes).toContain('object-result');
+    } else {
+      expect(object).toEqual(row.object ?? row.populated);
+    }
   });
 
-  // A resumed durable step rebuilds its options from the serialized run. The serialized
-  // `{ properties: {} }` record is closed, so re-deriving the decision there would choose the
-  // strict format; the resumed request must still use the recorded prompt injection.
+  // A resumed durable step rebuilds its options from the serialized run, so it must still use the
+  // recorded prompt injection for the open `{ properties: {} }` record.
   it('durable: a step resumed after a tool approval uses the recorded decision', async () => {
     reply = populatedRecord;
     const approvalTool = createTool({
@@ -444,11 +700,10 @@ describe('structured output through the real provider adapters (PF-7309)', () =>
     });
     const durableAgent = createDurableAgent({ agent, pubsub });
     new Mastra({ logger: false, storage: new MockStore(), agents: { pf7309ResumeAgent: durableAgent } });
-    const schema = rawRecordSchema({ type: 'object', properties: {} });
 
     let suspended: unknown;
     const initial = await durableAgent.stream('extract', {
-      structuredOutput: { schema } as any,
+      structuredOutput: { schema: rawOpenRecord } as any,
       onSuspended: data => {
         suspended = data;
       },

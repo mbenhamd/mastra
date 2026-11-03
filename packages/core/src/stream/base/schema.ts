@@ -139,8 +139,7 @@ type JsonSchemaOverrideContext = Parameters<typeof JSON_SCHEMA_LIBRARY_OPTIONS.o
 /**
  * Mastra's JSON Schema override (dates, `catchall(z.unknown())`) without its object-closing step:
  * an `additionalProperties: false` the override added to an object that did not declare
- * `additionalProperties` is taken back, so objects stay as open as the caller wrote them. Every other
- * Mastra conversion, including `unrepresentable: 'any'`, still applies.
+ * `additionalProperties` is taken back, so a caller's JSON Schema objects stay as open as written.
  */
 function sourceJsonSchemaOverride(ctx: JsonSchemaOverrideContext): undefined {
   const declaredAdditionalProperties = 'additionalProperties' in ctx.jsonSchema;
@@ -151,22 +150,35 @@ function sourceJsonSchemaOverride(ctx: JsonSchemaOverrideContext): undefined {
   return undefined;
 }
 
+/** Standard-schema vendors whose JSON Schema is the caller's own JSON Schema object. */
+const CALLER_JSON_SCHEMA_VENDORS = new Set(['json-schema', 'ai-sdk']);
+
 /**
- * The response schema as the caller wrote it: Mastra's own JSON Schema conversion minus the step
- * that closes objects (and without a provider compat layer), with the same output-format wrapping
- * as {@link getTransformedSchema}. A plain JSON Schema or AI SDK schema keeps the caller's
- * openness; a Zod schema comes from Mastra's Zod conversion.
+ * The caller's schema as JSON Schema, with every object exactly as open as the schema library makes
+ * it. A plain JSON Schema or AI SDK schema keeps the caller's own openness: an object is closed only
+ * by an explicit `additionalProperties: false`. Any other schema (Zod, ...) goes through Mastra's own
+ * conversion, whose object-closing step matches the library: a plain `z.object()` strips unknown
+ * keys, so it is closed, while `z.record()`, `.catchall()`, `.passthrough()` and `z.looseObject()`
+ * stay open. Every other Mastra conversion (dates, `unrepresentable: 'any'`) applies to both. No
+ * provider compat layer runs.
  */
-export function getSourceResponseSchema(schema?: PublicSchema): JSONSchema7 | undefined {
-  if (!schema) return undefined;
-  const jsonSchema = standardSchemaToJSONSchema(toStandardSchema(schema), {
-    io: 'input',
-    override: sourceJsonSchemaOverride,
-  });
-  return wrapForOutputFormat(jsonSchema)?.jsonSchema;
+export function getSemanticJsonSchema(schema: PublicSchema): JSONSchema7 {
+  const standardSchema = toStandardSchema(schema);
+  return CALLER_JSON_SCHEMA_VENDORS.has(standardSchema['~standard'].vendor)
+    ? standardSchemaToJSONSchema(standardSchema, { io: 'input', override: sourceJsonSchemaOverride })
+    : standardSchemaToJSONSchema(standardSchema, { io: 'input' });
 }
 
-function wrapForOutputFormat(jsonSchema: JSONSchema7 | undefined) {
+/**
+ * {@link getSemanticJsonSchema} with the output-format wrapping of {@link getTransformedSchema}. A
+ * root array keeps every array keyword (tuple items, `additionalItems`, bounds) inside `elements`.
+ */
+export function getSemanticResponseSchema(schema?: PublicSchema): JSONSchema7 | undefined {
+  if (!schema) return undefined;
+  return wrapForOutputFormat(getSemanticJsonSchema(schema), { keepArrayKeywords: true })?.jsonSchema;
+}
+
+function wrapForOutputFormat(jsonSchema: JSONSchema7 | undefined, options?: { keepArrayKeywords?: boolean }) {
   if (!jsonSchema) {
     return undefined;
   }
@@ -178,7 +190,7 @@ function wrapForOutputFormat(jsonSchema: JSONSchema7 | undefined) {
       $schema: $schema,
       type: 'object',
       properties: {
-        elements: { type: 'array', items: innerElement },
+        elements: options?.keepArrayKeywords ? itemSchema : { type: 'array', items: innerElement },
       },
       required: ['elements'],
       additionalProperties: false,
