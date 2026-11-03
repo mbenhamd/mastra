@@ -823,6 +823,62 @@ describe('planTaskCheck — bounded read', () => {
     expect(second.tasks[0]?.taskId).not.toBe(first.tasks[0]?.taskId);
   });
 
+  it('returns a near-limit delegated task without its tool trace instead of failing the read', async () => {
+    const delegateWithResult = async (port: Harness['port'], text: string, withTrace: boolean) => {
+      const task = await planTaskAdd(port, { content: 'near-limit result' });
+      await planTaskDelegate(port, { taskId: task.taskId, subagentSessionId: 'subagent-trace' });
+      await planTaskReconcileDelegation(port, {
+        taskId: task.taskId,
+        subagentSessionId: 'subagent-trace',
+        outcome: 'completed',
+        result: {
+          status: 'success',
+          text,
+          textTruncated: false,
+          finishReason: 'stop',
+          stepCount: 1,
+          toolCallCount: 20,
+          toolResultCount: 20,
+          ...(withTrace
+            ? {
+                toolTrace: Array.from({ length: 20 }, (_, index) => ({
+                  toolName: `${index}_${'t'.repeat(50)}`,
+                  calls: 1,
+                  errors: 0,
+                })),
+              }
+            : {}),
+        },
+      });
+    };
+    // Measure the plan-task view around a trace-free result exactly as
+    // planTaskCheck admits a candidate, to place the real result just inside
+    // the budget without its trace.
+    const probe = await setup();
+    await delegateWithResult(probe.port, '', false);
+    const probed = await planTaskCheck(probe.port, {});
+    const overhead = new TextEncoder().encode(
+      JSON.stringify({ tasks: probed.tasks, truncated: true, nextCursor: probed.tasks[0]?.taskId }),
+    ).byteLength;
+
+    // 512 spare bytes keep the truncation flag; 10 do not fit even its 26 bytes.
+    for (const [spare, flagged] of [
+      [512, true],
+      [10, undefined],
+    ] as const) {
+      const { port } = await setup();
+      await delegateWithResult(port, 'x'.repeat(PLAN_TASK_CHECK_MAX_OUTPUT_BYTES - overhead - spare), true);
+      const res = await planTaskCheck(port, {});
+
+      expect(res.tasks, `${spare} spare bytes`).toHaveLength(1);
+      expect(res.tasks[0]?.delegation?.result?.toolTrace).toBeUndefined();
+      expect(res.tasks[0]?.delegation?.result?.toolTraceTruncated, `${spare} spare bytes`).toBe(flagged);
+      expect(new TextEncoder().encode(JSON.stringify(res)).byteLength).toBeLessThanOrEqual(
+        PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
+      );
+    }
+  });
+
   it('honors depth (depth 0 returns only the root)', async () => {
     const res = await planTaskCheck(h.port, { rootTaskId: root, depth: 0, limit: 50 });
     expect(res.tasks.map(t => t.taskId)).toEqual([root]);

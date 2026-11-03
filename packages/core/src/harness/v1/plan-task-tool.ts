@@ -34,6 +34,7 @@ import {
   PLAN_TASK_MAX_NODES,
 } from './plan-task-session';
 import type { Session } from './session';
+import { formatSubagentTypeList } from './spawn-subagent-tool';
 import { harnessSubagentResultSummarySchema } from './terminal-subagent-result';
 
 export const TASK_ADD_TOOL_ID = 'task_add';
@@ -342,10 +343,14 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
     session as unknown as {
       _harness?: {
         _listSubagentTypeIds(options: { invocation: 'inline' | 'delegated' }): string[];
+        _getSubagentType(id: string): { description: string } | undefined;
       };
     }
   )._harness;
   const subagentTypeIds = harness?._listSubagentTypeIds({ invocation: 'delegated' }) ?? [];
+  // Same per-type card spawn_subagent shows, so the parent chooses a durable
+  // type by what it does rather than by its id alone.
+  const subagentTypeList = formatSubagentTypeList(subagentTypeIds, id => harness?._getSubagentType(id));
   const taskDelegate =
     subagentTypeIds.length === 0
       ? undefined
@@ -357,9 +362,8 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
             'to a subagent session whose completion this plan task tracks across turns: the task ' +
             'stays in_progress until the subagent finishes, then rolls up completed or failed. Pass ' +
             '`includeSubtree: true` to delegate the task and its descendants as one unit. Available ' +
-            'agent types: ' +
-            subagentTypeIds.join(', ') +
-            '.',
+            'agent types:\n' +
+            subagentTypeList,
           inputSchema: z.object({
             taskId: z.string().describe('Existing plan task to delegate.'),
             agentType: z.enum(subagentTypeIds as [string, ...string[]]).describe('Registered subagent type to run.'),
@@ -368,7 +372,10 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
               .min(1)
               .max(PLAN_TASK_DELEGATED_BODY_MAX_BYTES)
               .optional()
-              .describe('Self-contained task description for the subagent. Defaults to the plan task title.'),
+              .describe(
+                'Self-contained task description for the subagent. The subagent does not see the parent ' +
+                  'conversation, so include every piece of context it needs. Defaults to the plan task title.',
+              ),
             includeSubtree: z
               .boolean()
               .optional()
