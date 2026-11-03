@@ -4,9 +4,8 @@
  *
  * Children are started the way a model starts them (`task_delegate`), and the
  * control tool is driven through its public `execute` seam. The cross-process
- * case uses two `Harness` instances over ONE `InMemoryDB`: the second instance
- * holds the child's lease, so the parent's process can only record a durable
- * cancel intent on the child row.
+ * cases use several `Harness` instances over ONE `InMemoryDB`, with a foreign
+ * lease left on the child row to stand in for another (crashed or live) owner.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -286,13 +285,12 @@ describe('subagent control tool', () => {
     await harness.shutdown();
   });
 
-  it('cancel of a child leased by another process records a durable intent that the child honours', async () => {
+  it('cancel of a child leased by another process waits for that lease to lapse, then commits durably', async () => {
     const db = new InMemoryDB();
     const a = buildHarness(db);
     const b = buildHarness(db);
     const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    // Process B holds the child's lease.
-    const childInB = await b.harness.session({
+    const child = await b.harness.session({
       resourceId: 'u1',
       threadId: { fresh: true },
       parentSessionId: parent.id,
@@ -301,28 +299,74 @@ describe('subagent control tool', () => {
       subagentDepth: 1,
       subagentTypeId: 'worker',
     });
-    const leaseOwner = (await parent._internalStorage.loadSession({ sessionId: childInB.id }))?.ownerId;
-
-    const cancelled = await control(parent)({ action: 'cancel', subagentSessionId: childInB.id });
-
-    expect(cancelled).toMatchObject({ cancel: 'intent_recorded', settled: false });
-    const stored = await parent._internalStorage.loadSession({ sessionId: childInB.id });
-    expect(stored?.cancelRequest).toMatchObject({ reason: 'subagent_cancelled', requestedBy: parent.id });
-    expect(stored?.ownerId).toBe(leaseOwner);
-    expect(await control(parent)({ action: 'cancel', subagentSessionId: childInB.id })).toMatchObject({
-      cancel: 'already_requested',
-    });
-
-    // Once B lets go, whichever process hydrates the child refuses new work.
     await b.harness.shutdown();
+    // A crashed holder: its lease is still unexpired for a short while.
+    const storage = parent._internalStorage;
+    await storage.acquireSessionLease({ sessionId: child.id, ownerId: 'crashed-holder', ttlMs: 300 });
+
+    const started = Date.now();
+    const cancelled = await control(parent)({ action: 'cancel', subagentSessionId: child.id });
+
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+    expect(cancelled).toMatchObject({ action: 'cancel', cancel: 'acknowledged' });
+    const stored = await storage.loadSession({ sessionId: child.id });
+    expect(stored?.cancelRequest).toMatchObject({ reason: 'subagent_cancelled', requestedBy: parent.id });
+    // The cancel lives on the child's own row: any process that hydrates it refuses new work.
     const c = buildHarness(db);
-    const childInC = await c.harness.session({ sessionId: childInB.id, resourceId: 'u1' });
-    await expect(childInC.message({ content: 'keep going' })).rejects.toMatchObject({
+    await a.harness.shutdown();
+    const rehydrated = await c.harness.session({ sessionId: child.id, resourceId: 'u1' });
+    await expect(rehydrated.message({ content: 'keep going' })).rejects.toMatchObject({
       name: 'HarnessSessionCancelledError',
     });
-
     await c.harness.shutdown();
+  });
+
+  it('cancel never writes under a lease another process keeps holding', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const b = buildHarness(db);
+    const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const child = await b.harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+      origin: 'subagent-tool',
+      subagentDepth: 1,
+    });
+    await b.harness.shutdown();
+    const storage = parent._internalStorage;
+    await storage.acquireSessionLease({ sessionId: child.id, ownerId: 'busy-holder', ttlMs: 120_000 });
+    const versionBefore = (await storage.loadSession({ sessionId: child.id }))?.version;
+
+    const cancelled = await control(parent)({ action: 'cancel', subagentSessionId: child.id });
+
+    expect(cancelled).toMatchObject({ isError: true, code: 'harness.subagent_cancel_unavailable' });
+    const stored = await storage.loadSession({ sessionId: child.id });
+    expect(stored?.cancelRequest).toBeUndefined();
+    expect(stored?.version).toBe(versionBefore);
+    expect(stored?.ownerId).toBe('busy-holder');
     await a.harness.shutdown();
+  });
+
+  it('send refuses a child with no active run instead of waking it', async () => {
+    const { harness, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const idleChild = await harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+    });
+
+    const sent = await control(parent)({ action: 'send', subagentSessionId: idleChild.id, message: 'start now' });
+
+    expect(sent).toMatchObject({ isError: true, errorName: 'HarnessValidationError' });
+    await new Promise(r => setTimeout(r, 20));
+    expect(childAgent.streamCalls).toHaveLength(0);
+    expect(idleChild.isRunning()).toBe(false);
+    await harness.shutdown();
   });
 
   it('is absent without subagent types and for a session already at maxDepth', async () => {

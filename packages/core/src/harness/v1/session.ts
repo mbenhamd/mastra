@@ -6116,10 +6116,13 @@ export class Session {
    * child (the caller has already proven `parentSessionId === this.id`). Unlike
    * {@link cancelSubagent} it also reaches a cold child by hydrating it, through
    * the same owned-cascade path as a full `cancel()`. Returns `'unavailable'`
-   * when the child cannot be hydrated here (for example another process holds
-   * its lease), so the caller can record a durable cancel intent instead.
+   * when the child itself could not be cancelled here (for example another
+   * process holds its lease).
    */
-  async _internalCancelOwnedSubagent(subagentSessionId: string, reason: string): Promise<'delivered' | 'unavailable'> {
+  async _internalCancelOwnedSubagent(
+    subagentSessionId: string,
+    reason: string,
+  ): Promise<'delivered' | 'delivered_incomplete' | 'unavailable'> {
     this._assertNotDeleted();
     const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason);
     if (unavailable.includes(subagentSessionId)) return 'unavailable';
@@ -6127,7 +6130,9 @@ export class Session {
     // maps its committed cancelRequest to a failed plan task. A live driver's
     // delegation is skipped by the reconcile pass, so this is safe either way.
     this._scheduleDelegationReconcileRetry(0);
-    return 'delivered';
+    // The child committed its cancel, but a descendant below it could not be
+    // reached; a repeated cancel resumes that cascade.
+    return unavailable.length > 0 ? 'delivered_incomplete' : 'delivered';
   }
 
   /** Read every durable delegation link in this session's plan forest. */
@@ -14405,6 +14410,12 @@ export class Session {
   async injectSystemReminder(
     content: string,
     opts?: SessionInjectSystemReminderOptions,
+    /**
+     * @internal PF-7473 — `requireActiveRun` makes the reminder interleave-only:
+     * it rejects instead of waking an idle thread, decided at the same point
+     * the interleave routing is decided (no await in between).
+     */
+    internal?: { requireActiveRun?: boolean },
   ): Promise<SessionInjectSystemReminderResult> {
     this._assertLive('injectSystemReminder()');
     this._assertOpenForTurn('injectSystemReminder()');
@@ -14434,6 +14445,9 @@ export class Session {
     this._assertOpenForTurn('injectSystemReminder()');
     const activeRunId = sub.activeRunId();
     const willInterleave = activeRunId !== null;
+    if (!willInterleave && internal?.requireActiveRun === true) {
+      throw new HarnessValidationError('injectSystemReminder()', 'no active run to interleave into');
+    }
 
     if (!willInterleave) {
       // Owned-turn path: full turn bookkeeping in a background

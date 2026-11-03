@@ -7,7 +7,10 @@
  *   - `status` — list this session's children, or inspect one;
  *   - `wait`   — block up to a bounded timeout for one or more children to settle;
  *   - `send`   — interleave a bounded instruction into a running child's run;
- *   - `cancel` — cancel one owned child, durably across processes.
+ *   - `cancel` — cancel one owned child. The cancel commits on the child's own
+ *     record, so it survives restarts; a child leased by another process is
+ *     taken over only after that lease lapses (bounded wait), never written
+ *     under the other owner's lease.
  *
  * Ownership is the durable `parentSessionId` edge: a session acts only on its
  * own children (descendants deeper than that are reached through their own
@@ -23,9 +26,9 @@
 
 import { z } from 'zod';
 
-import type { HarnessPlanTask, HarnessStorage, SessionRecord } from '../../storage/domains/harness';
-import { HarnessStorageVersionConflictError } from '../../storage/domains/harness';
+import type { HarnessPlanTask, SessionRecord } from '../../storage/domains/harness';
 import { createTool } from '../../tools/tool';
+import { HarnessValidationError } from './errors';
 import { projectHarnessPublicError } from './events';
 import { readDelegationAttemptMetadata } from './plan-task-session';
 import type { ActiveSubagentState, Session } from './session';
@@ -43,8 +46,15 @@ export const SUBAGENT_CONTROL_MAX_WAIT_TARGETS = 16;
 export const SUBAGENT_CONTROL_MAX_MESSAGE_CHARS = 4_000;
 export const SUBAGENT_CONTROL_STATUS_LIMIT = 25;
 const SUBAGENT_CONTROL_TASK_PREVIEW_CHARS = 500;
+/**
+ * Longest `cancel` waits for another process's lease on the child to lapse
+ * before it reports the child unavailable (above the default 30 s lease TTL).
+ */
+export const SUBAGENT_CONTROL_MAX_LEASE_WAIT_MS = 35_000;
 const WAIT_POLL_INTERVAL_MS = 100;
-const CANCEL_INTENT_CAS_ATTEMPTS = 3;
+const WAIT_POLL_MAX_INTERVAL_MS = 1_000;
+const LEASE_EXPIRY_SLACK_MS = 25;
+const CANCEL_ATTEMPTS = 3;
 
 const subagentStatusEnum = z.enum(['running', 'awaiting_input', 'idle', 'completed', 'blocked', 'failed', 'closed']);
 type SubagentStatus = z.infer<typeof subagentStatusEnum>;
@@ -120,6 +130,13 @@ const inputSchema = z
     if (input.action !== 'send' && input.message !== undefined) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['message'], message: 'message is only valid for send' });
     }
+    if (input.subagentSessionIds !== undefined && input.subagentSessionId !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['subagentSessionIds'],
+        message: 'pass subagentSessionId or subagentSessionIds, not both',
+      });
+    }
     if (input.action !== 'wait' && (input.subagentSessionIds !== undefined || input.timeoutMs !== undefined)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -138,22 +155,24 @@ const outputSchema = z.object({
   /** wait: children still running when the wait ended. */
   runningSubagents: z.array(subagentViewSchema).optional(),
   timedOut: z.boolean().optional(),
+  /** wait: the tool call was aborted before the children settled. */
+  aborted: z.boolean().optional(),
   subagentSessionId: z.string().optional(),
   /** send: the instruction reached the child's active run. */
   delivered: z.boolean().optional(),
   /**
    * cancel: how the request landed.
-   * - `acknowledged`: the cancel committed on the child record and its abort
-   *   ran in this process.
-   * - `intent_recorded`: another process holds the child; the durable cancel
-   *   intent is on the child record and is honoured by that owner on its next
-   *   record write, or by restart reconciliation.
-   * - `already_requested`: a cancel request was already recorded.
+   * - `acknowledged`: the cancel committed durably on the child record (it
+   *   survives restarts) and the child's work was aborted in this process.
+   * - `already_requested`: a cancel was already recorded; the cascade to the
+   *   child's own descendants was resumed.
    * - `already_settled`: the child had already finished; nothing changed.
    */
-  cancel: z.enum(['acknowledged', 'intent_recorded', 'already_requested', 'already_settled']).optional(),
+  cancel: z.enum(['acknowledged', 'already_requested', 'already_settled']).optional(),
   /** cancel: the child has settled (true only when nothing is left to unwind). */
   settled: z.boolean().optional(),
+  /** cancel: a descendant below the child could not be reached yet; cancel again to resume. */
+  descendantCancelIncomplete: z.boolean().optional(),
   status: subagentStatusEnum.optional(),
   isError: z.boolean().optional(),
   errorName: z.string().optional(),
@@ -180,6 +199,11 @@ function preview(text: string): string {
     : `${text.slice(0, SUBAGENT_CONTROL_TASK_PREVIEW_CHARS - 1)}…`;
 }
 
+/** Read at call time (a property check would be narrowed across awaits). */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
 function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise(resolve => {
     if (signal?.aborted) return resolve();
@@ -193,42 +217,6 @@ function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
     }, ms);
     signal?.addEventListener('abort', onAbort, { once: true });
   });
-}
-
-/**
- * Durable cancel intent for a child whose lease another process holds. The
- * write is a version-CAS on the freshly loaded row that adds ONLY
- * `cancelRequest` (first writer wins, never cleared) and preserves the lease
- * metadata, so the holder's next `saveSession` hits a version conflict, reloads
- * the row, and from then on fails closed on new turns/resumes; a delegation
- * driver or restart reconcile maps the recorded cancel to a failed delegation.
- */
-async function recordDurableCancelIntent(
-  storage: HarnessStorage,
-  harnessName: string,
-  childId: string,
-  requestedBy: string,
-  fallbackOwnerId: string,
-): Promise<'recorded' | 'already_requested' | 'settled' | 'unavailable'> {
-  for (let attempt = 0; attempt < CANCEL_INTENT_CAS_ATTEMPTS; attempt++) {
-    const current = await storage.loadSession({ harnessName, sessionId: childId });
-    if (current === null || current.closedAt !== undefined || current.closingAt !== undefined) return 'settled';
-    if (current.cancelRequest !== undefined) return 'already_requested';
-    try {
-      await storage.saveSession(
-        {
-          ...current,
-          cancelRequest: { requestedAt: Date.now(), reason: SUBAGENT_CONTROL_CANCEL_REASON, requestedBy },
-        },
-        { harnessName, ownerId: current.ownerId ?? fallbackOwnerId, ifVersion: current.version },
-      );
-      return 'recorded';
-    } catch (err) {
-      if (err instanceof HarnessStorageVersionConflictError) continue;
-      return 'unavailable';
-    }
-  }
-  return 'unavailable';
 }
 
 /**
@@ -330,15 +318,17 @@ export function createSubagentControlTool(parent: Session) {
 
   /**
    * Resolve the views for `childIds`, or for every known child when omitted.
-   * A named id that is not this session's own child is returned in `foreign`.
+   * A named id that is not this session's own child is returned in `foreign`;
+   * a discovered id (implicit listing) without an own row is skipped, and an
+   * id in `knownOwned` whose row has since been deleted reads as closed.
    */
   async function resolveChildren(
     childIds: readonly string[] | undefined,
+    opts: { limit?: number; knownOwned?: ReadonlySet<string> } = {},
   ): Promise<{ views: SubagentView[]; foreign: string[]; truncated: boolean }> {
     const delegated = await loadDelegatedTasks();
     const activeById = new Map(activeSubagents().map(state => [state.subagentSessionId, state]));
     let ids: string[];
-    let truncated = false;
     if (childIds !== undefined) {
       ids = Array.from(new Set(childIds));
     } else {
@@ -350,20 +340,28 @@ export function createSubagentControlTool(parent: Session) {
       ids = Array.from(known.entries())
         .sort((left, right) => right[1] - left[1])
         .map(([id]) => id);
-      truncated = ids.length > SUBAGENT_CONTROL_STATUS_LIMIT;
-      ids = ids.slice(0, SUBAGENT_CONTROL_STATUS_LIMIT);
     }
     const views: SubagentView[] = [];
     const foreign: string[] = [];
     for (const id of ids) {
       const { record, live } = await loadChildRecord(id);
-      if (!isOwnChild(record)) {
+      if (isOwnChild(record)) {
+        views.push(project(id, record, live, activeById.get(id), delegated.get(id)));
+      } else if (record === null && opts.knownOwned?.has(id) === true) {
+        views.push({
+          subagentSessionId: id,
+          source: 'session',
+          status: 'closed',
+          settled: true,
+          cancelRequested: false,
+          live: false,
+        });
+      } else if (childIds !== undefined) {
         foreign.push(id);
-        continue;
       }
-      views.push(project(id, record, live, activeById.get(id), delegated.get(id)));
     }
-    return { views, foreign, truncated };
+    const truncated = opts.limit !== undefined && views.length > opts.limit;
+    return { views: truncated ? views.slice(0, opts.limit) : views, foreign, truncated };
   }
 
   function foreignError(ids: readonly string[]): SubagentControlOutput {
@@ -371,7 +369,9 @@ export function createSubagentControlTool(parent: Session) {
   }
 
   async function status(childId: string | undefined): Promise<SubagentControlOutput> {
-    const { views, foreign, truncated } = await resolveChildren(childId === undefined ? undefined : [childId]);
+    const { views, foreign, truncated } = await resolveChildren(childId === undefined ? undefined : [childId], {
+      limit: SUBAGENT_CONTROL_STATUS_LIMIT,
+    });
     if (foreign.length > 0) return foreignError(foreign);
     return { action: 'status', subagents: views, ...(truncated ? { truncated: true } : {}) };
   }
@@ -383,28 +383,31 @@ export function createSubagentControlTool(parent: Session) {
   ): Promise<SubagentControlOutput> {
     const deadline = Date.now() + timeoutMs;
     let targets = childIds;
+    let knownOwned: ReadonlySet<string> | undefined;
+    let interval = WAIT_POLL_INTERVAL_MS;
     for (;;) {
-      const { views, foreign } = await resolveChildren(targets);
+      const { views, foreign } = await resolveChildren(targets, knownOwned === undefined ? {} : { knownOwned });
       if (foreign.length > 0) return foreignError(foreign);
-      // An implicit wait pins the children that were running when it started.
-      if (targets === undefined) {
-        targets = views.filter(view => !view.settled).map(view => view.subagentSessionId);
-        if (targets.length === 0) {
-          return { action: 'wait', settledSubagents: [], runningSubagents: [], timedOut: false };
-        }
-        continue;
-      }
-      const running = views.filter(view => !view.settled);
-      const timedOut = running.length > 0 && Date.now() >= deadline;
-      if (running.length === 0 || timedOut || signal?.aborted === true) {
+      // Ownership is proven once; a child row deleted mid-wait then reads as closed.
+      knownOwned ??= new Set(views.map(view => view.subagentSessionId));
+      // An implicit wait pins every child that was running when it started.
+      targets ??= views.filter(view => !view.settled).map(view => view.subagentSessionId);
+      const pinned = new Set(targets);
+      const current = views.filter(view => pinned.has(view.subagentSessionId));
+      const running = current.filter(view => !view.settled);
+      const aborted = signal?.aborted === true;
+      const timedOut = running.length > 0 && !aborted && Date.now() >= deadline;
+      if (running.length === 0 || timedOut || aborted) {
         return {
           action: 'wait',
-          settledSubagents: views.filter(view => view.settled),
+          settledSubagents: current.filter(view => view.settled),
           runningSubagents: running,
           timedOut,
+          ...(aborted && running.length > 0 ? { aborted: true } : {}),
         };
       }
-      await abortable(Math.min(WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())), signal);
+      await abortable(Math.min(interval, Math.max(0, deadline - Date.now())), signal);
+      interval = Math.min(interval * 2, WAIT_POLL_MAX_INTERVAL_MS);
     }
   }
 
@@ -421,26 +424,30 @@ export function createSubagentControlTool(parent: Session) {
           : 'subagent is not live in this process; inspect it with status',
       );
     }
-    if (!child.isRunning() || view.status === 'awaiting_input') {
+    if (view.status === 'awaiting_input') {
       return validationError(
         'subagentSessionId',
-        view.status === 'awaiting_input'
-          ? 'subagent is awaiting human input; it cannot take a message until that interaction is resolved'
-          : 'subagent has no active run to deliver the message to',
+        'subagent is awaiting human input; it cannot take a message until that interaction is resolved',
       );
     }
-    const delivered = await child.injectSystemReminder(message, {
-      attributes: { source: 'parent_session', parentSessionId: parent.id },
-    });
-    return {
-      action: 'send',
-      subagentSessionId: childId,
-      delivered: delivered.willInterleave,
-      status: view.status,
-    };
+    try {
+      // Interleave-only: a child without an active run is never woken into a
+      // new, unsupervised turn.
+      await child.injectSystemReminder(
+        message,
+        { attributes: { source: 'parent_session', parentSessionId: parent.id } },
+        { requireActiveRun: true },
+      );
+    } catch (err) {
+      if (err instanceof HarnessValidationError) {
+        return validationError('subagentSessionId', 'subagent has no active run to deliver the message to');
+      }
+      throw err;
+    }
+    return { action: 'send', subagentSessionId: childId, delivered: true, status: view.status };
   }
 
-  async function cancel(childId: string): Promise<SubagentControlOutput> {
+  async function cancel(childId: string, signal: AbortSignal | undefined): Promise<SubagentControlOutput> {
     const before = await resolveChildren([childId]);
     if (before.foreign.length > 0) return foreignError(before.foreign);
     const view = before.views[0]!;
@@ -453,42 +460,56 @@ export function createSubagentControlTool(parent: Session) {
         status: view.status,
       };
     }
-    if (view.cancelRequested) {
-      return {
-        action: 'cancel',
-        subagentSessionId: childId,
-        cancel: 'already_requested',
-        settled: view.settled,
-        status: view.status,
-      };
-    }
-    const delivery = await parent._internalCancelOwnedSubagent(childId, SUBAGENT_CONTROL_CANCEL_REASON);
-    let landed: 'acknowledged' | 'intent_recorded' | 'already_requested' | 'already_settled' = 'acknowledged';
-    if (delivery === 'unavailable') {
-      const intent = await recordDurableCancelIntent(storage, harnessName, childId, parent.id, parent._internalOwnerId);
-      if (intent === 'unavailable') {
+    // A repeated cancel still runs: it resumes an incomplete descendant cascade.
+    const wasRequested = view.cancelRequested;
+    const leaseWaitDeadline = Date.now() + SUBAGENT_CONTROL_MAX_LEASE_WAIT_MS;
+    let delivery = await parent._internalCancelOwnedSubagent(childId, SUBAGENT_CONTROL_CANCEL_REASON);
+    for (let attempt = 1; delivery === 'unavailable' && attempt < CANCEL_ATTEMPTS; attempt++) {
+      const stored = await storage.loadSession({ harnessName, sessionId: childId });
+      if (stored === null || stored.closedAt !== undefined) {
         return {
-          isError: true,
-          errorName: 'HarnessSubagentCancelUnavailableError',
-          code: 'harness.subagent_cancel_unavailable',
-          message: 'The subagent could not be reached and its cancel request could not be recorded; retry later.',
+          action: 'cancel',
           subagentSessionId: childId,
+          cancel: 'already_settled',
+          settled: true,
+          status: 'closed',
         };
       }
-      landed =
-        intent === 'recorded' ? 'intent_recorded' : intent === 'settled' ? 'already_settled' : 'already_requested';
+      if (stored.cancelRequest !== undefined && !wasRequested) {
+        // The child committed the cancel; only its descendant discovery failed.
+        delivery = 'delivered_incomplete';
+        break;
+      }
+      // Another process's lease: never write under it (its holder would then
+      // fail its own CAS writes, including close). Wait, bounded, for it to
+      // lapse — a live holder renewing it is fenced by its own subtree renewal.
+      const heldUntil =
+        stored.ownerId !== undefined && stored.ownerId !== parent._internalOwnerId ? (stored.leaseExpiresAt ?? 0) : 0;
+      if (heldUntil > Date.now()) {
+        if (heldUntil + LEASE_EXPIRY_SLACK_MS > leaseWaitDeadline || isAborted(signal)) break;
+        await abortable(heldUntil - Date.now() + LEASE_EXPIRY_SLACK_MS, signal);
+        if (isAborted(signal)) break;
+      }
+      delivery = await parent._internalCancelOwnedSubagent(childId, SUBAGENT_CONTROL_CANCEL_REASON);
     }
+    if (delivery === 'unavailable') {
+      return {
+        isError: true,
+        errorName: 'HarnessSubagentCancelUnavailableError',
+        code: 'harness.subagent_cancel_unavailable',
+        message:
+          'The subagent is held by another process and could not be cancelled yet; nothing was changed. Retry the cancel later.',
+        subagentSessionId: childId,
+      };
+    }
+    const incomplete = delivery === 'delivered_incomplete';
     const after = (await resolveChildren([childId])).views[0];
     return {
       action: 'cancel',
       subagentSessionId: childId,
-      cancel: landed,
-      // A recorded intent has not reached the holder yet: an idle child there is
-      // not settled until it observes the intent or closes.
-      settled:
-        after === undefined
-          ? landed === 'already_settled'
-          : after.settled && !(landed === 'intent_recorded' && after.status === 'idle'),
+      cancel: wasRequested ? 'already_requested' : 'acknowledged',
+      settled: (after?.settled ?? false) && !incomplete,
+      ...(incomplete ? { descendantCancelIncomplete: true } : {}),
       ...(after !== undefined ? { status: after.status } : {}),
     };
   }
@@ -500,8 +521,8 @@ export function createSubagentControlTool(parent: Session) {
       '`status` lists them (or inspects one) with their status and, once settled, their result. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes; it ' +
       'returns settled results and those still running. `send` adds an instruction to a running ' +
-      'subagent. `cancel` stops one subagent; `cancel: "acknowledged"` or `"intent_recorded"` means the ' +
-      'request is accepted, and `settled` says whether the subagent has finished unwinding. You can only ' +
+      'subagent. `cancel` stops one subagent; `cancel: "acknowledged"` means the cancel is recorded and ' +
+      'its work aborted, and `settled` says whether the subagent has finished unwinding. You can only ' +
       'act on your own subagents.',
     inputSchema,
     outputSchema,
@@ -521,7 +542,7 @@ export function createSubagentControlTool(parent: Session) {
           case 'send':
             return await send(input.subagentSessionId!, input.message!);
           case 'cancel':
-            return await cancel(input.subagentSessionId!);
+            return await cancel(input.subagentSessionId!, ctx?.abortSignal);
         }
       } catch (err) {
         const publicError = projectHarnessPublicError(err);
