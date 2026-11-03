@@ -28,7 +28,7 @@ export interface HarnessSubagentBudgetMeter {
    * Record one completed iteration. Returns true when the run must stop here
    * because a budget is reached and the model would otherwise continue.
    */
-  observe(context: Pick<IterationCompleteContext, 'isFinal' | 'usage'>): boolean;
+  observe(context: Pick<IterationCompleteContext, 'isFinal' | 'usage' | 'runId' | 'iteration'>): boolean;
   readonly exhausted: HarnessSubagentBudgetExhaustion | undefined;
 }
 
@@ -50,23 +50,33 @@ export function createHarnessSubagentBudgetMeter(
   let steps = 0;
   let tokens = 0;
   let exhausted: HarnessSubagentBudgetExhaustion | undefined;
+  // Durable loop predicates may be replayed for the same iteration before the
+  // transition commits; a replay repeats the earlier decision without counting.
+  let last: { runId: string; iteration: number; stop: boolean } | undefined;
   return {
     observe(context) {
-      if (exhausted !== undefined) return true;
-      steps += 1;
-      tokens += stepTokens(context.usage);
-      if (context.isFinal) return false;
-      if (maxSteps !== undefined && steps >= maxSteps) {
-        exhausted = { budget: 'steps', limit: maxSteps, used: steps };
-      } else if (maxTotalTokens !== undefined && tokens >= maxTotalTokens) {
-        exhausted = { budget: 'tokens', limit: maxTotalTokens, used: tokens };
-      }
-      return exhausted !== undefined;
+      if (last !== undefined && last.runId === context.runId && last.iteration === context.iteration) return last.stop;
+      const stop = observeOnce(context);
+      last = { runId: context.runId, iteration: context.iteration, stop };
+      return stop;
     },
     get exhausted() {
       return exhausted;
     },
   };
+
+  function observeOnce(context: Pick<IterationCompleteContext, 'isFinal' | 'usage'>): boolean {
+    if (exhausted !== undefined) return true;
+    steps += 1;
+    tokens += stepTokens(context.usage);
+    if (context.isFinal) return false;
+    if (maxSteps !== undefined && steps >= maxSteps) {
+      exhausted = { budget: 'steps', limit: maxSteps, used: steps };
+    } else if (maxTotalTokens !== undefined && tokens >= maxTotalTokens) {
+      exhausted = { budget: 'tokens', limit: maxTotalTokens, used: tokens };
+    }
+    return exhausted !== undefined;
+  }
 }
 
 /** Parent-visible error for a child stopped by its budget before it reported an outcome. */

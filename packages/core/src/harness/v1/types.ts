@@ -1636,8 +1636,9 @@ export interface SubagentDefinition {
    * parent then receives a `harness.subagent_budget_exhausted` error result
    * whose bounded summary carries the partial text, tool trace, usage and
    * `budgetExhausted`; it is never reported as success. A step that ends the
-   * child (for example its outcome report) is never counted as exhaustion.
-   * The Harness-wide per-turn ceiling of 1,000 steps still applies.
+   * child (for example its outcome report) is never counted as exhaustion,
+   * and the Harness's one response-only recovery reply after a silent final
+   * step is not metered. The Harness-wide per-turn ceiling of 1,000 steps still applies.
    * Positive integer. Omitted ⇒ no per-type step budget.
    *
    * The meter lives with the child session in this process: a delegated

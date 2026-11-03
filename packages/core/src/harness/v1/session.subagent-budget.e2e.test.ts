@@ -55,6 +55,8 @@ function progressToolCallStream(toolCallId: string, toolName: string, inputJson:
 function budgetFixture(
   budget: Pick<SubagentDefinition, 'maxSteps' | 'maxTotalTokens'>,
   parentCalls: (call: number) => ReturnType<typeof progressToolCallStream>,
+  childStream: (call: number) => ReturnType<typeof progressToolCallStream> = call =>
+    progressToolCallStream(`search-${call}`, 'searchPapers', '{}', `Searched ${call}. `),
 ) {
   const search = vi.fn(async () => ({ hits: 1 }));
   const searchPapers = createTool({
@@ -74,7 +76,7 @@ function budgetFixture(
         return {
           rawCall: { rawPrompt: null, rawSettings: {} },
           warnings: [],
-          stream: progressToolCallStream(`search-${childCalls}`, 'searchPapers', '{}', `Searched ${childCalls}. `),
+          stream: childStream(childCalls),
         };
       },
     }),
@@ -174,6 +176,36 @@ describe('Harness v1 — per-type subagent budgets', () => {
       });
       // The tool trace serves parent continuation only; the event keeps its cap.
       expect((end as { output: { toolTrace?: unknown } }).output.toolTrace).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('lets a child that reports its outcome on the last allowed step complete normally', async () => {
+    const { harness, childCalls } = budgetFixture({ maxSteps: 2 }, spawnThenAnswer, call =>
+      call === 1
+        ? progressToolCallStream('search-1', 'searchPapers', '{}')
+        : progressToolCallStream(
+            'child-outcome',
+            'report_subagent_outcome',
+            JSON.stringify({
+              outcome: 'completed',
+              summary: 'Found one paper.',
+              evidence: [{ kind: 'tool-result', toolName: 'searchPapers', status: 'success', description: 'One hit.' }],
+            }),
+          ),
+    );
+    try {
+      const session = await harness.session({ resourceId: 'budget-user', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+
+      await session.message({ content: 'Find papers on X.' });
+
+      expect(childCalls()).toBe(2);
+      const end = events.find(event => event.type === 'subagent_end') as { isError: boolean; output: any };
+      expect(end).toMatchObject({ isError: false, output: { status: 'success', outcome: 'completed' } });
+      expect(end.output.budgetExhausted).toBeUndefined();
     } finally {
       await harness.shutdown();
     }
