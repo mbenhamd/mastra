@@ -442,9 +442,10 @@ describe('Harness subagent outcome terminal contract', () => {
     });
 
     expect(summary.outcome).toBe('completed');
-    // With no room left, neither the trace nor its flag is added.
+    // No room for the trace, but the flag still fits the 64 KiB envelope, so the
+    // parent is told entries were dropped instead of reading "no tools ran".
     expect(summary.toolTrace).toBeUndefined();
-    expect(summary.toolTraceTruncated).toBeUndefined();
+    expect(summary.toolTraceTruncated).toBe(true);
     expect(harnessSubagentResultSummarySchema.safeParse(summary).success).toBe(true);
     expect(new TextEncoder().encode(JSON.stringify(summary)).byteLength).toBeLessThanOrEqual(
       MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES,

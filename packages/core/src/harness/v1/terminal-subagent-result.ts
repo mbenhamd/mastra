@@ -564,13 +564,15 @@ export function summarizeHarnessSubagentResult(
     MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES,
     MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES - MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES - summaryBytes,
   );
-  // The key and flag bytes come out of the same budget, so a summary already at
-  // the limit gains neither a trace nor the flag.
+  // The key and flag bytes come out of the trace budget. The flag itself is
+  // kept whenever entries were dropped and it fits the 64 KiB terminal
+  // envelope: the parent must not read a missing trace as "no tools ran".
+  // plan_task_check drops trace and flag if a wrapped view would not fit.
   const toolTrace = summarizeToolTrace(
     value,
     traceBudget - HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES - '"toolTrace":,'.length,
   );
-  const flagFits = traceBudget >= HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES;
+  const flagFits = summaryBytes + HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES <= MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES;
   return {
     ...summary,
     ...(toolTrace.trace ? { toolTrace: toolTrace.trace } : {}),
