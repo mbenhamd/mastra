@@ -92,6 +92,8 @@ async function poll(pred: () => boolean | Promise<boolean>, timeoutMs = 2000): P
  * is idle.
  */
 async function deliveryFinished(parent: Session, taskId: string): Promise<void> {
+  // The notice is written by the settlement itself, so wait for that first.
+  await poll(async () => ['completed', 'failed', 'blocked'].includes((await planRow(parent, taskId))?.status ?? ''));
   await poll(
     async () =>
       (parent as any)._delegationNoticesInFlight.size === 0 && owedNotice(await planRow(parent, taskId)) === undefined,
@@ -143,7 +145,7 @@ async function delegateFromParentTurn(
   return { taskId: task.taskId as string, childId: delegated.subagentSessionId as string, releaseChild, endParentTurn };
 }
 
-/** Hold every write to the parent thread until the returned release is called. */
+/** Hold reminder-row writes to the parent thread until the returned release is called. */
 function gatedMemory(): { memory: MockMemory; release: () => void; entered: Promise<void> } {
   const memory = new MockMemory();
   let release!: () => void;
@@ -152,8 +154,10 @@ function gatedMemory(): { memory: MockMemory; release: () => void; entered: Prom
   const entered = new Promise<void>(r => (enter = r));
   const save = memory.saveMessages.bind(memory);
   vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
-    enter();
-    await gate;
+    if (args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) {
+      enter();
+      await gate;
+    }
     return save(args);
   });
   return { memory, release, entered };
