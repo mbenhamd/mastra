@@ -1807,6 +1807,8 @@ export class Session {
   private _assistantDraftFlushUrgent = false;
   /** At most one draft checkpoint may be queued/running on the session CAS chain. */
   private _assistantDraftFlushInFlight: Promise<void> | undefined;
+  /** PF-7538: set when the Harness fenced this session because another owner holds its lease. */
+  private _evictedByLeaseLoss = false;
   /**
    * §SA3 — shared parent-local reservation count for inline `spawn_subagent`
    * and durable `task_delegate` work. It includes the create/link window so two
@@ -3244,10 +3246,10 @@ export class Session {
       if (inFlight !== undefined) {
         // PF-7538: a lease-lost eviction raised from inside this very
         // checkpoint's save drains event persistence (and so this barrier)
-        // before the checkpoint can settle. Awaiting it there never resolves.
-        // Once evicted, no new draft write can start here (`_flushUpdate`
-        // rejects), and the in-flight one settles on its own, so stop.
-        if (this._state === 'evicted') return;
+        // before the checkpoint can settle. Awaiting it there never resolves,
+        // and the checkpoint cannot commit without the lease anyway. Pressure
+        // and idle evictions still hold the lease, so they keep awaiting it.
+        if (this._state === 'evicted' && this._evictedByLeaseLoss) return;
         await inFlight;
         continue;
       }
@@ -6643,6 +6645,11 @@ export class Session {
   }
 
   /** Current lifecycle state. */
+  /** @internal PF-7538 — evicted because another owner holds the lease. */
+  get _internalEvictedByLeaseLoss(): boolean {
+    return this._state === 'evicted' && this._evictedByLeaseLoss;
+  }
+
   get lifecycleState(): SessionLifecycleState {
     return this._state;
   }
@@ -21842,8 +21849,9 @@ export class Session {
    * instance from the live map (§5.4). The record stays active in storage;
    * the session can be re-hydrated. Currently unused; lands with eviction.
    */
-  _markEvicted(updatedRecord: SessionRecord): void {
+  _markEvicted(updatedRecord: SessionRecord, reason?: 'lease_lost' | 'pressure' | 'idle'): void {
     const err = new HarnessValidationError('session.evict()', 'Session evicted');
+    this._evictedByLeaseLoss = reason === 'lease_lost';
     this._leaseExtensionDeadline = undefined;
     this._clearPendingInteractionExpiryTimer();
     this._record = updatedRecord;

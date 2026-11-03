@@ -5185,6 +5185,72 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     expect(loops(a)).toEqual(allStopped);
     await expect(b.shutdown()).resolves.toBeUndefined();
   });
+
+  it('skips draining a child fenced with its adopted parent instead of waiting out its queued work', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const parent = await a.session({ resourceId: 'u', threadId: 't-fenced-parent' });
+    const child = await a.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: parent.id });
+    dirtyTokenUsage(parent);
+    // Queued child work that no longer drains once the parent's save fences
+    // the whole subtree.
+    const childInternals = child as unknown as { _record: ReturnType<typeof child.getRecord> };
+    childInternals._record = {
+      ...child.getRecord(),
+      pendingQueue: [
+        { id: 'q-child', admissionId: 'a-child', enqueuedAt: Date.now(), content: 'queued', attachments: [] },
+      ],
+    } as ReturnType<typeof child.getRecord>;
+    await adoptInto(db, b, parent.id, parent.getRecord().harnessName);
+
+    const startedAt = Date.now();
+    await expect(a.shutdown({ drainTimeoutMs: 30_000 })).resolves.toBeUndefined();
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+
+    expect(child.lifecycleState).toBe('evicted');
+    expect(loops(a)).toEqual(allStopped);
+    expect(a._internalLiveSessionCount()).toBe(0);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('keeps a pressure eviction waiting for an in-flight assistant-draft checkpoint', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-pressure-draft' });
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
+    let gateArmed = false;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (gateArmed) {
+        gateArmed = false;
+        await saveGate;
+      }
+      return saveSession(record, opts);
+    });
+    dirtyAssistantDraft(session);
+    const internals = session as unknown as {
+      _startAssistantDraftFlush(): Promise<void>;
+      _markEvicted(record: ReturnType<typeof session.getRecord>, reason: 'pressure'): void;
+    };
+    gateArmed = true;
+    const checkpoint = internals._startAssistantDraftFlush();
+    internals._markEvicted(session.getRecord(), 'pressure');
+
+    let barrierSettled = false;
+    const barrier = session._flushEventPersistence().then(() => {
+      barrierSettled = true;
+    });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(barrierSettled).toBe(false);
+
+    releaseSave();
+    await checkpoint;
+    await barrier;
+    expect(barrierSettled).toBe(true);
+  });
 });
 
 describe('Harness v1 — concurrent resolver race', () => {
