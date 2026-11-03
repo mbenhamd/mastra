@@ -627,30 +627,37 @@ function createHarnessEmptySynthesisOptions(
           };
           if (subagentBudget === undefined) return ordinary;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
+            // A budget stop is terminal: no later or replayed iteration, and no
+            // response-only recovery armed on the stopping step, reopens it.
+            if (subagentBudget.exhausted !== undefined) return { continue: false };
             if (responseOnly) return ordinary(context);
-            // A per-type subagent budget is a framework stop at this step
-            // boundary. Configured observers still see the iteration, but
-            // neither they nor their feedback can reopen it (the loop logs and
-            // ignores a throwing hook, which would otherwise skip this stop).
             const budgetReached = subagentBudget.observe(context, budgetSegment);
-            if (budgetReached && !context.isFinal) {
-              subagentBudget.exhaust();
+            if (!budgetReached) return ordinary(context);
+            // At the budget, configured observers still see the iteration, but
+            // neither their continuation nor their feedback can reopen it (the
+            // loop logs and ignores a throwing hook, so errors are reported here).
+            let result: Awaited<ReturnType<typeof ordinary>> = undefined;
+            if (context.isFinal) {
+              result = await ordinary(context);
+            } else {
               try {
                 await configured?.(context);
               } catch (error) {
                 reportConfiguredHookError('onIterationComplete', error);
               }
-              return { continue: false };
             }
-            const result = await ordinary(context);
-            // A final iteration ends the child within budget only when nothing
-            // reopens it: a hook continuation or the response-only recovery
-            // would spend past the budget, so the budget stops it instead.
-            if (budgetReached && result?.continue === true) {
-              subagentBudget.exhaust();
-              return { continue: false };
-            }
-            return result;
+            // Only a final step that nothing reopens ends the child within its
+            // budget. A continuation, feedback (which a durable loop can turn
+            // into another provider call), the empty-reply recovery, or the
+            // Harness step ceiling cutting off a model that wanted to continue
+            // all mean the child was stopped by its budget.
+            const reopened =
+              !context.isFinal ||
+              result?.continue === true ||
+              (result !== undefined && 'feedback' in result && result.feedback !== undefined) ||
+              ordinaryBudgetExhausted;
+            if (reopened) subagentBudget.exhaust();
+            return { continue: false };
           };
         },
         prepareStep: existing => {
@@ -2237,6 +2244,12 @@ export class Session {
       this._subagentBudget = createHarnessSubagentBudgetMeter(this._harness._getSubagentType(typeId));
     }
     return this._subagentBudget;
+  }
+
+  /** Spend to persist with a pending interaction, so a restart cannot reset it. */
+  private _subagentBudgetSpentProjection(): Pick<PendingResume, 'subagentBudgetSpent'> {
+    const meter = this._subagentBudgetMeter();
+    return meter === undefined ? {} : { subagentBudgetSpent: meter.spent() };
   }
 
   /** @internal — the budget that stopped this child, if one did. */
@@ -14741,7 +14754,8 @@ export class Session {
             current.toolCallId !== payload.toolCallId ||
             (pending.accountedTokenUsage === undefined &&
               pending.toolReceipts === undefined &&
-              pending.toolReceiptsOverflow !== true)
+              pending.toolReceiptsOverflow !== true &&
+              pending.subagentBudgetSpent === undefined)
           ) {
             return prev;
           }
@@ -14755,6 +14769,9 @@ export class Session {
                 : {}),
               ...(pending.toolReceipts !== undefined ? { toolReceipts: pending.toolReceipts } : {}),
               ...(pending.toolReceiptsOverflow === true ? { toolReceiptsOverflow: true } : {}),
+              ...(pending.subagentBudgetSpent !== undefined
+                ? { subagentBudgetSpent: pending.subagentBudgetSpent }
+                : {}),
             },
           };
         },
@@ -14849,7 +14866,7 @@ export class Session {
         : {}),
       ...(accountedTokenUsage ? { accountedTokenUsage } : {}),
       ...toolReceiptProjection,
-      ...(this._subagentBudget !== undefined ? { subagentBudgetSpent: this._subagentBudget.spent() } : {}),
+      ...this._subagentBudgetSpentProjection(),
       payload: this._buildResumePayload(kind, payload),
     };
 
@@ -20446,6 +20463,7 @@ export class Session {
       ...(this._currentToolSurfaceFenceSnapshot(runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
         : {}),
+      ...this._subagentBudgetSpentProjection(),
       payload: {
         question: params.question,
         ...(params.options ? { options: params.options } : {}),
@@ -20518,6 +20536,7 @@ export class Session {
       ...(this._currentToolSurfaceFenceSnapshot(runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
         : {}),
+      ...this._subagentBudgetSpentProjection(),
       payload: {
         sandboxAccess: {
           semanticType: params.semanticType,
@@ -20599,6 +20618,7 @@ export class Session {
       ...(this._currentToolSurfaceFenceSnapshot(runId)
         ? { toolSurfaceFence: this._currentToolSurfaceFenceSnapshot(runId) }
         : {}),
+      ...this._subagentBudgetSpentProjection(),
       payload: {
         ...(params.title !== undefined ? { title: params.title } : {}),
         plan: params.plan,
