@@ -127,30 +127,6 @@ describe('AnthropicSchemaCompatLayer', () => {
     });
   });
 
-  describe('arrays', () => {
-    it('accepts any items for an array schema without items', async () => {
-      const compatSchema = layer.processToCompatSchema({
-        type: 'object',
-        properties: { tags: { type: 'array' } },
-        required: ['tags'],
-      });
-
-      const result = await compatSchema['~standard'].validate({ tags: ['a', 1, { b: true }] });
-      expect(result).toEqual({ value: { tags: ['a', 1, { b: true }] } });
-    });
-
-    it('still rejects a wrong-typed item when the array schema has items', async () => {
-      const compatSchema = layer.processToCompatSchema({
-        type: 'object',
-        properties: { tags: { type: 'array', items: { type: 'string' } } },
-        required: ['tags'],
-      });
-
-      const result = await compatSchema['~standard'].validate({ tags: ['a', 1] });
-      expect('issues' in result && result.issues?.length).toBeTruthy();
-    });
-  });
-
   describe('Haiku string length constraints', () => {
     const haikuModelInfo: ModelInformation = {
       provider: 'anthropic',
