@@ -324,6 +324,30 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await a.harness.shutdown().catch(() => {});
   });
 
+  it('skips the wake when another parent turn began after the reminder was saved', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    // A user turn runs to completion between the reminder save and the wake claim.
+    const serialize = (parent as any)._serializePlanTaskWrite.bind(parent);
+    let userTurn: Promise<unknown> | undefined;
+    vi.spyOn(parent as any, '_serializePlanTaskWrite').mockImplementation(async (run: unknown) => {
+      if (userTurn === undefined && (parent as any)._delegationNoticesInFlight.size > 0) {
+        userTurn = parent.message({ content: 'a new user turn' });
+        await userTurn;
+      }
+      return serialize(run);
+    });
+
+    releaseChild();
+    await deliveryFinished(parent, taskId);
+
+    expect(userTurn).toBeDefined();
+    expect(reminderCalls(parentAgent)).toHaveLength(0);
+    expect(parentAgent.streamCalls).toHaveLength(2);
+    await harness.shutdown();
+  });
+
   it('a Stop after the reminder was persisted suppresses the pending wake', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

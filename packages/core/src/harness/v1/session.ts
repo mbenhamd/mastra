@@ -1809,6 +1809,8 @@ export class Session {
   private readonly _delegationDriverClaims = new Set<string>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
+  /** Turns begun by this live session; a settlement wake skips if a turn began after its reminder was saved. */
+  private _turnsBegun = 0;
   /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
   private readonly _pendingTerminalSubagentAnswers = new Map<
     string,
@@ -3056,6 +3058,7 @@ export class Session {
     }
     const controller = new AbortController();
     this._currentTurnAbortController = controller;
+    this._turnsBegun += 1;
     this._resetTurnTracking();
     this._currentTurnSourceWriteGuard = sourceWriteGuard;
     // §5.1b: stamp the run's EFFECTIVE identity AFTER the reset above, so the
@@ -3911,6 +3914,7 @@ export class Session {
         cleanup: done,
       };
       const timer = setTimeout(done, timeoutMs);
+      (timer as { unref?: () => void }).unref?.();
       this._idleWaiters.add(waiter);
     });
   }
@@ -22918,6 +22922,7 @@ export class Session {
         }),
       );
     const live = () => this._state === 'live' && !this.isClosing;
+    let claimed = false;
     try {
       if (!(await this._delegationNoticeIsOwed(notice))) return;
       if (this._record.cancelRequest !== undefined) {
@@ -22956,12 +22961,16 @@ export class Session {
         await acknowledge();
         return;
       }
+      // A turn that begins after this save reads the row from history itself.
+      const turnsBegunAtSave = this._turnsBegun;
       while (this.isRunning() && live()) await this._nextStateTransition(1_000);
       if (!live()) return;
       // The fenced acknowledgement is the claim: only its winner may wake.
       if (!(await acknowledge())) return;
+      claimed = true;
       const wakeIdle =
         live() &&
+        this._turnsBegun === turnsBegunAtSave &&
         this._record.cancelRequest === undefined &&
         !this.isRunning() &&
         this._activeWorkAdmissionIsCurrent(admissionEpoch) &&
@@ -22971,9 +22980,10 @@ export class Session {
         await this._injectSystemReminder(content, { attributes, metadata }, { signalId, admissionEpoch });
       }
     } catch {
-      // An unacknowledged notice stays durable; the persisted row is rewritten
-      // in place on retry, so a failing notice cannot accumulate copies.
-      this._scheduleDelegationReconcileRetry(retryAttempt);
+      // After the claim nothing is owed: a wake refused as busy lost its slot to
+      // a turn that reads the persisted row. Before it, the notice stays durable
+      // and the row is rewritten in place on retry, so copies cannot accumulate.
+      if (!claimed) this._scheduleDelegationReconcileRetry(retryAttempt);
     } finally {
       this._delegationNoticesInFlight.delete(key);
     }
