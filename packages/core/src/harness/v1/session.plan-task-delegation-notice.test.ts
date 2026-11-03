@@ -348,6 +348,37 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await harness.shutdown();
   });
 
+  it('a Stop between a failed delivery and its retry still suppresses the wake', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const save = memory.saveMessages.bind(memory);
+    let failReminderWrite = true;
+    vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
+      if (
+        failReminderWrite &&
+        args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))
+      ) {
+        failReminderWrite = false;
+        throw new Error('transient storage failure');
+      }
+      return save(args);
+    });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+
+    releaseChild();
+    await poll(() => !failReminderWrite && (parent as any)._delegationNoticesInFlight.size === 0);
+    expect(owedNotice(await planRow(parent, taskId))).toMatchObject({ mode: 'wake' });
+    await parent.abortActiveWork({ reason: 'user_requested' });
+    // The retry runs under a fresh reconcile pass with a post-Stop epoch.
+    await (parent as any)._reconcileDelegationsOnHydrate(0);
+    await deliveryFinished(parent, taskId);
+
+    expect(reminderCalls(parentAgent)).toHaveLength(0);
+    expect(parentAgent.streamCalls).toHaveLength(1);
+    await harness.shutdown();
+  });
+
   it('a Stop after the reminder was persisted suppresses the pending wake', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

@@ -1809,6 +1809,11 @@ export class Session {
   private readonly _delegationDriverClaims = new Set<string>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
+  /**
+   * First admission epoch seen for each owed notice in this process, so a retry
+   * or a later reconcile pass cannot launder a Stop that happened in between.
+   */
+  private readonly _delegationNoticeEpochs = new Map<string, number>();
   /** Turns begun by this live session; a settlement wake skips if a turn began after its reminder was saved. */
   private _turnsBegun = 0;
   /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
@@ -22913,6 +22918,9 @@ export class Session {
     const key = `${notice.subagentSessionId}:${notice.digest}`;
     if (this._state !== 'live' || this.isClosing || this._delegationNoticesInFlight.has(key)) return;
     this._delegationNoticesInFlight.add(key);
+    const firstEpoch = this._delegationNoticeEpochs.get(key);
+    if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
+    else admissionEpoch = firstEpoch;
     const acknowledge = () =>
       this._serializePlanTaskWrite(() =>
         planTaskAcknowledgeDelegationSettlementNotice(this._planTaskPort(), {
@@ -22920,11 +22928,17 @@ export class Session {
           subagentSessionId: notice.subagentSessionId,
           digest: notice.digest,
         }),
-      );
+      ).then(acknowledged => {
+        if (acknowledged) this._delegationNoticeEpochs.delete(key);
+        return acknowledged;
+      });
     const live = () => this._state === 'live' && !this.isClosing;
     let claimed = false;
     try {
-      if (!(await this._delegationNoticeIsOwed(notice))) return;
+      if (!(await this._delegationNoticeIsOwed(notice))) {
+        this._delegationNoticeEpochs.delete(key);
+        return;
+      }
       if (this._record.cancelRequest !== undefined) {
         await acknowledge();
         return;
@@ -22939,7 +22953,14 @@ export class Session {
       // does: no synthetic broadcast run occupies the thread, so a following
       // idle wake is not mistaken for an interleave, and nothing is handed to
       // an ungated follow-up run.
-      const memory = await agent.getMemory({ requestContext: new RequestContext() });
+      // Resolve memory with the parent's own context, as its turns do, so a
+      // dynamic memory resolver selects the parent's store.
+      const requestContext = await this._buildRequestContext({
+        modeId: this._currentRunModeId ?? this._record.modeId,
+        modelId: this._record.modelId,
+        abortSignal: new AbortController().signal,
+      });
+      const memory = await agent.getMemory({ requestContext });
       if (memory !== undefined && memory !== null) {
         await memory.saveMessages({
           messages: [
