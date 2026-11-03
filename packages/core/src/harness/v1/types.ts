@@ -1381,21 +1381,22 @@ export interface HarnessConfigCommon {
     delegationTimeoutMs?: number;
     /**
      * How the parent session learns that a detached `task_delegate` child
-     * settled. The notice is a `system-reminder` signal on the parent thread,
-     * sent only after the child closed and the fenced plan-task write committed.
+     * settled. The notice is a `system-reminder` signal persisted on the parent
+     * thread, sent only after the child closed and the fenced plan-task write
+     * committed.
      *
      * - `'none'` (default): no notice; the parent model reads settlements with
      *   `plan_task_check`.
-     * - `'remind'`: deliver into the parent's active run, or persist on an idle
-     *   parent thread so the next turn sees it. Never starts a turn.
-     * - `'wake'`: like `'remind'` while a parent turn is in progress; an idle
-     *   parent wakes with a follow-up turn.
+     * - `'remind'`: persist the reminder so the parent's next turn reads it.
+     *   Never starts a turn and never interleaves into a running one.
+     * - `'wake'`: persist it, then, once any running parent turn ended, start
+     *   one follow-up turn if the parent is idle, has no queued turn or parked
+     *   interaction, and was not stopped or cancelled since the settlement.
      *
      * The owed notice is recorded with the durable settlement and delivered at
      * most once per child session and settlement digest, including after a
      * process restart. A settlement caused by the parent's own Stop/cancel
-     * cascade sends no notice, a closed parent receives none, and an
-     * `abortActiveWork()` in flight downgrades a wake to a reminder.
+     * cascade sends no notice, and a closed parent receives none.
      */
     onDelegatedSettlement?: 'remind' | 'wake' | 'none';
     types: Record<string, SubagentDefinition>;

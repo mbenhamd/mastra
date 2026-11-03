@@ -14404,12 +14404,17 @@ export class Session {
     return this._injectSystemReminder(content, opts);
   }
 
-  /** `signalId` lets a harness-owned reminder reuse the id of its already-persisted row. */
+  /**
+   * `internal` is harness-owned: `signalId` reuses the id of an already
+   * persisted reminder row, and `admissionEpoch` makes the call an idle-only
+   * wake that a Stop or an already-active run rejects instead of interleaving.
+   */
   private async _injectSystemReminder(
     content: string,
     opts?: SessionInjectSystemReminderOptions,
-    signalId?: string,
+    internal?: { signalId: string; admissionEpoch: number },
   ): Promise<SessionInjectSystemReminderResult> {
+    const signalId = internal?.signalId;
     this._assertLive('injectSystemReminder()');
     this._assertOpenForTurn('injectSystemReminder()');
     if (typeof content !== 'string' || content.length === 0) {
@@ -14438,6 +14443,12 @@ export class Session {
     this._assertOpenForTurn('injectSystemReminder()');
     const activeRunId = sub.activeRunId();
     const willInterleave = activeRunId !== null;
+    if (
+      internal !== undefined &&
+      (willInterleave || this.isRunning() || !this._activeWorkAdmissionIsCurrent(internal.admissionEpoch))
+    ) {
+      throw new HarnessBusyError(this.id, 'in_flight');
+    }
 
     if (!willInterleave) {
       // Owned-turn path: full turn bookkeeping in a background
@@ -22834,7 +22845,7 @@ export class Session {
       );
       if (reconcileResult.reconciled) this._notifyDisplayRefresh();
       if (reconcileResult.notice !== undefined) {
-        void this._deliverDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch);
+        void this._deliverDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
       return reconcileResult.reconciled;
     } catch {
@@ -22872,23 +22883,28 @@ export class Session {
    * once per child session id + settlement digest (`key`, hashed into a
    * deterministic signal id, so every redelivery rewrites one message row).
    *
-   * 1. Send the reminder. An active parent run receives it mid-turn; the notice
-   *    stays owed until that run ended and the row is persisted (re-sent with
-   *    the same id, which upserts). An idle thread persists it without waking
-   *    (the native `persist` signal behaviour).
-   * 2. Acknowledge the owed notice with a version-fenced write. Only the winner
-   *    continues, so concurrent deliverers cannot both act on it.
-   * 3. With `wake`, a parent that was idle at delivery, is still idle, and saw no
-   *    Stop since settlement starts one follow-up turn with the same signal id.
-   *    A crash after step 2 loses at most that wake; the persisted reminder
-   *    still reaches the next turn.
+   * 1. Re-read the task: a stale scan snapshot must not deliver a notice that
+   *    another pass already acknowledged.
+   * 2. Persist the reminder row on the parent thread through the agent's
+   *    memory, as the runtime's `persist` signal behaviour does. Nothing is
+   *    delivered into a running turn, so the runtime never hands it to an
+   *    ungated follow-up run; the next parent turn reads it from history.
+   * 3. Acknowledge with a version-fenced write that re-checks the notice is still
+   *    owed (the claim). `remind` ends here and never starts a turn.
+   * 4. `wake` waits for the current parent turn to end, then claims and starts
+   *    one follow-up turn only when the parent is still idle, has no queued turn
+   *    or parked interaction, is not cancelled, and saw no Stop since settlement.
+   *    Otherwise it acknowledges without waking. A crash between claim and wake
+   *    loses at most that wake; the persisted reminder still reaches the next turn.
    *
    * A cancelled parent drops the notice. A closed or torn-down parent leaves it
-   * owed for restart reconcile. A transient failure re-arms reconciliation.
+   * owed for restart reconcile. A failure re-arms reconciliation with the
+   * caller's backoff attempt.
    */
   private async _deliverDelegationSettlementNotice(
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
+    retryAttempt: number,
   ): Promise<void> {
     const key = `${notice.subagentSessionId}:${notice.digest}`;
     if (this._state !== 'live' || this.isClosing || this._delegationNoticesInFlight.has(key)) return;
@@ -22901,7 +22917,9 @@ export class Session {
           digest: notice.digest,
         }),
       );
+    const live = () => this._state === 'live' && !this.isClosing;
     try {
+      if (!(await this._delegationNoticeIsOwed(notice))) return;
       if (this._record.cancelRequest !== undefined) {
         await acknowledge();
         return;
@@ -22910,65 +22928,68 @@ export class Session {
       const content = delegationSettlementNoticeText(notice);
       const attributes = { type: 'delegated-task-settled' };
       const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-      const send = (activeBehavior: 'persist' | 'deliver', deliveredRunId?: string) => {
-        // The active turn may run a per-turn mode override on another agent.
-        const agent = this._harness.getAgentForMode(this._currentRunModeId ?? this._record.modeId);
-        return agent.sendSignal(
-          {
-            type: 'system-reminder',
-            id: signalId,
-            contents: content,
-            attributes,
-            // The runtime replays a same-id, same-payload send from its admission
-            // cache; naming the run that already received it makes the durable
-            // re-send a distinct admission that rewrites the same row.
-            metadata: deliveredRunId === undefined ? metadata : { ...metadata, deliveredRunId },
-          },
-          {
-            resourceId: this.resourceId,
-            threadId: this.threadId,
-            ifActive: { behavior: activeBehavior },
-            ifIdle: {
-              behavior: 'persist',
-              streamOptions: { memory: { thread: this.threadId, resource: this.resourceId } } as never,
-            },
-          },
-        );
-      };
-      const first = send('deliver');
-      const accepted = await first.accepted;
-      if (accepted.action === 'persist') {
-        await first.persisted;
-      } else {
-        // Delivered into a run (or not admitted): the run's own message save is
-        // not an acknowledgement boundary. Persist the row once that run ended.
-        const deliveredRunId = accepted.action === 'deliver' ? accepted.runId : undefined;
-        if (deliveredRunId !== undefined) await this._awaitRunCompletion(deliveredRunId).catch(() => undefined);
-        // A parent closed or torn down meanwhile leaves the notice owed.
-        if (this._state !== 'live' || this.isClosing) return;
-        const durable = send('persist', deliveredRunId ?? 'undelivered');
-        await durable.accepted;
-        await durable.persisted;
+      // The active turn may run a per-turn mode override on another agent.
+      const agent = this._harness.getAgentForMode(this._currentRunModeId ?? this._record.modeId);
+      // Write the reminder row directly, as the runtime's `persist` behaviour
+      // does: no synthetic broadcast run occupies the thread, so a following
+      // idle wake is not mistaken for an interleave, and nothing is handed to
+      // an ungated follow-up run.
+      const memory = await agent.getMemory({ requestContext: new RequestContext() });
+      if (memory !== undefined && memory !== null) {
+        await memory.saveMessages({
+          messages: [
+            createSignal({
+              type: 'system-reminder',
+              id: signalId,
+              contents: content,
+              attributes,
+              metadata,
+            }).toDBMessage({
+              resourceId: this.resourceId,
+              threadId: this.threadId,
+            }),
+          ],
+        });
       }
+      if (!live()) return;
+      if (notice.mode === 'remind') {
+        await acknowledge();
+        return;
+      }
+      while (this.isRunning() && live()) await this._nextStateTransition(1_000);
+      if (!live()) return;
+      // The fenced acknowledgement is the claim: only its winner may wake.
       if (!(await acknowledge())) return;
       const wakeIdle =
-        notice.mode === 'wake' &&
-        accepted.action === 'persist' &&
-        this._state === 'live' &&
-        !this.isClosing &&
+        live() &&
         this._record.cancelRequest === undefined &&
         !this.isRunning() &&
         this._activeWorkAdmissionIsCurrent(admissionEpoch) &&
         this._record.pendingResume === undefined &&
         (this._record.pendingQueue ?? []).length === 0;
-      if (wakeIdle) await this._injectSystemReminder(content, { attributes, metadata }, signalId);
+      if (wakeIdle) {
+        await this._injectSystemReminder(content, { attributes, metadata }, { signalId, admissionEpoch });
+      }
     } catch {
-      // An unacknowledged notice stays durable; re-arm reconciliation so a live
-      // idle parent is not stranded until its next hydrate.
-      this._scheduleDelegationReconcileRetry(1);
+      // An unacknowledged notice stays durable; the persisted row is rewritten
+      // in place on retry, so a failing notice cannot accumulate copies.
+      this._scheduleDelegationReconcileRetry(retryAttempt);
     } finally {
       this._delegationNoticesInFlight.delete(key);
     }
+  }
+
+  /** Exact re-read: the notice with this digest is still owed on its task. */
+  private async _delegationNoticeIsOwed(notice: PendingDelegationSettlementNotice): Promise<boolean> {
+    const snapshot = await this._storage.loadPlanTaskSubtree({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      rootTaskId: notice.taskId,
+      limit: 1,
+    });
+    const task = snapshot.tasks.find(row => row.taskId === notice.taskId);
+    const current = task === undefined ? undefined : readPendingDelegationSettlementNotice(task);
+    return current?.subagentSessionId === notice.subagentSessionId && current.digest === notice.digest;
   }
 
   /**
@@ -23173,7 +23194,9 @@ export class Session {
       return;
     }
 
-    for (const owedNotice of owedNotices) void this._deliverDelegationSettlementNotice(owedNotice, admissionEpoch);
+    for (const owedNotice of owedNotices) {
+      void this._deliverDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
+    }
 
     let needsRetry = false;
     for (const task of delegated) {
