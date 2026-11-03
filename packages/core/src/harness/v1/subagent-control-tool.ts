@@ -436,7 +436,7 @@ export function createSubagentControlTool(parent: Session) {
       await child.injectSystemReminder(
         message,
         { attributes: { source: 'parent_session', parentSessionId: parent.id } },
-        { requireActiveRun: true },
+        { requireActiveRun: true, assertAdmitted: () => parent._internalAssertSubagentControlAdmitted(signal) },
       );
     } catch (err) {
       if (err instanceof HarnessValidationError) {

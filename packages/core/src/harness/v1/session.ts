@@ -6228,10 +6228,12 @@ export class Session {
       assertAdmitted?.();
       try {
         const alreadyCancelled = child.getRecord().cancelRequest !== undefined;
-        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id);
+        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id, assertAdmitted);
         if (!alreadyCancelled) cancelled.push(childId);
         unavailable.push(...nested.unavailable);
-      } catch {
+      } catch (error) {
+        // The caller lost admission mid-cancel: nothing was written; surface it.
+        if (assertAdmitted !== undefined && admissionLost(assertAdmitted)) throw error;
         unavailable.push(childId);
       }
     }
@@ -6241,6 +6243,8 @@ export class Session {
   private async _cancelInternal(
     opts?: { reason?: string; requestedBy?: string },
     parentOrigin?: string,
+    /** PF-7473: re-proved inside the serialized cancel write; a throw aborts it. */
+    assertAdmitted?: () => void,
   ): Promise<{ unavailable: string[] }> {
     this._assertNotDeleted();
     const existingCancel = this._currentCancelRequest();
@@ -6260,6 +6264,7 @@ export class Session {
 
     await this._flushUpdate(prev => {
       if (prev.cancelRequest !== undefined) return prev;
+      assertAdmitted?.();
 
       attemptedWrite = true;
       const existingReceipts = prev.queueAdmissionReceipts ?? {};
@@ -14437,7 +14442,7 @@ export class Session {
      * it rejects instead of waking an idle thread, decided at the same point
      * the interleave routing is decided (no await in between).
      */
-    internal?: { requireActiveRun?: boolean },
+    internal?: { requireActiveRun?: boolean; assertAdmitted?: () => void },
   ): Promise<SessionInjectSystemReminderResult> {
     this._assertLive('injectSystemReminder()');
     this._assertOpenForTurn('injectSystemReminder()');
@@ -14467,6 +14472,8 @@ export class Session {
     this._assertOpenForTurn('injectSystemReminder()');
     const activeRunId = sub.activeRunId();
     const willInterleave = activeRunId !== null;
+    // PF-7473: the sender may have lost admission during subscription setup.
+    internal?.assertAdmitted?.();
     if (!willInterleave && internal?.requireActiveRun === true) {
       throw new HarnessValidationError('injectSystemReminder()', 'no active run to interleave into');
     }
@@ -23301,6 +23308,16 @@ export class Session {
 }
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+/** PF-7473: true when the caller's admission check now fails. */
+function admissionLost(assertAdmitted: () => void): boolean {
+  try {
+    assertAdmitted();
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
