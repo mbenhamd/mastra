@@ -5396,6 +5396,22 @@ export class Harness {
     return session.lifecycleState === 'evicted';
   }
 
+  /**
+   * PF-7538: `err` failed `session` because another owner holds its lease, and
+   * the lease-lost path already fenced the session out of this harness. The
+   * lock error may arrive bare or as the `cause` of a wrapping error (for
+   * example a `session_save` `HarnessStorageError`).
+   */
+  private _isFencedEviction(session: Session, err: unknown): boolean {
+    if (!Harness._isEvicted(session) || this._liveSessions.get(session.id) === session) return false;
+    let current: unknown = err;
+    for (let depth = 0; depth < 8 && current instanceof Error; depth++) {
+      if (current instanceof HarnessSessionLockedError) return true;
+      current = current.cause;
+    }
+    return false;
+  }
+
   /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
   private _liveDescendantsOf(rootId: string): Session[] {
     const out: Session[] = [];
@@ -6593,34 +6609,47 @@ export class Harness {
 
     // Release every held lease. We keep the records active in storage —
     // shutdown is not a close.
-    const sessions = Array.from(this._liveSessions.values());
+    let sessions = Array.from(this._liveSessions.values());
     for (const session of sessions) {
       session._beginClosing();
     }
     const drainTimeoutMs = opts?.drainTimeoutMs ?? this._closeTimeoutMs;
     const drainDeadlineAt = Date.now() + drainTimeoutMs;
     let eventPersistenceError: { sessionId: string; error: unknown } | undefined;
+    // PF-7538: a session another owner adopted is fenced, not failed. Its save
+    // path already evicted it as `lease_lost` (dropped from `_liveSessions`,
+    // timers cleared, bridge torn down), so shutdown skips its remaining drain
+    // steps and neither restores it nor rolls the harness back for it. Any
+    // other failure keeps the restore-and-throw contract below.
+    const recordDrainFailure = (session: Session, err: unknown): void => {
+      if (this._isFencedEviction(session, err)) return;
+      eventPersistenceError ??= { sessionId: session.id, error: err };
+    };
     for (const session of sessions) {
       try {
         await session._waitForShutdownDrain(drainDeadlineAt);
       } catch (err) {
-        eventPersistenceError ??= { sessionId: session.id, error: err };
+        recordDrainFailure(session, err);
         continue;
       }
       try {
         await session._internalPersistTokenUsageForShutdown({ deadlineAt: drainDeadlineAt });
         await session._internalAwaitFlushChain({ deadlineAt: drainDeadlineAt });
       } catch (err) {
-        eventPersistenceError ??= { sessionId: session.id, error: err };
+        recordDrainFailure(session, err);
         continue;
       }
       try {
         await session._flushEventPersistence();
       } catch (err) {
-        eventPersistenceError ??= { sessionId: session.id, error: err };
+        recordDrainFailure(session, err);
         continue;
       }
     }
+    // Sessions fenced during the drain (directly, or as members of a fenced
+    // subtree) belong to their new owner: no restore, no shutdown eviction
+    // marker, no lease release.
+    sessions = sessions.filter(session => this._liveSessions.get(session.id) === session);
     if (eventPersistenceError !== undefined) {
       for (const session of sessions) {
         session._restoreLiveAfterFailedClose();

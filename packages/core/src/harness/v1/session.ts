@@ -3242,6 +3242,12 @@ export class Session {
       }
       const inFlight = this._assistantDraftFlushInFlight;
       if (inFlight !== undefined) {
+        // PF-7538: a lease-lost eviction raised from inside this very
+        // checkpoint's save drains event persistence (and so this barrier)
+        // before the checkpoint can settle. Awaiting it there never resolves.
+        // Once evicted, no new draft write can start here (`_flushUpdate`
+        // rejects), and the in-flight one settles on its own, so stop.
+        if (this._state === 'evicted') return;
         await inFlight;
         continue;
       }

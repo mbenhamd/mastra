@@ -5036,6 +5036,157 @@ describe('Harness v1 — crash recovery (lease TTL)', () => {
   });
 });
 
+describe('Harness v1 — shutdown after another owner adopted a session (PF-7538)', () => {
+  type ShutdownLoopProbe = {
+    _leaseRenewalTimer?: unknown;
+    _channelInboxRecoveryTimer?: unknown;
+    _pendingInteractionExpirySweepLoopEnabled: boolean;
+  };
+  const loops = (h: Harness) => {
+    const p = h as unknown as ShutdownLoopProbe;
+    return {
+      leaseRenewal: p._leaseRenewalTimer !== undefined,
+      channelRecovery: p._channelInboxRecoveryTimer !== undefined,
+      expirySweep: p._pendingInteractionExpirySweepLoopEnabled,
+    };
+  };
+  const allRunning = { leaseRenewal: true, channelRecovery: true, expirySweep: true };
+  const allStopped = { leaseRenewal: false, channelRecovery: false, expirySweep: false };
+
+  // A Mastra-bound harness with a channel, so all three background loops run.
+  function boundOwner(storage: InMemoryHarness): Harness {
+    const composite = new InMemoryStore();
+    composite.stores.harness = storage;
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+      channels: { support: makeHarnessChannelConfig() },
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    return harness;
+  }
+
+  // Unflushed token usage forces shutdown to save the session record.
+  function dirtyTokenUsage(session: Awaited<ReturnType<Harness['session']>>): void {
+    (
+      session as unknown as { _tokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } }
+    )._tokenUsage = { promptTokens: 3, completionTokens: 4, totalTokens: 7 };
+  }
+
+  // Another process adopts the session after this owner's lease lapsed in
+  // storage; the owner's local lease view is unchanged.
+  async function adoptInto(db: InMemoryDB, adopter: Harness, sessionId: string, harnessName: string) {
+    const key = `${harnessName}\u0000${sessionId}`;
+    const stored = db.harnessSessions.get(key);
+    if (!stored) throw new Error('precondition: session must be stored');
+    db.harnessSessions.set(key, { ...stored, leaseExpiresAt: Date.now() - 1 });
+    return adopter.session({ sessionId });
+  }
+
+  // An unflushed assistant draft makes the drain checkpoint it instead.
+  function dirtyAssistantDraft(session: Awaited<ReturnType<Harness['session']>>): void {
+    (
+      session as unknown as {
+        _recordAssistantDraftDelta(opts: { runId: string; kind: 'text'; delta: string }): void;
+      }
+    )._recordAssistantDraftDelta({ runId: 'run-fenced', kind: 'text', delta: 'partial answer' });
+  }
+
+  it.each([
+    { unflushed: 'token usage', dirty: dirtyTokenUsage },
+    { unflushed: 'assistant draft', dirty: dirtyAssistantDraft },
+  ])(
+    "completes shutdown well before the drain deadline when another owner fenced this owner's session ($unflushed)",
+    async ({ dirty }) => {
+      const db = new InMemoryDB();
+      const storage = new InMemoryHarness({ db });
+      const a = boundOwner(storage);
+      const b = boundOwner(storage);
+      const session = await a.session({ resourceId: 'u', threadId: 't-fenced-shutdown' });
+      dirty(session);
+      const adopted = await adoptInto(db, b, session.id, session.getRecord().harnessName);
+      expect(adopted._internalOwnerId).toBe(b.ownerId);
+      expect(loops(a)).toEqual(allRunning);
+
+      const startedAt = Date.now();
+      await expect(a.shutdown({ drainTimeoutMs: 30_000 })).resolves.toBeUndefined();
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+
+      expect(loops(a)).toEqual(allStopped);
+      expect(a._internalLiveSessionCount()).toBe(0);
+      await expect(a.session({ resourceId: 'u', threadId: 't-other' })).rejects.toThrow();
+      // Shutdown neither released nor overwrote the adopter's ownership.
+      await expect(
+        storage.loadSession({ harnessName: session.getRecord().harnessName, sessionId: session.id }),
+      ).resolves.toMatchObject({ ownerId: b.ownerId });
+
+      await expect(b.shutdown()).resolves.toBeUndefined();
+      expect(loops(b)).toEqual(allStopped);
+    },
+  );
+
+  it('still restores live sessions, restarts the loops and throws on a transient save failure', async () => {
+    const storage = makeStorage();
+    const harness = boundOwner(storage);
+    const session = await harness.session({ resourceId: 'u', threadId: 't-transient-shutdown' });
+    dirtyTokenUsage(session);
+    vi.spyOn(storage, 'saveSession').mockRejectedValueOnce(new Error('transient save failure'));
+
+    await expect(harness.shutdown()).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({ message: 'transient save failure' }),
+    });
+
+    expect(loops(harness)).toEqual(allRunning);
+    expect(session.lifecycleState).toBe('live');
+    await expect(harness.session({ sessionId: session.id })).resolves.toBe(session);
+
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+    expect(loops(harness)).toEqual(allStopped);
+  });
+
+  it('evicts the fenced session but restores the rest and throws when another session fails transiently', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const fenced = await a.session({ resourceId: 'u', threadId: 't-mixed-fenced' });
+    const failing = await a.session({ resourceId: 'u', threadId: 't-mixed-transient' });
+    dirtyTokenUsage(fenced);
+    dirtyTokenUsage(failing);
+    await adoptInto(db, b, fenced.id, fenced.getRecord().harnessName);
+    const saveSession = storage.saveSession.bind(storage);
+    let failed = false;
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (!failed && record.id === failing.id) {
+        failed = true;
+        throw new Error('transient save failure');
+      }
+      return saveSession(record, opts);
+    });
+
+    await expect(a.shutdown({ drainTimeoutMs: 30_000 })).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      sessionId: failing.id,
+      cause: expect.objectContaining({ message: 'transient save failure' }),
+    });
+    expect(loops(a)).toEqual(allRunning);
+    expect(fenced.lifecycleState).toBe('evicted');
+    expect(failing.lifecycleState).toBe('live');
+    expect(a._internalLiveSessionCount()).toBe(1);
+
+    await expect(a.shutdown()).resolves.toBeUndefined();
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+});
+
 describe('Harness v1 — concurrent resolver race', () => {
   // §5.3 cold-resolution singleflight. Two CONCURRENT session() calls for the
   // SAME not-yet-live target (same harness instance) must collapse onto one
