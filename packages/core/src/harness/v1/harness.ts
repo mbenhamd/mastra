@@ -6595,6 +6595,10 @@ export class Harness {
   async shutdown(opts?: ShutdownOptions): Promise<void> {
     if (this._shutdown) return;
     this._shutdown = true;
+    // PF-7538: every session live when shutdown begins is held to the final
+    // storage-work barrier below, even if it is fenced (and leaves
+    // `_liveSessions`) before the drain snapshot is taken.
+    const sessionsAtStart = Array.from(this._liveSessions.values());
     this._stopLeaseRenewalLoop();
     this._stopChannelInboxRecoveryLoop();
     this._stopPendingInteractionExpirySweepLoop();
@@ -6724,23 +6728,23 @@ export class Harness {
         break;
       }
     }
-    // PF-7538: a fenced session's queued `_flushUpdate` links now settle
-    // without touching storage, but one already inside a storage call when the
-    // fence landed may still be pending. Settle every fenced session's flush
-    // chain (bounded by the drain deadline) so no write of theirs is
-    // outstanding once shutdown reports success.
-    const fencedSessions = sessions.filter(session => this._isFencedByLeaseLoss(session));
-    if (fencedSessions.length > 0) {
+    // PF-7538 invariant: shutdown never reports success while storage work
+    // started by any of its sessions is still pending — fenced or not, and
+    // whenever the fence landed. Settle each session's outstanding-work
+    // barrier (bounded by the drain deadline). Fenced sessions settle fast:
+    // their queued writes no-op and their turn waiters were rejected. A
+    // timeout fails the shutdown through the restore-and-throw path below.
+    if (eventPersistenceError === undefined) {
+      const heldSessions = [...new Set([...sessionsAtStart, ...sessions])];
       const settled = await this._settleBeforeDeadline(
-        Promise.all(fencedSessions.map(session => session._internalSettleFlushChain())),
+        Promise.all(heldSessions.map(session => session._internalSettleOutstandingWork())),
         drainDeadlineAt,
       );
       if (!settled) {
-        eventPersistenceError ??= {
-          sessionId: fencedSessions[0]!.id,
+        eventPersistenceError = {
           error: new HarnessValidationError(
             'shutdown()',
-            'Fenced session writes did not settle before shutdown deadline',
+            'Session storage work did not settle before shutdown deadline',
           ),
         };
       }

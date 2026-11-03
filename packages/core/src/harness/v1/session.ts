@@ -20936,16 +20936,31 @@ export class Session {
   }
 
   /**
-   * @internal PF-7538 — settle every link already queued on `_flushChain`
-   * (failures are swallowed by the chain itself). Lets shutdown confirm that a
-   * fenced session has no storage write outstanding.
+   * @internal PF-7538 — wait, without starting new writes, until no storage
+   * work this session already started is pending: background turn
+   * completions (signal settlement, terminal CAS, run summaries), result
+   * evidence writes, the `_flushChain` (including a queued or in-flight draft
+   * checkpoint) and the event-persistence tail. Failures stay with their
+   * owners; this only observes settlement. Shutdown's final barrier.
    */
-  async _internalSettleFlushChain(): Promise<void> {
-    let chain: Promise<void>;
-    do {
-      chain = this._flushChain;
-      await chain;
-    } while (chain !== this._flushChain);
+  async _internalSettleOutstandingWork(): Promise<void> {
+    while (true) {
+      const completions = [...this._backgroundTurnCompletions];
+      const evidenceWrites = [...this._resultEvidenceWrites];
+      const chain = this._flushChain;
+      const draft = this._assistantDraftFlushInFlight;
+      const events = this._eventPersistenceTail;
+      await Promise.allSettled([...completions, ...evidenceWrites, chain, events, ...(draft ? [draft] : [])]);
+      if (
+        this._backgroundTurnCompletions.size === 0 &&
+        this._resultEvidenceWrites.size === 0 &&
+        chain === this._flushChain &&
+        draft === this._assistantDraftFlushInFlight &&
+        events === this._eventPersistenceTail
+      ) {
+        return;
+      }
+    }
   }
 
   /**
@@ -20991,10 +21006,11 @@ export class Session {
       // serialize on the flush chain, so a conflict here means another owner).
       const maxRetries = opts?.ifVersion !== undefined ? 0 : 1;
       for (let attempt = 0; ; attempt++) {
-        // PF-7538: a link queued on `_flushChain` before an eviction runs
-        // after it. Re-check here, as the pre-enqueue guard above does, so a
-        // fenced (or otherwise evicted) session never writes storage again.
-        if (this._state === 'evicted') {
+        // PF-7538: a link queued on `_flushChain` before a lease-loss eviction
+        // runs after it. Re-check here, as the pre-enqueue guard above does, so
+        // a fenced session never writes storage again. Pressure and idle
+        // evictions still hold the lease, so their queued links keep writing.
+        if (this._state === 'evicted' && this._evictedByLeaseLoss) {
           throw new HarnessSessionClosedError(this.id);
         }
         const leaseExpiresAt = this._record.leaseExpiresAt;
