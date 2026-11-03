@@ -516,8 +516,18 @@ type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepare
  * model that stays silent twice is allowed to finish (never loop). The loop
  * ignores continuation results for terminal tool delivery, and error, abort,
  * safety, and output-length finishes are left alone.
+ *
+ * A delegated child settles only through its terminal outcome report, so a
+ * response-only step cannot rescue it (PF-7507). When `subagentOutcomeReportToolId`
+ * is set, the one nudge instead asks for that report in one ordinary step whose
+ * active tools are exactly the report tool: the loop rejects any other call, and
+ * the run stops after that step. At the ordinary step ceiling no ordinary step
+ * is left, so the response-only recovery above applies unchanged.
  */
-function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessExecutionHookErrorReporter): {
+function createHarnessEmptySynthesisOptions(
+  reportConfiguredHookError: HarnessExecutionHookErrorReporter,
+  subagentOutcomeReportToolId?: string,
+): {
   [AGENT_EXECUTION_OPTION_COMPOSERS]: () => AgentExecutionOptionComposers;
 } {
   return {
@@ -528,11 +538,26 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
       let responseOnlyReservedAtIteration: number | undefined;
       let responseOnlyPrepared = false;
       let ordinaryBudgetExhausted = false;
+      // Child report-only step (PF-7507): armed instead of `responseOnly`.
+      let reportOnly = false;
+      let reportOnlyReservedAtIteration: number | undefined;
+      let reportOnlyContinuation: Awaited<ReturnType<HarnessIterationCompleteHandler>>;
       return {
         recoveryMaxSteps: 1,
         onIterationComplete: existing => {
           const configured = existing as HarnessIterationCompleteHandler | undefined;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
+            if (reportOnly) {
+              // A replayed predicate for the reserving iteration gets the same
+              // continuation; the report step itself is the last one.
+              if (context.iteration === reportOnlyReservedAtIteration) return reportOnlyContinuation;
+              try {
+                await configured?.(context);
+              } catch (error) {
+                reportConfiguredHookError('onIterationComplete', error);
+              }
+              return { continue: false };
+            }
             // The recovery phase gets one provider response, even if that
             // response tries to call a tool that prepareStep hid. Configured
             // observers still see this iteration, but cannot reopen it.
@@ -596,6 +621,23 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
             if (configuredResult?.continue === false) return configuredResult;
 
             nudged = true;
+            if (subagentOutcomeReportToolId !== undefined && !ordinaryBudgetExhausted) {
+              const reportFeedback =
+                'You finished your tool work without reporting the outcome. Call ' +
+                `${subagentOutcomeReportToolId} now, exactly once, with the outcome, a short summary, and evidence ` +
+                'from the tool results above. Do not claim an action ran unless its result confirms that. ' +
+                'No other tool is available.';
+              reportOnly = true;
+              reportOnlyReservedAtIteration = context.iteration;
+              reportOnlyContinuation = {
+                ...(configuredResult ?? {}),
+                continue: true,
+                feedback: configuredResult?.feedback
+                  ? `${configuredResult.feedback}\n\n${reportFeedback}`
+                  : reportFeedback,
+              };
+              return reportOnlyContinuation;
+            }
             responseOnly = true;
             responseOnlyReservedAtIteration = context.iteration;
             const recoveryFeedback =
@@ -631,6 +673,24 @@ function createHarnessEmptySynthesisOptions(reportConfiguredHookError: HarnessEx
             }
             if (responseOnly && responseOnlyPrepared) {
               throw new HarnessResponseRecoveryAlreadyPreparedError();
+            }
+            if (reportOnly && subagentOutcomeReportToolId !== undefined) {
+              let configuredReportResult: Awaited<ReturnType<HarnessPrepareStep>>;
+              try {
+                configuredReportResult = await configured?.(args);
+              } catch (error) {
+                // The selection below replaces the configured one, so an
+                // optional observer failure must not strand the child's report.
+                reportConfiguredHookError('prepareStep', error);
+                configuredReportResult = undefined;
+              }
+              // Narrowing the advertised tools costs the provider prompt cache
+              // (PF-5349), but only the report can settle a delegated child.
+              return {
+                ...(configuredReportResult ?? {}),
+                activeTools: [subagentOutcomeReportToolId],
+                toolChoice: 'auto',
+              };
             }
             if (responseOnly) responseOnlyPrepared = true;
 
@@ -2171,13 +2231,17 @@ export class Session {
   }
 
   private _createEmptySynthesisOptions() {
-    return createHarnessEmptySynthesisOptions((hook, error) => {
-      try {
-        this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
-      } catch {
-        // Diagnostics must never suppress the caller-visible recovery.
-      }
-    });
+    return createHarnessEmptySynthesisOptions(
+      (hook, error) => {
+        try {
+          this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
+        } catch {
+          // Diagnostics must never suppress the caller-visible recovery.
+        }
+      },
+      // Matches `_buildToolSurface`: every subagent-tool child carries the report.
+      this._record.origin === 'subagent-tool' ? HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID : undefined,
+    );
   }
 
   // -------------------------------------------------------------------------
