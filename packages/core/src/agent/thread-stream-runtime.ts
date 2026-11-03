@@ -1339,6 +1339,9 @@ type ThreadLeaseOperationProvenance = {
 
 let agentThreadRuntimeInstanceSequence = 0;
 
+/** PF-7473: shared empty result for the common no-run-scoped-signal path. */
+const NO_RUN_SCOPED_SIGNALS: ReadonlySet<string> = new Set<string>();
+
 export class AgentThreadStreamRuntime {
   // Upstream parity (PF-5928): resolved lazily by `#getSourceId()`, from
   // `globalThis.crypto`, when the runtime first participates in a thread. The
@@ -7331,7 +7334,7 @@ export class AgentThreadStreamRuntime {
             rejectTerminal(terminalError);
             this.#clearSuspendedRun(state, record.runId);
             state.pendingSignalsByThread.delete(key);
-            this.#dropRunScopedSignals(state, pubsub, key);
+            this.#dropRunScopedSignals(state, pubsub, key, owner => owner === record.runId);
             state.threadRunsByStreamId.delete(record.streamId);
             if (
               state.activeThreadRunIds.get(key) === record.runId &&
@@ -7367,7 +7370,7 @@ export class AgentThreadStreamRuntime {
           );
           this.#clearSuspendedRun(state, record.runId);
           state.pendingSignalsByThread.delete(key);
-          this.#dropRunScopedSignals(state, pubsub, key);
+          this.#dropRunScopedSignals(state, pubsub, key, owner => owner === record.runId);
           state.threadRunsByStreamId.delete(record.streamId);
           if (
             state.activeThreadRunIds.get(key) === record.runId &&
@@ -7506,10 +7509,10 @@ export class AgentThreadStreamRuntime {
     pubsub: PubSub | undefined,
     key: string,
     expire: (ownerRunId: string) => boolean = () => true,
-  ): Set<string> {
+  ): ReadonlySet<string> {
     const ids = state.runScopedSignalIdsByThread.get(key);
+    if (!ids) return NO_RUN_SCOPED_SIGNALS;
     const dropped = new Set<string>();
-    if (!ids) return dropped;
     for (const [id, owner] of ids) if (expire(owner)) dropped.add(id);
     if (dropped.size === 0) return dropped;
     this.#forgetRunScopedSignals(state, key, dropped);
@@ -7540,7 +7543,14 @@ export class AgentThreadStreamRuntime {
     }
     // PF-7473: run-scoped signals the finished run never consumed expire with
     // it, even when a successor run is already active on the thread.
-    this.#dropRunScopedSignals(state, pubsub, key, owner => owner === previousRun.runId);
+    // A displaced owner's leftovers expire too: only the thread's current
+    // active run keeps its scoped input.
+    this.#dropRunScopedSignals(
+      state,
+      pubsub,
+      key,
+      owner => owner === previousRun.runId || owner !== state.activeThreadRunIds.get(key),
+    );
     if (state.activeThreadRunIds.has(key)) {
       return;
     }
@@ -9314,10 +9324,11 @@ export class AgentThreadStreamRuntime {
       return [];
     }
 
+    signalsByThread.delete(key);
+    if (!state.runScopedSignalIdsByThread.has(key)) return queue;
     // A run never consumes another run's run-scoped signals.
     const foreign = this.#dropRunScopedSignals(state, pubsub, key, owner => owner !== runId);
     const taken = foreign.size > 0 ? queue.filter(signal => !foreign.has(signal.id)) : queue;
-    signalsByThread.delete(key);
     this.#forgetRunScopedSignals(
       state,
       key,
