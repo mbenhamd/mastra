@@ -1856,8 +1856,10 @@ export async function planTaskCheck(port: PlanTaskSessionPort, input: CheckInput
     // The delegated result's tool trace is advisory. When it alone keeps the
     // first task of a page from fitting, return that task without it (still
     // flagged truncated) rather than making the settled task unreadable.
-    const withoutTrace = tasks.length === 0 ? withoutDelegationToolTrace(candidate) : undefined;
-    if (withoutTrace !== undefined && fits([withoutTrace], withoutTrace)) tasks.push(withoutTrace);
+    if (tasks.length === 0) {
+      const withoutTrace = withoutDelegationToolTrace(candidate).find(variant => fits([variant], variant));
+      if (withoutTrace !== undefined) tasks.push(withoutTrace);
+    }
     break;
   }
   if (tasks.length === 0 && candidates.length > 0) {
@@ -1881,11 +1883,23 @@ export async function planTaskCheck(port: PlanTaskSessionPort, input: CheckInput
 // Helpers
 // ---------------------------------------------------------------------------
 
-function withoutDelegationToolTrace(view: PlanTaskView): PlanTaskView | undefined {
+/**
+ * Trace-free variants of a delegated task view, flagged first. When even the
+ * 26-byte truncation flag is what keeps the task from fitting, the second
+ * variant drops it too: the trace is advisory, the settled result is not.
+ */
+function withoutDelegationToolTrace(view: PlanTaskView): PlanTaskView[] {
   const result = view.delegation?.result;
-  if (view.delegation === undefined || result?.toolTrace === undefined) return undefined;
-  const { toolTrace: _toolTrace, ...rest } = result;
-  return { ...view, delegation: { ...view.delegation, result: { ...rest, toolTraceTruncated: true } } };
+  const delegation = view.delegation;
+  if (delegation === undefined || result === undefined) return [];
+  if (result.toolTrace === undefined && result.toolTraceTruncated === undefined) return [];
+  const { toolTrace: _toolTrace, toolTraceTruncated: _toolTraceTruncated, ...rest } = result;
+  return [
+    ...(result.toolTrace === undefined
+      ? []
+      : [{ ...view, delegation: { ...delegation, result: { ...rest, toolTraceTruncated: true } } }]),
+    { ...view, delegation: { ...delegation, result: rest } },
+  ];
 }
 
 /** Next sibling order = max(existing sibling order) + 1, or 0. */

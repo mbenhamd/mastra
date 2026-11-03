@@ -851,24 +851,32 @@ describe('planTaskCheck — bounded read', () => {
         },
       });
     };
-    // Measure the plan-task view around a trace-free result to place the
-    // real result just inside the budget without its trace.
+    // Measure the plan-task view around a trace-free result exactly as
+    // planTaskCheck admits a candidate, to place the real result just inside
+    // the budget without its trace.
     const probe = await setup();
     await delegateWithResult(probe.port, '', false);
+    const probed = await planTaskCheck(probe.port, {});
     const overhead = new TextEncoder().encode(
-      JSON.stringify({ ...(await planTaskCheck(probe.port, {})), truncated: true, nextCursor: 'x'.repeat(36) }),
+      JSON.stringify({ tasks: probed.tasks, truncated: true, nextCursor: probed.tasks[0]?.taskId }),
     ).byteLength;
 
-    const { port } = await setup();
-    await delegateWithResult(port, 'x'.repeat(PLAN_TASK_CHECK_MAX_OUTPUT_BYTES - overhead - 512), true);
-    const res = await planTaskCheck(port, {});
+    // 512 spare bytes keep the truncation flag; 10 do not fit even its 26 bytes.
+    for (const [spare, flagged] of [
+      [512, true],
+      [10, undefined],
+    ] as const) {
+      const { port } = await setup();
+      await delegateWithResult(port, 'x'.repeat(PLAN_TASK_CHECK_MAX_OUTPUT_BYTES - overhead - spare), true);
+      const res = await planTaskCheck(port, {});
 
-    expect(res.tasks).toHaveLength(1);
-    expect(res.tasks[0]?.delegation?.result?.toolTrace).toBeUndefined();
-    expect(res.tasks[0]?.delegation?.result?.toolTraceTruncated).toBe(true);
-    expect(new TextEncoder().encode(JSON.stringify(res)).byteLength).toBeLessThanOrEqual(
-      PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
-    );
+      expect(res.tasks, `${spare} spare bytes`).toHaveLength(1);
+      expect(res.tasks[0]?.delegation?.result?.toolTrace).toBeUndefined();
+      expect(res.tasks[0]?.delegation?.result?.toolTraceTruncated, `${spare} spare bytes`).toBe(flagged);
+      expect(new TextEncoder().encode(JSON.stringify(res)).byteLength).toBeLessThanOrEqual(
+        PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
+      );
+    }
   });
 
   it('honors depth (depth 0 returns only the root)', async () => {
