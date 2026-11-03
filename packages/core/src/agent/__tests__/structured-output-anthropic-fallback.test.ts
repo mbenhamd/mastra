@@ -11,6 +11,7 @@
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { createAnthropic as createAnthropicV2 } from '@ai-sdk/anthropic-v5';
 import { createAnthropic } from '@ai-sdk/anthropic-v6';
 import { createOpenAI } from '@ai-sdk/openai-v6';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -171,6 +172,12 @@ function sentFormat(body: any) {
 }
 
 const anthropic = () => createAnthropic({ apiKey: 'test-key', baseURL })('claude-haiku-5-5');
+/** The same Anthropic adapter under another provider name. */
+const renamedAnthropic = () => createAnthropic({ apiKey: 'test-key', baseURL, name: 'proxy' })('claude-haiku-5-5');
+/** A model the pinned adapter sends `jsonTool` responses natively for (it rejects forced tool use). */
+const anthropicOpus = () => createAnthropic({ apiKey: 'test-key', baseURL })('claude-opus-5-5');
+/** A V2 (AI SDK v5) Anthropic model, whose tools lose per-tool `strict` before dispatch. */
+const anthropicV2 = () => createAnthropicV2({ apiKey: 'test-key', baseURL })('claude-sonnet-5-5');
 const openai = () => createOpenAI({ apiKey: 'test-key', baseURL }).chat('gpt-4o');
 
 const recordSchema = z.object({ studyId: z.string(), fields: z.record(z.string(), z.string()) });
@@ -260,6 +267,8 @@ type Row = {
   toolChoice?: 'none';
   /** The request carries no tool definitions (they were stripped). */
   noRequestTools?: boolean;
+  /** Only the request is asserted: Mastra cannot validate this reply on any path. */
+  requestOnly?: boolean;
   /** A separate structuring model (`structuredOutput.model`). */
   structuringModel?: string;
   /** The record node inside the injected schema, when the row has a record. */
@@ -584,6 +593,64 @@ const rows: Row[] = [
     expected: 'anthropic-strict',
   },
   {
+    // Processor A swaps in an unverified vendor; processor B re-wraps its identical JSON as plain
+    // JSON Schema. A's downgrade must survive B.
+    name: 'processor chain: unverified vendor, then the same JSON as plain JSON Schema',
+    model: anthropic,
+    schema: z.object({ summary: z.string() }),
+    inputProcessors: [
+      replaceSchema(unverifiedVendorSchema),
+      {
+        id: 'rewrap-as-json-schema',
+        processInputStep: ({ structuredOutput }: any) => ({
+          structuredOutput: {
+            ...structuredOutput,
+            schema: toStandardSchema(unverifiedVendorSchema['~standard'].jsonSchema.input() as any),
+          },
+        }),
+      },
+    ],
+    populated: { summary: 's' },
+    expected: 'prompt',
+  },
+  {
+    name: "renamed Anthropic provider (createAnthropic({ name: 'proxy' })) with a record",
+    model: renamedAnthropic,
+    schema: recordSchema,
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+  },
+  {
+    // The pinned adapter turns jsonTool into native output for this model, so the decision applies.
+    name: "claude-opus-5-5 with structuredOutputMode 'jsonTool' and a record",
+    model: anthropicOpus,
+    schema: recordSchema,
+    providerOptions: { anthropic: { structuredOutputMode: 'jsonTool' } },
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+  },
+  {
+    // The output-format wrapping types a root enum's `result` as a string; numeric members can't
+    // match. Mastra's enum handler also accepts only string results, so no path validates the reply.
+    name: 'root numeric enum',
+    model: anthropic,
+    schema: { enum: [1, 2] },
+    populated: { result: 1 },
+    expected: 'prompt',
+    requestOnly: true,
+  },
+  {
+    // AI SDK v5 models lose per-tool `strict` before dispatch, so the tool isn't budgeted.
+    name: 'V2 model: 24 optional parameters plus a strict tool with 1 optional parameter stays native',
+    model: anthropicV2,
+    schema: manyFields(24, () => z.string().optional()),
+    tools: lookupTool(true),
+    populated: { field0: 'x' },
+    expected: 'anthropic-strict',
+  },
+  {
     // Equal JSON from an unverified vendor: the processor's live schema still falls back.
     name: 'input processor swaps a verified schema for an unverified vendor with equal JSON',
     model: anthropic,
@@ -747,7 +814,11 @@ function makeAgent(row: Row, id = 'pf7309-agent') {
 
 function rowOptions(row: Row) {
   return {
-    structuredOutput: { schema: row.schema, ...(row.structuringModel ? { model: row.structuringModel } : {}) },
+    structuredOutput: {
+      schema: row.schema,
+      ...(row.structuringModel ? { model: row.structuringModel } : {}),
+      ...(row.requestOnly ? { errorStrategy: 'warn' } : {}),
+    },
     providerOptions: row.providerOptions,
     ...(row.toolChoice ? { toolChoice: row.toolChoice } : {}),
   } as any;
@@ -877,7 +948,7 @@ describe('structured output through the real provider adapters (PF-7309)', () =>
       expect(recovered.executionError).toBeUndefined();
       expect(recovered.streamErrors).toEqual([]);
       expect(recovered.chunkTypes).toContain('object-result');
-    } else {
+    } else if (!row.requestOnly) {
       expect(object).toEqual(row.object ?? row.populated);
     }
   });

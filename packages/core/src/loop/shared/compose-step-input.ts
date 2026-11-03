@@ -58,7 +58,12 @@ export function composeStepInput(
     messageId: processInputStepResult.messageId ?? current.messageId,
     model: processInputStepResult.model ?? current.model,
     ...('structuredOutput' in processInputStepResult
-      ? { structuredOutput: withSourceDecision(current.structuredOutput, processInputStepResult.structuredOutput) }
+      ? {
+          structuredOutput: mergeStructuredOutputSourceDecision(
+            current.structuredOutput,
+            processInputStepResult.structuredOutput,
+          ),
+        }
       : {}),
   };
 }
@@ -69,9 +74,10 @@ export function composeStepInput(
  * schema's content fingerprint matches it (a durable reload of the same schema, or no processor
  * change at all), and the schema is decided again when its content differs (a replaced or
  * in-place mutated schema). Re-reading an unchanged serialized schema never replaces a decision
- * that only the caller's original schema could make.
+ * that only the caller's original schema could make. The processor runner applies this after
+ * every processor's return, so a downgrade from one processor survives the next one.
  */
-function withSourceDecision(current: any, next: any): any {
+export function mergeStructuredOutputSourceDecision(current: any, next: any): any {
   if (!next?.schema) return next;
   const recorded = next.sourceDecision ?? current?.sourceDecision;
   const live = recordStructuredOutputSourceDecision(next.schema);

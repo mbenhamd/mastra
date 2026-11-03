@@ -1,13 +1,15 @@
 import { isProxy } from 'node:util/types';
+import { getModelCapabilities as getAnthropicModelCapabilities } from '@ai-sdk/anthropic-v6/internal';
 import {
   injectJsonInstructionIntoMessages as injectJsonInstructionIntoMessagesV3,
   isAbortError,
 } from '@ai-sdk/provider-utils-v6';
-import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
+import type { LanguageModelV2CallOptions, LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import { APICallError } from '@internal/ai-sdk-v5';
 import type { IdGenerator, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import { prepareJsonSchemaForOpenAIStrictMode } from '@mastra/schema-compat';
 import type { StructuredOutputOptions, StructuredOutputSourceDecision } from '../../../agent/types';
+import { applyStrictForV2 } from '../../../llm/model/aisdk/v5/model';
 import { validateModelTimeoutSettings } from '../../../llm/model/model-settings';
 import type { ModelMethodType } from '../../../llm/model/model.loop.types';
 import { modelSupportsStructuredOutput, modelSupportsTemperature } from '../../../llm/model/provider-registry';
@@ -170,7 +172,14 @@ export function countStructuredOutputParameters(schema: unknown): { optional: nu
   return totals;
 }
 
-const isAnthropicProvider = (provider: string) => /^anthropic(\.|$)/.test(provider);
+/**
+ * Whether a model may be served by `@ai-sdk/anthropic` (or behave like it). Matched by provider id or,
+ * because `createAnthropic({ name })` renames the provider, by the same Claude model-id test the
+ * pinned adapter uses (`isKnownModel || modelId.includes('claude-')`). Over-matching only ever sends
+ * a schema through the prompt; missing a Claude model would send it strict.
+ */
+const isAnthropicModel = (model: { provider: string; modelId: string }) =>
+  /^anthropic(\.|$)/.test(model.provider) || model.modelId.includes('claude-');
 
 /** Keywords that only annotate or constrain a value; `@ai-sdk/anthropic` keeps or describes them. */
 const STRICT_VALUE_KEYWORDS = new Set([
@@ -242,6 +251,17 @@ function isStrictOutputCarriable(schema: unknown): boolean {
   if ('const' in node && !isPrimitiveJsonValue(node.const)) return false;
 
   const types = Array.isArray(node.type) ? node.type : [node.type];
+  // Enum and const values must have one of the node's declared types (a contradiction can't be met).
+  if ('type' in node) {
+    const values = [...(Array.isArray(node.enum) ? node.enum : []), ...('const' in node ? [node.const] : [])];
+    if (
+      !values.every(
+        value => types.includes(jsonValueType(value)) || (types.includes('number') && typeof value === 'number'),
+      )
+    ) {
+      return false;
+    }
+  }
   if ('properties' in node || 'required' in node || 'additionalProperties' in node || types.includes('object')) {
     if (!types.includes('object') || node.additionalProperties !== false) return false;
     // `@ai-sdk/anthropic` drops `additionalProperties` from an object without properties, so only an
@@ -271,6 +291,13 @@ function isStrictOutputCarriable(schema: unknown): boolean {
 
 function isPrimitiveJsonValue(value: unknown): boolean {
   return value === null || ['string', 'number', 'boolean'].includes(typeof value);
+}
+
+/** The JSON Schema type of a primitive value (`integer` for whole numbers). */
+function jsonValueType(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
+  return typeof value;
 }
 
 /**
@@ -335,24 +362,32 @@ function stableJson(value: unknown): string {
 
 /** The step's tool selection, whose strict tools count toward Anthropic's request-wide limits. */
 type StrictToolSource = { tools?: unknown; activeTools?: readonly string[]; toolChoice?: unknown };
+type DecisionModel = { provider: string; modelId: string; specificationVersion?: string };
 
 /**
- * The input schemas of the `strict: true` tools the candidate native request would send: the same
- * {@link prepareToolsAndToolChoice} call that builds the request, with the step's `toolChoice` and
- * `activeTools` and the native-format stripping (`toolChoice: 'none'` drops every tool).
+ * The input schemas of the tools the candidate native request would send as `strict: true`: the
+ * same {@link prepareToolsAndToolChoice} call that builds the request (the step's `toolChoice` and
+ * `activeTools`, native-format stripping, the model's spec version), then, for a V2 model, the
+ * {@link applyStrictForV2} step that removes per-tool `strict` before dispatch.
  */
-function strictToolInputSchemas({ tools, activeTools, toolChoice }: StrictToolSource): unknown[] {
+function strictToolInputSchemas({ tools, activeTools, toolChoice }: StrictToolSource, model: DecisionModel): unknown[] {
   if (!tools || typeof tools !== 'object') return [];
   if (!Object.values(tools).some(tool => (tool as { strict?: unknown } | undefined)?.strict === true)) return [];
   type PrepareArgs = Parameters<typeof prepareToolsAndToolChoice>[0];
+  const targetVersion: ModelSpecVersion =
+    model.specificationVersion === 'v4' ? 'v4' : model.specificationVersion === 'v3' ? 'v3' : 'v2';
   const prepared = prepareToolsAndToolChoice({
     tools: tools as PrepareArgs['tools'],
     toolChoice: toolChoice as PrepareArgs['toolChoice'],
     activeTools: activeTools as PrepareArgs['activeTools'],
-    targetVersion: 'v2',
+    targetVersion,
     stripToolsWhenNone: true,
   });
-  return (prepared.tools ?? [])
+  const sent =
+    model.specificationVersion === 'v2'
+      ? (applyStrictForV2({ prompt: [], tools: prepared.tools } as unknown as LanguageModelV2CallOptions).tools ?? [])
+      : (prepared.tools ?? []);
+  return sent
     .filter(tool => (tool as { strict?: unknown }).strict === true)
     .map(tool => (tool as { inputSchema?: unknown }).inputSchema);
 }
@@ -368,7 +403,7 @@ function strictToolInputSchemas({ tools, activeTools, toolChoice }: StrictToolSo
 function anthropicRequestWithinLimits(
   schema: unknown,
   recordedSchema: unknown,
-  model: { provider: string; modelId: string },
+  model: DecisionModel,
   tools: StrictToolSource,
 ): boolean {
   const wire = getResponseFormat(schema as Parameters<typeof getResponseFormat>[0], {
@@ -378,7 +413,7 @@ function anthropicRequestWithinLimits(
   const converted = countStructuredOutputParameters(wire.type === 'json' ? wire.schema : undefined);
   let optional = Math.max(source.optional, converted.optional);
   let union = Math.max(source.union, converted.union);
-  for (const inputSchema of strictToolInputSchemas(tools)) {
+  for (const inputSchema of strictToolInputSchemas(tools, model)) {
     const counts = countStructuredOutputParameters(inputSchema);
     optional += counts.optional;
     union += counts.union;
@@ -465,7 +500,7 @@ export function sendsNativeResponseFormat(
         sourceDecision?: StructuredOutputSourceDecision;
       }
     | undefined,
-  model: { provider: string; modelId: string },
+  model: DecisionModel,
   providerOptions?: SharedProviderOptions,
   tools: StrictToolSource = {},
 ): boolean {
@@ -484,11 +519,21 @@ function jsonSchemaOf(responseFormat: ReturnType<typeof getResponseFormat> | und
  * custom provider-name key over `anthropic`; the fallback only applies to `anthropic` / `anthropic.*`
  * providers, whose provider-options key is `anthropic`.
  */
-function choosesAnthropicStructuredOutputMode(providerOptions: SharedProviderOptions | undefined): boolean {
-  const options = (providerOptions as Record<string, unknown> | undefined)?.anthropic;
-  if (!options || typeof options !== 'object') return false;
-  const mode = (options as { structuredOutputMode?: unknown }).structuredOutputMode;
-  return mode === 'outputFormat' || mode === 'jsonTool';
+function choosesAnthropicStructuredOutputMode(
+  providerOptions: SharedProviderOptions | undefined,
+  model: DecisionModel,
+): boolean {
+  // The adapter merges `providerOptions.anthropic` with its own provider-name key, which wins.
+  const options = providerOptions as Record<string, { structuredOutputMode?: unknown } | undefined> | undefined;
+  const providerKey = model.provider.split('.')[0]!;
+  const mode = options?.[providerKey]?.structuredOutputMode ?? options?.anthropic?.structuredOutputMode;
+  if (mode === 'outputFormat') return true;
+  if (mode !== 'jsonTool') return false;
+  // The pinned adapter sends a JSON-schema response natively instead of as a JSON tool when the model
+  // rejects forced tool use and supports structured output (`@ai-sdk/anthropic` 3.0.133,
+  // `doStream`/`doGenerate` request args); then the decision and the request budget apply.
+  const { rejectsForcedToolUse, supportsStructuredOutput } = getAnthropicModelCapabilities(model.modelId);
+  return !(rejectsForcedToolUse && supportsStructuredOutput);
 }
 
 /**
@@ -515,14 +560,14 @@ function resolveDirectStructuredOutputInjection(
     jsonPromptInjection?: JsonPromptInjection;
     sourceDecision?: StructuredOutputSourceDecision;
   },
-  model: { provider: string; modelId: string },
+  model: DecisionModel,
   providerOptions: SharedProviderOptions | undefined,
   tools: StrictToolSource,
 ): { mode: 'system' | 'inline' | undefined; schema?: unknown } {
   const { jsonPromptInjection } = structuredOutput;
   if (jsonPromptInjection === false) return { mode: undefined };
-  const anthropic = isAnthropicProvider(model.provider);
-  const providerChoosesMode = anthropic && choosesAnthropicStructuredOutputMode(providerOptions);
+  const anthropic = isAnthropicModel(model);
+  const providerChoosesMode = anthropic && choosesAnthropicStructuredOutputMode(providerOptions, model);
   if (jsonPromptInjection === 'auto' && providerChoosesMode) return { mode: undefined };
 
   const decision = () =>
