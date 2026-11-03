@@ -5939,6 +5939,79 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     expect(readSettled).toBe(true);
   });
 
+  // Shutdown's outcome within a bounded window: its rejection, 'resolved', or
+  // a marker when it is still pending (a hang fails fast instead of timing out).
+  const shutdownOutcome = (shutdown: Promise<void>) =>
+    Promise.race([
+      shutdown.then(
+        () => 'resolved',
+        (err: unknown) => err,
+      ),
+      tick(2_000).then(() => 'still pending after 2s'),
+    ]);
+
+  it('fails shutdown within the deadline when an in-flight expiry sweep never settles, naming its call, and restores', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-stuck-sweep' });
+    const stuck = storageGate();
+    const listDue = storage.listDuePendingInteractions.bind(storage);
+    vi.spyOn(storage, 'listDuePendingInteractions').mockImplementation(async input => {
+      stuck.enter();
+      await stuck.opened;
+      return listDue(input);
+    });
+    void (harness as unknown as { _tickPendingInteractionExpirySweep(): Promise<void> })
+      ._tickPendingInteractionExpirySweep()
+      .catch(() => undefined);
+    await stuck.waitEntered();
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining('listDuePendingInteractions'),
+      }),
+    });
+    // Restored: the harness admits sessions again and the session is live.
+    expect(session.lifecycleState).toBe('live');
+    await expect(harness.session({ sessionId: session.id })).resolves.toBe(session);
+
+    stuck.open();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('fails shutdown within the deadline when an in-flight session admission never settles, naming its call, and restores', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const stuck = storageGate();
+    const loadByThread = storage.loadSessionByThread.bind(storage);
+    vi.spyOn(storage, 'loadSessionByThread').mockImplementation(async input => {
+      if (input.threadId === 't-stuck-admission') {
+        stuck.enter();
+        await stuck.opened;
+      }
+      return loadByThread(input);
+    });
+    const admission = harness.session({ resourceId: 'u', threadId: 't-stuck-admission' });
+    void admission.catch(() => undefined);
+    await stuck.waitEntered();
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining('loadSessionByThread'),
+      }),
+    });
+    // Restored: the harness admits sessions again.
+    await expect(harness.session({ resourceId: 'u', threadId: 't-after-restore' })).resolves.toBeDefined();
+
+    stuck.open();
+    await expect(admission).resolves.toBeDefined();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
   it('lets a draft checkpoint queued behind a slow save persist under a pressure eviction', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });

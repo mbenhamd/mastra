@@ -6645,11 +6645,21 @@ export class Harness {
     this._stopChannelInboxRecoveryLoop();
     this._stopPendingInteractionExpirySweepLoop();
 
+    // PF-7538: every await in shutdown is deadline-bounded. The pre-drain
+    // waits below share `entryDeadlineAt`; the drain gets its own full budget
+    // (`drainDeadlineAt`, computed after them) so it never loses time to them.
+    // Worst case: 2 × drainTimeoutMs for the waits, plus the final phase,
+    // whose steps share the drain deadline.
+    const entryDeadlineAt = Date.now() + (opts?.drainTimeoutMs ?? this._closeTimeoutMs);
+
     // A timer may already be inside a storage query or exact-generation CAS.
     // Wait for that bounded sweep to observe `_shutdown`, finish its current
     // atomic operation, and release any transient lease before tearing storage
     // and workspace ownership down.
-    await this._pendingInteractionExpirySweepInFlight;
+    const sweepInFlight = this._pendingInteractionExpirySweepInFlight;
+    if (sweepInFlight !== undefined && !(await this._settleBeforeDeadline(sweepInFlight, entryDeadlineAt))) {
+      this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Pending-interaction expiry sweep'));
+    }
 
     // `session({ fresh: true })` deliberately bypasses resolver-key
     // singleflight, so waiting only the resolver/materialization maps is not
@@ -6658,10 +6668,20 @@ export class Harness {
     // sessions. Materializers also observe `_shutdown` and roll back their
     // lease/publication if they resume during this wait.
     while (this._sessionAdmissionsInFlight.size > 0) {
-      await Promise.allSettled([...this._sessionAdmissionsInFlight]);
+      const settled = await this._settleBeforeDeadline(
+        Promise.allSettled([...this._sessionAdmissionsInFlight]),
+        entryDeadlineAt,
+      );
+      if (!settled) this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Session admission'));
     }
-    if (this._sessionEvictionsInFlight.size > 0) {
-      await Promise.allSettled([...this._sessionEvictionsInFlight.values()]);
+    if (
+      this._sessionEvictionsInFlight.size > 0 &&
+      !(await this._settleBeforeDeadline(
+        Promise.allSettled([...this._sessionEvictionsInFlight.values()]),
+        entryDeadlineAt,
+      ))
+    ) {
+      this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Session eviction'));
     }
 
     let storage: HarnessStorage;
@@ -6670,18 +6690,17 @@ export class Harness {
     } catch {
       // No storage bound — nothing to release. Idempotent.
       this._liveSessions.clear();
-      try {
-        await this._workspaceRegistry.shutdown();
-      } catch {
-        // Best-effort: errors surface through the workspace_error event.
-      }
+      await this._shutdownWorkspacesBeforeDeadline(entryDeadlineAt);
       this._untrackBoundStorage();
       return;
     }
 
     const pendingCloses = new Set(this._closePromises.values());
-    if (pendingCloses.size > 0) {
-      await Promise.allSettled(pendingCloses);
+    if (
+      pendingCloses.size > 0 &&
+      !(await this._settleBeforeDeadline(Promise.allSettled(pendingCloses), entryDeadlineAt))
+    ) {
+      this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Session close'));
     }
 
     // Release every held lease. We keep the records active in storage —
@@ -6907,12 +6926,7 @@ export class Harness {
     this._shutdownEvictedSessionIds.clear();
 
     // Tear down every provisioned workspace (shared + per-resource + per-session).
-    try {
-      await this._workspaceRegistry.shutdown();
-    } catch {
-      // Best-effort: workspace teardown errors are swallowed (provider-owned;
-      // §2.7/§10.2 define no public workspace event).
-    }
+    await this._shutdownWorkspacesBeforeDeadline(drainDeadlineAt);
     this._untrackBoundStorage();
     // §10.2: harness-scoped process-shutdown marker. No sessionId → delivered to
     // `harness.subscribe(...)` only, never per-session SSE replay. Sessions persist.
@@ -7643,6 +7657,34 @@ export class Harness {
       if (!settled) return this._shutdownTimeoutError('Storage calls');
     }
     return undefined;
+  }
+
+  /**
+   * PF-7538: a pre-drain shutdown wait expired. Nothing has drained or closed
+   * yet, so roll back exactly as a drain failure does — clear `_shutdown`,
+   * restart the background loops — and throw.
+   */
+  private _rollBackShutdownBeforeDrain(error: HarnessValidationError): never {
+    this._shutdown = false;
+    if (this._liveSessions.size > 0) this._ensureLeaseRenewalLoop();
+    this._ensureChannelInboxRecoveryLoop();
+    this._ensurePendingInteractionExpirySweepLoop();
+    throw new HarnessStorageError({ operation: 'session_save', cause: error });
+  }
+
+  /**
+   * PF-7538: provider-owned workspace teardown, best-effort (errors surface as
+   * workspace events) and bounded by `deadlineAt`: on expiry it is logged and
+   * shutdown continues, since workspaces are not harness storage.
+   */
+  private async _shutdownWorkspacesBeforeDeadline(deadlineAt: number): Promise<void> {
+    const settled = await this._settleBeforeDeadline(
+      this._workspaceRegistry.shutdown().catch(() => undefined),
+      deadlineAt,
+    );
+    if (!settled) {
+      console.error('[harness/v1] workspace teardown did not settle before the shutdown deadline; continuing');
+    }
   }
 
   /**
