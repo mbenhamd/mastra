@@ -513,7 +513,11 @@ describe('Harness v1 — construction', () => {
     expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(2_000);
     await harness._tickPendingInteractionExpirySweep();
     expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(1_000);
-    expect((harness as any)._runPendingInteractionExpiryGeneration).toHaveBeenCalledWith(storage, generation);
+    // PF-7538: the sweep runs on the harness's tracked handle over `storage`.
+    expect((harness as any)._runPendingInteractionExpiryGeneration).toHaveBeenCalledWith(
+      (harness as any)._trackStorage(storage),
+      generation,
+    );
 
     await harness.shutdown();
   });
@@ -5598,6 +5602,8 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
     // S2: a save admitted before shutdown, with a draft checkpoint queued behind it.
     const saving = await a.session({ resourceId: 'u', threadId: 't-invariant-save' });
+    // S3 (stays live): detached storage calls no session registry tracks.
+    const detached = await a.session({ resourceId: 'u', threadId: 't-invariant-detached' });
     await adoptInto(db, b, signalled.id, signalled.getRecord().harnessName);
     await adoptInto(db, b, saving.id, saving.getRecord().harnessName);
 
@@ -5630,6 +5636,35 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
       await renewalGate.opened;
       return renewSubtree(input);
     });
+    // S3's detached calls: (1) the queued-turn signal evidence write,
+    // (2) the run watcher's terminal staging, (3) the queued attachment read,
+    // (4) the plan-task summary's second read after the first one rejected.
+    const detachedGates = {
+      writeMessageResultEvidence: storageGate(),
+      stageTerminalCompletion: storageGate(),
+      loadAttachment: storageGate(),
+      loadPlanTaskSubtree: storageGate(),
+    };
+    for (const [name, gate] of Object.entries(detachedGates)) {
+      const original = (storage as unknown as Record<string, (input: unknown) => Promise<unknown>>)[name]!.bind(
+        storage,
+      );
+      vi.spyOn(storage as never, name as never).mockImplementation((async (input: {
+        sessionId?: string;
+        identity?: { sessionId?: string };
+      }) => {
+        const sessionId = input?.sessionId ?? input?.identity?.sessionId;
+        if (sessionId !== detached.id) return original(input);
+        gate.enter();
+        await gate.opened;
+        return original(input);
+      }) as never);
+    }
+    const countPlanTasks = storage.countPlanTasksByStatus.bind(storage);
+    vi.spyOn(storage, 'countPlanTasksByStatus').mockImplementation(async input => {
+      if (input.sessionId === detached.id) throw new Error('plan-task count unavailable');
+      return countPlanTasks(input);
+    });
 
     // Instrument every storage call of this owner: start and settle order.
     let clock = 0;
@@ -5649,7 +5684,13 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
       instrumented[name] = (...args: unknown[]) => {
         const op: { name: string; startedAt: number; settledAt?: number } = { name, startedAt: ++clock };
         ops.push(op);
-        const result = call(...args);
+        let result: unknown;
+        try {
+          result = call(...args);
+        } catch (err) {
+          op.settledAt = ++clock;
+          throw err;
+        }
         if (result instanceof Promise) {
           return result.finally(() => {
             op.settledAt = ++clock;
@@ -5659,6 +5700,31 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
         return result;
       };
     }
+
+    // Fire S3's detached storage work the way its owning paths do: nothing
+    // awaits or registers these calls.
+    const detachedInternals = detached as unknown as {
+      _storage: InMemoryHarness;
+      _writeQueueSignalResultEvidence(status: unknown): Promise<void>;
+      _validateQueuedAttachmentRefs(item: unknown): Promise<void>;
+      _ensurePlanTaskSummary(): Promise<unknown>;
+    };
+    void detachedInternals
+      ._writeQueueSignalResultEvidence({ status: 'pending', signalId: 'sig-queued', runId: 'run-queued' })
+      .catch(() => undefined);
+    void detachedInternals._storage
+      .stageTerminalCompletion({
+        identity: { harnessName: detached.getRecord().harnessName, sessionId: detached.id, runId: 'run-watched' },
+        result: {},
+      } as never)
+      .catch(() => undefined);
+    void detachedInternals
+      ._validateQueuedAttachmentRefs({
+        attachments: [{ kind: 'ref', ownerSessionId: detached.id, attachmentId: 'att-1', sha256: 'x', bytes: 1 }],
+      })
+      .catch(() => undefined);
+    void detachedInternals._ensurePlanTaskSummary().catch(() => undefined);
+    for (const gate of Object.values(detachedGates)) await gate.waitEntered();
 
     void saving.setState({ step: 1 }).catch(() => undefined);
     await save.reached;
@@ -5698,14 +5764,82 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     await tick();
     expect(resolvedAt).toBeUndefined();
     summary.open();
+    const remaining = Object.values(detachedGates);
+    for (const gate of remaining) {
+      await tick();
+      expect(resolvedAt).toBeUndefined();
+      gate.open();
+    }
     await shutdown;
     await tick();
     const shutdownResolvedAt = resolvedAt!;
     expect(settlement.entered.length).toBeGreaterThan(0);
     expect(ops.some(op => op.name === 'saveRunSummary')).toBe(true);
+    for (const name of Object.keys(detachedGates)) expect(ops.some(op => op.name === name)).toBe(true);
     expect(ops.filter(op => op.startedAt > shutdownResolvedAt)).toEqual([]);
     expect(ops.filter(op => op.settledAt === undefined || op.settledAt > shutdownResolvedAt)).toEqual([]);
     await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('fails shutdown at the drain deadline naming the storage calls still pending, and restores', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-storage-timeout' });
+    const stuck = storageGate();
+    const loadAttachment = storage.loadAttachment.bind(storage);
+    vi.spyOn(storage, 'loadAttachment').mockImplementation(async input => {
+      stuck.enter();
+      await stuck.opened;
+      return loadAttachment(input);
+    });
+    // A detached read through the session's storage handle that never settles
+    // before the deadline.
+    void (session as unknown as { _storage: InMemoryHarness })._storage
+      .loadAttachment({ harnessName: session.getRecord().harnessName, sessionId: session.id, attachmentId: 'att-x' })
+      .catch(() => undefined);
+    await stuck.waitEntered();
+
+    const failure = await harness.shutdown({ drainTimeoutMs: 200 }).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(failure).toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining(`loadAttachment(${session.id})`),
+      }),
+    });
+    // Restore-and-throw: the session is live again and usable.
+    expect(session.lifecycleState).toBe('live');
+    await expect(harness.session({ sessionId: session.id })).resolves.toBe(session);
+
+    stuck.open();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it("resolves once shutdown's own terminal append completes (it never waits on itself)", async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-own-terminal-append' });
+    // Shutdown's own `session_evicted('shutdown')` append is slow but settles.
+    let terminalAppendDone = false;
+    const appendSessionEvent = storage.appendSessionEvent.bind(storage);
+    vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async record => {
+      const event = record.event as { type?: string; reason?: string };
+      if (record.sessionId === session.id && event.type === 'session_evicted' && event.reason === 'shutdown') {
+        await tick(50);
+        await appendSessionEvent(record);
+        terminalAppendDone = true;
+        return;
+      }
+      return appendSessionEvent(record);
+    });
+
+    const startedAt = Date.now();
+    await expect(harness.shutdown({ drainTimeoutMs: 5_000 })).resolves.toBeUndefined();
+    expect(terminalAppendDone).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
 
   it('lets a draft checkpoint queued behind a slow save persist under a pressure eviction', async () => {
