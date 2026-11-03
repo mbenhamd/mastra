@@ -516,13 +516,18 @@ export function createSubagentControlTool(parent: Session) {
   return createTool({
     id: SUBAGENT_CONTROL_TOOL_ID,
     description:
-      'Operate on subagents this session started with spawn_subagent or task_delegate. ' +
-      '`status` lists them (or inspects one) with their status; a settled task_delegate subagent carries its result. ' +
-      '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes; it ' +
-      'returns settled results and those still running. `send` adds an instruction to a running ' +
-      'subagent. `cancel` stops one subagent; `cancel: "acknowledged"` means the cancel is recorded and ' +
-      'its work aborted, and `settled` says whether the subagent has finished unwinding. You can only ' +
-      'act on your own subagents.',
+      'Operate on subagents this session started with spawn_subagent or task_delegate. You can only act ' +
+      'on your own subagents. ' +
+      '`status` lists them (or inspects one) with their status. Only a settled task_delegate subagent ' +
+      'carries its result; a spawn_subagent result is returned by that spawn_subagent call only. ' +
+      '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
+      'returns those settled and those still running. ' +
+      '`send` adds an instruction to a subagent whose run is in progress. It is rejected for a subagent ' +
+      'that is idle or waiting for human input, and a message the run ends without reading is dropped. ' +
+      '`cancel` stops one subagent: `cancel: "acknowledged"` means the cancel is recorded on the subagent ' +
+      'and its work aborted, and `settled` says whether it has finished unwinding. Cancel needs the ' +
+      'subagent to be free or held by this process; if another process holds it, cancel returns ' +
+      '`harness.subagent_cancel_unavailable` and changes nothing, so retry later.',
     inputSchema,
     outputSchema,
     execute: async (input, ctx): Promise<SubagentControlOutput> => {

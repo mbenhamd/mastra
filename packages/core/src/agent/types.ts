@@ -204,12 +204,24 @@ export type DiscoverAgentThreadPeersOptions = {
   timeoutMs?: number;
 };
 
+/** Options applied when a signal targets a thread with a run in flight. */
+export type AgentSignalIfActiveOptions = {
+  behavior?: AgentSignalActiveBehavior;
+  attributes?: AgentSignalAttributes;
+  /**
+   * With `behavior: 'deliver'` to a same-agent run, the signal belongs to that
+   * run: if the run ends without consuming it, it is dropped instead of
+   * starting a follow-up run.
+   */
+  expireWithRun?: boolean;
+};
+
 export type SendAgentSignalOptions<OUTPUT = unknown> =
   | {
       runId: string;
       resourceId?: string;
       threadId?: string;
-      ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
+      ifActive?: AgentSignalIfActiveOptions;
       ifIdle?: never;
       /**
        * Validated, but does not change the scopes of the run receiving the signal:
@@ -221,7 +233,7 @@ export type SendAgentSignalOptions<OUTPUT = unknown> =
       runId?: never;
       resourceId?: undefined;
       threadId: string;
-      ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
+      ifActive?: AgentSignalIfActiveOptions;
       ifIdle?: never;
       /**
        * Validated, but does not change the scopes of the run receiving the signal:
@@ -233,7 +245,7 @@ export type SendAgentSignalOptions<OUTPUT = unknown> =
       runId?: string;
       resourceId: string;
       threadId: string;
-      ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
+      ifActive?: AgentSignalIfActiveOptions;
       ifIdle?: AgentSignalIfIdleOptions<OUTPUT>;
       /**
        * Scopes for a run this signal starts, unioned with `ifIdle.streamOptions.scopes`.

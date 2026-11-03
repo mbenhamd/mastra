@@ -14602,8 +14602,10 @@ export class Session {
       {
         resourceId: this.resourceId,
         threadId: this.threadId,
-        // PF-7473: an interleave-only reminder must never start a run, even
-        // when the active run ends between routing and dispatch.
+        // PF-7473: an interleave-only reminder must never start a run: it
+        // expires with the run it was delivered to, and is discarded when the
+        // run already ended between routing and dispatch.
+        ...(internal?.requireActiveRun === true ? { ifActive: { behavior: 'deliver', expireWithRun: true } } : {}),
         ifIdle:
           internal?.requireActiveRun === true
             ? { behavior: 'discard' }

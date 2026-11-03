@@ -216,6 +216,31 @@ describe('subagent control tool', () => {
     await harness.shutdown();
   });
 
+  it('a sent message the child run ends without consuming never starts a follow-up run', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const { childId, releaseChild } = await delegateHeldChild(parent, childAgent, 'write the appendix');
+    await poll(() => harness._internalGetLiveSession(childId)?.isRunning() === true);
+    const run = control(parent);
+    // The held mock run never drains queued signals, so it ends without
+    // consuming the message.
+    expect(await run({ action: 'send', subagentSessionId: childId, message: 'Also add a glossary.' })).toMatchObject({
+      delivered: true,
+    });
+
+    releaseChild();
+    const waited = await run({ action: 'wait', subagentSessionId: childId, timeoutMs: 5_000 });
+    expect(waited.settledSubagents).toEqual([
+      expect.objectContaining({ subagentSessionId: childId, status: 'completed' }),
+    ]);
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(childAgent.streamCalls).toHaveLength(1);
+    closeTurn();
+    await harness.shutdown();
+  });
+
   it('cancel acknowledges a live child, then the delegation settles failed; a second cancel is a no-op', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

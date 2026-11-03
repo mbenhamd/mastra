@@ -71,11 +71,15 @@ set when subagent types are configured and the calling session is below
   as running until `closedAt`.
 - `send` interleaves a bounded system reminder into the child's active run
   (`injectSystemReminder` with the internal `requireActiveRun`, dispatched with
-  `ifIdle: discard`). It never wakes an idle or parked child.
+  `ifIdle: discard` and `ifActive.expireWithRun`). It never wakes an idle or
+  parked child, and a message the run ends without consuming is dropped
+  instead of starting a follow-up run.
 - `cancel` runs the owned cancellation cascade, which commits `cancelRequest`
   on the child's own record. That cancel is honoured by the delegation driver
-  and by reconcile-on-rehydrate. The tool never writes under another process's
-  unexpired lease; it reports the child unavailable instead.
+  and by reconcile-on-rehydrate. Cancel needs the child's lease to be free or
+  held by this process. The tool never writes under another process's
+  unexpired lease; it returns the retryable
+  `harness.subagent_cancel_unavailable` instead.
 
 Rejections are `isError` payloads. The tool passes through the normal
 permission gate.
