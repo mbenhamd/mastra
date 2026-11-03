@@ -7331,7 +7331,7 @@ export class AgentThreadStreamRuntime {
             rejectTerminal(terminalError);
             this.#clearSuspendedRun(state, record.runId);
             state.pendingSignalsByThread.delete(key);
-            state.runScopedSignalIdsByThread.delete(key);
+            this.#dropRunScopedSignals(state, pubsub, key);
             state.threadRunsByStreamId.delete(record.streamId);
             if (
               state.activeThreadRunIds.get(key) === record.runId &&
@@ -7367,7 +7367,7 @@ export class AgentThreadStreamRuntime {
           );
           this.#clearSuspendedRun(state, record.runId);
           state.pendingSignalsByThread.delete(key);
-          state.runScopedSignalIdsByThread.delete(key);
+          this.#dropRunScopedSignals(state, pubsub, key);
           state.threadRunsByStreamId.delete(record.streamId);
           if (
             state.activeThreadRunIds.get(key) === record.runId &&
@@ -7627,6 +7627,8 @@ export class AgentThreadStreamRuntime {
         // cancellable through owner verification, and a competing handoff
         // cannot interleave once verification starts.
         if (!owns.acquired) {
+          // PF-7473: run-scoped input never follows the thread to the winner.
+          this.#dropRunScopedSignals(state, pubsub, key);
           if (state.activeThreadRunIds.get(key) === nextRunId) {
             state.activeThreadRunIds.delete(key);
           }
@@ -9074,6 +9076,8 @@ export class AgentThreadStreamRuntime {
       // Its admission records are forgotten here, as fork main forgets them (whichever
       // run they name), and recorded again when it is forwarded or requeued; a retry in
       // between is admitted afresh and carries it instead.
+      // PF-7473: run-scoped input never follows the signal to the winner.
+      this.#dropRunScopedSignals(state, pubsub, key);
       const keptInput = state.preRunSignalsByThread.get(key) ?? [];
       state.preRunSignalsByThread.delete(key);
       for (const kept of keptInput) this.#forgetCurrentSignalAdmission(state, key, kept);
