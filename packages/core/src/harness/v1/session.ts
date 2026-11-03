@@ -230,7 +230,9 @@ import type {
   AddTaskInput,
   CheckInput,
   DecomposeChildInput,
+  DelegatedSettlementNoticeMode,
   DelegatedSubagentOutcome,
+  PendingDelegationSettlementNotice,
   PlanTaskSessionPort,
   PlanTaskSummary,
   PlanTaskView,
@@ -239,6 +241,7 @@ import type {
 } from './plan-task-session';
 import {
   capturePlanTaskDelegationScope,
+  planTaskAcknowledgeDelegationSettlementNotice,
   planTaskAdd,
   planTaskCheck,
   planTaskComplete,
@@ -251,6 +254,7 @@ import {
   PLAN_TASK_MAX_NODES,
   PLAN_TASK_UPDATED_EVENT,
   readDelegationAttemptMetadata,
+  readPendingDelegationSettlementNotice,
 } from './plan-task-session';
 import { createPlanTaskTools, TASK_CHECK_TOOL_ID } from './plan-task-tool';
 import {
@@ -1298,6 +1302,15 @@ function buildJudgeContinuation(opts: { turn: number; max: number; objective: st
 }
 
 /**
+ * Parent-facing notice for a settled detached delegation. It names the task and
+ * outcome only; the durable result stays behind `plan_task_check`, the bounded
+ * read the model already uses for delegated work.
+ */
+function delegationSettlementNoticeText(notice: { taskId: string; outcome: string }): string {
+  return `Delegated plan task ${JSON.stringify(notice.taskId)} settled with outcome "${notice.outcome}". Call ${TASK_CHECK_TOOL_ID} with rootTaskId ${JSON.stringify(notice.taskId)} to read its result before continuing that work.`;
+}
+
+/**
  * Defensive cap on `inProgressTaskIds` in the lazily-seeded plan-task summary
  * (§5.1k / TM-5). The single-in-progress-per-root rule keeps this naturally
  * small; the cap bounds a degenerate tree from materializing an unbounded id
@@ -1794,6 +1807,8 @@ export class Session {
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
+  /** Settlement notices (child id + digest) this process is delivering right now. */
+  private readonly _delegationNoticesInFlight = new Set<string>();
   /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
   private readonly _pendingTerminalSubagentAnswers = new Map<
     string,
@@ -22728,7 +22743,9 @@ export class Session {
         this._scheduleDelegationReconcileRetry(0);
         return;
       }
-      const reconciled = await this._reconcileDelegatedTask(taskId, child.id, outcome, summary);
+      const reconciled = await this._reconcileDelegatedTask(taskId, child.id, outcome, summary, {
+        childCancelRequest: child._record.cancelRequest,
+      });
       if (!reconciled) {
         settlement = 'not_reconciled';
         return;
@@ -22766,8 +22783,16 @@ export class Session {
     subagentSessionId: string,
     outcome: DelegatedSubagentOutcome,
     result?: HarnessSubagentResultSummary,
+    /**
+     * Present for detached settlements the parent model did not observe in a
+     * tool result (the live driver and restart reconcile). Delegate-time
+     * failures omit it: their task_delegate call already returned the error.
+     */
+    notify?: { childCancelRequest: SessionRecord['cancelRequest'] },
   ): Promise<boolean> {
     if (this._state === 'closed') return false;
+    const noticeMode =
+      notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest);
     try {
       const durableResult =
         result ??
@@ -22791,9 +22816,11 @@ export class Session {
           subagentSessionId,
           outcome,
           ...(durableResult !== undefined ? { result: durableResult } : {}),
+          ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
         }),
       );
       if (reconcileResult.reconciled) this._notifyDisplayRefresh();
+      if (reconcileResult.notice !== undefined) void this._deliverDelegationSettlementNotice(reconcileResult.notice);
       return reconcileResult.reconciled;
     } catch {
       // Keep a live recovery path even when no future parent message or hydrate
@@ -22801,6 +22828,116 @@ export class Session {
       // scan retry re-reads the exact link and settles it idempotently.
       this._scheduleDelegationReconcileRetry(0);
       return false;
+    }
+  }
+
+  /**
+   * Notice mode for a detached settlement, or undefined for none. A settlement
+   * caused by this parent's own Stop/cancel cascade owes no notice; a durable
+   * delegation timeout is a real settlement the parent model must learn about.
+   */
+  private _delegatedSettlementNoticeMode(
+    childCancelRequest: SessionRecord['cancelRequest'],
+  ): DelegatedSettlementNoticeMode | undefined {
+    const configured = this._harness._getSubagentDelegatedSettlementNotice();
+    if (configured === 'none') return undefined;
+    if (this._record.cancelRequest !== undefined) return undefined;
+    if (
+      childCancelRequest !== undefined &&
+      childCancelRequest.requestedBy === this.id &&
+      childCancelRequest.reason !== 'delegation_timeout'
+    ) {
+      return undefined;
+    }
+    return configured;
+  }
+
+  /**
+   * Deliver one owed settlement notice as a `system-reminder` signal, at most
+   * once per child session id + settlement digest.
+   *
+   * - `remind`, or `wake` while a parent turn is in progress: send with a
+   *   deterministic signal id. An active run receives it; an idle thread
+   *   persists it for the next turn without waking (the native `persist` idle
+   *   behaviour). The durable notice is acknowledged only after the write, and
+   *   a repeat after a crash rewrites the same message id instead of adding one.
+   * - `wake` on an idle parent: acknowledge first, then wake a follow-up turn,
+   *   so a crash or a concurrent deliverer can never start a second turn.
+   *
+   * A cancelled parent drops the notice. A closed or torn-down parent leaves it
+   * owed; restart reconcile delivers it on the next live hydrate.
+   */
+  private async _deliverDelegationSettlementNotice(notice: PendingDelegationSettlementNotice): Promise<void> {
+    const key = `${notice.subagentSessionId}:${notice.digest}`;
+    if (this._state !== 'live' || this.isClosing || this._delegationNoticesInFlight.has(key)) return;
+    this._delegationNoticesInFlight.add(key);
+    const acknowledge = () =>
+      this._serializePlanTaskWrite(() =>
+        planTaskAcknowledgeDelegationSettlementNotice(this._planTaskPort(), {
+          taskId: notice.taskId,
+          subagentSessionId: notice.subagentSessionId,
+          digest: notice.digest,
+        }),
+      );
+    try {
+      if (this._record.cancelRequest !== undefined) {
+        await acknowledge();
+        return;
+      }
+      const content = delegationSettlementNoticeText(notice);
+      const attributes = { type: 'delegated-task-settled' };
+      const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
+      const persistOrDeliver = async () => {
+        const agent = this._harness.getAgentForMode(this._record.modeId);
+        const sent = agent.sendSignal(
+          {
+            type: 'system-reminder',
+            id: `harness-delegation-notice-${sha256CanonicalJson({ sessionId: this.id, key }).slice(0, 32)}`,
+            contents: content,
+            attributes,
+            metadata,
+          },
+          {
+            resourceId: this.resourceId,
+            threadId: this.threadId,
+            ifIdle: {
+              behavior: 'persist',
+              streamOptions: { memory: { thread: this.threadId, resource: this.resourceId } } as never,
+            },
+          },
+        );
+        await sent.accepted;
+        await sent.persisted;
+      };
+      // Only a fully idle parent wakes. A running turn, parked interaction, or
+      // queued turn will read the persisted reminder on its own run.
+      const wakeIdle =
+        notice.mode === 'wake' &&
+        !this.isRunning() &&
+        this._activeWorkInvalidationsInFlight === 0 &&
+        this._record.pendingResume === undefined &&
+        (this._record.pendingQueue ?? []).length === 0;
+      if (wakeIdle) {
+        // The fenced acknowledgement is the claim: only its winner wakes.
+        if (!(await acknowledge())) return;
+        try {
+          await this.injectSystemReminder(content, { attributes, metadata });
+          return;
+        } catch {
+          // A wake that cannot start (lost an idle race, session closing) still
+          // leaves the reminder for the parent's next turn when it stays open.
+        }
+        if (this._state !== 'live' || this._record.cancelRequest !== undefined) return;
+        await persistOrDeliver();
+        return;
+      }
+      await persistOrDeliver();
+      await acknowledge();
+    } catch {
+      // Best-effort: an unacknowledged notice stays durable and the next
+      // reconcile pass redelivers it under the same dedupe key.
+    } finally {
+      this._delegationNoticesInFlight.delete(key);
     }
   }
 
@@ -22979,6 +23116,7 @@ export class Session {
     }
     let cursor: string | undefined;
     const delegated: HarnessPlanTask[] = [];
+    const owedNotices: PendingDelegationSettlementNotice[] = [];
     try {
       for (;;) {
         const page = await this._storage.listPlanTasks({
@@ -22991,6 +23129,9 @@ export class Session {
           if (t.delegatedSubagentSessionId !== undefined && !TERMINAL_PLAN_TASK_STATUSES.has(t.status)) {
             delegated.push(t);
           }
+          // A settlement committed before a crash can still owe its notice.
+          const owedNotice = readPendingDelegationSettlementNotice(t);
+          if (owedNotice !== undefined) owedNotices.push(owedNotice);
         }
         if (!page.cursor || page.tasks.length === 0) break;
         cursor = page.cursor;
@@ -23001,6 +23142,8 @@ export class Session {
       this._scheduleDelegationReconcileRetry(attempt);
       return;
     }
+
+    for (const owedNotice of owedNotices) void this._deliverDelegationSettlementNotice(owedNotice);
 
     let needsRetry = false;
     for (const task of delegated) {
@@ -23020,7 +23163,9 @@ export class Session {
       }
       // Subagent session GONE/deleted → fail closed.
       if (!childRecord) {
-        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed', undefined, {
+          childCancelRequest: undefined,
+        });
         continue;
       }
       const delegationAttempt = readDelegationAttemptMetadata(task, childId);
@@ -23044,6 +23189,7 @@ export class Session {
           childRecord.cancelRequest.reason === 'delegation_timeout' && delegationAttempt !== undefined
             ? summarizeDelegationDeadline(delegationAttempt.deadlineAt)
             : undefined,
+          { childCancelRequest: childRecord.cancelRequest },
         );
         continue;
       }
@@ -23052,7 +23198,9 @@ export class Session {
           needsRetry = true;
           continue;
         }
-        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed', undefined, {
+          childCancelRequest: childRecord.cancelRequest,
+        });
         continue;
       }
       // DURABLE terminal evidence is the authority — a delegated run that ERRORED
@@ -23069,13 +23217,17 @@ export class Session {
           needsRetry = true;
           continue;
         }
-        await this._reconcileDelegatedTask(task.taskId, childId, durable.outcome, durable.result);
+        await this._reconcileDelegatedTask(task.taskId, childId, durable.outcome, durable.result, {
+          childCancelRequest: childRecord.cancelRequest,
+        });
         continue;
       }
       // A close marker cannot prove useful work completed. Without terminal
       // signal evidence, fail closed rather than fabricating success.
       if (childRecord.closedAt !== undefined) {
-        await this._reconcileDelegatedTask(task.taskId, childId, 'failed');
+        await this._reconcileDelegatedTask(task.taskId, childId, 'failed', undefined, {
+          childCancelRequest: childRecord.cancelRequest,
+        });
         continue;
       }
       // The absolute timestamp was committed with the ownership edge. Recovery
@@ -23091,6 +23243,7 @@ export class Session {
           childId,
           'failed',
           summarizeDelegationDeadline(delegationAttempt.deadlineAt),
+          { childCancelRequest: undefined },
         );
         continue;
       }
