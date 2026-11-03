@@ -5861,6 +5861,83 @@ NODE
       assert_not_contains 'Running changed test file in full:' "$output"
     fi
   done
+
+  # PF-7567: the v5 stream executor may name only getModelCapabilities from the
+  # Anthropic adapter's internal entrypoint. The first case approves it (and
+  # becomes the trusted base); every other shape or importer fails closed.
+  local anthropic_capabilities_base_sha anthropic_capabilities_case
+  anthropic_capabilities_base_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$package_contract_base_sha"
+    mkdir -p packages/core/src/stream/aisdk/v5
+    printf '%s\n' 'export const execute = {};' > packages/core/src/stream/aisdk/v5/execute.ts
+    printf '%s\n' 'export const transform = {};' > packages/core/src/stream/aisdk/v5/transform.ts
+    printf '%s\n' \
+      "import '../../../../core/src/stream/aisdk/v5/execute';" \
+      "import '../../../../core/src/stream/aisdk/v5/transform';" \
+      >> packages/server/src/server/handlers/favorites.integration.test.ts
+    git add .
+    git commit -q -m 'prepare the Anthropic capability runtime fixture'
+    git rev-parse HEAD
+  )"
+  for anthropic_capabilities_case in named extra-value namespace default side-effect reexport require dynamic other-importer; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$anthropic_capabilities_base_sha"
+      node - "$anthropic_capabilities_case" <<'NODE'
+const fs = require('node:fs');
+const variant = process.argv[2];
+const file = 'packages/core/src/stream/aisdk/v5/execute.ts';
+const specifier = '@ai-sdk/anthropic-v6/internal';
+const named = `import { type AnthropicMessagesModelId, getModelCapabilities as getAnthropicModelCapabilities } from '${specifier}';\n`;
+const use = 'export const execute = getAnthropicModelCapabilities;\n';
+const extra = {
+  named: '',
+  'extra-value': `import { anthropicTools } from '${specifier}';\nvoid anthropicTools;\n`,
+  namespace: `import * as anthropicInternal from '${specifier}';\nvoid anthropicInternal;\n`,
+  default: `import anthropicInternal from '${specifier}';\nvoid anthropicInternal;\n`,
+  'side-effect': `import '${specifier}';\n`,
+  reexport: `export { anthropicTools } from '${specifier}';\n`,
+  require: `void require('${specifier}');\n`,
+  dynamic: `void import('${specifier}');\n`,
+};
+if (variant === 'other-importer') {
+  fs.writeFileSync('packages/core/src/stream/aisdk/v5/transform.ts',
+    named + 'export const transform = getAnthropicModelCapabilities;\n');
+} else {
+  fs.writeFileSync(file, named + extra[variant] + use);
+}
+NODE
+      git add .
+      git commit -q -m "exercise Anthropic capability import $anthropic_capabilities_case"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/package-contract-anthropic-capabilities-$anthropic_capabilities_case.log"
+    if [[ "$anthropic_capabilities_case" == named ]]; then
+      if ! run_fixture "$head_sha" "$output" BASE_SHA="$anthropic_capabilities_base_sha"; then
+        cat "$output" >&2
+        exit 1
+      fi
+      assert_not_contains '@ai-sdk/anthropic-v6/internal' "$output"
+      assert_contains 'Running changed test file in full: packages/server/src/server/handlers/favorites.integration.test.ts' "$output"
+      anthropic_capabilities_base_sha="$head_sha"
+    else
+      if run_fixture "$head_sha" "$output" BASE_SHA="$anthropic_capabilities_base_sha"; then
+        echo "Unsupported Anthropic capability import unexpectedly passed: $anthropic_capabilities_case" >&2
+        cat "$output" >&2
+        exit 1
+      fi
+      assert_contains 'unreviewed external module @ai-sdk/anthropic-v6/internal' "$output"
+      if [[ "$anthropic_capabilities_case" == other-importer ]]; then
+        # The module ban applies outside the approved importer as well.
+        assert_line_matches \
+          'stream/aisdk/v5/transform\.ts: module @ai-sdk/anthropic-v6/internal$' \
+          "$output"
+      fi
+      assert_not_contains 'Running changed test file in full:' "$output"
+    fi
+  done
   git -C "$fixture_repo" reset -q --hard "$base_sha"
   echo 'Package contract ownership, native command, fixture metadata, and fail-closed validation fixtures passed.'
   if [[ "${1:-}" == '--package-contracts-only' ]]; then
@@ -16168,19 +16245,39 @@ function unsupportedModuleReason(specifier) {
   return undefined;
 }
 
+// Every runtime occurrence of the module must be an import declaration with
+// only named bindings, each either type-only or importing the reviewed export
+// (aliasing allowed), including repeated uses through another import or loader.
+function onlyReviewedNamedImport(occurrences, importedName) {
+  return Boolean(occurrences?.length && occurrences.every(node => {
+    if (!ts.isImportDeclaration(node)) return false;
+    const clause = node.importClause;
+    return clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings) &&
+      clause.namedBindings.elements.every(element =>
+        element.isTypeOnly || (element.propertyName ?? element.name).text === importedName);
+  }));
+}
+
+// PF-7567: the v5 stream executor mirrors the pinned Anthropic adapter's
+// jsonTool-to-native switch through its capability lookup. Approve that one
+// export from that one importer; every other @ai-sdk/* module stays banned.
+const ANTHROPIC_CAPABILITIES_SPECIFIER = '@ai-sdk/anthropic-v6/internal';
+const ANTHROPIC_CAPABILITIES_IMPORTER = 'packages/core/src/stream/aisdk/v5/execute.ts';
+
+function approvedAnthropicCapabilitiesImport(specifier, importer, occurrences) {
+  return specifier === ANTHROPIC_CAPABILITIES_SPECIFIER &&
+    repositoryPath(importer) === ANTHROPIC_CAPABILITIES_IMPORTER &&
+    onlyReviewedNamedImport(occurrences, 'getModelCapabilities');
+}
+
 function approvedExactExternalSpecifier(specifier, importer, occurrences) {
-  // Tool Builder's owning SDK supplies this schema constructor. Every runtime
-  // occurrence must retain the reviewed named import, including repeated uses
-  // of the same module through another import or loader expression.
+  // Tool Builder's owning SDK supplies this schema constructor.
   if (specifier === '@internal/ai-v6' &&
     repositoryPath(importer) === 'packages/core/src/tools/tool-builder/builder.ts') {
-    return Boolean(occurrences?.length && occurrences.every(node => {
-      if (!ts.isImportDeclaration(node)) return false;
-      const clause = node.importClause;
-      return clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings) &&
-        clause.namedBindings.elements.every(element =>
-          element.isTypeOnly || (element.propertyName ?? element.name).text === 'jsonSchema');
-    }));
+    return onlyReviewedNamedImport(occurrences, 'jsonSchema');
+  }
+  if (specifier === ANTHROPIC_CAPABILITIES_SPECIFIER) {
+    return approvedAnthropicCapabilitiesImport(specifier, importer, occurrences);
   }
   const bareSpecifier = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
   return (
@@ -16538,17 +16635,20 @@ function unsupportedRuntimeReasons(file, source) {
     // handler's SSRF-guarded fetch); editing unrelated lines of that file
     // must not retroactively reject it. Only NEWLY ADDED banned imports in
     // the changed surface fail closed.
-    if (reason && !(baseSource !== undefined && baseSpecifiers.has(specifier))) {
+    if (reason && !(baseSource !== undefined && baseSpecifiers.has(specifier)) &&
+      !approvedAnthropicCapabilitiesImport(specifier, file, runtimeOccurrences.get(specifier))) {
       reasons.add(`module ${reason}`);
     }
-    // The Tool Builder approval names one export, so it remains scoped after
-    // that import reaches the trusted base.
+    // The Tool Builder and Anthropic capability approvals each name one
+    // export, so they remain scoped after that import reaches the trusted base.
     if (
       exactTestEntries.has(entryFile) &&
       !specifier.startsWith('.') &&
       (!wasReachableFromExactTest || !baseSpecifiers.has(specifier) ||
         (specifier === '@internal/ai-v6' &&
-          repositoryPath(file) === 'packages/core/src/tools/tool-builder/builder.ts')) &&
+          repositoryPath(file) === 'packages/core/src/tools/tool-builder/builder.ts') ||
+        (specifier === ANTHROPIC_CAPABILITIES_SPECIFIER &&
+          repositoryPath(file) === ANTHROPIC_CAPABILITIES_IMPORTER)) &&
       !approvedExactExternalSpecifier(specifier, file, runtimeOccurrences.get(specifier))
     ) {
       reasons.add(`unreviewed external module ${specifier}`);

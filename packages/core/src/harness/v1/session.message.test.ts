@@ -6074,6 +6074,22 @@ describe('Session.message() — per-turn overrides', () => {
     expect(agent.calls[0]!.options.modelSettings).toBeUndefined();
     expect(agent.calls[1]!.options.modelSettings).toEqual({ temperature: 0.2, maxOutputTokens: 128 });
   });
+
+  it('forwards a caller jsonPromptInjection to sync structured generation only when provided', async () => {
+    const { harness, agent } = setup();
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const Schema = z.object({ ok: z.boolean() });
+    agent.fullOutput = {
+      ...agent.fullOutput,
+      object: { ok: true },
+    };
+
+    await session.message({ content: 'compute', output: Schema, sync: true });
+    await session.message({ content: 'compute again', output: Schema, sync: true, jsonPromptInjection: 'system' });
+
+    expect(agent.calls[0]!.options.structuredOutput).toEqual({ schema: Schema });
+    expect(agent.calls[1]!.options.structuredOutput).toEqual({ schema: Schema, jsonPromptInjection: 'system' });
+  });
 });
 
 describe('Session.message() — closed sessions reject', () => {

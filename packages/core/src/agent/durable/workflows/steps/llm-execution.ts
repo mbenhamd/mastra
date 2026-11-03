@@ -1060,6 +1060,8 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     schema: structuredOutputConfig.schema,
                     jsonPromptInjection: structuredOutputConfig.jsonPromptInjection,
                     instructions: structuredOutputConfig.instructions,
+                    // PF-7309: the decision recorded before serialization; never re-derived here.
+                    sourceDecision: structuredOutputConfig.sourceDecision,
                   }
                 : undefined;
 
@@ -1893,7 +1895,12 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                     toolChoice: currentToolChoice,
                     activeTools: currentActiveTools,
                     specificationVersion: currentModel.specificationVersion,
-                    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, currentModel),
+                    stripToolsWhenNone: sendsNativeResponseFormat(
+                      structuredOutput,
+                      currentModel,
+                      currentProviderOptions,
+                      { tools: currentTools, activeTools: currentActiveTools, toolChoice: currentToolChoice },
+                    ),
                   })
                 : undefined,
             );

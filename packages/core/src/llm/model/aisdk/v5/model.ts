@@ -10,7 +10,7 @@ type StreamResult = Awaited<ReturnType<LanguageModelV2['doStream']>>;
  * the OpenAI provider options so the V2 OpenAI provider enables strict mode
  * globally for all tools.
  */
-function applyStrictForV2(options: LanguageModelV2CallOptions): LanguageModelV2CallOptions {
+export function applyStrictForV2(options: LanguageModelV2CallOptions): LanguageModelV2CallOptions {
   if (!options.tools?.length) {
     return options;
   }
