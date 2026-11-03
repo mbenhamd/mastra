@@ -22944,6 +22944,8 @@ export class Session {
         // not an acknowledgement boundary. Persist the row once that run ended.
         const deliveredRunId = accepted.action === 'deliver' ? accepted.runId : undefined;
         if (deliveredRunId !== undefined) await this._awaitRunCompletion(deliveredRunId).catch(() => undefined);
+        // A parent closed or torn down meanwhile leaves the notice owed.
+        if (this._state !== 'live' || this.isClosing) return;
         const durable = send('persist', deliveredRunId ?? 'undelivered');
         await durable.accepted;
         await durable.persisted;
