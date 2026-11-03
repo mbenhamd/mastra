@@ -22,4 +22,4 @@ const harness = new Harness({
 });
 ```
 
-In the standard agent loop, `onIterationComplete` now also receives `usage`, the token usage of that iteration's model call.
+`onIterationComplete` now also receives `usage`, the token usage of that iteration's model call, in the standard, evented and durable agent loops.

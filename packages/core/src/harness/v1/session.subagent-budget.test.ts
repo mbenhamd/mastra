@@ -57,6 +57,7 @@ function budgetFixture(
   parentCalls: (call: number) => ReturnType<typeof progressToolCallStream>,
   childStream: (call: number) => ReturnType<typeof progressToolCallStream> = call =>
     progressToolCallStream(`search-${call}`, 'searchPapers', '{}', `Searched ${call}. `),
+  childAgentOptions: { durable?: boolean; defaultOptions?: Record<string, unknown> } = {},
 ) {
   const search = vi.fn(async () => ({ hits: 1 }));
   const searchPapers = createTool({
@@ -70,6 +71,7 @@ function budgetFixture(
     id: 'child-agent',
     name: 'child-agent',
     instructions: 'Search until done, then report.',
+    ...childAgentOptions,
     model: new MockLanguageModelV2({
       doStream: async () => {
         childCalls++;
@@ -283,6 +285,160 @@ describe('Harness v1 — per-type subagent budgets', () => {
       expect(page.tasks.find((task: { taskId: string }) => task.taskId === taskId)?.status).toBe('failed');
     } finally {
       await harness.shutdown();
+    }
+  });
+
+  it('counts a final step a hook reopens, so a continuing hook cannot spend past the budget', async () => {
+    const report = progressToolCallStream(
+      'child-outcome',
+      'report_subagent_outcome',
+      JSON.stringify({
+        outcome: 'completed',
+        summary: 'Done after many turns.',
+        evidence: [{ kind: 'analysis', description: 'Reasoned it through.' }],
+      }),
+    );
+    const { harness, childCalls } = budgetFixture(
+      { maxSteps: 1 },
+      spawnThenAnswer,
+      call => (call < 5 ? textStream(`Thinking ${call}.`) : report),
+      { defaultOptions: { onIterationComplete: () => ({ continue: true }) } },
+    );
+    try {
+      const session = await harness.session({ resourceId: 'budget-user', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+
+      await session.message({ content: 'Find papers on X.' });
+
+      expect(childCalls()).toBe(1);
+      expect(events.find(event => event.type === 'subagent_end')).toMatchObject({
+        isError: true,
+        output: {
+          budgetExhausted: { budget: 'steps', limit: 1, used: 1 },
+          error: { code: 'harness.subagent_budget_exhausted' },
+        },
+      });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('meters tokens for a durable child agent', async () => {
+    const { harness, childCalls } = budgetFixture({ maxTotalTokens: 50 }, spawnThenAnswer, undefined, {
+      durable: true,
+    });
+    try {
+      const session = await harness.session({ resourceId: 'budget-user', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+
+      await session.message({ content: 'Find papers on X.' });
+
+      expect(childCalls()).toBe(2);
+      expect(events.find(event => event.type === 'subagent_end')).toMatchObject({
+        isError: true,
+        output: {
+          budgetExhausted: { budget: 'tokens', limit: 50, used: 60 },
+          error: { code: 'harness.subagent_budget_exhausted' },
+        },
+      });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+/**
+ * A budgeted child whose every step calls an approval-gated tool, so each
+ * step ends in a suspension and the next step runs in a resumed segment.
+ */
+function approvalChildFixture(storage: InMemoryStore, maxSteps: number) {
+  let modelCalls = 0;
+  const searchPapers = createTool({
+    id: 'searchPapers',
+    description: 'search',
+    inputSchema: z.object({}),
+    requireApproval: true,
+    execute: async () => ({ hits: 1 }),
+  });
+  const agent = new Agent({
+    id: 'child-agent',
+    name: 'child-agent',
+    instructions: 'Search.',
+    tools: { searchPapers },
+    model: new MockLanguageModelV2({
+      doStream: async () => {
+        modelCalls++;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: progressToolCallStream(`search-${modelCalls}`, 'searchPapers', '{}'),
+        };
+      },
+    }),
+  });
+  const harness = new Harness({
+    agents: { 'child-agent': agent },
+    storage,
+    modes: [{ id: 'default', agentId: 'child-agent' }],
+    defaultModeId: 'default',
+    subagents: { types: { searcher: { agentId: 'child-agent', description: 'Search papers', maxSteps } } },
+  });
+  return { harness, modelCalls: () => modelCalls };
+}
+
+describe('Harness v1 — subagent budgets across resumed segments', () => {
+  it('counts every resumed step instead of treating a restarted iteration number as a replay', async () => {
+    const { harness, modelCalls } = approvalChildFixture(new InMemoryStore(), 2);
+    try {
+      const child = await harness.session({
+        resourceId: 'budget-user',
+        threadId: { fresh: true },
+        subagentTypeId: 'searcher',
+      });
+      expect(((await child.message({ content: 'Search.' })) as { finishReason: string }).finishReason).toBe(
+        'suspended',
+      );
+      for (let approval = 0; approval < 3 && child.getRecord().pendingResume !== undefined; approval++) {
+        await child.respondToToolApproval({ approved: true });
+      }
+
+      expect(modelCalls()).toBe(2);
+      expect(child.getRecord().pendingResume).toBeUndefined();
+      expect(child._internalSubagentBudgetExhaustion()).toEqual({ budget: 'steps', limit: 2, used: 2 });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('keeps the spent budget across a restart while the child is suspended', async () => {
+    const storage = new InMemoryStore();
+    const first = approvalChildFixture(storage, 2);
+    let second: ReturnType<typeof approvalChildFixture> | undefined;
+    try {
+      const child = await first.harness.session({
+        resourceId: 'budget-user',
+        threadId: { fresh: true },
+        subagentTypeId: 'searcher',
+      });
+      await child.message({ content: 'Search.' });
+      await child.respondToToolApproval({ approved: true });
+      expect(child.getRecord().pendingResume?.subagentBudgetSpent).toEqual({ steps: 1, tokens: 30 });
+      const threadId = child.threadId;
+      await first.harness.shutdown();
+
+      second = approvalChildFixture(storage, 2);
+      const rehydrated = await second.harness.session({ resourceId: 'budget-user', threadId });
+      await rehydrated.respondToToolApproval({ approved: true });
+
+      // The restored step plus the resumed one reach the budget: no new provider call.
+      expect(second.modelCalls()).toBe(0);
+      expect(rehydrated.getRecord().pendingResume).toBeUndefined();
+      expect(rehydrated._internalSubagentBudgetExhaustion()).toEqual({ budget: 'steps', limit: 2, used: 2 });
+    } finally {
+      await second?.harness.shutdown();
+      await first.harness.shutdown();
     }
   });
 });

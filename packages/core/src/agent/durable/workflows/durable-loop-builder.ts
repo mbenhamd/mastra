@@ -1031,6 +1031,7 @@ export class DurableAgenticLoopBuilder extends AgenticLoopBuilder {
             })),
             isFinal,
             finishReason: lastStep?.finishReason ?? 'unknown',
+            usage: lastStep?.usage,
             runId: state.runId,
             threadId: rt.threadId,
             resourceId: rt.resourceId,

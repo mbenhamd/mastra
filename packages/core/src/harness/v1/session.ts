@@ -275,12 +275,14 @@ import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
   MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES,
   materializeHarnessTerminalText,
+  parseHarnessSubagentBudgetExhausted,
   parseHarnessSubagentOutcomeReport,
   parseHarnessSubagentTerminalResult,
   parseHarnessTerminalToolResultText,
   summarizeHarnessSubagentEventResult,
   summarizeHarnessSubagentResult,
   verifyHarnessSubagentTerminalCompletion,
+  withHarnessSubagentBudgetExhausted,
   withHarnessSubagentToolReceipts,
 } from './terminal-subagent-result';
 import type {
@@ -533,11 +535,15 @@ function createHarnessEmptySynthesisOptions(
       let responseOnlyReservedAtIteration: number | undefined;
       let responseOnlyPrepared = false;
       let ordinaryBudgetExhausted = false;
+      // Identity of this run segment for the subagent budget meter: a resume
+      // builds new options, so its restarted iteration numbers are new steps,
+      // while a replayed predicate in this segment is not counted twice.
+      const budgetSegment = {};
       return {
         recoveryMaxSteps: 1,
         onIterationComplete: existing => {
           const configured = existing as HarnessIterationCompleteHandler | undefined;
-          return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
+          const ordinary = async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
             // The recovery phase gets one provider response, even if that
             // response tries to call a tool that prepareStep hid. Configured
             // observers still see this iteration, but cannot reopen it.
@@ -560,18 +566,6 @@ function createHarnessEmptySynthesisOptions(
             }
 
             if (context.toolResults.length > 0) segmentHasToolResults = true;
-            // A per-type subagent budget is a framework stop at this step
-            // boundary. Configured observers still see the iteration, but
-            // neither they nor their feedback can reopen it (the loop logs and
-            // ignores a throwing hook, which would otherwise skip this stop).
-            if (subagentBudget?.observe(context) === true) {
-              try {
-                await configured?.(context);
-              } catch (error) {
-                reportConfiguredHookError('onIterationComplete', error);
-              }
-              return { continue: false };
-            }
             ordinaryBudgetExhausted ||= context.iteration >= HARNESS_SESSION_MAX_STEPS;
             const needsRecovery =
               context.isFinal &&
@@ -630,6 +624,33 @@ function createHarnessEmptySynthesisOptions(
                 ? `${configuredResult.feedback}\n\n${recoveryFeedback}`
                 : recoveryFeedback,
             };
+          };
+          if (subagentBudget === undefined) return ordinary;
+          return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
+            if (responseOnly) return ordinary(context);
+            // A per-type subagent budget is a framework stop at this step
+            // boundary. Configured observers still see the iteration, but
+            // neither they nor their feedback can reopen it (the loop logs and
+            // ignores a throwing hook, which would otherwise skip this stop).
+            const budgetReached = subagentBudget.observe(context, budgetSegment);
+            if (budgetReached && !context.isFinal) {
+              subagentBudget.exhaust();
+              try {
+                await configured?.(context);
+              } catch (error) {
+                reportConfiguredHookError('onIterationComplete', error);
+              }
+              return { continue: false };
+            }
+            const result = await ordinary(context);
+            // A final iteration ends the child within budget only when nothing
+            // reopens it: a hook continuation or the response-only recovery
+            // would spend past the budget, so the budget stops it instead.
+            if (budgetReached && result?.continue === true) {
+              subagentBudget.exhaust();
+              return { continue: false };
+            }
+            return result;
           };
         },
         prepareStep: existing => {
@@ -1539,7 +1560,13 @@ export interface SessionDisplayState {
 
 export type SessionDisplayPending = Omit<
   NonNullable<SessionRecord['pendingResume']>,
-  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence' | 'toolReceipts' | 'toolReceiptsOverflow' | 'expiresAt'
+  | 'runtimeDependencies'
+  | 'requestContext'
+  | 'toolSurfaceFence'
+  | 'toolReceipts'
+  | 'toolReceiptsOverflow'
+  | 'subagentBudgetSpent'
+  | 'expiresAt'
 > & { expiresAt: number };
 
 function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
@@ -1553,6 +1580,7 @@ function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): Sessi
     toolSurfaceFence: _toolSurfaceFence,
     toolReceipts: _toolReceipts,
     toolReceiptsOverflow: _toolReceiptsOverflow,
+    subagentBudgetSpent: _subagentBudgetSpent,
     ...displayPending
   } = pending;
   return {
@@ -8394,7 +8422,10 @@ export class Session {
   ): Promise<void> {
     const receiptState = this._runToolReceipts.get(runId);
     const full = materializeHarnessTerminalText(
-      withHarnessSubagentToolReceipts(providerResult, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
+      withHarnessSubagentBudgetExhausted(
+        withHarnessSubagentToolReceipts(providerResult, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
+        this._subagentBudget?.exhausted,
+      ),
     );
     let failure: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -8663,7 +8694,10 @@ export class Session {
   private _materializeHarnessRunOutput(runId: string, rawFull: FullOutput<unknown>): FullOutput<unknown> {
     const receiptState = this._runToolReceipts.get(runId);
     const full = materializeHarnessTerminalText(
-      withHarnessSubagentToolReceipts(rawFull, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
+      withHarnessSubagentBudgetExhausted(
+        withHarnessSubagentToolReceipts(rawFull, receiptState?.receipts ?? [], receiptState?.overflow ?? false),
+        this._subagentBudget?.exhausted,
+      ),
     );
     if (full.finishReason !== 'suspended') this._runToolReceipts.delete(runId);
     return full;
@@ -14815,6 +14849,7 @@ export class Session {
         : {}),
       ...(accountedTokenUsage ? { accountedTokenUsage } : {}),
       ...toolReceiptProjection,
+      ...(this._subagentBudget !== undefined ? { subagentBudgetSpent: this._subagentBudget.spent() } : {}),
       payload: this._buildResumePayload(kind, payload),
     };
 
@@ -17313,6 +17348,7 @@ export class Session {
         stageToolSurfaceFenceRestore(resumeRequestContext, pending.runId, pending.toolSurfaceFence);
       }
       this._restorePendingRunToolReceipts(pending);
+      this._subagentBudgetMeter()?.restore(pending.subagentBudgetSpent);
       const resumeStream = agent.resumeStream(resumeData, {
         runId: pending.runId,
         toolCallId: pending.toolCallId,
@@ -22717,7 +22753,7 @@ export class Session {
         // reported an outcome: a typed partial result, not a generic failure.
         budgetExhausted =
           child._record.cancelRequest === undefined && report === undefined
-            ? child._internalSubagentBudgetExhaustion()
+            ? (parseHarnessSubagentBudgetExhausted(rawResult) ?? child._internalSubagentBudgetExhaustion())
             : undefined;
         if (budgetExhausted !== undefined) {
           publicError = harnessSubagentBudgetExhaustedError(agentType, budgetExhausted);
@@ -22929,28 +22965,36 @@ export class Session {
       );
       const report = verifyHarnessSubagentTerminalCompletion(rawResult);
       const outcome: DelegatedSubagentOutcome = report !== undefined ? report.outcome : 'failed';
+      // A budget stop persisted with the child's result keeps its typed code
+      // when a crash interrupted the live settlement.
+      const budgetExhausted = report === undefined ? parseHarnessSubagentBudgetExhausted(rawResult) : undefined;
       const result = summarizeHarnessSubagentResult(rawResult, {
         isError: outcome !== 'completed',
-        ...(outcome !== 'completed'
+        ...(budgetExhausted !== undefined
           ? {
-              error: {
-                code:
-                  report?.issue?.code ??
-                  ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
-                    ? 'harness.subagent_evidence_unverified'
-                    : report === undefined
-                      ? 'harness.subagent_outcome_missing'
-                      : 'harness.subagent_incomplete'),
-                message:
-                  report?.issue?.message ??
-                  (report === undefined
-                    ? declaredReport !== undefined || declaredTerminalText !== undefined
-                      ? 'The delegated subagent terminal completion did not match framework execution receipts'
-                      : `The delegated subagent ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
-                    : `The delegated subagent reported ${report.outcome} after provider finish reason "${String(finishReason ?? 'missing')}"`),
-              },
+              budgetExhausted,
+              error: harnessSubagentBudgetExhaustedError(childRecord.subagentTypeId ?? 'delegated', budgetExhausted),
             }
-          : {}),
+          : outcome !== 'completed'
+            ? {
+                error: {
+                  code:
+                    report?.issue?.code ??
+                    ((declaredReport !== undefined || declaredTerminalText !== undefined) && report === undefined
+                      ? 'harness.subagent_evidence_unverified'
+                      : report === undefined
+                        ? 'harness.subagent_outcome_missing'
+                        : 'harness.subagent_incomplete'),
+                  message:
+                    report?.issue?.message ??
+                    (report === undefined
+                      ? declaredReport !== undefined || declaredTerminalText !== undefined
+                        ? 'The delegated subagent terminal completion did not match framework execution receipts'
+                        : `The delegated subagent ended without ${HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID}`
+                      : `The delegated subagent reported ${report.outcome} after provider finish reason "${String(finishReason ?? 'missing')}"`),
+                },
+              }
+            : {}),
       });
       return { outcome, result };
     }

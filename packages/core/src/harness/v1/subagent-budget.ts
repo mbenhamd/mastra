@@ -3,9 +3,10 @@
  * `maxTotalTokens`).
  *
  * A child session whose type declares a budget gets one meter for its
- * lifetime. The Harness iteration hook feeds it every completed provider step
- * and stops the run at the step boundary where a budget is reached; a final
- * iteration is never counted as exhaustion because the run is ending anyway.
+ * lifetime; its spend is persisted with a suspended run so a restart keeps it.
+ * The Harness iteration hook feeds it every completed provider step and stops
+ * the run at the step boundary where a budget is reached, unless that
+ * iteration really ends the child (a final step nothing reopens).
  * The spawn tool and the delegation driver then report
  * `harness.subagent_budget_exhausted` with the bounded partial summary
  * instead of a generic incomplete result.
@@ -23,12 +24,24 @@ export interface HarnessSubagentBudgetExhaustion {
   used: number;
 }
 
+/** Steps and tokens a child has spent; persisted across a suspension so a restart keeps them. */
+export interface HarnessSubagentBudgetSpent {
+  steps: number;
+  tokens: number;
+}
+
 export interface HarnessSubagentBudgetMeter {
   /**
-   * Record one completed iteration. Returns true when the run must stop here
-   * because a budget is reached and the model would otherwise continue.
+   * Record one completed iteration of `segment` (one run segment's options).
+   * An iteration at or below one this segment already recorded is a replay
+   * and is not counted again. Returns true when a budget is reached.
    */
-  observe(context: Pick<IterationCompleteContext, 'isFinal' | 'usage' | 'runId' | 'iteration'>): boolean;
+  observe(context: Pick<IterationCompleteContext, 'iteration' | 'usage'>, segment: object): boolean;
+  /** Mark the child as stopped by its budget, at its current spend. */
+  exhaust(): void;
+  /** Seed spend persisted before a restart; never lowers the current spend. */
+  restore(spent: HarnessSubagentBudgetSpent | undefined): void;
+  spent(): HarnessSubagentBudgetSpent;
   readonly exhausted: HarnessSubagentBudgetExhaustion | undefined;
 }
 
@@ -38,6 +51,10 @@ function stepTokens(usage: IterationCompleteContext['usage']): number {
   const total = count(usage.totalTokens);
   // Providers that report only input/output tokens still spend the budget.
   return Math.max(total, count(usage.inputTokens) + count(usage.outputTokens));
+}
+
+function isSpendCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 /** Returns undefined when the type declares no budget (today's behaviour). */
@@ -50,33 +67,39 @@ export function createHarnessSubagentBudgetMeter(
   let steps = 0;
   let tokens = 0;
   let exhausted: HarnessSubagentBudgetExhaustion | undefined;
-  // Durable loop predicates may be replayed for the same iteration before the
-  // transition commits; a replay repeats the earlier decision without counting.
-  let last: { runId: string; iteration: number; stop: boolean } | undefined;
+  const lastIterationBySegment = new WeakMap<object, number>();
+  const stepsReached = () => maxSteps !== undefined && steps >= maxSteps;
+  const tokensReached = () => maxTotalTokens !== undefined && tokens >= maxTotalTokens;
   return {
-    observe(context) {
-      if (last !== undefined && last.runId === context.runId && last.iteration === context.iteration) return last.stop;
-      const stop = observeOnce(context);
-      last = { runId: context.runId, iteration: context.iteration, stop };
-      return stop;
+    observe(context, segment) {
+      const last = lastIterationBySegment.get(segment);
+      if (last === undefined || context.iteration > last) {
+        lastIterationBySegment.set(segment, context.iteration);
+        steps += 1;
+        tokens += stepTokens(context.usage);
+      }
+      return stepsReached() || tokensReached();
+    },
+    exhaust() {
+      if (exhausted !== undefined) return;
+      if (maxSteps !== undefined && (stepsReached() || maxTotalTokens === undefined)) {
+        exhausted = { budget: 'steps', limit: maxSteps, used: steps };
+      } else if (maxTotalTokens !== undefined) {
+        exhausted = { budget: 'tokens', limit: maxTotalTokens, used: tokens };
+      }
+    },
+    restore(spent) {
+      if (spent === undefined) return;
+      if (isSpendCount(spent.steps)) steps = Math.max(steps, spent.steps);
+      if (isSpendCount(spent.tokens)) tokens = Math.max(tokens, spent.tokens);
+    },
+    spent() {
+      return { steps, tokens };
     },
     get exhausted() {
       return exhausted;
     },
   };
-
-  function observeOnce(context: Pick<IterationCompleteContext, 'isFinal' | 'usage'>): boolean {
-    if (exhausted !== undefined) return true;
-    steps += 1;
-    tokens += stepTokens(context.usage);
-    if (context.isFinal) return false;
-    if (maxSteps !== undefined && steps >= maxSteps) {
-      exhausted = { budget: 'steps', limit: maxSteps, used: steps };
-    } else if (maxTotalTokens !== undefined && tokens >= maxTotalTokens) {
-      exhausted = { budget: 'tokens', limit: maxTotalTokens, used: tokens };
-    }
-    return exhausted !== undefined;
-  }
 }
 
 /** Parent-visible error for a child stopped by its budget before it reported an outcome. */

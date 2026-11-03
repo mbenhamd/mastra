@@ -587,6 +587,7 @@ export class AgenticLoopBuilder<Tools extends ToolSet = ToolSet, OUTPUT = undefi
         })),
         isFinal,
         finishReason: typedInputData.stepResult?.reason || 'unknown',
+        usage: typedInputData.output.usage,
         runId,
         threadId: rt.threadId,
         resourceId: rt.resourceId,

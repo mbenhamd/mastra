@@ -248,6 +248,12 @@ export interface PendingResume {
   /** Receipt collection exceeded its bounded count/byte budget; verify closed. */
   toolReceiptsOverflow?: boolean;
   /**
+   * Steps and provider tokens a subagent child with a per-type budget
+   * (`SubagentDefinition.maxSteps` / `maxTotalTokens`) had spent when it
+   * suspended. Restored on resume so a restart does not grant a fresh budget.
+   */
+  subagentBudgetSpent?: { steps: number; tokens: number };
+  /**
    * Idempotency marker. Set by the resume helper before calling
    * `agent.resumeStream(...)` and observed on replay so a crash between
    * "wrote resumedAt" and "cleared pendingResume" does not double-resume.

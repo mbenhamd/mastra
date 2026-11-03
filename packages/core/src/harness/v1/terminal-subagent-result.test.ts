@@ -477,8 +477,8 @@ describe('Harness subagent outcome terminal contract', () => {
     const summary = summarizeHarnessSubagentResult(
       {
         finishReason: 'tool-calls',
-        // Truncated to the 48 KiB answer budget.
-        text: 's'.repeat(60 * 1024),
+        // Newlines double under JSON escaping: the worst case for the envelope.
+        text: '\n'.repeat(60 * 1024),
         steps: Array.from({ length: 40 }, () => ({})),
         totalUsage: { inputTokens: 900_000, outputTokens: 100_000, totalTokens: 1_000_000 },
         harnessToolReceipts: Array.from({ length: 24 }, (_, index) => ({
@@ -508,8 +508,7 @@ describe('Harness subagent outcome terminal contract', () => {
     expect(event.budgetExhausted).toEqual({ budget: 'steps', limit: 40, used: 40 });
     expect(event.usage).toEqual({ inputTokens: 900_000, outputTokens: 100_000, totalTokens: 1_000_000 });
     expect(event.toolTrace).toBeUndefined();
-    expect(encoder.encode(event.text).byteLength).toBeLessThanOrEqual(4 * 1024);
-    expect(encoder.encode(JSON.stringify(event)).byteLength).toBeLessThanOrEqual(8 * 1024);
+    expect(encoder.encode(JSON.stringify(event)).byteLength).toBeLessThanOrEqual(4 * 1024);
   });
 
   it('trims a large tool trace within its byte budget and says so', () => {

@@ -31,6 +31,7 @@ import {
   harnessSubagentResultSummarySchema,
   harnessSubagentDirectAnswerSchema,
   MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES,
+  parseHarnessSubagentBudgetExhausted,
   parseHarnessSubagentOutcomeReport,
   parseHarnessTerminalToolResultText,
   projectHarnessSpawnSubagentResult,
@@ -399,7 +400,8 @@ export function createSpawnSubagentTool(parent: Session) {
             (rawResult as { terminalToolResult?: unknown } | undefined)?.terminalToolResult,
           );
           const report = verifyHarnessSubagentTerminalCompletion(rawResult);
-          const exhaustion = child._internalSubagentBudgetExhaustion();
+          const exhaustion =
+            parseHarnessSubagentBudgetExhausted(rawResult) ?? child._internalSubagentBudgetExhaustion();
           // §S3.3 — an inline spawn_subagent has NO independent driver to resume a
           // human-in-the-loop suspension, and the child is auto-closed below. A
           // default `message()` RESOLVES (not rejects) with finishReason
