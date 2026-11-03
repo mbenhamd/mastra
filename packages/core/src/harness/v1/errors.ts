@@ -624,6 +624,24 @@ export class HarnessPendingInteractionExpiredError extends HarnessError {
   }
 }
 
+/**
+ * The pending interaction was resolved by `session.discardPendingInteraction`
+ * without resuming its run. A retried or late answer for that generation
+ * replays this outcome instead of resuming.
+ */
+export class HarnessPendingInteractionDiscardedError extends HarnessError {
+  readonly name = 'HarnessPendingInteractionDiscardedError';
+  readonly code = 'harness.pending_interaction_discarded';
+
+  constructor(
+    public readonly sessionId: string,
+    public readonly itemId: string,
+    public readonly reason: string,
+  ) {
+    super(`Pending interaction "${itemId}" for session "${sessionId}" was discarded (${reason})`);
+  }
+}
+
 export class HarnessAdmissionConflictError extends Error {
   readonly name = 'HarnessAdmissionConflictError';
   constructor(

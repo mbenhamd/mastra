@@ -1246,6 +1246,14 @@ export interface InboxResponseReceipt {
   appliedAt?: number;
   failedAt?: number;
   deadAt?: number;
+  /**
+   * Present only on the receipt written by `session.discardPendingInteraction`.
+   * Equals the `expiryStartedAt` claim stamped on the discarded pending
+   * generation, so a crash between the claim and the clear completes as a
+   * discard (not an expiry). Such a receipt is always `failed` and not
+   * retryable; replays resolve to the same discard outcome.
+   */
+  discardedAt?: number;
   updatedAt: number;
 }
 

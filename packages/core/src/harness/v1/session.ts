@@ -173,6 +173,7 @@ import {
   HarnessInboxResponseConflictError,
   HarnessOutputGenerationError,
   HarnessOverrideConflictError,
+  HarnessPendingInteractionDiscardedError,
   HarnessPendingInteractionExpiredError,
   HarnessQueueFullDroppedError,
   HarnessQueueFullError,
@@ -181,6 +182,7 @@ import {
   HarnessSessionCancelledError,
   HarnessSessionClosedError,
   HarnessSessionCorruptError,
+  HarnessSessionClosingError,
   harnessSessionClosingError,
   HarnessSessionDeletedError,
   HarnessMessageResultErasedError,
@@ -285,6 +287,8 @@ import type {
   AgentResult,
   AgentStream,
   AttachmentRef,
+  DiscardPendingInteractionOptions,
+  DiscardPendingInteractionResult,
   GoalOptions,
   HarnessActionCatalogEntry,
   HarnessActionCatalogListOptions,
@@ -4371,6 +4375,22 @@ export class Session {
     expected: PendingInteractionExpiryGeneration,
     opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
   ): Promise<boolean> {
+    // A `discardPendingInteraction` claim whose clear did not commit (crash or
+    // storage failure between its phases) completes as that discard, not as
+    // an expiry. Only rows carrying a matching discard receipt reach this.
+    const current = this._record.pendingResume;
+    const discardClaim = current === undefined ? undefined : this._discardClaimForPending(current);
+    if (
+      current !== undefined &&
+      discardClaim !== undefined &&
+      current.kind === expected.kind &&
+      (current.itemId ?? current.toolCallId) === expected.itemId &&
+      current.runId === expected.runId &&
+      current.toolCallId === expected.toolCallId &&
+      current.requestedAt === expected.requestedAt
+    ) {
+      return this._completeDiscardedPendingInteraction(current, discardClaim);
+    }
     if (expected.resumedAt !== undefined) {
       return this._recoverStaleResumeAdmission(expected, opts);
     }
@@ -16241,6 +16261,358 @@ export class Session {
     );
   }
 
+  /**
+   * Resolve the session's CURRENT pending interaction without resuming its
+   * run and without aborting any turn. Use it when the interaction can no
+   * longer be answered meaningfully — e.g. an approval that was restored as
+   * answerable after its resume failed in-process although the work it gated
+   * has since settled elsewhere.
+   *
+   * The call is fenced to one exact generation (`kind`, `itemId`, `runId`,
+   * `toolCallId`, `pendingRequestedAt`): only if that interaction is still the
+   * session's pending interaction is it resolved, together with its pending
+   * admission (owning queue item, origin signal, deferred terminal admission,
+   * and every unsettled inbox receipt of that generation). The resolution is
+   * recorded in the same durable receipt map `respondTo*` uses, keyed by
+   * `responseId`, so a repeated call — or a retried answer carrying that
+   * `responseId` — replays the same outcome without new writes.
+   *
+   * Results: `discarded` (this call resolved it), `already_resolved` (a prior
+   * discard of this generation did), `not_current` (another generation is
+   * pending, or none; nothing was touched). Storage failures reject with
+   * `HarnessStorageError`; an interaction whose resume is admitted or whose
+   * tool is still running rejects with `HarnessBusyError` and is untouched; a
+   * `responseId` already used for a different response rejects with
+   * `HarnessInboxResponseConflictError`.
+   */
+  async discardPendingInteraction(opts: DiscardPendingInteractionOptions): Promise<DiscardPendingInteractionResult> {
+    this._assertLive('discardPendingInteraction()');
+    const input = parseDiscardPendingInteractionOptions(opts);
+    const responseHash = sha256CanonicalJson({
+      operation: 'discard',
+      kind: input.kind,
+      itemId: input.itemId,
+      runId: input.runId,
+      toolCallId: input.toolCallId,
+      pendingRequestedAt: input.pendingRequestedAt,
+      reason: input.reason,
+    });
+    try {
+      // One retry: a lost CAS re-classifies against the reloaded record.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const observed = this._classifyPendingInteractionDiscard(input, responseHash);
+        if (observed.status === 'finish') {
+          await this._completeDiscardedPendingInteraction(observed.pending, observed.receipt);
+          return discardReceiptResult('already_resolved', observed.receipt);
+        }
+        if (observed.status !== 'claimable') return observed.result;
+        const claimed = await this._claimPendingInteractionDiscard(input, responseHash, observed.pending);
+        if (claimed !== undefined) {
+          await this._completeDiscardedPendingInteraction(claimed.pending, claimed.receipt);
+          return discardReceiptResult('discarded', claimed.receipt);
+        }
+      }
+      throw new HarnessBusyError(this.id, 'in_flight');
+    } catch (err) {
+      throw this._discardPendingInteractionFailure(err, input.responseId);
+    }
+  }
+
+  private _classifyPendingInteractionDiscard(
+    input: DiscardPendingInteractionOptions,
+    responseHash: string,
+  ):
+    | { status: 'claimable'; pending: PendingResume }
+    | { status: 'finish'; pending: PendingResume; receipt: InboxResponseReceipt }
+    | { status: 'resolved'; result: DiscardPendingInteractionResult } {
+    const generation = discardGeneration(input);
+    const notCurrent = (): { status: 'resolved'; result: DiscardPendingInteractionResult } => ({
+      status: 'resolved',
+      result: { status: 'not_current', itemId: input.itemId, kind: input.kind },
+    });
+    const pending = this._record.pendingResume;
+    const pendingIsGeneration = pending !== undefined && pendingMatchesDiscardGeneration(pending, generation);
+    const ownReceipt = getOwnRecordValue(this._record.inboxResponseReceipts, input.responseId);
+    if (ownReceipt !== undefined) {
+      if (
+        ownReceipt.discardedAt === undefined ||
+        ownReceipt.responseHash !== responseHash ||
+        !receiptMatchesDiscardGeneration(ownReceipt, generation)
+      ) {
+        throw new HarnessInboxResponseConflictError(this.id, input.itemId, input.responseId);
+      }
+      if (pendingIsGeneration && pending!.expiryStartedAt === ownReceipt.discardedAt) {
+        return { status: 'finish', pending: pending!, receipt: ownReceipt };
+      }
+      return { status: 'resolved', result: discardReceiptResult('already_resolved', ownReceipt) };
+    }
+    if (!pendingIsGeneration) {
+      const prior = this._findDiscardReceipt(generation);
+      return prior !== undefined
+        ? { status: 'resolved', result: discardReceiptResult('already_resolved', prior) }
+        : notCurrent();
+    }
+    if (pending!.expiryStartedAt !== undefined) {
+      // Another terminalizer (expiry, Stop, or an earlier discard whose clear
+      // has not committed) already claimed this generation.
+      const claim = this._discardClaimForPending(pending!);
+      return claim !== undefined ? { status: 'finish', pending: pending!, receipt: claim } : notCurrent();
+    }
+    // A resume admitted for this generation, or a still-running tool that
+    // registered it, owns the interaction. Resolving it underneath would need a
+    // turn abort, which this operation never performs.
+    if (
+      pending!.resumedAt !== undefined ||
+      (this._currentTurnAbortController !== undefined &&
+        (pending!.kind === 'question' || pending!.kind === 'plan-approval' || pending!.kind === 'sandbox-access'))
+    ) {
+      throw new HarnessBusyError(this.id, 'in_flight');
+    }
+    return { status: 'claimable', pending: pending! };
+  }
+
+  /**
+   * Phase one: a single session CAS fenced to the exact unresumed, unclaimed
+   * generation stamps the terminalizing claim (`expiryStartedAt`, which resume
+   * admission rejects), writes the discard receipt, and finalizes every
+   * unsettled inbox receipt of that generation as discarded.
+   */
+  private async _claimPendingInteractionDiscard(
+    input: DiscardPendingInteractionOptions,
+    responseHash: string,
+    observed: PendingResume,
+  ): Promise<{ pending: PendingResume; receipt: InboxResponseReceipt } | undefined> {
+    const generation = discardGeneration(input);
+    const discardError = new HarnessPendingInteractionDiscardedError(this.id, input.itemId, input.reason);
+    const projectedError = projectHarnessPublicError(discardError);
+    let claimed: { pending: PendingResume; receipt: InboxResponseReceipt } | undefined;
+    await this._flushUpdate(prev => {
+      claimed = undefined;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        !pendingMatchesDiscardGeneration(current, generation) ||
+        current.expiresAt !== observed.expiresAt ||
+        current.resumedAt !== undefined ||
+        current.expiryStartedAt !== undefined ||
+        getOwnRecordValue(prev.inboxResponseReceipts, input.responseId) !== undefined
+      ) {
+        return prev;
+      }
+      const discardedAt = Date.now();
+      const receipt: InboxResponseReceipt = {
+        responseId: input.responseId,
+        responseHash,
+        resumeAttemptId: input.responseId,
+        itemId: input.itemId,
+        ...(current.queuedItemId !== undefined ? { queuedItemId: current.queuedItemId } : {}),
+        kind: input.kind,
+        runId: input.runId,
+        toolCallId: input.toolCallId,
+        pendingRequestedAt: input.pendingRequestedAt,
+        response: { discarded: true, reason: input.reason },
+        status: 'failed',
+        error: projectedError,
+        retryable: false,
+        acceptedAt: discardedAt,
+        failedAt: discardedAt,
+        discardedAt,
+        updatedAt: discardedAt,
+      };
+      const inboxResponseReceipts = { ...(prev.inboxResponseReceipts ?? {}) };
+      for (const [responseId, candidate] of Object.entries(inboxResponseReceipts)) {
+        if (
+          !receiptMatchesDiscardGeneration(candidate, generation) ||
+          !(candidate.status === 'accepted' || (candidate.status === 'failed' && candidate.retryable === true))
+        ) {
+          continue;
+        }
+        inboxResponseReceipts[responseId] = {
+          ...candidate,
+          status: 'failed',
+          error: projectedError,
+          retryable: false,
+          failedAt: discardedAt,
+          updatedAt: discardedAt,
+        };
+      }
+      inboxResponseReceipts[input.responseId] = receipt;
+      claimed = { pending: { ...current, expiryStartedAt: discardedAt }, receipt };
+      return { ...prev, pendingResume: claimed.pending, inboxResponseReceipts };
+    });
+    return claimed;
+  }
+
+  /**
+   * Settlement + phase two for a discard claim. Idempotent: replays, the
+   * pending-deadline reconciler (live timer, hydrate, cold sweep) and the
+   * original caller may all drive it; the clear is fenced to the claim.
+   */
+  private async _completeDiscardedPendingInteraction(
+    claimedPending: PendingResume,
+    receipt: InboxResponseReceipt,
+  ): Promise<boolean> {
+    const discardedAt = receipt.discardedAt;
+    if (discardedAt === undefined || claimedPending.expiryStartedAt !== discardedAt) return false;
+    const discardError = this._discardedErrorForReceipt(receipt);
+    const projectedError = projectHarnessPublicError(discardError);
+    const generation = {
+      kind: claimedPending.kind,
+      itemId: claimedPending.itemId ?? claimedPending.toolCallId,
+      runId: claimedPending.runId,
+      toolCallId: claimedPending.toolCallId,
+      pendingRequestedAt: claimedPending.requestedAt,
+    };
+    const queuedItemId = this._queuedItemIdForPendingResume(claimedPending);
+    const queueReceipt = queuedItemId === undefined ? undefined : this._record.queueAdmissionReceipts?.[queuedItemId];
+    if (queueReceipt?.signalId !== undefined) {
+      await this._writeQueueSignalResultEvidence({
+        status: 'failed',
+        signalId: queueReceipt.signalId,
+        runId: queueReceipt.runId,
+        error: projectedError,
+      });
+    }
+    if (claimedPending.originSignalId !== undefined) {
+      await this._settleSignalResult(claimedPending.originSignalId, {
+        status: 'failed',
+        runId: claimedPending.runId,
+        error: projectedError,
+      });
+    }
+    // Settle a deferred terminal admission before the claim marker clears, so
+    // a failure here leaves the claimed row discoverable for retry.
+    await this._cancelTerminalizedPendingAdmission(claimedPending, projectedError);
+
+    let cleared = false;
+    let settledQueueReceipt: QueueAdmissionReceipt | undefined;
+    await this._flushUpdate(prev => {
+      cleared = false;
+      settledQueueReceipt = undefined;
+      const current = prev.pendingResume;
+      if (
+        current === undefined ||
+        !pendingMatchesDiscardGeneration(current, generation) ||
+        current.expiryStartedAt !== discardedAt
+      ) {
+        return prev;
+      }
+      cleared = true;
+      const next: SessionRecord = { ...prev };
+      delete next.pendingResume;
+      if (queuedItemId !== undefined) {
+        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
+        const queued = prev.queueAdmissionReceipts?.[queuedItemId];
+        settledQueueReceipt = queued;
+        if (queued && queued.status !== 'completed' && queued.status !== 'failed' && queued.status !== 'dead') {
+          settledQueueReceipt = {
+            ...queued,
+            status: 'failed',
+            error: projectedError,
+            failedAt: queued.failedAt ?? discardedAt,
+            updatedAt: discardedAt,
+          };
+          next.queueAdmissionReceipts = { ...(prev.queueAdmissionReceipts ?? {}), [queuedItemId]: settledQueueReceipt };
+        }
+      }
+      return next;
+    });
+    if (!cleared) return false;
+
+    this._clearPendingInteractionExpiryTimer();
+    this._pendingReplacementToolSurfaces.delete(claimedPending.runId);
+    if (queuedItemId !== undefined) {
+      const resolver = this._queueResolvers.get(queuedItemId);
+      if (resolver) {
+        this._queueResolvers.delete(queuedItemId);
+        resolver.reject(discardError);
+      }
+      if (this._currentQueuedItemId === queuedItemId) {
+        this._currentQueuedItemId = undefined;
+        this._currentQueuedItemSource = undefined;
+      }
+      this._emit({
+        type: 'queue_failed',
+        queuedItemId,
+        ...(settledQueueReceipt?.runId ? { runId: settledQueueReceipt.runId } : {}),
+        ...(settledQueueReceipt?.signalId ? { signalId: settledQueueReceipt.signalId } : {}),
+        ...(settledQueueReceipt?.admissionId ? { admissionId: settledQueueReceipt.admissionId } : {}),
+        error: projectedError,
+      });
+    }
+    // The parked run has no live owner (the claim refuses discards while a
+    // turn owns the interaction); close it here. Tool rows and agent_end
+    // belong to a live turn when one is running, so leave those alone.
+    const turnActive = this._currentTurnAbortController !== undefined;
+    if (!turnActive) this._emitAbortedToolEnds({ force: true });
+    this._emitTurnEvent({
+      type: 'resume_failed',
+      runId: claimedPending.runId,
+      retryable: false,
+      error: projectedError,
+    });
+    if (!turnActive) this._emitAgentEnd({ runId: claimedPending.runId, finishReason: 'error' });
+    this._notifyMaybeIdle();
+    if (this._state === 'live') void this._maybeDrainQueue();
+    return true;
+  }
+
+  /** The discard receipt whose claim is stamped on `pending`, if any. */
+  private _discardClaimForPending(pending: PendingResume): InboxResponseReceipt | undefined {
+    if (pending.expiryStartedAt === undefined) return undefined;
+    const generation = {
+      kind: pending.kind,
+      itemId: pending.itemId ?? pending.toolCallId,
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      pendingRequestedAt: pending.requestedAt,
+    };
+    return Object.values(this._record.inboxResponseReceipts ?? {}).find(
+      receipt =>
+        receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
+    );
+  }
+
+  private _findDiscardReceipt(generation: DiscardGeneration): InboxResponseReceipt | undefined {
+    return Object.values(this._record.inboxResponseReceipts ?? {}).find(
+      receipt => receipt.discardedAt !== undefined && receiptMatchesDiscardGeneration(receipt, generation),
+    );
+  }
+
+  private _discardedErrorForReceipt(receipt: InboxResponseReceipt): HarnessPendingInteractionDiscardedError {
+    const reason = (receipt.response as { reason?: unknown } | undefined)?.reason;
+    return new HarnessPendingInteractionDiscardedError(
+      this.id,
+      receipt.itemId,
+      typeof reason === 'string' ? reason : 'discarded',
+    );
+  }
+
+  private _discardPendingInteractionFailure(err: unknown, responseId: string): unknown {
+    if (
+      err instanceof HarnessError ||
+      err instanceof HarnessStorageError ||
+      err instanceof HarnessValidationError ||
+      err instanceof HarnessInboxResponseConflictError ||
+      err instanceof HarnessSessionClosedError ||
+      err instanceof HarnessSessionClosingError ||
+      err instanceof HarnessSessionDeletedError ||
+      err instanceof HarnessSessionLockedError
+    ) {
+      return err;
+    }
+    return new HarnessStorageError({
+      operation: 'inbox_response',
+      cause: err,
+      retryable: true,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      harnessName: this._record.harnessName,
+      subject: { kind: 'inbox_response', id: responseId },
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Permissions (§4.2e).
   //
@@ -16674,6 +17046,14 @@ export class Session {
         if (expired?.kind === expectedKind) {
           throw new HarnessPendingInteractionExpiredError(this.id, expired.itemId, expired.expiresAt);
         }
+        const discarded = this._findDiscardReceipt({
+          kind: expectedKind,
+          itemId: requestedItemId,
+          runId: requestedRunId,
+          toolCallId: requestedToolCallId,
+          pendingRequestedAt: requestedPendingRequestedAt,
+        });
+        if (discarded !== undefined) throw this._discardedErrorForReceipt(discarded);
       }
       throw new HarnessValidationError(`respond[${expectedKind}]`, 'no pending resume on this session');
     }
@@ -18161,6 +18541,11 @@ export class Session {
       receipt.pendingRequestedAt !== requestedPendingRequestedAt
     ) {
       throw new HarnessInboxResponseConflictError(this.id, receipt.itemId, responseId);
+    }
+    // A retried answer reusing the responseId of a `discardPendingInteraction`
+    // replays the discard outcome rather than a payload conflict.
+    if (receipt.discardedAt !== undefined) {
+      throw this._discardedErrorForReceipt(receipt);
     }
     const attemptedHash = this._computeInboxResponseHash({
       kind: expectedKind,
@@ -23261,6 +23646,107 @@ function pendingInteractionGenerationKey(input: {
   requestedAt: number;
 }): string {
   return sha256CanonicalJson([input.kind, input.itemId ?? null, input.runId, input.toolCallId, input.requestedAt]);
+}
+
+const DISCARD_PENDING_INTERACTION_KINDS: ReadonlySet<PendingResume['kind']> = new Set([
+  'tool-approval',
+  'tool-suspension',
+  'question',
+  'plan-approval',
+  'sandbox-access',
+]);
+const MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH = 512;
+
+/** The exact pending generation a discard is fenced to. */
+interface DiscardGeneration {
+  kind: PendingResume['kind'];
+  itemId: string;
+  runId: string;
+  toolCallId: string;
+  pendingRequestedAt: number;
+}
+
+function parseDiscardPendingInteractionOptions(opts: unknown): DiscardPendingInteractionOptions {
+  if (opts === null || typeof opts !== 'object') {
+    throw new HarnessValidationError('discardPendingInteraction()', 'options must be an object');
+  }
+  const read = (key: string): unknown => getOwnRecordValue(opts as Record<string, unknown>, key);
+  const requireString = (key: string, maxLength?: number): string => {
+    const value = read(key);
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new HarnessValidationError(`discardPendingInteraction().${key}`, `${key} must be a non-empty string`);
+    }
+    if (maxLength !== undefined && value.length > maxLength) {
+      throw new HarnessValidationError(
+        `discardPendingInteraction().${key}`,
+        `${key} must be at most ${maxLength} characters`,
+      );
+    }
+    return value;
+  };
+  const kind = read('kind');
+  if (typeof kind !== 'string' || !DISCARD_PENDING_INTERACTION_KINDS.has(kind as PendingResume['kind'])) {
+    throw new HarnessValidationError('discardPendingInteraction().kind', 'kind must be a pending interaction kind');
+  }
+  const pendingRequestedAt = read('pendingRequestedAt');
+  if (typeof pendingRequestedAt !== 'number' || !Number.isSafeInteger(pendingRequestedAt) || pendingRequestedAt < 0) {
+    throw new HarnessValidationError(
+      'discardPendingInteraction().pendingRequestedAt',
+      'pendingRequestedAt must be a non-negative integer',
+    );
+  }
+  return {
+    kind: kind as PendingResume['kind'],
+    itemId: requireString('itemId'),
+    runId: requireString('runId'),
+    toolCallId: requireString('toolCallId'),
+    pendingRequestedAt,
+    responseId: requireString('responseId'),
+    reason: requireString('reason', MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH),
+  };
+}
+
+function discardGeneration(input: DiscardPendingInteractionOptions): DiscardGeneration {
+  return {
+    kind: input.kind,
+    itemId: input.itemId,
+    runId: input.runId,
+    toolCallId: input.toolCallId,
+    pendingRequestedAt: input.pendingRequestedAt,
+  };
+}
+
+function pendingMatchesDiscardGeneration(pending: PendingResume, generation: DiscardGeneration): boolean {
+  return (
+    pending.kind === generation.kind &&
+    (pending.itemId ?? pending.toolCallId) === generation.itemId &&
+    pending.runId === generation.runId &&
+    pending.toolCallId === generation.toolCallId &&
+    pending.requestedAt === generation.pendingRequestedAt
+  );
+}
+
+function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generation: DiscardGeneration): boolean {
+  return (
+    receipt.kind === generation.kind &&
+    receipt.itemId === generation.itemId &&
+    receipt.runId === generation.runId &&
+    receipt.toolCallId === generation.toolCallId &&
+    receipt.pendingRequestedAt === generation.pendingRequestedAt
+  );
+}
+
+function discardReceiptResult(
+  status: 'discarded' | 'already_resolved',
+  receipt: InboxResponseReceipt,
+): DiscardPendingInteractionResult {
+  return {
+    status,
+    itemId: receipt.itemId,
+    kind: receipt.kind,
+    responseId: receipt.responseId,
+    discardedAt: receipt.discardedAt ?? receipt.updatedAt,
+  };
 }
 
 function publicErrorProjectionToError(error: { code: string; message: string }): Error {
