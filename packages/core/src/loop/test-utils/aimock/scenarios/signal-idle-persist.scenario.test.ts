@@ -92,4 +92,59 @@ describeForAllEngines('AIMock scenario: ifIdle persist behavior', engine => {
     const text = await output.text;
     expect(text).toContain('noted response');
   });
+
+  // Harness v1 delegated-settlement reminders (`subagents.onDelegatedSettlement:
+  // 'remind'`) rely on a persisted system-reminder reaching the next prompt.
+  it('rehydrates a persisted system-reminder signal into the next run', async () => {
+    const REMINDER = 'Delegated plan task settled with outcome completed';
+    const threadId = 'idle-persist-reminder-thread';
+    const resourceId = 'idle-persist-user';
+    const memory = new MockMemory();
+    const shared = await createSharedAgent(getMock(), { memory, engine });
+
+    await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Start',
+      sharedAgent: shared,
+      memory,
+      threadId,
+      resourceId,
+      stopWhen: stepCountIs(2),
+      fixtures: llm => {
+        llm.on(
+          { endpoint: 'chat', predicate: req => !JSON.stringify(req).includes(REMINDER) },
+          { content: 'started response' },
+        );
+        llm.on(
+          { endpoint: 'chat', predicate: req => JSON.stringify(req).includes(REMINDER) },
+          { content: 'reminded response' },
+        );
+      },
+    });
+    const requestCountAfterFirstRun = getMock().getRequests().length;
+
+    const result = shared.agent.sendSignal(
+      { type: 'system-reminder', id: 'delegation-notice-1', contents: REMINDER },
+      { resourceId, threadId, ifIdle: { behavior: 'persist' } },
+    );
+    await expect(result.accepted).resolves.toMatchObject({ action: 'persist' });
+    await result.persisted;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(getMock().getRequests().length).toBe(requestCountAfterFirstRun);
+
+    const { output, requests } = await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Continue',
+      sharedAgent: shared,
+      memory,
+      threadId,
+      resourceId,
+      stopWhen: stepCountIs(2),
+      fixtures: () => {},
+    });
+    expect(requestText(requests[requests.length - 1])).toContain(REMINDER);
+    expect(await output.text).toContain('reminded response');
+  });
 });

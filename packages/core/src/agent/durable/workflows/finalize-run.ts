@@ -233,6 +233,9 @@ export async function runDurableFinishSideEffects({
             model: structuringModel as any,
             instructions: liveStructuredOutput?.instructions ?? structuredOutput.instructions,
             jsonPromptInjection: liveStructuredOutput?.jsonPromptInjection ?? structuredOutput.jsonPromptInjection,
+            // PF-7309: the decision recorded from the caller's schema; the structuring pass's
+            // inner Agent keeps it instead of deciding again from the reloaded schema.
+            sourceDecision: liveStructuredOutput?.sourceDecision ?? structuredOutput.sourceDecision,
             errorStrategy,
             fallbackValue,
           } as StructuredOutputOptions<any>,
