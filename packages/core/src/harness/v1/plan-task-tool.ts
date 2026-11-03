@@ -34,6 +34,7 @@ import {
   PLAN_TASK_MAX_NODES,
 } from './plan-task-session';
 import type { Session } from './session';
+import { formatSubagentTypeList } from './spawn-subagent-tool';
 import { harnessSubagentResultSummarySchema } from './terminal-subagent-result';
 
 export const TASK_ADD_TOOL_ID = 'task_add';
@@ -349,12 +350,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
   const subagentTypeIds = harness?._listSubagentTypeIds({ invocation: 'delegated' }) ?? [];
   // Same per-type card spawn_subagent shows, so the parent chooses a durable
   // type by what it does rather than by its id alone.
-  const subagentTypeList = subagentTypeIds
-    .map(id => {
-      const def = harness?._getSubagentType(id);
-      return def ? `- **${id}**: ${def.description}` : `- **${id}**`;
-    })
-    .join('\n');
+  const subagentTypeList = formatSubagentTypeList(subagentTypeIds, id => harness?._getSubagentType(id));
   const taskDelegate =
     subagentTypeIds.length === 0
       ? undefined

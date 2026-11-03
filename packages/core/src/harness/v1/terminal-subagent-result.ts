@@ -167,6 +167,12 @@ export const harnessSubagentToolTraceSchema = z
   .min(1)
   .max(MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES)
   .superRefine((trace, ctx) => {
+    if (new Set(trace.map(entry => entry.toolName)).size !== trace.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'subagent tool trace lists a tool more than once' });
+    }
+    if (trace.some(entry => entry.errors > entry.calls)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'subagent tool trace counts more errors than calls' });
+    }
     if (new TextEncoder().encode(JSON.stringify(trace)).byteLength > MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -407,6 +413,20 @@ function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
+/** Shorten to at most `maxLength` UTF-16 units without splitting a surrogate pair. */
+function truncateAtCodePoint(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  let result = '';
+  for (const codePoint of value) {
+    if (result.length + codePoint.length > maxLength) break;
+    result += codePoint;
+  }
+  return result;
+}
+
+/** Bytes of the `"toolTraceTruncated":true,` member; below this no flag fits either. */
+const HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES = 26;
+
 /**
  * Only framework-minted receipts feed the trace. Run tool-result fallbacks
  * stay available to evidence verification but are provider-shaped, so they
@@ -423,26 +443,32 @@ function summarizeToolTrace(
   for (const candidate of itemArray(source[HARNESS_SUBAGENT_TOOL_RECEIPTS_FIELD])) {
     const receipt = normalizeToolReceipt(candidate);
     if (receipt === undefined) continue;
-    const toolName = receipt.toolName.slice(0, MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH);
-    const calls = callsByTool.get(toolName) ?? new Map<string, boolean>();
+    const calls = callsByTool.get(receipt.toolName) ?? new Map<string, boolean>();
     calls.set(receipt.toolCallId, calls.get(receipt.toolCallId) === true || receipt.status === 'error');
-    callsByTool.set(toolName, calls);
+    callsByTool.set(receipt.toolName, calls);
   }
   if (callsByTool.size === 0) return { truncated: false };
   const trace: HarnessSubagentToolTrace = [];
+  const listedNames = new Set<string>();
+  let shortenedOrSkipped = false;
   let bytes = 2;
-  for (const [toolName, calls] of callsByTool) {
+  for (const [fullName, calls] of callsByTool) {
     if (trace.length >= MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES) break;
+    const toolName = truncateAtCodePoint(fullName, MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH);
+    // A shortened name is flagged, and never merged into another tool's entry.
+    if (toolName !== fullName) shortenedOrSkipped = true;
+    if (listedNames.has(toolName)) continue;
     const entry = { toolName, calls: calls.size, errors: [...calls.values()].filter(Boolean).length };
     const entryBytes = new TextEncoder().encode(JSON.stringify(entry)).byteLength + 1;
     if (bytes + entryBytes > maxBytes) break;
     bytes += entryBytes;
+    listedNames.add(toolName);
     trace.push(entry);
   }
   const overflow = source[HARNESS_SUBAGENT_TOOL_RECEIPTS_OVERFLOW_FIELD] === true;
   return {
     ...(trace.length > 0 ? { trace } : {}),
-    truncated: overflow || callsByTool.size > trace.length,
+    truncated: overflow || shortenedOrSkipped || callsByTool.size > trace.length,
   };
 }
 
@@ -538,11 +564,17 @@ export function summarizeHarnessSubagentResult(
     MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES,
     MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES - MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES - summaryBytes,
   );
-  const toolTrace = summarizeToolTrace(value, traceBudget);
+  // The key and flag bytes come out of the same budget, so a summary already at
+  // the limit gains neither a trace nor the flag.
+  const toolTrace = summarizeToolTrace(
+    value,
+    traceBudget - HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES - '"toolTrace":,'.length,
+  );
+  const flagFits = traceBudget >= HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES;
   return {
     ...summary,
     ...(toolTrace.trace ? { toolTrace: toolTrace.trace } : {}),
-    ...(toolTrace.truncated ? { toolTraceTruncated: true } : {}),
+    ...(toolTrace.truncated && flagFits ? { toolTraceTruncated: true } : {}),
   };
 }
 

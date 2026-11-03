@@ -4,6 +4,7 @@ import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+  MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES,
   harnessSubagentOutcomeReportSchema,
   harnessSubagentResultSummarySchema,
   parseHarnessSubagentOutcomeReport,
@@ -441,9 +442,34 @@ describe('Harness subagent outcome terminal contract', () => {
     });
 
     expect(summary.outcome).toBe('completed');
+    // With no room left, neither the trace nor its flag is added.
     expect(summary.toolTrace).toBeUndefined();
-    expect(summary.toolTraceTruncated).toBe(true);
+    expect(summary.toolTraceTruncated).toBeUndefined();
     expect(harnessSubagentResultSummarySchema.safeParse(summary).success).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(summary)).byteLength).toBeLessThanOrEqual(
+      MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES,
+    );
+  });
+
+  it('lists at most 24 tools and flags the rest, and flags an overflowed receipt ledger', () => {
+    const manyTools = summarizeHarnessSubagentResult({
+      finishReason: 'tool-calls',
+      harnessToolReceipts: Array.from({ length: 30 }, (_, index) => ({
+        toolCallId: `call-${index}`,
+        toolName: `t${index}`,
+        status: 'success',
+      })),
+    });
+    expect(manyTools.toolTrace).toHaveLength(24);
+    expect(manyTools.toolTraceTruncated).toBe(true);
+
+    const overflowed = summarizeHarnessSubagentResult({
+      finishReason: 'tool-calls',
+      harnessToolReceipts: [{ toolCallId: 'call-1', toolName: 'search_papers', status: 'success' }],
+      harnessToolReceiptsOverflow: true,
+    });
+    expect(overflowed.toolTrace).toEqual([{ toolName: 'search_papers', calls: 1, errors: 0 }]);
+    expect(overflowed.toolTraceTruncated).toBe(true);
   });
 
   it('trims a large tool trace within its byte budget and says so', () => {
