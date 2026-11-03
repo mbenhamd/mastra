@@ -378,6 +378,37 @@ describe('Harness subagent outcome terminal contract', () => {
     expect(projectHarnessSubagentOutcomeReceipts(placeholder)).toEqual([]);
   });
 
+  it('tells the parent which tools the child used and which failed, without raw inputs', () => {
+    const result = {
+      finishReason: 'tool-calls',
+      terminalToolResult: outcomeEnvelope(outcomeReport('completed')),
+      toolCalls: [{}, {}, {}, {}],
+      harnessToolReceipts: [
+        { toolCallId: 'search-1', toolName: 'search_papers', status: 'success' },
+        { toolCallId: 'compile-1', toolName: 'compile_latex', status: 'success' },
+        { toolCallId: 'search-2', toolName: 'search_papers', status: 'error' },
+        { toolCallId: 'tc-outcome', toolName: HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID, status: 'success' },
+      ],
+      toolResults: [
+        {
+          type: 'tool-result',
+          payload: { toolCallId: 'search-1', toolName: 'search_papers', args: { query: 'secret query' } },
+        },
+      ],
+    };
+
+    const summary = summarizeHarnessSubagentResult(result);
+
+    expect(summary.toolTrace).toEqual([
+      { toolName: 'search_papers', calls: 2, errors: 1 },
+      { toolName: 'compile_latex', calls: 1, errors: 0 },
+    ]);
+    expect(summary.toolTraceTruncated).toBeUndefined();
+    expect(JSON.stringify(summary)).not.toContain('secret query');
+    // Lifecycle events keep their small budget for terminal status.
+    expect(summarizeHarnessSubagentEventResult(summary).toolTrace).toBeUndefined();
+  });
+
   it('lets the framework receipt for a call override an earlier run tool result', () => {
     // An awaited background completion is streamed before processToolResult,
     // then recorded again after it; the framework receipt holds the recorded status.

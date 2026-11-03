@@ -137,6 +137,29 @@ const harnessSubagentUsageSchema = z
   })
   .strict();
 
+/** Maximum distinct tools listed in a subagent result's tool trace. */
+export const MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES = 24;
+
+/**
+ * Per-tool call and error counts from framework receipts, in first-call
+ * order. It tells the parent what the child covered (and what failed) without
+ * re-searching; raw tool inputs and outputs are never included.
+ */
+export const harnessSubagentToolTraceSchema = z
+  .array(
+    z
+      .object({
+        toolName: z.string().min(1).max(MAX_HARNESS_SUBAGENT_LABEL_LENGTH),
+        calls: z.number().int().positive(),
+        errors: z.number().int().nonnegative(),
+      })
+      .strict(),
+  )
+  .min(1)
+  .max(MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES);
+
+export type HarnessSubagentToolTrace = z.infer<typeof harnessSubagentToolTraceSchema>;
+
 export const harnessSubagentResultSummarySchema = z
   .object({
     status: z.enum(['success', 'error']),
@@ -147,6 +170,8 @@ export const harnessSubagentResultSummarySchema = z
     stepCount: z.number().int().nonnegative(),
     toolCallCount: z.number().int().nonnegative(),
     toolResultCount: z.number().int().nonnegative(),
+    toolTrace: harnessSubagentToolTraceSchema.optional(),
+    toolTraceTruncated: z.boolean().optional(),
     usage: harnessSubagentUsageSchema.optional(),
     artifacts: harnessSubagentTerminalArtifactsSchema.optional(),
     evidence: z.array(harnessSubagentOutcomeEvidenceSchema).max(MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS).optional(),
@@ -365,6 +390,24 @@ function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
+function summarizeToolTrace(value: unknown): { trace?: HarnessSubagentToolTrace; truncated: boolean } {
+  const { receipts, overflow } = collectToolReceipts(value);
+  const byTool = new Map<string, { calls: number; errors: number }>();
+  for (const receipt of receipts) {
+    const toolName = receipt.toolName.slice(0, MAX_HARNESS_SUBAGENT_LABEL_LENGTH);
+    const entry = byTool.get(toolName) ?? { calls: 0, errors: 0 };
+    entry.calls += 1;
+    if (receipt.status === 'error') entry.errors += 1;
+    byTool.set(toolName, entry);
+  }
+  if (byTool.size === 0) return { truncated: false };
+  const trace = [...byTool].slice(0, MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES).map(([toolName, counts]) => ({
+    toolName,
+    ...counts,
+  }));
+  return { trace, truncated: overflow || byTool.size > trace.length };
+}
+
 const USAGE_KEYS = [
   'inputTokens',
   'outputTokens',
@@ -429,6 +472,7 @@ export function summarizeHarnessSubagentResult(
     };
   }
   const usage = summarizeUsage(record?.totalUsage ?? record?.usage);
+  const toolTrace = summarizeToolTrace(value);
   const artifacts =
     status === 'success' && report?.outcome === 'completed'
       ? parseHarnessTerminalToolResultArtifacts(record?.terminalToolResult)
@@ -443,6 +487,8 @@ export function summarizeHarnessSubagentResult(
     stepCount: arrayLength(record?.steps),
     toolCallCount: arrayLength(record?.toolCalls),
     toolResultCount: arrayLength(record?.toolResults),
+    ...(toolTrace.trace ? { toolTrace: toolTrace.trace } : {}),
+    ...(toolTrace.truncated ? { toolTraceTruncated: true } : {}),
     ...(usage ? { usage } : {}),
     ...(artifacts ? { artifacts } : {}),
     ...(report ? { evidence: report.evidence } : {}),
@@ -460,7 +506,14 @@ export function summarizeHarnessSubagentResult(
 export function summarizeHarnessSubagentEventResult(
   summary: HarnessSubagentResultSummary,
 ): HarnessSubagentResultSummary {
-  const { artifacts: _artifacts, ...eventSummary } = summary;
+  // The tool trace serves parent continuation; lifecycle events keep their
+  // 4 KiB headroom for terminal status, as with artifacts.
+  const {
+    artifacts: _artifacts,
+    toolTrace: _toolTrace,
+    toolTraceTruncated: _toolTraceTruncated,
+    ...eventSummary
+  } = summary;
   const text = truncateUtf8(summary.text, MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES);
   const evidence = summary.evidence?.slice(0, MAX_HARNESS_SUBAGENT_EVENT_EVIDENCE_ITEMS).map(item => ({
     ...item,
