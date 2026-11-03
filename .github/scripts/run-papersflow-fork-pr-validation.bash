@@ -7840,7 +7840,7 @@ NODE
   # PF-7547: Schema Compat is an owned workspace on the generic path. Source
   # and unit-test edits get the package build, typecheck, and lint plus each
   # changed test file; the whole package suite never runs, and a live-provider
-  # e2e suite still fails closed before any command executes.
+  # e2e suite still fails closed before any test runs.
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
