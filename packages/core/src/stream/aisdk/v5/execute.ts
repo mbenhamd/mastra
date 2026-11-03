@@ -26,7 +26,7 @@ import { createExactJsonMeasurementSnapshot } from '../../../observability/conte
 import type { ExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import type { PublicSchema } from '../../../schema';
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
-import { getResponseFormat, getSemanticResponseSchema } from '../../base/schema';
+import { getResponseFormat, getSemanticResponseSchema, hasVerifiedObjectOpenness } from '../../base/schema';
 import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
 import { attachModelStreamTransport, readModelStreamTransport } from '../../types';
 import { prepareToolsAndToolChoice, preparedToolKey } from './compat';
@@ -273,12 +273,15 @@ export function anthropicStrictOutputCarries(schema: unknown): boolean {
 
 /**
  * Records the {@link StructuredOutputSourceDecision} for a caller's schema: the semantic response
- * schema (what prompt injection sends) and whether strict output carries it.
+ * schema (what prompt injection sends) and whether strict output carries it. Strict output is only
+ * provable for a schema library whose object openness Mastra reads soundly
+ * ({@link hasVerifiedObjectOpenness}); any other library's schema goes through the prompt.
  */
 export function recordStructuredOutputSourceDecision(schema: unknown): StructuredOutputSourceDecision | undefined {
   if (!schema) return undefined;
   const semantic = getSemanticResponseSchema(schema as PublicSchema);
-  return { schema: semantic, strictOutputCannotCarry: !anthropicStrictOutputCarries(semantic) };
+  const carries = hasVerifiedObjectOpenness(schema as PublicSchema) && anthropicStrictOutputCarries(semantic);
+  return { schema: semantic, strictOutputCannotCarry: !carries };
 }
 
 /**

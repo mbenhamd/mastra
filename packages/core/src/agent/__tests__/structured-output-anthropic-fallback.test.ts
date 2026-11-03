@@ -14,6 +14,7 @@ import type { AddressInfo } from 'node:net';
 import { createAnthropic } from '@ai-sdk/anthropic-v6';
 import { createOpenAI } from '@ai-sdk/openai-v6';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z as z3 } from 'zod/v3';
 import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../../events/event-emitter';
 import { Harness } from '../../harness/v1/harness';
@@ -198,6 +199,35 @@ const mutateSchema = (schema: unknown) => ({
   },
 });
 const when = '2026-11-03T00:00:00.000Z';
+
+/**
+ * A standard schema from a library Mastra has not verified: its JSON Schema looks closed, but
+ * Mastra cannot tell whether the library's own objects keep unknown keys, so strict is not provable.
+ */
+const unverifiedVendorSchema = {
+  '~standard': {
+    version: 1,
+    vendor: 'acme-schema',
+    validate: (value: unknown) =>
+      value && typeof value === 'object' && typeof (value as { summary?: unknown }).summary === 'string'
+        ? { value }
+        : { issues: [{ message: 'expected { summary: string }' }] },
+    jsonSchema: {
+      input: () => ({
+        type: 'object',
+        properties: { summary: { type: 'string' } },
+        required: ['summary'],
+        additionalProperties: false,
+      }),
+      output: () => ({
+        type: 'object',
+        properties: { summary: { type: 'string' } },
+        required: ['summary'],
+        additionalProperties: false,
+      }),
+    },
+  },
+};
 
 type Expected = 'prompt' | 'anthropic-strict' | 'anthropic-json-tool' | 'openai-non-strict';
 type Via = 'agent' | 'durable' | 'recovered' | 'harness';
@@ -472,6 +502,28 @@ const rows: Row[] = [
     schema: z.object({ when: z.coerce.date(), summary: z.string() }),
     populated: { when, summary: 's' },
     object: { when: new Date(when), summary: 's' },
+    expected: 'anthropic-strict',
+  },
+  {
+    name: 'unverified standard-schema vendor (closed-looking object)',
+    model: anthropic,
+    schema: unverifiedVendorSchema,
+    populated: { summary: 's' },
+    expected: 'prompt',
+  },
+  {
+    name: 'Zod v3: plain z.object with a z.record field',
+    model: anthropic,
+    schema: z3.object({ studyId: z3.string(), fields: z3.record(z3.string(), z3.string()) }),
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+  },
+  {
+    name: 'Zod v3: converse plain z.object within limits',
+    model: anthropic,
+    schema: z3.object({ summary: z3.string(), tags: z3.array(z3.string()) }),
+    populated: { summary: 's', tags: ['a'] },
     expected: 'anthropic-strict',
   },
   {

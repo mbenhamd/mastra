@@ -152,6 +152,17 @@ function sourceJsonSchemaOverride(ctx: JsonSchemaOverrideContext): undefined {
 
 /** Standard-schema vendors whose JSON Schema is the caller's own JSON Schema object. */
 const CALLER_JSON_SCHEMA_VENDORS = new Set(['json-schema', 'ai-sdk']);
+/**
+ * Vendors whose object openness {@link getSemanticJsonSchema} reads soundly: the caller's own JSON,
+ * and Zod (v3 and v4 both report `zod`), whose strip semantics Mastra's conversion matches. Another
+ * library's open objects could read as closed, so strict output is never provable for it.
+ */
+const OPENNESS_VERIFIED_VENDORS = new Set([...CALLER_JSON_SCHEMA_VENDORS, 'zod']);
+
+/** Whether {@link getSemanticJsonSchema} reads this schema's object openness soundly. */
+export function hasVerifiedObjectOpenness(schema: PublicSchema): boolean {
+  return OPENNESS_VERIFIED_VENDORS.has(toStandardSchema(schema)['~standard'].vendor);
+}
 
 /**
  * The caller's schema as JSON Schema, with every object exactly as open as the schema library makes
