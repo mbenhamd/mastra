@@ -5449,8 +5449,15 @@ run_validator_self_tests() {
       > packages/schema-compat/src/provider-compats/openai.ts
     printf '%s\n' 'export const providerCompatSuite = true;' \
       > packages/schema-compat/src/provider-compats/test-suite.ts
-    printf '%s\n' "import { it } from 'vitest';" "it('openai compat', () => {});" \
-      > packages/schema-compat/src/provider-compats/openai.test.ts
+    printf '%s\n' 'export const anthropicCompat = true;' \
+      > packages/schema-compat/src/provider-compats/anthropic.ts
+    printf '%s\n' 'export const schemaCompatUtils = true;' \
+      > packages/schema-compat/src/utils.ts
+    for schema_compat_suite in \
+      anthropic deepseek google groq meta openai-reasoning openai; do
+      printf '%s\n' "import { it } from 'vitest';" "it('${schema_compat_suite} compat', () => {});" \
+        > "packages/schema-compat/src/provider-compats/${schema_compat_suite}.test.ts"
+    done
     printf '%s\n' "import { it } from 'vitest';" "it('openai live compat', () => {});" \
       > packages/schema-compat/src/provider-compats/openai.e2e.test.ts
     printf '%s\n' \
@@ -7837,10 +7844,11 @@ NODE
     exit 1
   fi
 
-  # PF-7547: Schema Compat is an owned workspace on the generic path. Source
-  # and unit-test edits get the package build, typecheck, and lint plus each
-  # changed test file; the whole package suite never runs, and a live-provider
-  # e2e suite still fails closed before any test runs.
+  # PF-7547: Schema Compat is an owned workspace. Every edit gets the package
+  # build, typecheck, and lint plus each changed test file. The createSuite
+  # helper and the compat layers it drives queue the seven non-e2e suites that
+  # call it; the whole package suite never runs, and a live-provider e2e suite
+  # still fails closed before any test runs.
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
@@ -7866,15 +7874,51 @@ NODE
   assert_line_matches \
     '^--dir packages/schema-compat exec vitest run --reporter=dot --reporter=json --outputFile\.json=[^ ]+ src/provider-compats/openai\.test\.ts$' \
     "$command_log"
-  assert_line_match_count 1 '^--dir packages/schema-compat exec vitest run ' "$command_log"
+  assert_line_match_count 7 '^--dir packages/schema-compat exec vitest run ' "$command_log"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  # Listed once as forced and once among the changed test files to run.
+  assert_line_count 2 'packages/schema-compat/src/provider-compats/anthropic.test.ts' "$output"
+
+  for schema_compat_mapped_source in test-suite anthropic; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' "export const changedCompatSource = '${schema_compat_mapped_source}';" \
+        > "packages/schema-compat/src/provider-compats/${schema_compat_mapped_source}.ts"
+      git add .
+      git commit -q -m "exercise Schema Compat ${schema_compat_mapped_source} source-only change"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/schema-compat-${schema_compat_mapped_source}-forced-success.log"
+    if ! run_fixture "$head_sha" "$output"; then
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+    assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match build' "$command_log"
+    assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match exec tsc --noEmit' "$command_log"
+    assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match lint' "$command_log"
+    for schema_compat_suite in \
+      anthropic deepseek google groq meta openai-reasoning openai; do
+      assert_contains \
+        "Running changed test file in full: packages/schema-compat/src/provider-compats/${schema_compat_suite}.test.ts" \
+        "$output"
+      assert_line_match_count 1 \
+        "^--dir packages/schema-compat exec vitest run --reporter=dot --reporter=json --outputFile\\.json=[^ ]+ src/provider-compats/${schema_compat_suite}\\.test\\.ts\$" \
+        "$command_log"
+    done
+    assert_line_match_count 7 '^--dir packages/schema-compat exec vitest run ' "$command_log"
+    assert_not_contains 'e2e.test.ts' "$command_log"
+  done
 
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
-    printf '%s\n' 'export const providerCompatSuite = "itemless-array";' \
-      > packages/schema-compat/src/provider-compats/test-suite.ts
+    printf '%s\n' 'export const schemaCompatUtils = "unmapped";' \
+      > packages/schema-compat/src/utils.ts
     git add .
-    git commit -q -m 'exercise Schema Compat source-only change'
+    git commit -q -m 'exercise Schema Compat unmapped source-only change'
     git rev-parse HEAD
   )"
   : > "$command_log"
@@ -14926,6 +14970,23 @@ while IFS= read -r file; do
       ;;
     stores/upstash/src/storage/domains/workflows/index.ts)
       queue_owned_workspace_test "$file" stores/upstash/src/storage/index.test.ts
+      ;;
+    packages/schema-compat/src/provider-compats/test-suite.ts | \
+      packages/schema-compat/src/provider-compats/anthropic.ts | \
+      packages/schema-compat/src/provider-compats/deepseek.ts | \
+      packages/schema-compat/src/provider-compats/google.ts | \
+      packages/schema-compat/src/provider-compats/meta.ts | \
+      packages/schema-compat/src/provider-compats/openai.ts | \
+      packages/schema-compat/src/provider-compats/openai-reasoning.ts)
+      # PF-7547: the shared createSuite helper and the compat layers it drives
+      # have no test of their own. Queue every non-e2e suite that calls
+      # createSuite; the live-provider e2e suites stay outside this map.
+      for schema_compat_suite in \
+        anthropic.test.ts deepseek.test.ts google.test.ts groq.test.ts \
+        meta.test.ts openai-reasoning.test.ts openai.test.ts; do
+        queue_owned_workspace_test "$file" \
+          "packages/schema-compat/src/provider-compats/$schema_compat_suite"
+      done
       ;;
   esac
 done < "$changed_files"
