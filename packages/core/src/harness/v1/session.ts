@@ -261,6 +261,7 @@ import {
 } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
+import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-control-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
@@ -6108,6 +6109,25 @@ export class Session {
     } catch {
       // Best-effort: a late race (child already settling/closed) must not throw.
     }
+  }
+
+  /**
+   * @internal PF-7473 — the model-facing `subagent` tool's cancel of ONE own
+   * child (the caller has already proven `parentSessionId === this.id`). Unlike
+   * {@link cancelSubagent} it also reaches a cold child by hydrating it, through
+   * the same owned-cascade path as a full `cancel()`. Returns `'unavailable'`
+   * when the child cannot be hydrated here (for example another process holds
+   * its lease), so the caller can record a durable cancel intent instead.
+   */
+  async _internalCancelOwnedSubagent(subagentSessionId: string, reason: string): Promise<'delivered' | 'unavailable'> {
+    this._assertNotDeleted();
+    const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason);
+    if (unavailable.includes(subagentSessionId)) return 'unavailable';
+    // A cold delegated child has no live driver in this process; reconciliation
+    // maps its committed cancelRequest to a failed plan task. A live driver's
+    // delegation is skipped by the reconcile pass, so this is safe either way.
+    this._scheduleDelegationReconcileRetry(0);
+    return 'delivered';
   }
 
   /** Read every durable delegation link in this session's plan forest. */
@@ -21261,6 +21281,9 @@ export class Session {
     if (mode.harnessBuiltins !== 'exclude') {
       const spawn = createSpawnSubagentTool(this);
       if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
+      // PF-7473 — status/wait/send/cancel over this session's own children.
+      const control = createSubagentControlTool(this);
+      if (control) builtins[SUBAGENT_CONTROL_TOOL_ID] = control;
       // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
       // for the durable HarnessPlanTask tree; each write routes through this
       // session under its lease.
