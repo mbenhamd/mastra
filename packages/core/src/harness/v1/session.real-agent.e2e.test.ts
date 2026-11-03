@@ -5252,18 +5252,25 @@ describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
         execute: readFact,
       });
       const childStreams = [toolCallStream('read-fact', 'lookupFact', '{}'), textStream([]), recoveryStream];
+      const childRequests: Array<{ tools?: Array<{ name: string }>; prompt: unknown }> = [];
       let childCalls = 0;
       const childAgent = new Agent({
         id: 'child-agent',
         name: 'child-agent',
         instructions: 'Read the fact, then report the completed outcome.',
         model: new MockLanguageModelV2({
-          doStream: async () => ({
-            rawCall: { rawPrompt: null, rawSettings: {} },
-            warnings: [],
-            stream: childStreams[childCalls++] ?? textStream(['UNEXPECTED_EXTRA_CHILD_STEP']),
-          }),
+          doStream: async options => {
+            childRequests.push({ tools: options.tools as Array<{ name: string }> | undefined, prompt: options.prompt });
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              warnings: [],
+              stream: childStreams[childCalls++] ?? textStream(['UNEXPECTED_EXTRA_CHILD_STEP']),
+            };
+          },
         }),
+        // An application hook that narrows the step's tools must not remove
+        // the framework report from the recovery step.
+        defaultOptions: { prepareStep: async () => ({ tools: { lookupFact }, activeTools: ['lookupFact'] }) },
       });
       let parentCalls = 0;
       const parentAgent = new Agent({
@@ -5319,6 +5326,7 @@ describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
         return {
           readFact,
           childCalls,
+          recoveryRequest: childRequests[2],
           subagentEnd: events.find(event => event.type === 'subagent_end'),
         };
       } finally {
@@ -5329,6 +5337,10 @@ describe('Harness v1 real-agent E2E — S22 empty final synthesis', () => {
     const settled = await delegate(toolCallStream('child-outcome', 'report_subagent_outcome', report));
     expect(settled.readFact).toHaveBeenCalledOnce();
     expect(settled.childCalls).toBe(3);
+    // The recovery request offers exactly the report and asks for it in its last message.
+    expect(settled.recoveryRequest?.tools?.map(tool => tool.name)).toEqual(['report_subagent_outcome']);
+    const recoveryPrompt = settled.recoveryRequest?.prompt as Array<{ content: unknown }>;
+    expect(JSON.stringify(recoveryPrompt.at(-1)?.content)).toContain('report_subagent_outcome');
     expect(settled.subagentEnd).toMatchObject({
       isError: false,
       output: { status: 'success', outcome: 'completed' },

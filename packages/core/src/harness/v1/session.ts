@@ -541,16 +541,16 @@ function createHarnessEmptySynthesisOptions(
       // Child report-only step (PF-7507): armed instead of `responseOnly`.
       let reportOnly = false;
       let reportOnlyReservedAtIteration: number | undefined;
-      let reportOnlyContinuation: Awaited<ReturnType<HarnessIterationCompleteHandler>>;
       return {
         recoveryMaxSteps: 1,
         onIterationComplete: existing => {
           const configured = existing as HarnessIterationCompleteHandler | undefined;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
             if (reportOnly) {
-              // A replayed predicate for the reserving iteration gets the same
-              // continuation; the report step itself is the last one.
-              if (context.iteration === reportOnlyReservedAtIteration) return reportOnlyContinuation;
+              // A replayed predicate for the reserving iteration keeps the
+              // continuation without injecting the feedback a second time; the
+              // report step itself is the last one.
+              if (context.iteration === reportOnlyReservedAtIteration) return { continue: true };
               try {
                 await configured?.(context);
               } catch (error) {
@@ -629,14 +629,13 @@ function createHarnessEmptySynthesisOptions(
                 'No other tool is available.';
               reportOnly = true;
               reportOnlyReservedAtIteration = context.iteration;
-              reportOnlyContinuation = {
+              return {
                 ...(configuredResult ?? {}),
                 continue: true,
                 feedback: configuredResult?.feedback
                   ? `${configuredResult.feedback}\n\n${reportFeedback}`
                   : reportFeedback,
               };
-              return reportOnlyContinuation;
             }
             responseOnly = true;
             responseOnlyReservedAtIteration = context.iteration;
@@ -684,10 +683,18 @@ function createHarnessEmptySynthesisOptions(
                 reportConfiguredHookError('prepareStep', error);
                 configuredReportResult = undefined;
               }
+              // The step keeps the session's own tool map, which always carries
+              // the report: a configured `tools` replacement could drop it.
               // Narrowing the advertised tools costs the provider prompt cache
               // (PF-5349), but only the report can settle a delegated child.
+              const {
+                tools: _configuredTools,
+                activeTools: _configuredActiveTools,
+                toolChoice: _configuredToolChoice,
+                ...configuredStepSettings
+              } = (configuredReportResult ?? {}) as Record<string, unknown>;
               return {
-                ...(configuredReportResult ?? {}),
+                ...configuredStepSettings,
                 activeTools: [subagentOutcomeReportToolId],
                 toolChoice: 'auto',
               };
