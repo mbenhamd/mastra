@@ -5602,6 +5602,17 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     await adoptInto(db, b, saving.id, saving.getRecord().harnessName);
 
     const settlement = gateSignalSettlement(storage, signalled.id);
+    // The fenced turn's run summary (persisted when its agent_end is emitted).
+    const summary = storageGate();
+    let summaryArmed = false;
+    const saveRunSummary = storage.saveRunSummary.bind(storage);
+    vi.spyOn(storage, 'saveRunSummary').mockImplementation(async input => {
+      if (summaryArmed) {
+        summary.enter();
+        await summary.opened;
+      }
+      return saveRunSummary(input);
+    });
     const save = storageGate();
     let saveHeld = false;
     const saveSession = storage.saveSession.bind(storage);
@@ -5657,6 +5668,7 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
       .catch(() => undefined);
     const internals = a as unknown as ShutdownInternals;
     settlement.arm();
+    summaryArmed = true;
     void internals._renewLiveSessionLeases();
     const sweep = storageGate();
     internals._pendingInteractionExpirySweepInFlight = sweep.opened;
@@ -5672,6 +5684,7 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
       expect(saving.lifecycleState).toBe('evicted');
     });
     await settlement.waitEntered();
+    await summary.waitEntered();
     sweep.open();
     await tick();
     expect(resolvedAt).toBeUndefined();
@@ -5682,10 +5695,14 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     await tick();
     expect(resolvedAt).toBeUndefined();
     settlement.open();
+    await tick();
+    expect(resolvedAt).toBeUndefined();
+    summary.open();
     await shutdown;
     await tick();
     const shutdownResolvedAt = resolvedAt!;
     expect(settlement.entered.length).toBeGreaterThan(0);
+    expect(ops.some(op => op.name === 'saveRunSummary')).toBe(true);
     expect(ops.filter(op => op.startedAt > shutdownResolvedAt)).toEqual([]);
     expect(ops.filter(op => op.settledAt === undefined || op.settledAt > shutdownResolvedAt)).toEqual([]);
     await expect(b.shutdown()).resolves.toBeUndefined();

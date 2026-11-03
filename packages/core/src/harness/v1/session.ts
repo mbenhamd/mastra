@@ -20937,29 +20937,40 @@ export class Session {
 
   /**
    * @internal PF-7538 — wait, without starting new writes, until no storage
-   * work this session already started is pending: background turn
-   * completions (signal settlement, terminal CAS, run summaries), result
-   * evidence writes, the `_flushChain` (including a queued or in-flight draft
-   * checkpoint) and the event-persistence tail. Failures stay with their
-   * owners; this only observes settlement. Shutdown's final barrier.
+   * work this session already started is pending. Shutdown's final barrier.
+   * Covers every per-session tail and in-flight registry that issues storage
+   * calls: background turn completions (signal settlement, terminal CAS),
+   * result-evidence writes, signal settlements, terminal commits, recovered
+   * run publications, run-summary persistence, the `_flushChain` (record
+   * writes and draft checkpoints), the in-flight draft checkpoint, the
+   * event-persistence tail, the lease-renewal chain, orphaned-dispatch
+   * recovery, plan-task summary seeding and delegation reconcile. Failures
+   * stay with their owners; this only observes settlement, and loops until
+   * nothing new was registered while it waited.
    */
   async _internalSettleOutstandingWork(): Promise<void> {
+    const pending = (): Promise<unknown>[] => [
+      ...this._backgroundTurnCompletions,
+      ...this._resultEvidenceWrites,
+      ...this._signalResultSettlements.values(),
+      ...this._terminalCommitsByRunId.values(),
+      ...this._recoveredRunPublications.values(),
+      this._runSummaryPersistence,
+      this._flushChain,
+      this._eventPersistenceTail,
+      this._leaseRenewalChain,
+      ...[
+        this._assistantDraftFlushInFlight,
+        this._orphanRecovery,
+        this._planTaskSummarySeedPromise,
+        this._delegationReconcileInFlight,
+      ].filter((work): work is Promise<never> => work !== undefined),
+    ];
     while (true) {
-      const completions = [...this._backgroundTurnCompletions];
-      const evidenceWrites = [...this._resultEvidenceWrites];
-      const chain = this._flushChain;
-      const draft = this._assistantDraftFlushInFlight;
-      const events = this._eventPersistenceTail;
-      await Promise.allSettled([...completions, ...evidenceWrites, chain, events, ...(draft ? [draft] : [])]);
-      if (
-        this._backgroundTurnCompletions.size === 0 &&
-        this._resultEvidenceWrites.size === 0 &&
-        chain === this._flushChain &&
-        draft === this._assistantDraftFlushInFlight &&
-        events === this._eventPersistenceTail
-      ) {
-        return;
-      }
+      const before = pending();
+      await Promise.allSettled(before);
+      const after = pending();
+      if (after.length === before.length && after.every((work, index) => work === before[index])) return;
     }
   }
 
