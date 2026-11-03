@@ -1773,6 +1773,14 @@ export class Session {
    */
   private readonly _abortedToolTombstones = new Set<string>();
   private readonly _toolInputBuffers = new Map<string, { toolName: string; text: string }>();
+  /**
+   * `${runId}:${toolCallId}` of admitted resumes whose answered call produced
+   * its own result or error in the resumed segment. Recorded as the chunk
+   * arrives, because a failed run's terminal handling clears its run tool
+   * receipts before the resume's failure path can inspect them; consumed by
+   * that path (see `_answeredResumeCallExecuted`).
+   */
+  private readonly _executedResumedCalls = new Set<string>();
   private readonly _runToolReceipts = new Map<
     string,
     {
@@ -8654,6 +8662,33 @@ export class Session {
     }
   }
 
+  /** Record that an admitted resume's answered call produced its own terminal chunk. */
+  private _noteResumedCallExecuted(runId: string, toolCallId: string): void {
+    const pending = this._record.pendingResume;
+    if (
+      pending !== undefined &&
+      pending.resumedAt !== undefined &&
+      pending.runId === runId &&
+      pending.toolCallId === toolCallId
+    ) {
+      this._executedResumedCalls.add(`${runId}:${toolCallId}`);
+    }
+  }
+
+  /**
+   * Whether the call a resume answered produced its own result (or error) in
+   * the resumed segment. Consumes the mark, so a later resume of the same
+   * call is judged on its own segment.
+   */
+  private _answeredResumeCallExecuted(pending: PendingResume): boolean {
+    return this._executedResumedCalls.delete(`${pending.runId}:${pending.toolCallId}`);
+  }
+
+  /** Drop the mark of a resume that settled without the failure path. */
+  private _forgetResumedCallExecuted(pending: PendingResume): void {
+    this._executedResumedCalls.delete(`${pending.runId}:${pending.toolCallId}`);
+  }
+
   /**
    * PF-5620: forward the decoded `summary` characters of this child's
    * streaming `report_subagent_outcome` input to its spawning bridge. Only the
@@ -8948,6 +8983,7 @@ export class Session {
               },
               'tool-result',
             );
+            this._noteResumedCallExecuted(runId, payload.toolCallId);
           }
           // Project `output` at emit so live === replay (§10.2). Shared/aliased
           // refs are split into copies, Date->ISO, Map/Set->{}, class->plain.
@@ -8984,6 +9020,7 @@ export class Session {
             toolName,
             status: 'error',
           });
+          this._noteResumedCallExecuted(runId, payload.toolCallId);
           // §13.3f.1: a tool's OWN error is faithfully preserved (the shared
           // `harnessEventJsonReplacer` keeps name/code/message — NOT flattened
           // into `harness.internal`), and projected at emit so the raw thrown
@@ -14777,14 +14814,22 @@ export class Session {
     kind: PendingResume['kind'],
     payload: { args?: unknown; suspendPayload?: unknown; approvalReasons?: string[] },
   ): PendingResume['payload'] {
+    // The payload is persisted and published as JSON: an argument the model
+    // omitted (an optional `selectionMode`, `options`, `title`, a tool with no
+    // args, a suspension without data) is left out rather than stored as an
+    // explicit `undefined`, which strict JSON consumers read as a non-JSON
+    // payload. Absent stays absent; present values are unchanged.
     switch (kind) {
       case 'tool-approval':
         return {
-          input: payload.args,
+          ...(payload.args !== undefined ? { input: payload.args } : {}),
           ...(payload.approvalReasons !== undefined ? { approvalReasons: payload.approvalReasons } : {}),
         };
       case 'tool-suspension':
-        return { input: payload.args, suspendData: payload.suspendPayload };
+        return {
+          ...(payload.args !== undefined ? { input: payload.args } : {}),
+          ...(payload.suspendPayload !== undefined ? { suspendData: payload.suspendPayload } : {}),
+        };
       case 'question': {
         const args = (payload.args ?? {}) as {
           question?: string;
@@ -14792,14 +14837,17 @@ export class Session {
           selectionMode?: 'single_select' | 'multi_select';
         };
         return {
-          question: args.question,
-          options: args.options,
-          selectionMode: args.selectionMode,
+          ...(args.question !== undefined ? { question: args.question } : {}),
+          ...(args.options !== undefined ? { options: args.options } : {}),
+          ...(args.selectionMode !== undefined ? { selectionMode: args.selectionMode } : {}),
         };
       }
       case 'plan-approval': {
         const args = (payload.args ?? {}) as { title?: string; plan?: string };
-        return { title: args.title, plan: args.plan };
+        return {
+          ...(args.title !== undefined ? { title: args.title } : {}),
+          ...(args.plan !== undefined ? { plan: args.plan } : {}),
+        };
       }
     }
   }
@@ -17198,6 +17246,10 @@ export class Session {
     }
     let full: FullOutput<unknown>;
     let outputDrainError: AgentThreadOutputDrainError | undefined;
+    // The subscription drain of this resumed segment, kept for the failure
+    // path: FullOutput can reject before the drain has turned earlier chunks
+    // (the answered call's own result) into events.
+    let resumedOutputDrain: Promise<unknown> | undefined;
     try {
       assertResumedTurnNotDeleted();
       const threadSubscription = await Promise.race([this._ensureThreadSubscription(agent), activeTurnWaiter.promise]);
@@ -17254,6 +17306,7 @@ export class Session {
       // the sole event consumer. Reading `out.fullStream` here as well would emit
       // every resumed tool/text chunk twice.
       const outputDrain = threadSubscription._waitForOutputDrain?.(out);
+      resumedOutputDrain = outputDrain;
       // Registration can fail before the provider finishes producing FullOutput.
       // Observe the barrier immediately, then await it after FullOutput so the
       // durable completion-vs-retry decision still has the concrete model result.
@@ -17295,7 +17348,55 @@ export class Session {
           activeTurnWaiter.promise,
         ]);
       }
+      // Only now is the failure path below out of reach: a queue-completion
+      // write that rejects must still find the answered call marked executed.
+      this._forgetResumedCallExecuted(pending);
     } catch (err) {
+      // The answered call itself already ran in this resumed segment (its
+      // tool result or tool error was recorded) and only the continuation
+      // threw: its side effects happened, and the agent's resume claim refuses
+      // a second resume anyway. Restoring the admission as retryable would
+      // re-offer an executed interaction (a reload or a second client shows it
+      // answerable again). Terminalize it instead, exactly as an undeliverable
+      // re-suspension is: pending consumed, receipt failed and not retryable.
+      // Let the drain deliver the segment's chunks first (it settles, either
+      // way, once the failed stream ends), so the answered call's own result
+      // is observed before deciding.
+      if (resumedOutputDrain) {
+        await Promise.race([resumedOutputDrain, activeTurnWaiter.promise]).catch(() => undefined);
+      }
+      if (this._answeredResumeCallExecuted(pending)) {
+        let thrown: unknown = err;
+        let terminalized = false;
+        try {
+          terminalized = await Promise.race([
+            this._terminalizeUndeliverableResuspension({
+              pending,
+              resumedAt,
+              responseId,
+              queuedItemId: pendingQueuedItemId,
+              modeFlipTarget,
+              previousModeId,
+              error: err,
+            }),
+            activeTurnWaiter.promise,
+          ]);
+        } catch (terminalErr) {
+          thrown = terminalErr;
+        } finally {
+          if (!terminalized) this._emitAbortedToolEnds({ force: true });
+          finishResumedTurn();
+          if (pendingQueuedItemId !== undefined) {
+            this._currentQueuedItemId = undefined;
+            this._currentQueuedItemSource = undefined;
+            this._notifyMaybeIdle();
+          }
+        }
+        if (pendingQueuedItemId !== undefined) {
+          void this._maybeDrainQueue();
+        }
+        throw redactPublicBoundaryRejection(thrown);
+      }
       let thrown = err;
       let retryableAdmissionRestored = false;
       try {
@@ -17862,6 +17963,12 @@ export class Session {
    * can never be resumed. Atomically consume the exact admitted pending marker,
    * fail its inbox/queue evidence, and preserve any already-earned token usage
    * before the public response rejects.
+   *
+   * The same terminal applies when the resumed segment executed the answered
+   * call and then threw before producing a `FullOutput` (a continuation model
+   * call failing after the approved tool ran): restoring the admission as
+   * retryable would re-offer an interaction whose side effects already
+   * happened. `full` is absent there; usage already accounted stays as is.
    */
   private async _terminalizeUndeliverableResuspension(input: {
     pending: PendingResume;
@@ -17870,18 +17977,18 @@ export class Session {
     queuedItemId?: string;
     modeFlipTarget?: string;
     previousModeId: string;
-    full: FullOutput<unknown>;
-    error: AgentThreadOutputDrainError;
+    full?: FullOutput<unknown>;
+    error: unknown;
   }): Promise<boolean> {
     const { pending, resumedAt, responseId, queuedItemId, modeFlipTarget, previousModeId, full, error } = input;
     const failedAt = Date.now();
     const projectedError = projectHarnessPublicError(error);
-    const usageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
+    const usageDelta = full ? this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage) : undefined;
     let terminalized = false;
     let usageDeltaToPersist: TokenUsage | undefined;
     let failedQueueReceipt: QueueAdmissionReceipt | undefined;
 
-    this._captureTurnRunId(full);
+    if (full) this._captureTurnRunId(full);
 
     // Cancel the deferred terminal admission BEFORE the fenced generation is
     // cleared: once `pendingResume` is gone there is no discoverable marker
@@ -18018,7 +18125,7 @@ export class Session {
       retryable: false,
       error: projectedError,
     });
-    this._emitAgentEnd({ runId: full.runId, finishReason: 'error', full });
+    this._emitAgentEnd({ runId: full?.runId ?? pending.runId, finishReason: 'error', ...(full ? { full } : {}) });
     return true;
   }
 

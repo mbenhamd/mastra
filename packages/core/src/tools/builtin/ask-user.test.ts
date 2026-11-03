@@ -36,6 +36,15 @@ describe('askUserTool (native suspend)', () => {
     expect(result).toBeUndefined();
   });
 
+  it('suspends a free-text question without options or selectionMode keys', async () => {
+    const ctx = makeAgentContext();
+
+    await (askUserTool as any).execute({ question: 'Why?' }, ctx);
+
+    // toStrictEqual: an own `undefined` key would fail (JSON has no undefined).
+    expect((ctx.agent.suspend as any).mock.calls[0][0]).toStrictEqual({ question: 'Why?' });
+  });
+
   it('suspends with multi_select when requested', async () => {
     const ctx = makeAgentContext();
 

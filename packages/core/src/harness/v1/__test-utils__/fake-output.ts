@@ -35,6 +35,12 @@ export function buildFakeOutput(spec: {
   fullOutput: Record<string, unknown>;
   /** Chunks yielded by `fullStream`. Empty array → a stream that completes immediately. */
   chunks?: unknown[];
+  /**
+   * Fail the run after `chunks` have streamed: `getFullOutput()` rejects with
+   * this error once `fullStream` has been consumed, as when a continuation
+   * model call fails after a tool already returned its result.
+   */
+  failAfterStream?: Error;
 }): MastraModelOutput {
   const fullOutput = { ...spec.fullOutput, runId: spec.runId };
   const chunks = spec.chunks ?? [];
@@ -49,9 +55,15 @@ export function buildFakeOutput(spec: {
       finishedResolve();
     }
   })();
+  const failure = spec.failAfterStream;
   return {
     runId: spec.runId,
-    getFullOutput: async () => fullOutput,
+    getFullOutput: failure
+      ? async () => {
+          await finished;
+          throw failure;
+        }
+      : async () => fullOutput,
     fullStream,
     text: Promise.resolve((fullOutput as any).text),
     finishReason: Promise.resolve((fullOutput as any).finishReason),

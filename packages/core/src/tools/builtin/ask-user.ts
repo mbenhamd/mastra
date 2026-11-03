@@ -151,7 +151,13 @@ export const askUserTool = createTool({
             toolCallId: context.agent.toolCallId,
           });
         }
-        await suspend({ question, options, selectionMode: resolvedSelectionMode });
+        // Absent optional arguments stay absent: the suspend payload is
+        // persisted as JSON, where an explicit `undefined` is not a value.
+        await suspend({
+          question,
+          ...(options ? { options } : {}),
+          ...(resolvedSelectionMode ? { selectionMode: resolvedSelectionMode } : {}),
+        });
         return;
       }
 
