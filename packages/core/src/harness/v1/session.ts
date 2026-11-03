@@ -6119,6 +6119,16 @@ export class Session {
    * when the child itself could not be cancelled here (for example another
    * process holds its lease).
    */
+  /** @internal PF-7473 — the `subagent` tool's send/cancel admission check. */
+  _internalAssertSubagentControlAdmitted(callerSignal?: AbortSignal): void {
+    this._assertLive('subagent control');
+    this._assertActiveWorkAdmission(
+      this._captureActiveWorkAdmission('subagent control'),
+      'subagent control',
+      callerSignal,
+    );
+  }
+
   async _internalCancelOwnedSubagent(
     subagentSessionId: string,
     reason: string,
@@ -6127,13 +6137,13 @@ export class Session {
     this._assertNotDeleted();
     // Only a live parent whose turn is still admitted may cancel: a call that
     // resumes after eviction, Stop or reset must not act on the child.
-    this._assertLive('subagent cancel');
-    this._assertActiveWorkAdmission(
-      this._captureActiveWorkAdmission('subagent cancel'),
-      'subagent cancel',
-      callerSignal,
-    );
-    const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason);
+    const epoch = this._captureActiveWorkAdmission('subagent cancel');
+    const assertAdmitted = () => {
+      this._assertLive('subagent cancel');
+      this._assertActiveWorkAdmission(epoch, 'subagent cancel', callerSignal);
+    };
+    assertAdmitted();
+    const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason, assertAdmitted);
     if (unavailable.includes(subagentSessionId)) return 'unavailable';
     // A cold delegated child has no live driver in this process; reconciliation
     // maps its committed cancelRequest to a failed plan task. A live driver's
@@ -6175,6 +6185,8 @@ export class Session {
   private async _cancelOwnedSubagentSessions(
     subagentSessionIds: Iterable<string>,
     reason: string,
+    /** PF-7473: re-proves the caller is still admitted right before each child write. */
+    assertAdmitted?: () => void,
   ): Promise<{ cancelled: string[]; unavailable: string[] }> {
     const cancelled: string[] = [];
     const unavailable: string[] = [];
@@ -6213,6 +6225,7 @@ export class Session {
         unavailable.push(childId);
         continue;
       }
+      assertAdmitted?.();
       try {
         const alreadyCancelled = child.getRecord().cancelRequest !== undefined;
         const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id);

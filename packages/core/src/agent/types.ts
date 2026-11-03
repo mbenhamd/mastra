@@ -209,9 +209,11 @@ export type AgentSignalIfActiveOptions = {
   behavior?: AgentSignalActiveBehavior;
   attributes?: AgentSignalAttributes;
   /**
-   * With `behavior: 'deliver'` to a same-agent run, the signal belongs to that
-   * run: if the run ends without consuming it, it is dropped instead of
-   * starting a follow-up run.
+   * With `behavior: 'deliver'` to a same-agent run in this runtime, the signal
+   * belongs to that run: if the run ends or loses the thread without
+   * consuming it, it is dropped instead of starting a follow-up run or being
+   * handed to another owner. Not carried over pub/sub: a signal routed to a
+   * run owned by another process is delivered without this guarantee.
    */
   expireWithRun?: boolean;
 };

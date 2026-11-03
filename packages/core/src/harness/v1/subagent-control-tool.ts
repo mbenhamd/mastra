@@ -405,7 +405,11 @@ export function createSubagentControlTool(parent: Session) {
     }
   }
 
-  async function send(childId: string, message: string): Promise<SubagentControlOutput> {
+  async function send(
+    childId: string,
+    message: string,
+    signal: AbortSignal | undefined,
+  ): Promise<SubagentControlOutput> {
     const { views, foreign } = await resolveChildren([childId]);
     if (foreign.length > 0) return foreignError(foreign);
     const view = views[0]!;
@@ -424,6 +428,8 @@ export function createSubagentControlTool(parent: Session) {
         'subagent is awaiting human input; it cannot take a message until that interaction is resolved',
       );
     }
+    // Re-prove the parent turn after the async resolution above.
+    parent._internalAssertSubagentControlAdmitted(signal);
     try {
       // Interleave-only: a child without an active run is never woken into a
       // new, unsupervised turn.
@@ -544,7 +550,7 @@ export function createSubagentControlTool(parent: Session) {
           case 'wait':
             return await wait(ids, input.timeoutMs ?? SUBAGENT_CONTROL_DEFAULT_WAIT_MS, ctx?.abortSignal);
           case 'send':
-            return await send(input.subagentSessionId!, input.message!);
+            return await send(input.subagentSessionId!, input.message!, ctx?.abortSignal);
           case 'cancel':
             return await cancel(input.subagentSessionId!, ctx?.abortSignal);
         }
