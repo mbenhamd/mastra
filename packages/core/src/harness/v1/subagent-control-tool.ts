@@ -270,15 +270,19 @@ export function createSubagentControlTool(parent: Session) {
       status = 'completed';
     } else if (delegated !== undefined && (delegated.status === 'failed' || delegated.status === 'cancelled')) {
       status = 'failed';
+    } else if (record.closedAt !== undefined && delegated?.delegatedSubagentSessionId !== childId) {
+      // Terminal lifecycle wins over suspension metadata a cancel preserves.
+      status = 'closed';
     } else if (record.pendingResume !== undefined || active?.status === 'awaiting_input') {
       status = 'awaiting_input';
     } else if (delegated?.delegatedSubagentSessionId === childId) {
       // The durable link is live: the delegation driver (or reconcile) still
       // owes the settlement, even if the child row already closed.
       status = 'running';
-    } else if (record.closedAt !== undefined || record.closingAt !== undefined) {
+    } else if (record.closedAt !== undefined) {
       status = 'closed';
-    } else if (active !== undefined) {
+    } else if (active !== undefined || record.closingAt !== undefined) {
+      // A closing child is still draining admitted work until closedAt lands.
       status = 'running';
     } else {
       status = 'idle';
@@ -437,7 +441,7 @@ export function createSubagentControlTool(parent: Session) {
     return { action: 'send', subagentSessionId: childId, delivered: true, status: view.status };
   }
 
-  async function cancel(childId: string): Promise<SubagentControlOutput> {
+  async function cancel(childId: string, signal: AbortSignal | undefined): Promise<SubagentControlOutput> {
     const before = await resolveChildren([childId]);
     if (before.foreign.length > 0) return foreignError(before.foreign);
     const view = before.views[0]!;
@@ -452,12 +456,19 @@ export function createSubagentControlTool(parent: Session) {
     }
     // A repeated cancel still runs: it resumes an incomplete descendant cascade.
     const wasRequested = view.cancelRequested;
-    let delivery = await parent._internalCancelOwnedSubagent(childId, SUBAGENT_CONTROL_CANCEL_REASON);
+    let delivery = await parent._internalCancelOwnedSubagent(childId, SUBAGENT_CONTROL_CANCEL_REASON, signal);
     const stored = await storage.loadSession({ harnessName, sessionId: childId });
-    if (
-      stored === null ||
-      ((stored.closedAt !== undefined || stored.closingAt !== undefined) && !stored.cancelRequest)
-    ) {
+    if (stored !== null && stored.closedAt === undefined && stored.closingAt !== undefined && !stored.cancelRequest) {
+      // The cascade skips a closing child; its close is already draining it.
+      return {
+        isError: true,
+        errorName: 'HarnessSubagentClosingError',
+        code: 'harness.subagent_closing',
+        message: 'The subagent is already closing; wait for it to settle.',
+        subagentSessionId: childId,
+      };
+    }
+    if (stored === null || (stored.closedAt !== undefined && !stored.cancelRequest)) {
       // The cascade skips a gone/closed child without writing anything.
       return {
         action: 'cancel',
@@ -506,7 +517,7 @@ export function createSubagentControlTool(parent: Session) {
     id: SUBAGENT_CONTROL_TOOL_ID,
     description:
       'Operate on subagents this session started with spawn_subagent or task_delegate. ' +
-      '`status` lists them (or inspects one) with their status and, once settled, their result. ' +
+      '`status` lists them (or inspects one) with their status; a settled task_delegate subagent carries its result. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes; it ' +
       'returns settled results and those still running. `send` adds an instruction to a running ' +
       'subagent. `cancel` stops one subagent; `cancel: "acknowledged"` means the cancel is recorded and ' +
@@ -530,7 +541,7 @@ export function createSubagentControlTool(parent: Session) {
           case 'send':
             return await send(input.subagentSessionId!, input.message!);
           case 'cancel':
-            return await cancel(input.subagentSessionId!);
+            return await cancel(input.subagentSessionId!, ctx?.abortSignal);
         }
       } catch (err) {
         const publicError = projectHarnessPublicError(err);

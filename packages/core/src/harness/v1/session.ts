@@ -6122,8 +6122,17 @@ export class Session {
   async _internalCancelOwnedSubagent(
     subagentSessionId: string,
     reason: string,
+    callerSignal?: AbortSignal,
   ): Promise<'delivered' | 'delivered_incomplete' | 'unavailable'> {
     this._assertNotDeleted();
+    // Only a live parent whose turn is still admitted may cancel: a call that
+    // resumes after eviction, Stop or reset must not act on the child.
+    this._assertLive('subagent cancel');
+    this._assertActiveWorkAdmission(
+      this._captureActiveWorkAdmission('subagent cancel'),
+      'subagent cancel',
+      callerSignal,
+    );
     const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason);
     if (unavailable.includes(subagentSessionId)) return 'unavailable';
     // A cold delegated child has no live driver in this process; reconciliation

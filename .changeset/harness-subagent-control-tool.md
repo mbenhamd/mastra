@@ -6,7 +6,7 @@ Added a built-in `subagent` tool to Harness v1 so the parent model can manage th
 
 **Actions**
 
-- `status`: list your subagents, or inspect one, with its status and (once settled) its result.
+- `status`: list your subagents, or inspect one, with its status. A settled `task_delegate` subagent includes its result.
 - `wait`: wait up to a bounded timeout for one or more subagents to settle. Returns the settled results and the ones still running.
 - `send`: add an instruction to a running subagent's current run. A subagent without an active run is never woken.
 - `cancel`: stop one subagent. The cancel is stored on the subagent's own record, so it survives restarts. The result says whether the cancel was `acknowledged` and whether the subagent has `settled`.
