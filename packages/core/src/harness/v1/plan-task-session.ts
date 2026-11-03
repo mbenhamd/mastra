@@ -1960,16 +1960,25 @@ export async function planTaskCheck(port: PlanTaskSessionPort, input: CheckInput
 
   const candidates = views.slice(start, start + limit);
   const tasks: PlanTaskView[] = [];
+  // Measure the largest envelope this page could return. Using `truncated:
+  // true` plus a cursor guarantees the eventual (possibly final) envelope is
+  // no larger than the admitted candidate measurement.
+  const fits = (proposed: PlanTaskView[], candidate: PlanTaskView) =>
+    utf8Bytes(JSON.stringify({ tasks: proposed, truncated: true, nextCursor: candidate.taskId })) <=
+    PLAN_TASK_CHECK_MAX_OUTPUT_BYTES;
   for (const candidate of candidates) {
-    const proposed = [...tasks, candidate];
-    // Measure the largest envelope this page could return. Using `truncated:
-    // true` plus a cursor guarantees the eventual (possibly final) envelope is
-    // no larger than the admitted candidate measurement.
-    const projectedBytes = utf8Bytes(
-      JSON.stringify({ tasks: proposed, truncated: true, nextCursor: candidate.taskId }),
-    );
-    if (projectedBytes > PLAN_TASK_CHECK_MAX_OUTPUT_BYTES) break;
-    tasks.push(candidate);
+    if (fits([...tasks, candidate], candidate)) {
+      tasks.push(candidate);
+      continue;
+    }
+    // The delegated result's tool trace is advisory. When it alone keeps the
+    // first task of a page from fitting, return that task without it (still
+    // flagged truncated) rather than making the settled task unreadable.
+    if (tasks.length === 0) {
+      const withoutTrace = withoutDelegationToolTrace(candidate).find(variant => fits([variant], variant));
+      if (withoutTrace !== undefined) tasks.push(withoutTrace);
+    }
+    break;
   }
   if (tasks.length === 0 && candidates.length > 0) {
     throw new HarnessValidationError(
@@ -1991,6 +2000,25 @@ export async function planTaskCheck(port: PlanTaskSessionPort, input: CheckInput
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Trace-free variants of a delegated task view, flagged first. When even the
+ * 26-byte truncation flag is what keeps the task from fitting, the second
+ * variant drops it too: the trace is advisory, the settled result is not.
+ */
+function withoutDelegationToolTrace(view: PlanTaskView): PlanTaskView[] {
+  const result = view.delegation?.result;
+  const delegation = view.delegation;
+  if (delegation === undefined || result === undefined) return [];
+  if (result.toolTrace === undefined && result.toolTraceTruncated === undefined) return [];
+  const { toolTrace: _toolTrace, toolTraceTruncated: _toolTraceTruncated, ...rest } = result;
+  return [
+    ...(result.toolTrace === undefined
+      ? []
+      : [{ ...view, delegation: { ...delegation, result: { ...rest, toolTraceTruncated: true } } }]),
+    { ...view, delegation: { ...delegation, result: rest } },
+  ];
+}
 
 /** Next sibling order = max(existing sibling order) + 1, or 0. */
 function nextOrder(tasks: HarnessPlanTask[], parentTaskId: string | undefined): number {

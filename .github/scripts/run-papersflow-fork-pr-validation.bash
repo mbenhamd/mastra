@@ -5046,6 +5046,7 @@ run_validator_self_tests() {
     "$fixture_repo/workflows/inngest/src/durable-agent" \
     "$fixture_repo/workflows/inngest/src" \
     "$fixture_repo/workflows/temporal/src" \
+    "$fixture_repo/packages/schema-compat/src/provider-compats" \
     "$fixture_repo/node_modules" \
     "$mock_bin"
   # The production validator is copied to RUNNER_TEMP and resolves TypeScript
@@ -5443,6 +5444,22 @@ run_validator_self_tests() {
     printf '%s\n' 'export const temporalWorkflow = true;' > workflows/temporal/src/workflow.ts
     printf '%s\n' "import { it } from 'vitest';" "it('temporal workflow contract', () => {});" \
       > workflows/temporal/src/workflow.test.ts
+    printf '%s\n' '{}' > packages/schema-compat/package.json
+    printf '%s\n' 'export const openaiCompat = true;' \
+      > packages/schema-compat/src/provider-compats/openai.ts
+    printf '%s\n' 'export const providerCompatSuite = true;' \
+      > packages/schema-compat/src/provider-compats/test-suite.ts
+    printf '%s\n' 'export const anthropicCompat = true;' \
+      > packages/schema-compat/src/provider-compats/anthropic.ts
+    printf '%s\n' 'export const schemaCompatUtils = true;' \
+      > packages/schema-compat/src/utils.ts
+    for schema_compat_suite in \
+      anthropic deepseek google groq meta openai-reasoning openai; do
+      printf '%s\n' "import { it } from 'vitest';" "it('${schema_compat_suite} compat', () => {});" \
+        > "packages/schema-compat/src/provider-compats/${schema_compat_suite}.test.ts"
+    done
+    printf '%s\n' "import { it } from 'vitest';" "it('openai live compat', () => {});" \
+      > packages/schema-compat/src/provider-compats/openai.e2e.test.ts
     printf '%s\n' \
       'name: Fork validation fixture' \
       'jobs:' \
@@ -7826,6 +7843,119 @@ NODE
     cat "$command_log" >&2
     exit 1
   fi
+
+  # PF-7547: Schema Compat is an owned workspace. Every edit gets the package
+  # build, typecheck, and lint plus each changed test file. The createSuite
+  # helper and the compat layers it drives queue the seven non-e2e suites that
+  # call it; the whole package suite never runs, and a live-provider e2e suite
+  # still fails closed before any test runs.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const openaiCompat = "itemless-array";' \
+      > packages/schema-compat/src/provider-compats/openai.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('openai itemless array', () => {});" \
+      > packages/schema-compat/src/provider-compats/openai.test.ts
+    git add .
+    git commit -q -m 'exercise Schema Compat owned workspace'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/schema-compat-owned-workspace-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_not_contains 'do not have an owned fork-safe validation target' "$output"
+  assert_contains 'Running changed test file in full: packages/schema-compat/src/provider-compats/openai.test.ts' "$output"
+  assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match build' "$command_log"
+  assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match lint' "$command_log"
+  assert_line_matches \
+    '^--dir packages/schema-compat exec vitest run --reporter=dot --reporter=json --outputFile\.json=[^ ]+ src/provider-compats/openai\.test\.ts$' \
+    "$command_log"
+  assert_line_match_count 7 '^--dir packages/schema-compat exec vitest run ' "$command_log"
+  assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+  # Listed once as forced and once among the changed test files to run.
+  assert_line_count 2 'packages/schema-compat/src/provider-compats/anthropic.test.ts' "$output"
+
+  for schema_compat_mapped_source in test-suite anthropic; do
+    head_sha="$(
+      cd "$fixture_repo"
+      git reset -q --hard "$base_sha"
+      printf '%s\n' "export const changedCompatSource = '${schema_compat_mapped_source}';" \
+        > "packages/schema-compat/src/provider-compats/${schema_compat_mapped_source}.ts"
+      git add .
+      git commit -q -m "exercise Schema Compat ${schema_compat_mapped_source} source-only change"
+      git rev-parse HEAD
+    )"
+    : > "$command_log"
+    output="$test_root/schema-compat-${schema_compat_mapped_source}-forced-success.log"
+    if ! run_fixture "$head_sha" "$output"; then
+      cat "$output" >&2
+      exit 1
+    fi
+    assert_contains 'Forcing PF-2044 owned suites to run for source-only changes:' "$output"
+    assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match build' "$command_log"
+    assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match exec tsc --noEmit' "$command_log"
+    assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match lint' "$command_log"
+    for schema_compat_suite in \
+      anthropic deepseek google groq meta openai-reasoning openai; do
+      assert_contains \
+        "Running changed test file in full: packages/schema-compat/src/provider-compats/${schema_compat_suite}.test.ts" \
+        "$output"
+      assert_line_match_count 1 \
+        "^--dir packages/schema-compat exec vitest run --reporter=dot --reporter=json --outputFile\\.json=[^ ]+ src/provider-compats/${schema_compat_suite}\\.test\\.ts\$" \
+        "$command_log"
+    done
+    assert_line_match_count 7 '^--dir packages/schema-compat exec vitest run ' "$command_log"
+    assert_not_contains 'e2e.test.ts' "$command_log"
+  done
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const schemaCompatUtils = "unmapped";' \
+      > packages/schema-compat/src/utils.ts
+    git add .
+    git commit -q -m 'exercise Schema Compat unmapped source-only change'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/schema-compat-source-only-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'No changed test files detected. Build and type checks completed.' "$output"
+  assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match build' "$command_log"
+  assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_line_count 1 '--filter ./packages/schema-compat --fail-if-no-match lint' "$command_log"
+  assert_not_contains '--dir packages/schema-compat exec vitest run' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { it } from 'vitest';" "it('openai live compat snapshot', () => {});" \
+      > packages/schema-compat/src/provider-compats/openai.e2e.test.ts
+    git add .
+    git commit -q -m 'edit Schema Compat live-provider suite'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/schema-compat-e2e-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Schema Compat live-provider e2e fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'require a dedicated fork-safe workflow or suite-specific infrastructure' "$output"
+  assert_contains 'packages/schema-compat/src/provider-compats/openai.e2e.test.ts' "$output"
+  assert_not_contains '--dir packages/schema-compat exec vitest run' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -14024,7 +14154,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     packages/memory/integration-tests)
       # PF-4233 admits exactly one real-PostgreSQL suite from this nested,
       # separately locked package. Its manifest, lockfile, Vitest config,
@@ -14841,6 +14971,23 @@ while IFS= read -r file; do
     stores/upstash/src/storage/domains/workflows/index.ts)
       queue_owned_workspace_test "$file" stores/upstash/src/storage/index.test.ts
       ;;
+    packages/schema-compat/src/provider-compats/test-suite.ts | \
+      packages/schema-compat/src/provider-compats/anthropic.ts | \
+      packages/schema-compat/src/provider-compats/deepseek.ts | \
+      packages/schema-compat/src/provider-compats/google.ts | \
+      packages/schema-compat/src/provider-compats/meta.ts | \
+      packages/schema-compat/src/provider-compats/openai.ts | \
+      packages/schema-compat/src/provider-compats/openai-reasoning.ts)
+      # PF-7547: the shared createSuite helper and the compat layers it drives
+      # have no test of their own. Queue every non-e2e suite that calls
+      # createSuite; the live-provider e2e suites stay outside this map.
+      for schema_compat_suite in \
+        anthropic.test.ts deepseek.test.ts google.test.ts groq.test.ts \
+        meta.test.ts openai-reasoning.test.ts openai.test.ts; do
+        queue_owned_workspace_test "$file" \
+          "packages/schema-compat/src/provider-compats/$schema_compat_suite"
+      done
+      ;;
   esac
 done < "$changed_files"
 
@@ -15416,6 +15563,16 @@ if workspace_changed packages/mcp; then
   run_with_validation_budget 600 pnpm --filter ./packages/mcp --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 900 pnpm --filter ./packages/mcp --fail-if-no-match build:lib
   run_with_validation_budget 600 pnpm --filter ./packages/mcp --fail-if-no-match lint
+fi
+
+if workspace_changed packages/schema-compat; then
+  # build:core above already builds this package as a Core dependency; the
+  # explicit gates keep its own build, typecheck, and lint owned when Core's
+  # turbo graph or cache would otherwise hide them. The package declares no
+  # `typecheck` script, so typechecking goes through `exec tsc` like MCP's.
+  run_with_validation_budget 900 pnpm --filter ./packages/schema-compat --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./packages/schema-compat --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 600 pnpm --filter ./packages/schema-compat --fail-if-no-match lint
 fi
 
 if workspace_changed packages/server; then
