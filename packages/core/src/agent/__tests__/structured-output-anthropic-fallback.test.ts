@@ -642,6 +642,26 @@ const rows: Row[] = [
     requestOnly: true,
   },
   {
+    // PapersFlow's path: the router resolves the gateway model (here a V3 @ai-sdk/anthropic model)
+    // only at dispatch, so its strict tool keeps `strict` and counts: 24 + 1 = 25 optional.
+    name: "router model 'anthropic/claude-haiku-5-5': 24 optional parameters plus a strict tool with 1 optional",
+    model: () => 'anthropic/claude-haiku-5-5',
+    schema: manyFields(24, () => z.string().optional()),
+    tools: lookupTool(true),
+    populated: { field0: 'x' },
+    expected: 'prompt',
+  },
+  {
+    // The adapter's merge: an explicit `undefined` under the provider's own key overrides `anthropic`.
+    name: "renamed provider: { proxy: { structuredOutputMode: undefined } } overrides anthropic's 'jsonTool'",
+    model: renamedAnthropic,
+    schema: recordSchema,
+    providerOptions: { anthropic: { structuredOutputMode: 'jsonTool' }, proxy: { structuredOutputMode: undefined } },
+    populated: populatedRecord,
+    record: schema => schema.properties.fields,
+    expected: 'prompt',
+  },
+  {
     // AI SDK v5 models lose per-tool `strict` before dispatch, so the tool isn't budgeted.
     name: 'V2 model: 24 optional parameters plus a strict tool with 1 optional parameter stays native',
     model: anthropicV2,

@@ -9,7 +9,7 @@ import { APICallError } from '@internal/ai-sdk-v5';
 import type { IdGenerator, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
 import { prepareJsonSchemaForOpenAIStrictMode } from '@mastra/schema-compat';
 import type { StructuredOutputOptions, StructuredOutputSourceDecision } from '../../../agent/types';
-import { applyStrictForV2 } from '../../../llm/model/aisdk/v5/model';
+import { AISDKV5LanguageModel, applyStrictForV2 } from '../../../llm/model/aisdk/v5/model';
 import { validateModelTimeoutSettings } from '../../../llm/model/model-settings';
 import type { ModelMethodType } from '../../../llm/model/model.loop.types';
 import { modelSupportsStructuredOutput, modelSupportsTemperature } from '../../../llm/model/provider-registry';
@@ -383,8 +383,12 @@ function strictToolInputSchemas({ tools, activeTools, toolChoice }: StrictToolSo
     targetVersion,
     stripToolsWhenNone: true,
   });
+  // Only a model Mastra dispatches through AISDKV5LanguageModel loses per-tool `strict`
+  // (applyStrictForV2 in its doStream/doGenerate). Every other model, including a router model whose
+  // adapter version is only known after it resolves the gateway model at dispatch, keeps `strict`
+  // in this count.
   const sent =
-    model.specificationVersion === 'v2'
+    model instanceof AISDKV5LanguageModel
       ? (applyStrictForV2({ prompt: [], tools: prepared.tools } as unknown as LanguageModelV2CallOptions).tools ?? [])
       : (prepared.tools ?? []);
   return sent
@@ -523,10 +527,17 @@ function choosesAnthropicStructuredOutputMode(
   providerOptions: SharedProviderOptions | undefined,
   model: DecisionModel,
 ): boolean {
-  // The adapter merges `providerOptions.anthropic` with its own provider-name key, which wins.
-  const options = providerOptions as Record<string, { structuredOutputMode?: unknown } | undefined> | undefined;
+  // The adapter's merge (`@ai-sdk/anthropic` 3.0.133): `Object.assign({}, anthropic, ownKey)`, where
+  // `ownKey` is its provider-name key unless that is `anthropic`. A key present in `ownKey` wins
+  // even when its value is `undefined`.
+  const options = providerOptions as Record<string, object | undefined> | undefined;
   const providerKey = model.provider.split('.')[0]!;
-  const mode = options?.[providerKey]?.structuredOutputMode ?? options?.anthropic?.structuredOutputMode;
+  const merged: { structuredOutputMode?: unknown } = Object.assign(
+    {},
+    options?.anthropic ?? {},
+    providerKey !== 'anthropic' ? (options?.[providerKey] ?? {}) : {},
+  );
+  const mode = merged.structuredOutputMode;
   if (mode === 'outputFormat') return true;
   if (mode !== 'jsonTool') return false;
   // The pinned adapter sends a JSON-schema response natively instead of as a JSON tool when the model
