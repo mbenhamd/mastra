@@ -1899,6 +1899,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
                       structuredOutput,
                       currentModel,
                       currentProviderOptions,
+                      { tools: currentTools, activeTools: currentActiveTools },
                     ),
                   })
                 : undefined,

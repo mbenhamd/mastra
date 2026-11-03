@@ -2493,6 +2493,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                   currentStep.structuredOutput,
                   currentStep.model,
                   currentStep.providerOptions,
+                  { tools: currentStep.tools, activeTools: currentStep.activeTools as string[] | undefined },
                 ),
               })
             : undefined;

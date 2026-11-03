@@ -1,6 +1,6 @@
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { RunProcessInputStepResult } from '../../processors';
-import { recordStructuredOutputSourceDecision } from '../../stream/aisdk/v5/execute';
+import { recordStructuredOutputSourceDecision, structuredOutputSchemaFingerprint } from '../../stream/aisdk/v5/execute';
 
 /**
  * Shape of the per-step LLM input fields that an input-processor (or
@@ -58,17 +58,24 @@ export function composeStepInput(
     messageId: processInputStepResult.messageId ?? current.messageId,
     model: processInputStepResult.model ?? current.model,
     ...('structuredOutput' in processInputStepResult
-      ? { structuredOutput: withSourceDecision(processInputStepResult.structuredOutput) }
+      ? { structuredOutput: withSourceDecision(current.structuredOutput, processInputStepResult.structuredOutput) }
       : {}),
   };
 }
 
 /**
- * PF-7309: the structured-output source decision follows the schema the step actually uses. Every
- * processor return of `structuredOutput` is decided again from its schema, so a replaced or
- * in-place mutated schema never keeps a decision recorded for an earlier schema.
+ * PF-7309: the structured-output source decision follows the schema the step actually uses. The
+ * processor runner always returns `structuredOutput`, so the recorded decision is kept while the
+ * schema's content fingerprint matches it (a durable reload of the same schema, or no processor
+ * change at all), and the schema is decided again when its content differs (a replaced or
+ * in-place mutated schema). Re-reading an unchanged serialized schema never replaces a decision
+ * that only the caller's original schema could make.
  */
-function withSourceDecision(next: any): any {
+function withSourceDecision(current: any, next: any): any {
   if (!next?.schema) return next;
+  const recorded = next.sourceDecision ?? current?.sourceDecision;
+  if (recorded?.fingerprint && recorded.fingerprint === structuredOutputSchemaFingerprint(next.schema)) {
+    return next.sourceDecision === recorded ? next : { ...next, sourceDecision: recorded };
+  }
   return { ...next, sourceDecision: recordStructuredOutputSourceDecision(next.schema) };
 }

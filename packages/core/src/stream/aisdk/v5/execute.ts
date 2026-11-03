@@ -26,7 +26,12 @@ import { createExactJsonMeasurementSnapshot } from '../../../observability/conte
 import type { ExactJsonMeasurementSnapshot } from '../../../observability/content-free-measurement';
 import type { PublicSchema } from '../../../schema';
 import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
-import { getResponseFormat, getSemanticResponseSchema, hasVerifiedObjectOpenness } from '../../base/schema';
+import {
+  getResponseFormat,
+  getSemanticJsonSchema,
+  getSemanticResponseSchema,
+  hasVerifiedObjectOpenness,
+} from '../../base/schema';
 import type { ChunkType, LanguageModelV2StreamResult, OnResult } from '../../types';
 import { attachModelStreamTransport, readModelStreamTransport } from '../../types';
 import { prepareToolsAndToolChoice, preparedToolKey } from './compat';
@@ -204,7 +209,6 @@ const STRICT_STRUCTURE_KEYWORDS = new Set([
   'items',
   'anyOf',
   'oneOf',
-  '$ref',
   '$defs',
   'definitions',
 ]);
@@ -214,11 +218,13 @@ const STRICT_STRUCTURE_KEYWORDS = new Set([
  * True only for recognised shapes, so any keyword or shape not listed here means "not carriable":
  * - every keyword is a value keyword ({@link STRICT_VALUE_KEYWORDS}) or a structural one
  *   ({@link STRICT_STRUCTURE_KEYWORDS});
- * - the node has a `type`, `enum`, `const`, `anyOf`, `oneOf` or `$ref` (an empty schema accepts
- *   anything, which strict output cannot express);
+ * - the node has a `type`, `enum`, `const`, `anyOf` or `oneOf` (an empty schema accepts
+ *   anything, which strict output cannot express); `$ref` is never carriable (Anthropic rejects
+ *   recursive and external references, and Zod only emits references for recursion);
  * - an object node is typed `object`, closed (`additionalProperties: false`) and every property
  *   schema is carriable; a typeless node with `properties` / `required` / `additionalProperties` is not;
- * - an array node's `items` is one carriable schema (no tuples, `additionalItems` or `prefixItems`);
+ * - an array node has `items`, and it is one carriable schema (no tuples, `additionalItems`,
+ *   `prefixItems`, or an array without `items`, which admits any value);
  * - every `anyOf` / `oneOf` branch and `$defs` / `definitions` entry is carriable.
  * So `allOf` (intersections), `patternProperties`, `propertyNames`, `unevaluated*`, `not`,
  * conditionals and open objects (records, catchall, passthrough, loose objects, or JSON Schema
@@ -230,7 +236,7 @@ function isStrictOutputCarriable(schema: unknown): boolean {
   for (const key of Object.keys(node)) {
     if (!STRICT_VALUE_KEYWORDS.has(key) && !STRICT_STRUCTURE_KEYWORDS.has(key)) return false;
   }
-  if (!['type', 'enum', 'const', 'anyOf', 'oneOf', '$ref'].some(key => key in node)) return false;
+  if (!['type', 'enum', 'const', 'anyOf', 'oneOf'].some(key => key in node)) return false;
 
   const types = Array.isArray(node.type) ? node.type : [node.type];
   if ('properties' in node || 'required' in node || 'additionalProperties' in node || types.includes('object')) {
@@ -239,7 +245,10 @@ function isStrictOutputCarriable(schema: unknown): boolean {
     if (typeof properties !== 'object' || Array.isArray(properties)) return false;
     if (!Object.values(properties).every(isStrictOutputCarriable)) return false;
   }
-  if ('items' in node && (Array.isArray(node.items) || !isStrictOutputCarriable(node.items))) return false;
+  // An array admits any value unless one carriable `items` schema constrains it.
+  if (types.includes('array') || 'items' in node) {
+    if (!('items' in node) || Array.isArray(node.items) || !isStrictOutputCarriable(node.items)) return false;
+  }
   for (const key of ['anyOf', 'oneOf'] as const) {
     if (key in node && (!Array.isArray(node[key]) || !(node[key] as unknown[]).every(isStrictOutputCarriable))) {
       return false;
@@ -251,7 +260,7 @@ function isStrictOutputCarriable(schema: unknown): boolean {
     if (!map || typeof map !== 'object' || Array.isArray(map)) return false;
     if (!Object.values(map).every(isStrictOutputCarriable)) return false;
   }
-  return '$ref' in node ? typeof node.$ref === 'string' : true;
+  return true;
 }
 
 /**
@@ -263,6 +272,9 @@ function isStrictOutputCarriable(schema: unknown): boolean {
  * anything else goes through the prompt.
  */
 export function anthropicStrictOutputCarries(schema: unknown): boolean {
+  // Anthropic documents object roots only; a root union is not provably accepted. Arrays and enums
+  // already arrive wrapped in an object by the output-format wrapping.
+  if ((schema as { type?: unknown } | undefined)?.type !== 'object') return false;
   if (!isStrictOutputCarriable(schema)) return false;
   const { optional, union } = countStructuredOutputParameters(schema);
   return (
@@ -281,7 +293,87 @@ export function recordStructuredOutputSourceDecision(schema: unknown): Structure
   if (!schema) return undefined;
   const semantic = getSemanticResponseSchema(schema as PublicSchema);
   const carries = hasVerifiedObjectOpenness(schema as PublicSchema) && anthropicStrictOutputCarries(semantic);
-  return { schema: semantic, strictOutputCannotCarry: !carries };
+  return {
+    schema: semantic,
+    strictOutputCannotCarry: !carries,
+    fingerprint: structuredOutputSchemaFingerprint(schema),
+  };
+}
+
+/**
+ * A canonical fingerprint of the schema a decision was recorded for: the stable JSON of its
+ * semantic JSON Schema. A durable run's serialized schema has the same fingerprint as the caller's
+ * schema it was serialized from, so a reload keeps the recorded decision (including a fallback for
+ * a library whose openness only the original schema could tell) instead of re-reading the JSON.
+ */
+export function structuredOutputSchemaFingerprint(schema: unknown): string {
+  // The root `$schema` is a dialect marker, which the JSON Schema wrapper adds on a reload.
+  const { $schema: _dialect, ...semantic } = getSemanticJsonSchema(schema as PublicSchema);
+  return stableJson(semantic);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.keys(value)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`);
+    return `{${entries.join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** The tools whose input schemas count toward Anthropic's request-wide strict-schema limits. */
+type StrictToolSource = { tools?: unknown; activeTools?: readonly string[] };
+
+function strictToolInputSchemas({ tools, activeTools }: StrictToolSource): unknown[] {
+  if (!tools || typeof tools !== 'object') return [];
+  const strictTools = Object.fromEntries(
+    Object.entries(tools as Record<string, unknown>).filter(
+      ([name, tool]) =>
+        (tool as { strict?: unknown } | undefined)?.strict === true && (!activeTools || activeTools.includes(name)),
+    ),
+  );
+  if (Object.keys(strictTools).length === 0) return [];
+  const prepared = prepareToolsAndToolChoice({
+    tools: strictTools as Parameters<typeof prepareToolsAndToolChoice>[0]['tools'],
+    toolChoice: undefined,
+    activeTools: undefined,
+    targetVersion: 'v2',
+  });
+  return (prepared.tools ?? []).map(tool => (tool as { inputSchema?: unknown }).inputSchema);
+}
+
+/**
+ * Whether one Anthropic request stays within {@link ANTHROPIC_STRUCTURED_OUTPUT_LIMITS} with the
+ * response schema sent natively. The limits are request-wide: the response schema counts as the
+ * larger of its recorded source and its compat-converted wire form (the Anthropic compat layer can
+ * turn a root union of objects into one object with more optional properties), and every active
+ * `strict: true` tool's input schema is added. Checked per request, because tools vary per step;
+ * it only ever moves a carriable schema to the prompt.
+ */
+function anthropicRequestWithinLimits(
+  schema: unknown,
+  recordedSchema: unknown,
+  model: { provider: string; modelId: string },
+  tools: StrictToolSource,
+): boolean {
+  const wire = getResponseFormat(schema as Parameters<typeof getResponseFormat>[0], {
+    model: { provider: model.provider, modelId: model.modelId, supportsStructuredOutputs: true },
+  });
+  const source = countStructuredOutputParameters(recordedSchema);
+  const converted = countStructuredOutputParameters(wire.type === 'json' ? wire.schema : undefined);
+  let optional = Math.max(source.optional, converted.optional);
+  let union = Math.max(source.union, converted.union);
+  for (const inputSchema of strictToolInputSchemas(tools)) {
+    const counts = countStructuredOutputParameters(inputSchema);
+    optional += counts.optional;
+    union += counts.union;
+  }
+  return (
+    optional <= ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.optionalParameters &&
+    union <= ANTHROPIC_STRUCTURED_OUTPUT_LIMITS.unionParameters
+  );
 }
 
 /**
@@ -362,9 +454,10 @@ export function sendsNativeResponseFormat(
     | undefined,
   model: { provider: string; modelId: string },
   providerOptions?: SharedProviderOptions,
+  tools: StrictToolSource = {},
 ): boolean {
   if (!structuredOutput?.schema || structuredOutput.model) return false;
-  return !resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions).mode;
+  return !resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, tools).mode;
 }
 
 function jsonSchemaOf(responseFormat: ReturnType<typeof getResponseFormat> | undefined): unknown {
@@ -411,6 +504,7 @@ function resolveDirectStructuredOutputInjection(
   },
   model: { provider: string; modelId: string },
   providerOptions: SharedProviderOptions | undefined,
+  tools: StrictToolSource,
 ): { mode: 'system' | 'inline' | undefined; schema?: unknown } {
   const { jsonPromptInjection } = structuredOutput;
   if (jsonPromptInjection === false) return { mode: undefined };
@@ -431,7 +525,11 @@ function resolveDirectStructuredOutputInjection(
   }
   if (!anthropic || providerChoosesMode) return { mode: undefined };
   const recorded = decision();
-  return recorded?.strictOutputCannotCarry ? { mode: 'inline', schema: recorded.schema } : { mode: undefined };
+  if (!recorded) return { mode: undefined };
+  if (recorded.strictOutputCannotCarry) return { mode: 'inline', schema: recorded.schema };
+  return anthropicRequestWithinLimits(structuredOutput.schema, recorded.schema, model, tools)
+    ? { mode: undefined }
+    : { mode: 'inline', schema: recorded.schema };
 }
 
 type InjectJsonInstructionArgs = Parameters<typeof injectJsonInstructionIntoMessagesV3>[0];
@@ -908,7 +1006,7 @@ export function execute<OUTPUT = undefined>({
     toolChoice,
     activeTools,
     targetVersion,
-    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, model, providerOptions),
+    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, model, providerOptions, { tools, activeTools }),
   });
 
   const responseFormat = structuredOutput?.schema
@@ -926,7 +1024,7 @@ export function execute<OUTPUT = undefined>({
   const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
   const directInjection =
     structuredOutputMode === 'direct' && structuredOutput
-      ? resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions)
+      ? resolveDirectStructuredOutputInjection(structuredOutput, model, providerOptions, { tools, activeTools })
       : undefined;
   const resolvedJsonPromptInjection = directInjection
     ? directInjection.mode

@@ -545,6 +545,11 @@ export interface StructuredOutputSourceDecision {
    * open by JSON Schema default) or more than 24 optional / 16 union-typed parameters.
    */
   strictOutputCannotCarry: boolean;
+  /**
+   * Canonical fingerprint of the schema this decision was recorded for. A step whose schema has
+   * the same fingerprint keeps the decision; a changed schema is decided again.
+   */
+  fingerprint?: string;
 }
 
 export type StructuredOutputOptions<OUTPUT = {}> = StructuredOutputOptionsBase<OUTPUT> & {

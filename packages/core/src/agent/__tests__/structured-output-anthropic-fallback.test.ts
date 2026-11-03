@@ -200,6 +200,18 @@ const mutateSchema = (schema: unknown) => ({
 });
 const when = '2026-11-03T00:00:00.000Z';
 
+const lookupTool = (strict: boolean) => () => ({
+  lookup: createTool({
+    id: 'lookup',
+    description: 'Look something up',
+    inputSchema: z.object({ query: z.string().optional() }),
+    ...(strict ? { strict: true } : {}),
+    execute: async () => 'ok',
+  }),
+});
+const thirteenFields = (prefix: string) =>
+  z.object(Object.fromEntries(Array.from({ length: 13 }, (_, i) => [`${prefix}${i}`, z.string()])));
+
 /**
  * A standard schema from a library Mastra has not verified: its JSON Schema looks closed, but
  * Mastra cannot tell whether the library's own objects keep unknown keys, so strict is not provable.
@@ -240,6 +252,7 @@ type Row = {
   object?: unknown;
   providerOptions?: Record<string, any>;
   inputProcessors?: any[];
+  tools?: () => Record<string, any>;
   /** A separate structuring model (`structuredOutput.model`). */
   structuringModel?: string;
   /** The record node inside the injected schema, when the row has a record. */
@@ -512,6 +525,76 @@ const rows: Row[] = [
     expected: 'prompt',
   },
   {
+    name: 'array without items',
+    model: anthropic,
+    schema: {
+      type: 'object',
+      properties: { values: { type: 'array' } },
+      required: ['values'],
+      additionalProperties: false,
+    },
+    // An empty list: Mastra's Anthropic compat validation cannot traverse items of an array
+    // without an `items` schema (a separate, pre-existing limitation).
+    populated: { values: [] },
+    expected: 'prompt',
+  },
+  {
+    name: 'recursive $ref',
+    model: anthropic,
+    schema: {
+      type: 'object',
+      properties: { name: { type: 'string' }, children: { type: 'array', items: { $ref: '#' } } },
+      required: ['name', 'children'],
+      additionalProperties: false,
+    },
+    populated: { name: 'a', children: [{ name: 'b', children: [] }] },
+    expected: 'prompt',
+  },
+  {
+    // A root union is not provably accepted (Anthropic documents object roots only); merged into
+    // one object it would also have 26 optional properties.
+    name: 'root union of 2 closed objects with 13 required properties each',
+    model: anthropic,
+    schema: z.union([thirteenFields('a'), thirteenFields('b')]),
+    populated: Object.fromEntries(Array.from({ length: 13 }, (_, i) => [`a${i}`, 'x'])),
+    expected: 'prompt',
+  },
+  {
+    // Anthropic's limits are request-wide: the strict tool's optional argument makes 25.
+    name: '24 optional parameters plus a strict tool with 1 optional parameter',
+    model: anthropic,
+    schema: manyFields(24, () => z.string().optional()),
+    tools: lookupTool(true),
+    populated: { field0: 'x' },
+    expected: 'prompt',
+  },
+  {
+    name: 'converse: 24 optional parameters plus a non-strict tool',
+    model: anthropic,
+    schema: manyFields(24, () => z.string().optional()),
+    tools: lookupTool(false),
+    populated: { field0: 'x' },
+    expected: 'anthropic-strict',
+  },
+  {
+    name: 'durable: unverified standard-schema vendor (closed-looking object)',
+    model: anthropic,
+    schema: unverifiedVendorSchema,
+    populated: { summary: 's' },
+    expected: 'prompt',
+    via: 'durable',
+  },
+  {
+    // A cold worker rebuilds the structuring pass from the serialized, closed-looking JSON.
+    name: 'recovered durable run: structuredOutput.model structuring pass with an unverified vendor',
+    model: anthropic,
+    schema: unverifiedVendorSchema,
+    structuringModel: 'anthropic/claude-haiku-5-5',
+    populated: { summary: 's' },
+    expected: 'prompt',
+    via: 'recovered',
+  },
+  {
     name: 'Zod v3: plain z.object with a z.record field',
     model: anthropic,
     schema: z3.object({ studyId: z3.string(), fields: z3.record(z3.string(), z3.string()) }),
@@ -593,7 +676,14 @@ const rows: Row[] = [
 ];
 
 function makeAgent(row: Row, id = 'pf7309-agent') {
-  return new Agent({ id, name: id, instructions: 'test', model: row.model(), inputProcessors: row.inputProcessors });
+  return new Agent({
+    id,
+    name: id,
+    instructions: 'test',
+    model: row.model(),
+    inputProcessors: row.inputProcessors,
+    tools: row.tools?.(),
+  });
 }
 
 function rowOptions(row: Row) {
@@ -616,7 +706,13 @@ async function runRecovered(row: Row) {
     kind: 'durable',
     runId,
     build: ({ core }) =>
-      new core.Agent({ id: 'pf7309-recovered', name: 'pf7309-recovered', instructions: 'test', model: row.model() }),
+      new core.Agent({
+        id: 'pf7309-recovered',
+        name: 'pf7309-recovered',
+        instructions: 'test',
+        model: row.model(),
+        tools: row.tools?.(),
+      }),
   });
   try {
     holdRequests = true;
