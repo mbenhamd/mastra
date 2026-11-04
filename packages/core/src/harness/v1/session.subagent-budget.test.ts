@@ -239,6 +239,39 @@ describe('Harness v1 — per-type subagent budgets', () => {
     }
   });
 
+  it('stops a child that goes silent on its last allowed step without a report-only step (PF-7507)', async () => {
+    // Under its budget a silent child gets one report-only step; on the last
+    // allowed step that step would be a provider call past the budget.
+    const { harness, childCalls } = budgetFixture({ maxSteps: 2 }, spawnThenAnswer, call =>
+      call === 1
+        ? progressToolCallStream('search-1', 'searchPapers', '{}')
+        : convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'id-silent', modelId: 'mock-model-id', timestamp: new Date(0) },
+            { type: 'finish', finishReason: 'stop', usage: testUsage },
+          ]),
+    );
+    try {
+      const session = await harness.session({ resourceId: 'budget-user', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+
+      await session.message({ content: 'Find papers on X.' });
+
+      expect(childCalls()).toBe(2);
+      expect(events.find(event => event.type === 'subagent_end')).toMatchObject({
+        isError: true,
+        output: {
+          stepCount: 2,
+          budgetExhausted: { budget: 'steps', limit: 2, used: 2 },
+          error: { code: 'harness.subagent_budget_exhausted' },
+        },
+      });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   it('stops an inline child once its provider-reported tokens reach the token budget', async () => {
     // 30 tokens per step: 30 and 60 stay under 70, the third step reaches 90.
     const { harness, childCalls } = budgetFixture({ maxTotalTokens: 70 }, spawnThenAnswer);
