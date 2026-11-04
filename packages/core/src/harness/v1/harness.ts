@@ -6951,15 +6951,7 @@ export class Harness {
         sessionId: session.id,
         released: false,
       };
-      const attempt = storage
-        .releaseSessionLease({ harnessName: release.harnessName, sessionId: release.sessionId, ownerId: this.ownerId })
-        .then(
-          () => {
-            release.released = true;
-          },
-          () => undefined,
-        );
-      return { release, attempt };
+      return { release, attempt: this._attemptLeaseRelease(storage, release) };
     });
     if (!(await this._settleBeforeDeadline(Promise.all(releases.map(({ attempt }) => attempt)), drainDeadlineAt))) {
       finalFailure = this._shutdownTimeoutError('Session lease release');
@@ -7728,20 +7720,29 @@ export class Harness {
     const unreleased = this._pendingLeaseReleases.filter(release => !release.released);
     if (unreleased.length === 0) return undefined;
     const storage = this._requireStorage('shutdown()');
-    const attempts = unreleased.map(release =>
-      storage
-        .releaseSessionLease({ harnessName: release.harnessName, sessionId: release.sessionId, ownerId: this.ownerId })
-        .then(
-          () => {
-            release.released = true;
-          },
-          () => undefined,
-        ),
-    );
+    const attempts = unreleased.map(release => this._attemptLeaseRelease(storage, release));
     if (!(await this._settleBeforeDeadline(Promise.all(attempts), deadlineAt))) {
       return this._shutdownTimeoutError('Session lease release');
     }
     return undefined;
+  }
+
+  /**
+   * PF-7538: one best-effort lease release (a failed release TTLs out). Async
+   * so an adapter that throws synchronously is caught like a rejection and
+   * never aborts the other releases.
+   */
+  private async _attemptLeaseRelease(storage: HarnessStorage, release: PendingLeaseRelease): Promise<void> {
+    try {
+      await storage.releaseSessionLease({
+        harnessName: release.harnessName,
+        sessionId: release.sessionId,
+        ownerId: this.ownerId,
+      });
+      release.released = true;
+    } catch {
+      // Best-effort: leases TTL out anyway.
+    }
   }
 
   /**

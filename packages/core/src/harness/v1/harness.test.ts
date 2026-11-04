@@ -6133,6 +6133,35 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     expect(await ownerOf()).toBeUndefined();
   });
 
+  it('keeps releasing the other leases and completes when an adapter release throws synchronously', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const throwing = await harness.session({ resourceId: 'u', threadId: 't-release-throws-sync' });
+    const other = await harness.session({ resourceId: 'u', threadId: 't-release-after-throw' });
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(input => {
+      if (input.sessionId === throwing.id) throw new Error('adapter release threw synchronously');
+      return releaseSessionLease(input);
+    });
+    const workspaceShutdown = vi.spyOn(
+      (harness as unknown as { _workspaceRegistry: { shutdown(): Promise<void> } })._workspaceRegistry,
+      'shutdown',
+    );
+    const events: string[] = [];
+    harness.subscribe(event => {
+      if (event.type === 'harness_shutdown') events.push(event.type);
+    });
+
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+    // As at the base: every release was attempted and teardown ran.
+    const stored = await storage.loadSession({ harnessName: other.getRecord().harnessName, sessionId: other.id });
+    expect(stored?.ownerId).toBeUndefined();
+    expect(workspaceShutdown).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['harness_shutdown']);
+    await expect(harness.session({ resourceId: 'u', threadId: 't-after-shutdown' })).rejects.toThrow();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
   it('attempts every lease release when one hangs, and a retry completes the unfinished one', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });
