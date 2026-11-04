@@ -81,8 +81,10 @@ describeForAllEngines('AIMock scenario: run-scoped signal delivery', engine => {
     expect(await output.text).toContain('glossary added');
     expect(requests.some(request => requestText(request).includes(REMINDER))).toBe(true);
 
-    // The run consumed the reminder: no further model request follows.
+    // The run consumed the reminder: exactly the tool-call request and the
+    // drained request were made, and no further model request follows.
     const settledCount = getMock().getRequests().length;
+    expect(settledCount).toBe(2);
     await new Promise(resolve => setTimeout(resolve, 150));
     expect(getMock().getRequests().length).toBe(settledCount);
   });
