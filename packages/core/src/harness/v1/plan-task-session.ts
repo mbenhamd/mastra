@@ -1239,7 +1239,25 @@ interface DelegationAttemptMetadata {
     outcome: DelegatedSubagentOutcome;
     settledAt: number;
     result?: HarnessSubagentResultSummary;
+    /** Parent notice still owed for this settlement; removed once delivered. */
+    notice?: { mode: DelegatedSettlementNoticeMode; digest: string };
   };
+}
+
+/** How an owed parent notice is delivered (`subagents.onDelegatedSettlement`). */
+export type DelegatedSettlementNoticeMode = 'remind' | 'wake';
+
+/**
+ * A parent notice recorded with a committed delegation settlement and not yet
+ * acknowledged. `digest` identifies the exact settlement, so the child session
+ * id plus digest is the delivery dedupe key across live and restart paths.
+ */
+export interface PendingDelegationSettlementNotice {
+  taskId: string;
+  subagentSessionId: string;
+  mode: DelegatedSettlementNoticeMode;
+  digest: string;
+  outcome: DelegatedSubagentOutcome;
 }
 
 function sha256Text(value: string): string {
@@ -1291,9 +1309,20 @@ function settledDelegationAttemptMetadata(
   attempt: DelegationAttemptMetadata,
   outcome: DelegatedSubagentOutcome,
   result: HarnessSubagentResultSummary | undefined,
+  noticeMode: DelegatedSettlementNoticeMode | undefined,
 ): JsonValue {
   const settlement: Record<string, JsonValue> = { outcome, settledAt: Date.now() };
   if (result !== undefined) settlement.result = JSON.parse(JSON.stringify(result)) as JsonValue;
+  if (noticeMode !== undefined) {
+    settlement.notice = {
+      mode: noticeMode,
+      digest: sha256CanonicalJsonChecked({
+        attemptId: attempt.attemptId,
+        subagentSessionId: attempt.subagentSessionId,
+        settlement: { ...settlement },
+      }),
+    };
+  }
   const encoded: Record<string, JsonValue> = {
     attemptId: attempt.attemptId,
     taskBody: attempt.taskBody,
@@ -1389,10 +1418,22 @@ export function readDelegationAttemptMetadata(
         ? undefined
         : harnessSubagentResultSummarySchema.safeParse(raw.settlement.result);
     if (parsedResult !== undefined && !parsedResult.success) return undefined;
+    const rawNotice = raw.settlement.notice;
+    // A malformed notice only loses the notice; the settlement stays valid.
+    const notice =
+      rawNotice !== null &&
+      typeof rawNotice === 'object' &&
+      !Array.isArray(rawNotice) &&
+      (rawNotice.mode === 'remind' || rawNotice.mode === 'wake') &&
+      typeof rawNotice.digest === 'string' &&
+      rawNotice.digest.length > 0
+        ? { mode: rawNotice.mode as DelegatedSettlementNoticeMode, digest: rawNotice.digest }
+        : undefined;
     settlement = {
       outcome: raw.settlement.outcome,
       settledAt: raw.settlement.settledAt,
       ...(parsedResult?.success ? { result: parsedResult.data } : {}),
+      ...(notice !== undefined ? { notice } : {}),
     };
   }
   return {
@@ -1652,12 +1693,16 @@ export interface ReconcileDelegationInput {
   subagentSessionId: string;
   /** Bounded sanitized terminal report retained for parent synthesis. */
   result?: HarnessSubagentResultSummary;
+  /** Record an owed parent notice in the same fenced settlement write. */
+  notice?: DelegatedSettlementNoticeMode;
 }
 
 export interface ReconcileDelegationResult {
   /** True when a status write was committed (false = already terminal / stale link). */
   reconciled: boolean;
   view?: PlanTaskView;
+  /** The parent notice this commit recorded, present only when `reconciled`. */
+  notice?: PendingDelegationSettlementNotice;
 }
 
 /**
@@ -1700,7 +1745,7 @@ export async function planTaskReconcileDelegation(
   const settledMetadata =
     attemptMetadata === undefined
       ? undefined
-      : settledDelegationAttemptMetadata(attemptMetadata, input.outcome, input.result);
+      : settledDelegationAttemptMetadata(attemptMetadata, input.outcome, input.result, input.notice);
   const settledTaskIds = subtreeTaskIds(index, input.taskId);
 
   // Overlapping delegation scopes are rejected at both preflight and commit.
@@ -1760,7 +1805,80 @@ export async function planTaskReconcileDelegation(
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   emitBestEffort(port, 'delegate_settled', settledTaskIds, deltas);
-  return { reconciled: true, view: toView(updated) };
+  const notice = readPendingDelegationSettlementNotice(updated);
+  return { reconciled: true, view: toView(updated), ...(notice !== undefined ? { notice } : {}) };
+}
+
+/**
+ * The parent notice still owed by a settled delegation, if any. Only a task
+ * whose ownership link is cleared can owe one: the notice is written by the
+ * settlement commit itself.
+ */
+export function readPendingDelegationSettlementNotice(
+  task: HarnessPlanTask,
+): PendingDelegationSettlementNotice | undefined {
+  if (task.delegatedSubagentSessionId !== undefined) return undefined;
+  const attempt = readDelegationAttemptMetadata(task);
+  const settlement = attempt?.settlement;
+  if (attempt === undefined || settlement?.notice === undefined) return undefined;
+  return {
+    taskId: task.taskId,
+    subagentSessionId: attempt.subagentSessionId,
+    mode: settlement.notice.mode,
+    digest: settlement.notice.digest,
+    outcome: settlement.outcome,
+  };
+}
+
+/**
+ * Durably downgrade every owed `wake` notice to `remind` (same digest, so the
+ * dedupe key is unchanged). A parent Stop calls this so a notice that survives
+ * a restart cannot wake the parent after that Stop. Returns the count changed.
+ */
+export async function planTaskDowngradeDelegationWakeNotices(port: PlanTaskSessionPort): Promise<number> {
+  const ops: PlanTaskMutationOp[] = [];
+  for (const task of await loadAllTasks(port)) {
+    if (readPendingDelegationSettlementNotice(task)?.mode !== 'wake') continue;
+    const envelope = JSON.parse(JSON.stringify(task.metadata)) as Record<string, Record<string, Record<string, any>>>;
+    envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement!.notice.mode = 'remind';
+    ops.push({
+      kind: 'update',
+      taskId: task.taskId,
+      ifVersion: task.version,
+      patch: { metadata: envelope as JsonValue },
+    });
+  }
+  if (ops.length > 0) await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
+  return ops.length;
+}
+
+/**
+ * Remove an owed parent notice with a version-fenced write. Returns true only
+ * for the caller whose write removed it, so concurrent deliverers of the same
+ * notice cannot both act on it. A notice already removed, replaced by a newer
+ * delegation, or carrying another digest returns false.
+ */
+export async function planTaskAcknowledgeDelegationSettlementNotice(
+  port: PlanTaskSessionPort,
+  input: { taskId: string; subagentSessionId: string; digest: string },
+): Promise<boolean> {
+  const snapshot = await port.storage.loadPlanTaskSubtree({
+    harnessName: port.harnessName,
+    sessionId: port.id,
+    rootTaskId: input.taskId,
+    limit: 1,
+  });
+  const task = snapshot.tasks.find(row => row.taskId === input.taskId);
+  if (task === undefined) return false;
+  const pending = readPendingDelegationSettlementNotice(task);
+  if (pending?.subagentSessionId !== input.subagentSessionId || pending.digest !== input.digest) return false;
+  const envelope = JSON.parse(JSON.stringify(task.metadata)) as Record<string, Record<string, Record<string, unknown>>>;
+  delete envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement!.notice;
+  await port.storage.mutatePlanTasksForSession({
+    fence: fence(port),
+    ops: [{ kind: 'update', taskId: task.taskId, ifVersion: task.version, patch: { metadata: envelope as JsonValue } }],
+  });
+  return true;
 }
 
 export interface CheckInput {
@@ -1842,16 +1960,25 @@ export async function planTaskCheck(port: PlanTaskSessionPort, input: CheckInput
 
   const candidates = views.slice(start, start + limit);
   const tasks: PlanTaskView[] = [];
+  // Measure the largest envelope this page could return. Using `truncated:
+  // true` plus a cursor guarantees the eventual (possibly final) envelope is
+  // no larger than the admitted candidate measurement.
+  const fits = (proposed: PlanTaskView[], candidate: PlanTaskView) =>
+    utf8Bytes(JSON.stringify({ tasks: proposed, truncated: true, nextCursor: candidate.taskId })) <=
+    PLAN_TASK_CHECK_MAX_OUTPUT_BYTES;
   for (const candidate of candidates) {
-    const proposed = [...tasks, candidate];
-    // Measure the largest envelope this page could return. Using `truncated:
-    // true` plus a cursor guarantees the eventual (possibly final) envelope is
-    // no larger than the admitted candidate measurement.
-    const projectedBytes = utf8Bytes(
-      JSON.stringify({ tasks: proposed, truncated: true, nextCursor: candidate.taskId }),
-    );
-    if (projectedBytes > PLAN_TASK_CHECK_MAX_OUTPUT_BYTES) break;
-    tasks.push(candidate);
+    if (fits([...tasks, candidate], candidate)) {
+      tasks.push(candidate);
+      continue;
+    }
+    // The delegated result's tool trace is advisory. When it alone keeps the
+    // first task of a page from fitting, return that task without it (still
+    // flagged truncated) rather than making the settled task unreadable.
+    if (tasks.length === 0) {
+      const withoutTrace = withoutDelegationToolTrace(candidate).find(variant => fits([variant], variant));
+      if (withoutTrace !== undefined) tasks.push(withoutTrace);
+    }
+    break;
   }
   if (tasks.length === 0 && candidates.length > 0) {
     throw new HarnessValidationError(
@@ -1873,6 +2000,25 @@ export async function planTaskCheck(port: PlanTaskSessionPort, input: CheckInput
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Trace-free variants of a delegated task view, flagged first. When even the
+ * 26-byte truncation flag is what keeps the task from fitting, the second
+ * variant drops it too: the trace is advisory, the settled result is not.
+ */
+function withoutDelegationToolTrace(view: PlanTaskView): PlanTaskView[] {
+  const result = view.delegation?.result;
+  const delegation = view.delegation;
+  if (delegation === undefined || result === undefined) return [];
+  if (result.toolTrace === undefined && result.toolTraceTruncated === undefined) return [];
+  const { toolTrace: _toolTrace, toolTraceTruncated: _toolTraceTruncated, ...rest } = result;
+  return [
+    ...(result.toolTrace === undefined
+      ? []
+      : [{ ...view, delegation: { ...delegation, result: { ...rest, toolTraceTruncated: true } } }]),
+    { ...view, delegation: { ...delegation, result: rest } },
+  ];
+}
 
 /** Next sibling order = max(existing sibling order) + 1, or 0. */
 function nextOrder(tasks: HarnessPlanTask[], parentTaskId: string | undefined): number {

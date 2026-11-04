@@ -137,6 +137,52 @@ const harnessSubagentUsageSchema = z
   })
   .strict();
 
+/** Maximum distinct tools listed in a subagent result's tool trace. */
+export const MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES = 24;
+/**
+ * Serialized trace budget. It keeps a completed result with a near-maximal
+ * summary and evidence inside the 64 KiB terminal envelope.
+ */
+export const MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES = 2 * 1024;
+/** Room kept free for the settlement and plan-task view wrapping a summary. */
+const MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES = 4 * 1024;
+const MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH = 128;
+
+/**
+ * Per-tool distinct-call and error counts from framework receipts, in the
+ * order the framework recorded them. It tells the parent what the child
+ * covered (and what failed) without re-searching; raw tool inputs and
+ * outputs are never included.
+ */
+export const harnessSubagentToolTraceSchema = z
+  .array(
+    z
+      .object({
+        toolName: z.string().min(1).max(MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH),
+        calls: z.number().int().positive(),
+        errors: z.number().int().nonnegative(),
+      })
+      .strict(),
+  )
+  .min(1)
+  .max(MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES)
+  .superRefine((trace, ctx) => {
+    if (new Set(trace.map(entry => entry.toolName)).size !== trace.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'subagent tool trace lists a tool more than once' });
+    }
+    if (trace.some(entry => entry.errors > entry.calls)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'subagent tool trace counts more errors than calls' });
+    }
+    if (new TextEncoder().encode(JSON.stringify(trace)).byteLength > MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `subagent tool trace exceeds ${MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES} UTF-8 bytes`,
+      });
+    }
+  });
+
+export type HarnessSubagentToolTrace = z.infer<typeof harnessSubagentToolTraceSchema>;
+
 export const harnessSubagentResultSummarySchema = z
   .object({
     status: z.enum(['success', 'error']),
@@ -147,6 +193,8 @@ export const harnessSubagentResultSummarySchema = z
     stepCount: z.number().int().nonnegative(),
     toolCallCount: z.number().int().nonnegative(),
     toolResultCount: z.number().int().nonnegative(),
+    toolTrace: harnessSubagentToolTraceSchema.optional(),
+    toolTraceTruncated: z.boolean().optional(),
     usage: harnessSubagentUsageSchema.optional(),
     artifacts: harnessSubagentTerminalArtifactsSchema.optional(),
     evidence: z.array(harnessSubagentOutcomeEvidenceSchema).max(MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS).optional(),
@@ -365,6 +413,65 @@ function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
+/** Shorten to at most `maxLength` UTF-16 units without splitting a surrogate pair. */
+function truncateAtCodePoint(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  let result = '';
+  for (const codePoint of value) {
+    if (result.length + codePoint.length > maxLength) break;
+    result += codePoint;
+  }
+  return result;
+}
+
+/** Bytes of the `"toolTraceTruncated":true,` member; below this no flag fits either. */
+const HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES = 26;
+
+/**
+ * Only framework-minted receipts feed the trace. Run tool-result fallbacks
+ * stay available to evidence verification but are provider-shaped, so they
+ * never inflate what the parent is told the child did. A call is counted
+ * once, and as an error when any receipt for it failed.
+ */
+function summarizeToolTrace(
+  value: unknown,
+  maxBytes: number,
+): { trace?: HarnessSubagentToolTrace; truncated: boolean } {
+  const source = isRecord(value) ? value : undefined;
+  if (source === undefined) return { truncated: false };
+  const callsByTool = new Map<string, Map<string, boolean>>();
+  for (const candidate of itemArray(source[HARNESS_SUBAGENT_TOOL_RECEIPTS_FIELD])) {
+    const receipt = normalizeToolReceipt(candidate);
+    if (receipt === undefined) continue;
+    const calls = callsByTool.get(receipt.toolName) ?? new Map<string, boolean>();
+    calls.set(receipt.toolCallId, calls.get(receipt.toolCallId) === true || receipt.status === 'error');
+    callsByTool.set(receipt.toolName, calls);
+  }
+  if (callsByTool.size === 0) return { truncated: false };
+  const trace: HarnessSubagentToolTrace = [];
+  const listedNames = new Set<string>();
+  let shortenedOrSkipped = false;
+  let bytes = 2;
+  for (const [fullName, calls] of callsByTool) {
+    if (trace.length >= MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENTRIES) break;
+    const toolName = truncateAtCodePoint(fullName, MAX_HARNESS_SUBAGENT_TOOL_TRACE_NAME_LENGTH);
+    // A shortened name is flagged, and never merged into another tool's entry.
+    if (toolName !== fullName) shortenedOrSkipped = true;
+    if (listedNames.has(toolName)) continue;
+    const entry = { toolName, calls: calls.size, errors: [...calls.values()].filter(Boolean).length };
+    const entryBytes = new TextEncoder().encode(JSON.stringify(entry)).byteLength + 1;
+    if (bytes + entryBytes > maxBytes) break;
+    bytes += entryBytes;
+    listedNames.add(toolName);
+    trace.push(entry);
+  }
+  const overflow = source[HARNESS_SUBAGENT_TOOL_RECEIPTS_OVERFLOW_FIELD] === true;
+  return {
+    ...(trace.length > 0 ? { trace } : {}),
+    truncated: overflow || shortenedOrSkipped || callsByTool.size > trace.length,
+  };
+}
+
 const USAGE_KEYS = [
   'inputTokens',
   'outputTokens',
@@ -434,7 +541,7 @@ export function summarizeHarnessSubagentResult(
       ? parseHarnessTerminalToolResultArtifacts(record?.terminalToolResult)
       : undefined;
 
-  return {
+  const summary: HarnessSubagentResultSummary = {
     status,
     ...(report ? { outcome: report.outcome } : {}),
     text: text.value,
@@ -449,6 +556,28 @@ export function summarizeHarnessSubagentResult(
     ...(report?.issue ? { issue: report.issue } : {}),
     ...(error ? { error } : {}),
   };
+  // The trace only uses room the rest of the summary leaves inside the 64 KiB
+  // terminal envelope, keeping headroom for the settlement and plan-task view
+  // that wrap it; a near-limit answer keeps no trace rather than breaking reads.
+  const summaryBytes = new TextEncoder().encode(JSON.stringify(summary)).byteLength;
+  const traceBudget = Math.min(
+    MAX_HARNESS_SUBAGENT_TOOL_TRACE_BYTES,
+    MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES - MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES - summaryBytes,
+  );
+  // The key and flag bytes come out of the trace budget. The flag itself is
+  // kept whenever entries were dropped and it fits the 64 KiB terminal
+  // envelope: the parent must not read a missing trace as "no tools ran".
+  // plan_task_check drops trace and flag if a wrapped view would not fit.
+  const toolTrace = summarizeToolTrace(
+    value,
+    traceBudget - HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES - '"toolTrace":,'.length,
+  );
+  const flagFits = summaryBytes + HARNESS_SUBAGENT_TOOL_TRACE_FLAG_BYTES <= MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES;
+  return {
+    ...summary,
+    ...(toolTrace.trace ? { toolTrace: toolTrace.trace } : {}),
+    ...(toolTrace.truncated && flagFits ? { toolTraceTruncated: true } : {}),
+  };
 }
 
 /**
@@ -460,7 +589,14 @@ export function summarizeHarnessSubagentResult(
 export function summarizeHarnessSubagentEventResult(
   summary: HarnessSubagentResultSummary,
 ): HarnessSubagentResultSummary {
-  const { artifacts: _artifacts, ...eventSummary } = summary;
+  // The tool trace serves parent continuation; lifecycle events keep their
+  // 4 KiB headroom for terminal status, as with artifacts.
+  const {
+    artifacts: _artifacts,
+    toolTrace: _toolTrace,
+    toolTraceTruncated: _toolTraceTruncated,
+    ...eventSummary
+  } = summary;
   const text = truncateUtf8(summary.text, MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES);
   const evidence = summary.evidence?.slice(0, MAX_HARNESS_SUBAGENT_EVENT_EVIDENCE_ITEMS).map(item => ({
     ...item,

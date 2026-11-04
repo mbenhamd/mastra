@@ -1,5 +1,6 @@
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { RunProcessInputStepResult } from '../../processors';
+import { recordStructuredOutputSourceDecision, structuredOutputSchemaFingerprint } from '../../stream/aisdk/v5/execute';
 
 /**
  * Shape of the per-step LLM input fields that an input-processor (or
@@ -56,5 +57,35 @@ export function composeStepInput(
     // processor returned undefined for any of them.
     messageId: processInputStepResult.messageId ?? current.messageId,
     model: processInputStepResult.model ?? current.model,
+    ...('structuredOutput' in processInputStepResult
+      ? {
+          structuredOutput: mergeStructuredOutputSourceDecision(
+            current.structuredOutput,
+            processInputStepResult.structuredOutput,
+          ),
+        }
+      : {}),
   };
+}
+
+/**
+ * PF-7309: the structured-output source decision follows the schema the step actually uses. The
+ * processor runner always returns `structuredOutput`, so the recorded decision is kept while the
+ * schema's content fingerprint matches it (a durable reload of the same schema, or no processor
+ * change at all), and the schema is decided again when its content differs (a replaced or
+ * in-place mutated schema). Re-reading an unchanged serialized schema never replaces a decision
+ * that only the caller's original schema could make. The processor runner applies this after
+ * every processor's return, so a downgrade from one processor survives the next one.
+ */
+export function mergeStructuredOutputSourceDecision(current: any, next: any): any {
+  if (!next?.schema) return next;
+  const recorded = next.sourceDecision ?? current?.sourceDecision;
+  const live = recordStructuredOutputSourceDecision(next.schema);
+  if (!live || !recorded?.fingerprint || recorded.fingerprint !== live.fingerprint) {
+    return { ...next, sourceDecision: live };
+  }
+  // Equal content only ever downgrades: a reload of a fallback keeps it, and a live schema from a
+  // library whose openness Mastra cannot read (equal JSON, different vendor) still falls back.
+  const strictOutputCannotCarry = recorded.strictOutputCannotCarry || live.strictOutputCannotCarry;
+  return { ...next, sourceDecision: { ...recorded, strictOutputCannotCarry } };
 }

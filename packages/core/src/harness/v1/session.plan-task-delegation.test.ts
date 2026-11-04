@@ -185,6 +185,13 @@ describe('task_delegate registration', () => {
     expect(createPlanTaskTools(parent)[TASK_DELEGATE_TOOL_ID]).toBeDefined();
   });
 
+  it('describes each durable type to the parent, as spawn_subagent does', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+
+    expect(createPlanTaskTools(parent)[TASK_DELEGATE_TOOL_ID]?.description).toContain('Background worker subagent');
+  });
+
   it('keeps durable-only subagent types available to task_delegate', async () => {
     const { harness } = buildHarness(new InMemoryDB(), { allowInline: false });
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

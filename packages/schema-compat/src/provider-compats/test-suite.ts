@@ -87,6 +87,28 @@ export function createSuite(layer: SchemaCompatLayer) {
       const result = processed['~standard'].validate({ name: 'John', tags: null }) as SuccessResult;
       expect(result.value).toEqual({ name: 'John', tags: null });
     });
+
+    it('should accept any items for an array schema without items', async () => {
+      const processed = layer.processToCompatSchema({
+        type: 'object',
+        properties: { tags: { type: 'array' } },
+        required: ['tags'],
+      });
+
+      const result = await processed['~standard'].validate({ tags: ['a', 1, { b: true }] });
+      expect(result).toEqual({ value: { tags: ['a', 1, { b: true }] } });
+    });
+
+    it('should still reject a wrong-typed item when the array schema has items', async () => {
+      const processed = layer.processToCompatSchema({
+        type: 'object',
+        properties: { tags: { type: 'array', items: { type: 'string' } } },
+        required: ['tags'],
+      });
+
+      const result = await processed['~standard'].validate({ tags: ['a', 1] });
+      expect('issues' in result && result.issues?.length).toBeTruthy();
+    });
   });
 
   describe('Edge Cases', () => {
