@@ -51,7 +51,7 @@ import type { SerializedMessageListState } from '../message-list/state';
 import type { SaveQueueManager } from '../save-queue';
 import type { AgentSignalInput, CreatedAgentSignal } from '../signals';
 import type { TripwireData } from '../trip-wire';
-import type { GoalConfig, StructuredOutputOptions } from '../types';
+import type { GoalConfig, StructuredOutputOptions, StructuredOutputSourceDecision } from '../types';
 import type { ExecutionFence } from './execution-fence';
 
 /**
@@ -167,6 +167,11 @@ export interface SerializableDurableState {
 export interface SerializableStructuredOutput {
   /** JSON Schema representation of the output schema */
   schema?: JSONSchema7;
+  /**
+   * @internal Recorded from the caller's schema before `schema` was serialized (serialization
+   * closes objects). Steps, including resumed ones, read it and never re-derive it.
+   */
+  sourceDecision?: StructuredOutputSourceDecision;
   /** Whether to use JSON prompt injection instead of native response format */
   jsonPromptInjection?: boolean | 'system' | 'inline' | 'auto';
   /** Caller-supplied instructions (see `StructuredOutputOptionsBase.instructions`) */

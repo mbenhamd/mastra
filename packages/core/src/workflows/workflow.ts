@@ -22,6 +22,7 @@ import { PubSub } from '../events/pubsub';
 import type { Event, EventCallback, PublishEvent, SubscribeOptions } from '../events/types';
 import type { IMastraLogger } from '../logger';
 import { RegisteredLogger } from '../logger';
+import { mergeStructuredOutputSourceDecision } from '../loop/shared/compose-step-input';
 import type { Mastra } from '../mastra';
 import { DEFAULT_RESTART_CONCURRENCY, runWithConcurrency } from '../mastra/run-with-concurrency';
 import type { ObservabilityContext, Span, TracingOptions, TracingPolicy } from '../observability';
@@ -1470,6 +1471,15 @@ export function createStepFromProcessor<TProcessorId extends string>(
               return {
                 ...passThrough,
                 ...validatedResult,
+                // PF-7309: decide a processor-returned structured-output schema after every processor.
+                ...(validatedResult.structuredOutput !== undefined
+                  ? {
+                      structuredOutput: mergeStructuredOutputSourceDecision(
+                        structuredOutput,
+                        validatedResult.structuredOutput,
+                      ),
+                    }
+                  : {}),
                 messages: validatedResult.messages ?? checkedMessageList.get.all.db(),
                 runId: agentRunId,
                 systemMessages: checkedMessageList.getSystemMessages(),

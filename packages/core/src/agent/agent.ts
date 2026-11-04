@@ -142,7 +142,7 @@ import { InMemoryStore } from '../storage';
 import type { GoalObjectiveRecord } from '../storage/domains/thread-state/base';
 import { ChunkFrom } from '../stream';
 import type { ChunkType, MastraAgentNetworkStream, MastraOnFinishCallback } from '../stream';
-import { usesOpenAIStrictJsonSchema } from '../stream/aisdk/v5/execute';
+import { structuredOutputSourceDecision, usesOpenAIStrictJsonSchema } from '../stream/aisdk/v5/execute';
 import type { FullOutput, MastraModelOutput } from '../stream/base/output';
 import { createTool } from '../tools';
 import { createWebSearchProviderTool, isWebSearchTool, normalizeWebSearchProvider } from '../tools/builtin/web-search';
@@ -11529,6 +11529,8 @@ export class Agent<
             // Convert PublicSchema to StandardSchemaWithJSON at API boundary
             // This follows the same pattern as Tool/Workflow constructors
             schema: toStandardSchema(mergedOptions.structuredOutput.schema),
+            // PF-7309: recorded once from the caller's schema, before any normalization (or kept from upstream).
+            sourceDecision: structuredOutputSourceDecision(mergedOptions.structuredOutput as { schema: unknown }),
           }
         : undefined,
       messages,
@@ -12887,6 +12889,8 @@ export class Agent<
               // Convert PublicSchema to StandardSchemaWithJSON at API boundary
               // This follows the same pattern as Tool/Workflow constructors
               schema: toStandardSchema(mergedOptions.structuredOutput.schema),
+              // PF-7309: recorded once from the caller's schema, before any normalization (or kept from upstream).
+              sourceDecision: structuredOutputSourceDecision(mergedOptions.structuredOutput as { schema: unknown }),
             }
           : undefined,
         messages,
@@ -13779,6 +13783,10 @@ export class Agent<
             ? {
                 ...mergedStreamOptions.structuredOutput,
                 schema: toStandardSchema(mergedStreamOptions.structuredOutput.schema),
+                // PF-7309: recorded once from the caller's schema, before any normalization (or kept from upstream).
+                sourceDecision: structuredOutputSourceDecision(
+                  mergedStreamOptions.structuredOutput as { schema: unknown },
+                ),
               }
             : undefined,
           messages: [],
@@ -14107,6 +14115,8 @@ export class Agent<
             ? {
                 ...mergedOptions.structuredOutput,
                 schema: toStandardSchema(mergedOptions.structuredOutput.schema),
+                // PF-7309: recorded once from the caller's schema, before any normalization (or kept from upstream).
+                sourceDecision: structuredOutputSourceDecision(mergedOptions.structuredOutput as { schema: unknown }),
               }
             : undefined,
           messages: [],
