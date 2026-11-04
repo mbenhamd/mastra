@@ -677,9 +677,12 @@ function createHarnessEmptySynthesisOptions(
           };
           if (subagentBudget === undefined) return ordinary;
           // The single predicate for Harness-reserved recovery steps; any new
-          // reserved step kind is added here. The child report-only step
-          // (PF-7507) is armed only by a final step under the budget, so it is
-          // never a way past an exhausted budget.
+          // reserved step kind is added here. `ordinary` arms the child
+          // report-only step (PF-7507) on any silent final step, including one
+          // at the budget. There the reopen marks the child exhausted and the
+          // step returns `continue: false`; the `exhausted` check below runs
+          // before `inRecoveryStep()`, so no later or replayed iteration can
+          // admit the armed report step past the budget.
           const inRecoveryStep = () => responseOnly || reportOnly;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
             // A budget stop is terminal: no later or replayed iteration, and no

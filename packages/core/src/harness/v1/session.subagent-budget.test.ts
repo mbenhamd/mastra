@@ -651,6 +651,109 @@ describe('Harness v1 — subagent budget across a pre-registered question and a 
   });
 });
 
+describe('Harness v1 — subagent budget and the report-only step (PF-7507)', () => {
+  it('does not meter the report-only step, so a silent child that reports keeps its unspent steps', async () => {
+    const registrations: string[] = [];
+    const askUser = createTool({
+      id: 'ask_user',
+      description: 'ask the user',
+      inputSchema: z.object({ question: z.string() }),
+      execute: async ({ question }, context) => {
+        const slot = context?.requestContext?.get('harness') as
+          | { registerQuestion?: (params: Record<string, unknown>) => Promise<void> }
+          | undefined;
+        const toolCallId = context?.agent?.toolCallId ?? 'question';
+        await slot?.registerQuestion?.({ questionId: toolCallId, question, toolCallId });
+        registrations.push(toolCallId);
+        await context?.agent?.suspend?.({ question });
+        return undefined;
+      },
+    });
+    const searchPapers = createTool({
+      id: 'searchPapers',
+      description: 'search',
+      inputSchema: z.object({}),
+      execute: async () => ({ hits: 1 }),
+    });
+    const report = JSON.stringify({
+      outcome: 'completed',
+      summary: 'Found one paper.',
+      evidence: [{ kind: 'tool-result', toolName: 'searchPapers', status: 'success', description: 'One hit.' }],
+    });
+    let modelCalls = 0;
+    const agent = new Agent({
+      id: 'child-agent',
+      name: 'child-agent',
+      instructions: 'Search, then report.',
+      tools: { searchPapers, ask_user: askUser },
+      model: new MockLanguageModelV2({
+        doStream: async () => {
+          modelCalls++;
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream:
+              modelCalls === 1
+                ? progressToolCallStream('search-1', 'searchPapers', '{}')
+                : modelCalls === 2
+                  ? // Silent final after tool work: the one report-only step follows.
+                    convertArrayToReadableStream([
+                      { type: 'stream-start', warnings: [] },
+                      { type: 'response-metadata', id: 'id-silent', modelId: 'mock-model-id', timestamp: new Date(0) },
+                      { type: 'finish', finishReason: 'stop', usage: testUsage },
+                    ])
+                  : modelCalls === 3
+                    ? progressToolCallStream('child-outcome', 'report_subagent_outcome', report)
+                    : progressToolCallStream('question-4', 'ask_user', JSON.stringify({ question: 'Which year?' })),
+          };
+        },
+      }),
+    });
+    const harness = new Harness({
+      agents: { 'child-agent': agent },
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'child-agent', harnessBuiltins: 'exclude' }],
+      defaultModeId: 'default',
+      subagents: { types: { searcher: { agentId: 'child-agent', description: 'Search papers', maxSteps: 5 } } },
+    });
+    try {
+      const parent = await harness.session({ resourceId: 'budget-user', threadId: { fresh: true } });
+      const child = await harness.session({
+        resourceId: 'budget-user',
+        threadId: { fresh: true },
+        parentSessionId: parent.id,
+        origin: 'subagent-tool',
+        subagentTypeId: 'searcher',
+      });
+      const events: HarnessEvent[] = [];
+      child.subscribe(event => events.push(event));
+
+      await child.message({ content: 'Search.' });
+
+      expect(modelCalls).toBe(3);
+      expect(
+        events.find(
+          event => event.type === 'tool_end' && (event as { toolName: string }).toolName === 'report_subagent_outcome',
+        ),
+      ).toMatchObject({ isError: false, output: { outcome: 'completed' } });
+      expect(child._internalSubagentBudgetExhaustion()).toBeUndefined();
+
+      // The next turn suspends on a question, persisting the spend a restart
+      // resumes from. A suspending step is counted once it completes on resume
+      // (see the pre-registered question test above), so the spend is the
+      // search and the silent final: 2. The report-only step is a Harness
+      // recovery step and is not metered; metering it would persist 3.
+      await child.message({ content: 'And the year?' });
+
+      expect(modelCalls).toBe(4);
+      expect(registrations).toEqual(['question-4']);
+      expect(child.getRecord().pendingResume).toMatchObject({ kind: 'question', subagentBudgetSpent: { steps: 2 } });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
 /** The Harness iteration hook of a budgeted child session, driven directly. */
 async function budgetedIterationHook(maxSteps: number) {
   const setup = setupHarness({
