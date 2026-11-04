@@ -684,6 +684,30 @@ function hasHarnessThreadDeleteInProgress(metadata: unknown): boolean {
 }
 
 /**
+ * PF-7538: resolve after one macrotask turn, so every pending microtask
+ * continuation has run. Uses a MessageChannel hop rather than a timer so it
+ * still advances while a caller's fake timers are installed.
+ */
+function yieldMacrotask(): Promise<void> {
+  if (typeof MessageChannel !== 'function') return new Promise(resolve => setTimeout(resolve, 0));
+  return new Promise(resolve => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      resolve();
+    };
+    channel.port2.postMessage(undefined);
+  });
+}
+
+/** PF-7538: a shutdown lease release, and whether it has succeeded. */
+interface PendingLeaseRelease {
+  harnessName: string;
+  sessionId: string;
+  released: boolean;
+}
+
+/**
  * PF-7538: `method(sessionId)` label for a tracked storage call, taking the
  * session id from the call's first argument where it carries one (`sessionId`,
  * a terminal `identity.sessionId`, or a session record's `id`).
@@ -1086,6 +1110,8 @@ export class Harness {
   private readonly _storageCallsInFlight = new Map<Promise<unknown>, string>();
   /** PF-7538: the last shutdown released its leases but timed out waiting on storage calls. */
   private _shutdownFinalBarrierFailed = false;
+  /** PF-7538: lease releases the last shutdown did not complete; a retry re-attempts them. */
+  private _pendingLeaseReleases: PendingLeaseRelease[] = [];
   private readonly _trackedStorageByRaw = new WeakMap<HarnessStorage, HarnessStorage>();
   private readonly _rawStorageByTracked = new WeakMap<HarnessStorage, HarnessStorage>();
   /** PF-7538: background lease work shutdown quiesces before its final phase. */
@@ -6639,11 +6665,16 @@ export class Harness {
       // released its leases; a retry re-runs only that barrier (bounded) and
       // resolves once nothing is pending, instead of reporting success early.
       if (this._shutdownFinalBarrierFailed) {
-        const pendingStorage = await this._settleStorageCallsBeforeDeadline(
-          Date.now() + (opts?.drainTimeoutMs ?? this._closeTimeoutMs),
-        );
-        if (pendingStorage !== undefined) throw pendingStorage;
+        // The harness stays registered with Mastra until this succeeds, so
+        // `Mastra.shutdown()` retries it instead of skipping it.
+        const retryDeadlineAt = Date.now() + (opts?.drainTimeoutMs ?? this._closeTimeoutMs);
+        const failure =
+          (await this._settleStorageCallsBeforeDeadline(retryDeadlineAt)) ??
+          (await this._retryPendingLeaseReleases(retryDeadlineAt)) ??
+          (await this._settleStorageCallsBeforeDeadline(retryDeadlineAt));
+        if (failure !== undefined) throw failure;
         this._shutdownFinalBarrierFailed = false;
+        this._untrackBoundStorage();
       }
       return;
     }
@@ -6732,7 +6763,7 @@ export class Harness {
     // contract below.
     const recordDrainFailure = (session: Session, err: unknown): void => {
       if (this._isFencedByLeaseLoss(session)) return;
-      eventPersistenceError ??= { sessionId: session.id, error: err };
+      eventPersistenceError ??= { sessionId: session.id, error: this._withPendingStorageLabels(err) };
     };
     for (const session of sessions) {
       if (this._isFencedByLeaseLoss(session)) continue;
@@ -6909,23 +6940,31 @@ export class Harness {
     }
 
     let finalFailure: HarnessValidationError | undefined;
-    for (const session of sessions) {
-      if (finalFailure === undefined) {
-        // Best-effort (leases TTL out anyway), but bounded by the drain
-        // deadline (PF-7538): a hung release fails shutdown, named.
-        const released = await this._settleBeforeDeadline(
-          storage
-            .releaseSessionLease({
-              harnessName: session.getRecord().harnessName,
-              sessionId: session.id,
-              ownerId: this.ownerId,
-            })
-            .catch(() => undefined),
-          drainDeadlineAt,
+    // PF-7538: attempt every release at once, bounded collectively by the
+    // drain deadline. Best-effort for a rejection (leases TTL out anyway), but
+    // a release that did not finish by the deadline fails shutdown, named, and
+    // stays pending: a retry re-attempts any that did not succeed.
+    const releases = sessions.map(session => {
+      const release: PendingLeaseRelease = {
+        harnessName: session.getRecord().harnessName,
+        sessionId: session.id,
+        released: false,
+      };
+      const attempt = storage
+        .releaseSessionLease({ harnessName: release.harnessName, sessionId: release.sessionId, ownerId: this.ownerId })
+        .then(
+          () => {
+            release.released = true;
+          },
+          () => undefined,
         );
-        if (!released) finalFailure = this._shutdownTimeoutError('Session lease release');
-      }
-
+      return { release, attempt };
+    });
+    if (!(await this._settleBeforeDeadline(Promise.all(releases.map(({ attempt }) => attempt)), drainDeadlineAt))) {
+      finalFailure = this._shutdownTimeoutError('Session lease release');
+      this._pendingLeaseReleases = releases.map(({ release }) => release).filter(release => !release.released);
+    }
+    for (const session of sessions) {
       const bridge = this._sessionEventBridges.get(session.id);
       if (bridge) {
         bridge();
@@ -6938,7 +6977,6 @@ export class Harness {
 
     // Tear down every provisioned workspace (shared + per-resource + per-session).
     await this._shutdownWorkspacesBeforeDeadline(drainDeadlineAt);
-    this._untrackBoundStorage();
     // §10.2: harness-scoped process-shutdown marker. No sessionId → delivered to
     // `harness.subscribe(...)` only, never per-session SSE replay. Sessions persist.
     // Emitted before the final storage barrier (PF-7538) so storage work a
@@ -6951,9 +6989,13 @@ export class Harness {
     // restoring; a retry re-runs this barrier.
     finalFailure ??= await this._settleStorageCallsBeforeDeadline(drainDeadlineAt);
     if (finalFailure !== undefined) {
+      // Stay registered with Mastra (PF-7538) so its shutdown retries this
+      // barrier rather than skipping the harness and closing storage.
       this._shutdownFinalBarrierFailed = true;
       throw finalFailure;
     }
+    this._pendingLeaseReleases = [];
+    this._untrackBoundStorage();
   }
 
   // -------------------------------------------------------------------------
@@ -7660,14 +7702,56 @@ export class Harness {
    * every call still pending.
    */
   private async _settleStorageCallsBeforeDeadline(deadlineAt: number): Promise<HarnessValidationError | undefined> {
-    while (this._storageCallsInFlight.size > 0) {
-      const settled = await this._settleBeforeDeadline(
-        Promise.allSettled([...this._storageCallsInFlight.keys()]),
-        deadlineAt,
-      );
-      if (!settled) return this._shutdownTimeoutError('Storage calls');
+    while (true) {
+      while (this._storageCallsInFlight.size > 0) {
+        const settled = await this._settleBeforeDeadline(
+          Promise.allSettled([...this._storageCallsInFlight.keys()]),
+          deadlineAt,
+        );
+        if (!settled) return this._shutdownTimeoutError('Storage calls');
+      }
+      // Stable only if still empty after a macrotask turn: every microtask
+      // continuation (an async listener's `await` hop, a settle callback)
+      // has run by then and registered any storage call it starts.
+      await yieldMacrotask();
+      if (this._storageCallsInFlight.size === 0) return undefined;
+    }
+  }
+
+  /**
+   * PF-7538: re-attempt the lease releases a failed shutdown did not complete,
+   * bounded by `deadlineAt`. A rejection stays best-effort (the lease TTLs
+   * out); a release still unfinished at the deadline fails, named.
+   */
+  private async _retryPendingLeaseReleases(deadlineAt: number): Promise<HarnessValidationError | undefined> {
+    const unreleased = this._pendingLeaseReleases.filter(release => !release.released);
+    if (unreleased.length === 0) return undefined;
+    const storage = this._requireStorage('shutdown()');
+    const attempts = unreleased.map(release =>
+      storage
+        .releaseSessionLease({ harnessName: release.harnessName, sessionId: release.sessionId, ownerId: this.ownerId })
+        .then(
+          () => {
+            release.released = true;
+          },
+          () => undefined,
+        ),
+    );
+    if (!(await this._settleBeforeDeadline(Promise.all(attempts), deadlineAt))) {
+      return this._shutdownTimeoutError('Session lease release');
     }
     return undefined;
+  }
+
+  /**
+   * PF-7538: a shutdown deadline error raised inside a session (drain, flush)
+   * extended with the storage calls still pending on the tracked handle.
+   */
+  private _withPendingStorageLabels(err: unknown): unknown {
+    if (!(err instanceof HarnessValidationError) || err.field !== 'shutdown()') return err;
+    const pending = [...this._storageCallsInFlight.values()];
+    if (pending.length === 0) return err;
+    return new HarnessValidationError('shutdown()', `${err.reason}; pending storage calls: ${pending.join(', ')}`);
   }
 
   /**

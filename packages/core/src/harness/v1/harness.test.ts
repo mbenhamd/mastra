@@ -5798,11 +5798,22 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
       .loadAttachment({ harnessName: session.getRecord().harnessName, sessionId: session.id, attachmentId: 'att-x' })
       .catch(() => undefined);
     await stuck.waitEntered();
+    // A record write the drain's flush-chain wait times out on.
+    const save = storageGate();
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      save.enter();
+      await save.opened;
+      return saveSession(record, opts);
+    });
+    const slowWrite = session.setState({ step: 1 });
+    await save.waitEntered();
 
     const failure = await harness.shutdown({ drainTimeoutMs: 200 }).then(
       () => undefined,
       (err: unknown) => err,
     );
+    // The drain's own timeout names every pending storage call too.
     expect(failure).toMatchObject({
       name: 'HarnessStorageError',
       cause: expect.objectContaining({
@@ -5810,11 +5821,14 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
         message: expect.stringContaining(`loadAttachment(${session.id})`),
       }),
     });
+    expect((failure as { cause: Error }).cause.message).toContain(`saveSession(${session.id})`);
     // Restore-and-throw: the session is live again and usable.
     expect(session.lifecycleState).toBe('live');
     await expect(harness.session({ sessionId: session.id })).resolves.toBe(session);
 
     stuck.open();
+    save.open();
+    await slowWrite;
     await expect(harness.shutdown()).resolves.toBeUndefined();
   });
 
@@ -6010,6 +6024,117 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     stuck.open();
     await expect(admission).resolves.toBeDefined();
     await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('stays registered with Mastra after a final-barrier timeout so Mastra.shutdown retries it', async () => {
+    const storage = makeStorage();
+    const composite = new InMemoryStore();
+    composite.stores.harness = storage;
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage: composite,
+      harnesses: { primary: harness },
+    });
+    await harness.session({ resourceId: 'u', threadId: 't-mastra-retry' });
+    const read = storageGate();
+    const listSessions = storage.listSessions.bind(storage);
+    vi.spyOn(storage, 'listSessions').mockImplementation(async input => {
+      read.enter();
+      await read.opened;
+      return listSessions(input);
+    });
+    harness.subscribe(event => {
+      if (event.type === 'harness_shutdown') void harness.listSessions({ resourceId: 'u' }).catch(() => undefined);
+    });
+
+    await expect(harness.shutdown({ drainTimeoutMs: 300 })).rejects.toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining('listSessions'),
+    });
+
+    let mastraShutdownSettled = false;
+    const mastraShutdown = mastra.shutdown().finally(() => {
+      mastraShutdownSettled = true;
+    });
+    await tick(50);
+    expect(mastraShutdownSettled).toBe(false);
+    read.open();
+    await expect(mastraShutdown).resolves.toBeUndefined();
+  });
+
+  it('waits for storage work an async harness_shutdown listener starts after a microtask hop', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    await harness.session({ resourceId: 'u', threadId: 't-async-listener' });
+    const read = storageGate();
+    let readSettled = false;
+    const listSessions = storage.listSessions.bind(storage);
+    vi.spyOn(storage, 'listSessions').mockImplementation(async input => {
+      read.enter();
+      await read.opened;
+      try {
+        return await listSessions(input);
+      } finally {
+        readSettled = true;
+      }
+    });
+    harness.subscribe(event => {
+      if (event.type !== 'harness_shutdown') return;
+      void (async () => {
+        await Promise.resolve();
+        await harness.listSessions({ resourceId: 'u' });
+      })().catch(() => undefined);
+    });
+
+    let shutdownSettled = false;
+    const shutdown = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await read.waitEntered();
+    await tick();
+    expect(shutdownSettled).toBe(false);
+    read.open();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(readSettled).toBe(true);
+  });
+
+  it('attempts every lease release when one hangs, and a retry completes the unfinished one', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const first = await harness.session({ resourceId: 'u', threadId: 't-release-hangs' });
+    const second = await harness.session({ resourceId: 'u', threadId: 't-release-ok' });
+    const hung = storageGate();
+    let firstAttempt = true;
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      if (input.sessionId === first.id && firstAttempt) {
+        firstAttempt = false;
+        hung.enter();
+        await hung.opened;
+        throw new Error('release lost');
+      }
+      return releaseSessionLease(input);
+    });
+    const ownerOf = async (sessionId: string) =>
+      (await storage.loadSession({ harnessName: first.getRecord().harnessName, sessionId }))?.ownerId;
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`releaseSessionLease(${first.id})`),
+    });
+    // The other session's lease was released on the first attempt.
+    expect(await ownerOf(second.id)).toBeUndefined();
+    expect(await ownerOf(first.id)).toBe(harness.ownerId);
+
+    hung.open();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+    // The retry re-attempted the release the first attempt lost.
+    expect(await ownerOf(first.id)).toBeUndefined();
   });
 
   it('lets a draft checkpoint queued behind a slow save persist under a pressure eviction', async () => {
