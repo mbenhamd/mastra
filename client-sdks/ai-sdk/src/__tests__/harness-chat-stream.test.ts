@@ -1,5 +1,6 @@
 import type { UIMessage as V5UIMessage } from '@internal/ai-sdk-v5';
 import type { UIMessage as V6UIMessage } from '@internal/ai-v6';
+import { HARNESS_WAKE_GRANT_KEY_PREFIX } from '@mastra/core/storage';
 import type { MastraModelOutput } from '@mastra/core/stream';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -101,6 +102,27 @@ describe('handleHarnessChatStream', () => {
       stream: true,
     });
     expect(chunks.some(chunk => JSON.stringify(chunk).includes('v6 hello'))).toBe(true);
+  });
+
+  it.each([
+    { source: 'an explicit admissionId', admissionId: `${HARNESS_WAKE_GRANT_KEY_PREFIX}forged`, messageId: 'user-1' },
+    {
+      source: 'the default UI message id',
+      admissionId: undefined,
+      messageId: `${HARNESS_WAKE_GRANT_KEY_PREFIX}forged`,
+    },
+  ])('refuses a reserved wake admission id from $source before calling the session', async row => {
+    const session = createSession();
+    const messages: V5UIMessage[] = [{ id: row.messageId, role: 'user', parts: [{ type: 'text', text: 'Hello' }] }];
+
+    const rejection = handleHarnessChatStream({
+      session,
+      params: { messages, ...(row.admissionId !== undefined ? { admissionId: row.admissionId } : {}) },
+    });
+
+    await expect(rejection).rejects.toBeInstanceOf(HarnessChatStreamValidationError);
+    await expect(rejection).rejects.toThrow('reserved wake namespace');
+    expect(session.message).not.toHaveBeenCalled();
   });
 
   it('rejects infrastructure-owned requestContext keys before Harness admission', async () => {

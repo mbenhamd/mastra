@@ -584,6 +584,24 @@ function objectRequestBody(requestBody: unknown, label: string): Record<string, 
   return { ...(requestBody as Record<string, unknown>) };
 }
 
+/**
+ * The Harness reserves this admission-id namespace for its own settlement wake
+ * turns. Core sessions refuse it as well, but an admission route must refuse it
+ * before any side effect (URL attachment fetch and upload, session load). Kept
+ * as a local check instead of core's `isHarnessWakeReservedKey`: this package's
+ * `@mastra/core` peer range includes releases that predate that export.
+ */
+const HARNESS_WAKE_RESERVED_ADMISSION_PREFIX = 'harness-wake:';
+
+function assertAdmissionIdNotReserved(body: Record<string, unknown>, label: string): void {
+  if (typeof body.admissionId === 'string' && body.admissionId.startsWith(HARNESS_WAKE_RESERVED_ADMISSION_PREFIX)) {
+    throwHarnessHttpError(400, 'harness.validation', `${label} admissionId uses the Harness-reserved wake namespace`, {
+      field: 'admissionId',
+      reason: 'invalid',
+    });
+  }
+}
+
 function optionalRecordField(
   body: Record<string, unknown>,
   field: string,
@@ -2304,6 +2322,7 @@ export const POST_HARNESS_MESSAGE_ROUTE = createRoute({
     try {
       const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Message admission') as MessageAdmissionBody;
+      assertAdmissionIdNotReserved(body, 'Message admission');
       const resourceId = getAuthResourceId(requestContext);
       const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
       const session = await harness.session({ sessionId: pathSessionId, resourceId });
@@ -2333,6 +2352,7 @@ export const POST_HARNESS_QUEUE_ROUTE = createRoute({
     try {
       const { pathName, pathSessionId } = harnessSessionPathIdentity(requestPathParams, name, sessionId);
       const body = objectRequestBody(requestBody, 'Queue admission') as QueueAdmissionBody;
+      assertAdmissionIdNotReserved(body, 'Queue admission');
       const resourceId = getAuthResourceId(requestContext);
       const harness = resolveHarness(mastra as unknown as { getHarness(name: string): HarnessLike }, pathName);
       const session = await harness.session({ sessionId: pathSessionId, resourceId });

@@ -79,6 +79,12 @@ export interface MockRunSpec {
    * race abort against the held promise without polling `signal.aborted`.
    */
   onAbort?: (reason: unknown) => void;
+  /**
+   * Fail the run with this error, as a provider or agent error the run's own
+   * output surfaced: `status` reads `'failed'`, `error` is this value, and
+   * `getFullOutput()` rejects with it.
+   */
+  failWith?: Error;
 }
 
 export interface MockStreamCall {
@@ -249,7 +255,7 @@ export class MockAgent extends Agent<any, any, any> {
     const finishedPromise = new Promise<void>(resolve => {
       finishedResolve = resolve;
     });
-    let status: 'running' | 'finished' = 'running';
+    let status: 'running' | 'finished' | 'failed' = 'running';
     const fullStream = (async function* () {
       for (const chunk of chunks) yield chunk;
       // If a test asked us to hold the run mid-flight, keep the stream
@@ -342,6 +348,11 @@ export class MockAgent extends Agent<any, any, any> {
 
     const wrappedGetFullOutput = async () => {
       const result = await getFullOutput();
+      if (spec.failWith !== undefined) {
+        status = 'failed';
+        finishedResolve();
+        throw spec.failWith;
+      }
       status = 'finished';
       finishedResolve();
       return result;
@@ -357,6 +368,9 @@ export class MockAgent extends Agent<any, any, any> {
       object: Promise.resolve(fullOutput.object),
       get status() {
         return status;
+      },
+      get error() {
+        return status === 'failed' ? spec.failWith : undefined;
       },
       // Thread-stream-runtime calls this to know when to drop the run record
       // from #threadRunsById and drain pending signals.

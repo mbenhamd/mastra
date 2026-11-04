@@ -20,7 +20,7 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { MockAgent } from './__test-utils__';
-import { HarnessSessionLockedError } from './errors';
+import { HarnessSessionLockedError, HarnessStorageError } from './errors';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
 import type { Session } from './session';
@@ -328,77 +328,88 @@ describe('PF-7631 reserved wake namespace: every admission boundary', () => {
   });
 });
 
-describe('PF-7631 wake terminal commit re-drive (bounded)', () => {
+type WakeCaller = 'completed' | 'rejected';
+type CommitFailure = 'fails twice then recovers' | 'never recovers';
+
+const commitRows: Array<{ caller: WakeCaller; failure: CommitFailure }> = (['completed', 'rejected'] as const).flatMap(
+  caller => (['fails twice then recovers', 'never recovers'] as const).map(failure => ({ caller, failure })),
+);
+
+/** A wake terminal commit failure; the session surfaces it as `harness.terminal_pending`. */
+function commitFailure() {
+  return new HarnessStorageError({ operation: 'session_save', cause: new Error('storage down') });
+}
+
+function commitErrorEvents(events: Array<Record<string, unknown>>) {
+  return events.filter(event => (event.error as { code?: string } | undefined)?.code === 'harness.terminal_pending');
+}
+
+describe('PF-7631 wake terminal commit re-drive (bounded), both callers through one helper', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  it('a transient commit failure is retried in the turn: one intent, one error event per failed attempt, close succeeds', async () => {
-    const db = new InMemoryDB();
-    const { harness, storage, parentAgent, childAgent } = buildHarness(db);
-    const commit = storage.commitTerminalHandoff.bind(storage);
-    let wakeCommits = 0;
-    vi.spyOn(storage, 'commitTerminalHandoff').mockImplementation(async input => {
-      if (isWakeInput(input)) {
-        wakeCommits += 1;
-        if (wakeCommits <= 2) throw new Error('storage blip');
-      }
-      return commit(input);
-    });
-    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const { events, off } = errorEvents(parent);
-    const { releaseChild } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
-
-    releaseChild();
-    await poll(() => wakeIntents(db).length === 1);
-    await parent.waitForIdle({ timeoutMs: 3000 });
-    off();
-
-    expect(wakeCommits).toBe(3);
-    expect(wakeIntents(db)).toHaveLength(1);
-    expect(wakeIntents(db)[0]!.terminalResult.status).toBe('completed');
-    const wakeErrors = events.filter(event => event.signalId === wakeIntents(db)[0]!.signalId);
-    expect(wakeErrors).toHaveLength(2);
-    expect(wakeInFlight(parent).size).toBe(0);
-    await parent.close();
-    expect(wakeIntents(db)).toHaveLength(1);
-    expect(reminderCalls(parentAgent)).toHaveLength(1);
-    await harness.shutdown();
-  });
-
-  it('a commit that never recovers stops at the cap, close is refused typed, and the next owner settles it once', async () => {
+  it.each(commitRows)('$caller wake run, commit $failure', async ({ caller, failure }) => {
     const db = new InMemoryDB();
     const a = buildHarness(db);
-    let wakeCommits = 0;
     const commit = a.storage.commitTerminalHandoff.bind(a.storage);
+    let wakeCommits = 0;
     vi.spyOn(a.storage, 'commitTerminalHandoff').mockImplementation(async input => {
       if (isWakeInput(input)) {
         wakeCommits += 1;
-        throw new Error('storage down');
+        if (failure === 'never recovers' || wakeCommits <= 2) throw commitFailure();
       }
       return commit(input);
     });
     const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const { events, off } = errorEvents(parent);
     const { releaseChild } = await delegateFromAdmittedTurn(parent, a.parentAgent, a.childAgent);
+    // The wake run itself: completed, or failed by its own output.
+    a.parentAgent.enqueueRun(caller === 'rejected' ? { failWith: new Error('provider rejected the wake run') } : {});
+    const expectedStatus = caller === 'completed' ? 'completed' : 'failed';
+    // Dispatch recovery commits the staged output of a completed run; a failed
+    // run stages none, so the next owner settles it as interrupted.
+    const recoveredResult =
+      caller === 'completed'
+        ? { status: 'completed' }
+        : { status: 'aborted', error: { code: 'harness.run_interrupted' } };
 
     releaseChild();
     await poll(() => reminderCalls(a.parentAgent).length === 1);
+
+    if (failure === 'fails twice then recovers') {
+      await poll(() => wakeIntents(db).length === 1);
+      await poll(() => !parent.isRunning());
+      off();
+      expect(wakeCommits).toBe(3);
+      expect(commitErrorEvents(events)).toHaveLength(2);
+      expect(wakeIntents(db)).toHaveLength(1);
+      expect(wakeIntents(db)[0]!.terminalResult.status).toBe(expectedStatus);
+      expect(wakeEvidence(db).map(row => row.status)).toEqual([expectedStatus]);
+      expect(wakeInFlight(parent).size).toBe(0);
+      await parent.close();
+      expect(wakeIntents(db)).toHaveLength(1);
+      expect(reminderCalls(a.parentAgent)).toHaveLength(1);
+      await a.harness.shutdown();
+      return;
+    }
+
     await poll(() => wakeCommits >= 4 && !parent.isRunning());
+    // Past the whole backoff window: the in-turn re-drive stopped at the cap.
     await new Promise(r => setTimeout(r, 1_200));
     expect(wakeCommits).toBe(4);
-    expect(events).toHaveLength(4);
+    expect(commitErrorEvents(events)).toHaveLength(4);
 
+    // Close is refused typed, within its bound, and the admission stays durable.
     const startedAt = Date.now();
     await expect(parent.close()).rejects.toBeInstanceOf(HarnessSessionLockedError);
     expect(Date.now() - startedAt).toBeLessThan(5_000);
     off();
-    expect(events.length).toBeGreaterThan(4);
     expect(wakeIntents(db)).toHaveLength(0);
     expect(wakeEvidence(db).map(row => row.status)).toEqual(['pending']);
 
-    // The next owner settles the durable admission from the staged output.
+    // The next owner settles it exactly once, without re-running the wake.
     for (const [key, r] of db.harnessSessions) {
       if (r.id === parent.id) db.harnessSessions.set(key, { ...r, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
     }
@@ -408,9 +419,46 @@ describe('PF-7631 wake terminal commit re-drive (bounded)', () => {
     const b = buildHarness(db);
     await b.harness.closeSession({ sessionId: parent.id });
     expect(wakeIntents(db)).toHaveLength(1);
-    expect(wakeIntents(db)[0]!.terminalResult.status).toBe('completed');
+    expect(wakeIntents(db)[0]!.terminalResult).toMatchObject(recoveredResult);
+    expect(wakeEvidence(db).map(row => row.status)).not.toContain('pending');
     expect(b.parentAgent.streamCalls).toHaveLength(0);
     await b.harness.shutdown();
+  });
+
+  it('a Stop while a wake commit attempt is in flight ends the re-drive with no error event for the abort', async () => {
+    const db = new InMemoryDB();
+    const { harness, storage, parentAgent, childAgent } = buildHarness(db);
+    const commit = storage.commitTerminalHandoff.bind(storage);
+    let reached!: () => void;
+    const commitReached = new Promise<void>(r => (reached = r));
+    let release!: () => void;
+    const commitReleased = new Promise<void>(r => (release = r));
+    let wakeCommits = 0;
+    vi.spyOn(storage, 'commitTerminalHandoff').mockImplementation(async input => {
+      if (isWakeInput(input)) {
+        wakeCommits += 1;
+        reached();
+        await commitReleased;
+        throw commitFailure();
+      }
+      return commit(input);
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { events, off } = errorEvents(parent);
+    const { releaseChild } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
+
+    releaseChild();
+    await commitReached;
+    await parent.abortActiveWork();
+    await poll(() => !parent.isRunning());
+    release();
+    await new Promise(r => setTimeout(r, 1_200));
+    off();
+
+    expect(wakeCommits).toBe(1);
+    expect(events).toEqual([]);
+    expect(wakeInFlight(parent).size).toBe(0);
+    await harness.shutdown().catch(() => {});
   });
 });
 

@@ -4302,6 +4302,10 @@ export class Session {
     const block = (holder: string, retryAt: number) => {
       if (blockedBy === undefined || retryAt < blockedBy.retryAt) blockedBy = { holder, retryAt };
     };
+    // Released wake admissions this full scan still lists as pending. Only ids
+    // released before the scan began can be judged by it.
+    const releasedAtScanStart = [...this._releasedWakeAdmissions];
+    const releasedStillPending = new Set<string>();
     let cursor: PendingMessageAdmissionScanCursor | undefined;
     do {
       const page = await this._storage.listPendingMessageAdmissions({
@@ -4315,6 +4319,9 @@ export class Session {
       });
       for (const admission of page.items) {
         const { evidence } = admission;
+        if (evidence.admissionId !== undefined && this._releasedWakeAdmissions.has(evidence.admissionId)) {
+          releasedStillPending.add(evidence.admissionId);
+        }
         if (
           evidence.status === 'completed' ||
           (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE)
@@ -4331,6 +4338,12 @@ export class Session {
       }
       cursor = page.nextCursor;
     } while (cursor !== undefined);
+    // A released wake admission settled by any path (its own detached commit,
+    // another owner, or a settlement below) leaves the set, so it stays bounded
+    // by the wakes still pending here.
+    for (const admissionId of releasedAtScanStart) {
+      if (!releasedStillPending.has(admissionId)) this._releasedWakeAdmissions.delete(admissionId);
+    }
     for (const evidence of orphaned) {
       const wakeAdmission = evidence.admissionId !== undefined && isHarnessWakeReservedKey(evidence.admissionId);
       let settled: boolean;
@@ -12393,24 +12406,28 @@ export class Session {
   }
 
   /**
-   * PF-7631: commit a wake turn's terminal intent. No caller retries a wake,
-   * so a failed attempt is surfaced as an `error` event and re-driven with
-   * bounded backoff. It stops at the attempt cap, when the commit cannot win
-   * (fenced, cancelled, identity conflict), or when the turn is torn down;
-   * the admission then stays durable and is released to dispatch recovery.
+   * PF-7631: commit a wake turn's terminal outcome — its completed output or
+   * the failure its own run rejected with. No caller retries a wake, so every
+   * wake terminal commit goes through here: a failed attempt is surfaced as an
+   * `error` event and re-driven with bounded backoff. It stops at the attempt
+   * cap, when the commit cannot win (fenced, cancelled, identity conflict), or
+   * when the turn is stopped or torn down (no event: close's recovery reports
+   * any later failure). The caller then releases the admission to dispatch
+   * recovery, and it stays durable.
    */
-  private async _commitWakeTerminalTurn(
+  private async _commitWakeTerminalWithRetry(
     identity: HarnessTerminalIdentity,
-    full: FullOutput<unknown>,
+    outcome: FullOutput<unknown> | RejectedTerminalRun,
     options: { modeId: string; modelId: string },
     activeDeleted: Promise<never>,
+    turnAbortSignal: AbortSignal,
   ): Promise<void> {
     for (let attempt = 1; ; attempt += 1) {
       try {
-        await Promise.race([this._commitTerminalHandoff(identity, full, options), activeDeleted]);
+        await Promise.race([this._commitTerminalHandoff(identity, outcome, options), activeDeleted]);
         return;
       } catch (error) {
-        if (this._state !== 'live') throw error;
+        if (this._state !== 'live' || turnAbortSignal.aborted) throw error;
         this._emitTurnEvent({
           type: 'error',
           runId: identity.runId,
@@ -12429,7 +12446,12 @@ export class Session {
           WAKE_TERMINAL_COMMIT_RETRY_BASE_MS * 2 ** (attempt - 1),
           WAKE_TERMINAL_COMMIT_RETRY_MAX_MS,
         );
-        await Promise.race([new Promise(resolve => setTimeout(resolve, delayMs)), activeDeleted]);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const backoff = new Promise<void>(resolve => {
+          timer = setTimeout(resolve, delayMs);
+          (timer as { unref?: () => void }).unref?.();
+        });
+        await Promise.race([backoff, activeDeleted]).finally(() => clearTimeout(timer));
       }
     }
   }
@@ -15391,11 +15413,12 @@ export class Session {
             // as a message() terminal turn does. A failed commit leaves the
             // staged output pending for dispatch recovery.
             if (wakeTerminal !== undefined) {
-              await this._commitWakeTerminalTurn(
+              await this._commitWakeTerminalWithRetry(
                 wakeTerminal,
                 full,
                 { modeId: effectiveModeId, modelId: this._record.modelId },
                 activeTurnWaiter.promise,
+                turnAbortSignal,
               );
               wakeSettled = true;
             }
@@ -15408,13 +15431,21 @@ export class Session {
             // failed terminal; anything else stays pending for recovery.
             if (wakeTerminal !== undefined && !agentEndEmitted) {
               if (this._isRejectedTerminalRun(dispatched.runId, err, turnAbortSignal)) {
-                await this._settleRejectedTerminalRun(
+                // The same bounded re-drive as a completed wake. If it does
+                // not land, the admission is released to dispatch recovery
+                // below (finishOwnedReminderTurn), never left 'finished'.
+                const committed = await this._commitWakeTerminalWithRetry(
                   wakeTerminal,
-                  err,
+                  new RejectedTerminalRun(err),
                   { modeId: effectiveModeId, modelId: this._record.modelId },
                   activeTurnWaiter.promise,
+                  turnAbortSignal,
+                ).then(
+                  () => true,
+                  () => false,
                 );
-                wakeSettled = true;
+                if (committed) wakeSettled = true;
+                else this._scheduleOrphanRecheck(Date.now());
               } else {
                 this._scheduleOrphanRecheck(Date.now());
               }

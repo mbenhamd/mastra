@@ -379,6 +379,15 @@ export type HarnessChatMessageOptions = {
   requestContext?: { app: Record<string, JsonValue> };
 };
 
+/**
+ * The Harness reserves this admission-id namespace for its own settlement wake
+ * turns. Core sessions refuse it as well; the chat handler refuses it before
+ * calling the session. Kept as a local check instead of core's
+ * `isHarnessWakeReservedKey`: this package's `@mastra/core` peer range includes
+ * releases that predate that export.
+ */
+const HARNESS_WAKE_RESERVED_ADMISSION_PREFIX = 'harness-wake:';
+
 export class HarnessChatStreamValidationError extends Error {
   constructor(
     public readonly path: string,
@@ -828,6 +837,14 @@ export async function handleHarnessChatStream<OUTPUT = undefined>({
     );
   }
   const effectiveAdmissionId = trigger === 'regenerate-message' ? undefined : (admissionId ?? prompt.userMessage.id);
+  if (effectiveAdmissionId?.startsWith(HARNESS_WAKE_RESERVED_ADMISSION_PREFIX)) {
+    throw new HarnessChatStreamValidationError(
+      admissionId !== undefined
+        ? 'handleHarnessChatStream.params.admissionId'
+        : 'handleHarnessChatStream.params.messages',
+      'admissionId uses the Harness-reserved wake namespace',
+    );
+  }
 
   const messageOptions: HarnessChatMessageOptions = {
     content: prompt.content,
