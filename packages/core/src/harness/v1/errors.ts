@@ -639,8 +639,11 @@ export class HarnessPendingInteractionDiscardedError extends HarnessError {
     public readonly reason: string,
     options?: { cause?: unknown },
   ) {
+    // Fields are JSON string literals so the stored public message (the only
+    // durable carrier: projections are `{ code, message }`) parses back
+    // unambiguously whatever the caller-supplied reason contains.
     super(
-      `Pending interaction "${itemId}" for session "${sessionId}" was discarded (${reason})`,
+      `Pending interaction ${JSON.stringify(itemId)} for session ${JSON.stringify(sessionId)} was discarded: ${JSON.stringify(reason)}`,
       options?.cause !== undefined ? { cause: options.cause } : undefined,
     );
   }
@@ -651,12 +654,21 @@ export class HarnessPendingInteractionDiscardedError extends HarnessError {
    * the stored message verbatim.
    */
   static fromProjection(projection: { message: string }): HarnessPendingInteractionDiscardedError {
-    const match = /^Pending interaction "(.*)" for session "(.*)" was discarded \((.*)\)$/s.exec(projection.message);
-    const error = new HarnessPendingInteractionDiscardedError(
-      match?.[2] ?? '',
-      match?.[1] ?? '',
-      match?.[3] ?? 'discarded',
+    const literal = '("(?:[^"\\\\]|\\\\.)*")';
+    const match = new RegExp(`^Pending interaction ${literal} for session ${literal} was discarded: ${literal}$`).exec(
+      projection.message,
     );
+    const field = (index: number, fallback: string): string => {
+      const raw = match?.[index];
+      if (raw === undefined) return fallback;
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        return typeof parsed === 'string' ? parsed : fallback;
+      } catch {
+        return fallback;
+      }
+    };
+    const error = new HarnessPendingInteractionDiscardedError(field(2, ''), field(1, ''), field(3, 'discarded'));
     if (error.message !== projection.message) {
       Object.defineProperty(error, 'message', { value: projection.message, configurable: true, writable: true });
     }

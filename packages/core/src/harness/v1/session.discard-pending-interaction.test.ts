@@ -1050,4 +1050,99 @@ describe('Session.discardPendingInteraction', () => {
     expect(agent.resumeCalls).toHaveLength(0);
     await harness.shutdown();
   });
+
+  it('a strict discard that joins a failing best-effort signal settlement still settles the signal', async () => {
+    const { harness, agent, storage } = setup();
+    agent.enqueueRun(approvalRun('run-S', 'tc-S'));
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const handle = await session.signal({ content: 'signal turn' });
+    void handle.result.catch(() => {});
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'signal turn parked');
+    const pending = session.getRecord().pendingResume!;
+
+    // cancel() starts the best-effort origin-signal settlement; hold its
+    // write, let the discard join it, then fail it (best effort swallows).
+    const write = storage.writeMessageResultEvidence.bind(storage);
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>(resolve => (releaseWrite = resolve));
+    let heldWrite = false;
+    vi.spyOn(storage, 'writeMessageResultEvidence').mockImplementation(async (record, options) => {
+      if (!heldWrite && record.status === 'failed') {
+        heldWrite = true;
+        await writeGate;
+        throw new Error('signal evidence write failed');
+      }
+      return write(record, options);
+    });
+    const cancelling = session.cancel({ reason: 'user_cancelled' }).catch(() => undefined);
+    await waitFor(() => heldWrite, 'cancel settlement write in flight');
+    const discarding = session
+      .discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' })
+      .then(
+        result => result,
+        (err: unknown) => err,
+      );
+    await new Promise(resolve => setTimeout(resolve, 50));
+    releaseWrite();
+    await cancelling;
+
+    expect(await discarding).toMatchObject({ status: 'discarded' });
+    const evidence = await session.lookupMessageResult(handle.id);
+    expect(evidence && 'status' in evidence ? evidence.status : null).toBe('failed');
+    await harness.shutdown();
+  });
+
+  it('round-trips discard fields whose reason imitates the error message', async () => {
+    const tricky = 'Pending interaction "x" for session "y" was discarded (z): "w"';
+    const rebuilt = HarnessPendingInteractionDiscardedError.fromProjection(
+      new HarnessPendingInteractionDiscardedError('sess-1', 'item-1', tricky),
+    );
+    expect({ sessionId: rebuilt.sessionId, itemId: rebuilt.itemId, reason: rebuilt.reason }).toEqual({
+      sessionId: 'sess-1',
+      itemId: 'item-1',
+      reason: tricky,
+    });
+
+    const { harness, agent } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    await expect(
+      session.respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true }),
+    ).rejects.toBeTruthy();
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: tricky }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+    const replayed = await session
+      .respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true })
+      .then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+    expect(replayed).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(replayed).toMatchObject({ sessionId: session.id, itemId: generationOf(pending).itemId, reason: tricky });
+    await harness.shutdown();
+  });
+
+  it('a discard on a cancelled session keeps the cancelled interaction as audit evidence and the session deletes', async () => {
+    const { harness, agent } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    await session.cancel({ reason: 'user_cancelled' });
+    expect(session.getRecord().pendingResume).toBeDefined();
+
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(session.getRecord().inboxResponseReceipts?.['discard-1']?.cancelledPendingResume).toMatchObject({
+      kind: pending.kind,
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      requestedAt: pending.requestedAt,
+      toolName: pending.toolName,
+      cancelRequest: { reason: 'user_cancelled' },
+    });
+
+    await session.close();
+    await expect(harness.deleteSession({ sessionId: session.id, resourceId: 'u' })).resolves.toBeUndefined();
+    await harness.shutdown();
+  });
 });

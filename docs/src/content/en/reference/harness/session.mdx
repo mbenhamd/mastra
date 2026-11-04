@@ -190,7 +190,7 @@ The result `status` is one of:
 - `already_resolved`: an earlier discard of this generation resolved it.
 - `not_current`: a different interaction is pending, or none is, and nothing changed.
 
-Reusing `responseId` with the same input replays the result without new writes. A later answer for the discarded generation rejects with `HarnessPendingInteractionDiscardedError`. A storage failure rejects with `HarnessStorageError`. An interaction whose resume is already running rejects with `HarnessBusyError`.
+Reusing `responseId` with the same input replays the result without new writes. A later answer for the discarded generation rejects with `HarnessPendingInteractionDiscardedError`. A storage failure rejects with `HarnessStorageError`. An interaction whose resume is already running rejects with `HarnessBusyError`. On a cancelled session, discard still resolves the interaction so the session can settle and be deleted. The discard receipt keeps a copy of the cancelled interaction as audit evidence.
 
 ```typescript
 const pending = session.getRecord().pendingResume!

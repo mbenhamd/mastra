@@ -1254,6 +1254,22 @@ export interface InboxResponseReceipt {
    * retryable; replays resolve to the same discard outcome.
    */
   discardedAt?: number;
+  /**
+   * Discard receipts only: when the session had a durable `cancelRequest`,
+   * the cancelled `pendingResume` (which cancellation keeps as audit
+   * evidence) is preserved here, minus runtime-internal fields, before the
+   * discard clears it so the session can settle and be deleted.
+   */
+  cancelledPendingResume?: Omit<
+    PendingResume,
+    | 'runtimeDependencies'
+    | 'requestContext'
+    | 'toolSurfaceFence'
+    | 'toolReceipts'
+    | 'toolReceiptsOverflow'
+    | 'observationalMemorySourceWriteGuard'
+    | 'accountedTokenUsage'
+  > & { cancelRequest: NonNullable<SessionRecord['cancelRequest']> };
   updatedAt: number;
 }
 

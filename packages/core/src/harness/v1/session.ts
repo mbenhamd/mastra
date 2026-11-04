@@ -12516,7 +12516,13 @@ export class Session {
     options?: { strict?: boolean },
   ): Promise<AgentSignalResultEvidence | undefined> {
     const inFlight = this._signalResultSettlements.get(signalId);
-    if (inFlight !== undefined) return inFlight;
+    if (inFlight !== undefined) {
+      if (options?.strict !== true) return inFlight;
+      // A strict caller may join a best-effort settlement that swallowed its
+      // write failure: once it settles, verify the durable evidence is
+      // terminal and otherwise write it strictly (failure propagates).
+      return this._settleSignalResultStrictAfter(signalId, inFlight, outcome, admission);
+    }
     const settlement = this._settleSignalResultOnce(signalId, outcome, admission, options).finally(() => {
       if (this._signalResultSettlements.get(signalId) === settlement) {
         this._signalResultSettlements.delete(signalId);
@@ -12524,6 +12530,28 @@ export class Session {
     });
     this._signalResultSettlements.set(signalId, settlement);
     return settlement;
+  }
+
+  private async _settleSignalResultStrictAfter(
+    signalId: string,
+    inFlight: Promise<AgentSignalResultEvidence | undefined>,
+    outcome:
+      | { status: 'completed'; runId: string; result: AgentResult }
+      | { status: 'failed'; runId?: string; error: { code: string; message: string } },
+    admission?: SignalSettlementAdmission,
+  ): Promise<AgentSignalResultEvidence | undefined> {
+    await inFlight.catch(() => undefined);
+    const durable = await this._storage.loadMessageResultEvidence({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      signalId,
+    });
+    if (durable && 'status' in durable && (durable.status === 'completed' || durable.status === 'failed')) {
+      return durable as AgentSignalResultEvidence;
+    }
+    return this._settleSignalResultOnce(signalId, outcome, admission, { strict: true });
   }
 
   private async _settleSignalResultOnce(
@@ -16676,6 +16704,9 @@ export class Session {
           acceptedAt: discardedAt,
           failedAt: discardedAt,
           discardedAt,
+          ...(prev.cancelRequest !== undefined
+            ? { cancelledPendingResume: cancelledPendingAudit(current, prev.cancelRequest) }
+            : {}),
           updatedAt: discardedAt,
         };
         // Built with data-property semantics only (entries / computed keys),
@@ -24434,6 +24465,28 @@ function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generati
     receipt.toolCallId === generation.toolCallId &&
     receipt.pendingRequestedAt === generation.pendingRequestedAt
   );
+}
+
+/**
+ * Audit copy of a cancelled session's pending interaction for its discard
+ * receipt: cancellation keeps `pendingResume` as audit evidence, and discard
+ * must clear it for the session to settle and delete.
+ */
+function cancelledPendingAudit(
+  pending: PendingResume,
+  cancelRequest: NonNullable<SessionRecord['cancelRequest']>,
+): NonNullable<InboxResponseReceipt['cancelledPendingResume']> {
+  const {
+    runtimeDependencies: _runtimeDependencies,
+    requestContext: _requestContext,
+    toolSurfaceFence: _toolSurfaceFence,
+    toolReceipts: _toolReceipts,
+    toolReceiptsOverflow: _toolReceiptsOverflow,
+    observationalMemorySourceWriteGuard: _observationalMemorySourceWriteGuard,
+    accountedTokenUsage: _accountedTokenUsage,
+    ...audit
+  } = pending;
+  return { ...audit, cancelRequest: { ...cancelRequest } };
 }
 
 /** Whether `receipt`'s generation was resolved by `discardPendingInteraction`. */
