@@ -2176,6 +2176,55 @@ export interface InboxResponseResult {
   duplicate: boolean;
 }
 
+/**
+ * Input for `session.discardPendingInteraction(...)`. The generation fields
+ * are the same ones a receipt response (`respondTo*` with `responseId`) binds
+ * to, so a stale caller cannot resolve a newer interaction that reuses the
+ * item id.
+ */
+export interface DiscardPendingInteractionOptions {
+  kind: InboxResponseResult['kind'];
+  /** `pendingResume.itemId ?? pendingResume.toolCallId`. */
+  itemId: string;
+  runId: string;
+  toolCallId: string;
+  /** `pendingResume.requestedAt` of the generation being discarded. */
+  pendingRequestedAt: number;
+  /**
+   * Idempotency key, stored in the same durable receipt map as inbox
+   * responses. Reusing it with the same generation and reason replays the
+   * outcome; reusing it for anything else conflicts.
+   */
+  responseId: string;
+  /** Why the interaction is being resolved (1–512 characters). Persisted. */
+  reason: string;
+}
+
+export type DiscardPendingInteractionResult =
+  | {
+      /** This call resolved the interaction and its pending admission. */
+      status: 'discarded';
+      itemId: string;
+      kind: InboxResponseResult['kind'];
+      responseId: string;
+      discardedAt: number;
+    }
+  | {
+      /** A previous discard of this generation already resolved it (replay). */
+      status: 'already_resolved';
+      itemId: string;
+      kind: InboxResponseResult['kind'];
+      /** The responseId of the discard that resolved it. */
+      responseId: string;
+      discardedAt: number;
+    }
+  | {
+      /** The session's pending interaction is not this generation; nothing was touched. */
+      status: 'not_current';
+      itemId: string;
+      kind: InboxResponseResult['kind'];
+    };
+
 // ---------------------------------------------------------------------------
 // queue() — wait-for-idle FIFO turn queue (spec §4.2 / §6).
 //

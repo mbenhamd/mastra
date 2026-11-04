@@ -180,6 +180,31 @@ await session.respondToToolApproval({
 })
 ```
 
+#### `discardPendingInteraction({ kind, itemId, runId, toolCallId, pendingRequestedAt, responseId, reason })`
+
+Resolve the current pending interaction without resuming its run or aborting a turn. Use it when the interaction can no longer be answered meaningfully, for example when the work it gated has already settled. The call acts only when that exact generation is still pending, and it also settles the interaction's queued turn or signal and any unsettled inbox receipts.
+
+The result `status` is one of:
+
+- `discarded`: this call resolved the interaction.
+- `already_resolved`: an earlier discard of this generation resolved it.
+- `not_current`: a different interaction is pending, or none is, and nothing changed.
+
+Reusing `responseId` with the same input replays the result without new writes. A later answer for the discarded generation rejects with `HarnessPendingInteractionDiscardedError`. A storage failure rejects with `HarnessStorageError`. An interaction whose resume is already running rejects with `HarnessBusyError`. On a cancelled session, discard still resolves the interaction so the session can settle and be deleted. The discard receipt keeps a copy of the cancelled interaction as audit evidence.
+
+```typescript
+const pending = session.getRecord().pendingResume!
+const { status } = await session.discardPendingInteraction({
+  kind: pending.kind,
+  itemId: pending.itemId ?? pending.toolCallId,
+  runId: pending.runId,
+  toolCallId: pending.toolCallId,
+  pendingRequestedAt: pending.requestedAt,
+  responseId: crypto.randomUUID(),
+  reason: 'run_settled',
+})
+```
+
 ### Run control
 
 #### `getCurrentRunId()`

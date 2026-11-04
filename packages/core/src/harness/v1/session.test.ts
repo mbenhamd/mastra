@@ -211,6 +211,7 @@ describe('Session — surface area (M1)', () => {
         'cancelQueuedItem',
         'cancelSubagent',
         'abortActiveWork',
+        'discardPendingInteraction',
         'close',
         'delete',
         'rename',

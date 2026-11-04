@@ -624,6 +624,70 @@ export class HarnessPendingInteractionExpiredError extends HarnessError {
   }
 }
 
+/**
+ * The pending interaction was resolved by `session.discardPendingInteraction`
+ * without resuming its run. A retried or late answer for that generation
+ * replays this outcome instead of resuming.
+ */
+export class HarnessPendingInteractionDiscardedError extends HarnessError {
+  readonly name = 'HarnessPendingInteractionDiscardedError';
+  readonly code = 'harness.pending_interaction_discarded';
+
+  constructor(
+    public readonly sessionId: string,
+    public readonly itemId: string,
+    public readonly reason: string,
+    options?: { cause?: unknown },
+  ) {
+    // Fields are JSON string literals so the stored public message (the only
+    // durable carrier: projections are `{ code, message }`) parses back
+    // unambiguously whatever the caller-supplied reason contains.
+    super(
+      `Pending interaction ${JSON.stringify(itemId)} for session ${JSON.stringify(sessionId)} was discarded: ${JSON.stringify(reason)}`,
+      options?.cause !== undefined ? { cause: options.cause } : undefined,
+    );
+  }
+
+  /**
+   * Rebuild the typed error from its stored public projection
+   * (`{ code: 'harness.pending_interaction_discarded', message }`), keeping
+   * the stored message verbatim.
+   */
+  static fromProjection(projection: { message: string }): HarnessPendingInteractionDiscardedError {
+    const literal = '("(?:[^"\\\\]|\\\\.)*")';
+    const match = new RegExp(`^Pending interaction ${literal} for session ${literal} was discarded: ${literal}$`).exec(
+      projection.message,
+    );
+    const field = (index: number, fallback: string): string => {
+      const raw = match?.[index];
+      if (raw === undefined) return fallback;
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        return typeof parsed === 'string' ? parsed : fallback;
+      } catch {
+        return fallback;
+      }
+    };
+    // Projections written before the JSON-literal encoding used
+    // `... "<item>" for session "<sess>" was discarded (<reason>)`. That
+    // format is only decoded when unambiguous: each separator occurs exactly
+    // once and item/session carry no quote. Otherwise identity stays blank.
+    const occurrences = (needle: string): number => projection.message.split(needle).length - 1;
+    const legacy =
+      match === null && occurrences('" for session "') === 1 && occurrences('" was discarded (') === 1
+        ? /^Pending interaction "([^"]*)" for session "([^"]*)" was discarded \((.*)\)$/s.exec(projection.message)
+        : null;
+    const error =
+      legacy !== null
+        ? new HarnessPendingInteractionDiscardedError(legacy[2] ?? '', legacy[1] ?? '', legacy[3] ?? 'discarded')
+        : new HarnessPendingInteractionDiscardedError(field(2, ''), field(1, ''), field(3, 'discarded'));
+    if (error.message !== projection.message) {
+      Object.defineProperty(error, 'message', { value: projection.message, configurable: true, writable: true });
+    }
+    return error;
+  }
+}
+
 export class HarnessAdmissionConflictError extends Error {
   readonly name = 'HarnessAdmissionConflictError';
   constructor(
