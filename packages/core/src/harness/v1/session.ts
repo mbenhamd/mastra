@@ -1969,6 +1969,8 @@ export class Session {
   private readonly _delegationDriverClaims = new Set<string>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
+  /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
+  private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -21965,7 +21967,9 @@ export class Session {
    * run publications, run-summary persistence, the `_flushChain` (record
    * writes and draft checkpoints), the in-flight draft checkpoint, the
    * event-persistence tail, the lease-renewal chain, orphaned-dispatch
-   * recovery, plan-task summary seeding and delegation reconcile. Failures
+   * recovery, plan-task summary seeding, delegation reconcile and delegated
+   * settlement-notice deliveries (whose reminder write goes through the agent's
+   * memory, outside the tracked Harness storage handle). Failures
    * stay with their owners; this only observes settlement, and loops until
    * nothing new was registered while it waited.
    */
@@ -21976,6 +21980,7 @@ export class Session {
       ...this._signalResultSettlements.values(),
       ...this._terminalCommitsByRunId.values(),
       ...this._recoveredRunPublications.values(),
+      ...this._delegationNoticeDeliveries,
       this._runSummaryPersistence,
       this._flushChain,
       this._eventPersistenceTail,
@@ -23945,7 +23950,7 @@ export class Session {
       );
       if (reconcileResult.reconciled) this._notifyDisplayRefresh();
       if (reconcileResult.notice !== undefined) {
-        void this._deliverDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
+        this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
       return reconcileResult.reconciled;
     } catch {
@@ -23997,17 +24002,35 @@ export class Session {
    *    Otherwise it acknowledges without waking. A crash between claim and wake
    *    loses at most that wake; the persisted reminder still reaches the next turn.
    *
-   * A cancelled parent drops the notice. A closed or torn-down parent leaves it
-   * owed for restart reconcile. A failure re-arms reconciliation with the
+   * A cancelled parent drops the notice. A closed or torn-down parent, or one
+   * whose Harness is shutting down, leaves it owed for restart reconcile; a
+   * running delivery is awaited by the shutdown barrier (PF-7595). A failure re-arms reconciliation with the
    * caller's backoff attempt.
    */
+  private _startDelegationSettlementNotice(
+    notice: PendingDelegationSettlementNotice,
+    admissionEpoch: number,
+    retryAttempt: number,
+  ): void {
+    // Tracked so shutdown's bounded settle awaits a reminder write in flight.
+    const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch, retryAttempt);
+    this._delegationNoticeDeliveries.add(delivery);
+    const untrack = () => {
+      this._delegationNoticeDeliveries.delete(delivery);
+    };
+    void delivery.then(untrack, untrack);
+  }
+
   private async _deliverDelegationSettlementNotice(
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
     retryAttempt: number,
   ): Promise<void> {
     const key = `${notice.subagentSessionId}:${notice.digest}`;
-    if (this._state !== 'live' || this.isClosing || this._delegationNoticesInFlight.has(key)) return;
+    // A shutting-down Harness starts no new delivery work; the notice stays
+    // owed for the next owner's reconcile.
+    const live = () => this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown();
+    if (!live() || this._delegationNoticesInFlight.has(key)) return;
     this._delegationNoticesInFlight.add(key);
     const firstEpoch = this._delegationNoticeEpochs.get(key);
     if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
@@ -24023,7 +24046,6 @@ export class Session {
         if (acknowledged) this._delegationNoticeEpochs.delete(key);
         return acknowledged;
       });
-    const live = () => this._state === 'live' && !this.isClosing;
     let claimed = false;
     try {
       if (!(await this._delegationNoticeIsOwed(notice))) {
@@ -24055,6 +24077,8 @@ export class Session {
           : {}),
       });
       const memory = await agent.getMemory({ requestContext });
+      // Shutdown may have begun while the notice was re-read and memory resolved.
+      if (!live()) return;
       if (memory !== undefined && memory !== null) {
         await memory.saveMessages({
           messages: [
@@ -24461,7 +24485,7 @@ export class Session {
     }
 
     for (const owedNotice of owedNotices) {
-      void this._deliverDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
+      this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
     }
 
     let needsRetry = false;

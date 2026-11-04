@@ -15,6 +15,7 @@ import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { MockAgent } from './__test-utils__';
+import { HarnessConfigError } from './errors';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
 import type { Session } from './session';
@@ -44,8 +45,14 @@ const completedReport = {
 
 function buildHarness(db: InMemoryDB, onDelegatedSettlement: NoticeMode, memory?: MockMemory) {
   const parentAgent = new MockAgent({ id: 'parent-agent' });
-  if (memory !== undefined) vi.spyOn(parentAgent, 'getMemory').mockResolvedValue(memory as never);
   const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
+  if (memory !== undefined) {
+    // Both modes can delegate, so `remind` requires memory on both agents.
+    for (const agent of [parentAgent, childAgent]) {
+      vi.spyOn(agent, 'hasOwnMemory').mockReturnValue(true);
+      vi.spyOn(agent, 'getMemory').mockResolvedValue(memory as never);
+    }
+  }
   const harness = new Harness({
     agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
     modes: [
@@ -146,21 +153,23 @@ async function delegateFromParentTurn(
 }
 
 /** Hold reminder-row writes to the parent thread until the returned release is called. */
-function gatedMemory(): { memory: MockMemory; release: () => void; entered: Promise<void> } {
+function gatedMemory(): { memory: MockMemory; release: () => void; entered: Promise<void>; written: () => boolean } {
   const memory = new MockMemory();
   let release!: () => void;
   const gate = new Promise<void>(r => (release = r));
   let enter!: () => void;
   const entered = new Promise<void>(r => (enter = r));
+  let written = false;
   const save = memory.saveMessages.bind(memory);
   vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
-    if (args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) {
-      enter();
-      await gate;
-    }
-    return save(args);
+    if (!args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) return save(args);
+    enter();
+    await gate;
+    const saved = await save(args);
+    written = true;
+    return saved;
   });
-  return { memory, release, entered };
+  return { memory, release, entered, written: () => written };
 }
 
 function crashParent(db: InMemoryDB, parent: Session): void {
@@ -178,6 +187,37 @@ function reminderCalls(agent: MockAgent) {
 describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', () => {
   it('rejects an unknown notice mode', () => {
     expect(() => buildHarness(new InMemoryDB(), 'shout' as never)).toThrow(/onDelegatedSettlement/);
+  });
+
+  it('rejects remind when a delegation-capable mode has no memory to persist the reminder into', () => {
+    const build = () => buildHarness(new InMemoryDB(), 'remind');
+    expect(build).toThrow(HarnessConfigError);
+    expect(build).toThrow(/subagents\.onDelegatedSettlement.*mode "default".*no memory/);
+  });
+
+  it('shutdown does not report success while a reminder write is still pending', async () => {
+    const gated = gatedMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', gated.memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+
+    releaseChild();
+    await gated.entered;
+    // At the deadline the shutdown fails and names the outstanding work.
+    await expect(harness.shutdown({ drainTimeoutMs: 200 })).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({ message: expect.stringContaining('Session storage work did not settle') }),
+    });
+
+    let shutdownSettled = false;
+    const retry = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await new Promise(r => setTimeout(r, 50));
+    expect(shutdownSettled).toBe(false);
+    gated.release();
+    await expect(retry).resolves.toBeUndefined();
+    expect(gated.written()).toBe(true);
   });
 
   it('default config records no notice and never wakes the idle parent', async () => {
