@@ -372,6 +372,98 @@ describe('subagent control tool', () => {
     await a.harness.shutdown();
   });
 
+  it('after a restart, a cancelled child that kept its suspension evidence reads as settled, not awaiting input', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const b = buildHarness(db);
+    const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const child = await b.harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+      subagentTypeId: 'worker',
+    });
+    // The child suspended, then was cancelled; the cancel keeps pendingResume
+    // as audit evidence and nothing closed the child before its process stopped.
+    const now = Date.now();
+    await (child as any)._flushUpdate((prev: any) => ({
+      ...prev,
+      pendingResume: {
+        kind: 'tool-approval',
+        runId: 'run-suspended',
+        toolCallId: 'tool-call-suspended',
+        source: 'parent',
+        requestedAt: now,
+        expiresAt: now + 600_000,
+      },
+    }));
+    await child.cancel({ reason: 'subagent_cancelled' });
+    await b.harness.shutdown();
+    const stored = await parent._internalStorage.loadSession({ sessionId: child.id });
+    expect(stored).toMatchObject({ pendingResume: expect.anything(), cancelRequest: expect.anything() });
+    expect(stored?.closedAt).toBeUndefined();
+
+    const run = control(parent);
+    const inspected = await run({ action: 'status', subagentSessionId: child.id });
+    expect(inspected.subagents).toEqual([
+      expect.objectContaining({ subagentSessionId: child.id, cancelRequested: true, settled: true }),
+    ]);
+    expect(inspected.subagents[0].status).not.toBe('awaiting_input');
+    const waited = await run({ action: 'wait', subagentSessionId: child.id, timeoutMs: 200 });
+    expect(waited).toMatchObject({ action: 'wait', timedOut: false, runningSubagents: [] });
+    expect(waited.settledSubagents).toEqual([expect.objectContaining({ subagentSessionId: child.id })]);
+    await a.harness.shutdown();
+  });
+
+  it('wait stops at its timeout, or promptly on abort, while a storage read stalls', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const child = await harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+    });
+    const tool = createSubagentControlTool(parent)!;
+    let releaseStorage!: () => void;
+    const gate = new Promise<void>(r => (releaseStorage = r));
+    const stall = vi
+      .spyOn(InMemoryHarness.prototype, 'listPlanTasks')
+      .mockImplementation(() => gate.then(() => ({ tasks: [] })) as any);
+    const stalled = new Promise<'stalled'>(r => setTimeout(() => r('stalled'), 1_000));
+    try {
+      let started = Date.now();
+      const timed = await Promise.race([
+        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 50 } as any, toolCtx),
+        stalled,
+      ]);
+      expect(timed).toMatchObject({ action: 'wait', timedOut: true });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+
+      const abort = new AbortController();
+      started = Date.now();
+      setTimeout(() => abort.abort(), 30);
+      const aborted = await Promise.race([
+        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 300_000 } as any, {
+          ...toolCtx,
+          abortSignal: abort.signal,
+        }),
+        stalled,
+      ]);
+      expect(aborted).toMatchObject({ action: 'wait', timedOut: false, aborted: true });
+      expect(Date.now() - started).toBeLessThan(500);
+    } finally {
+      releaseStorage();
+      stall.mockRestore();
+    }
+    await harness.shutdown();
+  });
+
   it('send refuses a child with no active run instead of waking it', async () => {
     const { harness, childAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
