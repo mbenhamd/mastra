@@ -183,6 +183,19 @@ export const harnessSubagentToolTraceSchema = z
 
 export type HarnessSubagentToolTrace = z.infer<typeof harnessSubagentToolTraceSchema>;
 
+/**
+ * The per-type budget that stopped a child before it reported an outcome
+ * (`SubagentDefinition.maxSteps` / `maxTotalTokens`). Present only on a
+ * `harness.subagent_budget_exhausted` error summary.
+ */
+export const harnessSubagentBudgetExhaustedSchema = z
+  .object({
+    budget: z.enum(['steps', 'tokens']),
+    limit: z.number().int().positive(),
+    used: z.number().finite().nonnegative(),
+  })
+  .strict();
+
 export const harnessSubagentResultSummarySchema = z
   .object({
     status: z.enum(['success', 'error']),
@@ -196,6 +209,7 @@ export const harnessSubagentResultSummarySchema = z
     toolTrace: harnessSubagentToolTraceSchema.optional(),
     toolTraceTruncated: z.boolean().optional(),
     usage: harnessSubagentUsageSchema.optional(),
+    budgetExhausted: harnessSubagentBudgetExhaustedSchema.optional(),
     artifacts: harnessSubagentTerminalArtifactsSchema.optional(),
     evidence: z.array(harnessSubagentOutcomeEvidenceSchema).max(MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS).optional(),
     evidenceTruncated: z.boolean().optional(),
@@ -302,6 +316,35 @@ export function withHarnessSubagentToolReceipts<T extends object>(
       : {}),
     ...(overflow ? { [HARNESS_SUBAGENT_TOOL_RECEIPTS_OVERFLOW_FIELD]: true } : {}),
   } as T;
+}
+
+const HARNESS_SUBAGENT_BUDGET_EXHAUSTED_FIELD = 'harnessSubagentBudgetExhausted' as const;
+
+/**
+ * Attach the framework's budget-stop record to a child run result, so durable
+ * result evidence keeps the typed outcome for crash recovery. Any value already
+ * on the provider-shaped object is discarded first.
+ */
+export function withHarnessSubagentBudgetExhausted<T extends object>(
+  value: T,
+  exhausted: z.infer<typeof harnessSubagentBudgetExhaustedSchema> | undefined,
+): T {
+  const { [HARNESS_SUBAGENT_BUDGET_EXHAUSTED_FIELD]: _untrusted, ...safeValue } = value as T & {
+    [HARNESS_SUBAGENT_BUDGET_EXHAUSTED_FIELD]?: unknown;
+  };
+  return {
+    ...safeValue,
+    ...(exhausted !== undefined ? { [HARNESS_SUBAGENT_BUDGET_EXHAUSTED_FIELD]: { ...exhausted } } : {}),
+  } as T;
+}
+
+/** Read the budget-stop record the framework attached to a child run result. */
+export function parseHarnessSubagentBudgetExhausted(
+  value: unknown,
+): z.infer<typeof harnessSubagentBudgetExhaustedSchema> | undefined {
+  if (!isRecord(value)) return undefined;
+  const parsed = harnessSubagentBudgetExhaustedSchema.safeParse(value[HARNESS_SUBAGENT_BUDGET_EXHAUSTED_FIELD]);
+  return parsed.success ? parsed.data : undefined;
 }
 
 function itemArray(value: unknown): unknown[] {
@@ -504,6 +547,7 @@ export function summarizeHarnessSubagentResult(
   options: {
     isError?: boolean;
     error?: { code: string; message: string };
+    budgetExhausted?: z.infer<typeof harnessSubagentBudgetExhaustedSchema>;
   } = {},
 ): HarnessSubagentResultSummary {
   const record = isRecord(value) ? value : undefined;
@@ -541,7 +585,7 @@ export function summarizeHarnessSubagentResult(
       ? parseHarnessTerminalToolResultArtifacts(record?.terminalToolResult)
       : undefined;
 
-  const summary: HarnessSubagentResultSummary = {
+  const draft: HarnessSubagentResultSummary = {
     status,
     ...(report ? { outcome: report.outcome } : {}),
     text: text.value,
@@ -551,11 +595,22 @@ export function summarizeHarnessSubagentResult(
     toolCallCount: arrayLength(record?.toolCalls),
     toolResultCount: arrayLength(record?.toolResults),
     ...(usage ? { usage } : {}),
+    ...(status === 'error' && options.budgetExhausted ? { budgetExhausted: { ...options.budgetExhausted } } : {}),
     ...(artifacts ? { artifacts } : {}),
     ...(report ? { evidence: report.evidence } : {}),
     ...(report?.issue ? { issue: report.issue } : {}),
     ...(error ? { error } : {}),
   };
+  // A budget-stopped child's partial text is arbitrary interim prose whose JSON
+  // escaping can double it; fit the serialized summary to the room the trace
+  // budget below assumes, so the partial result never outgrows the envelope.
+  const summary =
+    draft.budgetExhausted === undefined
+      ? draft
+      : fitSummaryText(
+          draft,
+          MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES - MAX_HARNESS_SUBAGENT_TOOL_TRACE_ENVELOPE_HEADROOM_BYTES,
+        );
   // The trace only uses room the rest of the summary leaves inside the 64 KiB
   // terminal envelope, keeping headroom for the settlement and plan-task view
   // that wrap it; a near-limit answer keeps no trace rather than breaking reads.
@@ -578,6 +633,27 @@ export function summarizeHarnessSubagentResult(
     ...(toolTrace.trace ? { toolTrace: toolTrace.trace } : {}),
     ...(toolTrace.truncated && flagFits ? { toolTraceTruncated: true } : {}),
   };
+}
+
+function jsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/**
+ * Shorten `summary.text` until the serialized summary is at most `maxBytes`.
+ * Each pass removes at least the excess in raw bytes, which removes at least
+ * as many serialized bytes; the text is dropped if it still cannot fit.
+ */
+function fitSummaryText(summary: HarnessSubagentResultSummary, maxBytes: number): HarnessSubagentResultSummary {
+  let fitted = summary;
+  for (let pass = 0; pass < 8; pass += 1) {
+    const excess = jsonBytes(fitted) - maxBytes;
+    if (excess <= 0) return fitted;
+    const textBytes = new TextEncoder().encode(fitted.text).byteLength;
+    const shorter = truncateUtf8(fitted.text, Math.max(0, textBytes - excess));
+    fitted = { ...fitted, text: shorter.value, textTruncated: true };
+  }
+  return jsonBytes(fitted) <= maxBytes ? fitted : { ...fitted, text: '', textTruncated: true };
 }
 
 /**
@@ -627,7 +703,7 @@ export function summarizeHarnessSubagentEventResult(
           message: errorMessage.value,
           messageTruncated: summary.error.messageTruncated || errorMessage.truncated,
         };
-  return {
+  const projected: HarnessSubagentResultSummary = {
     ...eventSummary,
     text: text.value,
     textTruncated: summary.textTruncated || text.truncated,
@@ -638,6 +714,11 @@ export function summarizeHarnessSubagentEventResult(
     ...(issue === undefined ? {} : { issue }),
     ...(error === undefined ? {} : { error }),
   };
+  // A budget stop's event keeps its whole serialized summary inside the 4 KiB
+  // event budget, not only its text.
+  return projected.budgetExhausted === undefined
+    ? projected
+    : fitSummaryText(projected, MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES);
 }
 
 function isBoundedAnswerText(text: string): boolean {

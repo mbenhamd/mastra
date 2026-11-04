@@ -70,7 +70,7 @@ type SessionLifecycleStatus = 'active' | 'closing' | 'closed';
 type PendingInboxKind = 'tool-approval' | 'tool-suspension' | 'question' | 'plan-approval' | 'sandbox-access';
 type PublicPendingResume = Omit<
   NonNullable<SessionRecord['pendingResume']>,
-  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence'
+  'runtimeDependencies' | 'requestContext' | 'toolSurfaceFence' | 'subagentBudgetSpent'
 >;
 type ParsedHarnessEventId = { epoch: string; sequence: number };
 type UrlAttachmentInput = {
@@ -1826,6 +1826,7 @@ function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): Publi
     runtimeDependencies: _runtimeDependencies,
     requestContext: _requestContext,
     toolSurfaceFence: _toolSurfaceFence,
+    subagentBudgetSpent: _subagentBudgetSpent,
     ...displayPending
   } = pending;
   return displayPending;

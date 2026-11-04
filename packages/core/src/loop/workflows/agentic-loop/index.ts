@@ -366,6 +366,7 @@ export function createAgenticLoopWorkflow<Tools extends ToolSet = ToolSet, OUTPU
           })),
           isFinal,
           finishReason: typedInputData.stepResult?.reason || 'unknown',
+          usage: currentStep.usage,
           runId: runId,
           threadId: readScoped(scopeCtx, THREAD_ID_KEY, 'threadId'),
           resourceId: readScoped(scopeCtx, RESOURCE_ID_KEY, 'resourceId'),

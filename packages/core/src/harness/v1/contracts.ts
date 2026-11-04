@@ -147,6 +147,7 @@ export type PendingInteraction = Omit<
   | 'runtimeDependencies'
   | 'requestContext'
   | 'toolSurfaceFence'
+  | 'subagentBudgetSpent'
   | 'resumedAt'
   | 'approvedTransitionModeId'
   | 'modeTransitionAppliedAt'

@@ -1348,6 +1348,12 @@ export class Harness {
         if (def.allowInline !== undefined && typeof def.allowInline !== 'boolean') {
           throw new HarnessConfigError(`subagents.types["${agentType}"].allowInline`, 'must be a boolean');
         }
+        for (const budget of ['maxSteps', 'maxTotalTokens'] as const) {
+          const limit = def[budget];
+          if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) {
+            throw new HarnessConfigError(`subagents.types["${agentType}"].${budget}`, 'must be a positive integer');
+          }
+        }
         if (def.toolAllowlist !== undefined) {
           const field = `subagents.types["${agentType}"].toolAllowlist`;
           if (!Array.isArray(def.toolAllowlist)) {
