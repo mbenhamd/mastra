@@ -55,6 +55,7 @@ export class StructuredOutputProcessor<OUTPUT extends {}> implements Processor<'
   private errorStrategy: 'strict' | 'warn' | 'fallback';
   private fallbackValue?: OUTPUT;
   private jsonPromptInjection?: boolean | 'system' | 'inline' | 'auto';
+  private sourceDecision?: StructuredOutputOptions<OUTPUT>['sourceDecision'];
   private providerOptions?: ProviderOptions;
   private logger?: IMastraLogger;
   private readonly requestStates = new WeakMap<object, StructuredOutputRequestState>();
@@ -83,6 +84,7 @@ export class StructuredOutputProcessor<OUTPUT extends {}> implements Processor<'
     this.errorStrategy = options.errorStrategy ?? 'strict';
     this.fallbackValue = options.fallbackValue;
     this.jsonPromptInjection = options.jsonPromptInjection;
+    this.sourceDecision = options.sourceDecision;
     this.providerOptions = options.providerOptions;
     this.logger = options.logger;
     this.structuringInstructions = options.instructions || this.generateInstructions();
@@ -273,6 +275,8 @@ export class StructuredOutputProcessor<OUTPUT extends {}> implements Processor<'
     const structuredOutput: StructuredOutputOptions<OUTPUT> = {
       schema: this.schema,
       jsonPromptInjection: this.jsonPromptInjection,
+      // PF-7309: the inner Agent keeps the decision recorded from the caller's schema.
+      ...(this.sourceDecision ? { sourceDecision: this.sourceDecision } : {}),
       ...(this.errorStrategy === 'fallback' && this.fallbackValue !== undefined
         ? { errorStrategy: 'fallback', fallbackValue: this.fallbackValue }
         : {

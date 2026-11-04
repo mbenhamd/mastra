@@ -19,6 +19,7 @@ import { ErrorCategory, ErrorDomain, MastraError } from '../../error';
 import type { MastraScorers } from '../../evals';
 import type { Event } from '../../events';
 import { RegisteredLogger } from '../../logger';
+import { mergeStructuredOutputSourceDecision } from '../../loop/shared/compose-step-input';
 import type { Mastra } from '../../mastra';
 import {
   EntityType,
@@ -1424,6 +1425,15 @@ function createStepFromProcessor<TProcessorId extends string>(
               return {
                 ...passThrough,
                 ...validatedResult,
+                // PF-7309: decide a processor-returned structured-output schema after every processor.
+                ...(validatedResult.structuredOutput !== undefined
+                  ? {
+                      structuredOutput: mergeStructuredOutputSourceDecision(
+                        structuredOutput,
+                        validatedResult.structuredOutput,
+                      ),
+                    }
+                  : {}),
                 messages: validatedResult.messages ?? passThrough.messageList.get.all.db(),
                 runId: agentRunId,
                 systemMessages: passThrough.messageList.getSystemMessages(),
