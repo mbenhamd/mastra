@@ -757,8 +757,21 @@ function pruneInboxResponseReceipts(
   const entries = Object.entries(receipts);
   if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
   entries.sort((left, right) => (right[1].updatedAt ?? 0) - (left[1].updatedAt ?? 0));
-  return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
+  // `discardPendingInteraction` receipts are the durable replay and
+  // crash-recovery record of a discard. Its claim converts the generation's
+  // other receipts in the same write (sharing its timestamp), so plain recency
+  // could evict it at once. Retain the newest few discard receipts first; the
+  // remaining slots keep the ordinary recency order.
+  const pinned = entries
+    .filter(([, receipt]) => receipt.discardedAt !== undefined)
+    .slice(0, MAX_RETAINED_DISCARD_RECEIPTS);
+  const pinnedIds = new Set(pinned.map(([responseId]) => responseId));
+  const rest = entries.filter(([responseId]) => !pinnedIds.has(responseId));
+  return Object.fromEntries([...pinned, ...rest.slice(0, MAX_INBOX_RESPONSE_RECEIPTS - pinned.length)]);
 }
+
+/** Discard receipts retained ahead of recency pruning (bounded). */
+const MAX_RETAINED_DISCARD_RECEIPTS = 8;
 
 const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
 const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
@@ -4414,7 +4427,7 @@ export class Session {
       current.toolCallId === expected.toolCallId &&
       current.requestedAt === expected.requestedAt
     ) {
-      return this._completeDiscardedPendingInteraction(current, discardClaim);
+      return this._completeDiscardedPendingInteraction(current, discardClaim, { drainQueue: opts.drainQueue });
     }
     if (expected.resumedAt !== undefined) {
       return this._recoverStaleResumeAdmission(expected, opts);
@@ -4457,11 +4470,13 @@ export class Session {
     let expiryStarted = false;
     let expiredPending: PendingResume | undefined;
     let failedQueueReceipt: QueueAdmissionReceipt | undefined;
+    let discardOwned: { pending: PendingResume; receipt: InboxResponseReceipt } | undefined;
 
     await this._flushUpdate(prev => {
       expiryStarted = false;
       expiredPending = undefined;
       failedQueueReceipt = undefined;
+      discardOwned = undefined;
       const current = prev.pendingResume;
       if (
         current === undefined ||
@@ -4473,6 +4488,13 @@ export class Session {
         current.requestedAt !== expected.requestedAt ||
         this._pendingInteractionExpiresAt(current) !== expected.expiresAt
       ) {
+        return prev;
+      }
+      // A `discardPendingInteraction` claim owns this generation: never record
+      // expiry evidence for it; finish it as the discard below instead.
+      const discardReceipt = discardClaimReceipt(prev, current);
+      if (discardReceipt !== undefined) {
+        discardOwned = { pending: current, receipt: discardReceipt };
         return prev;
       }
 
@@ -4538,6 +4560,10 @@ export class Session {
       return next;
     });
 
+    if (discardOwned !== undefined) {
+      const owned: { pending: PendingResume; receipt: InboxResponseReceipt } = discardOwned;
+      return this._completeDiscardedPendingInteraction(owned.pending, owned.receipt, { drainQueue: opts.drainQueue });
+    }
     if (!expiryStarted || expiredPending === undefined) return false;
     this._pendingReplacementToolSurfaces.delete(expiredPending.runId);
     const activeController = this._currentTurnAbortController;
@@ -16448,60 +16474,67 @@ export class Session {
     const discardError = new HarnessPendingInteractionDiscardedError(this.id, input.itemId, input.reason);
     const projectedError = projectHarnessPublicError(discardError);
     let claimed: { pending: PendingResume; receipt: InboxResponseReceipt } | undefined;
-    await this._flushUpdate(prev => {
-      claimed = undefined;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        !pendingMatchesDiscardGeneration(current, generation) ||
-        current.expiresAt !== observed.expiresAt ||
-        current.resumedAt !== undefined ||
-        current.expiryStartedAt !== undefined ||
-        getOwnRecordValue(prev.inboxResponseReceipts, input.responseId) !== undefined
-      ) {
-        return prev;
-      }
-      const discardedAt = Date.now();
-      const receipt: InboxResponseReceipt = {
-        responseId: input.responseId,
-        responseHash,
-        resumeAttemptId: input.responseId,
-        itemId: input.itemId,
-        ...(current.queuedItemId !== undefined ? { queuedItemId: current.queuedItemId } : {}),
-        kind: input.kind,
-        runId: input.runId,
-        toolCallId: input.toolCallId,
-        pendingRequestedAt: input.pendingRequestedAt,
-        response: { discarded: true, reason: input.reason },
-        status: 'failed',
-        error: projectedError,
-        retryable: false,
-        acceptedAt: discardedAt,
-        failedAt: discardedAt,
-        discardedAt,
-        updatedAt: discardedAt,
-      };
-      const inboxResponseReceipts = { ...(prev.inboxResponseReceipts ?? {}) };
-      for (const [responseId, candidate] of Object.entries(inboxResponseReceipts)) {
+    await this._flushUpdate(
+      prev => {
+        claimed = undefined;
+        const current = prev.pendingResume;
         if (
-          !receiptMatchesDiscardGeneration(candidate, generation) ||
-          !(candidate.status === 'accepted' || (candidate.status === 'failed' && candidate.retryable === true))
+          current === undefined ||
+          !pendingMatchesDiscardGeneration(current, generation) ||
+          current.expiresAt !== observed.expiresAt ||
+          current.resumedAt !== undefined ||
+          current.expiryStartedAt !== undefined ||
+          getOwnRecordValue(prev.inboxResponseReceipts, input.responseId) !== undefined
         ) {
-          continue;
+          return prev;
         }
-        inboxResponseReceipts[responseId] = {
-          ...candidate,
+        const discardedAt = Date.now();
+        const receipt: InboxResponseReceipt = {
+          responseId: input.responseId,
+          responseHash,
+          resumeAttemptId: input.responseId,
+          itemId: input.itemId,
+          ...(current.queuedItemId !== undefined ? { queuedItemId: current.queuedItemId } : {}),
+          kind: input.kind,
+          runId: input.runId,
+          toolCallId: input.toolCallId,
+          pendingRequestedAt: input.pendingRequestedAt,
+          response: { discarded: true, reason: input.reason },
           status: 'failed',
           error: projectedError,
           retryable: false,
+          acceptedAt: discardedAt,
           failedAt: discardedAt,
+          discardedAt,
           updatedAt: discardedAt,
         };
-      }
-      inboxResponseReceipts[input.responseId] = receipt;
-      claimed = { pending: { ...current, expiryStartedAt: discardedAt }, receipt };
-      return { ...prev, pendingResume: claimed.pending, inboxResponseReceipts };
-    });
+        // Built with data-property semantics only (entries / computed keys),
+        // never `map[id] = ...`, so a caller id such as "__proto__" stays an
+        // own, serializable receipt instead of hitting the prototype setter.
+        const inboxResponseReceipts: Record<string, InboxResponseReceipt> = Object.fromEntries([
+          ...Object.entries(prev.inboxResponseReceipts ?? {}).map(([responseId, candidate]) =>
+            receiptMatchesDiscardGeneration(candidate, generation) &&
+            (candidate.status === 'accepted' || (candidate.status === 'failed' && candidate.retryable === true))
+              ? ([
+                  responseId,
+                  {
+                    ...candidate,
+                    status: 'failed',
+                    error: projectedError,
+                    retryable: false,
+                    failedAt: discardedAt,
+                    updatedAt: discardedAt,
+                  } satisfies InboxResponseReceipt,
+                ] as const)
+              : ([responseId, candidate] as const),
+          ),
+          [input.responseId, receipt] as const,
+        ]);
+        claimed = { pending: { ...current, expiryStartedAt: discardedAt }, receipt };
+        return { ...prev, pendingResume: claimed.pending, inboxResponseReceipts };
+      },
+      { skipIfUnchanged: true },
+    );
     return claimed;
   }
 
@@ -16513,6 +16546,7 @@ export class Session {
   private async _completeDiscardedPendingInteraction(
     claimedPending: PendingResume,
     receipt: InboxResponseReceipt,
+    opts: { drainQueue?: boolean } = {},
   ): Promise<boolean> {
     const discardedAt = receipt.discardedAt;
     if (discardedAt === undefined || claimedPending.expiryStartedAt !== discardedAt) return false;
@@ -16548,37 +16582,43 @@ export class Session {
 
     let cleared = false;
     let settledQueueReceipt: QueueAdmissionReceipt | undefined;
-    await this._flushUpdate(prev => {
-      cleared = false;
-      settledQueueReceipt = undefined;
-      const current = prev.pendingResume;
-      if (
-        current === undefined ||
-        !pendingMatchesDiscardGeneration(current, generation) ||
-        current.expiryStartedAt !== discardedAt
-      ) {
-        return prev;
-      }
-      cleared = true;
-      const next: SessionRecord = { ...prev };
-      delete next.pendingResume;
-      if (queuedItemId !== undefined) {
-        next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
-        const queued = prev.queueAdmissionReceipts?.[queuedItemId];
-        settledQueueReceipt = queued;
-        if (queued && queued.status !== 'completed' && queued.status !== 'failed' && queued.status !== 'dead') {
-          settledQueueReceipt = {
-            ...queued,
-            status: 'failed',
-            error: projectedError,
-            failedAt: queued.failedAt ?? discardedAt,
-            updatedAt: discardedAt,
-          };
-          next.queueAdmissionReceipts = { ...(prev.queueAdmissionReceipts ?? {}), [queuedItemId]: settledQueueReceipt };
+    await this._flushUpdate(
+      prev => {
+        cleared = false;
+        settledQueueReceipt = undefined;
+        const current = prev.pendingResume;
+        if (
+          current === undefined ||
+          !pendingMatchesDiscardGeneration(current, generation) ||
+          current.expiryStartedAt !== discardedAt
+        ) {
+          return prev;
         }
-      }
-      return next;
-    });
+        cleared = true;
+        const next: SessionRecord = { ...prev };
+        delete next.pendingResume;
+        if (queuedItemId !== undefined) {
+          next.pendingQueue = (prev.pendingQueue ?? []).filter(item => item.id !== queuedItemId);
+          const queued = prev.queueAdmissionReceipts?.[queuedItemId];
+          settledQueueReceipt = queued;
+          if (queued && queued.status !== 'completed' && queued.status !== 'failed' && queued.status !== 'dead') {
+            settledQueueReceipt = {
+              ...queued,
+              status: 'failed',
+              error: projectedError,
+              failedAt: queued.failedAt ?? discardedAt,
+              updatedAt: discardedAt,
+            };
+            next.queueAdmissionReceipts = {
+              ...(prev.queueAdmissionReceipts ?? {}),
+              [queuedItemId]: settledQueueReceipt,
+            };
+          }
+        }
+        return next;
+      },
+      { skipIfUnchanged: true },
+    );
     if (!cleared) return false;
 
     this._clearPendingInteractionExpiryTimer();
@@ -16615,24 +16655,13 @@ export class Session {
     });
     if (!turnActive) this._emitAgentEnd({ runId: claimedPending.runId, finishReason: 'error' });
     this._notifyMaybeIdle();
-    if (this._state === 'live') void this._maybeDrainQueue();
+    if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
     return true;
   }
 
   /** The discard receipt whose claim is stamped on `pending`, if any. */
   private _discardClaimForPending(pending: PendingResume): InboxResponseReceipt | undefined {
-    if (pending.expiryStartedAt === undefined) return undefined;
-    const generation = {
-      kind: pending.kind,
-      itemId: pending.itemId ?? pending.toolCallId,
-      runId: pending.runId,
-      toolCallId: pending.toolCallId,
-      pendingRequestedAt: pending.requestedAt,
-    };
-    return Object.values(this._record.inboxResponseReceipts ?? {}).find(
-      receipt =>
-        receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
-    );
+    return discardClaimReceipt(this._record, pending);
   }
 
   private _findDiscardReceipt(generation: DiscardGeneration): InboxResponseReceipt | undefined {
@@ -17089,6 +17118,33 @@ export class Session {
       throw new HarnessSessionCancelledError(this.id, cancelRequest.reason);
     }
 
+    // An answer naming a generation that `discardPendingInteraction` resolved
+    // replays the discard, whatever interaction is pending now. If that
+    // discard's clear has not committed yet, finish it first.
+    if (
+      typeof requestedItemId === 'string' &&
+      typeof requestedRunId === 'string' &&
+      typeof requestedToolCallId === 'string' &&
+      typeof requestedPendingRequestedAt === 'number'
+    ) {
+      const discarded = this._findDiscardReceipt({
+        kind: expectedKind,
+        itemId: requestedItemId,
+        runId: requestedRunId,
+        toolCallId: requestedToolCallId,
+        pendingRequestedAt: requestedPendingRequestedAt,
+      });
+      if (discarded !== undefined) {
+        const claimed = this._record.pendingResume;
+        if (claimed !== undefined && this._discardClaimForPending(claimed) === discarded) {
+          // Best effort: the claim is durable and the deadline reconciler
+          // retries the clear, so the answer still gets the discard outcome.
+          await this._completeDiscardedPendingInteraction(claimed, discarded).catch(() => false);
+        }
+        throw this._discardedErrorForReceipt(discarded);
+      }
+    }
+
     const pending = this._record.pendingResume;
     if (!pending) {
       if (
@@ -17108,14 +17164,6 @@ export class Session {
         if (expired?.kind === expectedKind) {
           throw new HarnessPendingInteractionExpiredError(this.id, expired.itemId, expired.expiresAt);
         }
-        const discarded = this._findDiscardReceipt({
-          kind: expectedKind,
-          itemId: requestedItemId,
-          runId: requestedRunId,
-          toolCallId: requestedToolCallId,
-          pendingRequestedAt: requestedPendingRequestedAt,
-        });
-        if (discarded !== undefined) throw this._discardedErrorForReceipt(discarded);
       }
       throw new HarnessValidationError(`respond[${expectedKind}]`, 'no pending resume on this session');
     }
@@ -17166,6 +17214,12 @@ export class Session {
       );
     }
     const pendingExpiresAt = this._pendingInteractionExpiresAt(pending);
+    // A discard-claimed generation is resolved by its discard, never expired.
+    const discardClaim = this._discardClaimForPending(pending);
+    if (discardClaim !== undefined) {
+      await this._completeDiscardedPendingInteraction(pending, discardClaim).catch(() => false);
+      throw this._discardedErrorForReceipt(discardClaim);
+    }
     if (pending.expiryStartedAt !== undefined || (pending.resumedAt === undefined && Date.now() >= pendingExpiresAt)) {
       const didExpire = await this._expirePendingInteraction({
         kind: pending.kind,
@@ -21377,6 +21431,12 @@ export class Session {
       attachmentReferences?: SaveAttachmentReferenceInput[];
       ifVersion?: number;
       tokenUsageDelta?: TokenUsage | (() => TokenUsage | undefined);
+      /**
+       * When the updater returns the current record unchanged (`prev`), skip
+       * the save entirely instead of writing a version/`lastActivityAt` bump.
+       * Opt-in for fenced transitions whose losing branch must not write.
+       */
+      skipIfUnchanged?: boolean;
     },
   ): Promise<void> {
     if (this._state === 'closed') {
@@ -21413,6 +21473,7 @@ export class Session {
         // and produce no changed keys, so they never emit.
         const prevState = this._record.state;
         const updated = update(this._record);
+        if (opts?.skipIfUnchanged === true && updated === this._record) return;
         const tokenUsageDelta =
           typeof opts?.tokenUsageDelta === 'function' ? opts.tokenUsageDelta() : opts?.tokenUsageDelta;
         const tokenUsageForSave =
@@ -23989,6 +24050,24 @@ function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generati
     receipt.runId === generation.runId &&
     receipt.toolCallId === generation.toolCallId &&
     receipt.pendingRequestedAt === generation.pendingRequestedAt
+  );
+}
+
+/**
+ * The `discardPendingInteraction` receipt whose claim (`expiryStartedAt`) is
+ * stamped on `pending` in `record`, if that generation is discard-owned.
+ */
+function discardClaimReceipt(record: SessionRecord, pending: PendingResume): InboxResponseReceipt | undefined {
+  if (pending.expiryStartedAt === undefined) return undefined;
+  const generation: DiscardGeneration = {
+    kind: pending.kind,
+    itemId: pending.itemId ?? pending.toolCallId,
+    runId: pending.runId,
+    toolCallId: pending.toolCallId,
+    pendingRequestedAt: pending.requestedAt,
+  };
+  return Object.values(record.inboxResponseReceipts ?? {}).find(
+    receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
   );
 }
 

@@ -23,6 +23,7 @@ import {
   HarnessStorageError,
 } from './errors';
 import { Harness } from './harness';
+import { Session } from './session';
 
 interface RunSpec {
   finishReason: string;
@@ -30,11 +31,16 @@ interface RunSpec {
   text?: string;
   runId?: string;
   holdUntil?: Promise<void>;
+  /** Side effect of the approved tool running inside the resumed segment. */
+  executeTool?: () => void;
+  /** The run's stream ends, then its FullOutput rejects with this error. */
+  failAfterStream?: Error;
 }
 
 class FakeAgent extends Agent<any, any, any> {
   runs: RunSpec[] = [];
   resumeCalls: unknown[] = [];
+  streamCalls = 0;
 
   constructor() {
     super({ id: 'fake', name: 'fake', instructions: 'fake', model: 'openai/gpt-4o-mini' as any });
@@ -74,10 +80,12 @@ class FakeAgent extends Agent<any, any, any> {
         messages: [],
         rememberedMessages: [],
       },
+      ...(spec.failAfterStream ? { failAfterStream: spec.failAfterStream } : {}),
     });
   }
 
   async stream(_messages: any, options?: any): Promise<any> {
+    this.streamCalls += 1;
     const spec = this.runs.shift();
     if (!spec) throw new Error('FakeAgent: no run enqueued for stream()');
     await spec.holdUntil;
@@ -91,25 +99,35 @@ class FakeAgent extends Agent<any, any, any> {
     const spec = this.runs.shift();
     if (!spec) throw new Error('FakeAgent: no run enqueued for resumeStream()');
     await spec.holdUntil;
+    spec.executeTool?.();
     const out = this.buildOutput(spec, options?.runId);
     this._internalRegisterStreamRun(out, (options ?? {}) as any);
     return out;
   }
 }
 
-function newHarness(agent: FakeAgent, storage: InMemoryHarness) {
+function newHarness(agent: FakeAgent, storage: InMemoryHarness, sessionOptions: Record<string, unknown> = {}) {
   return new Harness({
     agents: { default: agent } as any,
     modes: [{ id: 'default', agentId: 'default' }],
     defaultModeId: 'default',
-    sessions: { storage },
+    sessions: { storage, ...sessionOptions },
   });
 }
 
-function setup() {
+function setup(sessionOptions: Record<string, unknown> = {}) {
   const agent = new FakeAgent();
   const storage = new InMemoryHarness({ db: new InMemoryDB() });
-  return { agent, storage, harness: newHarness(agent, storage) };
+  return { agent, storage, harness: newHarness(agent, storage, sessionOptions) };
+}
+
+/** Fail exactly the discard's phase-two clear (the claim commits). */
+function failDiscardClear(storage: InMemoryHarness) {
+  const save = storage.saveSession.bind(storage);
+  return vi.spyOn(storage, 'saveSession').mockImplementation(async (record, options) => {
+    if (record.pendingResume === undefined) throw new Error('process died before the clear');
+    return save(record, options);
+  });
 }
 
 function approvalRun(runId: string, toolCallId: string, toolName = 'start_research_workflow'): RunSpec {
@@ -314,10 +332,22 @@ describe('Session.discardPendingInteraction', () => {
   it('resolves an approval restored after a failed resume so the session can settle and delete (PF-7532)', async () => {
     const { harness, agent } = setup();
     const { session, pending } = await suspendedSession(harness, agent);
-    // The approved resume fails in-process; the approval is restored answerable.
+    // The approved tool runs (the research workflow starts), then the resumed
+    // segment fails before the harness observes the tool result, so
+    // `_revertFailedResumeAdmission` restores the approval as answerable.
+    let toolExecutions = 0;
+    agent.enqueueRun({
+      finishReason: 'error',
+      runId: 'run-A',
+      executeTool: () => {
+        toolExecutions += 1;
+      },
+      failAfterStream: new Error('continuation model call failed'),
+    });
     await expect(
       session.respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true }),
     ).rejects.toBeTruthy();
+    expect(toolExecutions).toBe(1);
     expect(session.getRecord().pendingResume?.resumedAt).toBeUndefined();
     expect(session.getRecord().inboxResponseReceipts?.['approve-1']).toMatchObject({
       status: 'failed',
@@ -338,6 +368,7 @@ describe('Session.discardPendingInteraction', () => {
       session.respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true }),
     ).rejects.toMatchObject({ code: 'harness.pending_interaction_discarded' });
     expect(agent.resumeCalls).toHaveLength(1);
+    expect(toolExecutions).toBe(1);
 
     await session.close();
     await expect(harness.deleteSession({ sessionId: session.id, resourceId: 'u' })).resolves.toBeUndefined();
@@ -368,6 +399,220 @@ describe('Session.discardPendingInteraction', () => {
     saveSpy.mockImplementation(save);
     await expect(session.discardPendingInteraction(input)).resolves.toMatchObject({ status: 'discarded' });
     expect(session.getRecord().pendingResume).toBeUndefined();
+    await harness.shutdown();
+  });
+
+  it('cold recovery of a half-committed discard does not start queued work', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    const successor = session.queue({ content: 'queued successor' });
+    void successor.catch(() => {});
+    await waitFor(() => session.getRecord().pendingQueue.length === 1, 'successor queued');
+    const sessionId = session.id;
+    const clearFails = failDiscardClear(storage);
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).rejects.toBeInstanceOf(HarnessStorageError);
+    clearFails.mockRestore();
+    await harness.shutdown();
+
+    // Make the claimed row due for the cold sweep (keep its generation intact).
+    const fixtureOwner = 'discard-cold-fixture';
+    const lease = await storage.acquireSessionLease({ sessionId, ownerId: fixtureOwner, ttlMs: 30_000 });
+    const stored = (await storage.loadSession({ sessionId }))!;
+    expect(stored.pendingResume?.expiryStartedAt).toBeDefined();
+    expect(stored.pendingQueue).toHaveLength(1);
+    await storage.saveSession(
+      {
+        ...stored,
+        ownerId: fixtureOwner,
+        leaseExpiresAt: lease.expiresAt,
+        pendingResume: { ...stored.pendingResume!, expiresAt: stored.pendingResume!.requestedAt },
+      },
+      { ownerId: fixtureOwner, ifVersion: lease.version },
+    );
+    await storage.releaseSessionLease({ sessionId, ownerId: fixtureOwner });
+
+    const agent2 = new FakeAgent();
+    agent2.enqueueRun({ finishReason: 'stop', runId: 'run-S', text: 'successor ran' });
+    const harness2 = newHarness(agent2, storage);
+    (harness2 as any)._stopPendingInteractionExpirySweepLoop();
+    const drainKicks = vi.spyOn(Session.prototype as any, '_maybeDrainQueue');
+    await harness2._tickPendingInteractionExpirySweep();
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const recovered = (await storage.loadSession({ sessionId }))!;
+    expect(recovered.pendingResume).toBeUndefined();
+    expect(Object.keys(recovered.expiredPendingInteractions ?? {})).toHaveLength(0);
+    expect(recovered.pendingQueue).toHaveLength(1);
+    expect(agent2.streamCalls).toBe(0);
+    // The sweep's transient session must not even start queue processing.
+    expect(drainKicks).not.toHaveBeenCalled();
+    drainKicks.mockRestore();
+    await harness2.shutdown();
+  });
+
+  it('expiry racing a claimed discard finishes it as the discard, with no expiry evidence', async () => {
+    const { harness, agent, storage } = setup({ pendingInteractionTtlMs: 600 });
+    const { session, pending } = await suspendedSession(harness, agent);
+    const clearFails = failDiscardClear(storage);
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).rejects.toBeInstanceOf(HarnessStorageError);
+    await waitFor(() => Date.now() > pending.expiresAt + 5, 'deadline passed');
+    clearFails.mockRestore();
+    (session as any)._clearPendingInteractionExpiryTimer();
+
+    await (session as any)._expirePendingInteraction({
+      kind: pending.kind,
+      itemId: generationOf(pending).itemId,
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      requestedAt: pending.requestedAt,
+      expiresAt: pending.expiresAt,
+    });
+
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(Object.keys(session.getRecord().expiredPendingInteractions ?? {})).toHaveLength(0);
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'already_resolved' });
+    await harness.shutdown();
+  });
+
+  it('an answer between the discard phases after the deadline gets the discard, not an expiry', async () => {
+    const { harness, agent, storage } = setup({ pendingInteractionTtlMs: 600 });
+    const { session, pending } = await suspendedSession(harness, agent);
+    const clearFails = failDiscardClear(storage);
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).rejects.toBeInstanceOf(HarnessStorageError);
+    await waitFor(() => Date.now() > pending.expiresAt + 5, 'deadline passed');
+    clearFails.mockRestore();
+    (session as any)._clearPendingInteractionExpiryTimer();
+
+    // A legacy answer (no generation identity) reaches the deadline path.
+    await expect(session.respondToToolApproval({ approved: false })).rejects.toBeInstanceOf(
+      HarnessPendingInteractionDiscardedError,
+    );
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(Object.keys(session.getRecord().expiredPendingInteractions ?? {})).toHaveLength(0);
+    // A generation-bound answer replays the same outcome.
+    await expect(
+      session.respondToToolApproval({ ...answerIdentity(pending), responseId: 'late-1', approved: false }),
+    ).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('a discard that loses to an answer admission writes nothing and reports busy', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    const save = storage.saveSession.bind(storage);
+    let releaseAdmission!: () => void;
+    const admissionGate = new Promise<void>(resolve => (releaseAdmission = resolve));
+    let admissionSeen = false;
+    let saves = 0;
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, options) => {
+      if (!admissionSeen && record.pendingResume?.resumedAt !== undefined) {
+        admissionSeen = true;
+        await admissionGate;
+      }
+      saves += 1;
+      return save(record, options);
+    });
+    let releaseResume!: () => void;
+    agent.enqueueRun({
+      finishReason: 'stop',
+      runId: 'run-A',
+      text: 'resumed',
+      holdUntil: new Promise<void>(resolve => (releaseResume = resolve)),
+    });
+    const resuming = session.respondToToolApproval({ approved: true });
+    await waitFor(() => admissionSeen, 'answer admission save in flight');
+    // Classification still sees an unresumed interaction; the claim queues
+    // behind the in-flight admission and must lose without writing.
+    const discarding = session.discardPendingInteraction({
+      ...generationOf(pending),
+      responseId: 'discard-1',
+      reason: 'run_settled',
+    });
+    releaseAdmission();
+    await expect(discarding).rejects.toBeInstanceOf(HarnessBusyError);
+    await waitFor(() => agent.resumeCalls.length === 1, 'resume started');
+    expect(saves).toBe(1);
+    expect(session.getRecord().inboxResponseReceipts?.['discard-1']).toBeUndefined();
+    releaseResume();
+    await expect(resuming).resolves.toMatchObject({ finishReason: 'stop' });
+    await harness.shutdown();
+  });
+
+  it('keeps the discard receipt through receipt pruning (64 failed answers)', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    for (let index = 0; index < 64; index += 1) {
+      await expect(
+        session.respondToToolApproval({ ...answerIdentity(pending), responseId: `approve-${index}`, approved: true }),
+      ).rejects.toBeTruthy();
+    }
+    expect(Object.keys(session.getRecord().inboxResponseReceipts ?? {})).toHaveLength(64);
+    const input = { ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' };
+
+    // Crash shape: the claim must still be identifiable as a discard.
+    const clearFails = failDiscardClear(storage);
+    await expect(session.discardPendingInteraction(input)).rejects.toBeInstanceOf(HarnessStorageError);
+    clearFails.mockRestore();
+    expect(session.getRecord().inboxResponseReceipts?.['discard-1']).toMatchObject({ status: 'failed' });
+
+    await expect(session.discardPendingInteraction(input)).resolves.toMatchObject({
+      status: 'already_resolved',
+      responseId: 'discard-1',
+    });
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(Object.keys(session.getRecord().expiredPendingInteractions ?? {})).toHaveLength(0);
+    await expect(session.discardPendingInteraction(input)).resolves.toMatchObject({ status: 'already_resolved' });
+    await harness.shutdown();
+  });
+
+  it('round-trips a "__proto__" responseId through storage and replays it', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    const input = { ...generationOf(pending), responseId: '__proto__', reason: 'run_settled' };
+    await expect(session.discardPendingInteraction(input)).resolves.toMatchObject({
+      status: 'discarded',
+      responseId: '__proto__',
+    });
+    const sessionId = session.id;
+    await harness.shutdown();
+
+    const harness2 = newHarness(new FakeAgent(), storage);
+    const restored = await harness2.session({ sessionId, resourceId: 'u' });
+    expect(Object.prototype.hasOwnProperty.call(restored.getRecord().inboxResponseReceipts ?? {}, '__proto__')).toBe(
+      true,
+    );
+    await expect(restored.discardPendingInteraction(input)).resolves.toMatchObject({
+      status: 'already_resolved',
+      responseId: '__proto__',
+    });
+    await harness2.shutdown();
+  });
+
+  it('a late answer for a discarded generation gets the discard while another interaction is pending', async () => {
+    const { harness, agent } = setup();
+    const { session, pending: first } = await suspendedSession(harness, agent);
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(first), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+    agent.enqueueRun(approvalRun('run-B', 'tc-B'));
+    await session.message({ content: 'next' });
+    const second = session.getRecord().pendingResume!;
+    expect(second.toolCallId).toBe('tc-B');
+
+    await expect(
+      session.respondToToolApproval({ ...answerIdentity(first), responseId: 'late-1', approved: false }),
+    ).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(session.getRecord().pendingResume).toEqual(second);
+    expect(agent.resumeCalls).toHaveLength(0);
     await harness.shutdown();
   });
 });
