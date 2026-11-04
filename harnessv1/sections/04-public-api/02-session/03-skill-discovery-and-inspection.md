@@ -40,6 +40,15 @@
   // proves the run is still active. Cancellation is not a session concern in
   // v1 — see §3.
   isBusy(): boolean;
+  // Narrower than `isBusy()`: true for an in-flight turn, an active queue
+  // drain, a drained queued item, a non-empty `pendingQueue`, or a pending
+  // resume that has not been cancelled. It ignores in-flight subagent
+  // executions, so a detached `task_delegate` child that outlives its parent
+  // turn reads `isBusy() === true` but `isTurnActive() === false`. An inline
+  // `spawn_subagent` still reads true through the turn that runs it. Hosts
+  // gating admission of a new user turn read this; shutdown and `waitForIdle`
+  // keep the broader `isBusy()` boundary.
+  isTurnActive(): boolean;
   waitForIdle(opts?: { timeout?: number }): Promise<void>;
   getQueueDepth(): number;
   getCurrentRunId(): string | null;
