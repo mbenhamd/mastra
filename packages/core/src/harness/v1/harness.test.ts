@@ -6103,6 +6103,36 @@ describe('Harness v1 — shutdown after another owner adopted a session (PF-7538
     expect(readSettled).toBe(true);
   });
 
+  it('a retry re-releases a lease whose original release hangs forever, then still fails naming the hung call', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-release-hangs-forever' });
+    let releaseCalls = 0;
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      if (input.sessionId !== session.id) return releaseSessionLease(input);
+      releaseCalls++;
+      // The first release never settles; later ones go through.
+      if (releaseCalls === 1) return new Promise<void>(() => {});
+      return releaseSessionLease(input);
+    });
+    const ownerOf = async () =>
+      (await storage.loadSession({ harnessName: session.getRecord().harnessName, sessionId: session.id }))?.ownerId;
+    const namesHungRelease = {
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`releaseSessionLease(${session.id})`),
+    };
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject(namesHungRelease);
+    expect(await ownerOf()).toBe(harness.ownerId);
+
+    // The retry releases the lease with a fresh call, but the original call is
+    // still pending, so it still fails, naming it.
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject(namesHungRelease);
+    expect(releaseCalls).toBe(2);
+    expect(await ownerOf()).toBeUndefined();
+  });
+
   it('attempts every lease release when one hangs, and a retry completes the unfinished one', async () => {
     const storage = makeStorage();
     const harness = makeHarness({ sessions: { storage } });

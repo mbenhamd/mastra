@@ -6668,10 +6668,11 @@ export class Harness {
         // The harness stays registered with Mastra until this succeeds, so
         // `Mastra.shutdown()` retries it instead of skipping it.
         const retryDeadlineAt = Date.now() + (opts?.drainTimeoutMs ?? this._closeTimeoutMs);
-        const failure =
-          (await this._settleStorageCallsBeforeDeadline(retryDeadlineAt)) ??
-          (await this._retryPendingLeaseReleases(retryDeadlineAt)) ??
-          (await this._settleStorageCallsBeforeDeadline(retryDeadlineAt));
+        // Re-attempt unfinished lease releases first, so a fresh release frees
+        // the lease even while an original release call still hangs; then
+        // wait for every tracked call (originals included, named on timeout).
+        const releaseFailure = await this._retryPendingLeaseReleases(retryDeadlineAt);
+        const failure = (await this._settleStorageCallsBeforeDeadline(retryDeadlineAt)) ?? releaseFailure;
         if (failure !== undefined) throw failure;
         this._shutdownFinalBarrierFailed = false;
         this._untrackBoundStorage();
