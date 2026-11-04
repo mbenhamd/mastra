@@ -1831,6 +1831,10 @@ export class Session {
   private _assistantDraftFlushUrgent = false;
   /** At most one draft checkpoint may be queued/running on the session CAS chain. */
   private _assistantDraftFlushInFlight: Promise<void> | undefined;
+  /** PF-7538: set when the Harness fenced this session because another owner holds its lease. */
+  private _evictedByLeaseLoss = false;
+  /** PF-7538: > 0 while a `_flushUpdate` link awaits an eviction it raised itself. */
+  private _flushLinkEvictionDepth = 0;
   /**
    * §SA3 — shared parent-local reservation count for inline `spawn_subagent`
    * and durable `task_delegate` work. It includes the create/link window so two
@@ -3267,6 +3271,13 @@ export class Session {
       }
       const inFlight = this._assistantDraftFlushInFlight;
       if (inFlight !== undefined) {
+        // PF-7538: an eviction raised from inside a `_flushUpdate` link drains
+        // event persistence (and so this barrier) while that link is still
+        // running. The in-flight checkpoint is that link or queued behind it
+        // on `_flushChain`, so awaiting it there never resolves. Every other
+        // eviction (renewal-detected lease loss, pressure, idle) keeps
+        // awaiting the checkpoint; a fenced checkpoint settles on its own.
+        if (this._state === 'evicted' && this._flushLinkEvictionDepth > 0) return;
         await inFlight;
         continue;
       }
@@ -6726,6 +6737,11 @@ export class Session {
   }
 
   /** Current lifecycle state. */
+  /** @internal PF-7538 — evicted because another owner holds the lease. */
+  get _internalEvictedByLeaseLoss(): boolean {
+    return this._state === 'evicted' && this._evictedByLeaseLoss;
+  }
+
   get lifecycleState(): SessionLifecycleState {
     return this._state;
   }
@@ -21073,6 +21089,59 @@ export class Session {
   }
 
   /**
+   * @internal PF-7538 — wait, without starting new writes, until no storage
+   * work this session already started is pending. Shutdown's final barrier.
+   * Covers every per-session tail and in-flight registry that issues storage
+   * calls: background turn completions (signal settlement, terminal CAS),
+   * result-evidence writes, signal settlements, terminal commits, recovered
+   * run publications, run-summary persistence, the `_flushChain` (record
+   * writes and draft checkpoints), the in-flight draft checkpoint, the
+   * event-persistence tail, the lease-renewal chain, orphaned-dispatch
+   * recovery, plan-task summary seeding and delegation reconcile. Failures
+   * stay with their owners; this only observes settlement, and loops until
+   * nothing new was registered while it waited.
+   */
+  async _internalSettleOutstandingWork(): Promise<void> {
+    const pending = (): Promise<unknown>[] => [
+      ...this._backgroundTurnCompletions,
+      ...this._resultEvidenceWrites,
+      ...this._signalResultSettlements.values(),
+      ...this._terminalCommitsByRunId.values(),
+      ...this._recoveredRunPublications.values(),
+      this._runSummaryPersistence,
+      this._flushChain,
+      this._eventPersistenceTail,
+      this._leaseRenewalChain,
+      ...[
+        this._assistantDraftFlushInFlight,
+        this._orphanRecovery,
+        this._planTaskSummarySeedPromise,
+        this._delegationReconcileInFlight,
+      ].filter((work): work is Promise<never> => work !== undefined),
+    ];
+    while (true) {
+      const before = pending();
+      await Promise.allSettled(before);
+      const after = pending();
+      if (after.length === before.length && after.every((work, index) => work === before[index])) return;
+    }
+  }
+
+  /**
+   * PF-7538: run an eviction raised from inside a `_flushUpdate` link, marking
+   * it reentrant so the assistant-draft barrier does not await the flush chain
+   * that this link is blocking.
+   */
+  private async _evictFromFlushLink(evict: () => Promise<unknown>): Promise<void> {
+    this._flushLinkEvictionDepth++;
+    try {
+      await evict();
+    } finally {
+      this._flushLinkEvictionDepth--;
+    }
+  }
+
+  /**
    * Apply an update to the in-memory record, CAS-write to storage, and
    * adopt the returned version. Single point of truth so every setter
    * stays consistent with the lease + version contract (§5.8).
@@ -21101,13 +21170,20 @@ export class Session {
       // serialize on the flush chain, so a conflict here means another owner).
       const maxRetries = opts?.ifVersion !== undefined ? 0 : 1;
       for (let attempt = 0; ; attempt++) {
+        // PF-7538: a link queued on `_flushChain` before a lease-loss eviction
+        // runs after it. Re-check here, as the pre-enqueue guard above does, so
+        // a fenced session never writes storage again. Pressure and idle
+        // evictions still hold the lease, so their queued links keep writing.
+        if (this._state === 'evicted' && this._evictedByLeaseLoss) {
+          throw new HarnessSessionClosedError(this.id);
+        }
         const leaseExpiresAt = this._record.leaseExpiresAt;
         if (
           (this._state === 'live' || this._state === 'closing') &&
           leaseExpiresAt !== undefined &&
           leaseExpiresAt <= Date.now()
         ) {
-          await this._harness._internalEvictLiveSessionLeaseLost(this);
+          await this._evictFromFlushLink(() => this._harness._internalEvictLiveSessionLeaseLost(this));
           throw new HarnessSessionLockedError(this.id, 'unknown', leaseExpiresAt);
         }
         if (opts?.ifVersion !== undefined && this._record.version !== opts.ifVersion) {
@@ -21287,7 +21363,7 @@ export class Session {
           // conflict). Fence the WHOLE live subtree rather than only this session
           // or retrying into a contested record.
           if (err instanceof HarnessStorageLeaseConflictError) {
-            await this._harness._internalEvictSubtreeLeaseLost(this);
+            await this._evictFromFlushLink(() => this._harness._internalEvictSubtreeLeaseLost(this));
             throw new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt);
           }
           if (!(err instanceof HarnessStorageVersionConflictError) || attempt >= maxRetries) {
@@ -21299,16 +21375,18 @@ export class Session {
           // ownership loss or subtree split. The helper renews root + active
           // descendants and fences the whole subtree (throwing locked/not-found)
           // if ownership can't be proven.
-          await this._harness._internalRenewProveSubtree(
-            this,
-            this._getEffectiveLeaseTtlMs(this._harness._internalLeaseTtlMs),
+          await this._evictFromFlushLink(() =>
+            this._harness._internalRenewProveSubtree(
+              this,
+              this._getEffectiveLeaseTtlMs(this._harness._internalLeaseTtlMs),
+            ),
           );
           const reloaded = await this._storage.loadSession({
             harnessName: this._record.harnessName,
             sessionId: this.id,
           });
           if (!reloaded) {
-            await this._harness._internalEvictLiveSessionLeaseLost(this);
+            await this._evictFromFlushLink(() => this._harness._internalEvictLiveSessionLeaseLost(this));
             throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
           }
           // Adopt the concurrent durable state under our proven lease, then loop
@@ -21992,8 +22070,9 @@ export class Session {
    * instance from the live map (§5.4). The record stays active in storage;
    * the session can be re-hydrated. Currently unused; lands with eviction.
    */
-  _markEvicted(updatedRecord: SessionRecord): void {
+  _markEvicted(updatedRecord: SessionRecord, reason?: 'lease_lost' | 'pressure' | 'idle'): void {
     const err = new HarnessValidationError('session.evict()', 'Session evicted');
+    this._evictedByLeaseLoss = reason === 'lease_lost';
     this._leaseExtensionDeadline = undefined;
     this._clearPendingInteractionExpiryTimer();
     this._record = updatedRecord;
