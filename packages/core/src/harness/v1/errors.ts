@@ -668,7 +668,16 @@ export class HarnessPendingInteractionDiscardedError extends HarnessError {
         return fallback;
       }
     };
-    const error = new HarnessPendingInteractionDiscardedError(field(2, ''), field(1, ''), field(3, 'discarded'));
+    // Projections written before the JSON-literal encoding used
+    // `... "<item>" for session "<sess>" was discarded (<reason>)`.
+    const legacy =
+      match === null
+        ? /^Pending interaction "(.*)" for session "(.*)" was discarded \((.*)\)$/s.exec(projection.message)
+        : null;
+    const error =
+      legacy !== null
+        ? new HarnessPendingInteractionDiscardedError(legacy[2] ?? '', legacy[1] ?? '', legacy[3] ?? 'discarded')
+        : new HarnessPendingInteractionDiscardedError(field(2, ''), field(1, ''), field(3, 'discarded'));
     if (error.message !== projection.message) {
       Object.defineProperty(error, 'message', { value: projection.message, configurable: true, writable: true });
     }

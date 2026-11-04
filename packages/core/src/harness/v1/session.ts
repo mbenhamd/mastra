@@ -16738,7 +16738,7 @@ export class Session {
         claimed = { pending: { ...current, expiryStartedAt: discardedAt, expiresAt: discardedAt }, receipt };
         return { ...prev, pendingResume: claimed.pending, inboxResponseReceipts };
       },
-      { skipIfUnchanged: true },
+      { skipIfUnchanged: true, keepPendingResume: true },
     );
     return claimed;
   }
@@ -21827,6 +21827,12 @@ export class Session {
        * Opt-in for fenced transitions whose losing branch must not write.
        */
       skipIfUnchanged?: boolean;
+      /**
+       * Never let the size-budget guard drop `pendingResume` on this write:
+       * when it would, reject the write instead. Used by the discard claim,
+       * whose `pendingResume` is the recovery marker until settlement ends.
+       */
+      keepPendingResume?: boolean;
     },
   ): Promise<void> {
     if (this._state === 'closed') {
@@ -21945,6 +21951,17 @@ export class Session {
               pending.requestedAt !== undefined &&
               safeSerializedSize(pending) > serializedSize / 4
             ) {
+              if (opts?.keepPendingResume === true) {
+                throw new HarnessStorageError({
+                  operation: 'session_save',
+                  cause: new Error('session record would exceed the size budget'),
+                  retryable: false,
+                  sessionId: this.id,
+                  resourceId: this.resourceId,
+                  threadId: this.threadId,
+                  harnessName: this._record.harnessName,
+                });
+              }
               next.expiredPendingInteractions = appendExpiredPendingInteraction(next.expiredPendingInteractions, {
                 generationKey: pendingInteractionGenerationKey({
                   kind: pending.kind,
@@ -24476,17 +24493,33 @@ function cancelledPendingAudit(
   pending: PendingResume,
   cancelRequest: NonNullable<SessionRecord['cancelRequest']>,
 ): NonNullable<InboxResponseReceipt['cancelledPendingResume']> {
-  const {
-    runtimeDependencies: _runtimeDependencies,
-    requestContext: _requestContext,
-    toolSurfaceFence: _toolSurfaceFence,
-    toolReceipts: _toolReceipts,
-    toolReceiptsOverflow: _toolReceiptsOverflow,
-    observationalMemorySourceWriteGuard: _observationalMemorySourceWriteGuard,
-    accountedTokenUsage: _accountedTokenUsage,
-    ...audit
-  } = pending;
-  return { ...audit, cancelRequest: { ...cancelRequest } };
+  // Identity and audit fields only — never payloads, suspend data or args —
+  // so the copy cannot push the claim write toward the record size budget.
+  return {
+    kind: pending.kind,
+    itemId: pending.itemId ?? pending.toolCallId,
+    runId: pending.runId,
+    toolCallId: pending.toolCallId,
+    requestedAt: pending.requestedAt,
+    expiresAt: pending.expiresAt,
+    ...(pending.toolName !== undefined ? { toolName: boundedAuditString(pending.toolName) } : {}),
+    cancelRequest: {
+      requestedAt: cancelRequest.requestedAt,
+      ...(cancelRequest.reason !== undefined ? { reason: boundedAuditString(cancelRequest.reason) } : {}),
+      ...(cancelRequest.requestedBy !== undefined
+        ? { requestedBy: boundedAuditString(cancelRequest.requestedBy) }
+        : {}),
+    },
+  };
+}
+
+const MAX_AUDIT_STRING_LENGTH = 256;
+const AUDIT_TRUNCATION_MARKER = '…[truncated]';
+
+function boundedAuditString(value: string): string {
+  return value.length <= MAX_AUDIT_STRING_LENGTH
+    ? value
+    : `${value.slice(0, MAX_AUDIT_STRING_LENGTH - AUDIT_TRUNCATION_MARKER.length)}${AUDIT_TRUNCATION_MARKER}`;
 }
 
 /** Whether `receipt`'s generation was resolved by `discardPendingInteraction`. */

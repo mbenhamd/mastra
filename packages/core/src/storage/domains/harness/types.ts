@@ -1256,20 +1256,22 @@ export interface InboxResponseReceipt {
   discardedAt?: number;
   /**
    * Discard receipts only: when the session had a durable `cancelRequest`,
-   * the cancelled `pendingResume` (which cancellation keeps as audit
-   * evidence) is preserved here, minus runtime-internal fields, before the
-   * discard clears it so the session can settle and be deleted.
+   * the cancelled `pendingResume`'s identity and audit fields (which
+   * cancellation keeps as evidence) are preserved here — never payloads —
+   * before the discard clears it so the session can settle and be deleted.
    */
-  cancelledPendingResume?: Omit<
-    PendingResume,
-    | 'runtimeDependencies'
-    | 'requestContext'
-    | 'toolSurfaceFence'
-    | 'toolReceipts'
-    | 'toolReceiptsOverflow'
-    | 'observationalMemorySourceWriteGuard'
-    | 'accountedTokenUsage'
-  > & { cancelRequest: NonNullable<SessionRecord['cancelRequest']> };
+  cancelledPendingResume?: {
+    kind: PendingResume['kind'];
+    itemId: string;
+    runId: string;
+    toolCallId: string;
+    requestedAt: number;
+    expiresAt: number;
+    /** Bounded (256 chars, truncation marker). */
+    toolName?: string;
+    /** `reason` / `requestedBy` bounded (256 chars, truncation marker). */
+    cancelRequest: NonNullable<SessionRecord['cancelRequest']>;
+  };
   updatedAt: number;
 }
 

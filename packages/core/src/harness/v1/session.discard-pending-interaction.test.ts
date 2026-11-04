@@ -1145,4 +1145,62 @@ describe('Session.discardPendingInteraction', () => {
     await expect(harness.deleteSession({ sessionId: session.id, resourceId: 'u' })).resolves.toBeUndefined();
     await harness.shutdown();
   });
+
+  it('a large cancelled interaction keeps its discard claim marker until settlement succeeds', async () => {
+    const { harness, agent, storage } = setup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      runId: 'run-B',
+      suspendPayload: {
+        toolCallId: 'tc-B',
+        toolName: 'start_research_workflow',
+        args: { blob: 'x'.repeat(500_000) },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const handle = await session.signal({ content: 'large approval' });
+    void handle.result.catch(() => {});
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'signal turn parked');
+    const pending = session.getRecord().pendingResume!;
+    expect(JSON.stringify(pending.payload).length).toBeGreaterThan(400_000);
+
+    const write = storage.writeMessageResultEvidence.bind(storage);
+    let failSignalWrites = true;
+    vi.spyOn(storage, 'writeMessageResultEvidence').mockImplementation(async (record, options) => {
+      if (failSignalWrites && record.status === 'failed') throw new Error('signal evidence write failed');
+      return write(record, options);
+    });
+    await session.cancel({ reason: 'user_cancelled' });
+    expect(session.getRecord().pendingResume).toBeDefined();
+
+    const input = { ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' };
+    await expect(session.discardPendingInteraction(input)).rejects.toBeInstanceOf(HarnessStorageError);
+    expect(session.getRecord().pendingResume?.expiryStartedAt).toBeDefined();
+    const audit = session.getRecord().inboxResponseReceipts?.['discard-1']?.cancelledPendingResume;
+    expect(audit).toMatchObject({ toolCallId: 'tc-B', cancelRequest: { reason: 'user_cancelled' } });
+    expect(JSON.stringify(audit).length).toBeLessThan(2_000);
+    // Still unresolved while the signal evidence cannot be written.
+    await expect(session.discardPendingInteraction(input)).rejects.toBeInstanceOf(HarnessStorageError);
+    expect(session.getRecord().pendingResume).toBeDefined();
+
+    failSignalWrites = false;
+    await expect(session.discardPendingInteraction(input)).resolves.toMatchObject({ status: 'already_resolved' });
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    const evidence = await session.lookupMessageResult(handle.id);
+    expect(evidence && 'status' in evidence ? evidence.status : null).toBe('failed');
+    await harness.shutdown();
+  });
+
+  it('decodes discard projections written in the earlier message format', () => {
+    const legacy = HarnessPendingInteractionDiscardedError.fromProjection({
+      message: 'Pending interaction "item-1" for session "sess-1" was discarded (run_settled)',
+    });
+    expect(legacy).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect({ sessionId: legacy.sessionId, itemId: legacy.itemId, reason: legacy.reason }).toEqual({
+      sessionId: 'sess-1',
+      itemId: 'item-1',
+      reason: 'run_settled',
+    });
+    expect(legacy.message).toBe('Pending interaction "item-1" for session "sess-1" was discarded (run_settled)');
+  });
 });
