@@ -22,12 +22,19 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { RequestContext } from '../../request-context';
+import type {
+  CompareAndSwapSignalTerminalInput,
+  CompareAndSwapSignalTerminalResult,
+  HarnessRunSummary,
+  SaveRunSummaryInput,
+} from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { createTool } from '../../tools';
 
 import { MockAgent } from './__test-utils__';
 import { sha256CanonicalJson } from './canonical-json';
+import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 import {
   createPlanTaskTools,
@@ -92,6 +99,7 @@ function buildHarness(
     maxLive?: number;
     allowInline?: boolean;
     inheritRequestContextAppKeys?: string[];
+    storage?: InMemoryHarness;
   } = {},
 ): { harness: Harness; parentAgent: MockAgent; childAgent: MockAgent } {
   const parentAgent = new MockAgent({ id: 'parent-agent' });
@@ -99,7 +107,7 @@ function buildHarness(
     id: 'child-agent',
     defaultOutput: { terminalToolResult: outcomeTerminalResult() },
   });
-  const storage = new InMemoryHarness({ db });
+  const storage = opts.storage ?? new InMemoryHarness({ db });
   const harness = new Harness({
     agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
     modes: [
@@ -2033,6 +2041,177 @@ describe('task_delegate — recovery on rehydrate', () => {
       await b.harness.shutdown();
     } finally {
       clock.mockRestore();
+    }
+  });
+
+  // PF-7499 setup shared by the rows below: harness A dies while the delegated
+  // child's admitted provider call is in flight (dispatch `accepted`), its
+  // leases lapse, and the clock moves past the accepted-receipt staleness window.
+  async function crashWithDelegatedChildMidCall(db: InMemoryDB) {
+    const a = buildHarness(db);
+    a.childAgent.enqueueRun({ holdUntil: new Promise<void>(() => {}), finishReason: 'stop' });
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeParentTurn = await openParentTurn(parentA, a.parentAgent);
+    const toolsA = createPlanTaskTools(parentA);
+    const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'research' } as any, toolCtx)) as any;
+    const delegated = (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    const childId: string = delegated.subagentSessionId;
+    const childEvidence = () => [...db.harnessMessageResultEvidence.values()].find(row => row.sessionId === childId);
+    await poll(() => childEvidence()?.dispatch?.state === 'accepted');
+    const runId = childEvidence()!.runId!;
+    closeParentTurn();
+    crashOwner(db, (parentA as any)._internalOwnerId);
+    const realNow = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 60_000);
+    return { parentId: parentA.id, taskId: task.taskId as string, childId, runId, childEvidence, clock };
+  }
+
+  function crashOwner(db: InMemoryDB, ownerId: string): void {
+    for (const [key, row] of db.harnessSessions) {
+      if (row.ownerId === ownerId) {
+        db.harnessSessions.set(key, { ...row, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
+      }
+    }
+  }
+
+  function collectCompletions(harness: Harness, runId: string) {
+    const events: HarnessEvent[] = [];
+    harness.subscribe(event => events.push(event));
+    return {
+      agentEnds: () => events.filter(event => event.type === 'agent_end' && event.runId === runId),
+      runCompletions: () => events.filter(event => event.type === 'run_completed' && event.runId === runId),
+    };
+  }
+
+  // An adapter whose terminal CAS does not enforce the lease precondition (as
+  // LibSQL's does not): the interrupting adopter pauses, its lease lapses, and
+  // adopter C takes the child before the write lands.
+  class UnfencedTakeoverStorage extends InMemoryHarness {
+    interruptedWritesOverForeignLease = 0;
+    constructor(private readonly memory: InMemoryDB) {
+      super({ db: memory });
+    }
+    override get supportsDispatchRecovery(): boolean {
+      return false;
+    }
+    override async compareAndSwapSignalTerminal(
+      input: CompareAndSwapSignalTerminalInput,
+    ): Promise<CompareAndSwapSignalTerminalResult> {
+      if (input.terminal.status === 'failed' && input.terminal.error.code === 'harness.run_interrupted') {
+        for (const [key, row] of this.memory.harnessSessions) {
+          if (row.id === input.sessionId) {
+            this.memory.harnessSessions.set(key, { ...row, ownerId: 'adopter-c', leaseExpiresAt: Date.now() + 60_000 });
+          }
+        }
+        const result = await super.compareAndSwapSignalTerminal({ ...input, leaseOwner: undefined });
+        if (result.applied) this.interruptedWritesOverForeignLease++;
+        return result;
+      }
+      return super.compareAndSwapSignalTerminal(input);
+    }
+  }
+
+  it('does not interrupt a delegated child through a terminal write the adapter cannot fence on the lease', async () => {
+    const db = new InMemoryDB();
+    const crashed = await crashWithDelegatedChildMidCall(db);
+    try {
+      const storage = new UnfencedTakeoverStorage(db);
+      const b = buildHarness(db, { storage });
+      await b.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(
+        () =>
+          storage.interruptedWritesOverForeignLease > 0 ||
+          b.childAgent.streamCalls.length > 0 ||
+          crashed.childEvidence()?.status !== 'pending',
+        5_000,
+      );
+
+      expect(storage.interruptedWritesOverForeignLease).toBe(0);
+      expect(crashed.childEvidence()).not.toMatchObject({
+        status: 'failed',
+        error: { code: 'harness.run_interrupted' },
+      });
+      await b.harness.shutdown();
+    } finally {
+      crashed.clock.mockRestore();
+    }
+  });
+
+  // Fails the delegated run's summary write: once, or by never returning (its
+  // writer dies). Other runs' summaries are written normally.
+  class FailingRunSummaryStorage extends InMemoryHarness {
+    saveAttempts = 0;
+    constructor(
+      db: InMemoryDB,
+      private readonly runId: string,
+      private readonly failure: 'once' | 'hang',
+    ) {
+      super({ db });
+    }
+    override async saveRunSummary(input: SaveRunSummaryInput): Promise<HarnessRunSummary | null> {
+      if (input.summary.runId !== this.runId) return super.saveRunSummary(input);
+      this.saveAttempts++;
+      if (this.failure === 'hang') return new Promise<HarnessRunSummary | null>(() => {});
+      if (this.saveAttempts === 1) throw new Error('transient run-summary write failure');
+      return super.saveRunSummary(input);
+    }
+  }
+
+  it('publishes an interrupted delegation completion on a later reconcile after its publication failed', async () => {
+    const db = new InMemoryDB();
+    const crashed = await crashWithDelegatedChildMidCall(db);
+    try {
+      const storage = new FailingRunSummaryStorage(db, crashed.runId, 'once');
+      const b = buildHarness(db, { storage });
+      const completions = collectCompletions(b.harness, crashed.runId);
+      const parentB = await b.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(async () => (await planRow(parentB, crashed.taskId))?.status === 'failed', 5_000);
+
+      expect(storage.saveAttempts).toBeGreaterThanOrEqual(2);
+      await expect(storage.loadRunSummary({ harnessName: 'default', runId: crashed.runId })).resolves.toMatchObject({
+        runId: crashed.runId,
+        sessionId: crashed.childId,
+      });
+      expect(completions.agentEnds()).toHaveLength(1);
+      expect(completions.runCompletions()).toHaveLength(1);
+      expect(b.childAgent.streamCalls).toHaveLength(0);
+      await b.harness.shutdown();
+    } finally {
+      crashed.clock.mockRestore();
+    }
+  });
+
+  it('publishes an interrupted delegation completion when the interrupting owner died before publishing it', async () => {
+    const db = new InMemoryDB();
+    const crashed = await crashWithDelegatedChildMidCall(db);
+    try {
+      // B commits the interruption, then dies inside its publication.
+      const storageB = new FailingRunSummaryStorage(db, crashed.runId, 'hang');
+      const b = buildHarness(db, { storage: storageB });
+      // Hydration runs the reconcile pass, so B's adoption never returns.
+      void b.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(() => storageB.saveAttempts > 0 && crashed.childEvidence()?.status === 'failed', 5_000);
+      crashOwner(db, b.harness.ownerId);
+
+      const c = buildHarness(db);
+      const completions = collectCompletions(c.harness, crashed.runId);
+      const parentC = await c.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(async () => (await planRow(parentC, crashed.taskId))?.status === 'failed', 5_000);
+
+      expect(crashed.childEvidence()).toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
+      await expect(
+        parentC._internalStorage.loadRunSummary({ harnessName: 'default', runId: crashed.runId }),
+      ).resolves.toMatchObject({ runId: crashed.runId, sessionId: crashed.childId });
+      expect(completions.agentEnds()).toHaveLength(1);
+      expect(completions.runCompletions()).toHaveLength(1);
+      expect(b.childAgent.streamCalls).toHaveLength(0);
+      expect(c.childAgent.streamCalls).toHaveLength(0);
+      await c.harness.shutdown();
+    } finally {
+      crashed.clock.mockRestore();
     }
   });
 

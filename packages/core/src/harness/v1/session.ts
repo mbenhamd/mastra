@@ -23218,12 +23218,21 @@ export class Session {
   /**
    * Make child closure the prerequisite for clearing its plan ownership edge.
    * Returns false on a transient/foreign-lease failure so the caller can retain
-   * the link and retry; a closed child is already safe.
+   * the link and retry; a closed child is already safe. With
+   * `publishAdmissionId`, the child first publishes that delegation's
+   * recovered completion (PF-7499); a publication failure also returns false.
    */
-  private async _closeDelegatedChildForSettlement(childRecord: SessionRecord): Promise<boolean> {
+  private async _closeDelegatedChildForSettlement(
+    childRecord: SessionRecord,
+    publishAdmissionId?: string,
+  ): Promise<boolean> {
     if (childRecord.closedAt !== undefined) return true;
     try {
       const child = await this._harness.session({ sessionId: childRecord.id, resourceId: this.resourceId });
+      // A recovered completion is published before the child closes and the
+      // task settles: until then the open child and its link keep it owed, so
+      // a failed or crashed publication is retried by the next scan.
+      if (publishAdmissionId !== undefined) await child._publishRecoveredDelegationCompletion(publishAdmissionId);
       await child.close();
       return true;
     } catch {
@@ -23343,7 +23352,9 @@ export class Session {
    *
    * `reattach`: nothing was dispatched yet, the run is parked for a HITL
    * response, or it is still live/settling in this process — re-issuing the
-   * admitted signal observes it. `retry`: another dispatch claim is still
+   * admitted signal observes it; also on an adapter without
+   * `supportsDispatchRecovery`, which cannot fence the settlement on this
+   * lease. `retry`: another dispatch claim is still
    * live, or the settlement did not commit (moved lease, changed dispatch).
    * `interrupted`: the admission is terminal (by this interruption or a
    * concurrent winner); settle the task from the durable evidence.
@@ -23372,6 +23383,11 @@ export class Session {
       return 'reattach';
     }
     if (dispatch.state === 'dispatching' && dispatch.claimExpiresAt > Date.now()) return 'retry';
+    // The settlement is fenced on this lease only where the adapter enforces
+    // the lease precondition at commit, as message recovery requires. An
+    // unfenced write could terminalize an admission a later adopter owns, so
+    // other adapters keep the re-attach path.
+    if (!this._storage.supportsDispatchRecovery) return 'reattach';
     const error = { code: HARNESS_RUN_INTERRUPTED_ERROR_CODE, message: HARNESS_RUN_INTERRUPTED_MESSAGE };
     const leaseOwner = { ownerId: this._harness.ownerId };
     // A pending native terminal admission settles through its finalizer, as in
@@ -23392,12 +23408,38 @@ export class Session {
       terminal: { status: 'failed', signalId: identity.signalId, runId, error },
       updatedAt: Date.now(),
     });
+    // A lost CAS means the dispatch changed or the lease moved.
     if (swapped.evidence.status === 'pending') return 'retry';
-    if (swapped.applied) {
-      // As in message recovery, the dead run's completion is published once.
-      await this._publishRecoveredRunCompletion(swapped.evidence).catch(() => {});
-    }
+    // The completion is published by the settlement, before the child closes.
     return 'interrupted';
+  }
+
+  /**
+   * @internal — publish a recovered delegation run's completion once, from the
+   * canonical settled evidence: `agent_end` and the reconstructed
+   * `run_completed`, acknowledged by the durable run summary (as message
+   * recovery does). A run whose summary exists is already published. Throws
+   * when publication fails, so the caller keeps the child open and the task
+   * linked, and a later scan retries it.
+   */
+  async _publishRecoveredDelegationCompletion(admissionId: string): Promise<void> {
+    if (!this._storage.supportsDispatchRecovery) return;
+    const loaded = await this._storage.loadMessageResultEvidence({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      signalId: this._signalAdmissionIdentity(admissionId).signalId,
+    });
+    if (!loaded || !('status' in loaded)) return;
+    const evidence = loaded as AgentSignalResultEvidence;
+    if (evidence.runId === undefined) return;
+    if (
+      (evidence.status === 'completed' && evidence.erased !== true) ||
+      (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE)
+    ) {
+      await this._publishRecoveredRunCompletion(evidence);
+    }
   }
 
   /**
@@ -23562,7 +23604,7 @@ export class Session {
         delegationAttempt.deadlineAt,
       );
       if (durable !== undefined) {
-        if (!(await this._closeDelegatedChildForSettlement(childRecord))) {
+        if (!(await this._closeDelegatedChildForSettlement(childRecord, this._delegationAdmissionId(task.taskId)))) {
           needsRetry = true;
           continue;
         }
@@ -23660,7 +23702,10 @@ export class Session {
                 delegationAttempt.deadlineAt,
               )
             : undefined;
-        if (interrupted === undefined || !(await this._closeDelegatedChildForSettlement(child.getRecord()))) {
+        if (
+          interrupted === undefined ||
+          !(await this._closeDelegatedChildForSettlement(child.getRecord(), this._delegationAdmissionId(task.taskId)))
+        ) {
           needsRetry = true;
           continue;
         }
