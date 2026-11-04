@@ -248,6 +248,12 @@ export interface PendingResume {
   /** Receipt collection exceeded its bounded count/byte budget; verify closed. */
   toolReceiptsOverflow?: boolean;
   /**
+   * Steps and provider tokens a subagent child with a per-type budget
+   * (`SubagentDefinition.maxSteps` / `maxTotalTokens`) had spent when it
+   * suspended. Restored on resume so a restart does not grant a fresh budget.
+   */
+  subagentBudgetSpent?: { steps: number; tokens: number };
+  /**
    * Idempotency marker. Set by the resume helper before calling
    * `agent.resumeStream(...)` and observed on replay so a crash between
    * "wrote resumedAt" and "cleared pendingResume" does not double-resume.
@@ -1246,6 +1252,32 @@ export interface InboxResponseReceipt {
   appliedAt?: number;
   failedAt?: number;
   deadAt?: number;
+  /**
+   * Present only on the receipt written by `session.discardPendingInteraction`.
+   * Equals the `expiryStartedAt` claim stamped on the discarded pending
+   * generation, so a crash between the claim and the clear completes as a
+   * discard (not an expiry). Such a receipt is always `failed` and not
+   * retryable; replays resolve to the same discard outcome.
+   */
+  discardedAt?: number;
+  /**
+   * Discard receipts only: when the session had a durable `cancelRequest`,
+   * the cancelled `pendingResume`'s identity and audit fields (which
+   * cancellation keeps as evidence) are preserved here — never payloads —
+   * before the discard clears it so the session can settle and be deleted.
+   */
+  cancelledPendingResume?: {
+    kind: PendingResume['kind'];
+    itemId: string;
+    runId: string;
+    toolCallId: string;
+    requestedAt: number;
+    expiresAt: number;
+    /** Bounded (256 chars, truncation marker). */
+    toolName?: string;
+    /** `reason` / `requestedBy` bounded (256 chars, truncation marker). */
+    cancelRequest: NonNullable<SessionRecord['cancelRequest']>;
+  };
   updatedAt: number;
 }
 

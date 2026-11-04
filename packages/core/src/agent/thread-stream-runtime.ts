@@ -843,6 +843,14 @@ type AgentThreadRuntimeState = {
   suspendedRunIds: Set<string>;
   suspensionMetadataByRunId: Map<string, Map<string | undefined, AgentThreadRunSuspension>>;
   pendingSignalsByThread: Map<string, CreatedAgentSignal[]>;
+  /**
+   * Per thread key, ids of queued signals sent with `ifActive.expireWithRun`,
+   * mapped to the run they were queued for:
+   * they belong to the run they were queued for. One that run did not consume
+   * is dropped when it ends or loses the thread, never replayed as a
+   * follow-up run or handed to another owner.
+   */
+  runScopedSignalIdsByThread: Map<string, Map<string, string>>;
   // Signal IDs this runtime queued locally before publishing them, mapped to the owner run they were
   // later forwarded to (if any). Replays of these are echoes, except one addressed to that forwarded owner.
   locallyQueuedSignalIdsByThread: Map<string, Map<string, string | undefined>>;
@@ -1252,6 +1260,7 @@ function createRuntimeState(): AgentThreadRuntimeState {
     suspendedRunIds: new Set(),
     suspensionMetadataByRunId: new Map(),
     pendingSignalsByThread: new Map(),
+    runScopedSignalIdsByThread: new Map(),
     locallyQueuedSignalIdsByThread: new Map(),
     pendingSignalListenersByRunId: new Map(),
     preRunSignalsByThread: new Map(),
@@ -1329,6 +1338,9 @@ type ThreadLeaseOperationProvenance = {
 };
 
 let agentThreadRuntimeInstanceSequence = 0;
+
+/** PF-7473: shared empty result for the common no-run-scoped-signal path. */
+const NO_RUN_SCOPED_SIGNALS: ReadonlySet<string> = new Set<string>();
 
 export class AgentThreadStreamRuntime {
   // Upstream parity (PF-5928): resolved lazily by `#getSourceId()`, from
@@ -4729,6 +4741,13 @@ export class AgentThreadStreamRuntime {
     state.threadKeysByRunId.set(runId, toKey);
     this.#resolveReservationWaiters(state, runId);
 
+    const runScoped = state.runScopedSignalIdsByThread.get(fromKey);
+    if (runScoped) {
+      state.runScopedSignalIdsByThread.delete(fromKey);
+      const merged = state.runScopedSignalIdsByThread.get(toKey) ?? new Map<string, string>();
+      for (const [id, owner] of runScoped) merged.set(id, owner);
+      state.runScopedSignalIdsByThread.set(toKey, merged);
+    }
     const pendingSignals = state.pendingSignalsByThread.get(fromKey);
     if (pendingSignals?.length) {
       state.pendingSignalsByThread.delete(fromKey);
@@ -5498,6 +5517,7 @@ export class AgentThreadStreamRuntime {
     state.suspendedRunIds.clear();
     state.suspensionMetadataByRunId.clear();
     state.pendingSignalsByThread.clear();
+    state.runScopedSignalIdsByThread.clear();
     state.locallyQueuedSignalIdsByThread.clear();
     state.preRunSignalsByThread.clear();
     state.lostRunsByThread.clear();
@@ -5953,6 +5973,7 @@ export class AgentThreadStreamRuntime {
       ];
       state.pendingSignalsByThread.delete(key);
       state.preRunSignalsByThread.delete(key);
+      state.runScopedSignalIdsByThread.delete(key);
       // PF-6944: discarded input may have been admitted under an earlier
       // reservation that kept it (an idle wake that lost its lease without a
       // winner). Forget exactly these records, whichever run they name, so a
@@ -7313,6 +7334,7 @@ export class AgentThreadStreamRuntime {
             rejectTerminal(terminalError);
             this.#clearSuspendedRun(state, record.runId);
             state.pendingSignalsByThread.delete(key);
+            this.#dropRunScopedSignals(state, pubsub, key, owner => owner === record.runId);
             state.threadRunsByStreamId.delete(record.streamId);
             if (
               state.activeThreadRunIds.get(key) === record.runId &&
@@ -7348,6 +7370,7 @@ export class AgentThreadStreamRuntime {
           );
           this.#clearSuspendedRun(state, record.runId);
           state.pendingSignalsByThread.delete(key);
+          this.#dropRunScopedSignals(state, pubsub, key, owner => owner === record.runId);
           state.threadRunsByStreamId.delete(record.streamId);
           if (
             state.activeThreadRunIds.get(key) === record.runId &&
@@ -7395,6 +7418,8 @@ export class AgentThreadStreamRuntime {
     runId: string,
     lostStreamId: string,
   ) {
+    // PF-7473: a run-scoped signal is never handed to another execution.
+    this.#dropRunScopedSignals(state, pubsub, key);
     // Idle messages and continuations start new runs once the thread is idle,
     // so they stay here and start when that execution's run ends.
     if (state.pendingIdleSignalsByThread.get(key)?.length || state.pendingContinuationsByThread.get(key)?.length) {
@@ -7457,6 +7482,51 @@ export class AgentThreadStreamRuntime {
     timer.unref?.();
   }
 
+  /**
+   * PF-7473: a run-scoped signal its run never consumed expires with that run.
+   * Dropped before any follow-up run is chosen, so it can never start one.
+   */
+  #markRunScopedSignal(state: AgentThreadRuntimeState, key: string, signalId: string, ownerRunId: string) {
+    const ids = state.runScopedSignalIdsByThread.get(key) ?? new Map<string, string>();
+    ids.set(signalId, ownerRunId);
+    state.runScopedSignalIdsByThread.set(key, ids);
+  }
+
+  #forgetRunScopedSignals(state: AgentThreadRuntimeState, key: string, signalIds: Iterable<string>) {
+    const ids = state.runScopedSignalIdsByThread.get(key);
+    if (!ids) return;
+    for (const id of signalIds) ids.delete(id);
+    if (ids.size === 0) state.runScopedSignalIdsByThread.delete(key);
+  }
+
+  /**
+   * PF-7473: drop queued run-scoped signals for `key` that `expire` selects
+   * (by owning run id); they are never replayed as a follow-up run or handed
+   * to another execution. Returns the dropped ids.
+   */
+  #dropRunScopedSignals(
+    state: AgentThreadRuntimeState,
+    pubsub: PubSub | undefined,
+    key: string,
+    expire: (ownerRunId: string) => boolean = () => true,
+  ): ReadonlySet<string> {
+    const ids = state.runScopedSignalIdsByThread.get(key);
+    if (!ids) return NO_RUN_SCOPED_SIGNALS;
+    const dropped = new Set<string>();
+    for (const [id, owner] of ids) if (expire(owner)) dropped.add(id);
+    if (dropped.size === 0) return dropped;
+    this.#forgetRunScopedSignals(state, key, dropped);
+    for (const queues of [state.preRunSignalsByThread, state.pendingSignalsByThread]) {
+      const queue = queues.get(key);
+      if (!queue) continue;
+      const kept = queue.filter(signal => !dropped.has(signal.id));
+      if (kept.length > 0) queues.set(key, kept);
+      else queues.delete(key);
+    }
+    this.#publishCancelledUserMessages(pubsub, key, [...dropped]);
+    return dropped;
+  }
+
   async #drainPendingSignals(
     state: AgentThreadRuntimeState,
     pubsub: PubSub | undefined,
@@ -7471,6 +7541,16 @@ export class AgentThreadStreamRuntime {
       // past it or start a competing run.
       return;
     }
+    // PF-7473: run-scoped signals the finished run never consumed expire with
+    // it, even when a successor run is already active on the thread.
+    // A displaced owner's leftovers expire too: only the thread's current
+    // active run keeps its scoped input.
+    this.#dropRunScopedSignals(
+      state,
+      pubsub,
+      key,
+      owner => owner === previousRun.runId || owner !== state.activeThreadRunIds.get(key),
+    );
     if (state.activeThreadRunIds.has(key)) {
       return;
     }
@@ -7557,6 +7637,8 @@ export class AgentThreadStreamRuntime {
         // cancellable through owner verification, and a competing handoff
         // cannot interleave once verification starts.
         if (!owns.acquired) {
+          // PF-7473: run-scoped input never follows the thread to the winner.
+          this.#dropRunScopedSignals(state, pubsub, key);
           if (state.activeThreadRunIds.get(key) === nextRunId) {
             state.activeThreadRunIds.delete(key);
           }
@@ -7962,6 +8044,8 @@ export class AgentThreadStreamRuntime {
   ): Promise<boolean> {
     const projectedWinner = this.#projectedForeignWinner(state, key, record.runId);
     if (projectedWinner === undefined) return false;
+    // PF-7473: run-scoped signals never follow the thread to another owner.
+    this.#dropRunScopedSignals(state, pubsub, key);
     if (state.unresolvedForwardingsByThread.has(key)) {
       // Fail-closed: the completion handoff never forwards past an
       // ambiguously published item. The ordinary drain/release path below
@@ -9002,6 +9086,8 @@ export class AgentThreadStreamRuntime {
       // Its admission records are forgotten here, as fork main forgets them (whichever
       // run they name), and recorded again when it is forwarded or requeued; a retry in
       // between is admitted afresh and carries it instead.
+      // PF-7473: run-scoped input never follows the signal to the winner.
+      this.#dropRunScopedSignals(state, pubsub, key);
       const keptInput = state.preRunSignalsByThread.get(key) ?? [];
       state.preRunSignalsByThread.delete(key);
       for (const kept of keptInput) this.#forgetCurrentSignalAdmission(state, key, kept);
@@ -9239,7 +9325,16 @@ export class AgentThreadStreamRuntime {
     }
 
     signalsByThread.delete(key);
-    return queue;
+    if (!state.runScopedSignalIdsByThread.has(key)) return queue;
+    // A run never consumes another run's run-scoped signals.
+    const foreign = this.#dropRunScopedSignals(state, pubsub, key, owner => owner !== runId);
+    const taken = foreign.size > 0 ? queue.filter(signal => !foreign.has(signal.id)) : queue;
+    this.#forgetRunScopedSignals(
+      state,
+      key,
+      taken.map(signal => signal.id),
+    );
+    return taken;
   }
 
   async waitForCrossAgentThreadRun(
@@ -11629,6 +11724,7 @@ export class AgentThreadStreamRuntime {
       if (remaining.length) queues.set(key, remaining);
       else queues.delete(key);
     }
+    this.#forgetRunScopedSignals(state, key, cancelled);
     const draining = state.drainingPendingSignalsByThread.get(key);
     if (
       draining &&
@@ -12138,6 +12234,9 @@ export class AgentThreadStreamRuntime {
               false,
             );
           }
+          if (target.ifActive?.expireWithRun === true) {
+            this.#markRunScopedSignal(state, key, signal.id, activeRecord.runId);
+          }
           this.#queueForActiveRun(state, pubsub, key, activeRecord, signal);
           return acceptSignal(
             {
@@ -12227,6 +12326,9 @@ export class AgentThreadStreamRuntime {
           const queue = state.preRunSignalsByThread.get(key) ?? [];
           queue.push(signal);
           state.preRunSignalsByThread.set(key, queue);
+          if (target.ifActive?.expireWithRun === true && runId !== undefined) {
+            this.#markRunScopedSignal(state, key, signal.id, runId);
+          }
           this.#recordLocallyQueuedSignal(state, key, signal.id);
           this.#publishPendingUserMessage(pubsub, key, runId, signal, 'pending');
           this.#notifyPendingSignals(state, key);
@@ -12642,6 +12744,7 @@ export class AgentThreadStreamRuntime {
         // so we don't trip our own activeThreadRunIds check on a follow-up.
         // PF-6944: take the input queued for this reservation first (the rollback would
         // delete it); it follows the wake signal to the winner below.
+        if (reserveBeforeIdleWake) this.#dropRunScopedSignals(state, pubsub, reservedKey);
         const keptInput =
           reserveBeforeIdleWake && state.threadKeysByRunId.get(reservedRunId) === reservedKey
             ? (state.preRunSignalsByThread.get(reservedKey) ?? [])

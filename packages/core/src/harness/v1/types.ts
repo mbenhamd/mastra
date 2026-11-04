@@ -1649,6 +1649,33 @@ export interface SubagentDefinition {
   allowInline?: boolean;
 
   /**
+   * Provider-step budget for one child of this type, for both inline
+   * `spawn_subagent` and durable `task_delegate` children. The Harness counts
+   * every completed provider step of the child and stops the child at the step
+   * boundary where it reaches this count while the model would continue. The
+   * parent then receives a `harness.subagent_budget_exhausted` error result
+   * whose bounded summary carries the partial text, tool trace, usage and
+   * `budgetExhausted`; it is never reported as success. A final step that
+   * really ends the child (for example its outcome report) is not exhaustion,
+   * but a final step that a hook or the Harness's empty-reply recovery would
+   * reopen is: the budget stops it instead. Spend is kept across resumed
+   * segments and persisted with a suspended run, so a restart does not grant a
+   * fresh budget, and the stop is persisted with the child's result for crash
+   * recovery. The Harness-wide per-turn ceiling of 1,000 steps still applies.
+   * Positive integer. Omitted ⇒ no per-type step budget.
+   */
+  maxSteps?: number;
+
+  /**
+   * Total-token budget for one child of this type, enforced like `maxSteps`
+   * from provider-reported usage (`totalTokens`, or input + output tokens when
+   * a provider omits the total). The check runs after each completed step, so
+   * the step that crosses the budget finishes, then the child stops. Positive
+   * integer. Omitted ⇒ no per-type token budget.
+   */
+  maxTotalTokens?: number;
+
+  /**
    * Extra tools layered onto this subagent type's surface, on top of its mode's
    * tools + the harness built-ins (subject to the same workspace-tool profile and
    * permission gate as any other tool). To strictly CONSTRAIN a subagent to a
@@ -2175,6 +2202,55 @@ export interface InboxResponseResult {
   responseId: string;
   duplicate: boolean;
 }
+
+/**
+ * Input for `session.discardPendingInteraction(...)`. The generation fields
+ * are the same ones a receipt response (`respondTo*` with `responseId`) binds
+ * to, so a stale caller cannot resolve a newer interaction that reuses the
+ * item id.
+ */
+export interface DiscardPendingInteractionOptions {
+  kind: InboxResponseResult['kind'];
+  /** `pendingResume.itemId ?? pendingResume.toolCallId`. */
+  itemId: string;
+  runId: string;
+  toolCallId: string;
+  /** `pendingResume.requestedAt` of the generation being discarded. */
+  pendingRequestedAt: number;
+  /**
+   * Idempotency key, stored in the same durable receipt map as inbox
+   * responses. Reusing it with the same generation and reason replays the
+   * outcome; reusing it for anything else conflicts.
+   */
+  responseId: string;
+  /** Why the interaction is being resolved (1–512 characters). Persisted. */
+  reason: string;
+}
+
+export type DiscardPendingInteractionResult =
+  | {
+      /** This call resolved the interaction and its pending admission. */
+      status: 'discarded';
+      itemId: string;
+      kind: InboxResponseResult['kind'];
+      responseId: string;
+      discardedAt: number;
+    }
+  | {
+      /** A previous discard of this generation already resolved it (replay). */
+      status: 'already_resolved';
+      itemId: string;
+      kind: InboxResponseResult['kind'];
+      /** The responseId of the discard that resolved it. */
+      responseId: string;
+      discardedAt: number;
+    }
+  | {
+      /** The session's pending interaction is not this generation; nothing was touched. */
+      status: 'not_current';
+      itemId: string;
+      kind: InboxResponseResult['kind'];
+    };
 
 // ---------------------------------------------------------------------------
 // queue() — wait-for-idle FIFO turn queue (spec §4.2 / §6).

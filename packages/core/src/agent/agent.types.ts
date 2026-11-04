@@ -19,7 +19,7 @@ import type { ObservabilityContext, TracingOptions } from '../observability';
 import type { ErrorProcessorOrWorkflow, InputProcessorOrWorkflow, OutputProcessorOrWorkflow } from '../processors';
 import type { RequestContext } from '../request-context';
 import type { ObservationalMemorySourceWriteGuard } from '../storage';
-import type { MastraStreamTransformOptions } from '../stream/types';
+import type { LanguageModelUsage, MastraStreamTransformOptions } from '../stream/types';
 import type { MCPToolExecutionContext, RequireToolApproval, ToolHooks, ToolPayloadTransformPolicy } from '../tools';
 import type { DynamicArgument } from '../types';
 import type { OutputWriter, WorkflowRunState } from '../workflows/types';
@@ -315,6 +315,8 @@ export interface IterationCompleteContext {
   isFinal: boolean;
   /** The reason the model stopped */
   finishReason: string;
+  /** Provider token usage of this iteration's model call, when the provider reported it */
+  usage?: LanguageModelUsage;
   /** ID of the current run */
   runId: string;
   /** Current thread ID (if using memory) */
