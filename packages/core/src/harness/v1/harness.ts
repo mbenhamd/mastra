@@ -1828,9 +1828,11 @@ export class Harness {
       }
       // `remind` persists the notice into the parent's memory thread for its
       // next turn to read. A mode that can delegate (`task_delegate` ships with
-      // the Harness built-ins) on a memory-less agent could never deliver it.
+      // the Harness built-ins whenever a subagent type is registered) on a
+      // memory-less agent could never deliver it.
       if (
         this._subagentDelegatedSettlementNotice === 'remind' &&
+        this._subagentTypes.size > 0 &&
         mode.harnessBuiltins !== 'exclude' &&
         !agent.hasOwnMemory()
       ) {

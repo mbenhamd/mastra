@@ -198,6 +198,20 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     expect(build).toThrow(/subagents\.onDelegatedSettlement.*mode "default".*no memory/);
   });
 
+  it('accepts remind on a memory-less mode when no subagent type exists to delegate to', async () => {
+    const harness = new Harness({
+      agents: { 'parent-agent': new MockAgent({ id: 'parent-agent' }) } as any,
+      modes: [{ id: 'default', agentId: 'parent-agent' }],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      subagents: { maxDepth: 2, onDelegatedSettlement: 'remind', types: {} },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // Without a subagent type there is no task_delegate, so no reminder can be owed.
+    expect(Object.keys(createPlanTaskTools(session))).not.toContain(TASK_DELEGATE_TOOL_ID);
+    await harness.shutdown();
+  });
+
   it('shutdown does not report success while a reminder write is still pending', async () => {
     const gated = gatedMemory();
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', gated.memory);
