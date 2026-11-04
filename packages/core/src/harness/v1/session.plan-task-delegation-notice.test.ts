@@ -262,6 +262,35 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await b.harness.shutdown();
   });
 
+  // PF-7626: a consumer that renders the woken turn (for example as a reply
+  // bubble with its own id) must tell it apart from a caller-started turn from
+  // the public event alone, without reading the private signal-id format.
+  it('a settlement wake turn announces itself on agent_start; the caller-started turn does not', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const starts: Array<Record<string, unknown>> = [];
+    const off = parent.subscribe(event => {
+      if (event.type === 'agent_start') starts.push({ ...event });
+    });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+
+    releaseChild();
+    await poll(() => reminderCalls(parentAgent).length === 1);
+    await deliveryFinished(parent, taskId);
+    off();
+
+    expect(starts).toHaveLength(2);
+    const [userTurn, wakeTurn] = starts;
+    expect(userTurn).not.toHaveProperty('origin');
+    expect(userTurn).not.toHaveProperty('wakeNoticeId');
+    expect(wakeTurn).toMatchObject({ origin: 'wake', wakeNoticeId: expect.any(String) });
+    expect(wakeTurn!.runId).not.toBe(userTurn!.runId);
+    // The notice id names the persisted reminder the woken run delivers.
+    const delivered = reminderCalls(parentAgent)[0]!.messages as { id?: unknown };
+    expect(wakeTurn!.wakeNoticeId).toBe(delivered.id);
+    await harness.shutdown();
+  });
+
   it('a restart between the settlement commit and the notice delivers the owed wake exactly once', async () => {
     const db = new InMemoryDB();
     const a = buildHarness(db, 'wake');
