@@ -513,7 +513,11 @@ describe('Harness v1 — construction', () => {
     expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(2_000);
     await harness._tickPendingInteractionExpirySweep();
     expect((harness as any)._pendingInteractionExpirySweepDelayMs).toBe(1_000);
-    expect((harness as any)._runPendingInteractionExpiryGeneration).toHaveBeenCalledWith(storage, generation);
+    // PF-7538: the sweep runs on the harness's tracked handle over `storage`.
+    expect((harness as any)._runPendingInteractionExpiryGeneration).toHaveBeenCalledWith(
+      (harness as any)._trackStorage(storage),
+      generation,
+    );
 
     await harness.shutdown();
   });
@@ -5033,6 +5037,1238 @@ describe('Harness v1 — crash recovery (lease TTL)', () => {
     const taken = await b.session({ sessionId: id });
     expect(taken.id).toBe(id);
     expect(taken._internalOwnerId).toBe(b.ownerId);
+  });
+});
+
+describe('Harness v1 — shutdown after another owner adopted a session (PF-7538)', () => {
+  type ShutdownLoopProbe = {
+    _leaseRenewalTimer?: unknown;
+    _channelInboxRecoveryTimer?: unknown;
+    _pendingInteractionExpirySweepLoopEnabled: boolean;
+  };
+  const loops = (h: Harness) => {
+    const p = h as unknown as ShutdownLoopProbe;
+    return {
+      leaseRenewal: p._leaseRenewalTimer !== undefined,
+      channelRecovery: p._channelInboxRecoveryTimer !== undefined,
+      expirySweep: p._pendingInteractionExpirySweepLoopEnabled,
+    };
+  };
+  const allRunning = { leaseRenewal: true, channelRecovery: true, expirySweep: true };
+  const allStopped = { leaseRenewal: false, channelRecovery: false, expirySweep: false };
+
+  // A Mastra-bound harness with a channel, so all three background loops run.
+  function boundOwner(storage: InMemoryHarness): Harness {
+    const composite = new InMemoryStore();
+    composite.stores.harness = storage;
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+      channels: { support: makeHarnessChannelConfig() },
+    });
+    new Mastra({
+      agents: { default: makeAgent() },
+      storage: composite,
+      channels: { slack: makeChannelProvider('slack') },
+      harnesses: { primary: harness },
+    });
+    return harness;
+  }
+
+  // Unflushed token usage forces shutdown to save the session record.
+  function dirtyTokenUsage(session: Awaited<ReturnType<Harness['session']>>): void {
+    (
+      session as unknown as { _tokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } }
+    )._tokenUsage = { promptTokens: 3, completionTokens: 4, totalTokens: 7 };
+  }
+
+  // Another process adopts the session after this owner's lease lapsed in
+  // storage; the owner's local lease view is unchanged.
+  async function adoptInto(db: InMemoryDB, adopter: Harness, sessionId: string, harnessName: string) {
+    const key = `${harnessName}\u0000${sessionId}`;
+    const stored = db.harnessSessions.get(key);
+    if (!stored) throw new Error('precondition: session must be stored');
+    db.harnessSessions.set(key, { ...stored, leaseExpiresAt: Date.now() - 1 });
+    return adopter.session({ sessionId });
+  }
+
+  // An unflushed assistant draft makes the drain checkpoint it instead.
+  function dirtyAssistantDraft(session: Awaited<ReturnType<Harness['session']>>): void {
+    (
+      session as unknown as {
+        _recordAssistantDraftDelta(opts: { runId: string; kind: 'text'; delta: string }): void;
+      }
+    )._recordAssistantDraftDelta({ runId: 'run-fenced', kind: 'text', delta: 'partial answer' });
+  }
+
+  it.each([
+    { unflushed: 'token usage', dirty: dirtyTokenUsage },
+    { unflushed: 'assistant draft', dirty: dirtyAssistantDraft },
+  ])(
+    "completes shutdown well before the drain deadline when another owner fenced this owner's session ($unflushed)",
+    async ({ dirty }) => {
+      const db = new InMemoryDB();
+      const storage = new InMemoryHarness({ db });
+      const a = boundOwner(storage);
+      const b = boundOwner(storage);
+      const session = await a.session({ resourceId: 'u', threadId: 't-fenced-shutdown' });
+      dirty(session);
+      const adopted = await adoptInto(db, b, session.id, session.getRecord().harnessName);
+      expect(adopted._internalOwnerId).toBe(b.ownerId);
+      expect(loops(a)).toEqual(allRunning);
+
+      const startedAt = Date.now();
+      await expect(a.shutdown({ drainTimeoutMs: 30_000 })).resolves.toBeUndefined();
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+
+      expect(loops(a)).toEqual(allStopped);
+      expect(a._internalLiveSessionCount()).toBe(0);
+      await expect(a.session({ resourceId: 'u', threadId: 't-other' })).rejects.toThrow();
+      // Shutdown neither released nor overwrote the adopter's ownership.
+      await expect(
+        storage.loadSession({ harnessName: session.getRecord().harnessName, sessionId: session.id }),
+      ).resolves.toMatchObject({ ownerId: b.ownerId });
+
+      await expect(b.shutdown()).resolves.toBeUndefined();
+      expect(loops(b)).toEqual(allStopped);
+    },
+  );
+
+  it('still restores live sessions, restarts the loops and throws on a transient save failure', async () => {
+    const storage = makeStorage();
+    const harness = boundOwner(storage);
+    const session = await harness.session({ resourceId: 'u', threadId: 't-transient-shutdown' });
+    dirtyTokenUsage(session);
+    vi.spyOn(storage, 'saveSession').mockRejectedValueOnce(new Error('transient save failure'));
+
+    await expect(harness.shutdown()).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({ message: 'transient save failure' }),
+    });
+
+    expect(loops(harness)).toEqual(allRunning);
+    expect(session.lifecycleState).toBe('live');
+    await expect(harness.session({ sessionId: session.id })).resolves.toBe(session);
+
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+    expect(loops(harness)).toEqual(allStopped);
+  });
+
+  it('evicts the fenced session but restores the rest and throws when another session fails transiently', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const fenced = await a.session({ resourceId: 'u', threadId: 't-mixed-fenced' });
+    const failing = await a.session({ resourceId: 'u', threadId: 't-mixed-transient' });
+    dirtyTokenUsage(fenced);
+    dirtyTokenUsage(failing);
+    await adoptInto(db, b, fenced.id, fenced.getRecord().harnessName);
+    const saveSession = storage.saveSession.bind(storage);
+    let failed = false;
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (!failed && record.id === failing.id) {
+        failed = true;
+        throw new Error('transient save failure');
+      }
+      return saveSession(record, opts);
+    });
+
+    await expect(a.shutdown({ drainTimeoutMs: 30_000 })).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      sessionId: failing.id,
+      cause: expect.objectContaining({ message: 'transient save failure' }),
+    });
+    expect(loops(a)).toEqual(allRunning);
+    expect(fenced.lifecycleState).toBe('evicted');
+    expect(failing.lifecycleState).toBe('live');
+    expect(a._internalLiveSessionCount()).toBe(1);
+
+    await expect(a.shutdown()).resolves.toBeUndefined();
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('skips draining a child fenced with its adopted parent instead of waiting out its queued work', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const parent = await a.session({ resourceId: 'u', threadId: 't-fenced-parent' });
+    const child = await a.session({ resourceId: 'u', threadId: { fresh: true }, parentSessionId: parent.id });
+    dirtyTokenUsage(parent);
+    // Queued child work that no longer drains once the parent's save fences
+    // the whole subtree.
+    const childInternals = child as unknown as { _record: ReturnType<typeof child.getRecord> };
+    childInternals._record = {
+      ...child.getRecord(),
+      pendingQueue: [
+        { id: 'q-child', admissionId: 'a-child', enqueuedAt: Date.now(), content: 'queued', attachments: [] },
+      ],
+    } as ReturnType<typeof child.getRecord>;
+    await adoptInto(db, b, parent.id, parent.getRecord().harnessName);
+
+    const startedAt = Date.now();
+    await expect(a.shutdown({ drainTimeoutMs: 30_000 })).resolves.toBeUndefined();
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+
+    expect(child.lifecycleState).toBe('evicted');
+    expect(loops(a)).toEqual(allStopped);
+    expect(a._internalLiveSessionCount()).toBe(0);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('waits for a lease-loss eviction that started during the drain to persist its events', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-renewal-fenced' });
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // Block the eviction's `session_evicted` ledger append on a gate.
+    let openGate!: () => void;
+    const gate = new Promise<void>(resolve => (openGate = resolve));
+    let evictedAppendDone = false;
+    const appendSessionEvent = storage.appendSessionEvent.bind(storage);
+    vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async record => {
+      if (record.sessionId === session.id && (record.event as { type?: string }).type === 'session_evicted') {
+        await gate;
+        await appendSessionEvent(record);
+        evictedAppendDone = true;
+        return;
+      }
+      return appendSessionEvent(record);
+    });
+
+    // An already-running lease renewal discovers the lease loss while shutdown
+    // waits on this session's drain.
+    const internals = a as unknown as {
+      _renewLiveSessionLeaseSubtree(storage: InMemoryHarness, root: unknown): Promise<void>;
+    };
+    const waitForDrain = session._waitForShutdownDrain.bind(session);
+    vi.spyOn(session, '_waitForShutdownDrain').mockImplementation(async deadlineAt => {
+      void internals._renewLiveSessionLeaseSubtree(storage, session);
+      while (session.lifecycleState !== 'evicted') await new Promise(resolve => setTimeout(resolve, 1));
+      return waitForDrain(deadlineAt);
+    });
+
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await vi.waitFor(() => expect(session.lifecycleState).toBe('evicted'));
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(shutdownSettled).toBe(false);
+
+    openGate();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(evictedAppendDone).toBe(true);
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  const tick = (ms = 25) => new Promise(resolve => setTimeout(resolve, ms));
+  type RenewalProbe = { _renewLiveSessionLeases(): Promise<void> };
+
+  it('keeps a renewal-detected lease-loss eviction waiting for an independent in-flight draft save', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-renewal-draft' });
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // A's draft checkpoint is already awaiting storage...
+    let openSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (openSave = resolve));
+    let gateArmed = false;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (gateArmed && record.id === session.id) {
+        gateArmed = false;
+        await saveGate;
+      }
+      return saveSession(record, opts);
+    });
+    dirtyAssistantDraft(session);
+    gateArmed = true;
+    let draftSaveSettled = false;
+    void (session as unknown as { _startAssistantDraftFlush(): Promise<void> })
+      ._startAssistantDraftFlush()
+      .catch(() => undefined)
+      .finally(() => {
+        draftSaveSettled = true;
+      });
+
+    // ...when a background renewal, not that save, discovers the lease loss.
+    void (a as unknown as RenewalProbe)._renewLiveSessionLeases();
+    await vi.waitFor(() => expect(session.lifecycleState).toBe('evicted'));
+
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await tick();
+    expect(shutdownSettled).toBe(false);
+
+    openSave();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(draftSaveSettled).toBe(true);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('quiesces an in-flight lease renewal before the final shutdown phase', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-renewal-final-phase' });
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // A's renewal is already in flight in storage when shutdown starts.
+    let openRenewal!: () => void;
+    const renewalGate = new Promise<void>(resolve => (openRenewal = resolve));
+    const renewSubtree = storage.renewSessionLeaseSubtree.bind(storage);
+    vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementationOnce(async input => {
+      await renewalGate;
+      return renewSubtree(input);
+    });
+    // Every `session_evicted` ledger append for the session waits on a gate.
+    let openAppend!: () => void;
+    const appendGate = new Promise<void>(resolve => (openAppend = resolve));
+    const appendSessionEvent = storage.appendSessionEvent.bind(storage);
+    vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async record => {
+      if (record.sessionId === session.id && (record.event as { type?: string }).type === 'session_evicted') {
+        await appendGate;
+      }
+      return appendSessionEvent(record);
+    });
+    const evictionReasons: string[] = [];
+    a.subscribe(event => {
+      if (event.type === 'session_evicted' && event.sessionId === session.id) evictionReasons.push(event.reason);
+    });
+    const releaseSessionLease = vi.spyOn(storage, 'releaseSessionLease');
+
+    const renewal = (a as unknown as RenewalProbe)._renewLiveSessionLeases();
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await tick();
+    openRenewal();
+    await vi.waitFor(() => expect(evictionReasons).toContain('lease_lost'));
+    await tick();
+    expect(shutdownSettled).toBe(false);
+
+    openAppend();
+    await expect(shutdown).resolves.toBeUndefined();
+    await renewal;
+    expect(evictionReasons).toEqual(['lease_lost']);
+    expect(releaseSessionLease).not.toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: session.id, ownerId: a.ownerId }),
+    );
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('never lets a draft checkpoint queued behind the fenced save reach storage', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = boundOwner(storage);
+    const b = boundOwner(storage);
+    const session = await a.session({ resourceId: 'u', threadId: 't-queued-draft' });
+    dirtyTokenUsage(session);
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    // Hold shutdown's token-usage save in storage, and record any draft save.
+    let openTokenSave!: () => void;
+    const tokenGate = new Promise<void>(resolve => (openTokenSave = resolve));
+    let tokenSaveEntered!: () => void;
+    const tokenSaveInStorage = new Promise<void>(resolve => (tokenSaveEntered = resolve));
+    let tokenSaveHeld = false;
+    let draftSavesReachingStorage = 0;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (record.id === session.id && record.assistantDrafts?.['run-fenced'] !== undefined) draftSavesReachingStorage++;
+      if (record.id === session.id && !tokenSaveHeld) {
+        tokenSaveHeld = true;
+        tokenSaveEntered();
+        await tokenGate;
+      }
+      return saveSession(record, opts);
+    });
+
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 });
+    await tokenSaveInStorage;
+    // The draft timer fires now and queues its checkpoint behind that save.
+    dirtyAssistantDraft(session);
+    void (session as unknown as { _startAssistantDraftFlush(): Promise<void> })
+      ._startAssistantDraftFlush()
+      .catch(() => undefined);
+
+    openTokenSave();
+    await expect(shutdown).resolves.toBeUndefined();
+    await tick();
+    expect(session.lifecycleState).toBe('evicted');
+    expect(draftSavesReachingStorage).toBe(0);
+    expect(loops(a)).toEqual(allStopped);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  // A plain (unbound) harness over `storage` whose default agent is `agent`.
+  function mockOwner(storage: InMemoryHarness, agent = new MockAgent({ id: 'default' })): Harness {
+    const composite = new InMemoryStore();
+    composite.stores.harness = storage;
+    return new Harness({
+      agents: { default: agent } as never,
+      storage: composite,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+    });
+  }
+
+  // A gate that holds every matching storage call until opened.
+  function storageGate() {
+    let open!: () => void;
+    const opened = new Promise<void>(resolve => (open = resolve));
+    let entered!: () => void;
+    const reached = new Promise<void>(resolve => (entered = resolve));
+    let wasEntered = false;
+    return {
+      open,
+      opened,
+      reached,
+      enter: () => {
+        wasEntered = true;
+        entered();
+      },
+      // Bounded wait for the first matching call, so a missing path fails fast.
+      waitEntered: () => vi.waitFor(() => expect(wasEntered).toBe(true), { timeout: 5_000 }),
+    };
+  }
+
+  // Holds the storage operations a fenced signal's settlement performs (its
+  // terminal CAS, or the evidence read an unstamped admission settles with)
+  // once armed, and records which ones ran.
+  function gateSignalSettlement(storage: InMemoryHarness, sessionId: string) {
+    const gate = storageGate();
+    let armed = false;
+    const entered: string[] = [];
+    let settledOps = 0;
+    for (const name of ['compareAndSwapSignalTerminal', 'loadMessageResultEvidence'] as const) {
+      const original = (storage[name] as (input: { sessionId: string }) => Promise<unknown>).bind(storage);
+      vi.spyOn(storage, name).mockImplementation((async (input: { sessionId: string }) => {
+        if (!armed || input.sessionId !== sessionId) return original(input);
+        entered.push(name);
+        gate.enter();
+        await gate.opened;
+        try {
+          return await original(input);
+        } finally {
+          settledOps++;
+        }
+      }) as never);
+    }
+    return {
+      ...gate,
+      arm: () => {
+        armed = true;
+      },
+      entered,
+      settledAll: () => settledOps === entered.length,
+    };
+  }
+
+  type ShutdownInternals = {
+    _renewLiveSessionLeases(): Promise<void>;
+    _pendingInteractionExpirySweepInFlight?: Promise<void>;
+  };
+
+  it("waits for a fenced signal's terminal settlement before resolving", async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const agent = new MockAgent({ id: 'default' });
+    const a = mockOwner(storage, agent);
+    const b = mockOwner(new InMemoryHarness({ db }));
+    agent.enqueueRun({ holdUntil: new Promise<void>(() => {}) });
+    const session = await a.session({ resourceId: 'u', threadId: 't-fenced-signal' });
+    const signal = await session.signal({ content: 'go', admissionId: 'fenced-signal' });
+    void signal.result.catch(() => undefined);
+    await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    const settlement = gateSignalSettlement(storage, session.id);
+    // A background renewal already in flight fences the session while
+    // shutdown drains it.
+    const renewalGate = storageGate();
+    const renewSubtree = storage.renewSessionLeaseSubtree.bind(storage);
+    vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementation(async input => {
+      await renewalGate.opened;
+      return renewSubtree(input);
+    });
+    void (a as unknown as ShutdownInternals)._renewLiveSessionLeases();
+    const waitForDrain = session._waitForShutdownDrain.bind(session);
+    vi.spyOn(session, '_waitForShutdownDrain').mockImplementation(async deadlineAt => {
+      settlement.arm();
+      renewalGate.open();
+      while (session.lifecycleState !== 'evicted') await tick(1);
+      return waitForDrain(deadlineAt);
+    });
+
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await settlement.waitEntered();
+    await tick();
+    expect(shutdownSettled).toBe(false);
+
+    settlement.open();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(settlement.entered.length).toBeGreaterThan(0);
+    expect(settlement.settledAll()).toBe(true);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('waits for a save admitted before shutdown when renewal fences its session during the expiry-sweep wait', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const a = mockOwner(storage);
+    const b = mockOwner(new InMemoryHarness({ db }));
+    const session = await a.session({ resourceId: 'u', threadId: 't-sweep-fenced-save' });
+    await adoptInto(db, b, session.id, session.getRecord().harnessName);
+
+    const save = storageGate();
+    let saveHeld = false;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (record.id === session.id && !saveHeld) {
+        saveHeld = true;
+        save.enter();
+        await save.opened;
+      }
+      return saveSession(record, opts);
+    });
+    const renewalGate = storageGate();
+    const renewSubtree = storage.renewSessionLeaseSubtree.bind(storage);
+    vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementation(async input => {
+      await renewalGate.opened;
+      return renewSubtree(input);
+    });
+
+    let saveSettled = false;
+    void session
+      .setState({ step: 1 })
+      .catch(() => undefined)
+      .finally(() => {
+        saveSettled = true;
+      });
+    await save.reached;
+    const internals = a as unknown as ShutdownInternals;
+    const renewal = internals._renewLiveSessionLeases();
+    const sweep = storageGate();
+    internals._pendingInteractionExpirySweepInFlight = sweep.opened;
+
+    let shutdownSettled = false;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    renewalGate.open();
+    await renewal;
+    expect(session.lifecycleState).toBe('evicted');
+    sweep.open();
+    await tick();
+    expect(shutdownSettled).toBe(false);
+
+    save.open();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(saveSettled).toBe(true);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('shutdown resolves only after all storage work of its sessions settled', async () => {
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({ db });
+    const agent = new MockAgent({ id: 'default' });
+    const a = mockOwner(storage, agent);
+    const b = mockOwner(new InMemoryHarness({ db }));
+    // S1: an active signal whose terminal CAS will be gated.
+    agent.enqueueRun({ holdUntil: new Promise<void>(() => {}) });
+    const signalled = await a.session({ resourceId: 'u', threadId: 't-invariant-signal' });
+    const signal = await signalled.signal({ content: 'go', admissionId: 'invariant-signal' });
+    void signal.result.catch(() => undefined);
+    await vi.waitFor(() => expect(agent.streamCalls).toHaveLength(1));
+    // S2: a save admitted before shutdown, with a draft checkpoint queued behind it.
+    const saving = await a.session({ resourceId: 'u', threadId: 't-invariant-save' });
+    // S3 (stays live): detached storage calls no session registry tracks.
+    const detached = await a.session({ resourceId: 'u', threadId: 't-invariant-detached' });
+    await adoptInto(db, b, signalled.id, signalled.getRecord().harnessName);
+    await adoptInto(db, b, saving.id, saving.getRecord().harnessName);
+
+    const settlement = gateSignalSettlement(storage, signalled.id);
+    // The fenced turn's run summary (persisted when its agent_end is emitted).
+    const summary = storageGate();
+    let summaryArmed = false;
+    const saveRunSummary = storage.saveRunSummary.bind(storage);
+    vi.spyOn(storage, 'saveRunSummary').mockImplementation(async input => {
+      if (summaryArmed) {
+        summary.enter();
+        await summary.opened;
+      }
+      return saveRunSummary(input);
+    });
+    const save = storageGate();
+    let saveHeld = false;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (record.id === saving.id && !saveHeld) {
+        saveHeld = true;
+        save.enter();
+        await save.opened;
+      }
+      return saveSession(record, opts);
+    });
+    const renewalGate = storageGate();
+    const renewSubtree = storage.renewSessionLeaseSubtree.bind(storage);
+    vi.spyOn(storage, 'renewSessionLeaseSubtree').mockImplementation(async input => {
+      await renewalGate.opened;
+      return renewSubtree(input);
+    });
+    // S3's detached calls: (1) the queued-turn signal evidence write,
+    // (2) the run watcher's terminal staging, (3) the queued attachment read,
+    // (4) the plan-task summary's second read after the first one rejected.
+    const detachedGates = {
+      writeMessageResultEvidence: storageGate(),
+      stageTerminalCompletion: storageGate(),
+      loadAttachment: storageGate(),
+      loadPlanTaskSubtree: storageGate(),
+    };
+    for (const [name, gate] of Object.entries(detachedGates)) {
+      const original = (storage as unknown as Record<string, (input: unknown) => Promise<unknown>>)[name]!.bind(
+        storage,
+      );
+      vi.spyOn(storage as never, name as never).mockImplementation((async (input: {
+        sessionId?: string;
+        identity?: { sessionId?: string };
+      }) => {
+        const sessionId = input?.sessionId ?? input?.identity?.sessionId;
+        if (sessionId !== detached.id) return original(input);
+        gate.enter();
+        await gate.opened;
+        return original(input);
+      }) as never);
+    }
+    const countPlanTasks = storage.countPlanTasksByStatus.bind(storage);
+    vi.spyOn(storage, 'countPlanTasksByStatus').mockImplementation(async input => {
+      if (input.sessionId === detached.id) throw new Error('plan-task count unavailable');
+      return countPlanTasks(input);
+    });
+
+    // Instrument every storage call of this owner: start and settle order.
+    let clock = 0;
+    const ops: Array<{ name: string; startedAt: number; settledAt?: number }> = [];
+    const instrumented = storage as unknown as Record<string, unknown>;
+    const names = new Set<string>();
+    for (let proto = Object.getPrototypeOf(storage); proto && proto !== Object.prototype;) {
+      for (const name of Object.getOwnPropertyNames(proto)) {
+        if (typeof Object.getOwnPropertyDescriptor(proto, name)?.value === 'function') names.add(name);
+      }
+      proto = Object.getPrototypeOf(proto);
+    }
+    for (const name of [...names, ...Object.keys(instrumented)]) {
+      const original = instrumented[name];
+      if (name === 'constructor' || typeof original !== 'function') continue;
+      const call = (original as (...args: unknown[]) => unknown).bind(storage);
+      instrumented[name] = (...args: unknown[]) => {
+        const op: { name: string; startedAt: number; settledAt?: number } = { name, startedAt: ++clock };
+        ops.push(op);
+        let result: unknown;
+        try {
+          result = call(...args);
+        } catch (err) {
+          op.settledAt = ++clock;
+          throw err;
+        }
+        if (result instanceof Promise) {
+          return result.finally(() => {
+            op.settledAt = ++clock;
+          });
+        }
+        op.settledAt = ++clock;
+        return result;
+      };
+    }
+
+    // Fire S3's detached storage work the way its owning paths do: nothing
+    // awaits or registers these calls.
+    const detachedInternals = detached as unknown as {
+      _storage: InMemoryHarness;
+      _writeQueueSignalResultEvidence(status: unknown): Promise<void>;
+      _validateQueuedAttachmentRefs(item: unknown): Promise<void>;
+      _ensurePlanTaskSummary(): Promise<unknown>;
+    };
+    void detachedInternals
+      ._writeQueueSignalResultEvidence({ status: 'pending', signalId: 'sig-queued', runId: 'run-queued' })
+      .catch(() => undefined);
+    void detachedInternals._storage
+      .stageTerminalCompletion({
+        identity: { harnessName: detached.getRecord().harnessName, sessionId: detached.id, runId: 'run-watched' },
+        result: {},
+      } as never)
+      .catch(() => undefined);
+    void detachedInternals
+      ._validateQueuedAttachmentRefs({
+        attachments: [{ kind: 'ref', ownerSessionId: detached.id, attachmentId: 'att-1', sha256: 'x', bytes: 1 }],
+      })
+      .catch(() => undefined);
+    void detachedInternals._ensurePlanTaskSummary().catch(() => undefined);
+    for (const gate of Object.values(detachedGates)) await gate.waitEntered();
+
+    void saving.setState({ step: 1 }).catch(() => undefined);
+    await save.reached;
+    dirtyAssistantDraft(saving);
+    void (saving as unknown as { _startAssistantDraftFlush(): Promise<void> })
+      ._startAssistantDraftFlush()
+      .catch(() => undefined);
+    const internals = a as unknown as ShutdownInternals;
+    settlement.arm();
+    summaryArmed = true;
+    void internals._renewLiveSessionLeases();
+    const sweep = storageGate();
+    internals._pendingInteractionExpirySweepInFlight = sweep.opened;
+
+    let resolvedAt: number | undefined;
+    const shutdown = a.shutdown({ drainTimeoutMs: 30_000 }).then(() => {
+      resolvedAt = ++clock;
+    });
+    // Background renewal fences both sessions during the expiry-sweep wait.
+    renewalGate.open();
+    await vi.waitFor(() => {
+      expect(signalled.lifecycleState).toBe('evicted');
+      expect(saving.lifecycleState).toBe('evicted');
+    });
+    await settlement.waitEntered();
+    await summary.waitEntered();
+    sweep.open();
+    await tick();
+    expect(resolvedAt).toBeUndefined();
+
+    // Release the gates one at a time: shutdown must still be pending while
+    // any of them holds a storage operation.
+    save.open();
+    await tick();
+    expect(resolvedAt).toBeUndefined();
+    settlement.open();
+    await tick();
+    expect(resolvedAt).toBeUndefined();
+    summary.open();
+    const remaining = Object.values(detachedGates);
+    for (const gate of remaining) {
+      await tick();
+      expect(resolvedAt).toBeUndefined();
+      gate.open();
+    }
+    await shutdown;
+    await tick();
+    const shutdownResolvedAt = resolvedAt!;
+    expect(settlement.entered.length).toBeGreaterThan(0);
+    expect(ops.some(op => op.name === 'saveRunSummary')).toBe(true);
+    for (const name of Object.keys(detachedGates)) expect(ops.some(op => op.name === name)).toBe(true);
+    expect(ops.filter(op => op.startedAt > shutdownResolvedAt)).toEqual([]);
+    expect(ops.filter(op => op.settledAt === undefined || op.settledAt > shutdownResolvedAt)).toEqual([]);
+    await expect(b.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('fails shutdown at the drain deadline naming the storage calls still pending, and restores', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-storage-timeout' });
+    const stuck = storageGate();
+    const loadAttachment = storage.loadAttachment.bind(storage);
+    vi.spyOn(storage, 'loadAttachment').mockImplementation(async input => {
+      stuck.enter();
+      await stuck.opened;
+      return loadAttachment(input);
+    });
+    // A detached read through the session's storage handle that never settles
+    // before the deadline.
+    void (session as unknown as { _storage: InMemoryHarness })._storage
+      .loadAttachment({ harnessName: session.getRecord().harnessName, sessionId: session.id, attachmentId: 'att-x' })
+      .catch(() => undefined);
+    await stuck.waitEntered();
+    // A record write the drain's flush-chain wait times out on.
+    const save = storageGate();
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      save.enter();
+      await save.opened;
+      return saveSession(record, opts);
+    });
+    const slowWrite = session.setState({ step: 1 });
+    await save.waitEntered();
+
+    const failure = await harness.shutdown({ drainTimeoutMs: 200 }).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    // The drain's own timeout names every pending storage call too.
+    expect(failure).toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining(`loadAttachment(${session.id})`),
+      }),
+    });
+    expect((failure as { cause: Error }).cause.message).toContain(`saveSession(${session.id})`);
+    // Restore-and-throw: the session is live again and usable.
+    expect(session.lifecycleState).toBe('live');
+    await expect(harness.session({ sessionId: session.id })).resolves.toBe(session);
+
+    stuck.open();
+    save.open();
+    await slowWrite;
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it("resolves once shutdown's own terminal append completes (it never waits on itself)", async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-own-terminal-append' });
+    // Shutdown's own `session_evicted('shutdown')` append is slow but settles.
+    let terminalAppendDone = false;
+    const appendSessionEvent = storage.appendSessionEvent.bind(storage);
+    vi.spyOn(storage, 'appendSessionEvent').mockImplementation(async record => {
+      const event = record.event as { type?: string; reason?: string };
+      if (record.sessionId === session.id && event.type === 'session_evicted' && event.reason === 'shutdown') {
+        await tick(50);
+        await appendSessionEvent(record);
+        terminalAppendDone = true;
+        return;
+      }
+      return appendSessionEvent(record);
+    });
+
+    const startedAt = Date.now();
+    await expect(harness.shutdown({ drainTimeoutMs: 5_000 })).resolves.toBeUndefined();
+    expect(terminalAppendDone).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  it('a retry after the final storage barrier timed out waits for the pending call before resolving', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-final-barrier-retry' });
+    const stuck = storageGate();
+    let armed = false;
+    const loadSession = storage.loadSession.bind(storage);
+    vi.spyOn(storage, 'loadSession').mockImplementation(async input => {
+      if (armed && input.sessionId === session.id) {
+        stuck.enter();
+        await stuck.opened;
+      }
+      return loadSession(input);
+    });
+    // A public read starts while shutdown releases its lease.
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      armed = true;
+      void harness.loadSession({ sessionId: session.id }).catch(() => undefined);
+      return releaseSessionLease(input);
+    });
+
+    await expect(harness.shutdown({ drainTimeoutMs: 300 })).rejects.toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`loadSession(${session.id})`),
+    });
+
+    let retrySettled = false;
+    const retry = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      retrySettled = true;
+    });
+    await tick();
+    expect(retrySettled).toBe(false);
+    stuck.open();
+    await expect(retry).resolves.toBeUndefined();
+  });
+
+  it('fails shutdown within the drain deadline when a lease release never settles, naming it', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-hung-release' });
+    const hung = storageGate();
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      hung.enter();
+      await hung.opened;
+      return releaseSessionLease(input);
+    });
+
+    const outcome = await Promise.race([
+      harness.shutdown({ drainTimeoutMs: 300 }).then(
+        () => 'resolved',
+        (err: unknown) => err,
+      ),
+      tick(2_000).then(() => 'still pending after 2s'),
+    ]);
+    expect(outcome).toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`releaseSessionLease(${session.id})`),
+    });
+
+    hung.open();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('waits for storage work a harness_shutdown listener starts', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    await harness.session({ resourceId: 'u', threadId: 't-listener-read' });
+    const read = storageGate();
+    let readSettled = false;
+    const listSessions = storage.listSessions.bind(storage);
+    vi.spyOn(storage, 'listSessions').mockImplementation(async input => {
+      read.enter();
+      await read.opened;
+      try {
+        return await listSessions(input);
+      } finally {
+        readSettled = true;
+      }
+    });
+    harness.subscribe(event => {
+      if (event.type === 'harness_shutdown') void harness.listSessions({ resourceId: 'u' }).catch(() => undefined);
+    });
+
+    let shutdownSettled = false;
+    const shutdown = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await read.waitEntered();
+    await tick();
+    expect(shutdownSettled).toBe(false);
+    read.open();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(readSettled).toBe(true);
+  });
+
+  // Shutdown's outcome within a bounded window: its rejection, 'resolved', or
+  // a marker when it is still pending (a hang fails fast instead of timing out).
+  const shutdownOutcome = (shutdown: Promise<void>) =>
+    Promise.race([
+      shutdown.then(
+        () => 'resolved',
+        (err: unknown) => err,
+      ),
+      tick(2_000).then(() => 'still pending after 2s'),
+    ]);
+
+  it('fails shutdown within the deadline when an in-flight expiry sweep never settles, naming its call, and restores', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-stuck-sweep' });
+    const stuck = storageGate();
+    const listDue = storage.listDuePendingInteractions.bind(storage);
+    vi.spyOn(storage, 'listDuePendingInteractions').mockImplementation(async input => {
+      stuck.enter();
+      await stuck.opened;
+      return listDue(input);
+    });
+    void (harness as unknown as { _tickPendingInteractionExpirySweep(): Promise<void> })
+      ._tickPendingInteractionExpirySweep()
+      .catch(() => undefined);
+    await stuck.waitEntered();
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining('listDuePendingInteractions'),
+      }),
+    });
+    // Restored: the harness admits sessions again and the session is live.
+    expect(session.lifecycleState).toBe('live');
+    await expect(harness.session({ sessionId: session.id })).resolves.toBe(session);
+
+    stuck.open();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('fails shutdown within the deadline when an in-flight session admission never settles, naming its call, and restores', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const stuck = storageGate();
+    const loadByThread = storage.loadSessionByThread.bind(storage);
+    vi.spyOn(storage, 'loadSessionByThread').mockImplementation(async input => {
+      if (input.threadId === 't-stuck-admission') {
+        stuck.enter();
+        await stuck.opened;
+      }
+      return loadByThread(input);
+    });
+    const admission = harness.session({ resourceId: 'u', threadId: 't-stuck-admission' });
+    void admission.catch(() => undefined);
+    await stuck.waitEntered();
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({
+        name: 'HarnessValidationError',
+        message: expect.stringContaining('loadSessionByThread'),
+      }),
+    });
+    // Restored: the harness admits sessions again.
+    await expect(harness.session({ resourceId: 'u', threadId: 't-after-restore' })).resolves.toBeDefined();
+
+    stuck.open();
+    await expect(admission).resolves.toBeDefined();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('stays registered with Mastra after a final-barrier timeout so Mastra.shutdown retries it', async () => {
+    const storage = makeStorage();
+    const composite = new InMemoryStore();
+    composite.stores.harness = storage;
+    const harness = new Harness({
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: { storage },
+    });
+    const mastra = new Mastra({
+      agents: { default: makeAgent() },
+      storage: composite,
+      harnesses: { primary: harness },
+    });
+    await harness.session({ resourceId: 'u', threadId: 't-mastra-retry' });
+    const read = storageGate();
+    const listSessions = storage.listSessions.bind(storage);
+    vi.spyOn(storage, 'listSessions').mockImplementation(async input => {
+      read.enter();
+      await read.opened;
+      return listSessions(input);
+    });
+    harness.subscribe(event => {
+      if (event.type === 'harness_shutdown') void harness.listSessions({ resourceId: 'u' }).catch(() => undefined);
+    });
+
+    await expect(harness.shutdown({ drainTimeoutMs: 300 })).rejects.toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining('listSessions'),
+    });
+
+    let mastraShutdownSettled = false;
+    const mastraShutdown = mastra.shutdown().finally(() => {
+      mastraShutdownSettled = true;
+    });
+    await tick(50);
+    expect(mastraShutdownSettled).toBe(false);
+    read.open();
+    await expect(mastraShutdown).resolves.toBeUndefined();
+  });
+
+  it('waits for storage work an async harness_shutdown listener starts after a microtask hop', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    await harness.session({ resourceId: 'u', threadId: 't-async-listener' });
+    const read = storageGate();
+    let readSettled = false;
+    const listSessions = storage.listSessions.bind(storage);
+    vi.spyOn(storage, 'listSessions').mockImplementation(async input => {
+      read.enter();
+      await read.opened;
+      try {
+        return await listSessions(input);
+      } finally {
+        readSettled = true;
+      }
+    });
+    harness.subscribe(event => {
+      if (event.type !== 'harness_shutdown') return;
+      void (async () => {
+        await Promise.resolve();
+        await harness.listSessions({ resourceId: 'u' });
+      })().catch(() => undefined);
+    });
+
+    let shutdownSettled = false;
+    const shutdown = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await read.waitEntered();
+    await tick();
+    expect(shutdownSettled).toBe(false);
+    read.open();
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(readSettled).toBe(true);
+  });
+
+  it('a retry re-releases a lease whose original release hangs forever, then still fails naming the hung call', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-release-hangs-forever' });
+    let releaseCalls = 0;
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      if (input.sessionId !== session.id) return releaseSessionLease(input);
+      releaseCalls++;
+      // The first release never settles; later ones go through.
+      if (releaseCalls === 1) return new Promise<void>(() => {});
+      return releaseSessionLease(input);
+    });
+    const ownerOf = async () =>
+      (await storage.loadSession({ harnessName: session.getRecord().harnessName, sessionId: session.id }))?.ownerId;
+    const namesHungRelease = {
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`releaseSessionLease(${session.id})`),
+    };
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject(namesHungRelease);
+    expect(await ownerOf()).toBe(harness.ownerId);
+
+    // The retry releases the lease with a fresh call, but the original call is
+    // still pending, so it still fails, naming it.
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject(namesHungRelease);
+    expect(releaseCalls).toBe(2);
+    expect(await ownerOf()).toBeUndefined();
+  });
+
+  it('keeps releasing the other leases and completes when an adapter release throws synchronously', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const throwing = await harness.session({ resourceId: 'u', threadId: 't-release-throws-sync' });
+    const other = await harness.session({ resourceId: 'u', threadId: 't-release-after-throw' });
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(input => {
+      if (input.sessionId === throwing.id) throw new Error('adapter release threw synchronously');
+      return releaseSessionLease(input);
+    });
+    const workspaceShutdown = vi.spyOn(
+      (harness as unknown as { _workspaceRegistry: { shutdown(): Promise<void> } })._workspaceRegistry,
+      'shutdown',
+    );
+    const events: string[] = [];
+    harness.subscribe(event => {
+      if (event.type === 'harness_shutdown') events.push(event.type);
+    });
+
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+    // As at the base: every release was attempted and teardown ran.
+    const stored = await storage.loadSession({ harnessName: other.getRecord().harnessName, sessionId: other.id });
+    expect(stored?.ownerId).toBeUndefined();
+    expect(workspaceShutdown).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['harness_shutdown']);
+    await expect(harness.session({ resourceId: 'u', threadId: 't-after-shutdown' })).rejects.toThrow();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('attempts every lease release when one hangs, and a retry completes the unfinished one', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const first = await harness.session({ resourceId: 'u', threadId: 't-release-hangs' });
+    const second = await harness.session({ resourceId: 'u', threadId: 't-release-ok' });
+    const hung = storageGate();
+    let firstAttempt = true;
+    const releaseSessionLease = storage.releaseSessionLease.bind(storage);
+    vi.spyOn(storage, 'releaseSessionLease').mockImplementation(async input => {
+      if (input.sessionId === first.id && firstAttempt) {
+        firstAttempt = false;
+        hung.enter();
+        await hung.opened;
+        throw new Error('release lost');
+      }
+      return releaseSessionLease(input);
+    });
+    const ownerOf = async (sessionId: string) =>
+      (await storage.loadSession({ harnessName: first.getRecord().harnessName, sessionId }))?.ownerId;
+
+    expect(await shutdownOutcome(harness.shutdown({ drainTimeoutMs: 300 }))).toMatchObject({
+      name: 'HarnessValidationError',
+      message: expect.stringContaining(`releaseSessionLease(${first.id})`),
+    });
+    // The other session's lease was released on the first attempt.
+    expect(await ownerOf(second.id)).toBeUndefined();
+    expect(await ownerOf(first.id)).toBe(harness.ownerId);
+
+    hung.open();
+    await expect(harness.shutdown()).resolves.toBeUndefined();
+    // The retry re-attempted the release the first attempt lost.
+    expect(await ownerOf(first.id)).toBeUndefined();
+  });
+
+  it('lets a draft checkpoint queued behind a slow save persist under a pressure eviction', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-pressure-queued-draft' });
+    const save = storageGate();
+    let saveHeld = false;
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (!saveHeld) {
+        saveHeld = true;
+        save.enter();
+        await save.opened;
+      }
+      return saveSession(record, opts);
+    });
+    const slowSave = session.setState({ step: 1 });
+    await save.reached;
+    dirtyAssistantDraft(session);
+    const internals = session as unknown as {
+      _startAssistantDraftFlush(): Promise<void>;
+      _markEvicted(record: ReturnType<typeof session.getRecord>, reason: 'pressure'): void;
+    };
+    const checkpoint = internals._startAssistantDraftFlush();
+    // The pressure eviction's bounded drain gave up on the slow save.
+    internals._markEvicted(session.getRecord(), 'pressure');
+
+    save.open();
+    await slowSave;
+    await checkpoint;
+    const stored = await storage.loadSession({ harnessName: session.getRecord().harnessName, sessionId: session.id });
+    expect(stored?.assistantDrafts?.['run-fenced']).toBeDefined();
+  });
+
+  it('keeps a pressure eviction waiting for an in-flight assistant-draft checkpoint', async () => {
+    const storage = makeStorage();
+    const harness = makeHarness({ sessions: { storage } });
+    const session = await harness.session({ resourceId: 'u', threadId: 't-pressure-draft' });
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
+    let gateArmed = false;
+    let saveEntered!: () => void;
+    const checkpointInStorage = new Promise<void>(resolve => (saveEntered = resolve));
+    const saveSession = storage.saveSession.bind(storage);
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, opts) => {
+      if (gateArmed) {
+        gateArmed = false;
+        saveEntered();
+        await saveGate;
+      }
+      return saveSession(record, opts);
+    });
+    dirtyAssistantDraft(session);
+    const internals = session as unknown as {
+      _startAssistantDraftFlush(): Promise<void>;
+      _markEvicted(record: ReturnType<typeof session.getRecord>, reason: 'pressure'): void;
+    };
+    gateArmed = true;
+    const checkpoint = internals._startAssistantDraftFlush();
+    // The eviction lands while the checkpoint's save is already in storage.
+    await checkpointInStorage;
+    internals._markEvicted(session.getRecord(), 'pressure');
+
+    let barrierSettled = false;
+    const barrier = session._flushEventPersistence().then(() => {
+      barrierSettled = true;
+    });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(barrierSettled).toBe(false);
+
+    releaseSave();
+    await checkpoint;
+    await barrier;
+    expect(barrierSettled).toBe(true);
   });
 });
 

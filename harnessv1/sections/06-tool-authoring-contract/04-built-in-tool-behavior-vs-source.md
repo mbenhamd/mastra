@@ -58,5 +58,31 @@ session terminalizes, then rolls up `completed` / `failed` (cascading through th
 truth-table). See §5.6 for the wait-point, completion hook, and
 recovery-on-rehydrate.
 
+**Subagent control tool (PF-7473).** `subagent` joins the same `harness:builtin`
+set when subagent types are configured and the calling session is below
+`subagents.maxDepth`. It acts only on the calling session's own children
+(`parentSessionId === session.id`, same resource):
+
+- `status` lists or inspects children from the live active-subagent projection
+  plus the durable delegation links. A delegated child carries its settled
+  result. An inline `spawn_subagent` result is returned by that tool call only.
+- `wait` blocks up to a bounded timeout (default 30 s, maximum 300 s) and
+  returns the settled children and those still running. A closing child counts
+  as running until `closedAt`.
+- `send` interleaves a bounded system reminder into the child's active run
+  (`injectSystemReminder` with the internal `requireActiveRun`, dispatched with
+  `ifIdle: discard` and `ifActive.expireWithRun`). It never wakes an idle or
+  parked child, and a message the run ends without consuming is dropped
+  instead of starting a follow-up run.
+- `cancel` runs the owned cancellation cascade, which commits `cancelRequest`
+  on the child's own record. That cancel is honoured by the delegation driver
+  and by reconcile-on-rehydrate. Cancel needs the child's lease to be free or
+  held by this process. The tool never writes under another process's
+  unexpired lease; it returns the retryable
+  `harness.subagent_cancel_unavailable` instead.
+
+Rejections are `isError` payloads. The tool passes through the normal
+permission gate.
+
 > **Deferred (TM-5).** The `plan_task_*` event payload polish (TM-5) is not yet
 > implemented.
