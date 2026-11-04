@@ -48,6 +48,13 @@ export const SUBAGENT_CONTROL_STATUS_LIMIT = 25;
 const SUBAGENT_CONTROL_TASK_PREVIEW_CHARS = 500;
 const WAIT_POLL_INTERVAL_MS = 100;
 const WAIT_POLL_MAX_INTERVAL_MS = 1_000;
+/**
+ * How long a `wait` poll's storage read may run past the wait deadline. The
+ * deadline decides when to stop polling, never how long a started read may
+ * take; only a read still pending this long after it started (and after the
+ * deadline) counts as stalled.
+ */
+export const SUBAGENT_CONTROL_WAIT_READ_STALL_MS = 1_000;
 
 const subagentStatusEnum = z.enum(['running', 'awaiting_input', 'idle', 'completed', 'blocked', 'failed', 'closed']);
 type SubagentStatus = z.infer<typeof subagentStatusEnum>;
@@ -100,7 +107,9 @@ const inputSchema = z
       .max(SUBAGENT_CONTROL_MAX_WAIT_MS)
       .optional()
       .describe(
-        `wait only: maximum wait in ms (default ${SUBAGENT_CONTROL_DEFAULT_WAIT_MS}, max ${SUBAGENT_CONTROL_MAX_WAIT_MS}).`,
+        `wait only: maximum wait in ms (default ${SUBAGENT_CONTROL_DEFAULT_WAIT_MS}, max ${SUBAGENT_CONTROL_MAX_WAIT_MS}). ` +
+          'If the first status read stalls, wait fails with harness.storage and can be retried; if a later ' +
+          'read stalls past the timeout, wait returns timedOut with the statuses from its last completed read.',
       ),
     message: z
       .string()
@@ -208,6 +217,44 @@ function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
 }
 
 /**
+ * Settle with `work`, unless `signal` aborts or `stallAt` passes first; then
+ * resolve `{ done: false }` and stop waiting. The
+ * storage call behind `work` keeps running (the harness storage tracker still
+ * owns it); only this caller stops waiting for it.
+ */
+function settleWithin<T>(
+  work: Promise<T>,
+  stallAt: number,
+  signal: AbortSignal | undefined,
+): Promise<{ done: true; value: T } | { done: false }> {
+  if (signal?.aborted) {
+    work.catch(() => {});
+    return Promise.resolve({ done: false });
+  }
+  return new Promise((resolve, reject) => {
+    const onStop = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onStop);
+      resolve({ done: false });
+    };
+    const timer = setTimeout(onStop, Math.max(0, stallAt - Date.now()));
+    signal?.addEventListener('abort', onStop, { once: true });
+    work.then(
+      value => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onStop);
+        resolve({ done: true, value });
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onStop);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
  * Build the `subagent` control tool for one session. Returns `undefined` when
  * the harness has no subagent types or this session is already at
  * `subagents.maxDepth` (it can have no children to control).
@@ -273,7 +320,13 @@ export function createSubagentControlTool(parent: Session) {
     } else if (record.closedAt !== undefined && delegated?.delegatedSubagentSessionId !== childId) {
       // Terminal lifecycle wins over suspension metadata a cancel preserves.
       status = 'closed';
-    } else if (record.pendingResume !== undefined || active?.status === 'awaiting_input') {
+    } else if (
+      record.cancelRequest === undefined &&
+      record.closedAt === undefined &&
+      (record.pendingResume !== undefined || active?.status === 'awaiting_input')
+    ) {
+      // A cancel (or close) keeps `pendingResume` only as audit evidence: the
+      // interaction can no longer be resumed, so it is never awaiting input.
       status = 'awaiting_input';
     } else if (delegated?.delegatedSubagentSessionId === childId) {
       // The durable link is live: the delegation driver (or reconcile) still
@@ -379,8 +432,42 @@ export function createSubagentControlTool(parent: Session) {
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
     let interval = WAIT_POLL_INTERVAL_MS;
+    // The last resolved views of the pinned children, reported when a later
+    // storage read stalls past the deadline or the call is aborted.
+    let lastSettled: SubagentView[] = [];
+    let lastRunning: SubagentView[] = [];
     for (;;) {
-      const { views, foreign } = await resolveChildren(targets, knownOwned === undefined ? {} : { knownOwned });
+      // The deadline decides when to stop polling, not how long a started read
+      // may take: every read may run at least SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
+      // even when it starts at the deadline.
+      const resolution = await settleWithin(
+        resolveChildren(targets, knownOwned === undefined ? {} : { knownOwned }),
+        Math.max(deadline, Date.now() + SUBAGENT_CONTROL_WAIT_READ_STALL_MS),
+        signal,
+      );
+      if (!resolution.done) {
+        const aborted = signal?.aborted === true;
+        if (!aborted && knownOwned === undefined) {
+          // The first read proves ownership and reads the initial views; with it
+          // stalled both are unknown, so this is a storage failure, not a timeout.
+          return {
+            isError: true,
+            errorName: 'HarnessStorageError',
+            code: 'harness.storage',
+            message:
+              `The subagent state read did not answer within ${SUBAGENT_CONTROL_WAIT_READ_STALL_MS} ms; ` +
+              'nothing is known about the subagents yet. Retry the wait.',
+          };
+        }
+        return {
+          action: 'wait',
+          settledSubagents: lastSettled,
+          runningSubagents: lastRunning,
+          timedOut: !aborted,
+          ...(aborted ? { aborted: true } : {}),
+        };
+      }
+      const { views, foreign } = resolution.value;
       if (foreign.length > 0) return foreignError(foreign);
       // Ownership is proven once; a child row deleted mid-wait then reads as closed.
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
@@ -389,13 +476,15 @@ export function createSubagentControlTool(parent: Session) {
       const pinned = new Set(targets);
       const current = views.filter(view => pinned.has(view.subagentSessionId));
       const running = current.filter(view => !view.settled);
+      lastSettled = current.filter(view => view.settled);
+      lastRunning = running;
       const aborted = signal?.aborted === true;
       const timedOut = running.length > 0 && !aborted && Date.now() >= deadline;
       if (running.length === 0 || timedOut || aborted) {
         return {
           action: 'wait',
-          settledSubagents: current.filter(view => view.settled),
-          runningSubagents: running,
+          settledSubagents: lastSettled,
+          runningSubagents: lastRunning,
           timedOut,
           ...(aborted && running.length > 0 ? { aborted: true } : {}),
         };
@@ -527,7 +616,9 @@ export function createSubagentControlTool(parent: Session) {
       '`status` lists them (or inspects one) with their status. Only a settled task_delegate subagent ' +
       'carries its result; a spawn_subagent result is returned by that spawn_subagent call only. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
-      'returns those settled and those still running. ' +
+      'returns those settled and those still running. If the first status read stalls, wait fails with ' +
+      '`harness.storage` (retry it); if a later read stalls past the timeout, the lists are the statuses from ' +
+      'its last completed read and may be stale. ' +
       '`send` adds an instruction to a subagent whose run is in progress. It is rejected for a subagent ' +
       'that is idle or waiting for human input, and a message the run ends without reading is dropped. ' +
       '`cancel` stops one subagent: `cancel: "acknowledged"` means the cancel is recorded on the subagent ' +
