@@ -23165,11 +23165,14 @@ export class Session {
    * same run id. Delegation follows the orphaned-dispatch contract instead:
    * provider work is never re-run, so the admission settles
    * `failed{harness.run_interrupted}` and a retry must be a new delegation.
+   * Like message recovery, holding the adopted lease is the authority: an
+   * accepted receipt is not given the admitted-signal staleness window.
    *
    * `reattach`: nothing was dispatched yet, the run is parked for a HITL
    * response, or it is still live/settling in this process — re-issuing the
    * admitted signal observes it. `retry`: another dispatch claim is still
-   * live. `interrupted`: the admission is terminal (by this interruption or a
+   * live, or the settlement did not commit (moved lease, changed dispatch).
+   * `interrupted`: the admission is terminal (by this interruption or a
    * concurrent winner); settle the task from the durable evidence.
    */
   async _interruptOrphanedDelegationSignal(admissionId: string): Promise<'reattach' | 'retry' | 'interrupted'> {
@@ -23196,6 +23199,13 @@ export class Session {
       return 'reattach';
     }
     if (dispatch.state === 'dispatching' && dispatch.claimExpiresAt > Date.now()) return 'retry';
+    const error = { code: HARNESS_RUN_INTERRUPTED_ERROR_CODE, message: HARNESS_RUN_INTERRUPTED_MESSAGE };
+    const leaseOwner = { ownerId: this._harness.ownerId };
+    // A pending native terminal admission settles through its finalizer, as in
+    // message recovery: staged output commits completed, otherwise aborted.
+    const terminal = await this._commitInterruptedTerminalHandoff(evidence, runId, error, leaseOwner);
+    if (terminal === 'completed' || terminal === 'committed') return 'interrupted';
+    if (terminal === 'skipped') return 'retry';
     const swapped = await this._storage.compareAndSwapSignalTerminal({
       harnessName: this._record.harnessName,
       sessionId: this.id,
@@ -23205,16 +23215,16 @@ export class Session {
       admissionId,
       admissionHash: evidence.admissionHash,
       expected: dispatch,
-      leaseOwner: { ownerId: this._harness.ownerId },
-      terminal: {
-        status: 'failed',
-        signalId: identity.signalId,
-        runId,
-        error: { code: HARNESS_RUN_INTERRUPTED_ERROR_CODE, message: HARNESS_RUN_INTERRUPTED_MESSAGE },
-      },
+      leaseOwner,
+      terminal: { status: 'failed', signalId: identity.signalId, runId, error },
       updatedAt: Date.now(),
     });
-    return swapped.evidence.status === 'pending' ? 'retry' : 'interrupted';
+    if (swapped.evidence.status === 'pending') return 'retry';
+    if (swapped.applied) {
+      // As in message recovery, the dead run's completion is published once.
+      await this._publishRecoveredRunCompletion(swapped.evidence).catch(() => {});
+    }
+    return 'interrupted';
   }
 
   /**

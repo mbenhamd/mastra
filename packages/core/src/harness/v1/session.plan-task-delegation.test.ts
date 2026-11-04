@@ -2005,7 +2005,8 @@ describe('task_delegate — recovery on rehydrate', () => {
         db.harnessSessions.set(key, { ...row, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
       }
     }
-    // The restart happens after the accepted receipt went stale.
+    // Past the accepted-receipt staleness window, where the admitted-signal
+    // path would reclaim and replay the same run id.
     const realNow = Date.now.bind(Date);
     const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 60_000);
     try {
