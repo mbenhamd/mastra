@@ -20,7 +20,11 @@ import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
 import type { Session } from './session';
-import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-control-tool';
+import {
+  createSubagentControlTool,
+  SUBAGENT_CONTROL_TOOL_ID,
+  SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
+} from './subagent-control-tool';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
@@ -121,6 +125,31 @@ async function delegateHeldChild(parent: Session, childAgent: MockAgent, content
   )) as any;
   await poll(() => childAgent.streamCalls.length > 0);
   return { taskId: task.taskId as string, childId: delegated.subagentSessionId as string, releaseChild };
+}
+
+/** An own child suspended on a pending interaction (awaiting input, not settled). */
+async function awaitingInputChild(harness: Harness, parent: Session): Promise<Session> {
+  const child = await harness.session({
+    resourceId: 'u1',
+    threadId: { fresh: true },
+    parentSessionId: parent.id,
+    origin: 'subagent-tool',
+    modeId: 'worker-mode',
+    subagentDepth: 1,
+  });
+  const now = Date.now();
+  await (child as any)._flushUpdate((prev: any) => ({
+    ...prev,
+    pendingResume: {
+      kind: 'tool-approval',
+      runId: 'run-suspended',
+      toolCallId: 'tool-call-suspended',
+      source: 'parent',
+      requestedAt: now,
+      expiresAt: now + 600_000,
+    },
+  }));
+  return child;
 }
 
 function control(parent: Session) {
@@ -418,10 +447,80 @@ describe('subagent control tool', () => {
     await a.harness.shutdown();
   });
 
-  it('wait stops at its timeout, or promptly on abort, while a storage read stalls', async () => {
+  it('wait stops at its timeout, or promptly on abort, while a later storage read stalls', async () => {
     const { harness } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const child = await harness.session({
+    const child = await awaitingInputChild(harness, parent);
+    const tool = createSubagentControlTool(parent)!;
+    let releaseStorage!: () => void;
+    const gate = new Promise<void>(r => (releaseStorage = r));
+    // The first read (ownership proof and initial views) answers; every later one stalls.
+    let reads = 0;
+    const original = InMemoryHarness.prototype.listPlanTasks;
+    const stall = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(function (
+      this: InMemoryHarness,
+      ...args: Parameters<InMemoryHarness['listPlanTasks']>
+    ) {
+      reads += 1;
+      return reads === 1 ? original.apply(this, args) : gate.then(() => original.apply(this, args));
+    });
+    const guard = (ms: number) => {
+      let timer!: ReturnType<typeof setTimeout>;
+      const stalled = new Promise<'stalled'>(r => (timer = setTimeout(() => r('stalled'), ms)));
+      return { stalled, clear: () => clearTimeout(timer) };
+    };
+    try {
+      let started = Date.now();
+      let bound = guard(SUBAGENT_CONTROL_WAIT_READ_STALL_MS + 2_000);
+      const timed = await Promise.race([
+        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 50 } as any, toolCtx),
+        bound.stalled,
+      ]);
+      bound.clear();
+      expect(timed).toMatchObject({
+        action: 'wait',
+        timedOut: true,
+        settledSubagents: [],
+        runningSubagents: [expect.objectContaining({ subagentSessionId: child.id, status: 'awaiting_input' })],
+      });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+
+      reads = 0;
+      const abort = new AbortController();
+      started = Date.now();
+      // Past the first 100 ms poll interval, so the abort lands on a stalled read.
+      setTimeout(() => abort.abort(), 150);
+      bound = guard(1_000);
+      const aborted = await Promise.race([
+        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 300_000 } as any, {
+          ...toolCtx,
+          abortSignal: abort.signal,
+        }),
+        bound.stalled,
+      ]);
+      bound.clear();
+      expect(aborted).toMatchObject({ action: 'wait', timedOut: false, aborted: true });
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(Date.now() - started).toBeLessThan(500);
+    } finally {
+      releaseStorage();
+      stall.mockRestore();
+    }
+    await harness.shutdown();
+  });
+
+  it('wait over storage with a few ms of latency still proves ownership and reports fresh settlement', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const other = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const foreignChild = await harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: other.id,
+      origin: 'subagent-tool',
+      subagentDepth: 1,
+    });
+    const idleChild = await harness.session({
       resourceId: 'u1',
       threadId: { fresh: true },
       parentSessionId: parent.id,
@@ -429,37 +528,39 @@ describe('subagent control tool', () => {
       modeId: 'worker-mode',
       subagentDepth: 1,
     });
-    const tool = createSubagentControlTool(parent)!;
-    let releaseStorage!: () => void;
-    const gate = new Promise<void>(r => (releaseStorage = r));
-    const stall = vi
-      .spyOn(InMemoryHarness.prototype, 'listPlanTasks')
-      .mockImplementation(() => gate.then(() => ({ tasks: [] })) as any);
-    const stalled = new Promise<'stalled'>(r => setTimeout(() => r('stalled'), 1_000));
+    const suspended = await awaitingInputChild(harness, parent);
+    const original = InMemoryHarness.prototype.listPlanTasks;
+    const latency = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(async function (
+      this: InMemoryHarness,
+      ...args: Parameters<InMemoryHarness['listPlanTasks']>
+    ) {
+      await new Promise(r => setTimeout(r, 5));
+      return original.apply(this, args);
+    });
     try {
-      let started = Date.now();
-      const timed = await Promise.race([
-        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 50 } as any, toolCtx),
-        stalled,
-      ]);
-      expect(timed).toMatchObject({ action: 'wait', timedOut: true });
-      expect(Date.now() - started).toBeGreaterThanOrEqual(45);
-
-      const abort = new AbortController();
-      started = Date.now();
-      setTimeout(() => abort.abort(), 30);
-      const aborted = await Promise.race([
-        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 300_000 } as any, {
-          ...toolCtx,
-          abortSignal: abort.signal,
-        }),
-        stalled,
-      ]);
-      expect(aborted).toMatchObject({ action: 'wait', timedOut: false, aborted: true });
-      expect(Date.now() - started).toBeLessThan(500);
+      const run = control(parent);
+      expect(await run({ action: 'wait', subagentSessionId: foreignChild.id, timeoutMs: 0 })).toMatchObject({
+        isError: true,
+        errorName: 'HarnessValidationError',
+      });
+      for (const timeoutMs of [0, 3]) {
+        expect(await run({ action: 'wait', subagentSessionId: idleChild.id, timeoutMs })).toMatchObject({
+          timedOut: false,
+          runningSubagents: [],
+          settledSubagents: [expect.objectContaining({ subagentSessionId: idleChild.id, settled: true })],
+        });
+      }
+      // The child settles shortly before the deadline: the final poll must see it.
+      setTimeout(() => {
+        void (suspended as any)._flushUpdate((prev: any) => ({ ...prev, pendingResume: undefined }));
+      }, 40);
+      expect(await run({ action: 'wait', subagentSessionId: suspended.id, timeoutMs: 60 })).toMatchObject({
+        timedOut: false,
+        runningSubagents: [],
+        settledSubagents: [expect.objectContaining({ subagentSessionId: suspended.id, settled: true })],
+      });
     } finally {
-      releaseStorage();
-      stall.mockRestore();
+      latency.mockRestore();
     }
     await harness.shutdown();
   });

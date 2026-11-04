@@ -48,6 +48,13 @@ export const SUBAGENT_CONTROL_STATUS_LIMIT = 25;
 const SUBAGENT_CONTROL_TASK_PREVIEW_CHARS = 500;
 const WAIT_POLL_INTERVAL_MS = 100;
 const WAIT_POLL_MAX_INTERVAL_MS = 1_000;
+/**
+ * How long a `wait` poll's storage read may run past the wait deadline. The
+ * deadline decides when to stop polling, never how long a started read may
+ * take; only a read still pending this long after it started (and after the
+ * deadline) counts as stalled.
+ */
+export const SUBAGENT_CONTROL_WAIT_READ_STALL_MS = 1_000;
 
 const subagentStatusEnum = z.enum(['running', 'awaiting_input', 'idle', 'completed', 'blocked', 'failed', 'closed']);
 type SubagentStatus = z.infer<typeof subagentStatusEnum>;
@@ -100,7 +107,9 @@ const inputSchema = z
       .max(SUBAGENT_CONTROL_MAX_WAIT_MS)
       .optional()
       .describe(
-        `wait only: maximum wait in ms (default ${SUBAGENT_CONTROL_DEFAULT_WAIT_MS}, max ${SUBAGENT_CONTROL_MAX_WAIT_MS}).`,
+        `wait only: maximum wait in ms (default ${SUBAGENT_CONTROL_DEFAULT_WAIT_MS}, max ${SUBAGENT_CONTROL_MAX_WAIT_MS}). ` +
+          'If a status read stalls past the timeout, wait returns timedOut with the last statuses it read, ' +
+          'which can be partial or empty; that does not mean nothing is running.',
       ),
     message: z
       .string()
@@ -208,30 +217,29 @@ function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
 }
 
 /**
- * Settle with `work`, unless `deadline` passes or `signal` aborts first; then
- * resolve `{ done: false }` and stop waiting. The storage call behind `work`
- * keeps running (the harness storage tracker still owns it); only this caller
- * stops waiting for it.
+ * Settle with `work`, unless `signal` aborts or (when `stallAt` is given) that
+ * time passes first; then resolve `{ done: false }` and stop waiting. The
+ * storage call behind `work` keeps running (the harness storage tracker still
+ * owns it); only this caller stops waiting for it.
  */
 function settleWithin<T>(
   work: Promise<T>,
-  deadline: number,
+  stallAt: number | undefined,
   signal: AbortSignal | undefined,
 ): Promise<{ done: true; value: T } | { done: false }> {
+  if (signal?.aborted) {
+    work.catch(() => {});
+    return Promise.resolve({ done: false });
+  }
   return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const onStop = () => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onStop);
       resolve({ done: false });
     };
-    const timer = setTimeout(
-      () => {
-        signal?.removeEventListener('abort', onStop);
-        resolve({ done: false });
-      },
-      Math.max(0, deadline - Date.now()),
-    );
+    if (stallAt !== undefined) timer = setTimeout(onStop, Math.max(0, stallAt - Date.now()));
     signal?.addEventListener('abort', onStop, { once: true });
-    if (signal?.aborted) onStop();
     work.then(
       value => {
         clearTimeout(timer);
@@ -425,14 +433,19 @@ export function createSubagentControlTool(parent: Session) {
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
     let interval = WAIT_POLL_INTERVAL_MS;
-    // The last resolved views of the pinned children, reported when a stalled
-    // storage read outlasts the deadline or the abort.
+    // The last resolved views of the pinned children, reported when a later
+    // storage read stalls past the deadline or the call is aborted.
     let lastSettled: SubagentView[] = [];
     let lastRunning: SubagentView[] = [];
     for (;;) {
+      // The first poll proves ownership and reads the initial views, so only an
+      // abort ends it early. A later read may always run at least
+      // SUBAGENT_CONTROL_WAIT_READ_STALL_MS, even when it starts at the deadline.
+      const stallAt =
+        knownOwned === undefined ? undefined : Math.max(deadline, Date.now() + SUBAGENT_CONTROL_WAIT_READ_STALL_MS);
       const resolution = await settleWithin(
         resolveChildren(targets, knownOwned === undefined ? {} : { knownOwned }),
-        deadline,
+        stallAt,
         signal,
       );
       if (!resolution.done) {
@@ -594,7 +607,8 @@ export function createSubagentControlTool(parent: Session) {
       '`status` lists them (or inspects one) with their status. Only a settled task_delegate subagent ' +
       'carries its result; a spawn_subagent result is returned by that spawn_subagent call only. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
-      'returns those settled and those still running. ' +
+      'returns those settled and those still running. If a status read stalls past the timeout, the lists ' +
+      'are the last statuses read and can be partial or empty. ' +
       '`send` adds an instruction to a subagent whose run is in progress. It is rejected for a subagent ' +
       'that is idle or waiting for human input, and a message the run ends without reading is dropped. ' +
       '`cancel` stops one subagent: `cancel: "acknowledged"` means the cancel is recorded on the subagent ' +
