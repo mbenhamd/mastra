@@ -268,17 +268,34 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
   it('a settlement wake turn announces itself on agent_start; the caller-started turn does not', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const starts: Array<Record<string, unknown>> = [];
-    const off = parent.subscribe(event => {
-      if (event.type === 'agent_start') starts.push({ ...event });
+    const sessionEvents: Array<Record<string, unknown>> = [];
+    const hostEvents: Array<Record<string, unknown>> = [];
+    const offSession = parent.subscribe(event => {
+      sessionEvents.push({ ...event });
+    });
+    const offHost = harness.subscribe(event => {
+      hostEvents.push({ ...event });
     });
     const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    // The woken run streams a reply. The chunks carry no runId: the mock cannot
+    // know the runtime-allocated one, so the Session attributes them to the run
+    // its agent_start stamped.
+    parentAgent.enqueueRun({
+      finishReason: 'stop',
+      chunks: [
+        { type: 'text-start', payload: { id: 'wake-msg' } },
+        { type: 'text-delta', payload: { id: 'wake-msg', text: 'woken reply' } },
+        { type: 'text-end', payload: { id: 'wake-msg' } },
+      ],
+    });
 
     releaseChild();
     await poll(() => reminderCalls(parentAgent).length === 1);
     await deliveryFinished(parent, taskId);
-    off();
+    offSession();
+    offHost();
 
+    const starts = sessionEvents.filter(e => e.type === 'agent_start');
     expect(starts).toHaveLength(2);
     const [userTurn, wakeTurn] = starts;
     expect(userTurn).not.toHaveProperty('origin');
@@ -288,6 +305,24 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     // The notice id names the persisted reminder the woken run delivers.
     const delivered = reminderCalls(parentAgent)[0]!.messages as { id?: unknown };
     expect(wakeTurn!.wakeNoticeId).toBe(delivered.id);
+
+    // A consumer registers the reply on agent_start, so it must arrive before
+    // the woken run's first streamed token.
+    const wakeStartAt = sessionEvents.indexOf(wakeTurn!);
+    const firstWakeDeltaAt = sessionEvents.findIndex(e => e.type === 'text_delta' && e.delta === 'woken reply');
+    expect(firstWakeDeltaAt).toBeGreaterThan(-1);
+    expect(sessionEvents[firstWakeDeltaAt]).toMatchObject({ runId: wakeTurn!.runId });
+    expect(wakeStartAt).toBeLessThan(firstWakeDeltaAt);
+
+    // The host-level subscription sees the same wake identity.
+    const hostStarts = hostEvents.filter(e => e.type === 'agent_start' && e.sessionId === parent.id);
+    expect(hostStarts).toHaveLength(2);
+    expect(hostStarts[0]).not.toHaveProperty('origin');
+    expect(hostStarts[1]).toMatchObject({
+      runId: wakeTurn!.runId,
+      origin: 'wake',
+      wakeNoticeId: wakeTurn!.wakeNoticeId,
+    });
     await harness.shutdown();
   });
 
@@ -297,8 +332,12 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     // The process dies after the fenced settlement write, before the reminder
     // row lands: every parent-thread write fails on instance A.
+    const attemptedReminderIds: string[] = [];
     vi.spyOn(a.parentAgent, 'getMemory').mockResolvedValue({
-      saveMessages: () => Promise.reject(new Error('storage down')),
+      saveMessages: (args: { messages: Array<{ id?: string }> }) => {
+        for (const m of args.messages) if (m.id !== undefined) attemptedReminderIds.push(m.id);
+        return Promise.reject(new Error('storage down'));
+      },
     } as never);
     const { taskId, releaseChild } = await delegateFromParentTurn(parentA, a.parentAgent, a.childAgent);
 
@@ -310,10 +349,30 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     crashParent(db, parentA);
     await a.harness.shutdown().catch(() => {});
 
-    const b = buildHarness(db, 'wake');
+    expect(attemptedReminderIds).toHaveLength(1);
+
+    const memoryB = new MockMemory();
+    const b = buildHarness(db, 'wake', memoryB);
+    // PF-7626: the redelivered wake carries the same notice id as before the restart.
+    const startsB: Array<Record<string, unknown>> = [];
+    const offB = b.harness.subscribe(event => {
+      if (event.type === 'agent_start') startsB.push({ ...event });
+    });
     const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
     await poll(() => reminderCalls(b.parentAgent).length === 1);
     await deliveryFinished(parentB, taskId);
+    offB();
+    const { messages: rowsB } = await memoryB.recall({
+      threadId: parentB.threadId,
+      resourceId: 'u1',
+      hideSignals: false,
+    });
+    const persisted = rowsB.filter(m => JSON.stringify(m.content).includes('settled with outcome'));
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]!.id).toBe(attemptedReminderIds[0]);
+    const wakeStartsB = startsB.filter(e => e.sessionId === parentB.id && e.origin === 'wake');
+    expect(wakeStartsB).toHaveLength(1);
+    expect(wakeStartsB[0]).toMatchObject({ origin: 'wake', wakeNoticeId: attemptedReminderIds[0] });
 
     crashParent(db, parentB);
     await b.harness.shutdown().catch(() => {});
@@ -412,8 +471,12 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     const db = new InMemoryDB();
     const a = buildHarness(db, 'wake');
     const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const attemptedReminderIds: string[] = [];
     vi.spyOn(a.parentAgent, 'getMemory').mockResolvedValue({
-      saveMessages: () => Promise.reject(new Error('storage down')),
+      saveMessages: (args: { messages: Array<{ id?: string }> }) => {
+        for (const m of args.messages) if (m.id !== undefined) attemptedReminderIds.push(m.id);
+        return Promise.reject(new Error('storage down'));
+      },
     } as never);
     const { taskId, releaseChild } = await delegateFromParentTurn(parentA, a.parentAgent, a.childAgent);
     releaseChild();
