@@ -204,12 +204,26 @@ export type DiscoverAgentThreadPeersOptions = {
   timeoutMs?: number;
 };
 
+/** Options applied when a signal targets a thread with a run in flight. */
+export type AgentSignalIfActiveOptions = {
+  behavior?: AgentSignalActiveBehavior;
+  attributes?: AgentSignalAttributes;
+  /**
+   * With `behavior: 'deliver'` to a same-agent run in this runtime, the signal
+   * belongs to that run: if the run ends or loses the thread without
+   * consuming it, it is dropped instead of starting a follow-up run or being
+   * handed to another owner. Not carried over pub/sub: a signal routed to a
+   * run owned by another process is delivered without this guarantee.
+   */
+  expireWithRun?: boolean;
+};
+
 export type SendAgentSignalOptions<OUTPUT = unknown> =
   | {
       runId: string;
       resourceId?: string;
       threadId?: string;
-      ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
+      ifActive?: AgentSignalIfActiveOptions;
       ifIdle?: never;
       /**
        * Validated, but does not change the scopes of the run receiving the signal:
@@ -221,7 +235,7 @@ export type SendAgentSignalOptions<OUTPUT = unknown> =
       runId?: never;
       resourceId?: undefined;
       threadId: string;
-      ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
+      ifActive?: AgentSignalIfActiveOptions;
       ifIdle?: never;
       /**
        * Validated, but does not change the scopes of the run receiving the signal:
@@ -233,7 +247,7 @@ export type SendAgentSignalOptions<OUTPUT = unknown> =
       runId?: string;
       resourceId: string;
       threadId: string;
-      ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
+      ifActive?: AgentSignalIfActiveOptions;
       ifIdle?: AgentSignalIfIdleOptions<OUTPUT>;
       /**
        * Scopes for a run this signal starts, unioned with `ifIdle.streamOptions.scopes`.
@@ -504,7 +518,11 @@ export type StructuredOutputOptionsBase<OUTPUT = {}> = {
    * true and 'system' inject JSON instructions into the leading system message.
    * 'inline' appends JSON instructions to the latest user message.
    * 'auto' uses native structured output when supported and inline injection otherwise.
-   * false or omitted uses the provider's native response format.
+   * Omitted uses the provider's native response format, except on Anthropic: omitted or
+   * 'auto', a schema with a free-form object or beyond Anthropic's strict-output limits
+   * (more than 24 optional or 16 union-typed parameters) cannot be carried by the strict
+   * format, so it is injected inline instead (`instructions`, when set, in its place).
+   * false always uses the provider's native response format.
    */
   jsonPromptInjection?: boolean | 'system' | 'inline' | 'auto';
 
@@ -527,9 +545,32 @@ export type StructuredOutputOptionsBase<OUTPUT = {}> = {
   providerOptions?: ProviderOptions;
 } & FallbackFields<OUTPUT>;
 
+/**
+ * @internal Recorded once from the caller's schema where it enters Mastra (the Agent API
+ * boundary, durable preparation, or an input processor that replaces the schema), before any
+ * normalization closes its objects. JSON-safe, so durable runs persist it and a resumed step reads
+ * it instead of re-deriving it from the serialized schema.
+ */
+export interface StructuredOutputSourceDecision {
+  /** The caller's response schema as JSON Schema, wrapped for the output format; what prompt injection sends. */
+  schema?: JSONSchema7;
+  /**
+   * Whether Anthropic's strict output format cannot carry it: a free-form object (explicit or
+   * open by JSON Schema default) or more than 24 optional / 16 union-typed parameters.
+   */
+  strictOutputCannotCarry: boolean;
+  /**
+   * Canonical fingerprint of the schema this decision was recorded for. A step whose schema has
+   * the same fingerprint keeps the decision; a changed schema is decided again.
+   */
+  fingerprint?: string;
+}
+
 export type StructuredOutputOptions<OUTPUT = {}> = StructuredOutputOptionsBase<OUTPUT> & {
   /** Zod schema to validate the output against */
   schema: StandardSchemaWithJSON<OUTPUT>;
+  /** @internal See {@link StructuredOutputSourceDecision}. */
+  sourceDecision?: StructuredOutputSourceDecision;
 };
 
 export type PublicStructuredOutputOptions<OUTPUT = {}> = StructuredOutputOptionsBase<OUTPUT> & {

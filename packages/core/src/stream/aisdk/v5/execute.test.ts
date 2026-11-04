@@ -2,9 +2,19 @@ import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { coreFeatures } from '../../../features';
+import { modelSupportsStructuredOutput } from '../../../llm/model/provider-registry';
 import { ModelRouterLanguageModel } from '../../../llm/model/router';
 import { MAX_EXACT_JSON_MEASUREMENT_CODE_UNITS } from '../../../observability/content-free-measurement';
-import { execute, hasFreeFormObject, resolveJsonPromptInjection, usesOpenAIStrictJsonSchema } from './execute';
+import { getSemanticResponseSchema } from '../../base/schema';
+import {
+  countStructuredOutputParameters,
+  execute,
+  anthropicStrictOutputCarries,
+  hasFreeFormObject,
+  resolveJsonPromptInjection,
+  sendsNativeResponseFormat,
+  usesOpenAIStrictJsonSchema,
+} from './execute';
 import { testUsage } from './test-utils';
 
 const inputMessages = [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'Summarize the plan.' }] }];
@@ -1054,6 +1064,141 @@ describe('execute OpenAI strict-mode schema preparation (issue #23795)', () => {
   it('decides model-router models by provider id', () => {
     expect(usesOpenAIStrictJsonSchema(new ModelRouterLanguageModel('anthropic/claude-sonnet-4-5'))).toBe(false);
     expect(usesOpenAIStrictJsonSchema(new ModelRouterLanguageModel('openai/gpt-4o'))).toBe(true);
+  });
+});
+
+// PF-7309: Anthropic's native output format is strict. It rewrites free-form objects to
+// `additionalProperties: false` (so records come back `{}`) and rejects schemas over its
+// complexity limits, so those schemas are injected into the prompt instead.
+describe('execute Anthropic structured-output fallback (PF-7309)', () => {
+  const recordSchema = z.object({ studyId: z.string(), fields: z.record(z.string(), z.string()) });
+  async function capture(
+    provider: string,
+    structuredOutputSchema: any,
+    providerOptions?: Record<string, any>,
+    { modelId = 'claude-haiku-5-5', jsonPromptInjection }: { modelId?: string; jsonPromptInjection?: 'auto' } = {},
+  ) {
+    let captured: any;
+    const model = new MockLanguageModelV2({
+      provider,
+      modelId,
+      doStream: async (options: any) => {
+        captured = options;
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'text-start', id: 'text-1' },
+            { type: 'text-delta', id: 'text-1', delta: '{}' },
+            { type: 'text-end', id: 'text-1' },
+            { type: 'finish', finishReason: 'stop', usage: testUsage, providerMetadata: undefined },
+          ]),
+          request: { body: '' },
+          response: { headers: {} },
+          warnings: [] as any[],
+        };
+      },
+    });
+    await readStream(
+      execute({
+        runId: 'test-run-id-anthropic',
+        model: model as any,
+        inputMessages,
+        onResult: () => {},
+        methodType: 'stream',
+        providerOptions,
+        structuredOutput: { schema: structuredOutputSchema, jsonPromptInjection },
+      }),
+    );
+    return { options: captured, model };
+  }
+
+  function promptText(options: any): string {
+    return JSON.stringify(options.prompt);
+  }
+
+  // The real-adapter table in agent/__tests__/structured-output-anthropic-fallback.test.ts covers the
+  // schema shapes; this covers the model-router provider id and the tool-stripping decision.
+  it.each(['anthropic'])(
+    'injects a record-bearing schema into the prompt instead of the strict output format (%s)',
+    async provider => {
+      const { options, model } = await capture(provider, recordSchema);
+
+      expect(options.responseFormat).toBeUndefined();
+      expect(promptText(options)).toContain('fields');
+      expect(promptText(options)).toContain('additionalProperties');
+      expect(sendsNativeResponseFormat({ schema: recordSchema }, model)).toBe(false);
+    },
+  );
+
+  describe("jsonPromptInjection: 'auto' on an Anthropic model without registered native support", () => {
+    const modelId = 'claude-sonnet-4-20250514';
+    const unionSchema = z.union([z.record(z.string(), z.string()), z.object({ error: z.boolean() })]);
+
+    it('resolves to prompt injection for this model (precondition)', () => {
+      expect(modelSupportsStructuredOutput(`anthropic/${modelId}`)).not.toBe(true);
+    });
+
+    it('keeps the native response format when structuredOutputMode is jsonTool', async () => {
+      const providerOptions = { anthropic: { structuredOutputMode: 'jsonTool' } };
+      const { options, model } = await capture('anthropic.messages', recordSchema, providerOptions, {
+        modelId,
+        jsonPromptInjection: 'auto',
+      });
+
+      expect(options.responseFormat?.type).toBe('json');
+      expect(
+        sendsNativeResponseFormat({ schema: recordSchema, jsonPromptInjection: 'auto' }, model, providerOptions),
+      ).toBe(true);
+    });
+
+    it('injects the source schema, with the record branch open', async () => {
+      const { options } = await capture('anthropic.messages', unionSchema, undefined, {
+        modelId,
+        jsonPromptInjection: 'auto',
+      });
+      const sourceSchema = getSemanticResponseSchema(unionSchema);
+      const promptParts = options.prompt.flatMap((message: any) =>
+        Array.isArray(message.content) ? message.content.map((part: any) => part.text ?? '') : [message.content],
+      );
+
+      expect(options.responseFormat).toBeUndefined();
+      expect(sourceSchema?.anyOf?.[0]).toMatchObject({ additionalProperties: { type: 'string' } });
+      expect(promptParts.some((part: string) => part.includes(JSON.stringify(sourceSchema)))).toBe(true);
+    });
+  });
+
+  // A raw JSON Schema object is closed only by an explicit `additionalProperties: false`.
+  it('falls back for a raw JSON Schema object that declares properties without additionalProperties', async () => {
+    const rawSchema = {
+      type: 'object',
+      properties: {
+        studyId: { type: 'string' },
+        fields: { type: 'object', properties: { outcome: { type: 'string' } } },
+      },
+      required: ['studyId', 'fields'],
+    };
+    const { options } = await capture('anthropic.messages', rawSchema);
+
+    expect(options.responseFormat).toBeUndefined();
+  });
+
+  it('leaves the OpenAI free-form check unchanged for implicitly open objects', () => {
+    const schema = { type: 'object', properties: { fields: { type: 'object' } } };
+    expect(hasFreeFormObject(schema)).toBe(false);
+    expect(anthropicStrictOutputCarries(schema)).toBe(false);
+  });
+
+  it('counts optional and union-typed parameters across nested subschemas', () => {
+    expect(
+      countStructuredOutputParameters({
+        type: 'object',
+        required: ['a'],
+        properties: {
+          a: { type: ['string', 'null'] },
+          b: { anyOf: [{ type: 'string' }, { type: 'object', properties: { c: { type: 'string' } } }] },
+        },
+      }),
+    ).toEqual({ optional: 2, union: 2 });
   });
 });
 

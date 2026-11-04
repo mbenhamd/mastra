@@ -22,6 +22,7 @@ import { PubSub } from '../events/pubsub';
 import type { Event, EventCallback, PublishEvent, SubscribeOptions } from '../events/types';
 import type { IMastraLogger } from '../logger';
 import { RegisteredLogger } from '../logger';
+import { mergeStructuredOutputSourceDecision } from '../loop/shared/compose-step-input';
 import type { Mastra } from '../mastra';
 import { DEFAULT_RESTART_CONCURRENCY, runWithConcurrency } from '../mastra/run-with-concurrency';
 import type { ObservabilityContext, Span, TracingOptions, TracingPolicy } from '../observability';
@@ -1470,6 +1471,15 @@ export function createStepFromProcessor<TProcessorId extends string>(
               return {
                 ...passThrough,
                 ...validatedResult,
+                // PF-7309: decide a processor-returned structured-output schema after every processor.
+                ...(validatedResult.structuredOutput !== undefined
+                  ? {
+                      structuredOutput: mergeStructuredOutputSourceDecision(
+                        structuredOutput,
+                        validatedResult.structuredOutput,
+                      ),
+                    }
+                  : {}),
                 messages: validatedResult.messages ?? checkedMessageList.get.all.db(),
                 runId: agentRunId,
                 systemMessages: checkedMessageList.getSystemMessages(),
@@ -5604,37 +5614,37 @@ export class Run<
       const result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
         // Upstream #25579: hold the boot-recovery ownership lease while this process drives the run.
         this.#executeOwned(() =>
-        this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-          workflowId: this.workflowId,
-          runId: this.runId,
-          parentWorkflow: this.parentWorkflow,
-          transientExecution: this.transientExecution,
-          ...lifecycleExecution,
-          resourceId: this.resourceId,
-          disableScorers: this.disableScorers,
-          graph: this.executionGraph,
-          serializedStepGraph: this.serializedStepGraph,
-          input: inputDataToUse,
-          initialState: initialStateToUse,
-          firstAdmission: true,
-          pubsub: this.pubsub,
-          retryConfig: this.retryConfig,
-          requestContext: (requestContext ?? new RequestContext()) as RequestContext,
-          actor,
-          abortController: this.abortController,
-          outputWriter,
-          workflowSpan,
-          format,
-          outputOptions,
-          perStep,
-          commitTerminalStatus: status =>
-            this.commitTerminalStatus(
-              lifecycleExecution.executionGeneration,
-              status,
-              lifecycleExecution.lifecycleResumeAttempt,
-            ),
-          isCancellationAdmitted: this.isCancellationAdmitted,
-        }),
+          this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+            workflowId: this.workflowId,
+            runId: this.runId,
+            parentWorkflow: this.parentWorkflow,
+            transientExecution: this.transientExecution,
+            ...lifecycleExecution,
+            resourceId: this.resourceId,
+            disableScorers: this.disableScorers,
+            graph: this.executionGraph,
+            serializedStepGraph: this.serializedStepGraph,
+            input: inputDataToUse,
+            initialState: initialStateToUse,
+            firstAdmission: true,
+            pubsub: this.pubsub,
+            retryConfig: this.retryConfig,
+            requestContext: (requestContext ?? new RequestContext()) as RequestContext,
+            actor,
+            abortController: this.abortController,
+            outputWriter,
+            workflowSpan,
+            format,
+            outputOptions,
+            perStep,
+            commitTerminalStatus: status =>
+              this.commitTerminalStatus(
+                lifecycleExecution.executionGeneration,
+                status,
+                lifecycleExecution.lifecycleResumeAttempt,
+              ),
+            isCancellationAdmitted: this.isCancellationAdmitted,
+          }),
         ),
       );
 
@@ -6865,40 +6875,41 @@ export class Run<
     const executionResultPromise = this.#withActiveExecution(executionGeneration, () =>
       // Upstream #25579: hold the boot-recovery ownership lease while this process drives the run.
       this.#executeOwned(() =>
-      this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-        workflowId: this.workflowId,
-        runId: this.runId,
-        parentWorkflow: this.parentWorkflow,
-        executionGeneration,
-        lifecycleResumeAttempt,
-        lifecycleStepStates,
-        resourceId: this.resourceId,
-        graph: this.executionGraph,
-        serializedStepGraph: this.serializedStepGraph,
-        input: snapshot?.context?.input as TInput,
-        initialState: (snapshot?.value ?? {}) as any,
-        resume: {
-          steps,
-          stepResults,
-          resumePayload: resumeDataToUse,
-          // @ts-expect-error - context type mismatch
-          resumePath: snapshot?.suspendedPaths?.[steps?.[0]] as any,
-          stepExecutionPath: snapshot?.stepExecutionPath,
-          forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
-          label: params.label,
-        },
-        format: params.format,
-        pubsub: this.pubsub,
-        requestContext: requestContextToUse as RequestContext,
-        actor: params.actor,
-        abortController: this.abortController,
-        workflowSpan,
-        outputOptions: params.outputOptions,
-        outputWriter: params.outputWriter,
-        perStep: params.perStep,
-        commitTerminalStatus: status => this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
-        isCancellationAdmitted: this.isCancellationAdmitted,
-      }),
+        this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+          workflowId: this.workflowId,
+          runId: this.runId,
+          parentWorkflow: this.parentWorkflow,
+          executionGeneration,
+          lifecycleResumeAttempt,
+          lifecycleStepStates,
+          resourceId: this.resourceId,
+          graph: this.executionGraph,
+          serializedStepGraph: this.serializedStepGraph,
+          input: snapshot?.context?.input as TInput,
+          initialState: (snapshot?.value ?? {}) as any,
+          resume: {
+            steps,
+            stepResults,
+            resumePayload: resumeDataToUse,
+            // @ts-expect-error - context type mismatch
+            resumePath: snapshot?.suspendedPaths?.[steps?.[0]] as any,
+            stepExecutionPath: snapshot?.stepExecutionPath,
+            forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
+            label: params.label,
+          },
+          format: params.format,
+          pubsub: this.pubsub,
+          requestContext: requestContextToUse as RequestContext,
+          actor: params.actor,
+          abortController: this.abortController,
+          workflowSpan,
+          outputOptions: params.outputOptions,
+          outputWriter: params.outputWriter,
+          perStep: params.perStep,
+          commitTerminalStatus: status =>
+            this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
+          isCancellationAdmitted: this.isCancellationAdmitted,
+        }),
       ),
     ).then(
       result => {
@@ -7329,32 +7340,32 @@ export class Run<
       result = await this.#withActiveExecution(lifecycleExecution.executionGeneration, () =>
         // Upstream #25579: hold the boot-recovery ownership lease while this process drives the run.
         this.#executeOwned(() =>
-        this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-          workflowId: this.workflowId,
-          runId: this.runId,
-          parentWorkflow: this.parentWorkflow,
-          ...lifecycleExecution,
-          resourceId: this.resourceId,
-          disableScorers: this.disableScorers,
-          graph: this.executionGraph,
-          timeTravel: timeTravelData,
-          serializedStepGraph: this.serializedStepGraph,
-          pubsub: this.pubsub,
-          retryConfig: this.retryConfig,
-          requestContext: requestContextToUse as RequestContext,
-          actor,
-          abortController: this.abortController,
-          outputWriter,
-          workflowSpan,
-          outputOptions,
-          perStep,
-          commitTerminalStatus: status =>
-            this.commitTerminalStatus(
-              lifecycleExecution.executionGeneration,
-              status,
-              lifecycleExecution.lifecycleResumeAttempt,
-            ),
-          isCancellationAdmitted: this.isCancellationAdmitted,
+          this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+            workflowId: this.workflowId,
+            runId: this.runId,
+            parentWorkflow: this.parentWorkflow,
+            ...lifecycleExecution,
+            resourceId: this.resourceId,
+            disableScorers: this.disableScorers,
+            graph: this.executionGraph,
+            timeTravel: timeTravelData,
+            serializedStepGraph: this.serializedStepGraph,
+            pubsub: this.pubsub,
+            retryConfig: this.retryConfig,
+            requestContext: requestContextToUse as RequestContext,
+            actor,
+            abortController: this.abortController,
+            outputWriter,
+            workflowSpan,
+            outputOptions,
+            perStep,
+            commitTerminalStatus: status =>
+              this.commitTerminalStatus(
+                lifecycleExecution.executionGeneration,
+                status,
+                lifecycleExecution.lifecycleResumeAttempt,
+              ),
+            isCancellationAdmitted: this.isCancellationAdmitted,
           }),
         ),
       );
