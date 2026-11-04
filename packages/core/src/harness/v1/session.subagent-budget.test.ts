@@ -663,11 +663,42 @@ describe('Harness v1 — subagent budget stop is terminal', () => {
       await hook({
         iteration: 1000,
         text: '',
-        toolResults: [{ id: 'report', name: 'report_subagent_outcome', result: { kind: 'subagent-outcome-report' } }],
+        toolResults: [
+          {
+            id: 'report',
+            name: 'report_subagent_outcome',
+            result: {
+              kind: 'subagent-outcome-report',
+              outcome: 'completed',
+              summary: 'Found it.',
+              evidence: [{ kind: 'analysis', description: 'Checked the sources.' }],
+            },
+          },
+        ],
         isFinal: true,
         finishReason: 'tool-calls',
       });
       expect(session._internalSubagentBudgetExhaustion()).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('records the budget stop when an invalid outcome report is cut off by the Harness step ceiling', async () => {
+    const { hook, session, harness } = await budgetedIterationHook(1000);
+    try {
+      for (let iteration = 1; iteration < 1000; iteration++) {
+        await hook({ iteration, text: '', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' });
+      }
+      // The loop reports a rejected report call under the report tool's name.
+      await hook({
+        iteration: 1000,
+        text: '',
+        toolResults: [{ id: 'report', name: 'report_subagent_outcome', result: {}, error: new Error('invalid input') }],
+        isFinal: true,
+        finishReason: 'tool-calls',
+      });
+      expect(session._internalSubagentBudgetExhaustion()).toEqual({ budget: 'steps', limit: 1000, used: 1000 });
     } finally {
       await harness.shutdown();
     }

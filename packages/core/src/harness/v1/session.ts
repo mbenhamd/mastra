@@ -273,6 +273,7 @@ import type {
 } from './terminal-subagent-result';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
+  harnessSubagentOutcomeReportSchema,
   MAX_HARNESS_SUBAGENT_RESULT_TEXT_BYTES,
   materializeHarnessTerminalText,
   parseHarnessSubagentBudgetExhausted,
@@ -656,9 +657,16 @@ function createHarnessEmptySynthesisOptions(
             // Harness step ceiling cutting off a model that wanted to continue
             // all mean the child was stopped by its budget. A step that reports
             // the child's outcome at the ceiling is a real completion.
+            // Only a step whose sole result is a valid outcome report (the same
+            // predicate the report tool's terminal result uses) is a completion.
+            const [onlyResult, ...otherResults] = context.toolResults;
             const reportedOutcome =
               context.isFinal &&
-              context.toolResults.some(toolResult => toolResult.name === HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID);
+              otherResults.length === 0 &&
+              onlyResult !== undefined &&
+              onlyResult.name === HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID &&
+              onlyResult.error === undefined &&
+              harnessSubagentOutcomeReportSchema.safeParse(onlyResult.result).success;
             const reopened =
               !reportedOutcome &&
               (!context.isFinal ||
