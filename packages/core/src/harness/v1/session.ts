@@ -22920,6 +22920,66 @@ export class Session {
   }
 
   /**
+   * @internal — called on a delegated child this process has just adopted
+   * (it holds the child's lease) before a restart re-attach. A delegated
+   * signal whose dispatch a dead owner already claimed or accepted may have
+   * reached the provider; the admitted-signal path would replay it under the
+   * same run id. Delegation follows the orphaned-dispatch contract instead:
+   * provider work is never re-run, so the admission settles
+   * `failed{harness.run_interrupted}` and a retry must be a new delegation.
+   *
+   * `reattach`: nothing was dispatched yet, the run is parked for a HITL
+   * response, or it is still live/settling in this process — re-issuing the
+   * admitted signal observes it. `retry`: another dispatch claim is still
+   * live. `interrupted`: the admission is terminal (by this interruption or a
+   * concurrent winner); settle the task from the durable evidence.
+   */
+  async _interruptOrphanedDelegationSignal(admissionId: string): Promise<'reattach' | 'retry' | 'interrupted'> {
+    const identity = this._signalAdmissionIdentity(admissionId);
+    const loaded = await this._storage.loadMessageResultEvidence({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      signalId: identity.signalId,
+    });
+    if (!loaded || !('status' in loaded)) return 'reattach';
+    const evidence = loaded as AgentSignalResultEvidence;
+    if (evidence.status !== 'pending') return 'interrupted';
+    const dispatch = this._signalDispatchState(evidence, identity);
+    if (dispatch.state === 'reserved' || evidence.admissionHash === undefined) return 'reattach';
+    const runId = dispatch.runId;
+    if (
+      this._record.pendingResume?.runId === runId ||
+      this._messageAdmissionStarts.has(admissionId) ||
+      this._runCompletionPromises.has(runId) ||
+      this._completedRuns.has(runId)
+    ) {
+      return 'reattach';
+    }
+    if (dispatch.state === 'dispatching' && dispatch.claimExpiresAt > Date.now()) return 'retry';
+    const swapped = await this._storage.compareAndSwapSignalTerminal({
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      signalId: identity.signalId,
+      admissionId,
+      admissionHash: evidence.admissionHash,
+      expected: dispatch,
+      leaseOwner: { ownerId: this._harness.ownerId },
+      terminal: {
+        status: 'failed',
+        signalId: identity.signalId,
+        runId,
+        error: { code: HARNESS_RUN_INTERRUPTED_ERROR_CODE, message: HARNESS_RUN_INTERRUPTED_MESSAGE },
+      },
+      updatedAt: Date.now(),
+    });
+    return swapped.evidence.status === 'pending' ? 'retry' : 'interrupted';
+  }
+
+  /**
    * @internal — recovery / reconcile-on-rehydrate (§5.6 TM-6). Scan this
    * session's plan tasks for a `delegatedSubagentSessionId` whose task is still
    * non-terminal and reconcile each against the delegated subagent session's
@@ -22930,9 +22990,12 @@ export class Session {
    *     it (a FAILED delegated run recovers as `failed`, not `completed`);
    *   - subagent session GONE/deleted → fail closed (`failed`);
    *   - subagent CLOSED with no terminal evidence → fail closed;
-   *   - subagent still LIVE with pending evidence → re-attach by re-issuing the
-   *     admitted signal. Dedup observes the original run or waits for its
-   *     suspended resume; it never dispatches a second specialist turn.
+   *   - subagent still LIVE with a dispatch a dead owner claimed or accepted
+   *     (not parked for HITL) → interrupt it `failed{harness.run_interrupted}`
+   *     and fail the task; provider work is never re-run (PF-7499);
+   *   - subagent still LIVE with an undispatched reservation or a parked
+   *     suspension → re-attach by re-issuing the admitted signal. Dedup
+   *     dispatches the reservation once or waits for the suspended resume.
    *
    * Resilient: a transient/CAS failure on a single task does not strand it — the
    * scan re-arms a capped-backoff retry so a stuck `in_progress` delegation is not left
@@ -23136,6 +23199,33 @@ export class Session {
         this._delegationDriverClaims.delete(childId);
         this._internalReleaseSubagentExecution();
         if (!this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
+        continue;
+      }
+      // PF-7499: a dispatch the dead owner already claimed or accepted is
+      // interrupted, never replayed under the same run id. The settled
+      // evidence then rolls the task up through the durable path.
+      let orphan: 'reattach' | 'retry' | 'interrupted';
+      try {
+        orphan = await child._interruptOrphanedDelegationSignal(this._delegationAdmissionId(task.taskId));
+      } catch {
+        orphan = 'retry';
+      }
+      if (orphan !== 'reattach') {
+        this._delegationDriverClaims.delete(childId);
+        this._internalReleaseSubagentExecution();
+        const interrupted =
+          orphan === 'interrupted'
+            ? await this._loadDelegationOutcomeFromEvidence(
+                child.getRecord(),
+                task.taskId,
+                delegationAttempt.deadlineAt,
+              )
+            : undefined;
+        if (interrupted === undefined || !(await this._closeDelegatedChildForSettlement(child.getRecord()))) {
+          needsRetry = true;
+          continue;
+        }
+        await this._reconcileDelegatedTask(task.taskId, childId, interrupted.outcome, interrupted.result);
         continue;
       }
       // §9 — restore the SubagentDefinition overrides on the reattached child. The

@@ -1976,6 +1976,65 @@ describe('task_delegate — recovery on rehydrate', () => {
     await b.harness.shutdown();
   });
 
+  // PF-7499: the dead owner had ACCEPTED the child's admitted dispatch (its
+  // provider call was in flight). Once that receipt is stale, re-issuing the
+  // admitted signal would replay the same run; recovery must interrupt it.
+  it('interrupts a delegated child killed mid-provider-call instead of re-running it after restart', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    // Never released: A dies while the child's provider call is in flight.
+    a.childAgent.enqueueRun({ holdUntil: new Promise<void>(() => {}), finishReason: 'stop' });
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeParentTurn = await openParentTurn(parentA, a.parentAgent);
+    const toolsA = createPlanTaskTools(parentA);
+    const task = (await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'research' } as any, toolCtx)) as any;
+    const delegated = (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    await poll(() =>
+      [...db.harnessMessageResultEvidence.values()].some(
+        row => row.sessionId === delegated.subagentSessionId && row.dispatch?.state === 'accepted',
+      ),
+    );
+    expect(a.childAgent.streamCalls).toHaveLength(1);
+    closeParentTurn();
+
+    for (const [key, row] of db.harnessSessions) {
+      if (row.ownerId === (parentA as any)._internalOwnerId) {
+        db.harnessSessions.set(key, { ...row, ownerId: 'crashed', leaseExpiresAt: Date.now() - 1 });
+      }
+    }
+    // The restart happens after the accepted receipt went stale.
+    const realNow = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 60_000);
+    try {
+      const b = buildHarness(db);
+      const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+      // Settled, or (the PF-7499 defect) the admitted child turn was dispatched again.
+      await poll(
+        async () =>
+          b.childAgent.streamCalls.length > 0 ||
+          ['failed', 'completed'].includes((await planRow(parentB, task.taskId))?.status ?? ''),
+        5_000,
+      );
+
+      expect(b.childAgent.streamCalls).toHaveLength(0);
+      const checked = (await (parentB as any)._planTaskCheck({ rootTaskId: task.taskId })).tasks[0];
+      expect(checked.status).toBe('failed');
+      expect(checked.delegation).toMatchObject({
+        status: 'failed',
+        result: { error: { code: 'harness.run_interrupted' } },
+      });
+      const child = await parentB._internalStorage.loadSession({ sessionId: delegated.subagentSessionId });
+      expect(child?.closedAt).toBeDefined();
+      expect(parentB.isBusy()).toBe(false);
+      await b.harness.shutdown();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   // CRASH-FAITHFUL: the child run already COMPLETED (durable terminal evidence
   // written by the delegation admissionId) before the crash, but the rollup hook
   // was lost. Reconcile reads the durable `completed` evidence and rolls up
