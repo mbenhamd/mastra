@@ -2140,14 +2140,15 @@ describe('task_delegate — recovery on rehydrate', () => {
     }
   });
 
-  // Fails the delegated run's summary write: once, or by never returning (its
-  // writer dies). Other runs' summaries are written normally.
+  // Fails the delegated run's summary write: once, while `failing` is set, or
+  // by never returning (its writer dies). Other runs' summaries are written.
   class FailingRunSummaryStorage extends InMemoryHarness {
     saveAttempts = 0;
+    failing = true;
     constructor(
       db: InMemoryDB,
       private readonly runId: string,
-      private readonly failure: 'once' | 'hang',
+      private readonly failure: 'once' | 'while-failing' | 'hang',
     ) {
       super({ db });
     }
@@ -2155,7 +2156,9 @@ describe('task_delegate — recovery on rehydrate', () => {
       if (input.summary.runId !== this.runId) return super.saveRunSummary(input);
       this.saveAttempts++;
       if (this.failure === 'hang') return new Promise<HarnessRunSummary | null>(() => {});
-      if (this.saveAttempts === 1) throw new Error('transient run-summary write failure');
+      if (this.failure === 'once' ? this.saveAttempts === 1 : this.failing) {
+        throw new Error('transient run-summary write failure');
+      }
       return super.saveRunSummary(input);
     }
   }
@@ -2209,6 +2212,90 @@ describe('task_delegate — recovery on rehydrate', () => {
       expect(completions.runCompletions()).toHaveLength(1);
       expect(b.childAgent.streamCalls).toHaveLength(0);
       expect(c.childAgent.streamCalls).toHaveLength(0);
+      await c.harness.shutdown();
+    } finally {
+      crashed.clock.mockRestore();
+    }
+  });
+
+  // The interruption committed but its publication failed; the child is then
+  // closed (or cancelled) before the reconcile retry. Every close publishes it.
+  async function interruptWithFailedPublication(db: InMemoryDB) {
+    const crashed = await crashWithDelegatedChildMidCall(db);
+    const storage = new FailingRunSummaryStorage(db, crashed.runId, 'while-failing');
+    const b = buildHarness(db, { storage });
+    const completions = collectCompletions(b.harness, crashed.runId);
+    const parentB = await b.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+    await poll(() => storage.saveAttempts > 0 && crashed.childEvidence()?.status === 'failed', 5_000);
+    storage.failing = false;
+    return { ...crashed, storage, b, parentB, completions };
+  }
+
+  it('publishes an interrupted delegation completion when its child is closed before the reconcile retry', async () => {
+    const db = new InMemoryDB();
+    const run = await interruptWithFailedPublication(db);
+    try {
+      const child = await run.b.harness.session({ sessionId: run.childId, resourceId: 'u1' });
+      await child.close();
+      await poll(async () => (await planRow(run.parentB, run.taskId))?.status === 'failed', 5_000);
+
+      await expect(run.storage.loadRunSummary({ harnessName: 'default', runId: run.runId })).resolves.toMatchObject({
+        runId: run.runId,
+        sessionId: run.childId,
+      });
+      expect(run.completions.agentEnds()).toHaveLength(1);
+      expect(run.completions.runCompletions()).toHaveLength(1);
+      await run.b.harness.shutdown();
+    } finally {
+      run.clock.mockRestore();
+    }
+  });
+
+  it('publishes an interrupted delegation completion when its child is cancelled before the reconcile retry', async () => {
+    const db = new InMemoryDB();
+    const run = await interruptWithFailedPublication(db);
+    try {
+      await run.parentB._internalCancelOwnedSubagent(run.childId, 'subagent_cancelled');
+      await poll(async () => (await planRow(run.parentB, run.taskId))?.status === 'failed', 5_000);
+
+      await expect(run.storage.loadRunSummary({ harnessName: 'default', runId: run.runId })).resolves.toMatchObject({
+        runId: run.runId,
+        sessionId: run.childId,
+      });
+      expect(run.completions.agentEnds()).toHaveLength(1);
+      expect(run.completions.runCompletions()).toHaveLength(1);
+      await run.b.harness.shutdown();
+    } finally {
+      run.clock.mockRestore();
+    }
+  });
+
+  it('publishes the completion of a closed delegated child with interrupted evidence before settling its task', async () => {
+    const db = new InMemoryDB();
+    const crashed = await crashWithDelegatedChildMidCall(db);
+    try {
+      // B commits the interruption and dies inside its publication; the child
+      // is then left closed with no summary.
+      const storageB = new FailingRunSummaryStorage(db, crashed.runId, 'hang');
+      const b = buildHarness(db, { storage: storageB });
+      void b.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(() => storageB.saveAttempts > 0 && crashed.childEvidence()?.status === 'failed', 5_000);
+      crashOwner(db, b.harness.ownerId);
+      for (const [key, row] of db.harnessSessions) {
+        if (row.id === crashed.childId) db.harnessSessions.set(key, { ...row, closedAt: Date.now() });
+      }
+
+      const c = buildHarness(db);
+      const completions = collectCompletions(c.harness, crashed.runId);
+      const parentC = await c.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(async () => (await planRow(parentC, crashed.taskId))?.status === 'failed', 5_000);
+
+      await expect(
+        parentC._internalStorage.loadRunSummary({ harnessName: 'default', runId: crashed.runId }),
+      ).resolves.toMatchObject({ runId: crashed.runId, sessionId: crashed.childId });
+      expect(completions.agentEnds()).toHaveLength(1);
+      expect(completions.runCompletions()).toHaveLength(1);
+      expect((await parentC._internalStorage.loadSession({ sessionId: crashed.childId }))?.closedAt).toBeDefined();
       await c.harness.shutdown();
     } finally {
       crashed.clock.mockRestore();

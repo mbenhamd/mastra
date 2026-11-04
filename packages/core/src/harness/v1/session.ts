@@ -1622,6 +1622,26 @@ function normalizeSessionLogicalMessageInputIdentity(
   }
 }
 
+/** The deterministic admission id of a parent's `task_delegate` signal to its child. */
+function delegationAdmissionId(parentSessionId: string, taskId: string): string {
+  return `harness-delegate:${parentSessionId}:${taskId}`;
+}
+
+/**
+ * Settled evidence recovery publishes (as message recovery does): a completed
+ * result that was not erased, or an interruption. Other failures were
+ * reported by the run that failed.
+ */
+function owesRecoveredCompletion(
+  evidence: AgentSignalResultEvidence,
+): evidence is AgentSignalResultEvidence & { runId: string } {
+  return (
+    evidence.runId !== undefined &&
+    ((evidence.status === 'completed' && evidence.erased !== true) ||
+      (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE))
+  );
+}
+
 export class Session {
   /** Stable identity. Frozen at construction. */
   readonly id: string;
@@ -3854,6 +3874,10 @@ export class Session {
     }
     const { blockedBy } = await this._recoverOrphanedMessageDispatches();
     if (blockedBy !== undefined) return blockedBy;
+    // A delegated child's recovered completion is published before any close
+    // (explicit, cancellation, Stop or settlement): once closed, no recovery
+    // publishes it. A failure refuses the close, as message recovery's does.
+    if (phase === 'before-drain') await this._publishOwedDelegationCompletions();
     const parkedRunId = this._record.pendingResume?.runId;
     let cursor: PendingMessageAdmissionScanCursor | undefined;
     do {
@@ -22740,7 +22764,7 @@ export class Session {
    * specialist work.
    */
   private _delegationAdmissionId(taskId: string): string {
-    return `harness-delegate:${this.id}:${taskId}`;
+    return delegationAdmissionId(this.id, taskId);
   }
 
   /**
@@ -23218,21 +23242,17 @@ export class Session {
   /**
    * Make child closure the prerequisite for clearing its plan ownership edge.
    * Returns false on a transient/foreign-lease failure so the caller can retain
-   * the link and retry; a closed child is already safe. With
-   * `publishAdmissionId`, the child first publishes that delegation's
-   * recovered completion (PF-7499); a publication failure also returns false.
+   * the link and retry; a closed child is already safe once its recovered
+   * completion is published. The child's close publishes it while the link
+   * still names the child (PF-7499); a closed child that still owes it is
+   * reopened and closed again, so the task never settles unpublished.
    */
-  private async _closeDelegatedChildForSettlement(
-    childRecord: SessionRecord,
-    publishAdmissionId?: string,
-  ): Promise<boolean> {
-    if (childRecord.closedAt !== undefined) return true;
+  private async _closeDelegatedChildForSettlement(childRecord: SessionRecord, taskId: string): Promise<boolean> {
     try {
+      if (childRecord.closedAt !== undefined && !(await this._delegationCompletionOwed(childRecord, taskId))) {
+        return true;
+      }
       const child = await this._harness.session({ sessionId: childRecord.id, resourceId: this.resourceId });
-      // A recovered completion is published before the child closes and the
-      // task settles: until then the open child and its link keep it owed, so
-      // a failed or crashed publication is retried by the next scan.
-      if (publishAdmissionId !== undefined) await child._publishRecoveredDelegationCompletion(publishAdmissionId);
       await child.close();
       return true;
     } catch {
@@ -23260,30 +23280,45 @@ export class Session {
    * waiting for HITL", never a successful delegation. Evidence outlives a closed
    * child and therefore remains the recovery authority after a crash.
    */
-  private async _loadDelegationOutcomeFromEvidence(
+  private _loadDelegationEvidence(
     childRecord: SessionRecord,
     taskId: string,
-    deadlineAt: number,
-  ): Promise<{ outcome: DelegatedSubagentOutcome; result: HarnessSubagentResultSummary } | undefined> {
-    const admissionId = this._delegationAdmissionId(taskId);
+  ): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null> {
     const digest = sha256CanonicalJson({
       kind: 'channel-signal-admission',
       harnessName: childRecord.harnessName,
       sessionId: childRecord.id,
       resourceId: childRecord.resourceId,
       threadId: childRecord.threadId,
-      admissionId,
+      admissionId: this._delegationAdmissionId(taskId),
     });
-    const signalId = `harness-channel-signal-${digest.slice(0, 32)}`;
+    return this._storage.loadMessageResultEvidence({
+      harnessName: childRecord.harnessName,
+      sessionId: childRecord.id,
+      resourceId: childRecord.resourceId,
+      threadId: childRecord.threadId,
+      signalId: `harness-channel-signal-${digest.slice(0, 32)}`,
+    });
+  }
+
+  /** Whether a closed delegated child's settled run still lacks its published completion. */
+  private async _delegationCompletionOwed(childRecord: SessionRecord, taskId: string): Promise<boolean> {
+    if (!this._storage.supportsDispatchRecovery) return false;
+    const evidence = await this._loadDelegationEvidence(childRecord, taskId);
+    if (!evidence || !('status' in evidence) || !owesRecoveredCompletion(evidence)) return false;
+    return (
+      (await this._storage.loadRunSummary({ harnessName: childRecord.harnessName, runId: evidence.runId })) === null
+    );
+  }
+
+  private async _loadDelegationOutcomeFromEvidence(
+    childRecord: SessionRecord,
+    taskId: string,
+    deadlineAt: number,
+  ): Promise<{ outcome: DelegatedSubagentOutcome; result: HarnessSubagentResultSummary } | undefined> {
     let evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | null;
     try {
-      evidence = await this._storage.loadMessageResultEvidence({
-        harnessName: childRecord.harnessName,
-        sessionId: childRecord.id,
-        resourceId: childRecord.resourceId,
-        threadId: childRecord.threadId,
-        signalId,
-      });
+      evidence = await this._loadDelegationEvidence(childRecord, taskId);
     } catch {
       return undefined;
     }
@@ -23431,14 +23466,33 @@ export class Session {
       threadId: this.threadId,
       signalId: this._signalAdmissionIdentity(admissionId).signalId,
     });
-    if (!loaded || !('status' in loaded)) return;
-    const evidence = loaded as AgentSignalResultEvidence;
-    if (evidence.runId === undefined) return;
-    if (
-      (evidence.status === 'completed' && evidence.erased !== true) ||
-      (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE)
-    ) {
-      await this._publishRecoveredRunCompletion(evidence);
+    if (!loaded || !('status' in loaded) || !owesRecoveredCompletion(loaded)) return;
+    await this._publishRecoveredRunCompletion(loaded);
+  }
+
+  /**
+   * Publish the recovered completion of each delegation the parent's plan
+   * still links to this child. The link is cleared only when the task
+   * settles, and every settlement closes the child first, so a closing child
+   * finds every delegation whose completion can still be owed.
+   */
+  private async _publishOwedDelegationCompletions(): Promise<void> {
+    const parentSessionId = this._record.parentSessionId;
+    if (parentSessionId === undefined) return;
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this._storage.listPlanTasks({
+        harnessName: this._record.harnessName,
+        sessionId: parentSessionId,
+        limit: 500,
+        cursor,
+      });
+      for (const task of page.tasks) {
+        if (task.delegatedSubagentSessionId !== this.id) continue;
+        await this._publishRecoveredDelegationCompletion(delegationAdmissionId(parentSessionId, task.taskId));
+      }
+      if (!page.cursor || page.tasks.length === 0) return;
+      cursor = page.cursor;
     }
   }
 
@@ -23569,7 +23623,7 @@ export class Session {
       // durable cancellation CAS and task reconciliation; otherwise recovery
       // degrades a precise timeout into the generic delegation-failed result.
       if (childRecord.cancelRequest !== undefined) {
-        if (!(await this._closeDelegatedChildForSettlement(childRecord))) {
+        if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
           needsRetry = true;
           continue;
         }
@@ -23585,7 +23639,7 @@ export class Session {
         continue;
       }
       if (delegationAttempt === undefined) {
-        if (!(await this._closeDelegatedChildForSettlement(childRecord))) {
+        if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
           needsRetry = true;
           continue;
         }
@@ -23604,7 +23658,7 @@ export class Session {
         delegationAttempt.deadlineAt,
       );
       if (durable !== undefined) {
-        if (!(await this._closeDelegatedChildForSettlement(childRecord, this._delegationAdmissionId(task.taskId)))) {
+        if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
           needsRetry = true;
           continue;
         }
@@ -23704,7 +23758,7 @@ export class Session {
             : undefined;
         if (
           interrupted === undefined ||
-          !(await this._closeDelegatedChildForSettlement(child.getRecord(), this._delegationAdmissionId(task.taskId)))
+          !(await this._closeDelegatedChildForSettlement(child.getRecord(), task.taskId))
         ) {
           needsRetry = true;
           continue;
