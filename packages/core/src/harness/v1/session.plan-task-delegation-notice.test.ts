@@ -46,6 +46,8 @@ const completedReport = {
 function buildHarness(db: InMemoryDB, onDelegatedSettlement: NoticeMode, memory?: MockMemory) {
   const parentAgent = new MockAgent({ id: 'parent-agent' });
   const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
+  // A memory-less mode that cannot delegate, like a governed workflow step.
+  const quietAgent = new MockAgent({ id: 'quiet-agent' });
   if (memory !== undefined) {
     // Both modes can delegate, so `remind` requires memory on both agents.
     for (const agent of [parentAgent, childAgent]) {
@@ -54,10 +56,11 @@ function buildHarness(db: InMemoryDB, onDelegatedSettlement: NoticeMode, memory?
     }
   }
   const harness = new Harness({
-    agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+    agents: { 'parent-agent': parentAgent, 'child-agent': childAgent, 'quiet-agent': quietAgent } as any,
     modes: [
       { id: 'default', agentId: 'parent-agent' },
       { id: 'worker-mode', agentId: 'child-agent' },
+      { id: 'quiet-mode', agentId: 'quiet-agent', harnessBuiltins: 'exclude' },
     ],
     defaultModeId: 'default',
     sessions: { storage: new InMemoryHarness({ db }) },
@@ -249,6 +252,23 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     expect(reminders).toHaveLength(1);
     expect(JSON.stringify(reminders[0]!.content)).toContain(taskId);
     expect(parentAgent.streamCalls).toHaveLength(1);
+    await harness.shutdown();
+  });
+
+  it('remind persists into the delegating mode memory after the parent switched to a memory-less mode', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    await parent.switchMode({ mode: 'quiet-mode' });
+
+    releaseChild();
+    await deliveryFinished(parent, taskId);
+
+    const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+    const reminders = messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'));
+    expect(reminders).toHaveLength(1);
+    expect(JSON.stringify(reminders[0]!.content)).toContain(taskId);
     await harness.shutdown();
   });
 

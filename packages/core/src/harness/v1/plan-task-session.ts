@@ -1204,6 +1204,8 @@ export interface DelegateTaskInput {
   parentToolCallId?: string;
   /** Internal correlation to the parent provider run. */
   parentRunId?: string;
+  /** Mode the parent ran in when it delegated; its memory receives a `remind` notice. */
+  parentModeId?: string;
   /**
    * Exact JSON app-key subset approved for the delegated child turn. Kept out
    * of the model-facing plan projection, but persisted so restart reattachment
@@ -1230,6 +1232,7 @@ interface DelegationAttemptMetadata {
   subagentSessionId: string;
   parentToolCallId: string;
   parentRunId?: string;
+  parentModeId?: string;
   includeSubtree: boolean;
   startedAt: number;
   deadlineAt: number;
@@ -1258,6 +1261,8 @@ export interface PendingDelegationSettlementNotice {
   mode: DelegatedSettlementNoticeMode;
   digest: string;
   outcome: DelegatedSubagentOutcome;
+  /** Mode the parent delegated from, when recorded. */
+  parentModeId?: string;
 }
 
 function sha256Text(value: string): string {
@@ -1301,6 +1306,7 @@ function delegationAttemptMetadata(
     attempt.requestContextAppSha256 = sha256CanonicalJsonChecked(requestContextApp);
   }
   if (input.parentRunId !== undefined) attempt.parentRunId = input.parentRunId;
+  if (input.parentModeId !== undefined) attempt.parentModeId = input.parentModeId;
   if (priorMetadata !== undefined) attempt.priorMetadata = priorMetadata;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: attempt };
 }
@@ -1336,6 +1342,7 @@ function settledDelegationAttemptMetadata(
     settlement,
   };
   if (attempt.parentRunId !== undefined) encoded.parentRunId = attempt.parentRunId;
+  if (attempt.parentModeId !== undefined) encoded.parentModeId = attempt.parentModeId;
   if (attempt.hadPriorMetadata) encoded.priorMetadata = attempt.priorMetadata!;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: encoded };
 }
@@ -1362,6 +1369,7 @@ export function readDelegationAttemptMetadata(
     typeof raw.parentToolCallId !== 'string' ||
     raw.parentToolCallId.length === 0 ||
     (raw.parentRunId !== undefined && (typeof raw.parentRunId !== 'string' || raw.parentRunId.length === 0)) ||
+    (raw.parentModeId !== undefined && (typeof raw.parentModeId !== 'string' || raw.parentModeId.length === 0)) ||
     typeof raw.includeSubtree !== 'boolean' ||
     typeof raw.startedAt !== 'number' ||
     !Number.isSafeInteger(raw.startedAt) ||
@@ -1446,6 +1454,7 @@ export function readDelegationAttemptMetadata(
     subagentSessionId: raw.subagentSessionId,
     parentToolCallId: raw.parentToolCallId,
     ...(typeof raw.parentRunId === 'string' ? { parentRunId: raw.parentRunId } : {}),
+    ...(typeof raw.parentModeId === 'string' ? { parentModeId: raw.parentModeId } : {}),
     includeSubtree: raw.includeSubtree,
     startedAt: raw.startedAt,
     deadlineAt: raw.deadlineAt,
@@ -1827,6 +1836,7 @@ export function readPendingDelegationSettlementNotice(
     mode: settlement.notice.mode,
     digest: settlement.notice.digest,
     outcome: settlement.outcome,
+    ...(attempt.parentModeId !== undefined ? { parentModeId: attempt.parentModeId } : {}),
   };
 }
 

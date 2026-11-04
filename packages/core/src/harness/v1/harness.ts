@@ -2139,6 +2139,11 @@ export class Harness {
     return this._shutdown;
   }
 
+  /** @internal — whether `modeId` is a configured mode. */
+  _hasMode(modeId: string): boolean {
+    return this._modesById.has(modeId);
+  }
+
   /** @internal — Session reads the resolved mode for per-turn overlays. */
   _getMode(modeId: string): HarnessMode {
     const mode = this._modesById.get(modeId);

@@ -68,6 +68,7 @@ import {
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
+import type { MastraMemory } from '../../memory/memory';
 import type { TracingContext } from '../../observability';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -23439,6 +23440,7 @@ export class Session {
           expectedScopeFingerprint: scopeSnapshot.fingerprint,
           ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
           ...(parentRunId !== undefined ? { parentRunId } : {}),
+          parentModeId: this._currentRunModeId ?? this._record.modeId,
           ...(delegatedRequestContext !== undefined ? { requestContextApp: delegatedRequestContext.app } : {}),
         }),
       );
@@ -24060,23 +24062,11 @@ export class Session {
       const content = delegationSettlementNoticeText(notice);
       const attributes = { type: 'delegated-task-settled' };
       const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-      // The active turn may run a per-turn mode override on another agent.
-      const agent = this._harness.getAgentForMode(this._currentRunModeId ?? this._record.modeId);
       // Write the reminder row directly, as the runtime's `persist` behaviour
       // does: no synthetic broadcast run occupies the thread, so a following
       // idle wake is not mistaken for an interleave, and nothing is handed to
       // an ungated follow-up run.
-      // Resolve memory with the parent's own context, as its turns do, so a
-      // dynamic memory resolver selects the parent's store.
-      const requestContext = await this._buildRequestContext({
-        modeId: this._currentRunModeId ?? this._record.modeId,
-        modelId: this._record.modelId,
-        abortSignal: new AbortController().signal,
-        ...(this._currentTurnRequestContext !== undefined
-          ? { persistedRequestContext: this._currentTurnRequestContext }
-          : {}),
-      });
-      const memory = await agent.getMemory({ requestContext });
+      const memory = await this._resolveDelegationNoticeMemory(notice);
       // Shutdown may have begun while the notice was re-read and memory resolved.
       if (!live()) return;
       if (memory !== undefined && memory !== null) {
@@ -24126,6 +24116,42 @@ export class Session {
     } finally {
       this._delegationNoticesInFlight.delete(key);
     }
+  }
+
+  /**
+   * Memory that receives a settlement reminder row. The active mode's agent
+   * memory comes first (a per-turn override may run another agent). When that
+   * agent has none (the parent switched to a memory-less mode that cannot
+   * delegate), the reminder goes to the memory of the mode that delegated the
+   * task: binding requires memory there for `remind`, and the parent's next
+   * turn in that mode reads the row from its thread history. Memory resolves
+   * with the parent's own request context, as its turns do, so a dynamic memory
+   * resolver selects the parent's store. Undefined only when neither mode has
+   * memory (a Stop-downgraded `wake` notice of a memory-less parent, or a
+   * delegating mode removed from the configuration since).
+   */
+  private async _resolveDelegationNoticeMemory(
+    notice: PendingDelegationSettlementNotice,
+  ): Promise<MastraMemory | undefined> {
+    const activeModeId = this._currentRunModeId ?? this._record.modeId;
+    const modeIds = [activeModeId];
+    if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
+      if (this._harness._hasMode(notice.parentModeId)) modeIds.push(notice.parentModeId);
+    }
+    for (const modeId of modeIds) {
+      const agent = this._harness.getAgentForMode(modeId);
+      const requestContext = await this._buildRequestContext({
+        modeId,
+        modelId: this._record.modelId,
+        abortSignal: new AbortController().signal,
+        ...(this._currentTurnRequestContext !== undefined
+          ? { persistedRequestContext: this._currentTurnRequestContext }
+          : {}),
+      });
+      const memory = await agent.getMemory({ requestContext });
+      if (memory !== undefined && memory !== null) return memory;
+    }
+    return undefined;
   }
 
   /** Exact re-read: the notice with this digest is still owed on its task. */
