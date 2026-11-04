@@ -2237,13 +2237,15 @@ describe('task_delegate — recovery on rehydrate', () => {
     try {
       const child = await run.b.harness.session({ sessionId: run.childId, resourceId: 'u1' });
       await child.close();
-      await poll(async () => (await planRow(run.parentB, run.taskId))?.status === 'failed', 5_000);
 
+      // Published by the close itself, before any parent reconcile settles the task.
       await expect(run.storage.loadRunSummary({ harnessName: 'default', runId: run.runId })).resolves.toMatchObject({
         runId: run.runId,
         sessionId: run.childId,
       });
       expect(run.completions.agentEnds()).toHaveLength(1);
+      expect(run.completions.runCompletions()).toHaveLength(1);
+      await poll(async () => (await planRow(run.parentB, run.taskId))?.status === 'failed', 5_000);
       expect(run.completions.runCompletions()).toHaveLength(1);
       await run.b.harness.shutdown();
     } finally {
@@ -2296,6 +2298,89 @@ describe('task_delegate — recovery on rehydrate', () => {
       expect(completions.agentEnds()).toHaveLength(1);
       expect(completions.runCompletions()).toHaveLength(1);
       expect((await parentC._internalStorage.loadSession({ sessionId: crashed.childId }))?.closedAt).toBeDefined();
+      await c.harness.shutdown();
+    } finally {
+      crashed.clock.mockRestore();
+    }
+  });
+
+  // B commits the interruption and dies inside its publication: the child is
+  // left open (or, with `closeChild`, closed) with no run summary.
+  async function interruptAndDieBeforePublication(db: InMemoryDB, opts: { closeChild?: boolean } = {}) {
+    const crashed = await crashWithDelegatedChildMidCall(db);
+    const storageB = new FailingRunSummaryStorage(db, crashed.runId, 'hang');
+    const b = buildHarness(db, { storage: storageB });
+    void b.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+    await poll(() => storageB.saveAttempts > 0 && crashed.childEvidence()?.status === 'failed', 5_000);
+    crashOwner(db, b.harness.ownerId);
+    if (opts.closeChild) {
+      for (const [key, row] of db.harnessSessions) {
+        if (row.id === crashed.childId) db.harnessSessions.set(key, { ...row, closedAt: Date.now() });
+      }
+    }
+    return crashed;
+  }
+
+  it('publishes an owed delegation completion when a new harness closes the cold parent subtree', async () => {
+    const db = new InMemoryDB();
+    const crashed = await interruptAndDieBeforePublication(db);
+    try {
+      const c = buildHarness(db);
+      const completions = collectCompletions(c.harness, crashed.runId);
+      await c.harness.closeSession({ sessionId: crashed.parentId, resourceId: 'u1' });
+
+      const storage = new InMemoryHarness({ db });
+      await expect(storage.loadRunSummary({ harnessName: 'default', runId: crashed.runId })).resolves.toMatchObject({
+        runId: crashed.runId,
+        sessionId: crashed.childId,
+      });
+      expect(completions.agentEnds()).toHaveLength(1);
+      expect(completions.runCompletions()).toHaveLength(1);
+      expect((await storage.loadSession({ sessionId: crashed.childId }))?.closedAt).toBeDefined();
+      expect((await storage.loadSession({ sessionId: crashed.parentId }))?.closedAt).toBeDefined();
+      await c.harness.shutdown();
+    } finally {
+      crashed.clock.mockRestore();
+    }
+  });
+
+  // The first read of the child's delegation evidence fails once.
+  class FlakyEvidenceReadStorage extends InMemoryHarness {
+    readFailures = 0;
+    constructor(
+      db: InMemoryDB,
+      private readonly childId: string,
+    ) {
+      super({ db });
+    }
+    override async loadMessageResultEvidence(
+      input: Parameters<InMemoryHarness['loadMessageResultEvidence']>[0],
+    ): ReturnType<InMemoryHarness['loadMessageResultEvidence']> {
+      if (input.sessionId === this.childId && this.readFailures === 0) {
+        this.readFailures++;
+        throw new Error('transient evidence read failure');
+      }
+      return super.loadMessageResultEvidence(input);
+    }
+  }
+
+  it('does not settle a closed delegated child on an evidence read failure; a later pass publishes, then settles', async () => {
+    const db = new InMemoryDB();
+    const crashed = await interruptAndDieBeforePublication(db, { closeChild: true });
+    try {
+      const storage = new FlakyEvidenceReadStorage(db, crashed.childId);
+      const c = buildHarness(db, { storage });
+      const completions = collectCompletions(c.harness, crashed.runId);
+      const parentC = await c.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(async () => (await planRow(parentC, crashed.taskId))?.status === 'failed', 5_000);
+
+      expect(storage.readFailures).toBe(1);
+      await expect(storage.loadRunSummary({ harnessName: 'default', runId: crashed.runId })).resolves.toMatchObject({
+        runId: crashed.runId,
+        sessionId: crashed.childId,
+      });
+      expect(completions.agentEnds()).toHaveLength(1);
+      expect(completions.runCompletions()).toHaveLength(1);
       await c.harness.shutdown();
     } finally {
       crashed.clock.mockRestore();

@@ -1627,6 +1627,58 @@ function delegationAdmissionId(parentSessionId: string, taskId: string): string 
   return `harness-delegate:${parentSessionId}:${taskId}`;
 }
 
+/** The child's signal evidence id for one admitted delegation signal. */
+function delegationSignalId(child: SessionRecord, admissionId: string): string {
+  const digest = sha256CanonicalJson({
+    kind: 'channel-signal-admission',
+    harnessName: child.harnessName,
+    sessionId: child.id,
+    resourceId: child.resourceId,
+    threadId: child.threadId,
+    admissionId,
+  });
+  return `harness-channel-signal-${digest.slice(0, 32)}`;
+}
+
+/**
+ * @internal — whether a delegated child still owes a recovered completion: a
+ * delegation its parent's plan links to it settled (`completed`, or
+ * `failed{harness.run_interrupted}`) and has no run summary. Close
+ * preparation materializes such a cold child, so its close publishes it.
+ */
+export async function delegatedChildOwesRecoveredCompletion(
+  storage: HarnessStorage,
+  child: SessionRecord,
+): Promise<boolean> {
+  const parentSessionId = child.parentSessionId;
+  if (!storage.supportsDispatchRecovery || parentSessionId === undefined) return false;
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await storage.listPlanTasks({
+      harnessName: child.harnessName,
+      sessionId: parentSessionId,
+      limit: 500,
+      cursor,
+    });
+    for (const task of page.tasks) {
+      if (task.delegatedSubagentSessionId !== child.id) continue;
+      const evidence = await storage.loadMessageResultEvidence({
+        harnessName: child.harnessName,
+        sessionId: child.id,
+        resourceId: child.resourceId,
+        threadId: child.threadId,
+        signalId: delegationSignalId(child, delegationAdmissionId(parentSessionId, task.taskId)),
+      });
+      if (!evidence || !('status' in evidence) || !owesRecoveredCompletion(evidence)) continue;
+      if ((await storage.loadRunSummary({ harnessName: child.harnessName, runId: evidence.runId })) === null) {
+        return true;
+      }
+    }
+    if (!page.cursor || page.tasks.length === 0) return false;
+    cursor = page.cursor;
+  }
+}
+
 /**
  * Settled evidence recovery publishes (as message recovery does): a completed
  * result that was not erased, or an interruption. Other failures were
@@ -23273,31 +23325,16 @@ export class Session {
     }
   }
 
-  /**
-   * @internal — read the durable terminal outcome of the delegated admitted
-   * signal. Signal evidence deliberately remains `pending` across a suspension
-   * and settles only after resume/expiry, so `undefined` means "still owned or
-   * waiting for HITL", never a successful delegation. Evidence outlives a closed
-   * child and therefore remains the recovery authority after a crash.
-   */
   private _loadDelegationEvidence(
     childRecord: SessionRecord,
     taskId: string,
   ): Promise<AgentSignalResultEvidence | OperationAdmissionTombstone | null> {
-    const digest = sha256CanonicalJson({
-      kind: 'channel-signal-admission',
-      harnessName: childRecord.harnessName,
-      sessionId: childRecord.id,
-      resourceId: childRecord.resourceId,
-      threadId: childRecord.threadId,
-      admissionId: this._delegationAdmissionId(taskId),
-    });
     return this._storage.loadMessageResultEvidence({
       harnessName: childRecord.harnessName,
       sessionId: childRecord.id,
       resourceId: childRecord.resourceId,
       threadId: childRecord.threadId,
-      signalId: `harness-channel-signal-${digest.slice(0, 32)}`,
+      signalId: delegationSignalId(childRecord, this._delegationAdmissionId(taskId)),
     });
   }
 
@@ -23311,17 +23348,20 @@ export class Session {
     );
   }
 
+  /**
+   * @internal — read the durable terminal outcome of the delegated admitted
+   * signal. Signal evidence deliberately remains `pending` across a suspension
+   * and settles only after resume/expiry, so `undefined` means "still owned or
+   * waiting for HITL", never a successful delegation. Evidence outlives a closed
+   * child and therefore remains the recovery authority after a crash. A failed
+   * read rejects: it proves nothing, so the caller retries instead of settling.
+   */
   private async _loadDelegationOutcomeFromEvidence(
     childRecord: SessionRecord,
     taskId: string,
     deadlineAt: number,
   ): Promise<{ outcome: DelegatedSubagentOutcome; result: HarnessSubagentResultSummary } | undefined> {
-    let evidence: AgentSignalResultEvidence | OperationAdmissionTombstone | null;
-    try {
-      evidence = await this._loadDelegationEvidence(childRecord, taskId);
-    } catch {
-      return undefined;
-    }
+    const evidence = await this._loadDelegationEvidence(childRecord, taskId);
     if (!evidence || !('status' in evidence)) return undefined;
     if (evidence.status === 'completed' || evidence.status === 'failed') {
       const settledAt = evidence.updatedAt;
@@ -23652,11 +23692,15 @@ export class Session {
       // before closing recovers as `failed`, not `completed`. Its durable
       // settlement timestamp must also fall within the immutable attempt
       // deadline; a late provider result cannot retroactively win recovery.
-      const durable = await this._loadDelegationOutcomeFromEvidence(
-        childRecord,
-        task.taskId,
-        delegationAttempt.deadlineAt,
-      );
+      let durable: { outcome: DelegatedSubagentOutcome; result: HarnessSubagentResultSummary } | undefined;
+      try {
+        durable = await this._loadDelegationOutcomeFromEvidence(childRecord, task.taskId, delegationAttempt.deadlineAt);
+      } catch {
+        // Unread evidence is not absent evidence: the closed-child fallback
+        // below would settle the task without its owed publication.
+        needsRetry = true;
+        continue;
+      }
       if (durable !== undefined) {
         if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
           needsRetry = true;
@@ -23754,7 +23798,7 @@ export class Session {
                 child.getRecord(),
                 task.taskId,
                 delegationAttempt.deadlineAt,
-              )
+              ).catch(() => undefined)
             : undefined;
         if (
           interrupted === undefined ||
