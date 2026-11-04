@@ -531,9 +531,17 @@ type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepare
  * model that stays silent twice is allowed to finish (never loop). The loop
  * ignores continuation results for terminal tool delivery, and error, abort,
  * safety, and output-length finishes are left alone.
+ *
+ * A delegated child settles only through its terminal outcome report, so a
+ * response-only step cannot rescue it (PF-7507). When `subagentOutcomeReportToolId`
+ * is set, the one nudge instead asks for that report in one ordinary step whose
+ * active tools are exactly the report tool: the loop rejects any other call, and
+ * the run stops after that step. At the ordinary step ceiling no ordinary step
+ * is left, so the response-only recovery above applies unchanged.
  */
 function createHarnessEmptySynthesisOptions(
   reportConfiguredHookError: HarnessExecutionHookErrorReporter,
+  subagentOutcomeReportToolId?: string,
   subagentBudget?: HarnessSubagentBudgetMeter,
 ): {
   [AGENT_EXECUTION_OPTION_COMPOSERS]: () => AgentExecutionOptionComposers;
@@ -546,6 +554,9 @@ function createHarnessEmptySynthesisOptions(
       let responseOnlyReservedAtIteration: number | undefined;
       let responseOnlyPrepared = false;
       let ordinaryBudgetExhausted = false;
+      // Child report-only step (PF-7507): armed instead of `responseOnly`.
+      let reportOnly = false;
+      let reportOnlyReservedAtIteration: number | undefined;
       // Identity of this run segment for the subagent budget meter: a resume
       // builds new options, so its restarted iteration numbers are new steps,
       // while a replayed predicate in this segment is not counted twice.
@@ -555,6 +566,18 @@ function createHarnessEmptySynthesisOptions(
         onIterationComplete: existing => {
           const configured = existing as HarnessIterationCompleteHandler | undefined;
           const ordinary = async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
+            if (reportOnly) {
+              // A replayed predicate for the reserving iteration keeps the
+              // continuation without injecting the feedback a second time; the
+              // report step itself is the last one.
+              if (context.iteration === reportOnlyReservedAtIteration) return { continue: true };
+              try {
+                await configured?.(context);
+              } catch (error) {
+                reportConfiguredHookError('onIterationComplete', error);
+              }
+              return { continue: false };
+            }
             // The recovery phase gets one provider response, even if that
             // response tries to call a tool that prepareStep hid. Configured
             // observers still see this iteration, but cannot reopen it.
@@ -618,6 +641,22 @@ function createHarnessEmptySynthesisOptions(
             if (configuredResult?.continue === false) return configuredResult;
 
             nudged = true;
+            if (subagentOutcomeReportToolId !== undefined && !ordinaryBudgetExhausted) {
+              const reportFeedback =
+                'You finished your tool work without reporting the outcome. Call ' +
+                `${subagentOutcomeReportToolId} now, exactly once, with the outcome, a short summary, and evidence ` +
+                'from the tool results above. Do not claim an action ran unless its result confirms that. ' +
+                'No other tool is available.';
+              reportOnly = true;
+              reportOnlyReservedAtIteration = context.iteration;
+              return {
+                ...(configuredResult ?? {}),
+                continue: true,
+                feedback: configuredResult?.feedback
+                  ? `${configuredResult.feedback}\n\n${reportFeedback}`
+                  : reportFeedback,
+              };
+            }
             responseOnly = true;
             responseOnlyReservedAtIteration = context.iteration;
             const recoveryFeedback =
@@ -638,8 +677,13 @@ function createHarnessEmptySynthesisOptions(
           };
           if (subagentBudget === undefined) return ordinary;
           // The single predicate for Harness-reserved recovery steps; any new
-          // reserved step kind is added here.
-          const inRecoveryStep = () => responseOnly;
+          // reserved step kind is added here. `ordinary` arms the child
+          // report-only step (PF-7507) on any silent final step, including one
+          // at the budget. There the reopen marks the child exhausted and the
+          // step returns `continue: false`; the `exhausted` check below runs
+          // before `inRecoveryStep()`, so no later or replayed iteration can
+          // admit the armed report step past the budget.
+          const inRecoveryStep = () => responseOnly || reportOnly;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
             // A budget stop is terminal: no later or replayed iteration, and no
             // response-only recovery armed on the stopping step, reopens it.
@@ -703,6 +747,32 @@ function createHarnessEmptySynthesisOptions(
             }
             if (responseOnly && responseOnlyPrepared) {
               throw new HarnessResponseRecoveryAlreadyPreparedError();
+            }
+            if (reportOnly && subagentOutcomeReportToolId !== undefined) {
+              let configuredReportResult: Awaited<ReturnType<HarnessPrepareStep>>;
+              try {
+                configuredReportResult = await configured?.(args);
+              } catch (error) {
+                // The selection below replaces the configured one, so an
+                // optional observer failure must not strand the child's report.
+                reportConfiguredHookError('prepareStep', error);
+                configuredReportResult = undefined;
+              }
+              // The step keeps the session's own tool map, which always carries
+              // the report: a configured `tools` replacement could drop it.
+              // Narrowing the advertised tools costs the provider prompt cache
+              // (PF-5349), but only the report can settle a delegated child.
+              const {
+                tools: _configuredTools,
+                activeTools: _configuredActiveTools,
+                toolChoice: _configuredToolChoice,
+                ...configuredStepSettings
+              } = (configuredReportResult ?? {}) as Record<string, unknown>;
+              return {
+                ...configuredStepSettings,
+                activeTools: [subagentOutcomeReportToolId],
+                toolChoice: 'auto',
+              };
             }
             if (responseOnly) responseOnlyPrepared = true;
 
@@ -2357,13 +2427,18 @@ export class Session {
   }
 
   private _createEmptySynthesisOptions() {
-    return createHarnessEmptySynthesisOptions((hook, error) => {
-      try {
-        this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
-      } catch {
-        // Diagnostics must never suppress the caller-visible recovery.
-      }
-    }, this._subagentBudgetMeter());
+    return createHarnessEmptySynthesisOptions(
+      (hook, error) => {
+        try {
+          this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
+        } catch {
+          // Diagnostics must never suppress the caller-visible recovery.
+        }
+      },
+      // Matches `_buildToolSurface`: every subagent-tool child carries the report.
+      this._record.origin === 'subagent-tool' ? HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID : undefined,
+      this._subagentBudgetMeter(),
+    );
   }
 
   /**
