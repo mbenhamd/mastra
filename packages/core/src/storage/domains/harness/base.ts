@@ -925,10 +925,12 @@ export abstract class HarnessStorage extends StorageDomain {
 
   /**
    * Native adapters override this after implementing `listRecoverableSessions`,
-   * `listPendingMessageAdmissions`, the `'message'` terminal CAS with its lease
-   * precondition, the lease precondition of `compareAndSwapSignalDispatch`, the
-   * recovery precondition of `commitTerminalHandoff`, and run summaries.
-   * Session adoption skips orphaned-dispatch recovery when false.
+   * `listPendingMessageAdmissions`, the lease precondition of the terminal CAS
+   * (for `'message'` and `'signal'` settlements alike), the lease precondition
+   * of `compareAndSwapSignalDispatch`, the recovery precondition of
+   * `commitTerminalHandoff`, and run summaries. Session adoption skips
+   * orphaned-dispatch recovery, and delegation recovery re-attaches instead of
+   * interrupting, when false.
    */
   get supportsDispatchRecovery(): boolean {
     return false;

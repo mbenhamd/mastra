@@ -101,7 +101,7 @@ import type { HarnessSessionDeleteBlocker } from './errors';
 import { EventEmitter, projectHarnessPublicError } from './events';
 import type { HarnessEvent, HarnessEventListener, HarnessEventUnsubscribe } from './events';
 import { DEFAULT_PLAN_TASK_DELEGATION_TIMEOUT_MS } from './plan-task-session';
-import { Session, terminalFinalizerKey } from './session';
+import { delegatedChildOwesRecoveredCompletion, Session, terminalFinalizerKey } from './session';
 import type {
   AttachmentDeleteOptions,
   AttachmentRef,
@@ -6111,6 +6111,9 @@ export class Harness {
     // its crashed owner started: it is adopted like a queued record (below) so
     // the orphaned dispatches are settled (never re-run) before terminalizing.
     let hasPendingMessageAdmissions = false;
+    // A delegated child whose settled run's completion was never published
+    // (its recovering owner died first) is adopted too: its close publishes it.
+    let owesDelegationCompletion = false;
     try {
       latest = await storage.loadSession({ harnessName: record.harnessName, sessionId: record.id });
       if (!latest) throw new HarnessSessionNotFoundError(record.id);
@@ -6128,6 +6131,9 @@ export class Harness {
           includeParkedResume: true,
         });
         hasPendingMessageAdmissions = pending.items.length > 0;
+        if (!hasPendingMessageAdmissions) {
+          owesDelegationCompletion = await delegatedChildOwesRecoveredCompletion(storage, latest);
+        }
       }
     } catch (err) {
       try {
@@ -6148,13 +6154,13 @@ export class Harness {
       leaseExpiresAt: lease.expiresAt,
       version: lease.version,
     };
-    if ((leasedRecord.pendingQueue?.length ?? 0) > 0 || hasPendingMessageAdmissions) {
+    if ((leasedRecord.pendingQueue?.length ?? 0) > 0 || hasPendingMessageAdmissions || owesDelegationCompletion) {
       const recovered = this._adoptSession(storage, leasedRecord, {
         emitCreated: false,
         kickQueueDrain: false,
         eventReplaySeed: await this._eventReplaySeedFor(storage, leasedRecord),
       });
-      if (hasPendingMessageAdmissions) {
+      if (hasPendingMessageAdmissions || owesDelegationCompletion) {
         try {
           await this._settleOrphanedDispatchesBeforeClose(recovered);
         } catch (err) {
