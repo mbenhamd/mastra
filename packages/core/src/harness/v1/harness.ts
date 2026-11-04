@@ -683,6 +683,51 @@ function hasHarnessThreadDeleteInProgress(metadata: unknown): boolean {
   );
 }
 
+/**
+ * PF-7538: resolve after one macrotask turn, so every pending microtask
+ * continuation has run. Uses a MessageChannel hop rather than a timer so it
+ * still advances while a caller's fake timers are installed.
+ */
+function yieldMacrotask(): Promise<void> {
+  if (typeof MessageChannel !== 'function') return new Promise(resolve => setTimeout(resolve, 0));
+  return new Promise(resolve => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      resolve();
+    };
+    channel.port2.postMessage(undefined);
+  });
+}
+
+/** PF-7538: a shutdown lease release, and whether it has succeeded. */
+interface PendingLeaseRelease {
+  harnessName: string;
+  sessionId: string;
+  released: boolean;
+}
+
+/**
+ * PF-7538: `method(sessionId)` label for a tracked storage call, taking the
+ * session id from the call's first argument where it carries one (`sessionId`,
+ * a terminal `identity.sessionId`, or a session record's `id`).
+ */
+function storageCallLabel(method: string, input: unknown): string {
+  if (input === null || typeof input !== 'object') return method;
+  const fields = input as { sessionId?: unknown; identity?: { sessionId?: unknown }; id?: unknown };
+  const sessionId =
+    typeof fields.sessionId === 'string'
+      ? fields.sessionId
+      : typeof fields.identity?.sessionId === 'string'
+        ? fields.identity.sessionId
+        : method === 'saveSession' || method === 'saveSessionWithAttachmentReferences'
+          ? typeof fields.id === 'string'
+            ? fields.id
+            : undefined
+          : undefined;
+  return sessionId === undefined ? method : `${method}(${sessionId})`;
+}
+
 const boundHarnessesByMastra = new WeakMap<Mastra, Set<Harness>>();
 const boundHarnessesByMemory = new WeakMap<object, Set<Harness>>();
 const EXTERNAL_SESSION_STORAGE_OWNER_METADATA_KEY = '__mastraHarnessExternalSessionStorageOwner';
@@ -1058,6 +1103,19 @@ export class Harness {
   /** Per-id teardown barrier so resolution cannot rehydrate while an old live
    * handle is still flushing events/releasing its lease/workspace. */
   private readonly _sessionEvictionsInFlight = new Map<string, Promise<void>>();
+  /**
+   * PF-7538: storage calls issued through this harness's tracked handle that
+   * have not settled, labelled `method(sessionId)` for the shutdown timeout.
+   */
+  private readonly _storageCallsInFlight = new Map<Promise<unknown>, string>();
+  /** PF-7538: the last shutdown released its leases but timed out waiting on storage calls. */
+  private _shutdownFinalBarrierFailed = false;
+  /** PF-7538: lease releases the last shutdown did not complete; a retry re-attempts them. */
+  private _pendingLeaseReleases: PendingLeaseRelease[] = [];
+  private readonly _trackedStorageByRaw = new WeakMap<HarnessStorage, HarnessStorage>();
+  private readonly _rawStorageByTracked = new WeakMap<HarnessStorage, HarnessStorage>();
+  /** PF-7538: background lease work shutdown quiesces before its final phase. */
+  private readonly _backgroundLeaseWorkInFlight = new Set<Promise<void>>();
   /** Short critical-section tail for maxLive reserve/evict decisions. */
   private _liveMaterializationReservationTail: Promise<void> = Promise.resolve();
   /**
@@ -4816,6 +4874,10 @@ export class Harness {
    */
   async _tickChannelInboxRecovery(): Promise<void> {
     if (this._shutdown || this._channelInboxRecoveryRunning) return;
+    return this._trackBackgroundLeaseWork(this._runChannelInboxRecoveryPass());
+  }
+
+  private async _runChannelInboxRecoveryPass(): Promise<void> {
     this._channelInboxRecoveryRunning = true;
     try {
       for (const binding of this._channelRegistry.list()) {
@@ -5089,7 +5151,25 @@ export class Harness {
     }
   }
 
-  private async _renewLiveSessionLeases(): Promise<void> {
+  private _renewLiveSessionLeases(): Promise<void> {
+    return this._trackBackgroundLeaseWork(this._renewLiveSessionLeasesOnce());
+  }
+
+  /**
+   * PF-7538: register a background pass that can fence sessions (lease-loss
+   * eviction) or write their storage, so shutdown can wait for it before its
+   * final phase. Returns the pass unchanged.
+   */
+  private _trackBackgroundLeaseWork(work: Promise<void>): Promise<void> {
+    this._backgroundLeaseWorkInFlight.add(work);
+    work.then(
+      () => this._backgroundLeaseWorkInFlight.delete(work),
+      () => this._backgroundLeaseWorkInFlight.delete(work),
+    );
+    return work;
+  }
+
+  private async _renewLiveSessionLeasesOnce(): Promise<void> {
     if (this._shutdown || this._liveSessions.size === 0) {
       this._stopLeaseRenewalLoopIfIdle();
       return;
@@ -5407,6 +5487,29 @@ export class Harness {
     return session.lifecycleState === 'evicted';
   }
 
+  /**
+   * PF-7538: the lease-lost path fenced `session` out of this harness because
+   * another owner holds its lease (directly, or as a member of a fenced
+   * subtree). Its state now belongs to that owner.
+   */
+  private _isFencedByLeaseLoss(session: Session): boolean {
+    return this._liveSessions.get(session.id) !== session && session._internalEvictedByLeaseLoss;
+  }
+
+  /** Resolves `true` once `work` settles, or `false` if `deadlineAt` passes first. */
+  private async _settleBeforeDeadline(work: Promise<unknown>, deadlineAt: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<false>(resolve => {
+      timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()));
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([work.then(() => true as const), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Live descendants of `rootId` (BFS over `_liveSessions` by parentSessionId). */
   private _liveDescendantsOf(rootId: string): Session[] {
     const out: Session[] = [];
@@ -5500,7 +5603,7 @@ export class Harness {
     if (reason === 'pressure' || reason === 'idle') {
       session._emit({ type: 'session_eviction_warning', reason });
     }
-    session._markEvicted(record);
+    session._markEvicted(record, reason);
     this._liveSessions.delete(session.id);
     this._stopLeaseRenewalLoopIfIdle();
     await this._completeEviction(session, record, reason);
@@ -5541,7 +5644,7 @@ export class Harness {
       this._liveSessions.delete(session.id);
       fenced.push({ session, record, start });
     }
-    for (const { session, record } of fenced) session._markEvicted(record);
+    for (const { session, record } of fenced) session._markEvicted(record, 'lease_lost');
     this._stopLeaseRenewalLoopIfIdle();
     for (const { start } of fenced) start();
   }
@@ -6557,17 +6660,49 @@ export class Harness {
    * `session()` rejects. Idempotent.
    */
   async shutdown(opts?: ShutdownOptions): Promise<void> {
-    if (this._shutdown) return;
+    if (this._shutdown) {
+      // PF-7538: a shutdown whose final storage barrier timed out already
+      // released its leases; a retry re-runs only that barrier (bounded) and
+      // resolves once nothing is pending, instead of reporting success early.
+      if (this._shutdownFinalBarrierFailed) {
+        // The harness stays registered with Mastra until this succeeds, so
+        // `Mastra.shutdown()` retries it instead of skipping it.
+        const retryDeadlineAt = Date.now() + (opts?.drainTimeoutMs ?? this._closeTimeoutMs);
+        // Re-attempt unfinished lease releases first, so a fresh release frees
+        // the lease even while an original release call still hangs; then
+        // wait for every tracked call (originals included, named on timeout).
+        const releaseFailure = await this._retryPendingLeaseReleases(retryDeadlineAt);
+        const failure = (await this._settleStorageCallsBeforeDeadline(retryDeadlineAt)) ?? releaseFailure;
+        if (failure !== undefined) throw failure;
+        this._shutdownFinalBarrierFailed = false;
+        this._untrackBoundStorage();
+      }
+      return;
+    }
     this._shutdown = true;
+    // PF-7538: every session live when shutdown begins is held to the final
+    // storage-work barrier below, even if it is fenced (and leaves
+    // `_liveSessions`) before the drain snapshot is taken.
+    const sessionsAtStart = Array.from(this._liveSessions.values());
     this._stopLeaseRenewalLoop();
     this._stopChannelInboxRecoveryLoop();
     this._stopPendingInteractionExpirySweepLoop();
+
+    // PF-7538: every await in shutdown is deadline-bounded. The pre-drain
+    // waits below share `entryDeadlineAt`; the drain gets its own full budget
+    // (`drainDeadlineAt`, computed after them) so it never loses time to them.
+    // Worst case: 2 × drainTimeoutMs for the waits, plus the final phase,
+    // whose steps share the drain deadline.
+    const entryDeadlineAt = Date.now() + (opts?.drainTimeoutMs ?? this._closeTimeoutMs);
 
     // A timer may already be inside a storage query or exact-generation CAS.
     // Wait for that bounded sweep to observe `_shutdown`, finish its current
     // atomic operation, and release any transient lease before tearing storage
     // and workspace ownership down.
-    await this._pendingInteractionExpirySweepInFlight;
+    const sweepInFlight = this._pendingInteractionExpirySweepInFlight;
+    if (sweepInFlight !== undefined && !(await this._settleBeforeDeadline(sweepInFlight, entryDeadlineAt))) {
+      this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Pending-interaction expiry sweep'));
+    }
 
     // `session({ fresh: true })` deliberately bypasses resolver-key
     // singleflight, so waiting only the resolver/materialization maps is not
@@ -6576,10 +6711,20 @@ export class Harness {
     // sessions. Materializers also observe `_shutdown` and roll back their
     // lease/publication if they resume during this wait.
     while (this._sessionAdmissionsInFlight.size > 0) {
-      await Promise.allSettled([...this._sessionAdmissionsInFlight]);
+      const settled = await this._settleBeforeDeadline(
+        Promise.allSettled([...this._sessionAdmissionsInFlight]),
+        entryDeadlineAt,
+      );
+      if (!settled) this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Session admission'));
     }
-    if (this._sessionEvictionsInFlight.size > 0) {
-      await Promise.allSettled([...this._sessionEvictionsInFlight.values()]);
+    if (
+      this._sessionEvictionsInFlight.size > 0 &&
+      !(await this._settleBeforeDeadline(
+        Promise.allSettled([...this._sessionEvictionsInFlight.values()]),
+        entryDeadlineAt,
+      ))
+    ) {
+      this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Session eviction'));
     }
 
     let storage: HarnessStorage;
@@ -6588,50 +6733,136 @@ export class Harness {
     } catch {
       // No storage bound — nothing to release. Idempotent.
       this._liveSessions.clear();
-      try {
-        await this._workspaceRegistry.shutdown();
-      } catch {
-        // Best-effort: errors surface through the workspace_error event.
-      }
+      await this._shutdownWorkspacesBeforeDeadline(entryDeadlineAt);
       this._untrackBoundStorage();
       return;
     }
 
     const pendingCloses = new Set(this._closePromises.values());
-    if (pendingCloses.size > 0) {
-      await Promise.allSettled(pendingCloses);
+    if (
+      pendingCloses.size > 0 &&
+      !(await this._settleBeforeDeadline(Promise.allSettled(pendingCloses), entryDeadlineAt))
+    ) {
+      this._rollBackShutdownBeforeDrain(this._shutdownTimeoutError('Session close'));
     }
 
     // Release every held lease. We keep the records active in storage —
     // shutdown is not a close.
-    const sessions = Array.from(this._liveSessions.values());
+    let sessions = Array.from(this._liveSessions.values());
     for (const session of sessions) {
       session._beginClosing();
     }
     const drainTimeoutMs = opts?.drainTimeoutMs ?? this._closeTimeoutMs;
     const drainDeadlineAt = Date.now() + drainTimeoutMs;
-    let eventPersistenceError: { sessionId: string; error: unknown } | undefined;
+    let eventPersistenceError: { sessionId?: string; error: unknown } | undefined;
+    // PF-7538: a session another owner adopted is fenced, not failed. Its save
+    // (or an ancestor's) already evicted it as `lease_lost`: dropped from
+    // `_liveSessions`, timers cleared, bridge torn down, queue no longer
+    // drainable. Shutdown skips its remaining drain steps before running them
+    // and ignores a failure it raised, and neither restores it nor rolls the
+    // harness back for it. Any other failure keeps the restore-and-throw
+    // contract below.
+    const recordDrainFailure = (session: Session, err: unknown): void => {
+      if (this._isFencedByLeaseLoss(session)) return;
+      eventPersistenceError ??= { sessionId: session.id, error: this._withPendingStorageLabels(err) };
+    };
     for (const session of sessions) {
+      if (this._isFencedByLeaseLoss(session)) continue;
       try {
         await session._waitForShutdownDrain(drainDeadlineAt);
       } catch (err) {
-        eventPersistenceError ??= { sessionId: session.id, error: err };
+        recordDrainFailure(session, err);
         continue;
       }
+      if (this._isFencedByLeaseLoss(session)) continue;
       try {
         await session._internalPersistTokenUsageForShutdown({ deadlineAt: drainDeadlineAt });
         await session._internalAwaitFlushChain({ deadlineAt: drainDeadlineAt });
       } catch (err) {
-        eventPersistenceError ??= { sessionId: session.id, error: err };
+        recordDrainFailure(session, err);
         continue;
       }
+      if (this._isFencedByLeaseLoss(session)) continue;
       try {
-        await session._flushEventPersistence();
+        // PF-7538: bounded by the drain deadline like the steps above.
+        if (!(await this._settleBeforeDeadline(session._flushEventPersistence(), drainDeadlineAt))) {
+          recordDrainFailure(session, this._shutdownTimeoutError('Session event persistence'));
+          continue;
+        }
       } catch (err) {
-        eventPersistenceError ??= { sessionId: session.id, error: err };
+        recordDrainFailure(session, err);
         continue;
       }
     }
+    // PF-7538: quiesce background lease work before the final phase. Its timers
+    // stopped when shutdown began, but a lease-renewal or channel-recovery pass
+    // already running can still discover lease loss and fence a session. Wait
+    // for those passes (and the evictions they await) here, bounded by the
+    // drain deadline, so no new lease-loss eviction starts after the eviction
+    // wait and the fenced filter below. The expiry sweep needs no wait here:
+    // shutdown already awaited its in-flight pass before draining, and it
+    // starts no new pass once `_shutdown` is set.
+    if (this._backgroundLeaseWorkInFlight.size > 0) {
+      const settled = await this._settleBeforeDeadline(
+        Promise.allSettled([...this._backgroundLeaseWorkInFlight]),
+        drainDeadlineAt,
+      );
+      if (!settled) {
+        eventPersistenceError ??= {
+          error: this._shutdownTimeoutError('Background lease renewal'),
+        };
+      }
+    }
+    // PF-7538: an eviction that started during the drain (a fenced save, or a
+    // lease renewal that discovered lease loss while shutdown waited on a
+    // session) must finish its event persistence and workspace release before
+    // shutdown reports success and the caller tears storage down. Bounded by
+    // the drain deadline like every other drain wait. Eviction cleanup stays
+    // best-effort (`allSettled`), as for the evictions awaited before the drain.
+    while (this._sessionEvictionsInFlight.size > 0) {
+      const [pendingSessionId] = this._sessionEvictionsInFlight.keys();
+      const settled = await this._settleBeforeDeadline(
+        Promise.allSettled([...this._sessionEvictionsInFlight.values()]),
+        drainDeadlineAt,
+      );
+      if (!settled) {
+        eventPersistenceError ??= {
+          sessionId: pendingSessionId!,
+          error: this._shutdownTimeoutError('Session eviction'),
+        };
+        break;
+      }
+    }
+    // PF-7538 invariant: shutdown never reports success while storage work
+    // started by any of its sessions is still pending — fenced or not, and
+    // whenever the fence landed. Settle each session's outstanding-work
+    // barrier (bounded by the drain deadline). Fenced sessions settle fast:
+    // their queued writes no-op and their turn waiters were rejected. A
+    // timeout fails the shutdown through the restore-and-throw path below.
+    if (eventPersistenceError === undefined) {
+      const heldSessions = [...new Set([...sessionsAtStart, ...sessions])];
+      const settled = await this._settleBeforeDeadline(
+        Promise.all(heldSessions.map(session => session._internalSettleOutstandingWork())),
+        drainDeadlineAt,
+      );
+      if (!settled) {
+        eventPersistenceError = {
+          error: this._shutdownTimeoutError('Session storage work'),
+        };
+      }
+    }
+    // PF-7538 guarantee at the storage boundary: every call issued through
+    // this harness's tracked storage handle — by any session, on any path,
+    // detached or not — has settled. The per-session settle above only gets
+    // there earlier on the paths it knows.
+    if (eventPersistenceError === undefined) {
+      const pendingStorage = await this._settleStorageCallsBeforeDeadline(drainDeadlineAt);
+      if (pendingStorage !== undefined) eventPersistenceError = { error: pendingStorage };
+    }
+    // Sessions fenced during the drain (directly, or as members of a fenced
+    // subtree) belong to their new owner: no restore, no shutdown eviction
+    // marker, no lease release.
+    sessions = sessions.filter(session => this._liveSessions.get(session.id) === session);
     if (eventPersistenceError !== undefined) {
       for (const session of sessions) {
         session._restoreLiveAfterFailedClose();
@@ -6664,11 +6895,26 @@ export class Harness {
         this._shutdownEvictedSessionIds.add(session.id);
       }
       try {
-        await session._flushEventPersistence();
+        // PF-7538: bounded by the drain deadline; a timeout restores and throws.
+        if (!(await this._settleBeforeDeadline(session._flushEventPersistence(), drainDeadlineAt))) {
+          eventPersistenceError ??= {
+            sessionId: session.id,
+            error: this._shutdownTimeoutError('Terminal event persistence'),
+          };
+          break;
+        }
       } catch (err) {
         eventPersistenceError ??= { sessionId: session.id, error: err };
         continue;
       }
+    }
+    // PF-7538: the terminal `session_evicted('shutdown')` appends above were
+    // awaited before this point, so this wait covers only work started by
+    // others while they ran. It still sits before the lease release, so a
+    // timeout restores and throws.
+    if (eventPersistenceError === undefined) {
+      const pendingStorage = await this._settleStorageCallsBeforeDeadline(drainDeadlineAt);
+      if (pendingStorage !== undefined) eventPersistenceError = { error: pendingStorage };
     }
     if (eventPersistenceError !== undefined) {
       for (const session of sessions) {
@@ -6694,17 +6940,24 @@ export class Harness {
       });
     }
 
+    let finalFailure: HarnessValidationError | undefined;
+    // PF-7538: attempt every release at once, bounded collectively by the
+    // drain deadline. Best-effort for a rejection (leases TTL out anyway), but
+    // a release that did not finish by the deadline fails shutdown, named, and
+    // stays pending: a retry re-attempts any that did not succeed.
+    const releases = sessions.map(session => {
+      const release: PendingLeaseRelease = {
+        harnessName: session.getRecord().harnessName,
+        sessionId: session.id,
+        released: false,
+      };
+      return { release, attempt: this._attemptLeaseRelease(storage, release) };
+    });
+    if (!(await this._settleBeforeDeadline(Promise.all(releases.map(({ attempt }) => attempt)), drainDeadlineAt))) {
+      finalFailure = this._shutdownTimeoutError('Session lease release');
+      this._pendingLeaseReleases = releases.map(({ release }) => release).filter(release => !release.released);
+    }
     for (const session of sessions) {
-      try {
-        await storage.releaseSessionLease({
-          harnessName: session.getRecord().harnessName,
-          sessionId: session.id,
-          ownerId: this.ownerId,
-        });
-      } catch {
-        // Best-effort: leases TTL out anyway.
-      }
-
       const bridge = this._sessionEventBridges.get(session.id);
       if (bridge) {
         bridge();
@@ -6716,16 +6969,26 @@ export class Harness {
     this._shutdownEvictedSessionIds.clear();
 
     // Tear down every provisioned workspace (shared + per-resource + per-session).
-    try {
-      await this._workspaceRegistry.shutdown();
-    } catch {
-      // Best-effort: workspace teardown errors are swallowed (provider-owned;
-      // §2.7/§10.2 define no public workspace event).
-    }
-    this._untrackBoundStorage();
+    await this._shutdownWorkspacesBeforeDeadline(drainDeadlineAt);
     // §10.2: harness-scoped process-shutdown marker. No sessionId → delivered to
     // `harness.subscribe(...)` only, never per-session SSE replay. Sessions persist.
+    // Emitted before the final storage barrier (PF-7538) so storage work a
+    // listener starts is waited too.
     this._emitter.emit({ type: 'harness_shutdown' });
+    // PF-7538: shutdown's own lease releases above were each awaited, so the
+    // set now holds only calls something else started (including listeners
+    // above). Never report success with one pending. Leases are already
+    // released, so a timeout fails shutdown (naming the calls) without
+    // restoring; a retry re-runs this barrier.
+    finalFailure ??= await this._settleStorageCallsBeforeDeadline(drainDeadlineAt);
+    if (finalFailure !== undefined) {
+      // Stay registered with Mastra (PF-7538) so its shutdown retries this
+      // barrier rather than skipping the harness and closing storage.
+      this._shutdownFinalBarrierFailed = true;
+      throw finalFailure;
+    }
+    this._pendingLeaseReleases = [];
+    this._untrackBoundStorage();
   }
 
   // -------------------------------------------------------------------------
@@ -7372,6 +7635,169 @@ export class Harness {
   // -------------------------------------------------------------------------
 
   private _requireStorage(callsite: string): HarnessStorage {
+    return this._trackStorage(this._requireRawStorage(callsite));
+  }
+
+  /**
+   * PF-7538: every storage call this harness and its sessions issue goes
+   * through the handle `_requireStorage` / `_getEffectiveSessionStorage`
+   * return (sessions receive it at construction and keep no other
+   * reference). That handle is a thin proxy over the bound storage domain that
+   * registers each call's promise in `_storageCallsInFlight` until it
+   * settles, resolved or rejected. Shutdown waits on that set, so no storage
+   * work it started — detached or not, on any path — outlives it. Only this
+   * harness's own handle is tracked; external workers get the raw domain via
+   * `_internalGetSessionStorage`.
+   */
+  private _trackStorage(raw: HarnessStorage): HarnessStorage {
+    const cached = this._trackedStorageByRaw.get(raw);
+    if (cached !== undefined) return cached;
+    const inFlight = this._storageCallsInFlight;
+    const wrappers = new WeakMap<object, unknown>();
+    const tracked = new Proxy(raw, {
+      get(target, prop) {
+        const value: unknown = Reflect.get(target, prop, target);
+        if (typeof value !== 'function') return value;
+        let wrapper = wrappers.get(value);
+        if (wrapper === undefined) {
+          wrapper = (...args: unknown[]): unknown => {
+            const result: unknown = Reflect.apply(value, target, args);
+            if (result instanceof Promise) {
+              inFlight.set(result, storageCallLabel(String(prop), args[0]));
+              const settle = (): void => {
+                inFlight.delete(result);
+              };
+              result.then(settle, settle);
+            }
+            return result;
+          };
+          wrappers.set(value, wrapper);
+        }
+        return wrapper;
+      },
+    });
+    this._trackedStorageByRaw.set(raw, tracked);
+    this._rawStorageByTracked.set(tracked, raw);
+    return tracked;
+  }
+
+  /** The underlying storage domain behind a (possibly tracked) handle. */
+  private _rawStorage(storage: HarnessStorage): HarnessStorage {
+    return this._rawStorageByTracked.get(storage) ?? storage;
+  }
+
+  /**
+   * PF-7538: wait until no storage call this harness issued is still pending,
+   * re-checking after each settle so a call started meanwhile is waited too.
+   * Shutdown only calls this between its own awaited steps, so the set never
+   * holds a promise shutdown's own awaiting chain depends on. Resolves
+   * `undefined` once empty, or, if `deadlineAt` passes first, an error naming
+   * every call still pending.
+   */
+  private async _settleStorageCallsBeforeDeadline(deadlineAt: number): Promise<HarnessValidationError | undefined> {
+    while (true) {
+      while (this._storageCallsInFlight.size > 0) {
+        const settled = await this._settleBeforeDeadline(
+          Promise.allSettled([...this._storageCallsInFlight.keys()]),
+          deadlineAt,
+        );
+        if (!settled) return this._shutdownTimeoutError('Storage calls');
+      }
+      // Stable only if still empty after a macrotask turn: every microtask
+      // continuation (an async listener's `await` hop, a settle callback)
+      // has run by then and registered any storage call it starts.
+      await yieldMacrotask();
+      if (this._storageCallsInFlight.size === 0) return undefined;
+    }
+  }
+
+  /**
+   * PF-7538: re-attempt the lease releases a failed shutdown did not complete,
+   * bounded by `deadlineAt`. A rejection stays best-effort (the lease TTLs
+   * out); a release still unfinished at the deadline fails, named.
+   */
+  private async _retryPendingLeaseReleases(deadlineAt: number): Promise<HarnessValidationError | undefined> {
+    const unreleased = this._pendingLeaseReleases.filter(release => !release.released);
+    if (unreleased.length === 0) return undefined;
+    const storage = this._requireStorage('shutdown()');
+    const attempts = unreleased.map(release => this._attemptLeaseRelease(storage, release));
+    if (!(await this._settleBeforeDeadline(Promise.all(attempts), deadlineAt))) {
+      return this._shutdownTimeoutError('Session lease release');
+    }
+    return undefined;
+  }
+
+  /**
+   * PF-7538: one best-effort lease release (a failed release TTLs out). Async
+   * so an adapter that throws synchronously is caught like a rejection and
+   * never aborts the other releases.
+   */
+  private async _attemptLeaseRelease(storage: HarnessStorage, release: PendingLeaseRelease): Promise<void> {
+    try {
+      await storage.releaseSessionLease({
+        harnessName: release.harnessName,
+        sessionId: release.sessionId,
+        ownerId: this.ownerId,
+      });
+      release.released = true;
+    } catch {
+      // Best-effort: leases TTL out anyway.
+    }
+  }
+
+  /**
+   * PF-7538: a shutdown deadline error raised inside a session (drain, flush)
+   * extended with the storage calls still pending on the tracked handle.
+   */
+  private _withPendingStorageLabels(err: unknown): unknown {
+    if (!(err instanceof HarnessValidationError) || err.field !== 'shutdown()') return err;
+    const pending = [...this._storageCallsInFlight.values()];
+    if (pending.length === 0) return err;
+    return new HarnessValidationError('shutdown()', `${err.reason}; pending storage calls: ${pending.join(', ')}`);
+  }
+
+  /**
+   * PF-7538: a pre-drain shutdown wait expired. Nothing has drained or closed
+   * yet, so roll back exactly as a drain failure does — clear `_shutdown`,
+   * restart the background loops — and throw.
+   */
+  private _rollBackShutdownBeforeDrain(error: HarnessValidationError): never {
+    this._shutdown = false;
+    if (this._liveSessions.size > 0) this._ensureLeaseRenewalLoop();
+    this._ensureChannelInboxRecoveryLoop();
+    this._ensurePendingInteractionExpirySweepLoop();
+    throw new HarnessStorageError({ operation: 'session_save', cause: error });
+  }
+
+  /**
+   * PF-7538: provider-owned workspace teardown, best-effort (errors surface as
+   * workspace events) and bounded by `deadlineAt`: on expiry it is logged and
+   * shutdown continues, since workspaces are not harness storage.
+   */
+  private async _shutdownWorkspacesBeforeDeadline(deadlineAt: number): Promise<void> {
+    const settled = await this._settleBeforeDeadline(
+      this._workspaceRegistry.shutdown().catch(() => undefined),
+      deadlineAt,
+    );
+    if (!settled) {
+      console.error('[harness/v1] workspace teardown did not settle before the shutdown deadline; continuing');
+    }
+  }
+
+  /**
+   * PF-7538: a shutdown deadline error naming what did not settle and every
+   * storage call still pending on this harness's tracked handle.
+   */
+  private _shutdownTimeoutError(what: string): HarnessValidationError {
+    const pending = [...this._storageCallsInFlight.values()];
+    return new HarnessValidationError(
+      'shutdown()',
+      `${what} did not settle before shutdown deadline` +
+        (pending.length > 0 ? `; pending storage calls: ${pending.join(', ')}` : ''),
+    );
+  }
+
+  private _requireRawStorage(callsite: string): HarnessStorage {
     if (this._storageOverride) return this._storageOverride;
     if (this._mastra) {
       const composite = this._mastra.getStorage();
@@ -7392,11 +7818,12 @@ export class Harness {
 
   private _canDeleteGlobalMemoryThreadWithStorage(storage: HarnessStorage, memory: object): boolean {
     const mastra = this._mastra;
-    if (!mastra || mastra.getStorage()?.stores?.harness !== storage) return false;
+    const raw = this._rawStorage(storage);
+    if (!mastra || mastra.getStorage()?.stores?.harness !== raw) return false;
     const boundHarnesses = boundHarnessesByMemory.get(memory);
     if (!boundHarnesses) return false;
     for (const harness of boundHarnesses) {
-      if (harness._getEffectiveSessionStorage() !== storage) return false;
+      if (harness._internalGetSessionStorage() !== raw) return false;
     }
     return true;
   }
@@ -7426,12 +7853,17 @@ export class Harness {
   }
 
   private _getEffectiveSessionStorage(): HarnessStorage | undefined {
-    return this._storageOverride ?? this._mastra?.getStorage()?.stores?.harness;
+    const raw = this._internalGetSessionStorage();
+    return raw === undefined ? undefined : this._trackStorage(raw);
   }
 
-  /** @internal — used by Harness wakeup workers to honor session storage overrides. */
+  /**
+   * @internal — used by Harness wakeup workers to honor session storage
+   * overrides. Returns the raw domain: worker calls are not this harness's
+   * own storage work (PF-7538 tracking).
+   */
   _internalGetSessionStorage(): HarnessStorage | undefined {
-    return this._getEffectiveSessionStorage();
+    return this._storageOverride ?? this._mastra?.getStorage()?.stores?.harness;
   }
 
   private _usesSeparateSessionStorage(): boolean {

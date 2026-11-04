@@ -266,6 +266,7 @@ import {
 } from './request-context-input';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
+import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-control-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
@@ -1830,6 +1831,10 @@ export class Session {
   private _assistantDraftFlushUrgent = false;
   /** At most one draft checkpoint may be queued/running on the session CAS chain. */
   private _assistantDraftFlushInFlight: Promise<void> | undefined;
+  /** PF-7538: set when the Harness fenced this session because another owner holds its lease. */
+  private _evictedByLeaseLoss = false;
+  /** PF-7538: > 0 while a `_flushUpdate` link awaits an eviction it raised itself. */
+  private _flushLinkEvictionDepth = 0;
   /**
    * §SA3 — shared parent-local reservation count for inline `spawn_subagent`
    * and durable `task_delegate` work. It includes the create/link window so two
@@ -3266,6 +3271,13 @@ export class Session {
       }
       const inFlight = this._assistantDraftFlushInFlight;
       if (inFlight !== undefined) {
+        // PF-7538: an eviction raised from inside a `_flushUpdate` link drains
+        // event persistence (and so this barrier) while that link is still
+        // running. The in-flight checkpoint is that link or queued behind it
+        // on `_flushChain`, so awaiting it there never resolves. Every other
+        // eviction (renewal-detected lease loss, pressure, idle) keeps
+        // awaiting the checkpoint; a fenced checkpoint settles on its own.
+        if (this._state === 'evicted' && this._flushLinkEvictionDepth > 0) return;
         await inFlight;
         continue;
       }
@@ -6147,6 +6159,49 @@ export class Session {
     }
   }
 
+  /**
+   * @internal PF-7473 — the model-facing `subagent` tool's cancel of ONE own
+   * child (the caller has already proven `parentSessionId === this.id`). Unlike
+   * {@link cancelSubagent} it also reaches a cold child by hydrating it, through
+   * the same owned-cascade path as a full `cancel()`. Returns `'unavailable'`
+   * when the child itself could not be cancelled here (for example another
+   * process holds its lease).
+   */
+  /** @internal PF-7473 — the `subagent` tool's send/cancel admission check. */
+  _internalAssertSubagentControlAdmitted(callerSignal?: AbortSignal): void {
+    this._assertLive('subagent control');
+    this._assertActiveWorkAdmission(
+      this._captureActiveWorkAdmission('subagent control'),
+      'subagent control',
+      callerSignal,
+    );
+  }
+
+  async _internalCancelOwnedSubagent(
+    subagentSessionId: string,
+    reason: string,
+    callerSignal?: AbortSignal,
+  ): Promise<'delivered' | 'delivered_incomplete' | 'unavailable'> {
+    this._assertNotDeleted();
+    // Only a live parent whose turn is still admitted may cancel: a call that
+    // resumes after eviction, Stop or reset must not act on the child.
+    const epoch = this._captureActiveWorkAdmission('subagent cancel');
+    const assertAdmitted = () => {
+      this._assertLive('subagent cancel');
+      this._assertActiveWorkAdmission(epoch, 'subagent cancel', callerSignal);
+    };
+    assertAdmitted();
+    const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason, assertAdmitted);
+    if (unavailable.includes(subagentSessionId)) return 'unavailable';
+    // A cold delegated child has no live driver in this process; reconciliation
+    // maps its committed cancelRequest to a failed plan task. A live driver's
+    // delegation is skipped by the reconcile pass, so this is safe either way.
+    this._scheduleDelegationReconcileRetry(0);
+    // The child committed its cancel, but a descendant below it could not be
+    // reached; a repeated cancel resumes that cascade.
+    return unavailable.length > 0 ? 'delivered_incomplete' : 'delivered';
+  }
+
   /** Read every durable delegation link in this session's plan forest. */
   private async _listDelegatedSubagentSessionIds(): Promise<string[]> {
     const ids = new Set<string>();
@@ -6178,6 +6233,8 @@ export class Session {
   private async _cancelOwnedSubagentSessions(
     subagentSessionIds: Iterable<string>,
     reason: string,
+    /** PF-7473: re-proves the caller is still admitted right before each child write. */
+    assertAdmitted?: () => void,
   ): Promise<{ cancelled: string[]; unavailable: string[] }> {
     const cancelled: string[] = [];
     const unavailable: string[] = [];
@@ -6216,12 +6273,15 @@ export class Session {
         unavailable.push(childId);
         continue;
       }
+      assertAdmitted?.();
       try {
         const alreadyCancelled = child.getRecord().cancelRequest !== undefined;
-        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id);
+        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id, assertAdmitted);
         if (!alreadyCancelled) cancelled.push(childId);
         unavailable.push(...nested.unavailable);
-      } catch {
+      } catch (error) {
+        // The caller lost admission mid-cancel: nothing was written; surface it.
+        if (assertAdmitted !== undefined && admissionLost(assertAdmitted)) throw error;
         unavailable.push(childId);
       }
     }
@@ -6231,6 +6291,8 @@ export class Session {
   private async _cancelInternal(
     opts?: { reason?: string; requestedBy?: string },
     parentOrigin?: string,
+    /** PF-7473: re-proved inside the serialized cancel write; a throw aborts it. */
+    assertAdmitted?: () => void,
   ): Promise<{ unavailable: string[] }> {
     this._assertNotDeleted();
     const existingCancel = this._currentCancelRequest();
@@ -6250,6 +6312,7 @@ export class Session {
 
     await this._flushUpdate(prev => {
       if (prev.cancelRequest !== undefined) return prev;
+      assertAdmitted?.();
 
       attemptedWrite = true;
       const existingReceipts = prev.queueAdmissionReceipts ?? {};
@@ -6674,6 +6737,11 @@ export class Session {
   }
 
   /** Current lifecycle state. */
+  /** @internal PF-7538 — evicted because another owner holds the lease. */
+  get _internalEvictedByLeaseLoss(): boolean {
+    return this._state === 'evicted' && this._evictedByLeaseLoss;
+  }
+
   get lifecycleState(): SessionLifecycleState {
     return this._state;
   }
@@ -14425,19 +14493,42 @@ export class Session {
   async injectSystemReminder(
     content: string,
     opts?: SessionInjectSystemReminderOptions,
+    /**
+     * @internal PF-7473 — `requireActiveRun` makes the reminder interleave-only:
+     * it rejects instead of waking an idle thread, decided at the same point
+     * the interleave routing is decided (no await in between).
+     */
+    internal?: { requireActiveRun?: boolean; assertAdmitted?: () => void },
   ): Promise<SessionInjectSystemReminderResult> {
-    return this._injectSystemReminder(content, opts);
+    return this._injectSystemReminder(
+      content,
+      opts,
+      internal === undefined
+        ? undefined
+        : {
+            ...(internal.requireActiveRun !== undefined ? { requireActiveRun: internal.requireActiveRun } : {}),
+            ...(internal.assertAdmitted !== undefined ? { assertAdmitted: internal.assertAdmitted } : {}),
+          },
+    );
   }
 
   /**
    * `internal` is harness-owned: `signalId` reuses the id of an already
    * persisted reminder row, and `admissionEpoch` makes the call an idle-only
    * wake that a Stop or an already-active run rejects instead of interleaving.
+   * PF-7473: `requireActiveRun` is the opposite, interleave-only mode (it never
+   * wakes an idle thread), and `assertAdmitted` re-proves the sender's own
+   * admission after subscription setup.
    */
   private async _injectSystemReminder(
     content: string,
     opts?: SessionInjectSystemReminderOptions,
-    internal?: { signalId: string; admissionEpoch: number },
+    internal?: {
+      signalId?: string;
+      admissionEpoch?: number;
+      requireActiveRun?: boolean;
+      assertAdmitted?: () => void;
+    },
   ): Promise<SessionInjectSystemReminderResult> {
     const signalId = internal?.signalId;
     this._assertLive('injectSystemReminder()');
@@ -14468,9 +14559,15 @@ export class Session {
     this._assertOpenForTurn('injectSystemReminder()');
     const activeRunId = sub.activeRunId();
     const willInterleave = activeRunId !== null;
+    // PF-7473: the sender may have lost admission during subscription setup.
+    internal?.assertAdmitted?.();
+    if (!willInterleave && internal?.requireActiveRun === true) {
+      throw new HarnessValidationError('injectSystemReminder()', 'no active run to interleave into');
+    }
+    const idleOnlyEpoch = internal?.admissionEpoch;
     if (
-      internal !== undefined &&
-      (willInterleave || this.isRunning() || !this._activeWorkAdmissionIsCurrent(internal.admissionEpoch))
+      idleOnlyEpoch !== undefined &&
+      (willInterleave || this.isRunning() || !this._activeWorkAdmissionIsCurrent(idleOnlyEpoch))
     ) {
       throw new HarnessBusyError(this.id, 'in_flight');
     }
@@ -14621,24 +14718,34 @@ export class Session {
       {
         resourceId: this.resourceId,
         threadId: this.threadId,
-        ifIdle: {
-          behavior: 'wake',
-          // The active-delivery race can still land idle; a wake here starts a
-          // REAL streamed turn, so it must carry the step ceiling and the
-          // silent-turn nudge like every other wake site — empty options ran
-          // the turn at the provider's 5-step default with no memory identity.
-          streamOptions: {
-            memory: { thread: this.threadId, resource: this.resourceId },
-            maxSteps: HARNESS_SESSION_MAX_STEPS,
-            ...this._createEmptySynthesisOptions(),
-            ...(this._currentTurnSourceWriteGuard
-              ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-              : {}),
-            ...this._subagentTracingOptions(),
-          } as never,
-        },
+        // PF-7473: an interleave-only reminder must never start a run: it
+        // expires with the run it was delivered to, and is discarded when the
+        // run already ended between routing and dispatch.
+        ...(internal?.requireActiveRun === true ? { ifActive: { behavior: 'deliver', expireWithRun: true } } : {}),
+        ifIdle:
+          internal?.requireActiveRun === true
+            ? { behavior: 'discard' }
+            : {
+                behavior: 'wake',
+                // The active-delivery race can still land idle; a wake here starts a
+                // REAL streamed turn, so it must carry the step ceiling and the
+                // silent-turn nudge like every other wake site — empty options ran
+                // the turn at the provider's 5-step default with no memory identity.
+                streamOptions: {
+                  memory: { thread: this.threadId, resource: this.resourceId },
+                  maxSteps: HARNESS_SESSION_MAX_STEPS,
+                  ...this._createEmptySynthesisOptions(),
+                  ...(this._currentTurnSourceWriteGuard
+                    ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
+                    : {}),
+                  ...this._subagentTracingOptions(),
+                } as never,
+              },
       },
     );
+    if (internal?.requireActiveRun === true && (await dispatched.accepted).action !== 'deliver') {
+      throw new HarnessValidationError('injectSystemReminder()', 'the active run ended before the reminder landed');
+    }
 
     return {
       id: dispatched.signal.id,
@@ -20982,6 +21089,59 @@ export class Session {
   }
 
   /**
+   * @internal PF-7538 — wait, without starting new writes, until no storage
+   * work this session already started is pending. Shutdown's final barrier.
+   * Covers every per-session tail and in-flight registry that issues storage
+   * calls: background turn completions (signal settlement, terminal CAS),
+   * result-evidence writes, signal settlements, terminal commits, recovered
+   * run publications, run-summary persistence, the `_flushChain` (record
+   * writes and draft checkpoints), the in-flight draft checkpoint, the
+   * event-persistence tail, the lease-renewal chain, orphaned-dispatch
+   * recovery, plan-task summary seeding and delegation reconcile. Failures
+   * stay with their owners; this only observes settlement, and loops until
+   * nothing new was registered while it waited.
+   */
+  async _internalSettleOutstandingWork(): Promise<void> {
+    const pending = (): Promise<unknown>[] => [
+      ...this._backgroundTurnCompletions,
+      ...this._resultEvidenceWrites,
+      ...this._signalResultSettlements.values(),
+      ...this._terminalCommitsByRunId.values(),
+      ...this._recoveredRunPublications.values(),
+      this._runSummaryPersistence,
+      this._flushChain,
+      this._eventPersistenceTail,
+      this._leaseRenewalChain,
+      ...[
+        this._assistantDraftFlushInFlight,
+        this._orphanRecovery,
+        this._planTaskSummarySeedPromise,
+        this._delegationReconcileInFlight,
+      ].filter((work): work is Promise<never> => work !== undefined),
+    ];
+    while (true) {
+      const before = pending();
+      await Promise.allSettled(before);
+      const after = pending();
+      if (after.length === before.length && after.every((work, index) => work === before[index])) return;
+    }
+  }
+
+  /**
+   * PF-7538: run an eviction raised from inside a `_flushUpdate` link, marking
+   * it reentrant so the assistant-draft barrier does not await the flush chain
+   * that this link is blocking.
+   */
+  private async _evictFromFlushLink(evict: () => Promise<unknown>): Promise<void> {
+    this._flushLinkEvictionDepth++;
+    try {
+      await evict();
+    } finally {
+      this._flushLinkEvictionDepth--;
+    }
+  }
+
+  /**
    * Apply an update to the in-memory record, CAS-write to storage, and
    * adopt the returned version. Single point of truth so every setter
    * stays consistent with the lease + version contract (§5.8).
@@ -21010,13 +21170,20 @@ export class Session {
       // serialize on the flush chain, so a conflict here means another owner).
       const maxRetries = opts?.ifVersion !== undefined ? 0 : 1;
       for (let attempt = 0; ; attempt++) {
+        // PF-7538: a link queued on `_flushChain` before a lease-loss eviction
+        // runs after it. Re-check here, as the pre-enqueue guard above does, so
+        // a fenced session never writes storage again. Pressure and idle
+        // evictions still hold the lease, so their queued links keep writing.
+        if (this._state === 'evicted' && this._evictedByLeaseLoss) {
+          throw new HarnessSessionClosedError(this.id);
+        }
         const leaseExpiresAt = this._record.leaseExpiresAt;
         if (
           (this._state === 'live' || this._state === 'closing') &&
           leaseExpiresAt !== undefined &&
           leaseExpiresAt <= Date.now()
         ) {
-          await this._harness._internalEvictLiveSessionLeaseLost(this);
+          await this._evictFromFlushLink(() => this._harness._internalEvictLiveSessionLeaseLost(this));
           throw new HarnessSessionLockedError(this.id, 'unknown', leaseExpiresAt);
         }
         if (opts?.ifVersion !== undefined && this._record.version !== opts.ifVersion) {
@@ -21196,7 +21363,7 @@ export class Session {
           // conflict). Fence the WHOLE live subtree rather than only this session
           // or retrying into a contested record.
           if (err instanceof HarnessStorageLeaseConflictError) {
-            await this._harness._internalEvictSubtreeLeaseLost(this);
+            await this._evictFromFlushLink(() => this._harness._internalEvictSubtreeLeaseLost(this));
             throw new HarnessSessionLockedError(this.id, err.heldBy, err.expiresAt);
           }
           if (!(err instanceof HarnessStorageVersionConflictError) || attempt >= maxRetries) {
@@ -21208,16 +21375,18 @@ export class Session {
           // ownership loss or subtree split. The helper renews root + active
           // descendants and fences the whole subtree (throwing locked/not-found)
           // if ownership can't be proven.
-          await this._harness._internalRenewProveSubtree(
-            this,
-            this._getEffectiveLeaseTtlMs(this._harness._internalLeaseTtlMs),
+          await this._evictFromFlushLink(() =>
+            this._harness._internalRenewProveSubtree(
+              this,
+              this._getEffectiveLeaseTtlMs(this._harness._internalLeaseTtlMs),
+            ),
           );
           const reloaded = await this._storage.loadSession({
             harnessName: this._record.harnessName,
             sessionId: this.id,
           });
           if (!reloaded) {
-            await this._harness._internalEvictLiveSessionLeaseLost(this);
+            await this._evictFromFlushLink(() => this._harness._internalEvictLiveSessionLeaseLost(this));
             throw new HarnessSessionDeletedError(this.id, this._record.resourceId, this._record.threadId);
           }
           // Adopt the concurrent durable state under our proven lease, then loop
@@ -21323,6 +21492,9 @@ export class Session {
     if (mode.harnessBuiltins !== 'exclude') {
       const spawn = createSpawnSubagentTool(this);
       if (spawn) builtins[SPAWN_SUBAGENT_TOOL_ID] = spawn;
+      // PF-7473 — status/wait/send/cancel over this session's own children.
+      const control = createSubagentControlTool(this);
+      if (control) builtins[SUBAGENT_CONTROL_TOOL_ID] = control;
       // Plan-task tools (§5.1k / §6.4 — TM-3). The only model-facing mutation path
       // for the durable HarnessPlanTask tree; each write routes through this
       // session under its lease.
@@ -21898,8 +22070,9 @@ export class Session {
    * instance from the live map (§5.4). The record stays active in storage;
    * the session can be re-hydrated. Currently unused; lands with eviction.
    */
-  _markEvicted(updatedRecord: SessionRecord): void {
+  _markEvicted(updatedRecord: SessionRecord, reason?: 'lease_lost' | 'pressure' | 'idle'): void {
     const err = new HarnessValidationError('session.evict()', 'Session evicted');
+    this._evictedByLeaseLoss = reason === 'lease_lost';
     this._leaseExtensionDeadline = undefined;
     this._clearPendingInteractionExpiryTimer();
     this._record = updatedRecord;
@@ -23590,6 +23763,16 @@ export class Session {
 }
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+/** PF-7473: true when the caller's admission check now fails. */
+function admissionLost(assertAdmitted: () => void): boolean {
+  try {
+    assertAdmitted();
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
