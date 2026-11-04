@@ -108,8 +108,8 @@ const inputSchema = z
       .optional()
       .describe(
         `wait only: maximum wait in ms (default ${SUBAGENT_CONTROL_DEFAULT_WAIT_MS}, max ${SUBAGENT_CONTROL_MAX_WAIT_MS}). ` +
-          'If a status read stalls past the timeout, wait returns timedOut with the last statuses it read, ' +
-          'which can be partial or empty; that does not mean nothing is running.',
+          'If the first status read stalls, wait fails with harness.storage and can be retried; if a later ' +
+          'read stalls past the timeout, wait returns timedOut with the statuses from its last completed read.',
       ),
     message: z
       .string()
@@ -217,14 +217,14 @@ function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
 }
 
 /**
- * Settle with `work`, unless `signal` aborts or (when `stallAt` is given) that
- * time passes first; then resolve `{ done: false }` and stop waiting. The
+ * Settle with `work`, unless `signal` aborts or `stallAt` passes first; then
+ * resolve `{ done: false }` and stop waiting. The
  * storage call behind `work` keeps running (the harness storage tracker still
  * owns it); only this caller stops waiting for it.
  */
 function settleWithin<T>(
   work: Promise<T>,
-  stallAt: number | undefined,
+  stallAt: number,
   signal: AbortSignal | undefined,
 ): Promise<{ done: true; value: T } | { done: false }> {
   if (signal?.aborted) {
@@ -232,13 +232,12 @@ function settleWithin<T>(
     return Promise.resolve({ done: false });
   }
   return new Promise((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const onStop = () => {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onStop);
       resolve({ done: false });
     };
-    if (stallAt !== undefined) timer = setTimeout(onStop, Math.max(0, stallAt - Date.now()));
+    const timer = setTimeout(onStop, Math.max(0, stallAt - Date.now()));
     signal?.addEventListener('abort', onStop, { once: true });
     work.then(
       value => {
@@ -438,18 +437,28 @@ export function createSubagentControlTool(parent: Session) {
     let lastSettled: SubagentView[] = [];
     let lastRunning: SubagentView[] = [];
     for (;;) {
-      // The first poll proves ownership and reads the initial views, so only an
-      // abort ends it early. A later read may always run at least
-      // SUBAGENT_CONTROL_WAIT_READ_STALL_MS, even when it starts at the deadline.
-      const stallAt =
-        knownOwned === undefined ? undefined : Math.max(deadline, Date.now() + SUBAGENT_CONTROL_WAIT_READ_STALL_MS);
+      // The deadline decides when to stop polling, not how long a started read
+      // may take: every read may run at least SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
+      // even when it starts at the deadline.
       const resolution = await settleWithin(
         resolveChildren(targets, knownOwned === undefined ? {} : { knownOwned }),
-        stallAt,
+        Math.max(deadline, Date.now() + SUBAGENT_CONTROL_WAIT_READ_STALL_MS),
         signal,
       );
       if (!resolution.done) {
         const aborted = signal?.aborted === true;
+        if (!aborted && knownOwned === undefined) {
+          // The first read proves ownership and reads the initial views; with it
+          // stalled both are unknown, so this is a storage failure, not a timeout.
+          return {
+            isError: true,
+            errorName: 'HarnessStorageError',
+            code: 'harness.storage',
+            message:
+              `The subagent state read did not answer within ${SUBAGENT_CONTROL_WAIT_READ_STALL_MS} ms; ` +
+              'nothing is known about the subagents yet. Retry the wait.',
+          };
+        }
         return {
           action: 'wait',
           settledSubagents: lastSettled,
@@ -607,8 +616,9 @@ export function createSubagentControlTool(parent: Session) {
       '`status` lists them (or inspects one) with their status. Only a settled task_delegate subagent ' +
       'carries its result; a spawn_subagent result is returned by that spawn_subagent call only. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
-      'returns those settled and those still running. If a status read stalls past the timeout, the lists ' +
-      'are the last statuses read and can be partial or empty. ' +
+      'returns those settled and those still running. If the first status read stalls, wait fails with ' +
+      '`harness.storage` (retry it); if a later read stalls past the timeout, the lists are the statuses from ' +
+      'its last completed read and may be stale. ' +
       '`send` adds an instruction to a subagent whose run is in progress. It is rejected for a subagent ' +
       'that is idle or waiting for human input, and a message the run ends without reading is dropped. ' +
       '`cancel` stops one subagent: `cancel: "acknowledged"` means the cancel is recorded on the subagent ' +

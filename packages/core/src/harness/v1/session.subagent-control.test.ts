@@ -509,6 +509,40 @@ describe('subagent control tool', () => {
     await harness.shutdown();
   });
 
+  it('wait fails with a storage error, never an empty timeout, when its first storage read stalls', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const child = await awaitingInputChild(harness, parent);
+    let releaseStorage!: () => void;
+    const gate = new Promise<void>(r => (releaseStorage = r));
+    const original = InMemoryHarness.prototype.listPlanTasks;
+    const stall = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(function (
+      this: InMemoryHarness,
+      ...args: Parameters<InMemoryHarness['listPlanTasks']>
+    ) {
+      return gate.then(() => original.apply(this, args));
+    });
+    let guardTimer!: ReturnType<typeof setTimeout>;
+    const stalled = new Promise<'stalled'>(
+      r => (guardTimer = setTimeout(() => r('stalled'), SUBAGENT_CONTROL_WAIT_READ_STALL_MS + 2_000)),
+    );
+    try {
+      const started = Date.now();
+      const waited = await Promise.race([
+        control(parent)({ action: 'wait', subagentSessionId: child.id, timeoutMs: 50 }),
+        stalled,
+      ]);
+      expect(waited).toMatchObject({ isError: true, errorName: 'HarnessStorageError', code: 'harness.storage' });
+      expect(waited).not.toHaveProperty('timedOut');
+      expect(Date.now() - started).toBeGreaterThanOrEqual(SUBAGENT_CONTROL_WAIT_READ_STALL_MS - 5);
+    } finally {
+      clearTimeout(guardTimer);
+      releaseStorage();
+      stall.mockRestore();
+    }
+    await harness.shutdown();
+  });
+
   it('wait over storage with a few ms of latency still proves ownership and reports fresh settlement', async () => {
     const { harness } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -530,10 +564,17 @@ describe('subagent control tool', () => {
     });
     const suspended = await awaitingInputChild(harness, parent);
     const original = InMemoryHarness.prototype.listPlanTasks;
+    // Set for the last case: the first read that starts at or after this time
+    // (the wait's final, deadline poll) settles the suspended child first.
+    let settleChildFrom: number | undefined;
     const latency = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(async function (
       this: InMemoryHarness,
       ...args: Parameters<InMemoryHarness['listPlanTasks']>
     ) {
+      if (settleChildFrom !== undefined && Date.now() >= settleChildFrom) {
+        settleChildFrom = undefined;
+        await (suspended as any)._flushUpdate((prev: any) => ({ ...prev, pendingResume: undefined }));
+      }
       await new Promise(r => setTimeout(r, 5));
       return original.apply(this, args);
     });
@@ -550,11 +591,10 @@ describe('subagent control tool', () => {
           settledSubagents: [expect.objectContaining({ subagentSessionId: idleChild.id, settled: true })],
         });
       }
-      // The child settles shortly before the deadline: the final poll must see it.
-      setTimeout(() => {
-        void (suspended as any)._flushUpdate((prev: any) => ({ ...prev, pendingResume: undefined }));
-      }, 40);
-      expect(await run({ action: 'wait', subagentSessionId: suspended.id, timeoutMs: 60 })).toMatchObject({
+      // The child settles just as the deadline poll starts: that poll must see it.
+      const timeoutMs = 1_000;
+      settleChildFrom = Date.now() + timeoutMs;
+      expect(await run({ action: 'wait', subagentSessionId: suspended.id, timeoutMs })).toMatchObject({
         timedOut: false,
         runningSubagents: [],
         settledSubagents: [expect.objectContaining({ subagentSessionId: suspended.id, settled: true })],
