@@ -644,6 +644,24 @@ export class HarnessPendingInteractionDiscardedError extends HarnessError {
       options?.cause !== undefined ? { cause: options.cause } : undefined,
     );
   }
+
+  /**
+   * Rebuild the typed error from its stored public projection
+   * (`{ code: 'harness.pending_interaction_discarded', message }`), keeping
+   * the stored message verbatim.
+   */
+  static fromProjection(projection: { message: string }): HarnessPendingInteractionDiscardedError {
+    const match = /^Pending interaction "(.*)" for session "(.*)" was discarded \((.*)\)$/s.exec(projection.message);
+    const error = new HarnessPendingInteractionDiscardedError(
+      match?.[2] ?? '',
+      match?.[1] ?? '',
+      match?.[3] ?? 'discarded',
+    );
+    if (error.message !== projection.message) {
+      Object.defineProperty(error, 'message', { value: projection.message, configurable: true, writable: true });
+    }
+    return error;
+  }
 }
 
 export class HarnessAdmissionConflictError extends Error {

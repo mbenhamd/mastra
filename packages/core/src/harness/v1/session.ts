@@ -10852,6 +10852,10 @@ export class Session {
           // recomputing it.
           if (evidence.erased === true) await this._rejectErasedDuplicate(evidence, opts, activeDeleted);
           const completedResult = this._completedEvidenceResult(evidence);
+          // A completed (terminal, immutable) suspended result whose
+          // suspension was discarded replays the discard, not `suspended`.
+          const discardedSuspension = this._discardReceiptForSuspendedOutput(completedResult);
+          if (discardedSuspension !== undefined) throw this._discardedErrorForReceipt(discardedSuspension);
           if (this._terminalFinalizer !== undefined && opts.executionAuthorityGrant !== undefined) {
             await this._commitCachedDuplicateTerminal(
               completedResult as FullOutput<unknown>,
@@ -10864,14 +10868,6 @@ export class Session {
         }
         if (evidence.status === 'failed') {
           await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
-          // A message admission settled by a discard replays the typed discard.
-          const discard =
-            evidence.error.code === DISCARDED_ERROR_CODE && evidence.runId !== undefined
-              ? Object.values(this._record.inboxResponseReceipts ?? {}).find(
-                  receipt => receipt.discardedAt !== undefined && receipt.runId === evidence.runId,
-                )
-              : undefined;
-          if (discard !== undefined) throw this._discardedErrorForReceipt(discard);
           throw publicErrorProjectionToError(evidence.error);
         }
         const runId = await this._pendingMessageRunId(evidence);
@@ -11127,15 +11123,7 @@ export class Session {
       // discarded run answerable again; settle the still-pending message
       // admission as discarded instead and report that outcome.
       const discardedCallRunId = full.runId ?? evidence.runId;
-      const discard =
-        parked === undefined && discardedCallRunId !== undefined && payload?.toolCallId !== undefined
-          ? Object.values(this._record.inboxResponseReceipts ?? {}).find(
-              receipt =>
-                receipt.discardedAt !== undefined &&
-                receipt.runId === discardedCallRunId &&
-                receipt.toolCallId === payload.toolCallId,
-            )
-          : undefined;
+      const discard = parked === undefined ? this._discardReceiptForSuspendedOutput(full, evidence.runId) : undefined;
       if (discard !== undefined) {
         const discardError = this._discardedErrorForReceipt(discard);
         if (evidence.status === 'pending') {
@@ -11361,7 +11349,17 @@ export class Session {
   private async _cancelTerminalizedPendingAdmission(
     pending: PendingResume,
     error: { code: string; message: string },
+    options: {
+      /**
+       * `discardPendingInteraction` completion: settle the admitted message
+       * row with the discard outcome (`error`), not as a cancellation, so a
+       * retried message replays the discard. Live terminal observers still
+       * receive the typed handoff cancellation their contract carries.
+       */
+      settleAsDiscard?: boolean;
+    } = {},
   ): Promise<void> {
+    const settleOptions = options.settleAsDiscard === true ? { terminalError: error } : {};
     // Durable admission state is independent of local finalizer registration —
     // a reopened session must still drain observers for a dead grant.
     // Probe across statuses: an external cancellation may have already moved
@@ -11370,7 +11368,7 @@ export class Session {
     const admission = await this._probeResumeAdmissionByRun(pending);
     if (!admission) return;
     if (admission.status === 'cancelled') {
-      await this._settleCancelledTerminalMessage(admission, error.message);
+      await this._settleCancelledTerminalMessage(admission, error.message, settleOptions);
       this._drainTerminalObservers(
         pending.runId,
         new HarnessTerminalHandoffCancelledError(admission.executionGrant.key),
@@ -11420,7 +11418,7 @@ export class Session {
     } else if (finalStatus === 'fenced') {
       this._drainTerminalObservers(pending.runId, new HarnessTerminalHandoffFencedError(this.id));
     } else {
-      await this._settleCancelledTerminalMessage(admission, error.message);
+      await this._settleCancelledTerminalMessage(admission, error.message, settleOptions);
       this._drainTerminalObservers(
         pending.runId,
         new HarnessTerminalHandoffCancelledError(admission.executionGrant.key),
@@ -11445,6 +11443,8 @@ export class Session {
        * recovery once its claim expires.
        */
       requireUndispatched?: boolean;
+      /** Settle with this outcome instead of `harness.terminal_cancelled`. */
+      terminalError?: { code: string; message: string };
     } = {},
   ): Promise<void> {
     if (!this._storage.supportsDispatchRecovery) return;
@@ -11486,7 +11486,7 @@ export class Session {
           status: 'failed',
           signalId: evidence.signalId,
           runId: admission.runId,
-          error: { code: 'harness.terminal_cancelled', message },
+          error: options.terminalError ?? { code: 'harness.terminal_cancelled', message },
           ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
           ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
         },
@@ -16548,7 +16548,10 @@ export class Session {
         ) {
           return prev;
         }
-        const discardedAt = Date.now();
+        // Never below `requestedAt`: the parking host's clock may be ahead of
+        // ours (lease handoff, NTP step), and `expiresAt < requestedAt` is a
+        // corrupt pending row.
+        const discardedAt = Math.max(Date.now(), current.requestedAt);
         const receipt: InboxResponseReceipt = {
           responseId: input.responseId,
           responseHash,
@@ -16645,7 +16648,7 @@ export class Session {
     }
     // Settle a deferred terminal admission before the claim marker clears, so
     // a failure here leaves the claimed row discoverable for retry.
-    await this._cancelTerminalizedPendingAdmission(claimedPending, projectedError);
+    await this._cancelTerminalizedPendingAdmission(claimedPending, projectedError, { settleAsDiscard: true });
 
     let cleared = false;
     let settledQueueReceipt: QueueAdmissionReceipt | undefined;
@@ -16735,24 +16738,16 @@ export class Session {
     return findDiscardReceiptIn(this._record, generation);
   }
 
-  /**
-   * Typed discard error for any receipt of a discarded generation: uses the
-   * generation's discard receipt (for its reason) when it is still retained.
-   */
-  private _discardedErrorForGeneration(receipt: InboxResponseReceipt): HarnessPendingInteractionDiscardedError {
-    const discard =
-      receipt.discardedAt !== undefined
-        ? receipt
-        : this._findDiscardReceipt({
-            kind: receipt.kind,
-            itemId: receipt.itemId,
-            runId: receipt.runId,
-            toolCallId: receipt.toolCallId,
-            pendingRequestedAt: receipt.pendingRequestedAt,
-          });
-    return discard !== undefined
-      ? this._discardedErrorForReceipt(discard)
-      : new HarnessPendingInteractionDiscardedError(this.id, receipt.itemId, 'discarded');
+  /** The discard receipt for the suspended call `output` parked on, if discarded. */
+  private _discardReceiptForSuspendedOutput(output: unknown, fallbackRunId?: string): InboxResponseReceipt | undefined {
+    const full = output as { finishReason?: unknown; runId?: unknown; suspendPayload?: unknown } | undefined;
+    if (full?.finishReason !== 'suspended') return undefined;
+    const runId = typeof full.runId === 'string' ? full.runId : fallbackRunId;
+    const toolCallId = (full.suspendPayload as { toolCallId?: unknown } | undefined)?.toolCallId;
+    if (runId === undefined || typeof toolCallId !== 'string') return undefined;
+    return Object.values(this._record.inboxResponseReceipts ?? {}).find(
+      receipt => receipt.discardedAt !== undefined && receipt.runId === runId && receipt.toolCallId === toolCallId,
+    );
   }
 
   /** Throw the typed discard outcome when `pending`'s generation was discarded. */
@@ -18886,10 +18881,6 @@ export class Session {
   private _throwStoredInboxResponseFailure(receipt: InboxResponseReceipt): void {
     if (receipt.status !== 'failed' && receipt.status !== 'dead') return;
     if (receipt.status === 'failed' && receipt.retryable === true) return;
-    // Receipts a discard converted (or wrote) replay as the typed discard.
-    if (receipt.error?.code === DISCARDED_ERROR_CODE) {
-      throw this._discardedErrorForGeneration(receipt);
-    }
     throw publicErrorProjectionToError(
       receipt.error ?? { code: 'harness.inbox_response_failed', message: 'inbox response failed' },
     );
@@ -24328,6 +24319,10 @@ function discardReceiptResult(
 }
 
 function publicErrorProjectionToError(error: { code: string; message: string }): Error {
+  // Every stored-error replay (receipts, signal/queue/message evidence)
+  // comes through here: a discard outcome replays as its typed error, even
+  // after the discard receipt itself has been pruned.
+  if (error.code === DISCARDED_ERROR_CODE) return HarnessPendingInteractionDiscardedError.fromProjection(error);
   const projected = new Error(error.message);
   projected.name = error.code;
   (projected as Error & { code: string }).code = error.code;

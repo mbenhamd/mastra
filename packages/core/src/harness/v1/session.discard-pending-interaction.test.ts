@@ -913,4 +913,141 @@ describe('Session.discardPendingInteraction', () => {
     await expect(session.discardPendingInteraction(input)).resolves.toMatchObject({ status: 'already_resolved' });
     await harness.shutdown();
   });
+
+  function terminalHandoffSetup() {
+    const storage = new InMemoryHarness({
+      db: new InMemoryDB(),
+      terminalHandoff: { enabled: true },
+      sessionRecordProjection: { enabled: true },
+    });
+    const agent = new MockAgent({ id: 'default' });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: {
+        storage,
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({ projectionKind: 'chat.summary', projectionId: 'response-1', payload: {} }),
+          },
+        },
+      },
+    });
+    return { storage, agent, harness };
+  }
+
+  it('clamps the claim to requestedAt when the local clock is behind the parking host', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    const sessionId = session.id;
+    const skewed = vi.spyOn(Date, 'now').mockReturnValue(pending.requestedAt - 50);
+    const result = await session.discardPendingInteraction({
+      ...generationOf(pending),
+      responseId: 'discard-1',
+      reason: 'run_settled',
+    });
+    skewed.mockRestore();
+    expect(result).toMatchObject({ status: 'discarded' });
+    await harness.shutdown();
+
+    const harness2 = newHarness(new FakeAgent(), storage);
+    const reopened = await harness2.session({ sessionId, resourceId: 'u' });
+    expect(reopened.getRecord().pendingResume).toBeUndefined();
+    await expect(
+      reopened.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'already_resolved' });
+    await harness2.shutdown();
+  });
+
+  it('a terminal-handoff message retry after a discard gets the discard, not a cancellation', async () => {
+    const { agent, harness } = terminalHandoffSetup();
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-T', toolName: 'start_research_workflow', args: { topic: 'x' } },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const opts = {
+      content: 'needs approval',
+      admissionId: 'adm-T',
+      executionAuthorityGrant: { key: 'usage-claim-discard', generation: 1 },
+      terminalAdmissionSeed: { v: 1 },
+    } as const;
+    expect((await session.message(opts)).finishReason).toBe('suspended');
+    const pending = session.getRecord().pendingResume!;
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+
+    await expect(session.message(opts)).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    await expect(session.message({ ...opts, onTerminalCommit: async () => {} })).rejects.toBeInstanceOf(
+      HarnessPendingInteractionDiscardedError,
+    );
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('signal results, duplicate signals and duplicate queue items replay the typed discard', async () => {
+    const { harness, agent } = setup();
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+
+    agent.enqueueRun(approvalRun('run-S', 'tc-S'));
+    const handle = await session.signal({ content: 'signal turn', admissionId: 'sig-1' });
+    const original = handle.result.then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'signal turn parked');
+    const signalPending = session.getRecord().pendingResume!;
+    await expect(
+      session.discardPendingInteraction({
+        ...generationOf(signalPending),
+        responseId: 'discard-s',
+        reason: 'run_settled',
+      }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+    expect(await original).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    const duplicateSignal = await session.signal({ content: 'signal turn', admissionId: 'sig-1' });
+    await expect(duplicateSignal.result).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+
+    agent.enqueueRun(approvalRun('run-Q', 'tc-Q'));
+    const queued = session.queue({ content: 'queued turn', admissionId: 'q-1' }).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'queued turn parked');
+    const queuePending = session.getRecord().pendingResume!;
+    await expect(
+      session.discardPendingInteraction({
+        ...generationOf(queuePending),
+        responseId: 'discard-q',
+        reason: 'run_settled',
+      }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+    expect(await queued).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    await expect(session.queue({ content: 'queued turn', admissionId: 'q-1' })).rejects.toBeInstanceOf(
+      HarnessPendingInteractionDiscardedError,
+    );
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('a plain message retry after a discard gets the discard, not the cached suspension', async () => {
+    const { harness, agent } = setup();
+    agent.enqueueRun(approvalRun('run-M', 'tc-M'));
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const opts = { content: 'start the research run', admissionId: 'adm-plain' };
+    expect((await session.message(opts)).finishReason).toBe('suspended');
+    const pending = session.getRecord().pendingResume!;
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+
+    await expect(session.message(opts)).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
 });
