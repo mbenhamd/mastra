@@ -792,6 +792,7 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
     const children: { a?: string; b?: string } = {};
     let turnActiveDuringSteerTurn: boolean | undefined;
     let parent!: Session;
+    const releases: Array<() => void> = [];
     const { harness, childAgent } = buildRealLoopHarness(async () => {
       switch (phase) {
         case 'delegate':
@@ -825,6 +826,7 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
       const sendSignal = vi.spyOn(childAgent, 'sendSignal');
       const releaseA = holdChildRun(childAgent, 'first survey: done');
       const releaseB = holdChildRun(childAgent, 'second survey: done');
+      releases.push(openDelegationTurn, releaseA, releaseB);
 
       const delegationTurn = parent.message({ content: 'run two surveys in the background' });
       await poll(() => parent.isRunning());
@@ -886,6 +888,8 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
       expect(parent.isBusy()).toBe(false);
       expect(parent.isTurnActive()).toBe(false);
     } finally {
+      // Let held runs finish so a failed assertion surfaces instead of a drain timeout.
+      for (const release of releases) release();
       await harness.shutdown();
     }
   });
@@ -894,6 +898,7 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
     let step = 0;
     let observed: { turnActive: boolean; busy: boolean; inFlight: number } | undefined;
     let parent!: Session;
+    let releaseChild = () => {};
     const { harness, childAgent } = buildRealLoopHarness(() => {
       step++;
       return step === 1
@@ -905,7 +910,7 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
     });
     try {
       parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-      const releaseChild = holdChildRun(childAgent, 'citation checked');
+      releaseChild = holdChildRun(childAgent, 'citation checked');
 
       const turn = parent.message({ content: 'check the citation' });
       await poll(() => childAgent.streamCalls.length === 1);
@@ -921,6 +926,7 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
       expect(parent.isTurnActive()).toBe(false);
       expect(parent.isBusy()).toBe(false);
     } finally {
+      releaseChild();
       await harness.shutdown();
     }
   });

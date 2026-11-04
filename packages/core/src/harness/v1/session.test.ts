@@ -218,6 +218,7 @@ describe('Session — surface area (M1)', () => {
         'clone',
         'isRunning',
         'isBusy',
+        'isTurnActive',
         'isPinned',
         'getQueueDepth',
         'getCurrentRunId',

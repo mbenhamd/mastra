@@ -448,3 +448,126 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await harness.shutdown();
   });
 });
+
+/**
+ * PF-7632 — a host admits a user turn on `isTurnActive()`, so a user turn can
+ * now start while a detached child still runs. These rows pin how such a turn
+ * interacts with the child's settlement, a settlement wake, and Stop.
+ */
+describe('user turns admitted while a delegated child runs (isTurnActive)', () => {
+  /** Count overlapping parent turns from the public event stream. */
+  function trackTurns(parent: Session) {
+    const order: string[] = [];
+    let active = 0;
+    let maxActive = 0;
+    parent.subscribe(event => {
+      if (event.type === 'agent_start') {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        order.push('start');
+      } else if (event.type === 'agent_end') {
+        active -= 1;
+        order.push('end');
+      }
+    });
+    return { order, maxActive: () => maxActive };
+  }
+
+  async function heldUserTurn(parent: Session, parentAgent: MockAgent, content: string) {
+    let release!: () => void;
+    parentAgent.enqueueRun({ holdUntil: new Promise<void>(r => (release = r)), finishReason: 'stop', text: content });
+    const before = parentAgent.streamCalls.length;
+    const turn = parent.message({ content });
+    await poll(() => parentAgent.streamCalls.length === before + 1);
+    return {
+      turn,
+      end: async () => {
+        release();
+        await turn;
+      },
+    };
+  }
+
+  it('a user turn admitted as the child settles loses no settlement and never overlaps another turn', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), undefined);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    const turns = trackTurns(parent);
+    expect(parent.isTurnActive()).toBe(false);
+    expect(parent.isBusy()).toBe(true);
+
+    // Settlement and admission start in the same tick.
+    releaseChild();
+    const user = await heldUserTurn(parent, parentAgent, 'how are the tasks going?');
+    expect(parent.isTurnActive()).toBe(true);
+    await poll(async () => (await planRow(parent, taskId))?.status === 'completed');
+    await user.end();
+    await parent.waitForIdle({ timeoutMs: 2000 });
+
+    expect(parent.isTurnActive()).toBe(false);
+    expect(parent.isBusy()).toBe(false);
+    expect(parent._internalSubagentExecutionsInFlight).toBe(0);
+    expect((await planRow(parent, taskId))?.status).toBe('completed');
+    expect(turns.order).toEqual(['start', 'end']);
+    expect(turns.maxActive()).toBe(1);
+    expect(parentAgent.streamCalls).toHaveLength(2);
+    await harness.shutdown();
+  });
+
+  it('a settlement wake owed during an admitted user turn starts exactly once, after that turn ends', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    const turns = trackTurns(parent);
+    expect(parent.isTurnActive()).toBe(false);
+
+    const user = await heldUserTurn(parent, parentAgent, 'anything new?');
+    releaseChild();
+    await poll(async () => (await planRow(parent, taskId))?.status === 'completed');
+    // The wake waits for the user turn instead of starting a second one.
+    await new Promise(r => setTimeout(r, 50));
+    expect(reminderCalls(parentAgent)).toHaveLength(0);
+    expect(turns.order).toEqual(['start']);
+
+    await user.end();
+    await deliveryFinished(parent, taskId);
+
+    expect(reminderCalls(parentAgent)).toHaveLength(1);
+    expect(String((reminderCalls(parentAgent)[0]!.messages as { contents?: unknown }).contents)).toContain(taskId);
+    expect(turns.order).toEqual(['start', 'end', 'start', 'end']);
+    expect(turns.maxActive()).toBe(1);
+    expect(parent.isTurnActive()).toBe(false);
+    expect(parent.isBusy()).toBe(false);
+    await harness.shutdown();
+  });
+
+  it('aborting an admitted user turn leaves the child running; Stop (abortActiveWork) cancels it', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, childId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    const childRunning = () => harness._internalGetLiveSession(childId)?.isRunning() === true;
+
+    const first = await heldUserTurn(parent, parentAgent, 'never mind');
+    parent.abort();
+    await first.turn.catch(() => {});
+    await poll(() => !parent.isRunning());
+    expect(parent.isTurnActive()).toBe(false);
+    expect(parent.isBusy()).toBe(true);
+    expect(childRunning()).toBe(true);
+    expect((await planRow(parent, taskId))?.status).not.toBe('failed');
+
+    const second = await heldUserTurn(parent, parentAgent, 'stop everything');
+    const stopped = await parent.abortActiveWork({ reason: 'user_requested' });
+    await second.turn.catch(() => {});
+    releaseChild();
+    await poll(async () => (await planRow(parent, taskId))?.status === 'failed');
+    await parent.waitForIdle({ timeoutMs: 2000 });
+
+    expect(stopped.cancelledSubagentSessionIds).toEqual([childId]);
+    expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+    expect(reminderCalls(parentAgent)).toHaveLength(0);
+    expect(parent.isTurnActive()).toBe(false);
+    expect(parent.isBusy()).toBe(false);
+    await harness.shutdown();
+  });
+});
