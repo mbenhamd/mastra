@@ -637,8 +637,12 @@ export class HarnessPendingInteractionDiscardedError extends HarnessError {
     public readonly sessionId: string,
     public readonly itemId: string,
     public readonly reason: string,
+    options?: { cause?: unknown },
   ) {
-    super(`Pending interaction "${itemId}" for session "${sessionId}" was discarded (${reason})`);
+    super(
+      `Pending interaction "${itemId}" for session "${sessionId}" was discarded (${reason})`,
+      options?.cause !== undefined ? { cause: options.cause } : undefined,
+    );
   }
 }
 

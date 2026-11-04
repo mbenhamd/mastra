@@ -15,6 +15,7 @@ import type { PendingResume } from '../../storage/domains/harness/types';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import type { MastraModelOutput } from '../../stream/base/output';
 import { buildFakeOutput } from './__test-utils__/fake-output';
+import { MockAgent } from './__test-utils__/mock-agent';
 
 import {
   HarnessBusyError,
@@ -738,6 +739,178 @@ describe('Session.discardPendingInteraction', () => {
     expect(session.getRecord().pendingResume).toBeUndefined();
     await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
     expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  /** Block the first discard-claim save until `release()`. */
+  function gateDiscardClaim(storage: InMemoryHarness, opts: { failClear?: boolean } = {}) {
+    const save = storage.saveSession.bind(storage);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const state = { claimSeen: false, release: () => release() };
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, options) => {
+      if (!state.claimSeen && record.pendingResume?.expiryStartedAt !== undefined) {
+        state.claimSeen = true;
+        await gate;
+      }
+      if (opts.failClear === true && record.pendingResume === undefined) {
+        throw new Error('process died before the clear');
+      }
+      return save(record, options);
+    });
+    return state;
+  }
+
+  it('an answer reusing the discard responseId that queues behind the claim gets the discard', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    const gate = gateDiscardClaim(storage);
+    const discarding = session.discardPendingInteraction({
+      ...generationOf(pending),
+      responseId: 'shared-1',
+      reason: 'run_settled',
+    });
+    await waitFor(() => gate.claimSeen, 'discard claim save in flight');
+    const answering = session
+      .respondToToolApproval({ ...answerIdentity(pending), responseId: 'shared-1', approved: true })
+      .then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+    await new Promise(resolve => setTimeout(resolve, 50));
+    gate.release();
+
+    await expect(discarding).resolves.toMatchObject({ status: 'discarded' });
+    expect(await answering).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(session.getRecord().inboxResponseReceipts?.['shared-1']?.discardedAt).toBeDefined();
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('an answer whose terminal-admission probe races the discard gets the discard and stores no refusal', async () => {
+    const storage = new InMemoryHarness({
+      db: new InMemoryDB(),
+      terminalHandoff: { enabled: true },
+      sessionRecordProjection: { enabled: true },
+    });
+    const agent = new MockAgent({ id: 'default' });
+    agent.enqueueRun({
+      finishReason: 'suspended',
+      suspendPayload: { toolCallId: 'tc-T', toolName: 'start_research_workflow', args: { topic: 'x' } },
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      modes: [{ id: 'default', agentId: 'default' }],
+      defaultModeId: 'default',
+      sessions: {
+        storage,
+        terminalHandoff: {
+          finalizer: {
+            id: 'doxa.chat',
+            version: '2026-09-20',
+            finalize: async () => ({ projectionKind: 'chat.summary', projectionId: 'response-1', payload: {} }),
+          },
+        },
+      },
+    });
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const first = await session.message({
+      content: 'needs approval',
+      admissionId: 'discard-handoff-admission',
+      executionAuthorityGrant: { key: 'usage-claim-discard', generation: 1 },
+      terminalAdmissionSeed: { v: 1 },
+    });
+    expect(first.finishReason).toBe('suspended');
+    const pending = session.getRecord().pendingResume!;
+
+    // Hold the answer's terminal-admission probe while the discard commits
+    // and cancels that admission.
+    let probeCalls = 0;
+    let releaseProbe!: () => void;
+    const probeGate = new Promise<void>(resolve => (releaseProbe = resolve));
+    const byRun = storage.loadTerminalAdmissionByRun.bind(storage);
+    vi.spyOn(storage, 'loadTerminalAdmissionByRun').mockImplementation(async (input: any) => {
+      probeCalls += 1;
+      if (probeCalls === 1) await probeGate;
+      return byRun(input);
+    });
+    const answering = session
+      .respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true })
+      .then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+    await waitFor(() => probeCalls === 1, 'answer terminal-admission probe in flight');
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+    releaseProbe();
+
+    expect(await answering).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(session.getRecord().inboxResponseReceipts?.['approve-1']).toBeUndefined();
+    await expect(
+      session.respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true }),
+    ).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('an overdue answer that drives a failing discard completion gets the discard', async () => {
+    const { harness, agent, storage } = setup({ pendingInteractionTtlMs: 600 });
+    const { session, pending } = await suspendedSession(harness, agent);
+    (session as any)._clearPendingInteractionExpiryTimer();
+    await waitFor(() => Date.now() > pending.expiresAt + 5, 'deadline passed');
+    const gate = gateDiscardClaim(storage, { failClear: true });
+    const discarding = session
+      .discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' })
+      .then(
+        result => result,
+        (err: unknown) => err,
+      );
+    await waitFor(() => gate.claimSeen, 'discard claim save in flight');
+    const answering = session
+      .respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true })
+      .then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+    await new Promise(resolve => setTimeout(resolve, 50));
+    gate.release();
+
+    expect(await discarding).toBeInstanceOf(HarnessStorageError);
+    expect(await answering).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(Object.keys(session.getRecord().expiredPendingInteractions ?? {})).toHaveLength(0);
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('keeps the claim when origin-signal evidence cannot be written, and recovery completes it later', async () => {
+    const { harness, agent, storage } = setup();
+    agent.enqueueRun(approvalRun('run-S', 'tc-S'));
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const handle = await session.signal({ content: 'start the research run' });
+    await handle.result;
+    await waitFor(() => session.getRecord().pendingResume !== undefined, 'signal turn parked');
+    const pending = session.getRecord().pendingResume!;
+    expect(pending.originSignalId).toBe(handle.id);
+
+    const write = storage.writeMessageResultEvidence.bind(storage);
+    const evidenceSpy = vi.spyOn(storage, 'writeMessageResultEvidence').mockImplementation(async (record, options) => {
+      if (record.status === 'failed') throw new Error('signal evidence write failed');
+      return write(record, options);
+    });
+    const input = { ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' };
+    await expect(session.discardPendingInteraction(input)).rejects.toBeInstanceOf(HarnessStorageError);
+    expect(session.getRecord().pendingResume?.expiryStartedAt).toBeDefined();
+    // Not resolved yet: a replay re-drives the settlement and still fails.
+    await expect(session.discardPendingInteraction(input)).rejects.toBeInstanceOf(HarnessStorageError);
+    expect(session.getRecord().pendingResume).toBeDefined();
+
+    evidenceSpy.mockRestore();
+    await waitFor(() => session.getRecord().pendingResume === undefined, 'recovery completed the discard', 5_000);
+    const evidence = await session.lookupMessageResult(handle.id);
+    expect(evidence && 'status' in evidence ? evidence.status : null).toBe('failed');
+    await expect(session.discardPendingInteraction(input)).resolves.toMatchObject({ status: 'already_resolved' });
     await harness.shutdown();
   });
 });

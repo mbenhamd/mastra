@@ -12445,10 +12445,11 @@ export class Session {
       | { status: 'completed'; runId: string; result: AgentResult }
       | { status: 'failed'; runId?: string; error: { code: string; message: string } },
     admission?: SignalSettlementAdmission,
+    options?: { strict?: boolean },
   ): Promise<AgentSignalResultEvidence | undefined> {
     const inFlight = this._signalResultSettlements.get(signalId);
     if (inFlight !== undefined) return inFlight;
-    const settlement = this._settleSignalResultOnce(signalId, outcome, admission).finally(() => {
+    const settlement = this._settleSignalResultOnce(signalId, outcome, admission, options).finally(() => {
       if (this._signalResultSettlements.get(signalId) === settlement) {
         this._signalResultSettlements.delete(signalId);
       }
@@ -12463,6 +12464,7 @@ export class Session {
       | { status: 'completed'; runId: string; result: AgentResult }
       | { status: 'failed'; runId?: string; error: { code: string; message: string } },
     admission?: SignalSettlementAdmission,
+    options?: { strict?: boolean },
   ): Promise<AgentSignalResultEvidence | undefined> {
     // A signal-owned run can suspend and later resume through a rehydrated
     // Session. `PendingResume` intentionally carries only the public
@@ -12565,6 +12567,15 @@ export class Session {
         signalId,
         runId: outcome.runId,
         result: outcome.result,
+      });
+    } else if (options?.strict === true) {
+      // Strict callers (discard completion) must not clear their recovery
+      // marker over a lost write, so a failure here propagates.
+      await this._writeMessageResultEvidence({
+        status: 'failed',
+        signalId,
+        ...(outcome.runId !== undefined ? { runId: outcome.runId } : {}),
+        error: outcome.error,
       });
     } else {
       await this._writeMessageResultEvidenceBestEffort({
@@ -16623,11 +16634,14 @@ export class Session {
       });
     }
     if (claimedPending.originSignalId !== undefined) {
-      await this._settleSignalResult(claimedPending.originSignalId, {
-        status: 'failed',
-        runId: claimedPending.runId,
-        error: projectedError,
-      });
+      // Required, not best effort: if the signal evidence cannot be written,
+      // the claim stays as the (immediately due) recovery marker.
+      await this._settleSignalResult(
+        claimedPending.originSignalId,
+        { status: 'failed', runId: claimedPending.runId, error: projectedError },
+        undefined,
+        { strict: true },
+      );
     }
     // Settle a deferred terminal admission before the claim marker clears, so
     // a failure here leaves the claimed row discoverable for retry.
@@ -16718,9 +16732,7 @@ export class Session {
   }
 
   private _findDiscardReceipt(generation: DiscardGeneration): InboxResponseReceipt | undefined {
-    return Object.values(this._record.inboxResponseReceipts ?? {}).find(
-      receipt => receipt.discardedAt !== undefined && receiptMatchesDiscardGeneration(receipt, generation),
-    );
+    return findDiscardReceiptIn(this._record, generation);
   }
 
   /**
@@ -17104,10 +17116,74 @@ export class Session {
   // can configure OM directly on the Agent Memory and omit this option while native
   // per-turn engine selection is implemented in @mastra/memory.
 
+  /**
+   * Every `respondTo*` funnels through here. A `discardPendingInteraction`
+   * that wins against this answer (at any await: receipt checks, terminal
+   * admission probes, expiry, admission CAS, or a failing discard completion
+   * the answer drove) is the authoritative outcome: once input validation has
+   * passed, any rejection for a generation the discard owns is reported as
+   * `HarnessPendingInteractionDiscardedError` (original error as `cause`).
+   */
   private async _resume(
     expectedKind: PendingResume['kind'],
     resumeData: unknown,
     responseOptions: InboxResponseOptions = {},
+  ): Promise<AgentResult | InboxResponseResult> {
+    const progress: ResumeAnswerProgress = { validated: false, pending: this._record.pendingResume };
+    try {
+      return await this._resumeAnswer(expectedKind, resumeData, responseOptions, progress);
+    } catch (err) {
+      if (err instanceof HarnessPendingInteractionDiscardedError || !progress.validated) throw err;
+      const discard = this._discardReceiptForAnswer(expectedKind, responseOptions, progress.pending);
+      if (discard === undefined) throw err;
+      const reason = (discard.response as { reason?: unknown } | undefined)?.reason;
+      throw new HarnessPendingInteractionDiscardedError(
+        this.id,
+        discard.itemId,
+        typeof reason === 'string' ? reason : 'discarded',
+        { cause: err },
+      );
+    }
+  }
+
+  /**
+   * The discard receipt owning the generation this answer targeted: the
+   * answer's explicit generation fields when present, else the pending
+   * interaction it observed on entry.
+   */
+  private _discardReceiptForAnswer(
+    expectedKind: PendingResume['kind'],
+    responseOptions: InboxResponseOptions,
+    observed: PendingResume | undefined,
+  ): InboxResponseReceipt | undefined {
+    const options = responseOptions as Record<string, unknown>;
+    const itemId = getOwnRecordValue(options, 'itemId');
+    const runId = getOwnRecordValue(options, 'runId');
+    const toolCallId = getOwnRecordValue(options, 'toolCallId');
+    const pendingRequestedAt = getOwnRecordValue(options, 'pendingRequestedAt');
+    if (
+      typeof itemId === 'string' &&
+      typeof runId === 'string' &&
+      typeof toolCallId === 'string' &&
+      typeof pendingRequestedAt === 'number'
+    ) {
+      return this._findDiscardReceipt({ kind: expectedKind, itemId, runId, toolCallId, pendingRequestedAt });
+    }
+    if (observed === undefined || observed.kind !== expectedKind) return undefined;
+    return this._findDiscardReceipt({
+      kind: observed.kind,
+      itemId: observed.itemId ?? observed.toolCallId,
+      runId: observed.runId,
+      toolCallId: observed.toolCallId,
+      pendingRequestedAt: observed.requestedAt,
+    });
+  }
+
+  private async _resumeAnswer(
+    expectedKind: PendingResume['kind'],
+    resumeData: unknown,
+    responseOptions: InboxResponseOptions,
+    progress: ResumeAnswerProgress,
   ): Promise<AgentResult | InboxResponseResult> {
     this._assertLive(`respond[${expectedKind}]`);
     const activeWorkAdmissionEpoch = this._captureActiveWorkAdmission(`respond[${expectedKind}]`);
@@ -17172,6 +17248,7 @@ export class Session {
     if (approvalScope === 'always' && (resumeData as { approved?: unknown })?.approved !== true) {
       throw new HarnessValidationError('respond[tool-approval].approvalScope', '"always" requires approved: true');
     }
+    progress.validated = true;
 
     const storedReceipt =
       responseId !== undefined ? getOwnRecordValue(this._record.inboxResponseReceipts, responseId) : undefined;
@@ -17604,10 +17681,24 @@ export class Session {
     let invalidatedBeforeResume = false;
     let expiredBeforeAdmission: PendingResume | undefined;
     let grantedToolAfterAdmission: string | undefined;
+    let discardedBeforeAdmission: InboxResponseReceipt | undefined;
+    const answeredGeneration: DiscardGeneration = {
+      kind: pending.kind,
+      itemId,
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      pendingRequestedAt: pending.requestedAt,
+    };
     await this._flushUpdate(prev => {
       expiredBeforeAdmission = undefined;
       grantedToolAfterAdmission = undefined;
       resumedAt = undefined;
+      discardedBeforeAdmission = undefined;
+      // A discard that committed while this answer was in flight owns the
+      // generation: record nothing for the answer (no receipt, conflict, or
+      // refusal) and report the discard.
+      discardedBeforeAdmission = findDiscardReceiptIn(prev, answeredGeneration);
+      if (discardedBeforeAdmission !== undefined) return prev;
       if (!this._activeWorkAdmissionIsCurrent(activeWorkAdmissionEpoch)) {
         invalidatedBeforeResume = true;
         return prev;
@@ -17720,6 +17811,9 @@ export class Session {
     // not hide a grant that remains authoritative in storage.
     if (grantedToolAfterAdmission !== undefined) {
       this._emitter.emit({ type: 'permission_granted', toolName: grantedToolAfterAdmission });
+    }
+    if (discardedBeforeAdmission !== undefined) {
+      throw this._discardedErrorForReceipt(discardedBeforeAdmission);
     }
     if (cancelledBeforeResume !== undefined) {
       throw new HarnessSessionCancelledError(this.id, cancelledBeforeResume.reason);
@@ -18817,7 +18911,7 @@ export class Session {
     const appliedAt = Date.now();
     await this._flushUpdate(prev => {
       const receipt = getOwnRecordValue(prev.inboxResponseReceipts, responseId);
-      if (!receipt || receipt.status === 'applied') return prev;
+      if (!receipt || receipt.status === 'applied' || receiptGenerationDiscarded(prev, receipt)) return prev;
       return {
         ...prev,
         inboxResponseReceipts: {
@@ -18849,6 +18943,18 @@ export class Session {
   ): Promise<void> {
     const failedAt = Date.now();
     await this._flushUpdate(prev => {
+      // Never persist a contrary refusal for a generation a discard owns.
+      if (
+        findDiscardReceiptIn(prev, {
+          kind: input.kind,
+          itemId: input.itemId,
+          runId: input.pending.runId,
+          toolCallId: input.pending.toolCallId,
+          pendingRequestedAt: input.pending.requestedAt,
+        }) !== undefined
+      ) {
+        return prev;
+      }
       const currentReceipt = getOwnRecordValue(prev.inboxResponseReceipts, input.responseId);
       if (currentReceipt !== undefined) {
         this._assertMatchingInboxReceipt(currentReceipt, {
@@ -18891,7 +18997,13 @@ export class Session {
     const failedAt = Date.now();
     await this._flushUpdate(prev => {
       const receipt = getOwnRecordValue(prev.inboxResponseReceipts, responseId);
-      if (!receipt || receipt.status === 'applied' || receipt.status === 'failed' || receipt.status === 'dead') {
+      if (
+        !receipt ||
+        receipt.status === 'applied' ||
+        receipt.status === 'failed' ||
+        receipt.status === 'dead' ||
+        receiptGenerationDiscarded(prev, receipt)
+      ) {
         return prev;
       }
       return {
@@ -24150,6 +24262,26 @@ function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generati
   );
 }
 
+/** Whether `receipt`'s generation was resolved by `discardPendingInteraction`. */
+function receiptGenerationDiscarded(record: SessionRecord, receipt: InboxResponseReceipt): boolean {
+  return (
+    findDiscardReceiptIn(record, {
+      kind: receipt.kind,
+      itemId: receipt.itemId,
+      runId: receipt.runId,
+      toolCallId: receipt.toolCallId,
+      pendingRequestedAt: receipt.pendingRequestedAt,
+    }) !== undefined
+  );
+}
+
+/** The `discardPendingInteraction` receipt for `generation` in `record`, if any. */
+function findDiscardReceiptIn(record: SessionRecord, generation: DiscardGeneration): InboxResponseReceipt | undefined {
+  return Object.values(record.inboxResponseReceipts ?? {}).find(
+    receipt => receipt.discardedAt !== undefined && receiptMatchesDiscardGeneration(receipt, generation),
+  );
+}
+
 /**
  * The `discardPendingInteraction` receipt whose claim (`expiryStartedAt`) is
  * stamped on `pending` in `record`, if that generation is discard-owned.
@@ -24166,6 +24298,14 @@ function discardClaimReceipt(record: SessionRecord, pending: PendingResume): Inb
   return Object.values(record.inboxResponseReceipts ?? {}).find(
     receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
   );
+}
+
+/** Shared between `_resume` and `_resumeAnswer` for discard reclassification. */
+interface ResumeAnswerProgress {
+  /** Input validation passed; later rejections may be reclassified. */
+  validated: boolean;
+  /** The pending interaction observed when the answer arrived. */
+  pending: PendingResume | undefined;
 }
 
 /**
