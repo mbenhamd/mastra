@@ -669,10 +669,13 @@ export class HarnessPendingInteractionDiscardedError extends HarnessError {
       }
     };
     // Projections written before the JSON-literal encoding used
-    // `... "<item>" for session "<sess>" was discarded (<reason>)`.
+    // `... "<item>" for session "<sess>" was discarded (<reason>)`. That
+    // format is only decoded when unambiguous: each separator occurs exactly
+    // once and item/session carry no quote. Otherwise identity stays blank.
+    const occurrences = (needle: string): number => projection.message.split(needle).length - 1;
     const legacy =
-      match === null
-        ? /^Pending interaction "(.*)" for session "(.*)" was discarded \((.*)\)$/s.exec(projection.message)
+      match === null && occurrences('" for session "') === 1 && occurrences('" was discarded (') === 1
+        ? /^Pending interaction "([^"]*)" for session "([^"]*)" was discarded \((.*)\)$/s.exec(projection.message)
         : null;
     const error =
       legacy !== null

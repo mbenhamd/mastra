@@ -1203,4 +1203,72 @@ describe('Session.discardPendingInteraction', () => {
     });
     expect(legacy.message).toBe('Pending interaction "item-1" for session "sess-1" was discarded (run_settled)');
   });
+
+  it('does not guess identity from an ambiguous earlier-format discard message', () => {
+    const message =
+      'Pending interaction "item-1" for session "sess-1" was discarded (prior) for session "other" was discarded (replacement)';
+    const decoded = HarnessPendingInteractionDiscardedError.fromProjection({ message });
+    expect(decoded).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(decoded.code).toBe('harness.pending_interaction_discarded');
+    expect({ sessionId: decoded.sessionId, itemId: decoded.itemId, reason: decoded.reason }).toEqual({
+      sessionId: '',
+      itemId: '',
+      reason: 'discarded',
+    });
+    expect(decoded.message).toBe(message);
+    // The unambiguous earlier format still decodes.
+    expect(
+      HarnessPendingInteractionDiscardedError.fromProjection({
+        message: 'Pending interaction "item-1" for session "sess-1" was discarded (run_settled)',
+      }),
+    ).toMatchObject({ sessionId: 'sess-1', itemId: 'item-1', reason: 'run_settled' });
+  });
+
+  it('reports a claim rejected by the record size budget as an inbox_response storage failure', async () => {
+    const recordBytes = (record: unknown) => Buffer.byteLength(JSON.stringify(record), 'utf8');
+    const suspendWithBlob = async (harness: Harness, agent: FakeAgent, blobBytes: number) => {
+      agent.enqueueRun({
+        finishReason: 'suspended',
+        runId: 'run-L',
+        suspendPayload: {
+          toolCallId: 'tc-L',
+          toolName: 'start_research_workflow',
+          args: { blob: 'x'.repeat(blobBytes) },
+        },
+      });
+      const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+      await session.message({ content: 'large approval' });
+      return session;
+    };
+    // Measure the record overhead, then size the blob so the parked record
+    // sits just under the 900,000-byte budget and the claim crosses it.
+    const probe = setup();
+    const probeSession = await suspendWithBlob(probe.harness, probe.agent, 800_000);
+    const overhead = recordBytes(probeSession.getRecord()) - 800_000;
+    await probe.harness.shutdown();
+
+    const { harness, agent } = setup();
+    const session = await suspendWithBlob(harness, agent, 899_800 - overhead);
+    const before = session.getRecord();
+    expect(recordBytes(before)).toBeGreaterThan(899_000);
+    expect(recordBytes(before)).toBeLessThan(900_000);
+    const pending = before.pendingResume!;
+
+    const failure = await session
+      .discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' })
+      .then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+    expect(failure).toBeInstanceOf(HarnessStorageError);
+    expect(failure).toMatchObject({
+      operation: 'inbox_response',
+      retryable: false,
+      subject: { kind: 'inbox_response', id: 'discard-1' },
+    });
+    expect(session.getRecord().version).toBe(before.version);
+    expect(session.getRecord().pendingResume).toEqual(pending);
+    expect(session.getRecord().inboxResponseReceipts?.['discard-1']).toBeUndefined();
+    await harness.shutdown();
+  });
 });

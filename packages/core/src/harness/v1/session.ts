@@ -16910,6 +16910,20 @@ export class Session {
   }
 
   private _discardPendingInteractionFailure(err: unknown, responseId: string): unknown {
+    // Storage errors raised inside the discard's own writes (e.g. the claim
+    // rejected by the record size budget) carry the discard's response subject.
+    if (err instanceof HarnessStorageError && err.operation !== 'inbox_response') {
+      return new HarnessStorageError({
+        operation: 'inbox_response',
+        cause: err.cause ?? err,
+        retryable: err.retryable,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        harnessName: this._record.harnessName,
+        subject: { kind: 'inbox_response', id: responseId },
+      });
+    }
     if (
       err instanceof HarnessError ||
       err instanceof HarnessStorageError ||
