@@ -564,18 +564,19 @@ describe('subagent control tool', () => {
     });
     const suspended = await awaitingInputChild(harness, parent);
     const original = InMemoryHarness.prototype.listPlanTasks;
-    // Set for the last case: the first read that starts at or after this time
-    // (the wait's final, deadline poll) settles the suspended child first.
+    // Set for the last case: the first read that answers at or after this time
+    // settles the suspended child before it reads. The read that ends the wait
+    // answers at or after the deadline, so it always sees the settlement.
     let settleChildFrom: number | undefined;
     const latency = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(async function (
       this: InMemoryHarness,
       ...args: Parameters<InMemoryHarness['listPlanTasks']>
     ) {
+      await new Promise(r => setTimeout(r, 5));
       if (settleChildFrom !== undefined && Date.now() >= settleChildFrom) {
         settleChildFrom = undefined;
         await (suspended as any)._flushUpdate((prev: any) => ({ ...prev, pendingResume: undefined }));
       }
-      await new Promise(r => setTimeout(r, 5));
       return original.apply(this, args);
     });
     try {
@@ -591,7 +592,7 @@ describe('subagent control tool', () => {
           settledSubagents: [expect.objectContaining({ subagentSessionId: idleChild.id, settled: true })],
         });
       }
-      // The child settles just as the deadline poll starts: that poll must see it.
+      // The child settles as the deadline passes: the read that ends the wait must see it.
       const timeoutMs = 1_000;
       settleChildFrom = Date.now() + timeoutMs;
       expect(await run({ action: 'wait', subagentSessionId: suspended.id, timeoutMs })).toMatchObject({
