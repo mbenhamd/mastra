@@ -366,7 +366,7 @@ describe('Session.discardPendingInteraction', () => {
     // A retry of the original approval no longer resumes the executed tool.
     await expect(
       session.respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true }),
-    ).rejects.toMatchObject({ code: 'harness.pending_interaction_discarded' });
+    ).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
     expect(agent.resumeCalls).toHaveLength(1);
     expect(toolExecutions).toBe(1);
 
@@ -416,22 +416,12 @@ describe('Session.discardPendingInteraction', () => {
     clearFails.mockRestore();
     await harness.shutdown();
 
-    // Make the claimed row due for the cold sweep (keep its generation intact).
-    const fixtureOwner = 'discard-cold-fixture';
-    const lease = await storage.acquireSessionLease({ sessionId, ownerId: fixtureOwner, ttlMs: 30_000 });
+    // The claimed row is due for the cold sweep at once; its original
+    // interaction deadline (the default TTL) is still far in the future.
     const stored = (await storage.loadSession({ sessionId }))!;
     expect(stored.pendingResume?.expiryStartedAt).toBeDefined();
     expect(stored.pendingQueue).toHaveLength(1);
-    await storage.saveSession(
-      {
-        ...stored,
-        ownerId: fixtureOwner,
-        leaseExpiresAt: lease.expiresAt,
-        pendingResume: { ...stored.pendingResume!, expiresAt: stored.pendingResume!.requestedAt },
-      },
-      { ownerId: fixtureOwner, ifVersion: lease.version },
-    );
-    await storage.releaseSessionLease({ sessionId, ownerId: fixtureOwner });
+    expect(Date.now()).toBeLessThan(pending.expiresAt);
 
     const agent2 = new FakeAgent();
     agent2.enqueueRun({ finishReason: 'stop', runId: 'run-S', text: 'successor ran' });
@@ -612,6 +602,141 @@ describe('Session.discardPendingInteraction', () => {
       session.respondToToolApproval({ ...answerIdentity(first), responseId: 'late-1', approved: false }),
     ).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
     expect(session.getRecord().pendingResume).toEqual(second);
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('a claimed discard whose clear failed completes on the live timer long before the original deadline', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    const clearFails = failDiscardClear(storage);
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).rejects.toBeInstanceOf(HarnessStorageError);
+    clearFails.mockRestore();
+
+    await waitFor(() => session.getRecord().pendingResume === undefined, 'timer completed the discard', 5_000);
+    expect(Date.now()).toBeLessThan(pending.expiresAt);
+    expect(Object.keys(session.getRecord().expiredPendingInteractions ?? {})).toHaveLength(0);
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'already_resolved' });
+    await harness.shutdown();
+  });
+
+  it('an answer whose admission queues behind a committing discard gets the discard', async () => {
+    const { harness, agent, storage } = setup();
+    const { session, pending } = await suspendedSession(harness, agent);
+    const save = storage.saveSession.bind(storage);
+    let releaseClaim!: () => void;
+    const claimGate = new Promise<void>(resolve => (releaseClaim = resolve));
+    let claimSeen = false;
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, options) => {
+      if (!claimSeen && record.pendingResume?.expiryStartedAt !== undefined) {
+        claimSeen = true;
+        await claimGate;
+      }
+      return save(record, options);
+    });
+    const discarding = session.discardPendingInteraction({
+      ...generationOf(pending),
+      responseId: 'discard-1',
+      reason: 'run_settled',
+    });
+    await waitFor(() => claimSeen, 'discard claim save in flight');
+    // The answer passes its pre-admission discard checks (the claim is not
+    // committed yet) and queues its admission behind the claim.
+    const answering = session
+      .respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true })
+      .then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+    await new Promise(resolve => setTimeout(resolve, 50));
+    releaseClaim();
+
+    await expect(discarding).resolves.toMatchObject({ status: 'discarded' });
+    expect(await answering).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('an answer that reaches the expiry boundary behind a committing discard gets the discard', async () => {
+    const { harness, agent, storage } = setup({ pendingInteractionTtlMs: 600 });
+    const { session, pending } = await suspendedSession(harness, agent);
+    (session as any)._clearPendingInteractionExpiryTimer();
+    await waitFor(() => Date.now() > pending.expiresAt + 5, 'deadline passed');
+    const save = storage.saveSession.bind(storage);
+    let releaseClaim!: () => void;
+    const claimGate = new Promise<void>(resolve => (releaseClaim = resolve));
+    let claimSeen = false;
+    vi.spyOn(storage, 'saveSession').mockImplementation(async (record, options) => {
+      if (!claimSeen && record.pendingResume?.expiryStartedAt !== undefined) {
+        claimSeen = true;
+        await claimGate;
+      }
+      return save(record, options);
+    });
+    const discarding = session.discardPendingInteraction({
+      ...generationOf(pending),
+      responseId: 'discard-1',
+      reason: 'run_settled',
+    });
+    await waitFor(() => claimSeen, 'discard claim save in flight');
+    // Past the deadline, the answer enters the expiry path behind the claim.
+    const answering = session
+      .respondToToolApproval({ ...answerIdentity(pending), responseId: 'approve-1', approved: true })
+      .then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+    await new Promise(resolve => setTimeout(resolve, 50));
+    releaseClaim();
+
+    await expect(discarding).resolves.toMatchObject({ status: 'discarded' });
+    expect(await answering).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(Object.keys(session.getRecord().expiredPendingInteractions ?? {})).toHaveLength(0);
+    expect(agent.resumeCalls).toHaveLength(0);
+    await harness.shutdown();
+  });
+
+  it('a replayed message admission does not re-park a discarded suspension', async () => {
+    const { harness, agent, storage } = setup();
+    agent.enqueueRun(approvalRun('run-M', 'tc-M'));
+    const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
+    const write = storage.writeMessageResultEvidence.bind(storage);
+    let evidenceFailed = false;
+    const evidenceSpy = vi.spyOn(storage, 'writeMessageResultEvidence').mockImplementation(async (record, options) => {
+      if (!evidenceFailed && record.status === 'completed') {
+        evidenceFailed = true;
+        throw new Error('completed evidence write failed');
+      }
+      return write(record, options);
+    });
+    const opts = { content: 'start the research run', admissionId: 'adm-discard' };
+    await session.message(opts).then(
+      () => undefined,
+      () => undefined,
+    );
+    expect(evidenceFailed).toBe(true);
+    evidenceSpy.mockRestore();
+    const pending = session.getRecord().pendingResume!;
+    expect(pending).toBeDefined();
+
+    await expect(
+      session.discardPendingInteraction({ ...generationOf(pending), responseId: 'discard-1', reason: 'run_settled' }),
+    ).resolves.toMatchObject({ status: 'discarded' });
+
+    const retry = await session.message(opts).then(
+      (result: unknown) => result,
+      (err: unknown) => err,
+    );
+    expect(retry).toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    // The settled admission keeps replaying the discard outcome.
+    await expect(session.message(opts)).rejects.toBeInstanceOf(HarnessPendingInteractionDiscardedError);
+    expect(session.getRecord().pendingResume).toBeUndefined();
+    await expect(session.respondToToolApproval({ approved: true })).rejects.toBeTruthy();
     expect(agent.resumeCalls).toHaveLength(0);
     await harness.shutdown();
   });

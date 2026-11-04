@@ -4432,7 +4432,7 @@ export class Session {
     if (expected.resumedAt !== undefined) {
       return this._recoverStaleResumeAdmission(expected, opts);
     }
-    return this._expirePendingInteraction(
+    const outcome = await this._expirePendingInteraction(
       {
         kind: expected.kind,
         itemId: expected.itemId,
@@ -4443,6 +4443,7 @@ export class Session {
       },
       opts,
     );
+    return outcome !== 'none';
   }
 
   private async _expirePendingInteraction(
@@ -4455,14 +4456,14 @@ export class Session {
       expiresAt: number;
     },
     opts: { drainQueue?: boolean; whileClosing?: boolean } = {},
-  ): Promise<boolean> {
+  ): Promise<PendingExpiryOutcome> {
     // A close may expire an overdue interaction: the parked turn could never
     // be answered once the session closes.
-    if (this._state !== 'live' && !(opts.whileClosing === true && this._state === 'closing')) return false;
+    if (this._state !== 'live' && !(opts.whileClosing === true && this._state === 'closing')) return 'none';
     const expiredAt = Date.now();
     if (expiredAt < expected.expiresAt) {
       this._syncPendingInteractionExpiryTimer();
-      return false;
+      return 'none';
     }
     const expiryError = new HarnessPendingInteractionExpiredError(this.id, expected.itemId, expected.expiresAt);
     const projectedError = projectHarnessPublicError(expiryError);
@@ -4485,18 +4486,19 @@ export class Session {
         current.runId !== expected.runId ||
         current.toolCallId !== expected.toolCallId ||
         (current.itemId ?? current.toolCallId) !== expected.itemId ||
-        current.requestedAt !== expected.requestedAt ||
-        this._pendingInteractionExpiresAt(current) !== expected.expiresAt
+        current.requestedAt !== expected.requestedAt
       ) {
         return prev;
       }
-      // A `discardPendingInteraction` claim owns this generation: never record
-      // expiry evidence for it; finish it as the discard below instead.
+      // A `discardPendingInteraction` claim owns this generation (its claim
+      // moved `expiresAt`, so an expiry captured earlier still lands here):
+      // never record expiry evidence for it; finish it as the discard below.
       const discardReceipt = discardClaimReceipt(prev, current);
       if (discardReceipt !== undefined) {
         discardOwned = { pending: current, receipt: discardReceipt };
         return prev;
       }
+      if (this._pendingInteractionExpiresAt(current) !== expected.expiresAt) return prev;
 
       expiryStarted = true;
       const expiryStartedAt = current.expiryStartedAt ?? expiredAt;
@@ -4562,9 +4564,10 @@ export class Session {
 
     if (discardOwned !== undefined) {
       const owned: { pending: PendingResume; receipt: InboxResponseReceipt } = discardOwned;
-      return this._completeDiscardedPendingInteraction(owned.pending, owned.receipt, { drainQueue: opts.drainQueue });
+      await this._completeDiscardedPendingInteraction(owned.pending, owned.receipt, { drainQueue: opts.drainQueue });
+      return 'discarded';
     }
-    if (!expiryStarted || expiredPending === undefined) return false;
+    if (!expiryStarted || expiredPending === undefined) return 'none';
     this._pendingReplacementToolSurfaces.delete(expiredPending.runId);
     const activeController = this._currentTurnAbortController;
     if (activeController !== undefined) activeController.abort(expiryError);
@@ -4627,7 +4630,7 @@ export class Session {
       delete next.pendingResume;
       return next;
     });
-    if (!finalized) return false;
+    if (!finalized) return 'none';
 
     if (queuedItemId !== undefined) {
       const settledReceipt = this._record.queueAdmissionReceipts?.[queuedItemId] ?? failedQueueReceipt;
@@ -4655,7 +4658,7 @@ export class Session {
     }
     this._notifyMaybeIdle();
     if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
-    return true;
+    return 'expired';
   }
 
   /**
@@ -10861,6 +10864,14 @@ export class Session {
         }
         if (evidence.status === 'failed') {
           await this._replayCommittedTerminalFailure(evidence, opts, activeDeleted);
+          // A message admission settled by a discard replays the typed discard.
+          const discard =
+            evidence.error.code === DISCARDED_ERROR_CODE && evidence.runId !== undefined
+              ? Object.values(this._record.inboxResponseReceipts ?? {}).find(
+                  receipt => receipt.discardedAt !== undefined && receipt.runId === evidence.runId,
+                )
+              : undefined;
+          if (discard !== undefined) throw this._discardedErrorForReceipt(discard);
           throw publicErrorProjectionToError(evidence.error);
         }
         const runId = await this._pendingMessageRunId(evidence);
@@ -11110,6 +11121,44 @@ export class Session {
       const payload = full.suspendPayload as { toolCallId?: string } | undefined;
       if (parked !== undefined && (parked.runId !== full.runId || parked.toolCallId !== payload?.toolCallId)) {
         return;
+      }
+      // `discardPendingInteraction` resolved this suspended call. Re-parking
+      // the cached suspension (with a fresh `requestedAt`) would make the
+      // discarded run answerable again; settle the still-pending message
+      // admission as discarded instead and report that outcome.
+      const discardedCallRunId = full.runId ?? evidence.runId;
+      const discard =
+        parked === undefined && discardedCallRunId !== undefined && payload?.toolCallId !== undefined
+          ? Object.values(this._record.inboxResponseReceipts ?? {}).find(
+              receipt =>
+                receipt.discardedAt !== undefined &&
+                receipt.runId === discardedCallRunId &&
+                receipt.toolCallId === payload.toolCallId,
+            )
+          : undefined;
+      if (discard !== undefined) {
+        const discardError = this._discardedErrorForReceipt(discard);
+        if (evidence.status === 'pending') {
+          // Same admitted failure write a failed message turn makes, so later
+          // retries replay a terminal outcome. Best effort: the discard
+          // receipt keeps refusing the re-park if this write fails.
+          await this._raceActiveTurnWaiter(
+            this._writeMessageResultEvidence({
+              status: 'failed',
+              signalId: evidence.signalId,
+              runId: discardedCallRunId,
+              ...(evidence.modeId !== undefined ? { modeId: evidence.modeId } : {}),
+              ...(evidence.modelId !== undefined ? { modelId: evidence.modelId } : {}),
+              operationKind: 'message',
+              error: projectHarnessPublicError(discardError),
+              ...(evidence.admissionId !== undefined && evidence.admissionHash !== undefined
+                ? { admissionId: evidence.admissionId, admissionHash: evidence.admissionHash }
+                : {}),
+            }).catch(() => undefined),
+            activeDeleted,
+          );
+        }
+        throw discardError;
       }
       // The deferred admission bound to this run may already be terminal
       // (aborted/cancelled/fenced) or sealed. Re-parking the cached suspension
@@ -16530,7 +16579,11 @@ export class Session {
           ),
           [input.responseId, receipt] as const,
         ]);
-        claimed = { pending: { ...current, expiryStartedAt: discardedAt }, receipt };
+        // The claim also moves the row's deadline to now, so a completion that
+        // fails after this commit is due at once for the live timer, hydrate,
+        // and the cold sweep instead of waiting for the original TTL. Expiry
+        // never acts on a discard-owned row, so nothing else reads it.
+        claimed = { pending: { ...current, expiryStartedAt: discardedAt, expiresAt: discardedAt }, receipt };
         return { ...prev, pendingResume: claimed.pending, inboxResponseReceipts };
       },
       { skipIfUnchanged: true },
@@ -16668,6 +16721,38 @@ export class Session {
     return Object.values(this._record.inboxResponseReceipts ?? {}).find(
       receipt => receipt.discardedAt !== undefined && receiptMatchesDiscardGeneration(receipt, generation),
     );
+  }
+
+  /**
+   * Typed discard error for any receipt of a discarded generation: uses the
+   * generation's discard receipt (for its reason) when it is still retained.
+   */
+  private _discardedErrorForGeneration(receipt: InboxResponseReceipt): HarnessPendingInteractionDiscardedError {
+    const discard =
+      receipt.discardedAt !== undefined
+        ? receipt
+        : this._findDiscardReceipt({
+            kind: receipt.kind,
+            itemId: receipt.itemId,
+            runId: receipt.runId,
+            toolCallId: receipt.toolCallId,
+            pendingRequestedAt: receipt.pendingRequestedAt,
+          });
+    return discard !== undefined
+      ? this._discardedErrorForReceipt(discard)
+      : new HarnessPendingInteractionDiscardedError(this.id, receipt.itemId, 'discarded');
+  }
+
+  /** Throw the typed discard outcome when `pending`'s generation was discarded. */
+  private _throwIfPendingGenerationDiscarded(pending: PendingResume): void {
+    const discard = this._findDiscardReceipt({
+      kind: pending.kind,
+      itemId: pending.itemId ?? pending.toolCallId,
+      runId: pending.runId,
+      toolCallId: pending.toolCallId,
+      pendingRequestedAt: pending.requestedAt,
+    });
+    if (discard !== undefined) throw this._discardedErrorForReceipt(discard);
   }
 
   private _discardedErrorForReceipt(receipt: InboxResponseReceipt): HarnessPendingInteractionDiscardedError {
@@ -17221,7 +17306,7 @@ export class Session {
       throw this._discardedErrorForReceipt(discardClaim);
     }
     if (pending.expiryStartedAt !== undefined || (pending.resumedAt === undefined && Date.now() >= pendingExpiresAt)) {
-      const didExpire = await this._expirePendingInteraction({
+      const expiryOutcome = await this._expirePendingInteraction({
         kind: pending.kind,
         itemId,
         runId: pending.runId,
@@ -17229,6 +17314,9 @@ export class Session {
         requestedAt: pending.requestedAt,
         expiresAt: pendingExpiresAt,
       });
+      // A discard that won while this answer was in flight is the outcome.
+      this._throwIfPendingGenerationDiscarded(pending);
+      const didExpire = expiryOutcome === 'expired';
       const generationKey = pendingInteractionGenerationKey({
         kind: pending.kind,
         itemId,
@@ -17639,6 +17727,9 @@ export class Session {
     if (invalidatedBeforeResume || !this._activeWorkAdmissionIsCurrent(activeWorkAdmissionEpoch)) {
       throw new HarnessBusyError(this.id, 'in_flight');
     }
+    // The admission lost to a `discardPendingInteraction` claim that
+    // committed after this answer's pre-admission checks: report the discard.
+    if (resumedAt === undefined) this._throwIfPendingGenerationDiscarded(pending);
     if (expiredBeforeAdmission !== undefined) {
       const expired = expiredBeforeAdmission;
       await this._expirePendingInteraction({
@@ -17649,6 +17740,7 @@ export class Session {
         requestedAt: expired.requestedAt,
         expiresAt: this._pendingInteractionExpiresAt(expired),
       });
+      this._throwIfPendingGenerationDiscarded(expired);
       throw new HarnessPendingInteractionExpiredError(
         this.id,
         expired.itemId ?? expired.toolCallId,
@@ -18700,6 +18792,10 @@ export class Session {
   private _throwStoredInboxResponseFailure(receipt: InboxResponseReceipt): void {
     if (receipt.status !== 'failed' && receipt.status !== 'dead') return;
     if (receipt.status === 'failed' && receipt.retryable === true) return;
+    // Receipts a discard converted (or wrote) replay as the typed discard.
+    if (receipt.error?.code === DISCARDED_ERROR_CODE) {
+      throw this._discardedErrorForGeneration(receipt);
+    }
     throw publicErrorProjectionToError(
       receipt.error ?? { code: 'harness.inbox_response_failed', message: 'inbox response failed' },
     );
@@ -23973,6 +24069,7 @@ const DISCARD_PENDING_INTERACTION_KINDS: ReadonlySet<PendingResume['kind']> = ne
   'sandbox-access',
 ]);
 const MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH = 512;
+const DISCARDED_ERROR_CODE = 'harness.pending_interaction_discarded';
 
 /** The exact pending generation a discard is fenced to. */
 interface DiscardGeneration {
@@ -24070,6 +24167,12 @@ function discardClaimReceipt(record: SessionRecord, pending: PendingResume): Inb
     receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
   );
 }
+
+/**
+ * What `_expirePendingInteraction` did: recorded an expiry, finished a
+ * discard-owned generation as its discard (no expiry evidence), or nothing.
+ */
+type PendingExpiryOutcome = 'expired' | 'discarded' | 'none';
 
 function discardReceiptResult(
   status: 'discarded' | 'already_resolved',
