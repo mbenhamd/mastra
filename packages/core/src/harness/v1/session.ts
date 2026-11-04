@@ -23481,7 +23481,9 @@ export class Session {
           needsRetry = true;
           continue;
         }
-        await this._reconcileDelegatedTask(task.taskId, childId, interrupted.outcome, interrupted.result);
+        await this._reconcileDelegatedTask(task.taskId, childId, interrupted.outcome, interrupted.result, {
+          childCancelRequest: child.getRecord().cancelRequest,
+        });
         continue;
       }
       // §9 — restore the SubagentDefinition overrides on the reattached child. The
