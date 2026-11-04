@@ -11658,6 +11658,8 @@ export class Session {
     pending: PendingResume,
     full: FullOutput<unknown>,
     options: { modeId?: string; modelId?: string },
+    deletedTurnWaiter: Promise<never>,
+    turnAbortSignal: AbortSignal | undefined,
   ): Promise<void> {
     // Probe durable state even when no finalizer is registered on this session
     // instance — a reopened session must still observe a bound admission and
@@ -11665,6 +11667,14 @@ export class Session {
     // unsettled (or dead) grant.
     const admission = await this._probeResumeAdmissionByRun(pending);
     if (!admission) return;
+    // PF-7631: a resumed wake turn's terminal commit is a wake terminal commit:
+    // the same bounded re-drive with an `error` event per failed attempt. If it
+    // still fails, the resume rejects and the parked interaction stays, so a
+    // retry of the response or stale-resume recovery settles it later.
+    if (isHarnessWakeReservedKey(admission.admissionId)) {
+      await this._commitWakeTerminalWithRetry(admission, full, options, deletedTurnWaiter, turnAbortSignal);
+      return;
+    }
     await this._commitTerminalHandoff(admission, full, options);
   }
 
@@ -12418,16 +12428,16 @@ export class Session {
   private async _commitWakeTerminalWithRetry(
     identity: HarnessTerminalIdentity,
     outcome: FullOutput<unknown> | RejectedTerminalRun,
-    options: { modeId: string; modelId: string },
+    options: { modeId?: string; modelId?: string },
     activeDeleted: Promise<never>,
-    turnAbortSignal: AbortSignal,
+    turnAbortSignal: AbortSignal | undefined,
   ): Promise<void> {
     for (let attempt = 1; ; attempt += 1) {
       try {
         await Promise.race([this._commitTerminalHandoff(identity, outcome, options), activeDeleted]);
         return;
       } catch (error) {
-        if (this._state !== 'live' || turnAbortSignal.aborted) throw error;
+        if (this._state !== 'live' || turnAbortSignal?.aborted) throw error;
         this._emitTurnEvent({
           type: 'error',
           runId: identity.runId,
@@ -15431,6 +15441,16 @@ export class Session {
             // failed terminal; anything else stays pending for recovery.
             if (wakeTerminal !== undefined && !agentEndEmitted) {
               if (this._isRejectedTerminalRun(dispatched.runId, err, turnAbortSignal)) {
+                // A wake run has no caller to reject: surface the run's own
+                // failure first. If the commit below never lands, recovery
+                // settles the admission as interrupted, so this event is the
+                // only record of what the run failed with.
+                this._emitTurnEvent({
+                  type: 'error',
+                  runId: dispatched.runId,
+                  signalId: wakeTerminal.signalId,
+                  error: projectHarnessPublicError(err),
+                });
                 // The same bounded re-drive as a completed wake. If it does
                 // not land, the admission is released to dispatch recovery
                 // below (finishOwnedReminderTurn), never left 'finished'.
@@ -19017,6 +19037,7 @@ export class Session {
         resumeModeId,
         resumeModelId: resumeRuntimeDependencies.modelId,
         deletedTurnWaiter: activeTurnWaiter.promise,
+        turnAbortSignal: turnAbortController.signal,
       });
     } catch (err) {
       if (err instanceof QueuePostRunFinalizationPendingError && completingQueuedItemId !== undefined) {
@@ -19069,6 +19090,8 @@ export class Session {
       resumeModeId: string;
       resumeModelId?: string;
       deletedTurnWaiter: Promise<never>;
+      /** The resumed turn's abort signal; recovery paths have none. */
+      turnAbortSignal?: AbortSignal;
     },
   ): Promise<void> {
     const {
@@ -19080,6 +19103,7 @@ export class Session {
       resumeModeId,
       resumeModelId,
       deletedTurnWaiter,
+      turnAbortSignal,
     } = options;
     const suspendedPayload =
       full.finishReason === 'suspended'
@@ -19213,10 +19237,13 @@ export class Session {
     // pending and recoverable only while a retry of the same responseId can
     // still reach this settlement.
     if (full.finishReason !== 'suspended') {
-      await this._settleResumedTerminalHandoff(pending, full, {
-        modeId: resumeModeId,
-        modelId: resumeModelId,
-      });
+      await this._settleResumedTerminalHandoff(
+        pending,
+        full,
+        { modeId: resumeModeId, modelId: resumeModelId },
+        deletedTurnWaiter,
+        turnAbortSignal,
+      );
     }
     const queueCompletedAt = Date.now();
     const responseAppliedAt = queueCompletedAt;
