@@ -626,11 +626,15 @@ function createHarnessEmptySynthesisOptions(
             };
           };
           if (subagentBudget === undefined) return ordinary;
+          // The single predicate for Harness-reserved recovery steps; any new
+          // reserved step kind is added here.
+          const inRecoveryStep = () => responseOnly;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
             // A budget stop is terminal: no later or replayed iteration, and no
             // response-only recovery armed on the stopping step, reopens it.
             if (subagentBudget.exhausted !== undefined) return { continue: false };
-            if (responseOnly) return ordinary(context);
+            // A Harness-reserved recovery step is neither metered nor a stop.
+            if (inRecoveryStep()) return ordinary(context);
             const budgetReached = subagentBudget.observe(context, budgetSegment);
             if (!budgetReached) return ordinary(context);
             // At the budget, configured observers still see the iteration, but
@@ -650,12 +654,17 @@ function createHarnessEmptySynthesisOptions(
             // budget. A continuation, feedback (which a durable loop can turn
             // into another provider call), the empty-reply recovery, or the
             // Harness step ceiling cutting off a model that wanted to continue
-            // all mean the child was stopped by its budget.
+            // all mean the child was stopped by its budget. A step that reports
+            // the child's outcome at the ceiling is a real completion.
+            const reportedOutcome =
+              context.isFinal &&
+              context.toolResults.some(toolResult => toolResult.name === HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID);
             const reopened =
-              !context.isFinal ||
-              result?.continue === true ||
-              (result !== undefined && 'feedback' in result && result.feedback !== undefined) ||
-              ordinaryBudgetExhausted;
+              !reportedOutcome &&
+              (!context.isFinal ||
+                result?.continue === true ||
+                (result !== undefined && 'feedback' in result && result.feedback !== undefined) ||
+                (ordinaryBudgetExhausted && context.finishReason === 'tool-calls'));
             if (reopened) subagentBudget.exhaust();
             return { continue: false };
           };

@@ -14,7 +14,6 @@ import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/_
 import { mergeAgentExecutionOptions } from '../../agent/merge-execution-options';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
-import { askUser } from '../../tools/builtin';
 
 import { setupHarness } from './__test-utils__';
 
@@ -527,10 +526,29 @@ describe('Harness v1 — subagent budgets across resumed segments', () => {
 });
 
 describe('Harness v1 — subagent budget across a pre-registered question and a restart', () => {
-  it('keeps the spent budget when a question suspends the child across a restart', async () => {
+  it('keeps the spent budget when a pre-registered question suspends the child across a restart', async () => {
     const storage = new InMemoryStore();
+    const registrations: string[] = [];
     function questionChild() {
       let modelCalls = 0;
+      // Pre-registers its question through the Harness slot during the tool
+      // call, as durable question tools do, then suspends for the answer.
+      const askYear = createTool({
+        id: 'ask_user',
+        description: 'ask the user',
+        inputSchema: z.object({ question: z.string() }),
+        execute: async ({ question }, context) => {
+          if (context?.agent?.resumeData !== undefined) return { answer: context.agent.resumeData };
+          const slot = context?.requestContext?.get('harness') as
+            | { registerQuestion?: (params: Record<string, unknown>) => Promise<void> }
+            | undefined;
+          const toolCallId = context?.agent?.toolCallId ?? 'question';
+          await slot?.registerQuestion?.({ questionId: toolCallId, question, toolCallId });
+          registrations.push(toolCallId);
+          await context?.agent?.suspend?.({ question });
+          return undefined;
+        },
+      });
       const searchPapers = createTool({
         id: 'searchPapers',
         description: 'search',
@@ -541,7 +559,7 @@ describe('Harness v1 — subagent budget across a pre-registered question and a 
         id: 'child-agent',
         name: 'child-agent',
         instructions: 'Search, then ask.',
-        tools: { searchPapers, ask_user: askUser },
+        tools: { searchPapers, ask_user: askYear },
         model: new MockLanguageModelV2({
           doStream: async () => {
             modelCalls++;
@@ -582,6 +600,7 @@ describe('Harness v1 — subagent budget across a pre-registered question and a 
         'suspended',
       );
       expect(first.modelCalls()).toBe(2);
+      expect(registrations).toEqual(['question-2']);
       expect(child.getRecord().pendingResume).toMatchObject({ kind: 'question', subagentBudgetSpent: { steps: 1 } });
       const threadId = child.threadId;
       await first.harness.shutdown();
@@ -630,6 +649,25 @@ describe('Harness v1 — subagent budget stop is terminal', () => {
       expect(await hook(finalStep)).toEqual({ continue: false });
       expect(await hook(finalStep)).toEqual({ continue: false });
       expect(session._internalSubagentBudgetExhaustion()).toEqual({ budget: 'steps', limit: 2, used: 2 });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('does not mark a child that reports its outcome at the Harness step ceiling as stopped', async () => {
+    const { hook, session, harness } = await budgetedIterationHook(1000);
+    try {
+      for (let iteration = 1; iteration < 1000; iteration++) {
+        await hook({ iteration, text: '', toolResults: [toolResult], isFinal: false, finishReason: 'tool-calls' });
+      }
+      await hook({
+        iteration: 1000,
+        text: '',
+        toolResults: [{ id: 'report', name: 'report_subagent_outcome', result: { kind: 'subagent-outcome-report' } }],
+        isFinal: true,
+        finishReason: 'tool-calls',
+      });
+      expect(session._internalSubagentBudgetExhaustion()).toBeUndefined();
     } finally {
       await harness.shutdown();
     }
