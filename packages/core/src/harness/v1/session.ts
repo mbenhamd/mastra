@@ -90,6 +90,8 @@ import {
   HarnessTerminalHandoffValidationError,
   HarnessTerminalFinalizationPendingError,
   assertJsonValue as assertBoundedTerminalJsonValue,
+  harnessWakeExecutionGrant,
+  isHarnessWakeReservedKey,
   validateHarnessTerminalExecutionGrant,
 } from '../../storage/domains/harness';
 import type {
@@ -112,6 +114,7 @@ import type {
   HarnessTerminalFinalizer,
   HarnessTerminalIdentity,
   HarnessTerminalIntent,
+  HarnessWakeTerminalPayload,
   HarnessTerminalProjection,
   HarnessTerminalResult,
   HarnessStorageAttachmentUnavailableError,
@@ -1387,6 +1390,63 @@ function buildJudgeContinuation(opts: { turn: number; max: number; objective: st
  * outcome only; the durable result stays behind `plan_task_check`, the bounded
  * read the model already uses for delegated work.
  */
+/**
+ * PF-7631: the bounded seed a settlement wake turn is admitted with. It names
+ * the notice and the settlement the wake delivers; the finalizer receives it
+ * and the wake payload envelope is built from it.
+ */
+interface HarnessWakeTerminalSeed {
+  [key: string]: JsonValue;
+  origin: 'wake';
+  wakeNoticeId: string;
+  taskId: string;
+  subagentSessionId: string;
+  outcome: HarnessWakeTerminalPayload['outcome'];
+}
+
+function readHarnessWakeTerminalSeed(seed: JsonValue): HarnessWakeTerminalSeed {
+  const value = seed as Partial<Record<keyof HarnessWakeTerminalSeed, unknown>> | null;
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    value.origin !== 'wake' ||
+    typeof value.wakeNoticeId !== 'string' ||
+    typeof value.taskId !== 'string' ||
+    typeof value.subagentSessionId !== 'string' ||
+    (value.outcome !== 'completed' && value.outcome !== 'blocked' && value.outcome !== 'failed')
+  ) {
+    throw new HarnessTerminalHandoffValidationError('seed', 'is not a settlement wake seed');
+  }
+  return value as HarnessWakeTerminalSeed;
+}
+
+/**
+ * PF-7631: a wake finalizer registration commits the wake identity around the
+ * registered finalizer's own payload (`HarnessWakeTerminalPayload`), on the
+ * live commit and on every recovery commit alike.
+ */
+function wakeTerminalFinalizer(finalizer: HarnessTerminalFinalizer): HarnessTerminalFinalizer {
+  return {
+    id: finalizer.id,
+    version: finalizer.version,
+    async finalize(input) {
+      const seed = readHarnessWakeTerminalSeed(input.seed);
+      const projection = await finalizer.finalize(input);
+      const payload: HarnessWakeTerminalPayload = {
+        origin: 'wake',
+        wakeNoticeId: seed.wakeNoticeId,
+        runId: input.identity.runId,
+        taskId: seed.taskId,
+        subagentSessionId: seed.subagentSessionId,
+        outcome: seed.outcome,
+        reply: projection.payload,
+      };
+      return { projectionKind: projection.projectionKind, projectionId: projection.projectionId, payload };
+    },
+  };
+}
+
 function delegationSettlementNoticeText(notice: { taskId: string; outcome: string }): string {
   return `Delegated plan task ${JSON.stringify(notice.taskId)} settled with outcome "${notice.outcome}". Call ${TASK_CHECK_TOOL_ID} with rootTaskId ${JSON.stringify(notice.taskId)} to read its result before continuing that work.`;
 }
@@ -1673,6 +1733,12 @@ export interface SessionInternals {
    * admit new turns (`sessions.terminalHandoff.settleOnly`).
    */
   terminalSettleOnlyFinalizers?: readonly HarnessTerminalFinalizer[];
+  /**
+   * PF-7631: admits and settles settlement wake turns
+   * (`sessions.terminalHandoff.wakeFinalizer`). Registrations under its id,
+   * including settle-only versions, commit a `HarnessWakeTerminalPayload`.
+   */
+  terminalWakeFinalizer?: HarnessTerminalFinalizer;
 }
 
 /** Lookup key for a terminal finalizer registration by its id and version. */
@@ -2161,6 +2227,13 @@ export class Session {
    * primary.
    */
   private readonly _terminalFinalizersByIdentity = new Map<string, HarnessTerminalFinalizer>();
+  /** PF-7631: the wrapped wake finalizer settlement wake turns admit under. */
+  private readonly _terminalWakeFinalizer?: HarnessTerminalFinalizer;
+  /**
+   * PF-7631: admission ids of settlement wake turns between their pending
+   * reservation and dispatch, so recovery never interrupts one in flight here.
+   */
+  private readonly _wakeTerminalAdmissionsInFlight = new Set<string>();
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   /** Pending native completions whose usage has joined the durable session counter. */
   private readonly _terminalTokenAccountedRunIds = new Set<string>();
@@ -2336,6 +2409,44 @@ export class Session {
         );
       }
       this._terminalFinalizersByIdentity.set(key, settleOnly);
+    }
+    const wakeFinalizer = internals.terminalWakeFinalizer;
+    if (wakeFinalizer !== undefined) {
+      if (this._terminalFinalizer === undefined) {
+        throw new HarnessTerminalHandoffValidationError(
+          'terminalHandoff.wakeFinalizer',
+          'requires a primary terminalHandoff.finalizer',
+        );
+      }
+      if (
+        typeof wakeFinalizer?.id !== 'string' ||
+        wakeFinalizer.id.length === 0 ||
+        wakeFinalizer.id === this._terminalFinalizer.id ||
+        typeof wakeFinalizer.version !== 'string' ||
+        wakeFinalizer.version.length === 0 ||
+        typeof wakeFinalizer.finalize !== 'function'
+      ) {
+        throw new HarnessTerminalHandoffValidationError(
+          'terminalHandoff.wakeFinalizer',
+          'id (distinct from the primary finalizer id), version, and a finalize callback are required',
+        );
+      }
+      const key = terminalFinalizerKey(wakeFinalizer.id, wakeFinalizer.version);
+      if (this._terminalFinalizersByIdentity.has(key)) {
+        throw new HarnessTerminalHandoffValidationError(
+          'terminalHandoff.wakeFinalizer',
+          `terminal finalizer ${wakeFinalizer.id}@${wakeFinalizer.version} is registered more than once`,
+        );
+      }
+      // Every registration under the wake id, including settle-only versions
+      // that drain earlier wake turns, commits the wake payload envelope.
+      for (const [registeredKey, registered] of this._terminalFinalizersByIdentity) {
+        if (registered.id === wakeFinalizer.id) {
+          this._terminalFinalizersByIdentity.set(registeredKey, wakeTerminalFinalizer(registered));
+        }
+      }
+      this._terminalWakeFinalizer = wakeTerminalFinalizer(wakeFinalizer);
+      this._terminalFinalizersByIdentity.set(key, this._terminalWakeFinalizer);
     }
     this._emitter = new EventEmitter(
       { sessionId: this.id },
@@ -4251,7 +4362,11 @@ export class Session {
     // A suspension parked for resume is waiting on a response, not orphaned.
     if (this._record.pendingResume?.runId === runId) return 'active';
     // A run in flight here is live (or settling) in this process.
-    if (this._messageAdmissionStarts.has(evidence.admissionId) || this._runCompletionPromises.has(runId)) {
+    if (
+      this._messageAdmissionStarts.has(evidence.admissionId) ||
+      this._wakeTerminalAdmissionsInFlight.has(evidence.admissionId) ||
+      this._runCompletionPromises.has(runId)
+    ) {
       return 'active';
     }
     let agent: Agent | undefined;
@@ -9444,6 +9559,17 @@ export class Session {
     if (opts.admissionId !== undefined && opts.admissionId.length === 0) {
       throw new HarnessValidationError('message().admissionId', 'admissionId must be a non-empty string');
     }
+    // PF-7631: the wake namespace is minted only by the Harness, one grant per
+    // settlement wake turn; a caller can neither claim nor shadow it.
+    if (opts.admissionId !== undefined && isHarnessWakeReservedKey(opts.admissionId)) {
+      throw new HarnessValidationError('message().admissionId', 'admissionId uses the Harness-reserved wake namespace');
+    }
+    if (opts.executionAuthorityGrant !== undefined && isHarnessWakeReservedKey(opts.executionAuthorityGrant.key)) {
+      throw new HarnessTerminalHandoffValidationError(
+        'message().executionAuthorityGrant.key',
+        'uses the Harness-reserved wake namespace',
+      );
+    }
 
     // §3 / §4.4a: the sync structured-output form is the one fail-fast signal
     // form — it needs a clean turn boundary, so refuse on a busy session rather
@@ -12091,6 +12217,106 @@ export class Session {
     };
   }
 
+  /**
+   * PF-7631: admit a settlement wake turn under its Harness-minted grant
+   * (`harness-wake:<wakeNoticeId>`, generation 1) before it dispatches, through
+   * the same three durable steps an admitted message() terminal turn takes:
+   * the pending result reservation (lease-fenced), the terminal admission
+   * under the wake finalizer (grant lock, tombstones, winner check), and the
+   * dispatch claim stamp. Its staged output and settlement then follow the
+   * message() terminal path, and dispatch recovery settles it after a crash.
+   * Any refusal throws before dispatch, so no run starts under the grant.
+   */
+  private async _admitWakeTerminalTurn(input: {
+    wakeNoticeId: string;
+    signalId: string;
+    settlement: Pick<PendingDelegationSettlementNotice, 'taskId' | 'subagentSessionId' | 'outcome'>;
+    modeId: string;
+    modelId: string;
+  }): Promise<HarnessTerminalIdentity> {
+    const finalizer = this._terminalWakeFinalizer!;
+    const sessionIncarnation = this._record.sessionIncarnation;
+    if (sessionIncarnation === undefined || sessionIncarnation.length === 0) {
+      throw new HarnessTerminalHandoffFencedError(this.id);
+    }
+    const executionGrant = harnessWakeExecutionGrant(input.wakeNoticeId);
+    const seed: HarnessWakeTerminalSeed = {
+      origin: 'wake',
+      wakeNoticeId: input.wakeNoticeId,
+      taskId: input.settlement.taskId,
+      subagentSessionId: input.settlement.subagentSessionId,
+      outcome: input.settlement.outcome,
+    };
+    const digest = sha256CanonicalJson({
+      kind: 'wake-admission',
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      wakeNoticeId: input.wakeNoticeId,
+    });
+    const identity: HarnessTerminalIdentity = {
+      harnessName: this._record.harnessName,
+      sessionId: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      sessionIncarnation,
+      // The admission id is the grant key: both live in the reserved namespace.
+      admissionId: executionGrant.key,
+      admissionHash: sha256CanonicalJson({ kind: 'wake-admission-hash', seed }),
+      signalId: input.signalId,
+      runId: `harness-wake-${digest.slice(0, 32)}`,
+      executionGrant,
+    };
+    validateHarnessTerminalExecutionGrant(executionGrant, 'wake.executionGrant');
+    this._wakeTerminalAdmissionsInFlight.add(identity.admissionId);
+    try {
+      const reservation = await this._writeMessageResultEvidence(
+        {
+          status: 'pending',
+          signalId: identity.signalId,
+          runId: identity.runId,
+          modeId: input.modeId,
+          modelId: input.modelId,
+          operationKind: 'message',
+          admissionId: identity.admissionId,
+          admissionHash: identity.admissionHash,
+        },
+        { leaseOwner: { ownerId: this._harness.ownerId } },
+      );
+      // An existing reservation means another attempt owns this notice's wake.
+      if (!reservation.created) throw new HarnessBusyError(this.id, 'in_flight');
+      await this._admitTerminalHandoff(identity, seed, undefined, finalizer);
+      const stamped = await this._storage.compareAndSwapSignalDispatch({
+        harnessName: this._record.harnessName,
+        sessionId: this.id,
+        resourceId: this.resourceId,
+        threadId: this.threadId,
+        signalId: identity.signalId,
+        admissionId: identity.admissionId,
+        admissionHash: identity.admissionHash,
+        operationKind: 'message',
+        expected: { state: 'reserved' },
+        next: {
+          state: 'dispatching',
+          attemptId: `wake-dispatch-${randomUUID()}`,
+          claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
+          delivery: 'idle',
+          runId: identity.runId,
+        },
+        leaseOwner: { ownerId: this._harness.ownerId },
+        updatedAt: Date.now(),
+      });
+      if (!stamped.applied) throw new HarnessBusyError(this.id, 'in_flight');
+      return identity;
+    } catch (error) {
+      this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+      // A reservation left behind is settled interrupted by dispatch recovery.
+      this._scheduleOrphanRecheck(Date.now());
+      throw error;
+    }
+  }
+
   /** The registration that settles a turn admitted under `id@version`, if any. */
   private _terminalFinalizerFor(id: string, version: string): HarnessTerminalFinalizer | undefined {
     return this._terminalFinalizersByIdentity.get(terminalFinalizerKey(id, version));
@@ -12100,8 +12326,8 @@ export class Session {
     identity: HarnessTerminalIdentity,
     seed: JsonValue,
     onFailure?: (error: HarnessTerminalHandoffError) => void,
+    finalizer: HarnessTerminalFinalizer | undefined = this._terminalFinalizer,
   ): Promise<void> {
-    const finalizer = this._terminalFinalizer;
     if (finalizer === undefined) return;
     const reportFailure = (error: unknown): never => {
       const terminalError =
@@ -14834,6 +15060,9 @@ export class Session {
    * wakes an idle thread), and `assertAdmitted` re-proves the sender's own
    * admission after subscription setup. PF-7626: `wakeNoticeId` marks an idle
    * wake as a settlement-notice wake, published on its `agent_start`.
+   * PF-7631: with `wakeSettlement` and a registered wake finalizer, the wake
+   * turn is admitted under its Harness-minted grant and commits a terminal
+   * intent (`_admitWakeTerminalTurn`).
    */
   private async _injectSystemReminder(
     content: string,
@@ -14842,6 +15071,7 @@ export class Session {
       signalId?: string;
       admissionEpoch?: number;
       wakeNoticeId?: string;
+      wakeSettlement?: Pick<PendingDelegationSettlementNotice, 'taskId' | 'subagentSessionId' | 'outcome'>;
       requireActiveRun?: boolean;
       assertAdmitted?: () => void;
     },
@@ -14895,7 +15125,10 @@ export class Session {
       const turnAbortSignal = turnAbortController.signal;
       const activeTurnWaiter = this._createActiveTurnWaiter();
       void activeTurnWaiter.promise.catch(() => {});
+      // PF-7631: the terminal identity of a settlement wake turn, once admitted.
+      let wakeTerminal: HarnessTerminalIdentity | undefined;
       const finishOwnedReminderTurn = () => {
+        if (wakeTerminal !== undefined) this._wakeTerminalAdmissionsInFlight.delete(wakeTerminal.admissionId);
         activeTurnWaiter.cleanup();
         this._endTurn(turnAbortController);
       };
@@ -14932,6 +15165,24 @@ export class Session {
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
+        if (
+          internal?.wakeNoticeId !== undefined &&
+          internal.wakeSettlement !== undefined &&
+          signalId !== undefined &&
+          this._terminalWakeFinalizer !== undefined
+        ) {
+          wakeTerminal = await Promise.race([
+            this._admitWakeTerminalTurn({
+              wakeNoticeId: internal.wakeNoticeId,
+              signalId,
+              settlement: internal.wakeSettlement,
+              modeId: effectiveModeId,
+              modelId: this._record.modelId,
+            }),
+            activeTurnWaiter.promise,
+          ]);
+          assertOwnedReminderTurnNotDeleted();
+        }
 
         dispatched = agent.sendSignal(
           {
@@ -14944,9 +15195,21 @@ export class Session {
           {
             resourceId: this.resourceId,
             threadId: this.threadId,
+            // An admitted wake binds its grant to the run this dispatch starts:
+            // it must never fold into a run that appeared meanwhile.
+            ...(wakeTerminal !== undefined ? { runId: wakeTerminal.runId, ifActive: { behavior: 'discard' } } : {}),
             ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
           },
         );
+        if (wakeTerminal !== undefined) {
+          const accepted = await Promise.race([dispatched.accepted, activeTurnWaiter.promise]);
+          if (accepted.action !== 'wake' || accepted.runId !== wakeTerminal.runId) {
+            // Nothing runs under the grant; the pending reservation is left to
+            // dispatch recovery, which settles it interrupted.
+            this._scheduleOrphanRecheck(Date.now());
+            throw new HarnessBusyError(this.id, 'in_flight');
+          }
+        }
       } catch (err) {
         finishOwnedReminderTurn();
         throw err;
@@ -14962,10 +15225,15 @@ export class Session {
       const result = this._trackBackgroundTurnCompletion(
         completionOrDelete
           .then(async full => {
+            // A wake terminal turn accounts usage under the terminal fences, as
+            // an admitted message turn does, so a recovery commit of its
+            // staged output never counts it twice.
             const tokenUsageDelta =
               full.finishReason === 'suspended'
                 ? this._tokenUsageDeltaFromFullOutput(full)
-                : this._recordTurnCompletion(full, { persist: false });
+                : wakeTerminal !== undefined
+                  ? this._recordMessageTurnCompletion(full, { persist: false }).tokenUsageDelta
+                  : this._recordTurnCompletion(full, { persist: false });
             await Promise.race([
               this._maybeCaptureSuspend(full, undefined, effectiveModeId, this._record.modelId, {
                 tokenUsageDelta: full.finishReason === 'suspended' ? tokenUsageDelta : undefined,
@@ -14984,11 +15252,37 @@ export class Session {
                 activeTurnWaiter.promise,
               ]);
             }
+            // PF-7631: commit the wake turn's terminal intent before agent_end,
+            // as a message() terminal turn does. A failed commit leaves the
+            // staged output pending for dispatch recovery.
+            if (wakeTerminal !== undefined) {
+              await Promise.race([
+                this._commitTerminalHandoff(wakeTerminal, full, {
+                  modeId: effectiveModeId,
+                  modelId: this._record.modelId,
+                }),
+                activeTurnWaiter.promise,
+              ]);
+            }
             this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
             agentEndEmitted = true;
             await Promise.race([this._runGoalJudge(full, false), activeTurnWaiter.promise]);
           })
-          .catch(err => {
+          .catch(async err => {
+            // PF-7631: a wake run whose own output rejected commits a durable
+            // failed terminal; anything else stays pending for recovery.
+            if (wakeTerminal !== undefined && !agentEndEmitted) {
+              if (this._isRejectedTerminalRun(dispatched.runId, err, turnAbortSignal)) {
+                await this._settleRejectedTerminalRun(
+                  wakeTerminal,
+                  err,
+                  { modeId: effectiveModeId, modelId: this._record.modelId },
+                  activeTurnWaiter.promise,
+                );
+              } else {
+                this._scheduleOrphanRecheck(Date.now());
+              }
+            }
             if (!agentEndEmitted) {
               this._emitTurnEvent({
                 type: 'agent_end',
@@ -24101,7 +24395,16 @@ export class Session {
         await this._injectSystemReminder(
           content,
           { attributes, metadata },
-          { signalId, admissionEpoch, wakeNoticeId: signalId },
+          {
+            signalId,
+            admissionEpoch,
+            wakeNoticeId: signalId,
+            wakeSettlement: {
+              taskId: notice.taskId,
+              subagentSessionId: notice.subagentSessionId,
+              outcome: notice.outcome,
+            },
+          },
         );
       }
     } catch {

@@ -78,6 +78,7 @@ import {
   contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
   canonicalJson,
+  normalizeHarnessTerminalClaimFinalizerIds,
   prepareHarnessTerminalAdmission,
   prepareHarnessTerminalProjection,
   terminalClaimId,
@@ -2370,6 +2371,7 @@ export class InMemoryHarness extends HarnessStorage {
     if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(leaseMs) || leaseMs <= 0) {
       throw new HarnessTerminalHandoffValidationError('claim', 'clock and lease must be positive safe integers');
     }
+    const finalizerIds = normalizeHarnessTerminalClaimFinalizerIds(input.finalizerIds);
     const claimed: HarnessTerminalIntent[] = [];
     // Claim order is wall-clock creation first: `revision` is only scoped to
     // (harness, session, incarnation), so sorting by it globally would let a
@@ -2377,7 +2379,10 @@ export class InMemoryHarness extends HarnessStorage {
     // per-session ordering guarantee itself is enforced separately by
     // `hasEarlierUnsettledTerminalIntent`.
     const candidates = [...this.db.harnessTerminalIntents.values()]
-      .filter(intent => intent.harnessName === namespace)
+      .filter(
+        intent =>
+          intent.harnessName === namespace && (finalizerIds === undefined || finalizerIds.includes(intent.finalizerId)),
+      )
       .sort((a, b) => a.createdAt - b.createdAt || a.revision - b.revision || a.id.localeCompare(b.id));
     for (const current of candidates) {
       if (claimed.length >= input.limit) break;
@@ -2653,10 +2658,13 @@ export class InMemoryHarness extends HarnessStorage {
   private hasEarlierUnsettledTerminalIntent(candidate: HarnessTerminalIntent): boolean {
     for (const intent of this.db.harnessTerminalIntents.values()) {
       if (intent.id === candidate.id) continue;
+      // Ordering is per finalizer id: one kind's unsettled intent never holds
+      // another kind's delivery (PF-7631).
       if (
         intent.harnessName !== candidate.harnessName ||
         intent.sessionId !== candidate.sessionId ||
-        intent.sessionIncarnation !== candidate.sessionIncarnation
+        intent.sessionIncarnation !== candidate.sessionIncarnation ||
+        intent.finalizerId !== candidate.finalizerId
       )
         continue;
       if (intent.revision < candidate.revision && !['acked', 'dead', 'fenced'].includes(intent.status)) return true;

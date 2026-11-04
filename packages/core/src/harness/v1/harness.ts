@@ -1048,6 +1048,7 @@ export class Harness {
   private readonly _onBeforeToolExecution: NonNullable<HarnessConfig['sessions']>['onBeforeToolExecution'];
   private readonly _terminalFinalizer?: import('../../storage/domains/harness').HarnessTerminalFinalizer;
   private readonly _terminalSettleOnlyFinalizers?: readonly import('../../storage/domains/harness').HarnessTerminalFinalizer[];
+  private readonly _terminalWakeFinalizer?: import('../../storage/domains/harness').HarnessTerminalFinalizer;
   private readonly _closeTimeoutMs: number;
   private readonly _pendingInteractionTtlMs: number;
   /** Validated per-kind TTL overrides; kinds absent here use the default. */
@@ -1193,6 +1194,26 @@ export class Harness {
           );
         }
         registered.add(key);
+      }
+      // PF-7631: settlement wake turns admit under their own finalizer, whose
+      // id partitions claim order and consumer filters from message turns.
+      const wakeFinalizer = terminalHandoff.wakeFinalizer;
+      if (wakeFinalizer !== undefined) {
+        assertTerminalFinalizerRegistration(wakeFinalizer, 'sessions.terminalHandoff.wakeFinalizer');
+        if (wakeFinalizer.id === finalizer.id) {
+          throw new HarnessConfigError(
+            'sessions.terminalHandoff.wakeFinalizer',
+            'must use a finalizer id other than sessions.terminalHandoff.finalizer',
+          );
+        }
+        const key = terminalFinalizerKey(wakeFinalizer.id, wakeFinalizer.version);
+        if (registered.has(key)) {
+          throw new HarnessConfigError(
+            'sessions.terminalHandoff.wakeFinalizer',
+            `registers terminal finalizer ${wakeFinalizer.id}@${wakeFinalizer.version} more than once`,
+          );
+        }
+        this._terminalWakeFinalizer = wakeFinalizer;
       }
       this._terminalFinalizer = finalizer;
       this._terminalSettleOnlyFinalizers = settleOnly === undefined ? undefined : [...settleOnly];
@@ -4739,6 +4760,7 @@ export class Harness {
       persistTransientStreamingEvents: this._persistTransientStreamingEvents,
       terminalFinalizer: this._terminalFinalizer,
       terminalSettleOnlyFinalizers: this._terminalSettleOnlyFinalizers,
+      terminalWakeFinalizer: this._terminalWakeFinalizer,
     });
     if (workspaceLost) session._markWorkspaceLost();
 
@@ -5116,6 +5138,7 @@ export class Harness {
         persistTransientStreamingEvents: this._persistTransientStreamingEvents,
         terminalFinalizer: this._terminalFinalizer,
         terminalSettleOnlyFinalizers: this._terminalSettleOnlyFinalizers,
+        terminalWakeFinalizer: this._terminalWakeFinalizer,
       });
       bridge = transientSession._subscribeInternal(event => this._emitter.forward(event));
       await transientSession._internalExpirePendingInteractionGeneration(generation, { drainQueue: false });

@@ -1165,6 +1165,18 @@ export interface HarnessConfigCommon {
        * `countUndeliveredTerminalIntents` both report zero for it.
        */
       settleOnly?: readonly HarnessTerminalFinalizer[];
+      /**
+       * Opt-in finalizer for settlement wake turns (PF-7631). With it, a turn
+       * the Harness starts to deliver a delegated-task settlement notice
+       * (`subagents.onDelegatedSettlement: 'wake'`) is admitted under a
+       * Harness-minted grant (`harness-wake:<wakeNoticeId>`, generation 1) and
+       * commits a terminal intent under this finalizer, so its reply survives
+       * a crash between the run's end and the consumer's write. Its id must
+       * differ from `finalizer.id`: consumers claim each kind by finalizer id.
+       * The committed payload is a `HarnessWakeTerminalPayload` wrapping this
+       * finalizer's payload. Earlier versions settle through `settleOnly`.
+       */
+      wakeFinalizer?: HarnessTerminalFinalizer;
     };
 
     /**

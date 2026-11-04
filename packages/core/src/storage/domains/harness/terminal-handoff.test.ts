@@ -1556,6 +1556,107 @@ describe('native chat terminal handoff', () => {
     expect(enabled.supportsTerminalHandoff).toBe(true);
   });
 
+  // PF-7631: a wake turn's intent (its own finalizer id) and a message turn's
+  // intent in one session are claimed and acked independently. Neither kind's
+  // unsettled intent holds the other kind's delivery.
+  it('claims and acks two finalizer kinds in one session independently', async () => {
+    const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
+    await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
+    const commit = async (input: HarnessTerminalAdmissionInput, at: number) => {
+      await storage.writeMessageResultEvidence(pendingEvidence(input));
+      await storage.admitTerminalHandoff(input);
+      return storage.commitTerminalHandoff({
+        admission: input,
+        resultEvidence: { ...pendingEvidence(input), status: 'completed', result: { text: 'done' }, updatedAt: at },
+        terminalResult: { status: 'completed', runId: input.runId, completedAt: at },
+        projection: { projectionKind: 'chat.summary', projectionId: input.admissionId, payload: { text: 'done' } },
+      });
+    };
+    const message = admission();
+    const wake: HarnessTerminalAdmissionInput = {
+      ...admission(),
+      admissionId: 'harness-wake:notice-1',
+      admissionHash: 'wake-hash-1',
+      signalId: 'notice-1',
+      runId: 'wake-run-1',
+      executionGrant: { key: 'harness-wake:notice-1', generation: 1 },
+      finalizerId: 'doxa.chat-wake',
+      seed: { origin: 'wake', wakeNoticeId: 'notice-1' },
+    };
+    const laterMessage: HarnessTerminalAdmissionInput = {
+      ...admission(),
+      admissionId: 'admission-2',
+      admissionHash: 'admission-hash-2',
+      signalId: 'signal-2',
+      runId: 'run-2',
+      executionGrant: { key: 'grant-2', generation: 1 },
+    };
+    // Session order: message (rev 1), wake (rev 2), message (rev 3).
+    await commit(message, 3_000);
+    await commit(wake, 3_100);
+    await commit(laterMessage, 3_200);
+    const ackOf = (intent: HarnessTerminalIntent, consumerId: string, now: number) =>
+      storage.ackTerminalIntent({
+        harnessName: intent.harnessName,
+        intentId: intent.id,
+        sessionId: intent.sessionId,
+        sessionIncarnation: intent.sessionIncarnation,
+        revision: intent.revision,
+        payloadHash: intent.projection.payloadHash,
+        claimId: intent.claimId!,
+        consumerId,
+        now,
+      });
+
+    // The wake consumer gets the wake intent although the earlier message
+    // intent is still pending.
+    const wakeClaim = await storage.claimTerminalIntents({
+      harnessName: 'default',
+      consumerId: 'wake-worker',
+      limit: 10,
+      now: 4_000,
+      finalizerIds: ['doxa.chat-wake'],
+    });
+    expect(wakeClaim.intents.map(intent => intent.admissionId)).toEqual(['harness-wake:notice-1']);
+
+    // The message consumer gets only message intents, in session order: the
+    // first one now, and the later one is not held by the still-claimed wake.
+    const first = await storage.claimTerminalIntents({
+      harnessName: 'default',
+      consumerId: 'message-worker',
+      limit: 10,
+      now: 4_000,
+      finalizerIds: ['doxa.chat'],
+    });
+    expect(first.intents.map(intent => intent.admissionId)).toEqual(['admission-1']);
+    await expect(ackOf(first.intents[0]!, 'message-worker', 4_100)).resolves.toMatchObject({ status: 'acked' });
+    const second = await storage.claimTerminalIntents({
+      harnessName: 'default',
+      consumerId: 'message-worker',
+      limit: 10,
+      now: 4_200,
+      finalizerIds: ['doxa.chat'],
+    });
+    expect(second.intents.map(intent => intent.admissionId)).toEqual(['admission-2']);
+    await expect(ackOf(second.intents[0]!, 'message-worker', 4_300)).resolves.toMatchObject({ status: 'acked' });
+
+    // The wake intent is still held by its own claim and acks on its own.
+    await expect(ackOf(wakeClaim.intents[0]!, 'wake-worker', 4_400)).resolves.toMatchObject({ status: 'acked' });
+    await expect(storage.getTerminalQueuePressure({ harnessName: 'default' })).resolves.toEqual({
+      pendingIntents: 0,
+      pendingBytes: 0,
+    });
+    await expect(
+      storage.claimTerminalIntents({
+        harnessName: 'default',
+        consumerId: 'message-worker',
+        limit: 1,
+        now: 4_000,
+        finalizerIds: [],
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+  });
+
   it('binds claim settlement to the claiming consumer', async () => {
     const storage = new InMemoryHarness({ db: new InMemoryDB(), terminalHandoff: { enabled: true } });
     await storage.saveSession(session(), { ownerId: 'owner-1', ifVersion: 0 });
