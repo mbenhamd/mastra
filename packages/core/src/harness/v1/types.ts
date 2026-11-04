@@ -1163,6 +1163,12 @@ export interface HarnessConfigCommon {
        * registered twice (including one equal to `finalizer`) is rejected.
        * Drop an entry only once `countPendingTerminalAdmissions` and
        * `countUndeliveredTerminalIntents` both report zero for it.
+       *
+       * Keep one id across versions: intents are delivered in per-session
+       * order only within one finalizer id (PF-7631), so an entry under a
+       * renamed id is not ordered against intents under the new id. An entry
+       * whose id equals `wakeFinalizer.id` is an earlier wake version and is
+       * settled with the wake payload envelope, so it requires `wakeFinalizer`.
        */
       settleOnly?: readonly HarnessTerminalFinalizer[];
       /**

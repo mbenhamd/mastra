@@ -863,6 +863,15 @@ const HARNESS_RUN_INTERRUPTED_MESSAGE =
 /** Back-off before recovery retries a turn whose settlement did not commit. */
 const ORPHANED_DISPATCH_RETRY_MS = 1_000;
 /**
+ * PF-7631: a settlement wake turn has no caller to retry its terminal commit,
+ * so its owning turn re-drives it: at most this many attempts, backing off
+ * from the base delay, doubling, capped at the max delay. After the last one
+ * the admission is released to dispatch recovery (close or the next owner).
+ */
+const WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS = 4;
+const WAKE_TERMINAL_COMMIT_RETRY_BASE_MS = 100;
+const WAKE_TERMINAL_COMMIT_RETRY_MAX_MS = 1_000;
+/**
  * §S4.1 — max transiently-failed event-ledger appends retained for retry before
  * fail-stop. A transient `appendSessionEvent` failure no longer permanently latches
  * the durable log: the failed slot is backlogged and retried (in order) ahead of any
@@ -1445,6 +1454,24 @@ function wakeTerminalFinalizer(finalizer: HarnessTerminalFinalizer): HarnessTerm
       return { projectionKind: projection.projectionKind, projectionId: projection.projectionId, payload };
     },
   };
+}
+
+/**
+ * PF-7631: the `harness-wake:` namespace is minted only by the Harness, one
+ * grant per settlement wake turn. Every public admission boundary shares the
+ * session's admission-id space (message, queue and signal evidence), so each
+ * rejects a caller id in it before any evidence is written.
+ */
+function assertCallerAdmissionIdNotReserved(field: string, admissionId: string | undefined): void {
+  if (admissionId !== undefined && isHarnessWakeReservedKey(admissionId)) {
+    throw new HarnessValidationError(field, 'admissionId uses the Harness-reserved wake namespace');
+  }
+}
+
+function assertCallerGrantKeyNotReserved(field: string, grant: { key: string } | undefined): void {
+  if (grant !== undefined && isHarnessWakeReservedKey(grant.key)) {
+    throw new HarnessTerminalHandoffValidationError(field, 'uses the Harness-reserved wake namespace');
+  }
 }
 
 function delegationSettlementNoticeText(notice: { taskId: string; outcome: string }): string {
@@ -2234,6 +2261,14 @@ export class Session {
    * reservation and dispatch, so recovery never interrupts one in flight here.
    */
   private readonly _wakeTerminalAdmissionsInFlight = new Set<string>();
+  /**
+   * PF-7631: wake admissions this process admitted and then gave up on before
+   * their terminal commit (a Stop, delete or eviction during admission or
+   * dispatch, or an exhausted commit re-drive). No run of theirs is live here,
+   * so dispatch recovery settles them at once rather than waiting out a
+   * dispatch claim this process stamped itself.
+   */
+  private readonly _releasedWakeAdmissions = new Set<string>();
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   /** Pending native completions whose usage has joined the durable session counter. */
   private readonly _terminalTokenAccountedRunIds = new Set<string>();
@@ -4297,7 +4332,25 @@ export class Session {
       cursor = page.nextCursor;
     } while (cursor !== undefined);
     for (const evidence of orphaned) {
-      const settled = await this._interruptOrphanedMessageDispatch(evidence);
+      const wakeAdmission = evidence.admissionId !== undefined && isHarnessWakeReservedKey(evidence.admissionId);
+      let settled: boolean;
+      try {
+        settled = await this._interruptOrphanedMessageDispatch(evidence);
+      } catch (error) {
+        // PF-7631: a wake turn has no caller to report to. Its settlement
+        // failure is surfaced, and it blocks a close (typed refusal) while
+        // its admission stays durable for a retry or the next owner.
+        if (!wakeAdmission) throw error;
+        this._emitTurnEvent({
+          type: 'error',
+          ...(evidence.runId !== undefined ? { runId: evidence.runId } : {}),
+          signalId: evidence.signalId,
+          error: projectHarnessPublicError(error),
+        });
+        block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
+        continue;
+      }
+      if (settled && wakeAdmission) this._releasedWakeAdmissions.delete(evidence.admissionId!);
       const latest = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -4377,6 +4430,7 @@ export class Session {
       if (!(error instanceof HarnessConfigError)) throw error;
     }
     if (agent?.getRunOutput(runId)) return 'active';
+    if (this._releasedWakeAdmissions.has(evidence.admissionId)) return 'orphaned';
     const completed = this._completedRuns.get(runId);
     if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
@@ -9561,15 +9615,8 @@ export class Session {
     }
     // PF-7631: the wake namespace is minted only by the Harness, one grant per
     // settlement wake turn; a caller can neither claim nor shadow it.
-    if (opts.admissionId !== undefined && isHarnessWakeReservedKey(opts.admissionId)) {
-      throw new HarnessValidationError('message().admissionId', 'admissionId uses the Harness-reserved wake namespace');
-    }
-    if (opts.executionAuthorityGrant !== undefined && isHarnessWakeReservedKey(opts.executionAuthorityGrant.key)) {
-      throw new HarnessTerminalHandoffValidationError(
-        'message().executionAuthorityGrant.key',
-        'uses the Harness-reserved wake namespace',
-      );
-    }
+    assertCallerAdmissionIdNotReserved('message().admissionId', opts.admissionId);
+    assertCallerGrantKeyNotReserved('message().executionAuthorityGrant.key', opts.executionAuthorityGrant);
 
     // §3 / §4.4a: the sync structured-output form is the one fail-fast signal
     // form — it needs a clean turn boundary, so refuse on a busy session rather
@@ -10850,6 +10897,8 @@ export class Session {
     if (opts.admissionId === undefined || opts.admissionId.length === 0) {
       throw new HarnessValidationError('admitMessage().admissionId', 'admissionId must be a non-empty string');
     }
+    assertCallerAdmissionIdNotReserved('admitMessage().admissionId', opts.admissionId);
+    assertCallerGrantKeyNotReserved('admitMessage().executionAuthorityGrant.key', opts.executionAuthorityGrant);
     if (opts.output !== undefined || opts.sync !== undefined || opts.stream !== undefined) {
       throw new HarnessConfigError('admitMessage()', 'admitMessage only accepts default message options');
     }
@@ -12269,6 +12318,10 @@ export class Session {
       executionGrant,
     };
     validateHarnessTerminalExecutionGrant(executionGrant, 'wake.executionGrant');
+    // Another attempt for this notice is admitting or running here.
+    if (this._wakeTerminalAdmissionsInFlight.has(identity.admissionId)) {
+      throw new HarnessBusyError(this.id, 'in_flight');
+    }
     this._wakeTerminalAdmissionsInFlight.add(identity.admissionId);
     try {
       const reservation = await this._writeMessageResultEvidence(
@@ -12313,7 +12366,71 @@ export class Session {
       this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
       // A reservation left behind is settled interrupted by dispatch recovery.
       this._scheduleOrphanRecheck(Date.now());
+      // The notice was acknowledged before this wake, so a refusal other than
+      // a duplicate (busy) loses the wake: surface it rather than drop it. Its
+      // reminder row is persisted and still reaches the next parent turn.
+      if (!(error instanceof HarnessBusyError)) {
+        this._emitTurnEvent({
+          type: 'error',
+          runId: identity.runId,
+          signalId: identity.signalId,
+          error: projectHarnessPublicError(error),
+        });
+      }
       throw error;
+    }
+  }
+
+  /**
+   * PF-7631: hand a wake admission this process will not settle itself to
+   * dispatch recovery, which settles it (its staged output, else aborted) on
+   * the next recheck or close, or leaves it durable for the next owner.
+   */
+  private _releaseWakeTerminalAdmission(admissionId: string): void {
+    this._wakeTerminalAdmissionsInFlight.delete(admissionId);
+    this._releasedWakeAdmissions.add(admissionId);
+    this._scheduleOrphanRecheck(Date.now());
+  }
+
+  /**
+   * PF-7631: commit a wake turn's terminal intent. No caller retries a wake,
+   * so a failed attempt is surfaced as an `error` event and re-driven with
+   * bounded backoff. It stops at the attempt cap, when the commit cannot win
+   * (fenced, cancelled, identity conflict), or when the turn is torn down;
+   * the admission then stays durable and is released to dispatch recovery.
+   */
+  private async _commitWakeTerminalTurn(
+    identity: HarnessTerminalIdentity,
+    full: FullOutput<unknown>,
+    options: { modeId: string; modelId: string },
+    activeDeleted: Promise<never>,
+  ): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await Promise.race([this._commitTerminalHandoff(identity, full, options), activeDeleted]);
+        return;
+      } catch (error) {
+        if (this._state !== 'live') throw error;
+        this._emitTurnEvent({
+          type: 'error',
+          runId: identity.runId,
+          signalId: identity.signalId,
+          error: projectHarnessPublicError(error),
+        });
+        if (
+          attempt >= WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS ||
+          error instanceof HarnessTerminalHandoffFencedError ||
+          error instanceof HarnessTerminalHandoffCancelledError ||
+          error instanceof HarnessTerminalHandoffIdentityConflictError
+        ) {
+          throw error;
+        }
+        const delayMs = Math.min(
+          WAKE_TERMINAL_COMMIT_RETRY_BASE_MS * 2 ** (attempt - 1),
+          WAKE_TERMINAL_COMMIT_RETRY_MAX_MS,
+        );
+        await Promise.race([new Promise(resolve => setTimeout(resolve, delayMs)), activeDeleted]);
+      }
     }
   }
 
@@ -13840,6 +13957,7 @@ export class Session {
     if (opts.admissionId !== undefined && opts.admissionId.length === 0) {
       throw new HarnessValidationError('signal().admissionId', 'admissionId must be a non-empty string');
     }
+    assertCallerAdmissionIdNotReserved('signal().admissionId', opts.admissionId);
     if (opts.admissionId !== undefined && opts.additionalTools !== undefined) {
       throw new HarnessValidationError('signal().admissionId', 'admissionId cannot be combined with additionalTools');
     }
@@ -15127,8 +15245,27 @@ export class Session {
       void activeTurnWaiter.promise.catch(() => {});
       // PF-7631: the terminal identity of a settlement wake turn, once admitted.
       let wakeTerminal: HarnessTerminalIdentity | undefined;
+      // The wake admission attempt, kept even when a Stop, delete or eviction
+      // wins the race against it, and whether its terminal commit landed.
+      let wakeAdmission: Promise<HarnessTerminalIdentity> | undefined;
+      let wakeSettled = false;
       const finishOwnedReminderTurn = () => {
-        if (wakeTerminal !== undefined) this._wakeTerminalAdmissionsInFlight.delete(wakeTerminal.admissionId);
+        if (wakeAdmission !== undefined) {
+          const admission = wakeAdmission;
+          wakeAdmission = undefined;
+          if (wakeSettled) {
+            this._wakeTerminalAdmissionsInFlight.delete(wakeTerminal!.admissionId);
+          } else {
+            // Release the admission whenever it lands; one that failed has
+            // already cleared its own marker. Tracked, so a close waits for it.
+            void this._trackBackgroundTurnCompletion(
+              admission.then(
+                identity => this._releaseWakeTerminalAdmission(identity.admissionId),
+                () => undefined,
+              ),
+            );
+          }
+        }
         activeTurnWaiter.cleanup();
         this._endTurn(turnAbortController);
       };
@@ -15171,16 +15308,14 @@ export class Session {
           signalId !== undefined &&
           this._terminalWakeFinalizer !== undefined
         ) {
-          wakeTerminal = await Promise.race([
-            this._admitWakeTerminalTurn({
-              wakeNoticeId: internal.wakeNoticeId,
-              signalId,
-              settlement: internal.wakeSettlement,
-              modeId: effectiveModeId,
-              modelId: this._record.modelId,
-            }),
-            activeTurnWaiter.promise,
-          ]);
+          wakeAdmission = this._admitWakeTerminalTurn({
+            wakeNoticeId: internal.wakeNoticeId,
+            signalId,
+            settlement: internal.wakeSettlement,
+            modeId: effectiveModeId,
+            modelId: this._record.modelId,
+          });
+          wakeTerminal = await Promise.race([wakeAdmission, activeTurnWaiter.promise]);
           assertOwnedReminderTurnNotDeleted();
         }
 
@@ -15256,13 +15391,13 @@ export class Session {
             // as a message() terminal turn does. A failed commit leaves the
             // staged output pending for dispatch recovery.
             if (wakeTerminal !== undefined) {
-              await Promise.race([
-                this._commitTerminalHandoff(wakeTerminal, full, {
-                  modeId: effectiveModeId,
-                  modelId: this._record.modelId,
-                }),
+              await this._commitWakeTerminalTurn(
+                wakeTerminal,
+                full,
+                { modeId: effectiveModeId, modelId: this._record.modelId },
                 activeTurnWaiter.promise,
-              ]);
+              );
+              wakeSettled = true;
             }
             this._emitAgentEnd({ runId: full.runId, finishReason: this._agentEndReasonForFullOutput(full), full });
             agentEndEmitted = true;
@@ -15279,6 +15414,7 @@ export class Session {
                   { modeId: effectiveModeId, modelId: this._record.modelId },
                   activeTurnWaiter.promise,
                 );
+                wakeSettled = true;
               } else {
                 this._scheduleOrphanRecheck(Date.now());
               }
@@ -20154,6 +20290,7 @@ export class Session {
     if (opts.admissionId !== undefined && opts.admissionId.length === 0) {
       throw new HarnessValidationError(`${methodName}.admissionId`, 'admissionId must be a non-empty string');
     }
+    assertCallerAdmissionIdNotReserved(`${methodName}.admissionId`, opts.admissionId);
     const sourceWriteGuard = normalizeObservationalMemorySourceWriteGuard(
       opts.observationalMemorySourceWriteGuard,
       `${methodName}.observationalMemorySourceWriteGuard`,
