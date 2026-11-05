@@ -1502,14 +1502,30 @@ describe('task_delegate — rollup from subagent outcome', () => {
     { shape: 'another session cancels with subagent_cancelled', settle: 'foreign_cancel', ...failedRollup },
     { shape: 'public cancel naming the owner with subagent_cancelled', settle: 'untargeted_cancel', ...failedRollup },
     { shape: "owner's parent cancels the owner via the subagent tool", settle: 'grandparent_cancel', ...failedRollup },
+    {
+      shape: 'targeted cancel the child ignores, then the deadline',
+      settle: 'targeted_then_deadline',
+      task: 'cancelled',
+      root: 'completed',
+      dependent: 'blocked',
+    },
+    { shape: 'cascade cancel first, then a targeted cancel', settle: 'cascade_then_targeted', ...failedRollup },
+    {
+      shape: 'targeted cancel first, then the owner is stopped',
+      settle: 'targeted_then_stop',
+      task: 'cancelled',
+      root: 'completed',
+      dependent: 'blocked',
+    },
   ] as const)('$shape: task $task, root $root, dependent $dependent', async ({ settle, task, root, dependent }) => {
     const { harness, parentAgent, childAgent } = buildHarness(
       new InMemoryDB(),
-      settle === 'timeout' ? { delegationTimeoutMs: 80 } : {},
+      settle === 'timeout' || settle === 'targeted_then_deadline' ? { delegationTimeoutMs: 80 } : {},
     );
+    const neverReleased = settle === 'timeout';
     let releaseChild!: () => void;
     childAgent.enqueueRun({
-      holdUntil: settle === 'timeout' ? new Promise<void>(() => {}) : new Promise<void>(r => (releaseChild = r)),
+      holdUntil: neverReleased ? new Promise<void>(() => {}) : new Promise<void>(r => (releaseChild = r)),
       finishReason: 'stop',
       terminalToolResult: outcomeTerminalResult(settle === 'child_error' ? 'failed' : 'completed'),
     });
@@ -1573,7 +1589,28 @@ describe('task_delegate — rollup from subagent outcome', () => {
             ? { reason: 'subagent_cancelled', requestedBy: owner.id }
             : undefined;
     if (publicCancel !== undefined) await harness._internalGetLiveSession(childId)!.cancel(publicCancel);
-    if (settle !== 'timeout') releaseChild();
+    // A cancel request committed on the child whose abort the child has not
+    // observed (it ignores it, or a later cancel races in first).
+    const commitUnobservedCancel = (cancelRequest: Record<string, unknown>) =>
+      (harness._internalGetLiveSession(childId) as any)._flushUpdate((prev: any) => ({
+        ...prev,
+        cancelRequest: { requestedAt: Date.now(), requestedBy: owner.id, ...cancelRequest },
+      }));
+    if (settle === 'targeted_then_deadline') {
+      await commitUnobservedCancel({ reason: 'user_requested', targeted: true });
+      // The child finishes only after its durable deadline has passed.
+      const { deadlineAt } = readDelegationAttemptMetadata((await planRow(owner, delegatedId))!)!;
+      await poll(() => Date.now() > deadlineAt + 100, 3_000);
+    }
+    if (settle === 'cascade_then_targeted') {
+      await commitUnobservedCancel({ reason: 'parent_cancelled' });
+      await owner.cancelSubagent({ subagentSessionId: childId });
+    }
+    if (settle === 'targeted_then_stop') {
+      await commitUnobservedCancel({ reason: 'subagent_cancelled', targeted: true });
+      await owner.cancel();
+    }
+    if (!neverReleased) releaseChild();
 
     await poll(async () => (await planRow(owner, delegatedId))?.delegatedSubagentSessionId === undefined, 3_000);
     const settled = await planRow(owner, delegatedId);

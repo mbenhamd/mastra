@@ -23944,11 +23944,21 @@ export class Session {
           // Child closure below remains the ownership prerequisite. A failed
           // cancel/close retains the durable link for restart reconciliation.
         }
-        outcome = 'failed';
-        publicError = {
-          code: 'harness.delegation_timeout',
-          message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
-        };
+        // The first cancel request wins: a targeted cancel committed before the
+        // deadline still settles `cancelled`, as restart reconcile would.
+        if (isParentRequestedSubagentCancel(child._record.cancelRequest, this.id)) {
+          outcome = 'cancelled';
+          publicError = {
+            code: 'harness.subagent_cancelled',
+            message: 'The delegated subagent was cancelled before it completed',
+          };
+        } else {
+          outcome = 'failed';
+          publicError = {
+            code: 'harness.delegation_timeout',
+            message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
+          };
+        }
       } else {
         rawResult = terminal;
         const finishReason = (rawResult as { finishReason?: string } | undefined)?.finishReason;
