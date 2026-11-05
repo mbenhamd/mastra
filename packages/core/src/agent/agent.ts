@@ -476,6 +476,9 @@ type SubAgentPendingToolCall = NonNullable<SubAgentToolOutput['subAgentPendingTo
 
 const RESOLVED_TOOL_INVOCATION_STATES = new Set<string>(['result', 'output-error', 'output-denied']);
 
+/** How many recent runs `Agent.__runResolvedMemory` remembers. */
+const RUN_RESOLVED_MEMORY_LIMIT = 256;
+
 /**
  * Tool calls a sub-agent made that never got a result. A tool without a server-side
  * `execute` (a client tool) ends the sub-agent's run at the tool-calls step, and
@@ -993,6 +996,11 @@ export class Agent<
    * close if they're still the active one.
    */
   #activeStreamUntilIdle = new Map<string, () => void>();
+  /**
+   * The memory each recent run resolved at its execution boundary, by runId
+   * (null: the run resolved no memory). Bounded: the oldest entries go first.
+   */
+  #runResolvedMemory = new Map<string, MastraMemory | null>();
   #threadStreamPubSubsByRunId = new Map<string, PubSub>();
   #threadStreamPubSubsByThreadKey = new Map<string, { runId: string; pubsub: PubSub }>();
   readonly #options?: AgentCreateOptions;
@@ -3292,6 +3300,27 @@ export class Agent<
    */
   __fixedMemory(): MastraMemory | undefined {
     return this.#memory !== undefined && typeof this.#memory !== 'function' ? this.#memory : undefined;
+  }
+
+  /**
+   * The memory instance the run `runId` resolved at its execution boundary
+   * (null when it resolved none), or undefined when this agent has not (yet)
+   * resolved memory for that run, or no longer remembers it. Only recent runs
+   * are kept.
+   * @internal
+   */
+  __runResolvedMemory(runId: string): MastraMemory | null | undefined {
+    return this.#runResolvedMemory.get(runId);
+  }
+
+  #noteRunResolvedMemory(runId: string, memory: MastraMemory | undefined): void {
+    this.#runResolvedMemory.delete(runId);
+    this.#runResolvedMemory.set(runId, memory ?? null);
+    while (this.#runResolvedMemory.size > RUN_RESOLVED_MEMORY_LIMIT) {
+      const oldest = this.#runResolvedMemory.keys().next();
+      if (oldest.done) break;
+      this.#runResolvedMemory.delete(oldest.value);
+    }
   }
 
   /**
@@ -10542,6 +10571,7 @@ export class Agent<
       memoryRegistry.set(executionMemoryId, resolvedMemory);
     }
     const memory = resolvedMemory.value;
+    this.#noteRunResolvedMemory(runId, memory);
     // Reuse early workspace (resolved earlier for browser context) to avoid
     // duplicate factory resolution which could create different instances
     const workspace = earlyWorkspace;

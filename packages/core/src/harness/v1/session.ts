@@ -968,6 +968,8 @@ const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
 /** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
 const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
 const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
+/** PF-7679: accepted fresh runs remembered per agent for settlement notices. */
+const FRESH_DISPATCH_RUNS_LIMIT = 64;
 /**
  * TM-6 `includeSubtree` transfers the complete valid plan. The plan writer
  * already enforces this bound, so a normal delegated child never receives a
@@ -2172,6 +2174,12 @@ export class Session {
    * accepted as a fresh run (`action: 'wake'`, or a structured generate).
    */
   private readonly _freshDispatchTicks = new Map<Agent, number>();
+  /**
+   * PF-7679: recent accepted fresh runs, per agent, with their dispatch tick,
+   * for memory that is not the agent's fixed instance: such a run read a row
+   * only if the memory it resolved (`Agent.__runResolvedMemory`) saved it.
+   */
+  private readonly _freshDispatchRuns = new Map<Agent, Array<{ tick: number; runId: string }>>();
   /**
    * PF-7679: settlement reminder rows being saved right now. An owned dispatch
    * waits for them first, so a fresh run never loads history during a save.
@@ -10433,6 +10441,9 @@ export class Session {
       try {
         await Promise.race([this._awaitNoticeSaves(), activeTurnWaiter.promise]);
       } catch (err) {
+        // A stamped dispatch claim stays behind: make its recovery due, as the
+        // lapsed-claim exit below does.
+        if (dispatchClaim !== undefined) this._scheduleOrphanRecheck(Date.now());
         failOwnedMessageTurnBeforeDispatch(err);
         throw redactPublicBoundaryRejection(err);
       }
@@ -15297,8 +15308,19 @@ export class Session {
         this._assertOpenForTurn('signal()');
         const interleavedContents = await this._buildSignalContentsWithAttachments(opts.content, internal?.attachments);
         // PF-7679: the idle fallback may start a fresh run; never load history
-        // during a settlement reminder save.
-        if (this._noticeSaves.size > 0) await this._awaitNoticeSaves();
+        // during a settlement reminder save. A Stop or edit during the wait
+        // ends it, and the signal never starts a fresh run after it.
+        if (this._noticeSaves.size > 0) {
+          const saveWaitEpoch = this._captureActiveWorkAdmission('signal()');
+          while (
+            this._noticeSaves.size > 0 &&
+            this._activeWorkAdmissionIsCurrent(saveWaitEpoch) &&
+            opts.abortSignal?.aborted !== true
+          ) {
+            await Promise.race([this._awaitNoticeSaves(), this._nextStateTransition(250)]);
+          }
+          this._assertActiveWorkAdmission(saveWaitEpoch, 'signal()', opts.abortSignal);
+        }
         this._assertOpenForTurn('signal()');
         dispatched = agent.sendSignal(
           {
@@ -15687,10 +15709,12 @@ export class Session {
           assertOwnedReminderTurnNotDeleted();
           this._assertOpenForTurn('injectSystemReminder()');
         }
-        // PF-7679: claim last, and not raced: the delivery must learn whether
-        // its claim landed before it decides to restore the notice.
+        // PF-7679: claim last. Raced, so an abort still releases the turn while
+        // the claim write stalls; the delivery itself awaits that write before
+        // it decides whether to restore the notice.
         if (internal?.claimNotice !== undefined) {
-          if (!(await internal.claimNotice())) throw new DelegationNoticeWakeNotSentError('claim_lost');
+          const won = await Promise.race([internal.claimNotice(), activeTurnWaiter.promise]);
+          if (!won) throw new DelegationNoticeWakeNotSentError('claim_lost');
           assertOwnedReminderTurnNotDeleted();
           this._assertOpenForTurn('injectSystemReminder()');
         }
@@ -15732,9 +15756,12 @@ export class Session {
         // Last step before `sendSignal`, as in message(): never dispatch a granted
         // wake on a dispatch claim or session lease that lapsed during the
         // awaits above, when another owner may already have recovered it. The
-        // grant is then cancelled or released by the turn's cleanup.
+        // grant is then cancelled or released by the turn's cleanup. A claimed
+        // settlement notice is re-owed (its restore is lease-fenced), so the
+        // wake is not lost when no other owner took over.
         if (wakeTerminal !== undefined && !this._dispatchClaimStillHeld(wakeClaimExpiresAt)) {
           this._scheduleOrphanRecheck(Date.now());
+          if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('slot_lost');
           throw new HarnessBusyError(this.id, 'in_flight');
         }
         const idleOnlyDispatch = wakeTerminal !== undefined || internal?.claimNotice !== undefined;
@@ -25003,6 +25030,27 @@ export class Session {
         if (restored) this._delegationNoticeEpochs.set(key, admissionEpoch);
         return restored;
       });
+    // Reconcile only finds notices still owed, so it cannot retry a claimed
+    // notice's restore: a failed restore is retried here, with backoff, while
+    // the session is live. A fenced-out write (another owner, a closed or
+    // deleted session) is not retried: the notice is then not re-owed.
+    const restoreClaimed = async (): Promise<boolean> => {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await restore();
+        } catch (err) {
+          if (
+            !live() ||
+            err instanceof HarnessStorageLeaseConflictError ||
+            err instanceof HarnessStorageSessionClosedError ||
+            err instanceof HarnessStorageSessionNotFoundError
+          ) {
+            throw err;
+          }
+          await this._nextStateTransition(Math.min(250 * 2 ** Math.min(attempt, 4), 4_000));
+        }
+      }
+    };
     let claimed = false;
     try {
       if (!(await this._delegationNoticeIsOwed(notice))) {
@@ -25079,6 +25127,9 @@ export class Session {
           await acknowledge();
           return;
         }
+        // The wake turn races the claim write against an abort; the outcome
+        // below waits for the write itself, so it knows whether it claimed.
+        let claimWrite: Promise<boolean> | undefined;
         try {
           await this._injectSystemReminder(
             content,
@@ -25088,10 +25139,12 @@ export class Session {
               admissionEpoch,
               wakeNoticeId: signalId,
               // The fenced acknowledgement is the claim: only its winner may wake.
-              claimNotice: async () => {
-                const won = await acknowledge();
-                if (won) claimed = true;
-                return won;
+              claimNotice: () => {
+                claimWrite = acknowledge().then(won => {
+                  if (won) claimed = true;
+                  return won;
+                });
+                return claimWrite;
               },
               noticeRowDelivered: rowDelivered,
               // PF-7631: the wake grant is considered only over a saved reminder
@@ -25110,6 +25163,7 @@ export class Session {
           );
           return;
         } catch (err) {
+          if (claimWrite !== undefined) await claimWrite.catch(() => false);
           if (!claimed) {
             // Another pass owns the notice.
             if (err instanceof DelegationNoticeWakeNotSentError && err.reason === 'claim_lost') return;
@@ -25128,8 +25182,14 @@ export class Session {
           // Claimed but not delivered (slot lost, close, or a dispatch that
           // threw): owe it again before anything else.
           claimed = false;
-          if (!(await restore())) return;
-          if (err instanceof DelegationNoticeWakeNotSentError && live()) continue;
+          if (!(await restoreClaimed())) return;
+          if (err instanceof DelegationNoticeWakeNotSentError && live()) {
+            // A run this process cannot see (a foreign lease holder, or one not
+            // yet registered here) refuses every retry: back off as the
+            // pre-claim busy path does. A close or Stop ends the loop above.
+            if (err.reason === 'slot_lost') await this._nextStateTransition(250);
+            continue;
+          }
           throw err;
         }
       }
@@ -25226,11 +25286,20 @@ export class Session {
    * dispatch counts as a fresh run only once the runtime accepts it as a wake
    * (a fresh run loads thread history); a delivery into a running run does not.
    */
-  private _noteOwnedDispatch(agent: Agent, dispatched: { accepted: Promise<{ action: string }> }): void {
+  private _noteOwnedDispatch(
+    agent: Agent,
+    dispatched: { accepted: Promise<{ action: string; runId?: string }> },
+  ): void {
     const tick = ++this._noticeDispatchTick;
     void dispatched.accepted.then(
       accepted => {
-        if (accepted.action === 'wake') this._noteFreshDispatch(agent, tick);
+        if (accepted.action !== 'wake') return;
+        this._noteFreshDispatch(agent, tick);
+        if (accepted.runId === undefined) return;
+        const runs = this._freshDispatchRuns.get(agent) ?? [];
+        runs.push({ tick, runId: accepted.runId });
+        if (runs.length > FRESH_DISPATCH_RUNS_LIMIT) runs.splice(0, runs.length - FRESH_DISPATCH_RUNS_LIMIT);
+        this._freshDispatchRuns.set(agent, runs);
       },
       () => {},
     );
@@ -25242,17 +25311,21 @@ export class Session {
 
   /**
    * PF-7679: whether a fresh run has already loaded this reminder row. True only
-   * when the agent whose fixed memory saved the row dispatched a fresh run after
-   * the save completed (`saveTick`); that run read the row from its history, so
+   * when the agent whose memory saved the row dispatched a fresh run after the
+   * save completed (`saveTick`), on that same memory (its fixed instance, or the
+   * instance the run itself resolved); that run read the row from its history, so
    * a wake would deliver the notice a second time. Memory-less notices have no
    * row, so only the wake delivers them. Synchronous, so it is re-checked in the
    * same tick as the wake's dispatch.
    */
   private _noticeRowDelivered(row: WakeReminderRowOrigin | undefined, saveTick: number): boolean {
-    return (
-      row !== undefined &&
-      (this._freshDispatchTicks.get(row.agent) ?? 0) > saveTick &&
-      row.agent.__fixedMemory() === row.memory
+    if (row === undefined) return false;
+    if (row.agent.__fixedMemory() === row.memory) return (this._freshDispatchTicks.get(row.agent) ?? 0) > saveTick;
+    // Function or inherited memory: only a run that resolved the very memory
+    // that saved the row read it. A run that has not resolved memory yet does
+    // not count; the wake waits for it to end first.
+    return (this._freshDispatchRuns.get(row.agent) ?? []).some(
+      run => run.tick > saveTick && row.agent.__runResolvedMemory(run.runId) === row.memory,
     );
   }
 
