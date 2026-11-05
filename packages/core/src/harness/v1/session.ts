@@ -23513,12 +23513,15 @@ export class Session {
    * @internal — `task_delegate` without a `taskId`. Runs the checks that do not
    * depend on a plan task, including the delegated body's byte limit, so the
    * tool can refuse a delegation that cannot start before it adds the task.
-   * Throws the same errors `_planTaskDelegate` would; writes nothing.
+   * Throws the same errors `_planTaskDelegate` would; writes nothing. Returns
+   * the active-work admission epoch it captured: pass it to `_planTaskDelegate`
+   * so a Stop that completes while the task is being added still refuses the
+   * delegation.
    */
   _planTaskDelegatePreflight(
     input: { agentType: string; task?: string; modelOverride?: string },
     callerSignal?: AbortSignal,
-  ): void {
+  ): number {
     if (input.task !== undefined) {
       const bytes = new TextEncoder().encode(input.task).byteLength;
       if (bytes > PLAN_TASK_DELEGATED_BODY_MAX_BYTES) {
@@ -23528,7 +23531,7 @@ export class Session {
         );
       }
     }
-    this._preflightPlanTaskDelegate(input, callerSignal);
+    return this._preflightPlanTaskDelegate(input, callerSignal).admissionEpoch;
   }
 
   /**
@@ -23538,7 +23541,9 @@ export class Session {
    * session id. Throws `HarnessValidationError`,
    * `HarnessSubagentDepthExceededError`, or
    * `HarnessSubagentConcurrencyLimitError` BEFORE any plan-task or session
-   * mutation so a rejected delegation is a no-op.
+   * mutation so a rejected delegation is a no-op. `admissionEpoch`, from
+   * `_planTaskDelegatePreflight`, admits this delegation under the epoch the
+   * caller's earlier work was admitted under instead of a fresh one.
    */
   async _planTaskDelegate(
     input: {
@@ -23553,8 +23558,12 @@ export class Session {
     parentRunId?: string,
     callerRequestContext?: RequestContext,
     parentTracingContext?: TracingContext,
+    callerAdmissionEpoch?: number,
   ): Promise<PlanTaskView & { subagentSessionId: string }> {
-    const { admissionEpoch, def, childDepth } = this._preflightPlanTaskDelegate(input, callerSignal);
+    const preflight = this._preflightPlanTaskDelegate(input, callerSignal);
+    const { def, childDepth } = preflight;
+    const admissionEpoch = callerAdmissionEpoch ?? preflight.admissionEpoch;
+    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
     const delegatedRequestContext = projectInheritedRequestContextApp(
       callerRequestContext,
       this._harness._getSubagentInheritedRequestContextAppKeys(),

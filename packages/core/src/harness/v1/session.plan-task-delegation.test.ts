@@ -287,6 +287,8 @@ describe('task_delegate — with or without taskId', () => {
     parallel?: true;
     /** The first child session creation fails with a transient error. */
     failChildCreationOnce?: true;
+    /** Stop (abortActiveWork) completes while the first call's plan task add is held. */
+    stopDuringAdd?: true;
     expected: {
       /** Titles of the plan tasks the task_delegate calls added. */
       addedTitles: string[];
@@ -295,6 +297,8 @@ describe('task_delegate — with or without taskId', () => {
       targetLinked: boolean;
       /** Text the last delegated child must receive in its prompt. */
       lastChildReceives?: string;
+      /** Whether any child session was created or reached its model. */
+      childStarted?: boolean;
     };
   };
 
@@ -388,6 +392,17 @@ describe('task_delegate — with or without taskId', () => {
         addedTitles: [],
         results: [refused('HarnessValidationError', { field: 'task' })],
         targetLinked: false,
+      },
+    },
+    {
+      name: 'a Stop that completes while the task is added refuses the delegation',
+      stopDuringAdd: true,
+      calls: [{ task: 'Draft the summary' }],
+      expected: {
+        addedTitles: ['Draft the summary'],
+        results: [refused('HarnessBusyError')],
+        targetLinked: false,
+        childStarted: false,
       },
     },
     {
@@ -504,6 +519,30 @@ describe('task_delegate — with or without taskId', () => {
     if (row.failChildCreationOnce) {
       vi.spyOn(harness, 'session').mockRejectedValueOnce(new Error('transient storage failure'));
     }
+    let childCreations = 0;
+    if (row.stopDuringAdd) {
+      const originalSession = harness.session.bind(harness);
+      vi.spyOn(harness, 'session').mockImplementation(async (args: any) => {
+        if (args.parentSessionId === caller.id) childCreations++;
+        return originalSession(args);
+      });
+      // Hold the add before it enters the plan-task write queue, so Stop can
+      // run to completion while the add is pending.
+      const originalAdd = caller._planTaskAdd.bind(caller);
+      let releaseAdd!: () => void;
+      const addGate = new Promise<void>(resolve => (releaseAdd = resolve));
+      let addBlocked!: () => void;
+      const addBlockedPromise = new Promise<void>(resolve => (addBlocked = resolve));
+      vi.spyOn(caller, '_planTaskAdd').mockImplementationOnce(async (...args) => {
+        addBlocked();
+        await addGate;
+        return originalAdd(...args);
+      });
+      void addBlockedPromise.then(async () => {
+        await caller.abortActiveWork({ reason: 'user_requested', settleTimeoutMs: 1_000 });
+        releaseAdd();
+      });
+    }
     const results: any[] = [];
     const run = (call: Call) =>
       tools[TASK_DELEGATE_TOOL_ID]!.execute!(
@@ -550,6 +589,9 @@ describe('task_delegate — with or without taskId', () => {
               },
       ),
       targetLinked: target?.delegatedSubagentSessionId !== undefined,
+      ...(row.expected.childStarted === undefined
+        ? {}
+        : { childStarted: childCreations > 0 || childAgent.streamCalls.length > 0 }),
       ...(row.expected.lastChildReceives === undefined
         ? {}
         : {

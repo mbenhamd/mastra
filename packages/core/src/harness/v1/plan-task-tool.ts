@@ -522,6 +522,9 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
     idempotencyKey: string | undefined,
   ): Promise<unknown> {
     let addedTaskId: string | undefined;
+    // The admission epoch the preflight captured before the add, so a Stop
+    // that completes during the add still refuses the delegation.
+    let admissionEpoch: number | undefined;
     try {
       let taskId = input.taskId;
       if (taskId === undefined) {
@@ -532,7 +535,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
         // Refuse a delegation that cannot start (closed session, Stop
         // in flight, unknown type, depth cap) before adding a task,
         // so a refused call leaves nothing behind in the plan.
-        session._planTaskDelegatePreflight(input, context?.abortSignal);
+        admissionEpoch = session._planTaskDelegatePreflight(input, context?.abortSignal);
         const added = await session._planTaskAdd(
           { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
           context?.abortSignal,
@@ -549,6 +552,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
         context?.agent?.runId,
         context?.requestContext,
         context?.tracingContext,
+        admissionEpoch,
       )) as any;
     } catch (err) {
       // At the concurrency limit the added task stays pending with only its
