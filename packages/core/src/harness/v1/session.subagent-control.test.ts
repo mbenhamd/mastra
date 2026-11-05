@@ -680,7 +680,7 @@ function escapedSummary(chars: number): string {
 /**
  * What a returning spawn_subagent call does to an inline child registered
  * under `inline:<id>`: the parent drops its spawn record (keeping the child
- * listed for the rest of the turn), then the child closes.
+ * listed for the rest of the run), then the child closes.
  */
 async function returnInline(parent: Session, child: Session): Promise<void> {
   parent._internalReturnInlineSubagent(`inline:${child.id}`);
@@ -959,7 +959,7 @@ type ChildListRow = {
   /**
    * Between pages, some inline children return the way a finished
    * spawn_subagent call does (`returnInline`): three already read and three
-   * not read yet. They keep their place for the rest of the turn, so paging
+   * not read yet. They keep their place for the rest of the run, so paging
    * still sees every child exactly once.
    */
   settleBetweenPages?: boolean;
@@ -1448,7 +1448,7 @@ describe('subagent control tool — stable offsets', () => {
     }
   }, 60_000);
 
-  it('the record of returned inline children is cleared at each turn start and does not grow across turns', async () => {
+  it('the record of returned inline children is cleared when each new run starts and does not grow across runs', async () => {
     const { harness, parentAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const run = control(parent);
@@ -1459,13 +1459,13 @@ describe('subagent control tool — stable offsets', () => {
       const callsBefore = parentAgent.streamCalls.length;
       const pending = parent.message({ content: `turn ${turn}` });
       await poll(() => parentAgent.streamCalls.length > callsBefore);
-      // The turn boundary cleared the previous turn's returned children.
+      // The new run cleared the previous run's returned children.
       expect(record().size).toBe(0);
       const sessions = await addInlineChildren(harness, parent, 5);
       register(parent, sessions, () => Date.now());
       for (const child of sessions) await returnInline(parent, child);
       expect(record().size).toBe(5);
-      // Within the turn the returned children stay listed.
+      // Within the run the returned children stay listed.
       const listed = (await run({ action: 'status' })).subagents.map((view: any) => view.subagentSessionId);
       expect([...listed].sort()).toEqual(sessions.map(child => child.id).sort());
       release();
@@ -1473,6 +1473,40 @@ describe('subagent control tool — stable offsets', () => {
       expect(record().size).toBe(5);
     }
     await harness.shutdown();
+  }, 30_000);
+
+  it('a message that joins the active run keeps the returned inline children listed, each once', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    try {
+      const returned = await addInlineChildren(harness, parent, 5);
+      register(parent, returned, () => Date.now());
+      for (const child of returned) await returnInline(parent, child);
+      const running = await addInlineChildren(harness, parent, 3);
+      keys = register(parent, running, () => Date.now());
+      const turnsBefore = (parent as any)._turnsBegun as number;
+      // A second message while the run is active joins that run instead of starting a new one.
+      const joined = parent.message({ content: 'one more thing' });
+      void joined.catch(() => {});
+      await poll(() => ((parent as any)._turnsBegun as number) > turnsBefore);
+      const seen: string[] = [];
+      let page = await run({ action: 'status', offset: 0 });
+      for (;;) {
+        seen.push(...(page.subagents as any[]).map(view => view.subagentSessionId as string));
+        if (page.omittedSubagentCount === undefined) break;
+        page = await run({ action: 'status', offset: Number(/offset (\d+)/.exec(page.resultsHint)![1]) });
+      }
+      const allIds = [...returned, ...running].map(child => child.id);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual([...allIds].sort());
+    } finally {
+      unregister(parent, keys);
+      closeTurn();
+      await harness.shutdown();
+    }
   }, 30_000);
 
   it('children that start at the same time are ordered by id, whatever order they were registered in', async () => {

@@ -12,7 +12,7 @@ The `subagent` tool's `status` listings and multi-subagent `wait` outputs now al
 - `status` and `wait` without ids take an optional `offset` to read the next page. Following the `resultsHint` offsets reads every subagent once, and a `wait` with an offset also returns the settled subagents on its page.
 - `status` lists at most 25 subagents per call.
 - Listings without ids are now ordered oldest first, by start time and then id.
-- Positions can still shift when a subagent starts between calls with the same or an earlier start time, or when a new turn begins.
+- Positions can still shift when a subagent starts between calls with the same or an earlier start time, or when a new run begins. A message that joins the current run does not start a new one.
 - Any shortened output sets `resultsShortened`, and `resultsHint` says how to read a full result.
 
 A call that names exactly one subagent always returns its full result, which the terminal result caps already bound.
