@@ -264,9 +264,13 @@ describe('task_delegate — with or without taskId', () => {
     withExistingTaskId?: true;
     /** Settle the slot-holding delegation before this call. */
     freeSlotFirst?: true;
+    /** Tool call id; defaults to the shared retry id. */
+    toolCallId?: string;
+    /** Pass the taskId the first call's result named. */
+    withFirstResultTaskId?: true;
   };
   type ResultSummary =
-    | { ok: true; taskId: 'target'; sameChildAsFirstSuccess: boolean }
+    | { ok: true; taskId: 'target' | 'other'; sameChildAsFirstSuccess: boolean }
     | { ok: false; errorName: string; field?: string; namesAddedTask: boolean; retryHint: boolean };
   type Row = {
     name: string;
@@ -277,20 +281,24 @@ describe('task_delegate — with or without taskId', () => {
     saturate?: true;
     /** Call from a session already at the configured max subagent depth. */
     atMaxDepth?: true;
-    /** Every call uses the same tool call id (a retry). */
+    /** Every call uses the same tool call id (a retry) unless it names its own. */
     calls: Call[];
+    /** Run the calls concurrently (overlapping executions) instead of in order. */
+    parallel?: true;
     expected: {
       /** Titles of the plan tasks the task_delegate calls added. */
       addedTitles: string[];
       results: ResultSummary[];
       /** The target (existing or added) task is linked to a running subagent at the end. */
       targetLinked: boolean;
+      /** Text the last delegated child must receive in its prompt. */
+      lastChildReceives?: string;
     };
   };
 
-  const ok = (sameChildAsFirstSuccess = true): ResultSummary => ({
+  const ok = (sameChildAsFirstSuccess = true, taskId: 'target' | 'other' = 'target'): ResultSummary => ({
     ok: true,
-    taskId: 'target',
+    taskId,
     sameChildAsFirstSuccess,
   });
   const refused = (
@@ -333,11 +341,27 @@ describe('task_delegate — with or without taskId', () => {
       expected: { addedTitles: ['Extract outcomes'], results: [ok(), ok()], targetLinked: true },
     },
     {
-      name: 'a retried call with a different task is refused on task, not idempotencyKey',
-      calls: [{ task: 'Extract outcomes' }, { task: 'Extract harms' }],
+      name: 'the same call retried with the same title but a changed body adds a new task and child',
+      calls: [{ task: 'Screen abstracts\nInclude adults only.' }, { task: 'Screen abstracts\nInclude children only.' }],
       expected: {
-        addedTitles: ['Extract outcomes'],
-        results: [ok(), refused('HarnessValidationError', { field: 'task' })],
+        addedTitles: ['Screen abstracts', 'Screen abstracts'],
+        results: [ok(), ok(false, 'other')],
+        targetLinked: true,
+        lastChildReceives: 'Screen abstracts\nInclude children only.',
+      },
+    },
+    {
+      name: 'two overlapping executions of the same call return the same task and child',
+      parallel: true,
+      calls: [{ task: 'Extract outcomes\nAdults only.' }, { task: 'Extract outcomes\nAdults only.' }],
+      expected: { addedTitles: ['Extract outcomes'], results: [ok(), ok()], targetLinked: true },
+    },
+    {
+      name: 'a different tool call with the same task adds and delegates a new task',
+      calls: [{ task: 'Extract outcomes' }, { task: 'Extract outcomes', toolCallId: 'tc-delegate-2' }],
+      expected: {
+        addedTitles: ['Extract outcomes', 'Extract outcomes'],
+        results: [ok(), ok(false, 'other')],
         targetLinked: true,
       },
     },
@@ -378,6 +402,26 @@ describe('task_delegate — with or without taskId', () => {
         addedTitles: ['Appraise risk of bias'],
         results: [refused('HarnessSubagentConcurrencyLimitError', { namesAddedTask: true, retryHint: true })],
         targetLinked: false,
+      },
+    },
+    {
+      name: 'a retry with the named taskId and the same task delegates the full text',
+      maxConcurrent: 1,
+      saturate: true,
+      calls: [
+        { task: 'Appraise risk of bias\nUse RoB 2 for every trial.' },
+        {
+          task: 'Appraise risk of bias\nUse RoB 2 for every trial.',
+          withFirstResultTaskId: true,
+          toolCallId: 'tc-delegate-retry',
+          freeSlotFirst: true,
+        },
+      ],
+      expected: {
+        addedTitles: ['Appraise risk of bias'],
+        results: [refused('HarnessSubagentConcurrencyLimitError', { namesAddedTask: true, retryHint: true }), ok()],
+        targetLinked: true,
+        lastChildReceives: 'Appraise risk of bias\nUse RoB 2 for every trial.',
       },
     },
     {
@@ -433,18 +477,26 @@ describe('task_delegate — with or without taskId', () => {
     const before = new Set((await listTasks()).map(t => t.taskId));
 
     const results: any[] = [];
-    for (const call of row.calls) {
+    const run = (call: Call) =>
+      tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+        {
+          agentType: 'worker',
+          ...(call.withExistingTaskId ? { taskId: existing } : {}),
+          ...(call.withFirstResultTaskId ? { taskId: results[0]?.taskId } : {}),
+          ...(call.task !== undefined ? { task: call.task } : {}),
+        } as any,
+        agentCallCtx(call.toolCallId ?? 'tc-delegate'),
+      );
+    if (row.parallel) {
+      results.push(...(await Promise.all(row.calls.map(run))));
+    }
+    for (const call of row.parallel ? [] : row.calls) {
       if (call.freeSlotFirst) {
         releases[0]!();
         await poll(async () => (await planRow(caller, blockerTaskId!))?.status === 'completed');
         await poll(() => caller._internalSubagentExecutionsInFlight === 0);
       }
-      const input = {
-        agentType: 'worker',
-        ...(call.withExistingTaskId ? { taskId: existing } : {}),
-        ...(call.task !== undefined ? { task: call.task } : {}),
-      };
-      results.push(await tools[TASK_DELEGATE_TOOL_ID]!.execute!(input as any, agentCallCtx('tc-delegate')));
+      results.push(await run(call));
     }
 
     const added = (await listTasks()).filter(t => !before.has(t.taskId));
@@ -461,15 +513,26 @@ describe('task_delegate — with or without taskId', () => {
                 errorName: r.errorName,
                 ...(r.field !== undefined ? { field: r.field } : {}),
                 namesAddedTask: r.taskId !== undefined && r.taskId === added[0]?.taskId,
-                retryHint: /retry task_delegate with taskId/.test(r.message ?? ''),
+                retryHint: /retry task_delegate with taskId "[^"]+" and the same `task`/.test(r.message ?? ''),
               }
             : {
                 ok: true,
-                taskId: r.taskId === targetId ? 'target' : r.taskId,
+                taskId: r.taskId === targetId ? 'target' : 'other',
                 sameChildAsFirstSuccess: r.subagentSessionId === firstSuccess.subagentSessionId,
               },
       ),
       targetLinked: target?.delegatedSubagentSessionId !== undefined,
+      ...(row.expected.lastChildReceives === undefined
+        ? {}
+        : {
+            lastChildReceives: await (async () => {
+              const delegatedChildren = results.filter(r => !r.isError).length + (row.saturate ? 1 : 0);
+              await poll(() => childAgent.streamCalls.length >= delegatedChildren);
+              const lastPrompt = JSON.stringify(childAgent.streamCalls.at(-1)?.messages ?? '');
+              const expectedText = row.expected.lastChildReceives!;
+              return lastPrompt.includes(JSON.stringify(expectedText).slice(1, -1)) ? expectedText : lastPrompt;
+            })(),
+          }),
     };
     expect(summary).toEqual(row.expected);
     // Added tasks are always top-level.

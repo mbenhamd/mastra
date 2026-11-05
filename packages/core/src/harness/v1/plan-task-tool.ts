@@ -18,6 +18,7 @@
 import { z } from 'zod';
 
 import { createTool } from '../../tools/tool';
+import type { ToolExecutionContext } from '../../tools/types';
 import { sha256CanonicalJson } from './canonical-json';
 import {
   HarnessError,
@@ -136,11 +137,13 @@ function toToolError(err: unknown): ToolError {
  * Idempotency key for a plan task created by one agent tool call. A retried
  * call (same run, same tool call id) maps to the same key, so the session
  * returns the task it already created instead of adding a second one. Direct
- * (non-agent) executions get no key.
+ * (non-agent) executions get no key. `task`, when given, is part of the key:
+ * the same call retried with a different `task` is new work, not a replay.
  */
 function toolCallIdempotencyKey(
   prefix: string,
   agentContext: { toolCallId?: string; agentId?: unknown; messages?: unknown; runId?: string } | undefined,
+  task?: string,
 ): string | undefined {
   if (
     agentContext?.toolCallId === undefined ||
@@ -152,6 +155,7 @@ function toolCallIdempotencyKey(
   return `${prefix}:${sha256CanonicalJson({
     runId: agentContext.runId ?? 'missing',
     toolCallId: agentContext.toolCallId,
+    ...(task === undefined ? {} : { task }),
   }).slice(0, 40)}`;
 }
 
@@ -203,6 +207,14 @@ function replayedDelegation(
   if (delegation.status === 'failed' && delegation.result === undefined) return undefined;
   return { ...task, subagentSessionId: delegation.subagentSessionId };
 }
+
+/**
+ * In-flight taskId-less `task_delegate` executions, per session, by tool-call
+ * idempotency key. An overlapping execution of the same tool call awaits the
+ * first one and returns its result, instead of racing it to add and delegate
+ * the same task and failing as "already delegated".
+ */
+const inFlightDelegations = new WeakMap<Session, Map<string, Promise<unknown>>>();
 
 /**
  * Build the plan-task tools scoped to one session. Always returns the full set —
@@ -460,69 +472,89 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
             .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
           execute: async (input, context) => {
             // Without a taskId, this call first adds a root plan task for the
-            // delegated work. The add carries the tool call's idempotency key,
-            // so a retry of the same tool call resolves to the same task.
-            let addedTaskId: string | undefined;
+            // delegated work, keyed by the tool call and its full `task`, so a
+            // retry of the same call resolves to the same task. An overlapping
+            // execution of that call awaits the first one's result.
+            const sharedKey =
+              input.taskId === undefined && input.task !== undefined
+                ? toolCallIdempotencyKey('plan-task-delegate-add', context?.agent, input.task)
+                : undefined;
+            if (sharedKey === undefined) return (await delegate(input, context, undefined)) as any;
+            let inFlight = inFlightDelegations.get(session);
+            if (inFlight === undefined) {
+              inFlight = new Map();
+              inFlightDelegations.set(session, inFlight);
+            }
+            const running = inFlight.get(sharedKey);
+            if (running !== undefined) return (await running) as any;
+            const attempt = delegate(input, context, sharedKey);
+            inFlight.set(sharedKey, attempt);
             try {
-              let taskId = input.taskId;
-              if (taskId === undefined) {
-                const content = delegatedTaskTitle(input.task);
-                if (content === undefined) {
-                  throw new HarnessValidationError('task', 'is required when taskId is omitted');
-                }
-                // Refuse a delegation that cannot start (closed session, Stop
-                // in flight, unknown type, depth cap) before adding a task,
-                // so a refused call leaves nothing behind in the plan.
-                session._planTaskDelegatePreflight(input, context?.abortSignal);
-                const idempotencyKey = toolCallIdempotencyKey('plan-task-delegate-add', context?.agent);
-                let added: PlanTaskView;
-                try {
-                  added = await session._planTaskAdd(
-                    { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
-                    context?.abortSignal,
-                  );
-                } catch (err) {
-                  // The key is derived from the tool call, so a mismatch means
-                  // this same call was retried with a different `task`.
-                  if (err instanceof HarnessValidationError && err.field === 'idempotencyKey') {
-                    throw new HarnessValidationError(
-                      'task',
-                      'this tool call already added a plan task from a different `task`; ' +
-                        'call plan_task_check and pass that taskId',
-                    );
-                  }
-                  throw err;
-                }
-                const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId);
-                if (replayed !== undefined) return replayed as any;
-                taskId = added.taskId;
-                addedTaskId = added.taskId;
-              }
-              return (await session._planTaskDelegate(
-                { ...input, taskId },
-                context?.abortSignal,
-                context?.agent?.toolCallId,
-                context?.agent?.runId,
-                context?.requestContext,
-                context?.tracingContext,
-              )) as any;
-            } catch (err) {
-              // At the concurrency limit the added task stays pending: name it
-              // so the model retries with that taskId instead of adding another.
-              if (addedTaskId !== undefined && err instanceof HarnessSubagentConcurrencyLimitError) {
-                const error = toToolError(err);
-                return {
-                  ...error,
-                  taskId: addedTaskId,
-                  message:
-                    `${error.message} Plan task "${addedTaskId}" was added and is still pending; retry ` +
-                    `task_delegate with taskId "${addedTaskId}" after a running subagent settles.`,
-                } as any;
-              }
-              return toToolError(err) as any;
+              return (await attempt) as any;
+            } finally {
+              if (inFlight.get(sharedKey) === attempt) inFlight.delete(sharedKey);
             }
           },
         });
+
+  async function delegate(
+    input: {
+      taskId?: string;
+      agentType: string;
+      task?: string;
+      includeSubtree?: boolean;
+      modelOverride?: string;
+    },
+    context: ToolExecutionContext | undefined,
+    idempotencyKey: string | undefined,
+  ): Promise<unknown> {
+    let addedTaskId: string | undefined;
+    try {
+      let taskId = input.taskId;
+      if (taskId === undefined) {
+        const content = delegatedTaskTitle(input.task);
+        if (content === undefined) {
+          throw new HarnessValidationError('task', 'is required when taskId is omitted');
+        }
+        // Refuse a delegation that cannot start (closed session, Stop
+        // in flight, unknown type, depth cap) before adding a task,
+        // so a refused call leaves nothing behind in the plan.
+        session._planTaskDelegatePreflight(input, context?.abortSignal);
+        const added = await session._planTaskAdd(
+          { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
+          context?.abortSignal,
+        );
+        const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId);
+        if (replayed !== undefined) return replayed as any;
+        taskId = added.taskId;
+        addedTaskId = added.taskId;
+      }
+      return (await session._planTaskDelegate(
+        { ...input, taskId },
+        context?.abortSignal,
+        context?.agent?.toolCallId,
+        context?.agent?.runId,
+        context?.requestContext,
+        context?.tracingContext,
+      )) as any;
+    } catch (err) {
+      // At the concurrency limit the added task stays pending with only its
+      // title: name it so the model retries with that taskId (instead of
+      // adding another) and the same `task` (so the child gets the full text).
+      if (addedTaskId !== undefined && err instanceof HarnessSubagentConcurrencyLimitError) {
+        const error = toToolError(err);
+        return {
+          ...error,
+          taskId: addedTaskId,
+          message:
+            `${error.message} Plan task "${addedTaskId}" was added and is still pending; retry ` +
+            `task_delegate with taskId "${addedTaskId}" and the same \`task\` after a running subagent ` +
+            'settles; without `task` the subagent receives only the task title.',
+        } as any;
+      }
+      return toToolError(err) as any;
+    }
+  }
 
   return {
     [TASK_ADD_TOOL_ID]: taskAdd,
