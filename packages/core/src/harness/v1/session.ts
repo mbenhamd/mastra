@@ -15039,6 +15039,17 @@ export class Session {
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
+        // An idle-only wake re-proves idleness in the same tick as its dispatch:
+        // a caller turn that began or started a run during the context await
+        // keeps the slot, and that run is never announced as this wake.
+        if (
+          idleOnlyEpoch !== undefined &&
+          (this._currentTurnAbortController !== turnAbortController ||
+            sub.activeRunId() !== null ||
+            !this._activeWorkAdmissionIsCurrent(idleOnlyEpoch))
+        ) {
+          throw new HarnessBusyError(this.id, 'in_flight');
+        }
 
         dispatched = agent.sendSignal(
           {

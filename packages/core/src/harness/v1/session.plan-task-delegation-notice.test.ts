@@ -879,6 +879,68 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
     }
   });
 
+  // PF-7626: the wake passes its idle check, then awaits turn context. A user
+  // turn that starts its run inside that await keeps the only turn, and its
+  // agent_start must not be labelled as the wake.
+  it('a user turn that starts while the claimed wake builds its context is never labelled a wake', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    const releases: Array<() => void> = [];
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releases.push(releaseChild);
+      const turns = trackTurns(parent);
+      const starts: Array<Record<string, unknown>> = [];
+      parent.subscribe(event => {
+        if (event.type === 'agent_start') starts.push({ ...event });
+      });
+      // Seam: hold the wake's context build (the await between its idle check
+      // and its dispatch) until the user's run has started.
+      let wakeAdmitted = false;
+      let held = false;
+      let user: ReturnType<typeof startHeldUserTurn> | undefined;
+      const inject = (parent as any)._injectSystemReminder.bind(parent);
+      vi.spyOn(parent as any, '_injectSystemReminder').mockImplementation((...args: unknown[]) => {
+        wakeAdmitted = true;
+        return inject(...args);
+      });
+      const build = (parent as any)._buildTurnContextAndInstructions.bind(parent);
+      vi.spyOn(parent as any, '_buildTurnContextAndInstructions').mockImplementation(async (...args: unknown[]) => {
+        // The user's own message() reaches this seam synchronously, so mark the
+        // hold taken before starting it.
+        if (wakeAdmitted && !held) {
+          held = true;
+          const before = parentAgent.streamCalls.length;
+          user = startHeldUserTurn(parent, parentAgent, 'what happened?');
+          releases.push(user.release);
+          await poll(() => parentAgent.streamCalls.length === before + 1);
+        }
+        return build(...args);
+      });
+
+      releaseChild();
+      await poll(() => user !== undefined);
+      await poll(async () => (parent as any)._delegationNoticesInFlight.size === 0);
+      await user!.end();
+      await deliveryFinished(parent, taskId);
+
+      // Only the user's turn ran, and its agent_start carries no wake identity.
+      expect(starts.filter(s => 'origin' in s || 'wakeNoticeId' in s)).toEqual([]);
+      expect(starts).toHaveLength(1);
+      expect(turns.order).toEqual(['start', 'end']);
+      expect(turns.maxActive()).toBe(1);
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      // The claimed notice is delivered once: the user turn reads the persisted row.
+      const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+      expect(messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'))).toHaveLength(1);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+
   it('aborting an admitted user turn leaves the child running; Stop (abortActiveWork) cancels it', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
     const releases: Array<() => void> = [];

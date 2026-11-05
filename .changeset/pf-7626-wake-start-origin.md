@@ -2,7 +2,7 @@
 '@mastra/core': minor
 ---
 
-Harness v1: a run the Harness starts to deliver a delegated-task settlement notice (`subagents.onDelegatedSettlement: 'wake'`) now says so on its `agent_start` event. The event carries `origin: 'wake'` and `wakeNoticeId`, the stable id of the notice the run delivers. Runs a caller starts are unchanged and carry neither field, so a consumer can show a woken turn differently without parsing internal signal ids.
+Added `origin: 'wake'` and `wakeNoticeId` to the Harness v1 `agent_start` event of a settlement wake run (`subagents.onDelegatedSettlement: 'wake'`). `wakeNoticeId` is the stable id of the notice the run delivers. Use these fields to show a woken turn without parsing internal signal ids. Caller-started runs are unchanged and carry neither field.
 
 ```ts
 session.subscribe(event => {
