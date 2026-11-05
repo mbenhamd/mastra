@@ -55,18 +55,16 @@ const SUBAGENT_CONTROL_TASK_PREVIEW_CHARS = 500;
  * (the same budget as `plan_task_check`). A child named in the call, or one
  * that settled during it, gets its full result while the budget allows; every
  * other child gets a bounded preview. When the children's own fields still do
- * not fit, task texts are shortened, and then the last children are left out
- * and named in `resultsHint`. A call that names exactly one child returns that
- * child's full result whatever its size: the terminal result caps in
- * `terminal-subagent-result.ts` already bound it.
+ * not fit, task texts are shortened, and then the last children are left out;
+ * `resultsHint` says how to read them. A call that names exactly one child
+ * returns that child's full result whatever its size: the terminal result caps
+ * in `terminal-subagent-result.ts` already bound it.
  */
 export const SUBAGENT_CONTROL_MAX_OUTPUT_BYTES = 64 * 1024;
 /** A full result no larger than this is never replaced by a preview. */
 const SUBAGENT_CONTROL_SMALL_RESULT_BYTES = MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES;
 /** UTF-8 bytes of task text a child keeps once task texts are shortened. */
 const SUBAGENT_CONTROL_SHORT_TASK_BYTES = 160;
-/** At most this many left-out children are named in `resultsHint`. */
-const SUBAGENT_CONTROL_HINT_MAX_IDS = 512;
 export const SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT =
   'Some results or task texts are previews or were left out to keep this output small. To read one in full, ' +
   'call subagent with action "status" and only that subagentSessionId.';
@@ -139,6 +137,15 @@ const inputSchema = z
           'If the first status read stalls, wait fails with harness.storage and can be retried; if a later ' +
           'read stalls past the timeout, wait returns timedOut with the statuses from its last completed read.',
       ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        'status and wait without ids only: skip this many subagents of the list (newest first; for wait, of ' +
+          'the running ones). When an output leaves subagents out, resultsHint gives the next offset.',
+      ),
     message: z
       .string()
       .min(1)
@@ -172,6 +179,18 @@ const inputSchema = z
         code: z.ZodIssueCode.custom,
         path: ['action'],
         message: 'subagentSessionIds and timeoutMs are only valid for wait',
+      });
+    }
+    if (
+      input.offset !== undefined &&
+      ((input.action !== 'status' && input.action !== 'wait') ||
+        input.subagentSessionId !== undefined ||
+        input.subagentSessionIds !== undefined)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['offset'],
+        message: 'offset is only valid for status or wait without subagent ids',
       });
     }
   });
@@ -269,15 +288,29 @@ function shortTask(view: SubagentView): SubagentView {
   return task === view.task ? view : { ...view, task };
 }
 
-/** The hint naming the children left out of an output, so a narrower call can read them. */
-function omittedHint(ids: readonly string[]): string {
-  const named = ids.slice(0, SUBAGENT_CONTROL_HINT_MAX_IDS);
-  return (
-    `${ids.length} subagents were left out of this output. To read them, call subagent with action "wait", ` +
-    `timeoutMs 0 and subagentSessionIds set to at most ${SUBAGENT_CONTROL_MAX_WAIT_TARGETS} of these ids per call` +
-    `${named.length < ids.length ? ` (the first ${named.length} are listed)` : ''}: ${named.join(', ')}. ` +
-    SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT
-  );
+/**
+ * How a call reads the children its output left out: `next(kept)` names the
+ * call that continues after the first `kept` children. Undefined for a call
+ * that names its children; that hint lists the left-out ids instead.
+ */
+type Continuation = ((kept: number) => string) | undefined;
+
+/** The hint for the children left out of an output, so a narrower call can read them. */
+function omittedHint(ids: readonly string[], kept: number, continuation: Continuation): string {
+  const how =
+    continuation !== undefined
+      ? continuation(kept)
+      : `call subagent with action "wait", timeoutMs 0 and subagentSessionIds set to at most ` +
+        `${SUBAGENT_CONTROL_MAX_WAIT_TARGETS} of these ids per call: ${ids.join(', ')}`;
+  return `${ids.length} subagents were left out of this output. To read them, ${how}. ${SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT}`;
+}
+
+/** The implicit-list call that continues after `offset` children. */
+function continueAt(action: 'status' | 'wait', offset: number): Continuation {
+  return kept =>
+    action === 'wait'
+      ? `call subagent with action "wait", timeoutMs 0 and offset ${offset + kept}`
+      : `call subagent with action "status" and offset ${offset + kept}`;
 }
 
 type PlaceViews = (list: readonly SubagentView[]) => SubagentView[];
@@ -294,26 +327,29 @@ type PlaceViews = (list: readonly SubagentView[]) => SubagentView[];
  *   2. their task texts are cut to SUBAGENT_CONTROL_SHORT_TASK_BYTES and the
  *      results fitted again;
  *   3. only the longest prefix of the children that fits is kept; the rest
- *      are counted in `omittedSubagentCount` and named in `resultsHint`, which
- *      points at a `wait` over at most SUBAGENT_CONTROL_MAX_WAIT_TARGETS ids.
- *      That many children always fit, so following the hint never returns
- *      the same shortened output.
+ *      are counted in `omittedSubagentCount`. For an implicit list,
+ *      `resultsHint` gives the `offset` of the first one left out; each page
+ *      keeps at least one child, so paging always moves on. A call that names
+ *      its children (at most SUBAGENT_CONTROL_MAX_WAIT_TARGETS, which always
+ *      fit) never leaves one out; if it did, the hint would list their ids.
  */
 function boundResults(
   build: (place: PlaceViews) => SubagentControlOutput,
   views: readonly SubagentView[],
   fullResultIds: ReadonlySet<string>,
   namedOne: string | undefined,
+  continuation?: Continuation,
 ): SubagentControlOutput {
   if (namedOne !== undefined && views.every(view => view.subagentSessionId === namedOne)) {
     return build(list => [...list]);
   }
   // Room for the shortening notice is reserved only once something must be
   // shortened: an output whose full results fit as they are carries no notice.
-  const unshortened = fitResults(build, views, views, fullResultIds, false);
+  const unshortened = fitResults(build, views, views, fullResultIds, continuation, false);
   if (unshortened !== undefined) return unshortened;
   const whole =
-    fitResults(build, views, views, fullResultIds) ?? fitResults(build, views, views.map(shortTask), fullResultIds);
+    fitResults(build, views, views, fullResultIds, continuation) ??
+    fitResults(build, views, views.map(shortTask), fullResultIds, continuation);
   if (whole !== undefined) return whole;
   const short = views.map(shortTask);
   // The envelope grows with each kept child (a child's own fields are larger
@@ -324,7 +360,7 @@ function boundResults(
   let best: SubagentControlOutput | undefined;
   while (low <= high) {
     const keep = Math.floor((low + high) / 2);
-    const fitted = fitResults(build, views, short.slice(0, keep), fullResultIds);
+    const fitted = fitResults(build, views, short.slice(0, keep), fullResultIds, continuation);
     if (fitted === undefined) {
       high = keep - 1;
     } else {
@@ -362,6 +398,7 @@ function fitResults(
   views: readonly SubagentView[],
   kept: readonly SubagentView[],
   fullResultIds: ReadonlySet<string>,
+  continuation: Continuation,
   reserveNotice = true,
 ): SubagentControlOutput | undefined {
   const keptIds = new Set(kept.map(view => view.subagentSessionId));
@@ -369,7 +406,8 @@ function fitResults(
   const notice = {
     resultsShortened: true,
     ...(leftOut.length > 0 ? { omittedSubagentCount: leftOut.length } : {}),
-    resultsHint: leftOut.length > 0 ? omittedHint(leftOut) : SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT,
+    resultsHint:
+      leftOut.length > 0 ? omittedHint(leftOut, kept.length, continuation) : SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT,
   };
   const omitted = (view: SubagentView): SubagentView =>
     view.result === undefined ? view : { ...withoutResult(view), resultOmitted: true };
@@ -599,7 +637,7 @@ export function createSubagentControlTool(parent: Session) {
    */
   async function resolveChildren(
     childIds: readonly string[] | undefined,
-    opts: { limit?: number; knownOwned?: ReadonlySet<string> } = {},
+    opts: { limit?: number; knownOwned?: ReadonlySet<string>; offset?: number } = {},
   ): Promise<{ views: SubagentView[]; foreign: string[]; truncated: boolean }> {
     const delegated = await loadDelegatedTasks();
     const activeById = new Map(activeSubagents().map(state => [state.subagentSessionId, state]));
@@ -614,7 +652,8 @@ export function createSubagentControlTool(parent: Session) {
       }
       ids = Array.from(known.entries())
         .sort((left, right) => right[1] - left[1])
-        .map(([id]) => id);
+        .map(([id]) => id)
+        .slice(opts.offset ?? 0);
     }
     const views: SubagentView[] = [];
     const foreign: string[] = [];
@@ -645,9 +684,10 @@ export function createSubagentControlTool(parent: Session) {
     return validationError('subagentSessionId', `not a subagent of this session: ${ids.join(', ')}`);
   }
 
-  async function status(childId: string | undefined): Promise<SubagentControlOutput> {
+  async function status(childId: string | undefined, offset = 0): Promise<SubagentControlOutput> {
     const { views, foreign, truncated } = await resolveChildren(childId === undefined ? undefined : [childId], {
       limit: SUBAGENT_CONTROL_STATUS_LIMIT,
+      offset,
     });
     if (foreign.length > 0) return foreignError(foreign);
     return boundResults(
@@ -655,6 +695,7 @@ export function createSubagentControlTool(parent: Session) {
       views,
       new Set(childId === undefined ? [] : [childId]),
       childId,
+      childId === undefined ? continueAt('status', offset) : undefined,
     );
   }
 
@@ -662,6 +703,7 @@ export function createSubagentControlTool(parent: Session) {
     childIds: readonly string[] | undefined,
     timeoutMs: number,
     signal: AbortSignal | undefined,
+    offset = 0,
   ): Promise<SubagentControlOutput> {
     const deadline = Date.now() + timeoutMs;
     let targets = childIds;
@@ -671,6 +713,9 @@ export function createSubagentControlTool(parent: Session) {
     // storage read stalls past the deadline or the call is aborted.
     let lastSettled: SubagentView[] = [];
     let lastRunning: SubagentView[] = [];
+    // The pinned children in pinned order: an implicit wait leaves out a tail
+    // of this list, so the next offset counts from its start.
+    let lastCurrent: SubagentView[] = [];
     // Full results go to named children and to children that settle during
     // this call; a child already settled when the wait began gets a preview.
     const fullResultIds = new Set(childIds ?? []);
@@ -687,9 +732,10 @@ export function createSubagentControlTool(parent: Session) {
           runningSubagents: place(lastRunning),
           ...extra,
         }),
-        [...lastSettled, ...lastRunning],
+        childIds === undefined ? lastCurrent : [...lastSettled, ...lastRunning],
         fullResultIds,
         namedOne,
+        childIds === undefined ? continueAt('wait', offset) : undefined,
       );
     };
     for (;;) {
@@ -723,12 +769,16 @@ export function createSubagentControlTool(parent: Session) {
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
       runningAtStart ??= new Set(views.filter(view => !view.settled).map(view => view.subagentSessionId));
       // An implicit wait pins every child that was running when it started.
-      targets ??= views.filter(view => !view.settled).map(view => view.subagentSessionId);
+      targets ??= views
+        .filter(view => !view.settled)
+        .map(view => view.subagentSessionId)
+        .slice(offset);
       const pinned = new Set(targets);
       const current = views.filter(view => pinned.has(view.subagentSessionId));
       const running = current.filter(view => !view.settled);
       lastSettled = current.filter(view => view.settled);
       lastRunning = running;
+      lastCurrent = current;
       const aborted = signal?.aborted === true;
       const timedOut = running.length > 0 && !aborted && Date.now() >= deadline;
       if (running.length === 0 || timedOut || aborted) {
@@ -864,7 +914,7 @@ export function createSubagentControlTool(parent: Session) {
       'you name, or one that settles during a wait, gets its full result while it fits; others get a preview ' +
       '(`resultPreview`), and a result that does not fit is left out (`resultOmitted`). If the subagents still ' +
       'do not fit, task texts are shortened, then the last subagents are left out (`omittedSubagentCount`) and ' +
-      '`resultsHint` names them for a `wait` with timeoutMs 0. `resultsShortened` marks such an output. A call ' +
+      '`resultsHint` gives the `offset` that reads on from them. `resultsShortened` marks such an output. A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
       'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
@@ -889,9 +939,9 @@ export function createSubagentControlTool(parent: Session) {
       try {
         switch (input.action) {
           case 'status':
-            return await status(input.subagentSessionId);
+            return await status(input.subagentSessionId, input.offset);
           case 'wait':
-            return await wait(ids, input.timeoutMs ?? SUBAGENT_CONTROL_DEFAULT_WAIT_MS, ctx?.abortSignal);
+            return await wait(ids, input.timeoutMs ?? SUBAGENT_CONTROL_DEFAULT_WAIT_MS, ctx?.abortSignal, input.offset);
           case 'send':
             return await send(input.subagentSessionId!, input.message!, ctx?.abortSignal);
           case 'cancel':
