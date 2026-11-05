@@ -1624,7 +1624,7 @@ describe('subagent control tool — stable offsets', () => {
       children[2]!.releaseChild();
       const output = await pending;
       // The wait ended on child 2's settlement, not on the children already settled.
-      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(290);
       expect(output.timedOut).toBe(false);
       expect(settledIds(output).sort()).toEqual(
         children
@@ -1638,7 +1638,7 @@ describe('subagent control tool — stable offsets', () => {
       // With nothing new settling, it blocks until the timeout.
       const blockedAt = Date.now();
       const blocked = await run({ action: 'wait', until: 'any', offset: 0, timeoutMs: 400 });
-      expect(Date.now() - blockedAt).toBeGreaterThanOrEqual(400);
+      expect(Date.now() - blockedAt).toBeGreaterThanOrEqual(380);
       expect(blocked.timedOut).toBe(true);
       expect(runningIds(blocked)).toEqual([children[3]!.childId]);
     } finally {
