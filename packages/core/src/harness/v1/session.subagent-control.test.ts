@@ -1187,6 +1187,11 @@ type ChildListRow = {
   leavesOut: boolean;
   /** Read every left-out child back through the calls the hint names. */
   followHint?: boolean;
+  /**
+   * Between pages, settle (close) some inline children already read and some
+   * not yet read; paging must still see every child exactly once.
+   */
+  settleBetweenPages?: boolean;
 };
 
 const childListRows: ChildListRow[] = [
@@ -1237,6 +1242,16 @@ const childListRows: ChildListRow[] = [
     leavesOut: true,
     followHint: true,
   },
+  {
+    name: '1000 inline children, some settling between pages: each child seen exactly once, every page within 64 KiB',
+    largeSettling: 0,
+    running: 0,
+    inline: 1000,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+    followHint: true,
+    settleBetweenPages: true,
+  },
 ];
 
 describe('subagent control tool — bounded child list', () => {
@@ -1250,6 +1265,7 @@ describe('subagent control tool — bounded child list', () => {
       const children: Array<{ childId: string; releaseChild: () => void }> = [];
       const active = (parent as any)._activeSubagents as Map<string, ActiveSubagentState>;
       const inlineKeys: string[] = [];
+      const inlineSessions: Session[] = [];
       try {
         for (let index = 0; index < row.largeSettling + row.running; index += 1) {
           const large = index < row.largeSettling;
@@ -1284,6 +1300,7 @@ describe('subagent control tool — bounded child list', () => {
             status: 'running',
           });
           inlineKeys.push(key);
+          inlineSessions.push(child);
           children.push({ childId: child.id, releaseChild: () => {} });
         }
         const pending = run(row.call);
@@ -1323,13 +1340,24 @@ describe('subagent control tool — bounded child list', () => {
         // Page through the rest with the offset each hint gives, until a page leaves nothing out.
         const seen = [...listedIds];
         let page = output;
+        let settledBetween = 0;
         while (page.omittedSubagentCount !== undefined) {
           const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
           expect(offset).toBe(seen.length);
+          if (row.settleBetweenPages) {
+            // Settle three children already read and three not read yet.
+            const open = inlineSessions.filter(child => child.getRecord().closedAt === undefined);
+            const read = open.filter(child => seen.includes(child.id)).slice(0, 3);
+            const unread = open.filter(child => !seen.includes(child.id)).slice(0, 3);
+            for (const child of [...read, ...unread]) await child.close();
+            settledBetween += read.length + unread.length;
+          }
           page = await run({ action: 'wait', timeoutMs: 0, offset });
           expect(page.isError).toBeUndefined();
           expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
-          const ids = (page.runningSubagents as any[]).map(view => view.subagentSessionId as string);
+          const ids = [...page.settledSubagents, ...page.runningSubagents].map(
+            (view: any) => view.subagentSessionId as string,
+          );
           // Every page moves on, so following the hint cannot loop.
           expect(ids.length).toBeGreaterThan(0);
           seen.push(...ids);
@@ -1337,6 +1365,7 @@ describe('subagent control tool — bounded child list', () => {
         // Every child is seen exactly once.
         expect(new Set(seen).size).toBe(seen.length);
         expect([...seen].sort()).toEqual([...allIds].sort());
+        if (row.settleBetweenPages) expect(settledBetween).toBeGreaterThan(6);
       } finally {
         for (const key of inlineKeys) active.delete(key);
         for (const child of children) child.releaseChild();
@@ -1346,6 +1375,206 @@ describe('subagent control tool — bounded child list', () => {
     },
     120_000,
   );
+});
+
+describe('subagent control tool — stable offsets', () => {
+  /** `count` real child sessions; `register` adds the parent's in-process spawn records for them. */
+  async function addInlineChildren(harness: Harness, parent: Session, count: number): Promise<Session[]> {
+    const sessions: Session[] = [];
+    for (let index = 0; index < count; index += 1) {
+      sessions.push(
+        await harness.session({
+          resourceId: 'u1',
+          threadId: { fresh: true },
+          parentSessionId: parent.id,
+          origin: 'subagent-tool',
+          modeId: 'worker-mode',
+          subagentDepth: 1,
+        }),
+      );
+    }
+    return sessions;
+  }
+
+  function register(parent: Session, sessions: readonly Session[], startedAt: (index: number) => number): string[] {
+    const active = (parent as any)._activeSubagents as Map<string, ActiveSubagentState>;
+    return sessions.map((child, index) => {
+      const key = `inline:${child.id}`;
+      active.set(key, {
+        subagentSessionId: child.id,
+        agentType: 'worker',
+        task: japaneseTask(index, 500),
+        parentToolCallId: `spawn-${index}`,
+        startedAt: startedAt(index),
+        status: 'running',
+      });
+      return key;
+    });
+  }
+
+  function unregister(parent: Session, keys: readonly string[]): void {
+    const active = (parent as any)._activeSubagents as Map<string, ActiveSubagentState>;
+    for (const key of keys) active.delete(key);
+  }
+
+  it('wait until all over more than a page: following hints from offset 0 returns every child once, with its result', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
+    let keys: string[] = [];
+    try {
+      // 100 delegated children (the plan-task cap) with results, plus 150 inline
+      // children, so even the children without their results exceed one page.
+      for (let index = 0; index < 100; index += 1) {
+        const summary = largeSummary(`child-${index}`, 3_000);
+        children.push({
+          ...(await delegateHeldChild(parent, childAgent, `job ${index}`, summary, japaneseTask(index, 500))),
+          summary,
+        });
+      }
+      const sessions = await addInlineChildren(harness, parent, 150);
+      keys = register(parent, sessions, () => Date.now());
+      const pending = run({ action: 'wait', timeoutMs: 20_000, offset: 0 });
+      for (const child of children) child.releaseChild();
+      for (const child of sessions) await child.close();
+      let page = await pending;
+      expect(page.timedOut).toBe(false);
+      expect(page.omittedSubagentCount).toBeGreaterThan(0);
+      const seen: string[] = [];
+      let pages = 0;
+      for (;;) {
+        pages += 1;
+        expect(page.isError).toBeUndefined();
+        expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+        expect(page.runningSubagents).toEqual([]);
+        for (const view of page.settledSubagents as any[]) {
+          seen.push(view.subagentSessionId);
+          const child = children.find(candidate => candidate.childId === view.subagentSessionId);
+          // An inline child's result is returned by its spawn_subagent call only.
+          if (child === undefined) continue;
+          // A result left out of a page is read by naming that child, as the hint says.
+          const full = view.resultOmitted
+            ? (await run({ action: 'status', subagentSessionId: view.subagentSessionId })).subagents[0]
+            : view;
+          expect(full.result.text).toBe(child.summary);
+        }
+        if (page.omittedSubagentCount === undefined) break;
+        const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+        expect(offset).toBe(seen.length);
+        page = await run({ action: 'wait', timeoutMs: 0, offset });
+      }
+      expect(pages).toBeGreaterThan(1);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual(
+        [...children.map(child => child.childId), ...sessions.map(child => child.id)].sort(),
+      );
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('status over 250 children pages from offset 0 through the hints, each child once, each page within 64 KiB', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void }> = [];
+    let keys: string[] = [];
+    try {
+      for (let index = 0; index < 100; index += 1) {
+        children.push(await delegateHeldChild(parent, childAgent, `job ${index}`, undefined, japaneseTask(index, 500)));
+      }
+      const sessions = await addInlineChildren(harness, parent, 150);
+      keys = register(parent, sessions, () => Date.now());
+      const allIds = [...children.map(child => child.childId), ...sessions.map(child => child.id)];
+      const seen: string[] = [];
+      let page = await run({ action: 'status', offset: 0 });
+      for (;;) {
+        expect(page.isError).toBeUndefined();
+        expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+        const ids = (page.subagents as any[]).map(view => view.subagentSessionId as string);
+        expect(ids.length).toBeGreaterThan(0);
+        seen.push(...ids);
+        if (page.omittedSubagentCount === undefined) break;
+        expect(page.omittedSubagentCount).toBe(allIds.length - seen.length);
+        const offset = Number(/action "status" and offset (\d+)/.exec(page.resultsHint)![1]);
+        expect(offset).toBe(seen.length);
+        page = await run({ action: 'status', offset });
+      }
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual([...allIds].sort());
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('wait until any woken by a child far past the first page returns that child, within 64 KiB', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let waker: { childId: string; releaseChild: () => void } | undefined;
+    let keys: string[] = [];
+    try {
+      // 500 inline children started before the delegated child and 500 after
+      // it, so it sits in the middle of the list, far past the first page.
+      const sessions = await addInlineChildren(harness, parent, 1000);
+      const now = Date.now();
+      keys = register(parent, sessions, index => (index < 500 ? now - 60_000 : now + 60_000));
+      waker = await delegateHeldChild(parent, childAgent, 'job waker', undefined, japaneseTask(0, 500));
+      const pending = run({ action: 'wait', until: 'any', timeoutMs: 20_000 });
+      await new Promise(resolve => setTimeout(resolve, 200));
+      waker.releaseChild();
+      const output = await pending;
+      expect(output.isError).toBeUndefined();
+      expect(output.timedOut).toBe(false);
+      expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+      // The page is cut short, yet the child that woke the wait is in it, with its result.
+      expect(output.omittedSubagentCount).toBeGreaterThan(0);
+      const woke = (output.settledSubagents as any[]).find(view => view.subagentSessionId === waker!.childId);
+      expect(woke).toBeDefined();
+      expect(woke.result.text).toBe('job waker: done');
+    } finally {
+      unregister(parent, keys);
+      waker?.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('children that start at the same time are ordered by id, whatever order they were registered in', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    try {
+      const sessions = await addInlineChildren(harness, parent, 6);
+      const sortedIds = sessions.map(child => child.id).sort();
+      // Register in reverse id order, all with one start time.
+      const reversed = [...sessions].sort((left, right) => (left.id < right.id ? 1 : -1));
+      const startedAt = Date.now();
+      keys = register(parent, reversed, () => startedAt);
+      const listed = await run({ action: 'status' });
+      expect((listed.subagents as any[]).map(view => view.subagentSessionId)).toEqual(sortedIds);
+      const waited = await run({ action: 'wait', timeoutMs: 0 });
+      expect((waited.runningSubagents as any[]).map(view => view.subagentSessionId)).toEqual(sortedIds);
+      const fromTwo = await run({ action: 'status', offset: 2 });
+      expect((fromTwo.subagents as any[]).map(view => view.subagentSessionId)).toEqual(sortedIds.slice(2));
+    } finally {
+      unregister(parent, keys);
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 30_000);
 });
 
 describe('subagent control tool — permission gate (real agent loop)', () => {
