@@ -12018,7 +12018,7 @@ export class Session {
    * recovery interrupts it once its claim has expired.
    */
   private async _settleCancelledTerminalMessage(
-    admission: HarnessTerminalAdmissionRecord,
+    admission: HarnessTerminalIdentity,
     message: string,
     options: {
       /**
@@ -12554,13 +12554,17 @@ export class Session {
   }
 
   /**
-   * PF-7631: give up a wake grant before anything runs under it. The admission
-   * is cancelled through `cancelTerminalHandoff` (marked cancelled, its grant
-   * tombstoned), so no terminal result or intent is ever committed for it, and
-   * its reserved row is settled failed with `harness.terminal_cancelled`. It
-   * stays in flight until then, so dispatch recovery never interrupts it
-   * meanwhile; if the cancel does not land, it is released to recovery
-   * instead. Tracked, so a close waits for it.
+   * PF-7631: give up a wake grant before anything runs under it: a lost idle
+   * slot or row proof at the dispatch re-check, or a Stop, edit, delete or
+   * eviction during the admission. The admission is cancelled through
+   * `cancelTerminalHandoff` (marked cancelled, its grant tombstoned; an
+   * already-cancelled `duplicate` counts the same, as for a suspension), so no
+   * terminal result or intent is committed for it, and its reserved row is
+   * settled failed with `harness.terminal_cancelled`. It stays in flight until
+   * then, so dispatch recovery never interrupts it meanwhile. If storage
+   * refuses the cancel (it throws or answers `fenced`), the admission is
+   * released to recovery instead, which settles the wake as interrupted (an
+   * aborted wake intent is possible). Tracked, so a close waits for it.
    */
   private _cancelWakeTerminalAdmission(identity: HarnessTerminalIdentity): void {
     const reason = { code: 'harness.terminal_cancelled', message: 'the wake gave up its grant before dispatch' };
@@ -12577,8 +12581,8 @@ export class Session {
             reason,
             cancelledAt: Date.now(),
           });
-          if (receipt.status === 'cancelled' && receipt.admission !== undefined) {
-            await this._settleCancelledTerminalMessage(receipt.admission, reason.message);
+          if (receipt.status === 'cancelled' || receipt.status === 'duplicate') {
+            await this._settleCancelledTerminalMessage(receipt.admission ?? identity, reason.message);
             this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
             return;
           }
@@ -15466,12 +15470,24 @@ export class Session {
       // wins the race against it, and whether its terminal commit landed.
       let wakeAdmission: Promise<HarnessTerminalIdentity> | undefined;
       let wakeSettled = false;
+      // Whether the dispatch was sent: before it, nothing can run under the grant.
+      let wakeDispatchSent = false;
       const finishOwnedReminderTurn = () => {
         if (wakeAdmission !== undefined) {
           const admission = wakeAdmission;
           wakeAdmission = undefined;
           if (wakeSettled) {
             this._wakeTerminalAdmissionsInFlight.delete(wakeTerminal!.admissionId);
+          } else if (!wakeDispatchSent) {
+            // A Stop, edit, delete or eviction refused the turn before its
+            // dispatch: cancel the admission whenever it lands, as a grant
+            // given up at the re-check is. Tracked, so a close waits for it.
+            void this._trackBackgroundTurnCompletion(
+              admission.then(
+                identity => this._cancelWakeTerminalAdmission(identity),
+                () => undefined,
+              ),
+            );
           } else {
             // Release the admission whenever it lands; one that failed has
             // already cleared its own marker. Tracked, so a close waits for it.
@@ -15573,6 +15589,7 @@ export class Session {
           this._cancelWakeTerminalAdmission(givenUp);
         }
 
+        wakeDispatchSent = true;
         dispatched = agent.sendSignal(
           {
             type: 'system-reminder',

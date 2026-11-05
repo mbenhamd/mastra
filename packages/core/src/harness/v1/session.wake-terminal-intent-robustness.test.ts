@@ -744,6 +744,7 @@ describe('PF-7631 wake admission interrupted at each await', () => {
   });
 
   it.each(interruptRows)('$interrupt during the $at await leaves nothing active or in flight', async row => {
+    // Every await but the last is inside the admission, before the dispatch.
     const db = new InMemoryDB();
     const { harness, storage, parentAgent, childAgent } = buildHarness(db);
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -781,7 +782,20 @@ describe('PF-7631 wake admission interrupted at each await', () => {
     }
     expect(wakeInFlight(parent).size).toBe(0);
     for (const evidence of wakeEvidence(db)) expect(evidence.status).not.toBe('pending');
-    expect(wakeIntents(db).length).toBeLessThanOrEqual(1);
+    // Before the dispatch nothing ran under the grant: the admission is
+    // cancelled, with no intent. Once dispatched, the reserved run started
+    // under the grant, so recovery settles it interrupted with one aborted intent.
+    const admissions = [...db.harnessTerminalAdmissions.values()].filter(a =>
+      a.admissionId.startsWith('harness-wake:'),
+    );
+    const dispatched = row.at === 'dispatch accepted';
+    expect(wakeIntents(db)).toHaveLength(dispatched ? 1 : 0);
+    expect(admissions.map(a => a.status)).toEqual([dispatched ? 'committed' : 'cancelled']);
+    expect(wakeEvidence(db)).toHaveLength(1);
+    expect(wakeEvidence(db)[0]).toMatchObject({
+      status: 'failed',
+      error: { code: dispatched ? 'harness.run_interrupted' : 'harness.terminal_cancelled' },
+    });
     await harness.shutdown();
   });
 });
