@@ -255,6 +255,7 @@ import {
   planTaskReparent,
   planTaskReset,
   planTaskUpdate,
+  PLAN_TASK_DELEGATED_BODY_MAX_BYTES,
   PLAN_TASK_MAX_NODES,
   PLAN_TASK_UPDATED_EVENT,
   readDelegationAttemptMetadata,
@@ -23510,11 +23511,23 @@ export class Session {
 
   /**
    * @internal — `task_delegate` without a `taskId`. Runs the checks that do not
-   * depend on a plan task, so the tool can refuse a delegation that cannot
-   * start before it adds the task. Throws the same errors `_planTaskDelegate`
-   * would; writes nothing.
+   * depend on a plan task, including the delegated body's byte limit, so the
+   * tool can refuse a delegation that cannot start before it adds the task.
+   * Throws the same errors `_planTaskDelegate` would; writes nothing.
    */
-  _planTaskDelegatePreflight(input: { agentType: string; modelOverride?: string }, callerSignal?: AbortSignal): void {
+  _planTaskDelegatePreflight(
+    input: { agentType: string; task?: string; modelOverride?: string },
+    callerSignal?: AbortSignal,
+  ): void {
+    if (input.task !== undefined) {
+      const bytes = new TextEncoder().encode(input.task).byteLength;
+      if (bytes > PLAN_TASK_DELEGATED_BODY_MAX_BYTES) {
+        throw new HarnessValidationError(
+          'task',
+          `must be at most ${PLAN_TASK_DELEGATED_BODY_MAX_BYTES} UTF-8 bytes; received ${bytes}`,
+        );
+      }
+    }
     this._preflightPlanTaskDelegate(input, callerSignal);
   }
 

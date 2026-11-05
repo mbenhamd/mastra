@@ -285,6 +285,8 @@ describe('task_delegate — with or without taskId', () => {
     calls: Call[];
     /** Run the calls concurrently (overlapping executions) instead of in order. */
     parallel?: true;
+    /** The first child session creation fails with a transient error. */
+    failChildCreationOnce?: true;
     expected: {
       /** Titles of the plan tasks the task_delegate calls added. */
       addedTitles: string[];
@@ -363,6 +365,29 @@ describe('task_delegate — with or without taskId', () => {
         addedTitles: ['Extract outcomes', 'Extract outcomes'],
         results: [ok(), ok(false, 'other')],
         targetLinked: true,
+      },
+    },
+    {
+      name: 'a same-call retry after child creation failed creates a real child',
+      failChildCreationOnce: true,
+      calls: [
+        { task: 'Extract outcomes\nPrimary endpoints only.' },
+        { task: 'Extract outcomes\nPrimary endpoints only.' },
+      ],
+      expected: {
+        addedTitles: ['Extract outcomes'],
+        results: [refused('HarnessError'), ok()],
+        targetLinked: true,
+        lastChildReceives: 'Extract outcomes\nPrimary endpoints only.',
+      },
+    },
+    {
+      name: 'without taskId a task over the delegated body byte limit is refused before any task is added',
+      calls: [{ task: `Title\n${'é'.repeat(40000)}` }],
+      expected: {
+        addedTitles: [],
+        results: [refused('HarnessValidationError', { field: 'task' })],
+        targetLinked: false,
       },
     },
     {
@@ -476,6 +501,9 @@ describe('task_delegate — with or without taskId', () => {
       (await caller._internalStorage.listPlanTasks({ sessionId: caller.id, limit: 100 })).tasks;
     const before = new Set((await listTasks()).map(t => t.taskId));
 
+    if (row.failChildCreationOnce) {
+      vi.spyOn(harness, 'session').mockRejectedValueOnce(new Error('transient storage failure'));
+    }
     const results: any[] = [];
     const run = (call: Call) =>
       tools[TASK_DELEGATE_TOOL_ID]!.execute!(

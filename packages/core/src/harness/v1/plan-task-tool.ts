@@ -188,12 +188,20 @@ function delegatedTaskTitle(task: string | undefined): string | undefined {
 }
 
 /**
+ * Error codes `Session._reconcileDelegatedTask` stamps on a delegation that
+ * settled without a result from the child itself: the child was never
+ * created, or left no usable terminal evidence. Such a delegation has no child
+ * worth pointing a retry at.
+ */
+const DELEGATION_WITHOUT_CHILD_RESULT_CODES = new Set(['harness.delegation_failed', 'harness.delegation_blocked']);
+
+/**
  * A retry of a taskId-less `task_delegate` call resolves to the task the first
  * attempt added. When that attempt already delegated it, return the first
  * call's success view instead of an "already delegated" refusal. Only an
- * attempt by this exact tool call qualifies, and an attempt that failed before
- * its child reported anything does not, so its retry follows the normal
- * re-delegation rules.
+ * attempt by this exact tool call qualifies, and an attempt that settled
+ * without a result from its child (for example, child creation failed) does
+ * not, so its retry follows the normal re-delegation rules and creates a child.
  */
 function replayedDelegation(
   task: PlanTaskView,
@@ -204,7 +212,12 @@ function replayedDelegation(
   if (idempotencyKey === undefined || delegation === undefined || delegation.parentToolCallId !== toolCallId) {
     return undefined;
   }
-  if (delegation.status === 'failed' && delegation.result === undefined) return undefined;
+  if (delegation.status !== 'running' && delegation.status !== 'completed') {
+    const code = delegation.result?.error?.code;
+    if (delegation.result === undefined || (code !== undefined && DELEGATION_WITHOUT_CHILD_RESULT_CODES.has(code))) {
+      return undefined;
+    }
+  }
   return { ...task, subagentSessionId: delegation.subagentSessionId };
 }
 
