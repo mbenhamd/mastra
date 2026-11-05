@@ -204,8 +204,9 @@ export interface AgentStartEvent extends HarnessEventBase {
    * - `'wake'`: the Harness started this run to deliver a delegated-task
    *   settlement notice (`subagents.onDelegatedSettlement: 'wake'`). At most
    *   one wake run starts per notice. When a caller turn takes the parent's
-   *   slot while the wake prepares, the notice goes to that caller's run, or
-   *   to a run the caller's turn joins, and that run is unlabelled.
+   *   slot while the wake prepares, the notice content is still sent; the
+   *   runtime delivers it to the caller's run or to a run it starts after
+   *   that, and neither run is labelled.
    */
   origin?: 'wake';
   /**

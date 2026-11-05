@@ -14940,10 +14940,8 @@ export class Session {
    * PF-7473: `requireActiveRun` is the opposite, interleave-only mode (it never
    * wakes an idle thread), and `assertAdmitted` re-proves the sender's own
    * admission after subscription setup. PF-7626: `wakeNoticeId` marks an idle
-   * wake as a settlement-notice wake, published on its `agent_start`;
-   * `noticeMemoryModeId` names the mode whose agent memory holds a reminder row
-   * with the content, so a wake that lost its idle slot may stand down when
-   * that is the agent it dispatches through.
+   * wake as a settlement-notice wake, published on its `agent_start` only
+   * while the wake still holds its idle slot at dispatch.
    */
   private async _injectSystemReminder(
     content: string,
@@ -14952,7 +14950,6 @@ export class Session {
       signalId?: string;
       admissionEpoch?: number;
       wakeNoticeId?: string;
-      noticeMemoryModeId?: string;
       requireActiveRun?: boolean;
       assertAdmitted?: () => void;
     },
@@ -15044,21 +15041,17 @@ export class Session {
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
-        // An idle-only wake re-proves its slot in the same tick as its dispatch.
-        // A caller turn that began or started a run during the context await
-        // keeps the slot, and that run is never announced as this wake. When the
-        // active mode's agent has the memory that holds the reminder row, the
-        // wake stands down, because that turn loads the row; otherwise the
-        // content is still sent, unlabelled, so the runtime delivers it to the
-        // caller's run or starts a run with it. A Stop always refuses.
+        // An idle-only wake re-checks in the same tick as its dispatch. A Stop
+        // during the context await refuses it (the Stop contract: not stopped or
+        // cancelled since the settlement). If a caller turn began or started a
+        // run during the await, it keeps the slot: the content is sent exactly
+        // as fork main sends it; only the wake label is dropped, so that run is
+        // never announced as this wake.
         if (idleOnlyEpoch !== undefined) {
-          idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
-          const rowInDispatchMemory =
-            internal?.noticeMemoryModeId !== undefined &&
-            this._harness.getAgentForMode(internal.noticeMemoryModeId) === agent;
-          if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch) || (idleSlotLost && rowInDispatchMemory)) {
+          if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
             throw new HarnessBusyError(this.id, 'in_flight');
           }
+          idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
         }
 
         dispatched = agent.sendSignal(
@@ -24209,8 +24202,7 @@ export class Session {
       // does: no synthetic broadcast run occupies the thread, so a following
       // idle wake is not mistaken for an interleave, and nothing is handed to
       // an ungated follow-up run.
-      const noticeMemory = await this._resolveDelegationNoticeMemory(notice);
-      const memory = noticeMemory?.memory;
+      const memory = await this._resolveDelegationNoticeMemory(notice);
       // Shutdown may have begun while the notice was re-read and memory resolved.
       if (!live()) return;
       if (memory !== undefined && memory !== null) {
@@ -24253,23 +24245,16 @@ export class Session {
         await this._injectSystemReminder(
           content,
           { attributes, metadata },
-          {
-            signalId,
-            admissionEpoch,
-            wakeNoticeId: signalId,
-            ...(noticeMemory !== undefined ? { noticeMemoryModeId: noticeMemory.modeId } : {}),
-          },
+          { signalId, admissionEpoch, wakeNoticeId: signalId },
         );
       }
     } catch {
       // After the claim nothing is owed. A wake that lost its slot during the
-      // context await stands down only when the active mode's agent has the
-      // memory that holds the row, so the turn that took the slot loads it;
-      // otherwise it is still sent, unlabelled. Refusals
-      // before the turn begins (a Stop, or a run already active) drop the wake
-      // whether or not a row exists (PF-7679). Before the claim, the notice
-      // stays durable and the row is rewritten in place on retry, so copies
-      // cannot accumulate.
+      // context await is still sent exactly as fork main sends it, unlabelled.
+      // Refusals (a Stop, or a run already active before the turn begins) drop
+      // the wake whether or not a row exists (PF-7679). Before the claim, the
+      // notice stays durable and the row is rewritten in place on retry, so
+      // copies cannot accumulate.
       if (!claimed) this._scheduleDelegationReconcileRetry(retryAttempt);
     } finally {
       this._delegationNoticesInFlight.delete(key);
@@ -24284,14 +24269,13 @@ export class Session {
    * task: binding requires memory there for `remind`, and the parent's next
    * turn in that mode reads the row from its thread history. Memory resolves
    * with the parent's own request context, as its turns do, so a dynamic memory
-   * resolver selects the parent's store. Returns the mode whose agent supplied
-   * the memory with it. Undefined only when neither mode has memory (a
-   * Stop-downgraded `wake` notice of a memory-less parent, or a delegating mode
-   * removed from the configuration since).
+   * resolver selects the parent's store. Undefined only when neither mode has
+   * memory (a Stop-downgraded `wake` notice of a memory-less parent, or a
+   * delegating mode removed from the configuration since).
    */
   private async _resolveDelegationNoticeMemory(
     notice: PendingDelegationSettlementNotice,
-  ): Promise<{ memory: MastraMemory; modeId: string } | undefined> {
+  ): Promise<MastraMemory | undefined> {
     const activeModeId = this._currentRunModeId ?? this._record.modeId;
     const modeIds = [activeModeId];
     if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
@@ -24308,7 +24292,7 @@ export class Session {
           : {}),
       });
       const memory = await agent.getMemory({ requestContext });
-      if (memory !== undefined && memory !== null) return { memory, modeId };
+      if (memory !== undefined && memory !== null) return memory;
     }
     return undefined;
   }

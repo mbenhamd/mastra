@@ -12,4 +12,4 @@ session.subscribe(event => {
 });
 ```
 
-Differs from fork main: if Stop lands while a claimed wake builds its context, the notice is not delivered (honours the Stop contract 'not stopped or cancelled since the settlement').
+Differs from fork main: if Stop lands while a claimed wake builds its context, the wake does not run (honours the Stop contract 'not stopped or cancelled since the settlement'). Without memory the notice is then not delivered; with memory, the persisted notice stays in thread history for the next turn.

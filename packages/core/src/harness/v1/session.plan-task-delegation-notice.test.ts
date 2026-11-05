@@ -882,8 +882,8 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
   });
 
   // PF-7626: the wake passes its idle check, then awaits turn context. A user
-  // turn that starts its run inside that await keeps the only turn, and its
-  // agent_start must not be labelled as the wake.
+  // turn that starts its run inside that await keeps the slot; the wake's
+  // content is sent as on fork main, and no agent_start is labelled a wake.
   it('a user turn that starts while the claimed wake builds its context is never labelled a wake', async () => {
     const memory = new MockMemory();
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
@@ -892,7 +892,6 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
       const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
       const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
       releases.push(releaseChild);
-      const turns = trackTurns(parent);
       const starts: Array<Record<string, unknown>> = [];
       parent.subscribe(event => {
         if (event.type === 'agent_start') starts.push({ ...event });
@@ -927,13 +926,10 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
       await user!.end();
       await deliveryFinished(parent, taskId);
 
-      // Only the user's turn ran, and its agent_start carries no wake identity.
+      // The content is sent exactly as on fork main; no agent_start carries the wake identity.
       expect(starts.filter(s => 'origin' in s || 'wakeNoticeId' in s)).toEqual([]);
-      expect(starts).toHaveLength(1);
-      expect(turns.order).toEqual(['start', 'end']);
-      expect(turns.maxActive()).toBe(1);
-      expect(reminderCalls(parentAgent)).toHaveLength(0);
-      // The claimed notice is delivered once: the user turn reads the persisted row.
+      expect(reminderCalls(parentAgent)).toHaveLength(1);
+      // The persisted row is written once.
       const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
       expect(messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'))).toHaveLength(1);
       expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
@@ -1027,8 +1023,9 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
 // PF-7626: the race path with REAL parent Agents over one mock model, so thread
 // history and queued signals reach the provider prompt through the real
 // runtime. A user turn starts its run while the claimed wake builds its turn
-// context. No agent_start may carry the wake label, and the notice text must
-// reach exactly one provider prompt, except after a Stop, which the Stop
+// context. The wake then sends its content exactly as fork main does and only
+// drops its label: no agent_start may carry origin or wakeNoticeId. The one
+// difference from fork main is a Stop during the build await, which the Stop
 // contract ("not stopped or cancelled since the settlement") keeps silent.
 describe('a caller turn that takes the slot from the claimed wake (real Agent model input)', () => {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
@@ -1108,37 +1105,45 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     memory: boolean;
     /** The parent switches to the memory-less `quiet-mode` before the settlement. */
     switchToQuietMode: boolean;
+    /** The caller turn that takes the slot runs `quiet-mode` through a per-turn override. */
+    callerQuietMode: boolean;
     /** A Stop lands with the caller turn during the wake's context build. */
     stop: boolean;
     /** Where the notice text must land. */
-    expected: 'caller-history' | 'caller-next-input' | 'nowhere';
+    expected: 'as-main' | 'caller-next-input' | 'nowhere';
   };
 
   it.each([
     [
-      'active mode memory: R1 loads the row and the wake stands down',
-      { memory: true, switchToQuietMode: false, stop: false, expected: 'caller-history' },
+      'active mode memory: delivered as on fork main',
+      { memory: true, switchToQuietMode: false, callerQuietMode: false, stop: false, expected: 'as-main' },
     ],
     [
       'no memory: the unlabelled signal reaches R1',
-      { memory: false, switchToQuietMode: false, stop: false, expected: 'caller-next-input' },
+      { memory: false, switchToQuietMode: false, callerQuietMode: false, stop: false, expected: 'caller-next-input' },
     ],
     [
-      'only the delegating mode has memory: the unlabelled signal reaches the memory-less R1',
-      { memory: true, switchToQuietMode: true, stop: false, expected: 'caller-next-input' },
+      'only the delegating mode has memory: delivered as on fork main',
+      { memory: true, switchToQuietMode: true, callerQuietMode: false, stop: false, expected: 'as-main' },
+    ],
+    [
+      'the caller turn runs a memory-less agent: delivered as on fork main',
+      { memory: true, switchToQuietMode: false, callerQuietMode: true, stop: false, expected: 'as-main' },
     ],
     // Differs from fork main by design: main delivered after the Stop.
     [
       'a Stop with the caller turn: the notice reaches no model input',
-      { memory: false, switchToQuietMode: false, stop: true, expected: 'nowhere' },
+      { memory: false, switchToQuietMode: false, callerQuietMode: false, stop: true, expected: 'nowhere' },
     ],
   ] as Array<[string, Row]>)('%s', async (_label, row) => {
     const ctx = realParent(row.memory);
     try {
       const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
       const starts: Array<Record<string, unknown>> = [];
+      const ended: string[] = [];
       parent.subscribe(event => {
         if (event.type === 'agent_start') starts.push({ ...event });
+        if (event.type === 'agent_end') ended.push((event as { runId: string }).runId);
       });
 
       // R0 delegates the task and ends; the child is held.
@@ -1180,7 +1185,10 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         // The user's own message() reaches this seam, so mark the hold taken first.
         if (wakeAdmitted && !held) {
           held = true;
-          user = parent.message({ content: 'what happened?' });
+          user = parent.message({
+            content: 'what happened?',
+            ...(row.callerQuietMode ? { mode: 'quiet-mode' } : {}),
+          });
           void user.catch(() => {});
           await poll(() => ctx.prompts.length === 2);
           if (row.stop) {
@@ -1194,25 +1202,30 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       // Record the wake's dispatch and whether R1 was still on its held provider call.
       let r1Released = false;
       const reminderDispatches: Array<{ callerRunActive: boolean }> = [];
+      const reminderRunIds: string[] = [];
       for (const agent of ctx.agents) {
         const sendSignal = agent.sendSignal.bind(agent);
         vi.spyOn(agent, 'sendSignal').mockImplementation(((signal: { type?: string }, opts: unknown) => {
-          if (signal?.type === 'system-reminder') {
-            reminderDispatches.push({ callerRunActive: ctx.prompts.length === 2 && !r1Released });
-          }
-          return sendSignal(signal as never, opts as never);
+          if (signal?.type !== 'system-reminder') return sendSignal(signal as never, opts as never);
+          reminderDispatches.push({ callerRunActive: ctx.prompts.length === 2 && !r1Released });
+          const result = sendSignal(signal as never, opts as never);
+          reminderRunIds.push((result as { runId: string }).runId);
+          return result;
         }) as never);
       }
 
       releaseChild();
       await poll(() => user !== undefined);
-      // The wake has either dispatched into R1 or stood down.
+      // The wake has either dispatched or been refused.
       await poll(() => reminderDispatches.length > 0 || (parent as any)._delegationNoticesInFlight.size === 0);
       r1Released = true;
       releaseR1();
       await user!.catch(() => {});
       await stopping?.catch(() => {});
       await deliveryFinished(parent, taskId);
+      // A wake signal queued behind a caller run on another agent starts its own
+      // run once R1 clears the thread; wait for every dispatched run to end.
+      await poll(() => reminderRunIds.every(id => ended.includes(id)));
 
       // The interleave happened: R1's provider call began during the wake's context build.
       expect(held).toBe(true);
@@ -1222,20 +1235,20 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       if (row.expected === 'nowhere') {
         expect(withNotice).toHaveLength(0);
         expect(reminderDispatches).toEqual([]);
-      } else {
-        // Exactly one provider prompt after the settlement carries the notice text.
-        expect(withNotice).toHaveLength(1);
-        expect(noticeCount(withNotice[0]!)).toBe(1);
-        // It is R1's: that prompt carries the user's message.
-        expect(withNotice[0]).toContain('what happened?');
       }
-      if (row.expected === 'caller-history') {
-        // R1 loaded the persisted row from history; the wake stood down.
-        expect(noticeCount(ctx.prompts[1]!)).toBe(1);
-        expect(reminderDispatches).toEqual([]);
+      if (row.expected === 'as-main') {
+        // Fork main's delivery: the content is sent and reaches a model input.
+        // A second copy through the persisted row is possible, as on fork main
+        // (pre-existing, tracked in PF-7679), so this asserts at least one.
+        expect(withNotice.length).toBeGreaterThanOrEqual(1);
+        expect(reminderDispatches).toHaveLength(1);
       }
       if (row.expected === 'caller-next-input') {
-        // R1 cannot load a row: the wake's signal reached R1, unlabelled, as its next model input.
+        // Exactly one provider prompt carries the notice text: R1's next model
+        // input after its held call, through the unlabelled signal.
+        expect(withNotice).toHaveLength(1);
+        expect(noticeCount(withNotice[0]!)).toBe(1);
+        expect(withNotice[0]).toContain('what happened?');
         expect(noticeCount(ctx.prompts[1]!)).toBe(0);
         expect(reminderDispatches).toEqual([{ callerRunActive: true }]);
         expect(ctx.prompts.indexOf(withNotice[0]!)).toBeGreaterThan(1);
