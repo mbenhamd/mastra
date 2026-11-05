@@ -4180,10 +4180,28 @@ export class Session {
     // blocks the close. A resume still running here is left to finish.
     const due = this._record.pendingResume;
     if (due !== undefined && this._pendingInteractionDueAt(due) <= Date.now()) {
-      await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(due), {
-        drainQueue: false,
-        whileClosing: true,
-      });
+      try {
+        await this._reconcilePendingInteractionDeadlineGeneration(this._pendingInteractionGeneration(due), {
+          drainQueue: false,
+          whileClosing: true,
+        });
+      } catch (error) {
+        // PF-7631: a resumed wake turn has no caller to report to. When its
+        // stale-resume settlement does not commit, the failure is surfaced,
+        // the interaction stays parked, and the scan below refuses the close
+        // typed, as for an orphaned wake. The re-drive emits per attempt only
+        // while live, so a closing session reports the failure here.
+        const admission = await this._probeResumeAdmissionByRun(due).catch(() => undefined);
+        if (!admission || !isHarnessWakeReservedKey(admission.admissionId)) throw error;
+        if (this._state !== 'live') {
+          this._emitTurnEvent({
+            type: 'error',
+            runId: due.runId,
+            signalId: admission.signalId,
+            error: projectHarnessPublicError(error),
+          });
+        }
+      }
     }
     const { blockedBy } = await this._recoverOrphanedMessageDispatches();
     if (blockedBy !== undefined) return blockedBy;
