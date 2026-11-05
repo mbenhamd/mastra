@@ -49,13 +49,21 @@ import type { HarnessSubagentResultSummary } from './terminal-subagent-result';
 export const PLAN_TASK_UPDATED_EVENT = 'papersflow.plan_task.updated';
 
 /**
- * A plan is deliberately small and operational. This bound guarantees that a
- * single logical mutation (including a full reset or worst-case ancestor
- * rollup) fits the transaction contract implemented by every supported Harness
- * storage adapter. Larger bodies belong in workspace artifacts, not in the
- * task tracker.
+ * A plan is deliberately small and operational. This bound caps the LIVE
+ * (non-terminal) tasks a session may hold after a create: completed, cancelled
+ * and failed tasks do not count, so a long thread that keeps finishing its
+ * plans can always plan again. Larger bodies belong in workspace artifacts, not
+ * in the task tracker.
  */
 export const PLAN_TASK_MAX_NODES = 100;
+/**
+ * Hard bound on ALL stored tasks in a session, terminal ones included. Finished
+ * tasks are kept for history, so this bound is what keeps every whole-plan
+ * operation finite: the full in-memory load each mutation performs, a full
+ * reset (one transaction), a delegated-subtree settlement, and the
+ * `plan_task_check` read the model pages through.
+ */
+export const PLAN_TASK_MAX_STORED_NODES = 1000;
 /** Task labels stay concise; larger working material belongs in artifacts. */
 export const PLAN_TASK_CONTENT_MAX_BYTES = 512;
 export const PLAN_TASK_ACTIVE_FORM_MAX_BYTES = 256;
@@ -284,11 +292,29 @@ async function loadAllTasks(port: PlanTaskSessionPort): Promise<HarnessPlanTask[
   return all;
 }
 
-function assertPlanTaskCapacity(currentCount: number, additions: number): void {
-  if (currentCount + additions > PLAN_TASK_MAX_NODES) {
+/**
+ * Admit a create against both plan bounds using the committed post-image: the
+ * structural rows plus the final statuses from rollup. Counting the post-image
+ * (not `current + additions`) makes a new terminal task free and charges a
+ * derived ancestor that a new child reopens.
+ */
+function assertPlanTaskCapacity(postTasks: HarnessPlanTask[], deltas: PlanTaskDelta[]): void {
+  if (postTasks.length > PLAN_TASK_MAX_STORED_NODES) {
     throw new HarnessValidationError(
       'planTasks',
-      `plan task limit is ${PLAN_TASK_MAX_NODES} nodes; requested mutation would create ${currentCount + additions}`,
+      `stored plan task limit is ${PLAN_TASK_MAX_STORED_NODES} nodes; requested mutation would store ${postTasks.length}`,
+    );
+  }
+  const finalStatus = new Map<string, HarnessPlanTaskStatus>();
+  for (const delta of deltas) finalStatus.set(delta.taskId, delta.status);
+  let live = 0;
+  for (const task of postTasks) {
+    if (!TERMINAL_PLAN_TASK_STATUSES.has(finalStatus.get(task.taskId) ?? task.status)) live += 1;
+  }
+  if (live > PLAN_TASK_MAX_NODES) {
+    throw new HarnessValidationError(
+      'planTasks',
+      `plan task limit is ${PLAN_TASK_MAX_NODES} live (not completed, cancelled or failed) nodes; requested mutation would leave ${live}`,
     );
   }
 }
@@ -482,7 +508,7 @@ function buildCommitOps(
     }
     // Fold status/timestamp fields into an existing structural update for the
     // same row. Besides avoiding a redundant OCC hop, this guarantees a plan
-    // capped at PLAN_TASK_MAX_NODES can never expand into N+1 transaction ops.
+    // of N stored rows can never expand into N+1 transaction ops.
     const updateOp = structuralOps.find(o => o.kind === 'update' && o.taskId === id) as
       | Extract<PlanTaskMutationOp, { kind: 'update' }>
       | undefined;
@@ -661,7 +687,6 @@ export async function planTaskAdd(port: PlanTaskSessionPort, input: AddTaskInput
       return toView(existing);
     }
   }
-  assertPlanTaskCapacity(tasks.length, 1);
   const index = indexPlanTasks(tasks);
   if (input.parentTaskId !== undefined && !index.byId.has(input.parentTaskId)) {
     throw new HarnessValidationError('parentTaskId', `unknown parent task "${input.parentTaskId}"`);
@@ -731,6 +756,7 @@ export async function planTaskAdd(port: PlanTaskSessionPort, input: AddTaskInput
 
   const structuralOps: PlanTaskMutationOp[] = [{ kind: 'create', task: newTask }];
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
+  assertPlanTaskCapacity(postTasks, deltas);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   emit(port, 'add', [taskId], deltas);
@@ -757,8 +783,15 @@ export async function planTaskDecompose(
   if (!Array.isArray(children) || children.length === 0) {
     throw new HarnessValidationError('children', 'decompose requires at least one child task');
   }
+  // Every child is created pending (live), so an oversized call can never fit;
+  // reject it before the per-child validation and cycle work.
+  if (children.length > PLAN_TASK_MAX_NODES) {
+    throw new HarnessValidationError(
+      'planTasks',
+      `plan task limit is ${PLAN_TASK_MAX_NODES} live (not completed, cancelled or failed) nodes; decompose requested ${children.length} children`,
+    );
+  }
   const tasks = await loadAllTasks(port);
-  assertPlanTaskCapacity(tasks.length, children.length);
   const index = indexPlanTasks(tasks);
   if (!index.byId.has(parentTaskId)) {
     throw new HarnessValidationError('parentTaskId', `unknown parent task "${parentTaskId}"`);
@@ -840,6 +873,7 @@ export async function planTaskDecompose(
 
   const structuralOps: PlanTaskMutationOp[] = created.map(task => ({ kind: 'create', task }));
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
+  assertPlanTaskCapacity(postTasks, deltas);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   const ids = created.map(t => t.taskId);
@@ -1933,16 +1967,17 @@ export function clampPlanTaskCheckLimit(limit: number | undefined): number {
  * cap so the read stays bounded regardless of caller input. */
 export async function planTaskCheck(port: PlanTaskSessionPort, input: CheckInput): Promise<PlanTaskCheckResult> {
   const limit = clampPlanTaskCheckLimit(input.limit);
-  // Read the complete transaction-bounded plan (at most 100 nodes) so the
-  // model-facing cursor is stable across byte-budgeted pages. The serialized
-  // tool result below remains independently capped.
+  // Read the complete stored plan (finished tasks included, bounded by
+  // PLAN_TASK_MAX_STORED_NODES) so the model-facing cursor is stable across
+  // byte-budgeted pages and reaches the newest plan after many finished ones.
+  // The serialized tool result below remains independently capped.
   const read: Promise<LoadPlanTaskSubtreeResult> = port.storage.loadPlanTaskSubtree({
     harnessName: port.harnessName,
     sessionId: port.id,
     rootTaskId: input.rootTaskId,
     depth: input.depth,
     status: input.status,
-    limit: PLAN_TASK_CHECK_MAX_LIMIT,
+    limit: PLAN_TASK_MAX_STORED_NODES,
   });
   const rootRead =
     input.rootTaskId === undefined
