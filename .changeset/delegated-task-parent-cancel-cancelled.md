@@ -2,6 +2,17 @@
 '@mastra/core': patch
 ---
 
-A delegated plan task now settles as `cancelled` when its parent cancels the subagent. This covers the `subagent` tool's cancel and `cancelSubagent`. The `subagent` tool's status view reports the task as `cancelled`. Timeouts, child failures, a parent Stop, cascaded cancels and cancels by anyone else still settle as `failed`. When several cancels race, the first one committed decides the outcome, live and after a restart.
+A delegated plan task now ends as `cancelled` when the parent cancels its subagent with the `subagent` tool or `cancelSubagent`. The `subagent` tool's status view also shows `cancelled`.
 
-Type change: `DelegatedSubagentOutcome` and the plan task view's delegation `status` now include `'cancelled'`.
+Timeouts, child errors, stopping the parent, and cancels from anyone else still end as `failed`. If two cancels happen close together, the earlier one decides the result. This also holds after a restart.
+
+**Before / after**
+
+`DelegatedSubagentOutcome` and the plan task view's `delegation.status` now include `'cancelled'`. Before, a parent cancel showed as `'failed'`. Code that only checks `'failed'` must also handle `'cancelled'`:
+
+```ts
+const status = view.delegation?.status;
+if (status === 'failed' || status === 'cancelled') {
+  // the delegated task did not complete
+}
+```

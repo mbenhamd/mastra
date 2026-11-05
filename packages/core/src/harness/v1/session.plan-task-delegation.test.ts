@@ -1518,6 +1518,13 @@ describe('task_delegate — rollup from subagent outcome', () => {
       dependent: 'blocked',
     },
     {
+      shape: 'targeted cancel, then the child reports completed',
+      settle: 'targeted_then_completes',
+      task: 'cancelled',
+      root: 'completed',
+      dependent: 'blocked',
+    },
+    {
       shape: 'targeted cancel, then the child result rejects',
       settle: 'targeted_then_rejects',
       task: 'cancelled',
@@ -1562,6 +1569,8 @@ describe('task_delegate — rollup from subagent outcome', () => {
           })
         : top;
     if (owner !== top) await openTurn(owner);
+    const ownerEvents: any[] = [];
+    owner.subscribe(event => ownerEvents.push(event));
     const tools = createPlanTaskTools(owner);
     const add = async (input: Record<string, unknown>) =>
       ((await tools[TASK_ADD_TOOL_ID]!.execute!(input as any, toolCtx)) as any).taskId as string;
@@ -1634,6 +1643,9 @@ describe('task_delegate — rollup from subagent outcome', () => {
       await commitUnobservedCancel({ reason: 'subagent_cancelled', targeted: true });
       await owner.cancel();
     }
+    if (settle === 'targeted_then_completes') {
+      await commitUnobservedCancel({ reason: 'subagent_cancelled', targeted: true });
+    }
     if (settle === 'targeted_then_rejects') {
       await subagentCancel(owner, childId);
       await poll(() => rejectResult !== undefined);
@@ -1646,7 +1658,14 @@ describe('task_delegate — rollup from subagent outcome', () => {
     expect(settled?.status).toBe(task);
     const settlement = readDelegationAttemptMetadata(settled!)?.settlement;
     expect(settlement?.outcome).toBe(task);
-    if (task === 'cancelled') expect(settlement?.result?.error?.code).toBe('harness.subagent_cancelled');
+    if (task === 'cancelled') {
+      // A cancelled settlement keeps no report the child may have produced.
+      expect(settlement?.result).toMatchObject({ status: 'error', error: { code: 'harness.subagent_cancelled' } });
+      expect(settlement?.result?.outcome).toBeUndefined();
+      const ended = ownerEvents.find(event => event.type === 'subagent_end' && event.subagentSessionId === childId);
+      expect(ended).toMatchObject({ isError: true, output: { error: { code: 'harness.subagent_cancelled' } } });
+      expect(ended.output.outcome).toBeUndefined();
+    }
     expect((await planRow(owner, rootId))?.status).toBe(root);
     expect((await planRow(owner, dependentId))?.status).toBe(dependent);
     for (const close of closers) close();
@@ -2449,6 +2468,11 @@ describe('task_delegate — recovery on rehydrate', () => {
       task: 'cancelled',
     },
     {
+      shape: 'targeted cancel with the delegation_timeout reason',
+      cancelRequest: { reason: 'delegation_timeout', targeted: true },
+      task: 'cancelled',
+    },
+    {
       shape: 'untargeted subagent_cancelled from the parent',
       cancelRequest: { reason: 'subagent_cancelled' },
       task: 'failed',
@@ -2470,7 +2494,9 @@ describe('task_delegate — recovery on rehydrate', () => {
       await poll(async () => (await planRow(parentB, crashed.taskId))?.delegatedSubagentSessionId === undefined, 5_000);
       const settled = await planRow(parentB, crashed.taskId);
       expect(settled?.status).toBe(task);
-      expect(readDelegationAttemptMetadata(settled!)?.settlement?.outcome).toBe(task);
+      const settlement = readDelegationAttemptMetadata(settled!)?.settlement;
+      expect(settlement?.outcome).toBe(task);
+      if (task === 'cancelled') expect(settlement?.result?.error?.code).toBe('harness.subagent_cancelled');
       expect(b.childAgent.streamCalls).toHaveLength(0);
       await b.harness.shutdown();
     } finally {

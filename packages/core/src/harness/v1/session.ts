@@ -24030,7 +24030,9 @@ export class Session {
     // Anything but `settled` leaves the durable task to restart reconciliation.
     let settlement: DelegationDriveSettlement = 'error';
     try {
-      const summary = summarizeHarnessSubagentResult(rawResult, {
+      // The parent's cancel overrides any report the child produced, so the
+      // summary leaves it out, as restart reconcile does.
+      const summary = summarizeHarnessSubagentResult(outcome === 'cancelled' ? undefined : rawResult, {
         isError: outcome !== 'completed',
         ...(publicError !== undefined ? { error: publicError } : {}),
         ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
@@ -24751,11 +24753,15 @@ export class Session {
           needsRetry = true;
           continue;
         }
+        // The targeted marker, not the reason, decides the outcome.
+        const parentCancelled = isParentRequestedSubagentCancel(childRecord.cancelRequest, this.id);
         await this._reconcileDelegatedTask(
           task.taskId,
           childId,
-          isParentRequestedSubagentCancel(childRecord.cancelRequest, this.id) ? 'cancelled' : 'failed',
-          childRecord.cancelRequest.reason === 'delegation_timeout' && delegationAttempt !== undefined
+          parentCancelled ? 'cancelled' : 'failed',
+          !parentCancelled &&
+            childRecord.cancelRequest.reason === 'delegation_timeout' &&
+            delegationAttempt !== undefined
             ? summarizeDelegationDeadline(delegationAttempt.deadlineAt)
             : undefined,
           { childCancelRequest: childRecord.cancelRequest },
