@@ -285,7 +285,7 @@ describe('subagent control tool', () => {
     await harness.shutdown();
   });
 
-  it('cancel acknowledges a live child, then the delegation settles failed; a second cancel is a no-op', async () => {
+  it('cancel acknowledges a live child, then the delegation settles cancelled; a second cancel is a no-op', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const closeTurn = await openParentTurn(parent, parentAgent);
@@ -298,11 +298,11 @@ describe('subagent control tool', () => {
     releaseChild();
     const waited = await run({ action: 'wait', subagentSessionId: childId, timeoutMs: 5_000 });
     expect(waited.settledSubagents).toEqual([
-      expect.objectContaining({ subagentSessionId: childId, status: 'failed', cancelRequested: true }),
+      expect.objectContaining({ subagentSessionId: childId, status: 'cancelled', cancelRequested: true }),
     ]);
 
     const again = await run({ action: 'cancel', subagentSessionId: childId });
-    expect(again).toMatchObject({ cancel: 'already_settled', settled: true, status: 'failed' });
+    expect(again).toMatchObject({ cancel: 'already_settled', settled: true, status: 'cancelled' });
 
     closeTurn();
     await harness.shutdown();
@@ -1874,7 +1874,7 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
       const settledA = await run({ action: 'wait', subagentSessionId: children.a, timeoutMs: 5_000 });
       const settledB = await run({ action: 'wait', subagentSessionId: children.b, timeoutMs: 5_000 });
       expect(settledA.settledSubagents).toEqual([
-        expect.objectContaining({ subagentSessionId: children.a, status: 'failed', cancelRequested: true }),
+        expect.objectContaining({ subagentSessionId: children.a, status: 'cancelled', cancelRequested: true }),
       ]);
       expect(settledB.settledSubagents).toEqual([
         expect.objectContaining({ subagentSessionId: children.b, status: 'completed' }),
