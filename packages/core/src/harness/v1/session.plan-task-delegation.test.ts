@@ -37,6 +37,7 @@ import { MockAgent } from './__test-utils__';
 import { sha256CanonicalJson } from './canonical-json';
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
+import { readDelegationAttemptMetadata } from './plan-task-session';
 import {
   createPlanTaskTools,
   TASK_ADD_TOOL_ID,
@@ -1472,37 +1473,35 @@ describe('task_delegate — rollup from subagent outcome', () => {
 
   // PF-7706: how each delegated settlement reaches the plan. The delegated task
   // sits under a root next to an already-completed sibling, and a top-level
-  // task depends on it. `cancelled` is skipped work, so only the parent's own
-  // cancel leaves the root completed; a dependency still needs `completed`.
+  // task depends on it. `cancelled` is skipped work, so only the plan owner's
+  // own targeted cancel leaves the root completed, whatever its reason; a
+  // dependency still needs `completed`. Every other cancel source, including a
+  // public cancel that names the owner and a cancel cascading from the owner's
+  // own parent, stays `failed`.
+  const failedRollup = { task: 'failed', root: 'failed', dependent: 'blocked' } as const;
   it.each([
+    { shape: 'child completed', settle: 'complete', task: 'completed', root: 'completed', dependent: 'pending' },
     {
-      shape: 'child completed',
-      settle: 'complete',
-      task: 'completed',
-      root: 'completed',
-      dependent: 'pending',
-    },
-    {
-      shape: 'parent cancels via the subagent tool',
-      settle: 'parent_cancel',
+      shape: 'owner cancels via the subagent tool',
+      settle: 'owner_cancel',
       task: 'cancelled',
       root: 'completed',
       dependent: 'blocked',
     },
     {
-      shape: 'delegation deadline passes',
-      settle: 'timeout',
-      task: 'failed',
-      root: 'failed',
+      shape: 'owner cancelSubagent with a custom reason',
+      settle: 'owner_cancel_custom_reason',
+      task: 'cancelled',
+      root: 'completed',
       dependent: 'blocked',
     },
-    {
-      shape: 'child reports failure',
-      settle: 'child_error',
-      task: 'failed',
-      root: 'failed',
-      dependent: 'blocked',
-    },
+    { shape: 'delegation deadline passes', settle: 'timeout', ...failedRollup },
+    { shape: 'child reports failure', settle: 'child_error', ...failedRollup },
+    { shape: 'owner is stopped (parent_cancelled cascade)', settle: 'owner_stop', ...failedRollup },
+    { shape: 'owner records parent_work_aborted', settle: 'work_aborted', ...failedRollup },
+    { shape: 'another session cancels with subagent_cancelled', settle: 'foreign_cancel', ...failedRollup },
+    { shape: 'public cancel naming the owner with subagent_cancelled', settle: 'untargeted_cancel', ...failedRollup },
+    { shape: "owner's parent cancels the owner via the subagent tool", settle: 'grandparent_cancel', ...failedRollup },
   ] as const)('$shape: task $task, root $root, dependent $dependent', async ({ settle, task, root, dependent }) => {
     const { harness, parentAgent, childAgent } = buildHarness(
       new InMemoryDB(),
@@ -1514,9 +1513,33 @@ describe('task_delegate — rollup from subagent outcome', () => {
       finishReason: 'stop',
       terminalToolResult: outcomeTerminalResult(settle === 'child_error' ? 'failed' : 'completed'),
     });
-    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const close = await openParentTurn(parent, parentAgent);
-    const tools = createPlanTaskTools(parent);
+    const closers: Array<() => void> = [];
+    const openTurn = async (session: Session) => {
+      let release!: () => void;
+      const before = parentAgent.streamCalls.length;
+      parentAgent.enqueueRun({ holdUntil: new Promise<void>(r => (release = r)), finishReason: 'stop', text: 'done' });
+      const turn = session.message({ content: 'go' });
+      await poll(() => parentAgent.streamCalls.length > before);
+      closers.push(() => {
+        release();
+        void turn.catch(() => {});
+      });
+    };
+    const top = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    await openTurn(top);
+    // The plan owner is `top`, except in the nested row where it is a subagent of `top`.
+    const owner =
+      settle === 'grandparent_cancel'
+        ? await harness.session({
+            resourceId: 'u1',
+            threadId: { fresh: true },
+            parentSessionId: top.id,
+            origin: 'subagent-tool',
+            subagentDepth: 1,
+          })
+        : top;
+    if (owner !== top) await openTurn(owner);
+    const tools = createPlanTaskTools(owner);
     const add = async (input: Record<string, unknown>) =>
       ((await tools[TASK_ADD_TOOL_ID]!.execute!(input as any, toolCtx)) as any).taskId as string;
     const rootId = await add({ content: 'survey' });
@@ -1528,24 +1551,37 @@ describe('task_delegate — rollup from subagent outcome', () => {
       { taskId: delegatedId, agentType: 'worker' } as any,
       toolCtx,
     )) as any;
+    const childId = delegated.subagentSessionId as string;
     await poll(() => childAgent.streamCalls.length > 0);
+    const subagentCancel = async (by: Session, subagentSessionId: string) =>
+      expect(
+        await createSubagentControlTool(by)!.execute!({ action: 'cancel', subagentSessionId } as any, toolCtx),
+      ).toMatchObject({ cancel: 'acknowledged' });
 
-    if (settle === 'parent_cancel') {
-      const cancelled = await createSubagentControlTool(parent)!.execute!(
-        { action: 'cancel', subagentSessionId: delegated.subagentSessionId } as any,
-        toolCtx,
-      );
-      expect(cancelled).toMatchObject({ cancel: 'acknowledged' });
+    if (settle === 'owner_cancel') await subagentCancel(owner, childId);
+    if (settle === 'owner_cancel_custom_reason') {
+      await owner.cancelSubagent({ subagentSessionId: childId, reason: 'user_requested' });
     }
+    if (settle === 'grandparent_cancel') await subagentCancel(top, owner.id);
+    if (settle === 'owner_stop') await owner.cancel();
+    const publicCancel =
+      settle === 'work_aborted'
+        ? { reason: 'parent_work_aborted', requestedBy: owner.id }
+        : settle === 'foreign_cancel'
+          ? { reason: 'subagent_cancelled', requestedBy: 'another-session' }
+          : settle === 'untargeted_cancel'
+            ? { reason: 'subagent_cancelled', requestedBy: owner.id }
+            : undefined;
+    if (publicCancel !== undefined) await harness._internalGetLiveSession(childId)!.cancel(publicCancel);
     if (settle !== 'timeout') releaseChild();
 
-    await poll(async () => (await planRow(parent, delegatedId))?.delegatedSubagentSessionId === undefined, 3_000);
-    expect((await planRow(parent, delegatedId))?.status).toBe(task);
-    expect((await planRow(parent, rootId))?.status).toBe(root);
-    expect((await planRow(parent, dependentId))?.status).toBe(dependent);
-    const checked = (await tools[TASK_CHECK_TOOL_ID]!.execute!({ rootTaskId: delegatedId } as any, toolCtx)) as any;
-    expect(checked.tasks[0].delegation.status).toBe(task);
-    close();
+    await poll(async () => (await planRow(owner, delegatedId))?.delegatedSubagentSessionId === undefined, 3_000);
+    const settled = await planRow(owner, delegatedId);
+    expect(settled?.status).toBe(task);
+    expect(readDelegationAttemptMetadata(settled!)?.settlement?.outcome).toBe(task);
+    expect((await planRow(owner, rootId))?.status).toBe(root);
+    expect((await planRow(owner, dependentId))?.status).toBe(dependent);
+    for (const close of closers) close();
     await harness.shutdown();
   });
 });
@@ -2331,6 +2367,45 @@ describe('task_delegate — recovery on rehydrate', () => {
       await run.b.harness.shutdown();
     } finally {
       run.clock.mockRestore();
+    }
+  });
+
+  // PF-7706: a cancel committed on the child before its parent's owner crashed
+  // settles on restart reconcile. Only the harness-owned `targeted` marker from
+  // the parent makes it `cancelled`; the reason alone never does.
+  it.each([
+    {
+      shape: 'targeted cancel with a custom reason',
+      cancelRequest: { reason: 'user_requested', targeted: true },
+      task: 'cancelled',
+    },
+    {
+      shape: 'untargeted subagent_cancelled from the parent',
+      cancelRequest: { reason: 'subagent_cancelled' },
+      task: 'failed',
+    },
+  ] as const)('restart reconcile of a $shape settles $task', async ({ cancelRequest, task }) => {
+    const db = new InMemoryDB();
+    const crashed = await crashWithDelegatedChildMidCall(db);
+    try {
+      for (const [key, row] of db.harnessSessions) {
+        if (row.id === crashed.childId) {
+          db.harnessSessions.set(key, {
+            ...row,
+            cancelRequest: { requestedAt: Date.now(), requestedBy: crashed.parentId, ...cancelRequest },
+          });
+        }
+      }
+      const b = buildHarness(db);
+      const parentB = await b.harness.session({ sessionId: crashed.parentId, resourceId: 'u1' });
+      await poll(async () => (await planRow(parentB, crashed.taskId))?.delegatedSubagentSessionId === undefined, 5_000);
+      const settled = await planRow(parentB, crashed.taskId);
+      expect(settled?.status).toBe(task);
+      expect(readDelegationAttemptMetadata(settled!)?.settlement?.outcome).toBe(task);
+      expect(b.childAgent.streamCalls).toHaveLength(0);
+      await b.harness.shutdown();
+    } finally {
+      crashed.clock.mockRestore();
     }
   });
 

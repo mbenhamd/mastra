@@ -271,11 +271,7 @@ import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagen
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
 import { createHarnessSubagentBudgetMeter, harnessSubagentBudgetExhaustedError } from './subagent-budget';
 import type { HarnessSubagentBudgetExhaustion, HarnessSubagentBudgetMeter } from './subagent-budget';
-import {
-  createSubagentControlTool,
-  SUBAGENT_CONTROL_CANCEL_REASON,
-  SUBAGENT_CONTROL_TOOL_ID,
-} from './subagent-control-tool';
+import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-control-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
@@ -6473,9 +6469,9 @@ export class Session {
    * cascade as a full `cancel()` does for all children — so an inline
    * `spawn_subagent` child aborts its turn (the spawn tool's `finally` then closes
    * it), and a detached `task_delegate` child aborts + the delegation driver rolls
-   * its plan task up to `cancelled` (its `cancelRequest` is also honored by
-   * reconcile-on-rehydrate). Same-process only: a child owned by another live
-   * instance is not reachable here.
+   * its plan task up to `cancelled`, whatever the `reason` (its targeted
+   * `cancelRequest` is also honored by reconcile-on-rehydrate). Same-process
+   * only: a child owned by another live instance is not reachable here.
    */
   async cancelSubagent(opts: { subagentSessionId: string; reason?: string }): Promise<void> {
     this._assertNotDeleted();
@@ -6487,7 +6483,12 @@ export class Session {
     const child = this._harness._internalGetLiveSession(opts.subagentSessionId);
     if (!child) return; // not live in this process — best-effort no-op
     try {
-      await child._cancelInternal({ reason: opts.reason ?? 'subagent_cancelled', requestedBy: this.id }, this.id);
+      await child._cancelInternal(
+        { reason: opts.reason ?? 'subagent_cancelled', requestedBy: this.id },
+        this.id,
+        undefined,
+        true,
+      );
     } catch {
       // Best-effort: a late race (child already settling/closed) must not throw.
     }
@@ -6525,7 +6526,7 @@ export class Session {
       this._assertActiveWorkAdmission(epoch, 'subagent cancel', callerSignal);
     };
     assertAdmitted();
-    const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason, assertAdmitted);
+    const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason, assertAdmitted, true);
     if (unavailable.includes(subagentSessionId)) return 'unavailable';
     // A cold delegated child has no live driver in this process; reconciliation
     // maps its committed cancelRequest to a cancelled plan task. A live driver's
@@ -6569,6 +6570,8 @@ export class Session {
     reason: string,
     /** PF-7473: re-proves the caller is still admitted right before each child write. */
     assertAdmitted?: () => void,
+    /** PF-7706: only the `subagent` tool's cancel of one child; never a cascade. */
+    targeted = false,
   ): Promise<{ cancelled: string[]; unavailable: string[] }> {
     const cancelled: string[] = [];
     const unavailable: string[] = [];
@@ -6610,7 +6613,7 @@ export class Session {
       assertAdmitted?.();
       try {
         const alreadyCancelled = child.getRecord().cancelRequest !== undefined;
-        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id, assertAdmitted);
+        const nested = await child._cancelInternal({ reason, requestedBy: this.id }, this.id, assertAdmitted, targeted);
         if (!alreadyCancelled) cancelled.push(childId);
         unavailable.push(...nested.unavailable);
       } catch (error) {
@@ -6627,6 +6630,13 @@ export class Session {
     parentOrigin?: string,
     /** PF-7473: re-proved inside the serialized cancel write; a throw aborts it. */
     assertAdmitted?: () => void,
+    /**
+     * PF-7706: the parent's own targeted cancel of this one child
+     * (`cancelSubagent` or the `subagent` tool). Recorded on a new
+     * `cancelRequest` only; the first cancel request still wins, so a later
+     * targeted cancel never relabels an earlier Stop or cascade, and vice versa.
+     */
+    targeted = false,
   ): Promise<{ unavailable: string[] }> {
     this._assertNotDeleted();
     const existingCancel = this._currentCancelRequest();
@@ -6685,6 +6695,7 @@ export class Session {
           requestedAt,
           ...(reason !== undefined ? { reason } : {}),
           ...(requestedBy !== undefined ? { requestedBy } : {}),
+          ...(targeted ? { targeted: true as const } : {}),
         },
         pendingQueue: completedUnfinalizedItems.map(completed => completed.item),
       };
@@ -25345,13 +25356,15 @@ function createDeferred<T>(): Deferred<T> {
 
 /**
  * True when `parentSessionId` itself asked to stop exactly this child: the
- * `subagent` tool's cancel or `cancelSubagent`. A delegation timeout, the
- * parent's own Stop cascading to its children, and a cancel from anyone else
- * are not, so those settle the delegated task `failed`.
+ * `subagent` tool's cancel or `cancelSubagent`, which alone record the
+ * harness-owned `targeted` marker. The reason is not consulted. A delegation
+ * timeout, a cancel cascading down from the parent's own cancellation, and a
+ * cancel from anyone else carry no marker, so those settle the delegated task
+ * `failed`.
  */
 function isParentRequestedSubagentCancel(
   cancelRequest: SessionRecord['cancelRequest'],
   parentSessionId: string,
 ): boolean {
-  return cancelRequest?.requestedBy === parentSessionId && cancelRequest.reason === SUBAGENT_CONTROL_CANCEL_REASON;
+  return cancelRequest?.targeted === true && cancelRequest.requestedBy === parentSessionId;
 }
