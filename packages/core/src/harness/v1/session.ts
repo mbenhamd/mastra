@@ -24797,10 +24797,10 @@ export class Session {
           continue;
         }
         // A targeted cancel committed while the evidence read was pending wins
-        // over a failure, as it does in the live driver.
+        // over any evidence outcome, as it does in the live driver.
         let targetedCancel: SessionRecord['cancelRequest'];
         try {
-          targetedCancel = durable.outcome === 'failed' ? await this._loadTargetedDelegationCancel(childId) : undefined;
+          targetedCancel = await this._loadTargetedDelegationCancel(childId);
         } catch {
           needsRetry = true;
           continue;

@@ -1495,6 +1495,14 @@ describe('task_delegate — rollup from subagent outcome', () => {
       root: 'completed',
       dependent: 'blocked',
     },
+    {
+      // The one deliberate window: the driver already read the child's result.
+      shape: 'targeted cancel after the driver read the completed result',
+      settle: 'targeted_after_result',
+      task: 'completed',
+      root: 'completed',
+      dependent: 'pending',
+    },
     { shape: 'delegation deadline passes', settle: 'timeout', ...failedRollup },
     { shape: 'child reports failure', settle: 'child_error', ...failedRollup },
     { shape: 'owner is stopped (parent_cancelled cascade)', settle: 'owner_stop', ...failedRollup },
@@ -1591,6 +1599,27 @@ describe('task_delegate — rollup from subagent outcome', () => {
             const dispatched = await originalSignal(input);
             dispatched.result.catch(() => {});
             return { ...dispatched, result: new Promise<never>((_, reject) => (rejectResult = reject)) } as any;
+          });
+        }
+        return resolved;
+      });
+    }
+    // The targeted cancel commits as the driver closes the child, after it read the result.
+    if (settle === 'targeted_after_result') {
+      const originalSession = harness.session.bind(harness);
+      vi.spyOn(harness, 'session').mockImplementation(async (options: any) => {
+        const resolved = await originalSession(options);
+        if (options.parentSessionId === owner.id) {
+          const originalClose = resolved.close.bind(resolved);
+          vi.spyOn(resolved, 'close').mockImplementation(async () => {
+            await resolved._cancelInternal(
+              { reason: 'subagent_cancelled', requestedBy: owner.id },
+              owner.id,
+              undefined,
+              true,
+            );
+            expect(resolved.getRecord().cancelRequest).toMatchObject({ targeted: true });
+            return originalClose();
           });
         }
         return resolved;
@@ -2589,6 +2618,71 @@ describe('task_delegate — recovery on rehydrate', () => {
     } finally {
       crashed.clock.mockRestore();
     }
+  });
+
+  // PF-7706: the child completed and its `completed` evidence is durable, but
+  // the owner crashed while closing it. A targeted cancel committed during the
+  // recovery evidence read wins, as it does in the live driver.
+  it.each([
+    { shape: 'a targeted cancel commits during the evidence read', cancel: true, task: 'cancelled' },
+    { shape: 'no cancel', cancel: false, task: 'completed' },
+  ] as const)('restart reconcile of completed evidence with $shape settles $task', async ({ cancel, task }) => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parentA, a.parentAgent);
+    let closeStarted = false;
+    const originalSession = a.harness.session.bind(a.harness);
+    vi.spyOn(a.harness, 'session').mockImplementation(async (options: any) => {
+      const resolved = await originalSession(options);
+      if (options.parentSessionId === parentA.id) {
+        // The owner dies while closing the completed child.
+        vi.spyOn(resolved, 'close').mockImplementation(() => {
+          closeStarted = true;
+          return new Promise<void>(() => {});
+        });
+      }
+      return resolved;
+    });
+    const toolsA = createPlanTaskTools(parentA);
+    const taskId = ((await toolsA[TASK_ADD_TOOL_ID]!.execute!({ content: 'delegated' } as any, toolCtx)) as any)
+      .taskId as string;
+    const childId = (
+      (await toolsA[TASK_DELEGATE_TOOL_ID]!.execute!({ taskId, agentType: 'worker' } as any, toolCtx)) as any
+    ).subagentSessionId as string;
+    await poll(() => closeStarted);
+    closeTurn();
+    crashOwner(db, (parentA as any)._internalOwnerId);
+    vi.restoreAllMocks();
+
+    const storage = new GatedEvidenceReadStorage(db, childId);
+    const b = buildHarness(db, { storage });
+    if (cancel) {
+      storage.duringRead = async () => {
+        const child = await b.harness.session({ sessionId: childId, resourceId: 'u1' });
+        await child._cancelInternal(
+          { reason: 'subagent_cancelled', requestedBy: parentA.id },
+          parentA.id,
+          undefined,
+          true,
+        );
+      };
+    }
+    const parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+    await poll(async () => (await planRow(parentB, taskId))?.delegatedSubagentSessionId === undefined, 5_000);
+    const settled = await planRow(parentB, taskId);
+    expect(settled?.status).toBe(task);
+    const settlement = readDelegationAttemptMetadata(settled!)?.settlement;
+    expect(settlement?.outcome).toBe(task);
+    if (task === 'cancelled') {
+      expect(storage.duringRead).toBeUndefined();
+      // Like the live path, the cancelled settlement keeps no child report.
+      expect(settlement?.result).toMatchObject({ status: 'error', error: { code: 'harness.subagent_cancelled' } });
+      expect(settlement?.result?.outcome).toBeUndefined();
+    } else {
+      expect(settlement?.result).toMatchObject({ outcome: 'completed' });
+    }
+    await b.harness.shutdown();
   });
 
   it('publishes an interrupted delegation completion when its child is cancelled before the reconcile retry', async () => {
