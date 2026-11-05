@@ -245,6 +245,13 @@ describe('handleHarnessChatStream', () => {
             runId: 'harness-run-1',
             payload: { id: 'harness-message-1' },
           });
+          // The AI SDK transformer holds `start` until the first `step-start`, so
+          // without it the open stream yields nothing and the read never settles.
+          controller.enqueue({
+            type: 'step-start',
+            runId: 'harness-run-1',
+            payload: { request: {}, warnings: [], messageId: 'harness-message-1' },
+          });
         },
       }),
     } as MastraModelOutput);
