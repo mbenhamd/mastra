@@ -2252,6 +2252,12 @@ export class Session {
    */
   private readonly _delegationNoticeEpochs = new Map<string, number>();
   /**
+   * PF-7679: the history-load watch on each owed notice's reminder row, kept
+   * across delivery attempts until the notice is resolved or the session tears
+   * down, so a run that loads the row between two attempts still counts.
+   */
+  private readonly _delegationNoticeWatches = new Map<string, HistoryLoadWatch>();
+  /**
    * PF-7631: bumped synchronously by every `switchMode()` that changes the
    * mode, before its durable write, so a wake can prove no mode change
    * happened since its reminder row was saved.
@@ -22881,6 +22887,8 @@ export class Session {
     for (const timer of this._delegationReconcileRetryTimers) clearTimeout(timer);
     this._delegationReconcileRetryTimers.clear();
     this._delegationReconcileRerunRequested = false;
+    for (const watch of this._delegationNoticeWatches.values()) watch.dispose();
+    this._delegationNoticeWatches.clear();
   }
 
   private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
@@ -23762,6 +23770,9 @@ export class Session {
     }
     this._state = 'closing';
     this._rejectIdleWaiters(harnessSessionClosingError(this));
+    // PF-7679: a closing session retries no notice, so its kept row watches
+    // end here (a close that rolls back reconciles, and watches, again).
+    this._disposeKeptDelegationNoticeWatches(() => true);
   }
 
   /** @internal — restore admission if close failed before the durable marker committed. */
@@ -25211,6 +25222,28 @@ export class Session {
     // Another pass of this session is delivering it.
     if (this._delegationNoticesInFlight.has(key)) return 'superseded';
     this._delegationNoticesInFlight.add(key);
+    let outcome: DelegationNoticeOutcome = 'left_owed';
+    try {
+      outcome = await this._runDelegationSettlementNotice(notice, admissionEpoch, key, live);
+      return outcome;
+    } finally {
+      this._delegationNoticesInFlight.delete(key);
+      // The row's watch is kept for this session's own retry only while the
+      // notice is left owed in a live session that holds the lease (a lost
+      // lease hands the notice to the next holder); teardown disposes the rest.
+      if (outcome !== 'left_owed' || !live() || !this._sessionLeaseHeld()) {
+        this._delegationNoticeWatches.get(key)?.dispose();
+        this._delegationNoticeWatches.delete(key);
+      }
+    }
+  }
+
+  private async _runDelegationSettlementNotice(
+    notice: PendingDelegationSettlementNotice,
+    admissionEpoch: number,
+    key: string,
+    live: () => boolean,
+  ): Promise<DelegationNoticeOutcome> {
     const firstEpoch = this._delegationNoticeEpochs.get(key);
     if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
     else admissionEpoch = firstEpoch;
@@ -25219,7 +25252,16 @@ export class Session {
     const takeover = (claim: DelegationNoticeClaim) => noticeClaimTakeoverEligible(this._harness, claim);
     // The claim this delivery holds (its write may have landed), until resolved.
     let claimId: string | undefined;
-    let watch: HistoryLoadWatch | undefined;
+    let watch = this._delegationNoticeWatches.get(key);
+    // Wait the reconcile backoff for `attempt` (0-based), unless the session
+    // stops being live. False once the backoff passes its cap, or not live.
+    const backoff = async (attempt: number): Promise<boolean> => {
+      const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
+      if (backoffMs > DELEGATION_RECONCILE_RETRY_MAX_MS) return false;
+      const until = Date.now() + backoffMs;
+      while (live() && Date.now() < until) await this._nextStateTransition(until - Date.now());
+      return live();
+    };
     // Unserialized body: the caller runs it inside `_withNoticeFence`. A held
     // claim removes only itself; an unclaimed delivery removes a notice with no
     // claim or a claim reconcile may take over.
@@ -25257,8 +25299,9 @@ export class Session {
         });
       });
     // Clear this delivery's claim without a delivery (a stale or cancelled fence
-    // clears it as `remind`). The claim leaves the live set either way: cleared,
-    // gone, or (no write, or a failed one) dead, so reconcile may take it over.
+    // clears it as `remind`). The claim leaves the live set either way: cleared
+    // (or never landed, the notice still owed and claimable), gone, or (no
+    // write, or a failed one) dead, so reconcile may take it over.
     const resolveClaim = async (): Promise<'cleared' | 'superseded' | 'dead'> => {
       const id = claimId!;
       try {
@@ -25269,7 +25312,10 @@ export class Session {
             claimId: id,
             mode: fence.stale || fence.cancelled ? 'remind' : notice.mode,
           });
-          return cleared ? 'cleared' : 'superseded';
+          if (cleared) return 'cleared';
+          // Not ours: a claim write that never landed leaves the notice owed
+          // and claimable; only another live claim or a moved digest supersedes.
+          return (await this._delegationNoticeIsOwed(notice)) ? 'cleared' : 'superseded';
         });
       } catch (error) {
         this._logDelegationNotice('warn', 'settlement notice claim could not be cleared', notice, error);
@@ -25280,18 +25326,48 @@ export class Session {
       }
     };
     // The wake ran (or a run loaded the row, or a fence ended it): acknowledge
-    // under the claim. A fenced-out ack leaves the claim for the next holder.
+    // under the claim. A fenced-out ack leaves the claim for the next holder. A
+    // failed ack is retried with the reconcile backoff while the claim stays
+    // live, so no retry of this process re-delivers it. Past the backoff cap,
+    // or once the lease, the session or the epoch is lost, the claim is left
+    // dead: reconcile or the next holder takes it over (a possible duplicate).
     const finishClaimed = async (outcome: 'wake' | 'history' | 'fenced' | 'lost'): Promise<DelegationNoticeOutcome> => {
       const id = claimId!;
       try {
-        const result = await acknowledge('dispatch');
-        if (result === 'no_write') {
-          this._logDelegationNotice('warn', 'settlement notice acknowledgement fenced out; claim left', notice);
+        for (let attempt = 0; ; attempt += 1) {
+          let failure: unknown;
+          try {
+            const result = await acknowledge('dispatch');
+            if (result === 'no_write') {
+              this._logDelegationNotice('error', 'settlement notice acknowledgement fenced out; claim left', notice);
+            }
+            return outcome;
+          } catch (error) {
+            failure = error;
+          }
+          this._logDelegationNotice(
+            'warn',
+            `settlement notice acknowledgement failed (attempt ${attempt + 1})`,
+            notice,
+            failure,
+          );
+          const fence = this._readNoticeFence(delivery);
+          const retry =
+            fence.lifecycle === 'live' &&
+            fence.leaseHeld &&
+            !fence.stale &&
+            !fence.cancelled &&
+            (await backoff(attempt));
+          if (!retry) {
+            this._logDelegationNotice(
+              'error',
+              'settlement notice acknowledgement given up; claim left dead, so it may be taken over and wake twice',
+              notice,
+              failure,
+            );
+            return 'left_owed';
+          }
         }
-        return outcome;
-      } catch (error) {
-        this._logDelegationNotice('warn', 'settlement notice acknowledgement failed; claim left', notice, error);
-        return 'left_owed';
       } finally {
         claimId = undefined;
         releaseNoticeClaim(this._harness, id);
@@ -25324,7 +25400,10 @@ export class Session {
       if (resolved !== undefined) {
         // PF-7679: watch before the save, so a run that loads history while the
         // row is written either sees it (and is recorded) or does not.
-        watch = watchHistoryLoad(this.threadId, this.resourceId, signalId, () => this._notifyMaybeIdle());
+        if (watch === undefined) {
+          watch = watchHistoryLoad(this.threadId, this.resourceId, signalId, () => this._notifyMaybeIdle());
+          this._delegationNoticeWatches.set(key, watch);
+        }
         await resolved.memory.saveMessages({
           messages: [
             createSignal({
@@ -25344,6 +25423,7 @@ export class Session {
       if (!live()) return 'left_owed';
       if (notice.mode === 'remind') return acknowledged('row_save', reminderRow !== undefined ? 'history' : 'fenced');
       const rowDelivered = () => watch?.loaded() === true;
+      let claimWriteFailures = 0;
       for (;;) {
         // PF-7679: wait for quiescence before the claim, so a close, shutdown or
         // crash during the wait leaves the notice owed. A run that already
@@ -25431,6 +25511,14 @@ export class Session {
           const resolution = await resolveClaim();
           if (resolution === 'superseded') return 'superseded';
           if (resolution === 'dead') return 'left_owed';
+          if (claimResult === 'failed') {
+            // The claim write failed (a storage error or a version conflict):
+            // the notice is still owed, so back off and re-read it by claiming
+            // again, up to the reconcile backoff cap.
+            this._logDelegationNotice('warn', 'settlement notice claim write failed', notice, err);
+            if (await backoff(claimWriteFailures++)) continue;
+            return 'left_owed';
+          }
           if (err instanceof DelegationNoticeWakeNotSentError && err.reason === 'slot_lost' && live()) {
             // A run this process cannot see (a foreign lease holder, or one not
             // yet registered here) refuses every retry: back off as the
@@ -25448,9 +25536,6 @@ export class Session {
       this._logDelegationNotice('warn', 'settlement notice delivery left owed', notice, error);
       if (claimId !== undefined) await resolveClaim();
       return 'left_owed';
-    } finally {
-      this._delegationNoticesInFlight.delete(key);
-      watch?.dispose();
     }
   }
 
@@ -25876,6 +25961,7 @@ export class Session {
     let cursor: string | undefined;
     const delegated: HarnessPlanTask[] = [];
     const owedNotices: PendingDelegationSettlementNotice[] = [];
+    const owedKeys = new Set<string>();
     try {
       for (;;) {
         const page = await this._storage.listPlanTasks({
@@ -25892,6 +25978,7 @@ export class Session {
           // PF-7679: a notice under a live claim is being delivered; one whose
           // claimer lost the lease or is gone is taken over.
           const owedNotice = readPendingDelegationSettlementNotice(t);
+          if (owedNotice !== undefined) owedKeys.add(`${owedNotice.subagentSessionId}:${owedNotice.digest}`);
           if (owedNotice !== undefined && this._delegationNoticeClaimable(owedNotice)) owedNotices.push(owedNotice);
         }
         if (!page.cursor || page.tasks.length === 0) break;
@@ -25904,6 +25991,9 @@ export class Session {
       return;
     }
 
+    // PF-7679: a row watch kept for a retry ends once its notice is no longer
+    // owed (another owner or path resolved it), so no watch outlives it.
+    this._disposeKeptDelegationNoticeWatches(key => !owedKeys.has(key));
     for (const owedNotice of owedNotices) {
       this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
     }
@@ -26176,6 +26266,15 @@ export class Session {
    * window. At most one timer is armed, preventing retry fan-out. A fresh
    * capacity release (`attempt === 0`) replaces a slower pending timer.
    */
+  /** PF-7679: dispose the kept row watches whose key `drop` selects, unless a delivery of it runs. */
+  private _disposeKeptDelegationNoticeWatches(drop: (key: string) => boolean): void {
+    for (const [key, watch] of this._delegationNoticeWatches) {
+      if (!drop(key) || this._delegationNoticesInFlight.has(key)) continue;
+      watch.dispose();
+      this._delegationNoticeWatches.delete(key);
+    }
+  }
+
   private _scheduleDelegationReconcileRetry(attempt: number): void {
     if (this._state !== 'live') return;
     if (this._delegationReconcileRetryTimers.size > 0) {

@@ -13,6 +13,7 @@ import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
+import { hasHistoryLoadWatches } from '../../memory/history-load-watch';
 import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
 import type { HarnessTerminalFinalizer } from '../../storage/domains/harness';
@@ -1770,6 +1771,41 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     }
   }, 15_000);
 
+  it('a caller run that loads the row between a failed attempt and its retry is the delivery; no wake follows', async () => {
+    const ctx = realParent(true);
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      await endR0();
+      const starts = watchStarts(parent);
+      const [parentAgent] = ctx.agents;
+      const sendSignal = parentAgent!.sendSignal.bind(parentAgent);
+      let thrown = false;
+      vi.spyOn(parentAgent!, 'sendSignal').mockImplementation(((signal: any, opts: any) => {
+        if (signal?.type !== 'system-reminder' || thrown) return sendSignal(signal, opts);
+        thrown = true;
+        throw new Error('untyped dispatch failure');
+      }) as never);
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      releaseChild();
+      await poll(() => outcomes.mock.calls.length === 1);
+      // Inside the 500 ms reconcile backoff: a caller turn loads the saved row.
+      await parent.message({ content: 'what happened?' });
+      await deliveryFinished(parent, taskId);
+      await new Promise(r => setTimeout(r, 1_500));
+
+      expect(total(ctx.prompts)).toBe(1);
+      expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+      expect(starts.filter(s => s.origin === 'wake')).toHaveLength(0);
+      expect(outcomes.mock.calls.map(call => call[0])).toEqual(['left_owed', 'history']);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      expect(hasHistoryLoadWatches()).toBe(false);
+    } finally {
+      ctx.releaseAll();
+      await ctx.harness.shutdown({ drainTimeoutMs: 2000 }).catch(() => {});
+    }
+  }, 15_000);
+
   it.each(MEMORY)(
     'row 3: a caller turn begun before the save dispatches after it; one delivery (%s)',
     async (_l, memory) => {
@@ -2560,6 +2596,8 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
 // the wake count across every owner and this delivery's first typed outcome.
 describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
   type AwaitPoint =
+    | 'settlement-write'
+    | 'reconcile-list'
     | 'owed-reread'
     | 'memory-resolve'
     | 'row-save'
@@ -2645,6 +2683,27 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
       case 'quiescence':
         // The parent turn is held by the caller; its end is the release.
         break;
+      case 'settlement-write': {
+        // R1: the child settlement's plan-task write that makes the notice owed.
+        const storage = parent._internalStorage;
+        const mutate = storage.mutatePlanTasksForSession.bind(storage);
+        vi.spyOn(storage, 'mutatePlanTasksForSession').mockImplementation(async (input: any) => {
+          const ops = JSON.stringify(input.ops);
+          if (ops.includes('"notice":{') && !ops.includes('"claim":{') && take()) await gate;
+          return mutate(input);
+        });
+        break;
+      }
+      case 'reconcile-list': {
+        // R2: the reconcile pass's plan-task listing (armed by `run`).
+        const storage = parent._internalStorage;
+        const list = storage.listPlanTasks.bind(storage);
+        vi.spyOn(storage, 'listPlanTasks').mockImplementation(async (input: any) => {
+          if (take()) await gate;
+          return list(input);
+        });
+        break;
+      }
       case 'claim-write': {
         const storage = parent._internalStorage;
         const mutate = storage.mutatePlanTasksForSession.bind(storage);
@@ -2713,6 +2772,7 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
     const a = buildHarness(db, 'wake', memory);
     let b: ReturnType<typeof buildHarness> | undefined;
     let release = () => {};
+    let observed!: Observed;
     try {
       const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
       const { taskId, releaseChild, endParentTurn } = await delegateFromParentTurn(
@@ -2724,14 +2784,30 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
         },
       );
       const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
-      const parked = park(parent, a.parentAgent, memory, point);
-      release = point === 'quiescence' ? () => void endParentTurn().catch(() => {}) : parked.release;
+      // R2: the settlement's own delivery start is held back, so the reconcile
+      // pass parked at its listing is the one that delivers.
+      let heldBack = false;
+      if (point === 'reconcile-list') {
+        const start = (parent as any)._startDelegationSettlementNotice.bind(parent);
+        vi.spyOn(parent as any, '_startDelegationSettlementNotice').mockImplementation((...args: unknown[]) => {
+          if (heldBack) return start(...args);
+          heldBack = true;
+        });
+      }
+      const parked = point === 'reconcile-list' ? undefined : park(parent, a.parentAgent, memory, point);
       releaseChild();
+      let parkedAt = parked;
+      if (point === 'reconcile-list') {
+        await poll(() => heldBack);
+        parkedAt = park(parent, a.parentAgent, memory, point);
+        void (parent as any)._reconcileDelegationsOnHydrate(0);
+      }
+      release = point === 'quiescence' ? () => void endParentTurn().catch(() => {}) : parkedAt!.release;
       if (point === 'quiescence') {
         await poll(async () => (parent as any)._delegationNoticesInFlight.size === 1);
         await sleep(50);
       } else {
-        await parked.reached;
+        await parkedAt!.reached;
       }
 
       let holder: Session = parent;
@@ -2765,17 +2841,19 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
       if (holder !== parent) await (holder as any)._reconcileDelegationsOnHydrate(0);
       await deliveryFinished(holder, taskId);
       await sleep(100);
-      const observed = {
+      observed = {
         wakes: reminderCalls(a.parentAgent).length + (b ? reminderCalls(b.parentAgent).length : 0),
         firstOutcome: outcomes.mock.calls[0]?.[0] as string | undefined,
       };
       expect(owedNotice(await planRow(holder, taskId))).toBeUndefined();
-      return observed;
     } finally {
       release();
       await b?.harness.shutdown({ drainTimeoutMs: 2000 }).catch(() => {});
       await a.harness.shutdown({ drainTimeoutMs: 2000 }).catch(() => {});
     }
+    // Spec E.4: no history-load watch outlives the delivery or its session.
+    expect(hasHistoryLoadWatches()).toBe(false);
+    return observed;
   }
 
   // Design B, one table per await point: [interleaving, wakes, first outcome].
@@ -2783,6 +2861,26 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
   // delivery); an abort (no epoch bump) is ONCE; a close leaves it owed and the
   // reopened session delivers ONCE; a lost lease leaves it to the next holder
   // (ONCE), or wakes twice when the wake was already dispatched (DUP, F5).
+  // Design B R1/R2: NOWAKE / ONCE / OWED / HOLDER. In the R1 lease cell the
+  // first owner never starts a delivery; only the new holder delivers.
+  it.each([
+    ['stop', 0, 'fenced'],
+    ['abort', 1, 'wake'],
+    ['close', 1, 'left_owed'],
+    ['lease', 1, undefined],
+  ] as const)('await point R1 settlement write: %s', async (interleaving, wakes, firstOutcome) => {
+    expect(await run('settlement-write', interleaving)).toEqual({ wakes, firstOutcome });
+  });
+
+  it.each([
+    ['stop', 0, 'history'],
+    ['abort', 1, 'wake'],
+    ['close', 1, 'left_owed'],
+    ['lease', 1, 'left_owed'],
+  ] as const)('await point R2 reconcile listing: %s', async (interleaving, wakes, firstOutcome) => {
+    expect(await run('reconcile-list', interleaving)).toEqual({ wakes, firstOutcome });
+  });
+
   it.each([
     ['stop', 0, 'fenced'],
     ['abort', 1, 'wake'],
@@ -2861,8 +2959,9 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
     ['abort', 1, 'wake'],
     // The close releases the lease before the ack lands: the claim is left
     // and the reopened session takes it over (DUP-allowed, as a lost lease).
-    // `MockAgent` folds that second wake into its still-registered run, so it
-    // is no second provider call here.
+    // `MockAgent` folds that second wake into its still-registered run, so
+    // this cell observes one provider call: it cannot see the disclosed
+    // duplicate, only that the notice ends acknowledged.
     ['close', 1, 'left_owed'],
     ['lease', 2, 'wake'],
   ] as const)('await point P3/P4 delivered-ack write: %s', async (interleaving, wakes, firstOutcome) => {
@@ -3016,6 +3115,109 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
 
       expect(reminderCalls(parentAgent)).toHaveLength(1);
       expect(outcomes.mock.calls.map(call => call[0])).toEqual(['left_owed', 'wake']);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  /** Throw once from the first plan-task write that `when` selects, before it reaches storage. */
+  function failWriteOnce(parent: Session, when: (ops: string) => boolean): () => boolean {
+    const storage = parent._internalStorage;
+    const mutate = storage.mutatePlanTasksForSession.bind(storage);
+    let failed = false;
+    vi.spyOn(storage, 'mutatePlanTasksForSession').mockImplementation(async (input: any) => {
+      if (!failed && when(JSON.stringify(input.ops))) {
+        failed = true;
+        throw new Error('transient storage failure');
+      }
+      return mutate(input);
+    });
+    return () => failed;
+  }
+
+  it('a delivered-ack that fails once is retried under the live claim; the parent wakes once', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      // Count wake dispatches: `MockAgent` folds a second wake into a run it
+      // still holds, so its stream calls alone could miss a duplicate.
+      const dispatches = vi.spyOn(parentAgent, 'sendSignal');
+      const wakes = () => dispatches.mock.calls.filter(([signal]) => (signal as any)?.type === 'system-reminder');
+      // The first plan-task write after the wake is dispatched is its ack.
+      const failed = failWriteOnce(parent, () => reminderCalls(parentAgent).length === 1);
+      releaseChild();
+      await poll(failed);
+      await deliveryFinished(parent, taskId);
+      // Past the first reconcile retry (500 ms), which a dead claim would get.
+      await sleep(1_500);
+
+      expect(wakes()).toHaveLength(1);
+      expect(reminderCalls(parentAgent)).toHaveLength(1);
+      expect(outcomes.mock.calls.map(call => call[0])).toEqual(['wake']);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      expect(hasHistoryLoadWatches()).toBe(false);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('a claim write that throws leaves the notice owed; the same process retries and wakes once', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      const failed = failWriteOnce(parent, ops => ops.includes('"claim":{'));
+      releaseChild();
+      await poll(failed);
+      // Nothing else runs reconcile here: only the delivery's own retry can wake.
+      await poll(() => reminderCalls(parentAgent).length === 1, 3_000);
+      await deliveryFinished(parent, taskId);
+      await sleep(1_000);
+
+      expect(reminderCalls(parentAgent)).toHaveLength(1);
+      expect(outcomes.mock.calls.map(call => call[0])).toEqual(['wake']);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      expect(hasHistoryLoadWatches()).toBe(false);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('F5 dead claimer: a Stop downgrade before the takeover keeps remind; no wake follows', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, childId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      let notice: { digest: string } | undefined;
+      const start = vi.spyOn(parent as any, '_startDelegationSettlementNotice').mockImplementation((n: unknown) => {
+        notice = n as { digest: string };
+      });
+      releaseChild();
+      await poll(() => notice !== undefined);
+      // A claim by this owner whose id is not live: its claimer died.
+      const dead = { claimId: 'claim-dead', ownerId: harness.ownerId, claimedAt: 1_000 };
+      const port = (parent as any)._planTaskPort();
+      const key = { taskId, subagentSessionId: childId, digest: notice!.digest };
+      expect(await planTaskClaimDelegationSettlementNotice(port, { ...key, claim: dead, takeover: () => false })).toBe(
+        'claimed',
+      );
+      await parent.abortActiveWork({ reason: 'user_requested' });
+      expect(owedNotice(await planRow(parent, taskId))).toEqual({ mode: 'remind', digest: key.digest, claim: dead });
+
+      start.mockRestore();
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      await (parent as any)._reconcileDelegationsOnHydrate(0);
+      await deliveryFinished(parent, taskId);
+
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      expect(outcomes.mock.calls[0]?.[0]).toBe('history');
       expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
     } finally {
       await harness.shutdown();
