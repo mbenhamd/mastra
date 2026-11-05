@@ -1944,6 +1944,13 @@ function owesRecoveredCompletion(
   );
 }
 
+/**
+ * PF-7631: where a settlement notice's reminder row was saved: the agent whose
+ * memory saved it, that memory instance, the mode it was resolved for, and the
+ * session's mode-switch epoch taken before resolution.
+ */
+type WakeReminderRowOrigin = { agent: Agent; memory: MastraMemory; modeId: string; modeEpoch: number };
+
 export class Session {
   /** Stable identity. Frozen at construction. */
   readonly id: string;
@@ -2142,6 +2149,12 @@ export class Session {
   private readonly _delegationNoticeEpochs = new Map<string, number>();
   /** Turns begun by this live session; a settlement wake skips if a turn began after its reminder was saved. */
   private _turnsBegun = 0;
+  /**
+   * PF-7631: bumped synchronously by every `switchMode()` that changes the
+   * mode, before its durable write, so a wake can prove no mode change
+   * happened since its reminder row was saved.
+   */
+  private _modeSwitchEpoch = 0;
   /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
   private readonly _pendingTerminalSubagentAnswers = new Map<
     string,
@@ -15339,10 +15352,13 @@ export class Session {
    * started the run its wake grant reserved.
    * PF-7631: with `wakeSettlement` and a registered wake finalizer, the wake
    * turn is admitted under its Harness-minted grant and commits a terminal
-   * intent (`_admitWakeTerminalTurn`). The settlement path passes
-   * `wakeSettlement` only when it saved the notice's reminder row, because the
-   * grant refuses a dispatch that cannot start its reserved run and the row is
-   * then the notice's only delivery. Without it the call is fork main's.
+   * intent (`_admitWakeTerminalTurn`). The grant refuses a dispatch that
+   * cannot start its reserved run, so the notice then reaches a caller run only
+   * through its reminder row. It is therefore admitted only in the one case
+   * where that row is proven readable by the dispatching agent
+   * (`_wakeGrantAllowed`): `wakeReminderRow` says the row was saved by this
+   * agent's own fixed memory instance, with no mode change since. Every other
+   * case is fork main's call.
    */
   private async _injectSystemReminder(
     content: string,
@@ -15352,6 +15368,7 @@ export class Session {
       admissionEpoch?: number;
       wakeNoticeId?: string;
       wakeSettlement?: Pick<PendingDelegationSettlementNotice, 'taskId' | 'subagentSessionId' | 'outcome'>;
+      wakeReminderRow?: WakeReminderRowOrigin;
       requireActiveRun?: boolean;
       assertAdmitted?: () => void;
     },
@@ -15469,7 +15486,8 @@ export class Session {
           internal?.wakeNoticeId !== undefined &&
           internal.wakeSettlement !== undefined &&
           signalId !== undefined &&
-          this._terminalWakeFinalizer !== undefined
+          this._terminalWakeFinalizer !== undefined &&
+          this._wakeGrantAllowed(internal.wakeReminderRow, agent, effectiveModeId)
         ) {
           wakeAdmission = this._admitWakeTerminalTurn({
             wakeNoticeId: internal.wakeNoticeId,
@@ -15489,15 +15507,25 @@ export class Session {
         // run during the await, it keeps the slot: the content is sent exactly
         // as fork main sends it; only the wake label is dropped, so that run is
         // never announced as this wake. PF-7631: a wake admitted under its grant
-        // (registered wake finalizer, reminder row saved) is instead bound to the
-        // reserved run below; it never folds into a caller's run, and a dispatch
-        // that does not start that run is refused. The caller run reads the
-        // notice from the saved row.
+        // is instead bound to the reserved run below; it never folds into a
+        // caller's run, and a dispatch that does not start that run is refused.
+        // The caller run then reads the notice from the reminder row, which the
+        // grant's allowlist proves this agent's memory holds: same agent, same
+        // fixed memory instance, no mode change since the save. That proof is
+        // re-checked here, in the same tick as the dispatch; if it no longer
+        // holds, the admission is released to recovery (no run starts under it)
+        // and the wake is sent as fork main sends it.
         if (idleOnlyEpoch !== undefined) {
           if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
             throw new HarnessBusyError(this.id, 'in_flight');
           }
           idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
+        }
+        if (wakeTerminal !== undefined && !this._wakeGrantAllowed(internal?.wakeReminderRow, agent, effectiveModeId)) {
+          const released = wakeTerminal;
+          wakeAdmission = undefined;
+          wakeTerminal = undefined;
+          this._releaseWakeTerminalAdmission(released.admissionId);
         }
 
         dispatched = agent.sendSignal(
@@ -16007,6 +16035,7 @@ export class Session {
     this._harness._getMode(opts.mode);
     const previousModeId = this._record.modeId;
     if (previousModeId === opts.mode) return;
+    this._modeSwitchEpoch += 1;
     // §4.2e — entering a mode re-establishes its base permission policy when it
     // declares one (the mode owns the base; runtime grants/setPolicy overlay it).
     // A mode that declares no `permissions` leaves the existing rules untouched.
@@ -24725,12 +24754,16 @@ export class Session {
       // does: no synthetic broadcast run occupies the thread, so a following
       // idle wake is not mistaken for an interleave, and nothing is handed to
       // an ungated follow-up run.
-      const memory = await this._resolveDelegationNoticeMemory(notice);
+      // PF-7631: the mode marker is taken before resolution, so any switch from
+      // here on disqualifies the wake grant.
+      const modeEpoch = this._modeSwitchEpoch;
+      const resolved = await this._resolveDelegationNoticeMemory(notice);
       // Shutdown may have begun while the notice was re-read and memory resolved.
       if (!live()) return;
-      // PF-7631: set only once the row is written; it alone admits the wake grant.
-      let reminderRowSaved = false;
-      if (memory !== undefined && memory !== null) {
+      // PF-7631: which agent's memory saved the row, set only once it is written.
+      let reminderRow: WakeReminderRowOrigin | undefined;
+      if (resolved !== undefined) {
+        const { memory } = resolved;
         await memory.saveMessages({
           messages: [
             createSignal({
@@ -24745,7 +24778,7 @@ export class Session {
             }),
           ],
         });
-        reminderRowSaved = true;
+        reminderRow = { ...resolved, modeEpoch };
       }
       if (!live()) return;
       if (notice.mode === 'remind') {
@@ -24775,16 +24808,19 @@ export class Session {
             signalId,
             admissionEpoch,
             wakeNoticeId: signalId,
-            // PF-7631: the wake grant only over a saved reminder row. Without a
-            // row the call is fork main's, so a caller run that took the slot
-            // still receives the notice as its next model input.
-            ...(reminderRowSaved
+            // PF-7631: the wake grant is considered only over a saved reminder
+            // row, and admitted only when `_wakeGrantAllowed` proves the
+            // dispatching agent reads it. Otherwise the call is fork main's, so
+            // a caller run that took the slot still receives the notice as its
+            // next model input.
+            ...(reminderRow !== undefined
               ? {
                   wakeSettlement: {
                     taskId: notice.taskId,
                     subagentSessionId: notice.subagentSessionId,
                     outcome: notice.outcome,
                   },
+                  wakeReminderRow: reminderRow,
                 }
               : {}),
           },
@@ -24793,8 +24829,9 @@ export class Session {
     } catch {
       // After the claim nothing is owed. A wake that lost its slot during the
       // context await is sent as fork main sends it, unlabelled, unless it was
-      // admitted under its wake grant (a registered wake finalizer and a saved
-      // reminder row): that dispatch is refused busy, the reservation settles
+      // admitted under its wake grant (a registered wake finalizer, and the row
+      // saved by the dispatching agent's own fixed memory with no mode change
+      // since): that dispatch is refused busy, the reservation settles
       // interrupted, and the caller run reads the notice from the saved row.
       // Refusals (a stale admission epoch from a Stop or an edit/regenerate via
       // `resetPlanTasks`, or a run already active before the turn begins) drop
@@ -24821,7 +24858,7 @@ export class Session {
    */
   private async _resolveDelegationNoticeMemory(
     notice: PendingDelegationSettlementNotice,
-  ): Promise<MastraMemory | undefined> {
+  ): Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> {
     const activeModeId = this._currentRunModeId ?? this._record.modeId;
     const modeIds = [activeModeId];
     if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
@@ -24838,9 +24875,29 @@ export class Session {
           : {}),
       });
       const memory = await agent.getMemory({ requestContext });
-      if (memory !== undefined && memory !== null) return memory;
+      if (memory !== undefined && memory !== null) return { agent, memory, modeId };
     }
     return undefined;
+  }
+
+  /**
+   * PF-7631: the one case where a settlement wake may run under its grant. The
+   * grant refuses a dispatch that cannot start its reserved run, and a caller
+   * run that took the slot then reads the notice only from its reminder row.
+   * That is safe only when the dispatching agent reads that row: it is the
+   * agent whose memory saved it, its memory is that same fixed instance, and
+   * the mode is unchanged since the save. Synchronous, so it can be checked in
+   * the same tick as the dispatch. Any other case is fork main's path.
+   */
+  private _wakeGrantAllowed(row: WakeReminderRowOrigin | undefined, agent: Agent, modeId: string): boolean {
+    return (
+      row !== undefined &&
+      row.agent === agent &&
+      agent.__fixedMemory() === row.memory &&
+      row.modeId === modeId &&
+      this._record.modeId === modeId &&
+      this._modeSwitchEpoch === row.modeEpoch
+    );
   }
 
   /** Exact re-read: the notice with this digest is still owed on its task. */

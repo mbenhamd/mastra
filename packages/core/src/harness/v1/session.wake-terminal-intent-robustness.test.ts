@@ -78,8 +78,9 @@ const toolCtx = {
 
 function buildHarness(db: InMemoryDB) {
   const parentAgent = new MockAgent({ id: 'parent-agent', defaultOutput: { text: 'woken reply' } });
-  // The wake grant is admitted only over a saved reminder row, so the parent has memory.
-  vi.spyOn(parentAgent, 'getMemory').mockResolvedValue(new MockMemory() as never);
+  // The wake grant is admitted only when the dispatching agent's own fixed
+  // memory saved the reminder row, so the parent gets a fixed memory instance.
+  parentAgent.__setMemory(new MockMemory());
   const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
   const storage = new InMemoryHarness({
     db,
@@ -819,6 +820,12 @@ describe('PF-7631 wake grant invariants', () => {
             subagentSessionId: payload.subagentSessionId,
             outcome: payload.outcome,
           },
+          wakeReminderRow: {
+            agent: parentAgent,
+            memory: parentAgent.__fixedMemory()!,
+            modeId: 'default',
+            modeEpoch: 0,
+          },
         },
       ),
     ).rejects.toMatchObject({ name: 'HarnessBusyError' });
@@ -852,6 +859,12 @@ describe('PF-7631 wake grant invariants', () => {
           signalId: 'notice-x',
           wakeNoticeId: 'notice-x',
           wakeSettlement: { taskId: 't', subagentSessionId: 's', outcome: 'completed' },
+          wakeReminderRow: {
+            agent: parentAgent,
+            memory: parentAgent.__fixedMemory()!,
+            modeId: 'default',
+            modeEpoch: 0,
+          },
         },
       ),
     ).rejects.toThrow();

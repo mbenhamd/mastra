@@ -77,8 +77,9 @@ function buildHarness(
   terminalHandoff: Record<string, unknown> = { finalizer: messageFinalizer, wakeFinalizer },
 ) {
   const parentAgent = new MockAgent({ id: 'parent-agent', defaultOutput: { text: 'woken reply' } });
-  // The wake grant is admitted only over a saved reminder row, so the parent has memory.
-  vi.spyOn(parentAgent, 'getMemory').mockResolvedValue(new MockMemory() as never);
+  // The wake grant is admitted only when the dispatching agent's own fixed
+  // memory saved the reminder row, so the parent gets a fixed memory instance.
+  parentAgent.__setMemory(new MockMemory());
   const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
   const storage = new InMemoryHarness({
     db,
@@ -340,15 +341,44 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
 });
 
 // The wake grant binds the wake to a reserved run and refuses a dispatch that
-// does not start it. That refusal is safe only when the reminder row is saved:
-// a caller run that took the slot reads the notice from its thread history.
-// Without a row, the wake is sent as fork main sends it, so the notice reaches
-// the caller run's next model input. Real Agent, so the rows read provider input.
-describe('PF-7631 wake grant only over a saved reminder row (real Agent model input)', () => {
+// does not start it; a caller run that took the slot then reads the notice only
+// from its reminder row. So the grant is admitted only in the one proven case:
+// the dispatching agent's own fixed memory saved the row, with no mode change
+// since. Every other case is fork main's path: delivery and label as main.
+//
+// Dimensions under a registered wake finalizer: the delegating mode (`default`,
+// `parent-agent`) vs the active mode at settlement (same, a per-mode agent
+// `other-agent`, or `shared-mode` on the same `parent-agent`); memory on each
+// side; a caller run active at dispatch; a mode switch during the wake's
+// context build or its grant admission. Collapsed combinations:
+// - both sides memory-less, any agents: no row is saved, so the path is rows
+//   3/4 (memory-less parent) whatever the agents;
+// - both sides with memory on different agents: resolution takes the active
+//   mode's memory first, so the delegating side is never read: rows 7/8;
+// - a shared agent with no memory: no row, rows 3/4;
+// - a mode switch together with a caller run: the switch alone already takes
+//   main's path (rows 11-13), and main's caller delivery is rows 4/5.
+describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   const NOTICE = 'settled with outcome';
 
-  function realParent(withMemory: boolean) {
+  type ModeId = 'default' | 'other-mode' | 'shared-mode';
+  type Row = {
+    parentMemory: boolean;
+    otherMemory: boolean;
+    /** Active mode at settlement (switched to after R0, before the settlement). */
+    active: ModeId;
+    callerRun: boolean;
+    /** A switch to `switchTo` during the wake's context build or grant admission. */
+    switchDuring: 'none' | 'build' | 'admission';
+    switchTo?: ModeId;
+    grant: boolean;
+    /** The run main delivers to, and how the notice reaches it. */
+    delivery: 'wake-run' | 'caller-run-row' | 'caller-run-signal';
+    label: 'wake' | 'none';
+  };
+
+  function realParent(row: Row) {
     const prompts: string[] = [];
     const holds = new Map<number, Promise<void>>();
     const model = new MockLanguageModelV2({
@@ -370,13 +400,21 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
         };
       },
     });
-    const memory = withMemory ? new MockMemory() : undefined;
+    const parentMemory = row.parentMemory ? new MockMemory() : undefined;
+    const otherMemory = row.otherMemory ? new MockMemory() : undefined;
     const parentAgent = new Agent({
       id: 'parent-agent',
       name: 'parent-agent',
       instructions: 'coordinate the work',
       model,
-      ...(memory ? { memory } : {}),
+      ...(parentMemory ? { memory: parentMemory } : {}),
+    });
+    const otherAgent = new Agent({
+      id: 'other-agent',
+      name: 'other-agent',
+      instructions: 'answer briefly',
+      model,
+      ...(otherMemory ? { memory: otherMemory } : {}),
     });
     const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
     const db = new InMemoryDB();
@@ -386,10 +424,12 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
       sessionRecordProjection: { enabled: true },
     });
     const harness = new Harness({
-      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      agents: { 'parent-agent': parentAgent, 'other-agent': otherAgent, 'child-agent': childAgent } as any,
       modes: [
         { id: 'default', agentId: 'parent-agent' },
         { id: 'worker-mode', agentId: 'child-agent' },
+        { id: 'other-mode', agentId: 'other-agent', harnessBuiltins: 'exclude' },
+        { id: 'shared-mode', agentId: 'parent-agent' },
       ],
       defaultModeId: 'default',
       sessions: { storage, terminalHandoff: { finalizer: messageFinalizer, wakeFinalizer } as never },
@@ -417,7 +457,7 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
     const releaseAll = () => {
       for (const release of releases) release();
     };
-    return { harness, db, memory, parentAgent, childAgent, prompts, holdCall, releaseAll };
+    return { harness, db, storage, agents: [parentAgent, otherAgent], childAgent, prompts, holdCall, releaseAll };
   }
 
   function wakeEvidence(db: InMemoryDB) {
@@ -426,25 +466,115 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
     );
   }
 
-  type Row = {
-    /** The delegating parent agent has memory, so the reminder row is saved. */
-    memory: boolean;
-    /** A caller turn starts a run during the wake's context build and is on its provider call at dispatch. */
-    callerRun: boolean;
-  };
-
+  const base = { parentMemory: true, otherMemory: false, callerRun: false, switchDuring: 'none' } as const;
   it.each([
-    ['no caller run: the reserved run starts and keeps the wake label', { memory: true, callerRun: false }],
+    // Same mode as the delegating mode.
     [
-      'caller run active, parent with memory: busy refusal, the caller run reads the saved row',
-      { memory: true, callerRun: true },
+      '1 same mode, memory, no caller: GRANT, reserved run labelled',
+      { ...base, active: 'default', grant: true, delivery: 'wake-run', label: 'wake' },
     ],
     [
-      'caller run active, memory-less parent: delivered unlabelled into the caller run, as on fork main',
-      { memory: false, callerRun: true },
+      '2 same mode, memory, caller run: GRANT refused busy, caller reads the row',
+      { ...base, active: 'default', callerRun: true, grant: true, delivery: 'caller-run-row', label: 'none' },
+    ],
+    [
+      '3 same mode, memory-less, no caller: main, labelled as main',
+      { ...base, parentMemory: false, active: 'default', grant: false, delivery: 'wake-run', label: 'wake' },
+    ],
+    [
+      '4 same mode, memory-less, caller run: main, unlabelled into the caller run',
+      {
+        ...base,
+        parentMemory: false,
+        active: 'default',
+        callerRun: true,
+        grant: false,
+        delivery: 'caller-run-signal',
+        label: 'none',
+      },
+    ],
+    // Active mode on another agent at settlement.
+    [
+      '5 W4c: row in the delegating memory, active memory-less, caller run: main',
+      { ...base, active: 'other-mode', callerRun: true, grant: false, delivery: 'caller-run-signal', label: 'none' },
+    ],
+    [
+      '6 row in the delegating memory, active memory-less, no caller: main, labelled',
+      { ...base, active: 'other-mode', grant: false, delivery: 'wake-run', label: 'wake' },
+    ],
+    [
+      '7 delegating memory-less, active memory, no caller: GRANT (active agent saved the row)',
+      {
+        ...base,
+        parentMemory: false,
+        otherMemory: true,
+        active: 'other-mode',
+        grant: true,
+        delivery: 'wake-run',
+        label: 'wake',
+      },
+    ],
+    [
+      '8 delegating memory-less, active memory, caller run: GRANT refused busy, caller reads the row',
+      {
+        ...base,
+        parentMemory: false,
+        otherMemory: true,
+        active: 'other-mode',
+        callerRun: true,
+        grant: true,
+        delivery: 'caller-run-row',
+        label: 'none',
+      },
+    ],
+    // Active mode on the same agent.
+    [
+      '9 shared agent, memory, no caller: GRANT',
+      { ...base, active: 'shared-mode', grant: true, delivery: 'wake-run', label: 'wake' },
+    ],
+    [
+      '10 shared agent, memory, caller run: GRANT refused busy, caller reads the row',
+      { ...base, active: 'shared-mode', callerRun: true, grant: true, delivery: 'caller-run-row', label: 'none' },
+    ],
+    // A mode switch during the wake's awaits.
+    [
+      '11 switch to a memory-less agent during the context build: main, labelled',
+      {
+        ...base,
+        active: 'default',
+        switchDuring: 'build',
+        switchTo: 'other-mode',
+        grant: false,
+        delivery: 'wake-run',
+        label: 'wake',
+      },
+    ],
+    [
+      '12 switch during the grant admission: released, main, labelled',
+      {
+        ...base,
+        active: 'default',
+        switchDuring: 'admission',
+        switchTo: 'other-mode',
+        grant: false,
+        delivery: 'wake-run',
+        label: 'wake',
+      },
+    ],
+    [
+      '13 switch to a mode on the same agent during the build: main, labelled',
+      {
+        ...base,
+        active: 'default',
+        switchDuring: 'build',
+        switchTo: 'shared-mode',
+        grant: false,
+        delivery: 'wake-run',
+        label: 'wake',
+      },
     ],
   ] as Array<[string, Row]>)('%s', async (_label, row) => {
-    const ctx = realParent(row.memory);
+    const ctx = realParent(row);
     try {
       const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
       const starts: Array<Record<string, unknown>> = [];
@@ -454,7 +584,7 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
         if (event.type === 'agent_end') ended.push((event as { runId: string }).runId);
       });
 
-      // R0 delegates the task and ends; the child is held.
+      // R0 (delegating mode `default`) delegates the task and ends; the child is held.
       let releaseChild!: () => void;
       ctx.childAgent.enqueueRun({
         holdUntil: new Promise<void>(r => (releaseChild = r)),
@@ -471,12 +601,15 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
       await poll(() => ctx.childAgent.streamCalls.length === 1);
       releaseR0();
       await r0;
+      if (row.active !== 'default') await parent.switchMode({ mode: row.active });
 
-      // Seam: when the claimed wake builds its turn context, start the caller's
-      // turn and wait until its run R1 is on its (held) provider call.
+      // Seams: during the wake's context build, start the caller turn (its run
+      // R1 held on its provider call) or switch the mode; during the wake's
+      // grant admission, switch the mode.
       const releaseR1 = row.callerRun ? ctx.holdCall(1) : () => {};
       let wakeAdmitted = false;
       let held = false;
+      let switched = false;
       let user: Promise<unknown> | undefined;
       const inject = (parent as any)._injectSystemReminder.bind(parent);
       vi.spyOn(parent as any, '_injectSystemReminder').mockImplementation((...args: unknown[]) => {
@@ -485,28 +618,44 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
       });
       const build = (parent as any)._buildTurnContextAndInstructions.bind(parent);
       vi.spyOn(parent as any, '_buildTurnContextAndInstructions').mockImplementation(async (...args: unknown[]) => {
-        if (row.callerRun && wakeAdmitted && !held) {
+        if (wakeAdmitted && !held) {
           held = true;
-          user = parent.message({ content: 'what happened?' });
-          void user.catch(() => {});
-          await poll(() => ctx.prompts.length === 2);
+          if (row.callerRun) {
+            user = parent.message({ content: 'what happened?' });
+            void user.catch(() => {});
+            await poll(() => ctx.prompts.length === 2);
+          }
+          if (row.switchDuring === 'build') {
+            await parent.switchMode({ mode: row.switchTo! });
+            switched = true;
+          }
         }
         return build(...args);
+      });
+      const admit = ctx.storage.admitTerminalHandoff.bind(ctx.storage);
+      vi.spyOn(ctx.storage, 'admitTerminalHandoff').mockImplementation(async (input: any) => {
+        if (row.switchDuring === 'admission' && !switched && JSON.stringify(input).includes('"harness-wake:')) {
+          await parent.switchMode({ mode: row.switchTo! });
+          switched = true;
+        }
+        return admit(input);
       });
       let r1Released = !row.callerRun;
       const dispatches: Array<{ callerRunActive: boolean; reservedRun: boolean }> = [];
       const dispatchedRunIds: string[] = [];
-      const sendSignal = ctx.parentAgent.sendSignal.bind(ctx.parentAgent);
-      vi.spyOn(ctx.parentAgent, 'sendSignal').mockImplementation(((signal: { type?: string }, opts: any) => {
-        if (signal?.type !== 'system-reminder') return sendSignal(signal as never, opts);
-        dispatches.push({
-          callerRunActive: row.callerRun && ctx.prompts.length === 2 && !r1Released,
-          reservedRun: typeof opts?.runId === 'string' && opts.runId.startsWith('harness-wake-'),
-        });
-        const result = sendSignal(signal as never, opts);
-        dispatchedRunIds.push((result as { runId: string }).runId);
-        return result;
-      }) as never);
+      for (const agent of ctx.agents) {
+        const sendSignal = agent.sendSignal.bind(agent);
+        vi.spyOn(agent, 'sendSignal').mockImplementation(((signal: { type?: string }, opts: any) => {
+          if (signal?.type !== 'system-reminder') return sendSignal(signal as never, opts);
+          dispatches.push({
+            callerRunActive: row.callerRun && ctx.prompts.length === 2 && !r1Released,
+            reservedRun: typeof opts?.runId === 'string' && opts.runId.startsWith('harness-wake-'),
+          });
+          const result = sendSignal(signal as never, opts);
+          dispatchedRunIds.push((result as { runId: string }).runId);
+          return result;
+        }) as never);
+      }
 
       releaseChild();
       await poll(() => wakeAdmitted);
@@ -519,51 +668,54 @@ describe('PF-7631 wake grant only over a saved reminder row (real Agent model in
       await poll(() => dispatchedRunIds.every(id => ended.includes(id)));
       await parent.waitForIdle({ timeoutMs: 3000 });
       expect((await planRow(parent, task.taskId))?.status).toBe('completed');
+      if (row.switchDuring !== 'none') expect(switched).toBe(true);
+      if (row.callerRun) expect(held).toBe(true);
 
+      // Delivery first: the notice reaches the run main delivers it to.
       const withNotice = ctx.prompts.filter(p => p.includes(NOTICE));
-      const labelled = starts.filter(s => s.origin === 'wake');
-      if (!row.callerRun) {
-        // The reserved run starts and is announced as this wake.
-        expect(dispatches).toEqual([{ callerRunActive: false, reservedRun: true }]);
-        expect(labelled).toHaveLength(1);
-        expect(labelled[0]!.runId).toMatch(/^harness-wake-/);
-        await poll(() => intents(ctx.db, wakeFinalizer.id).length === 1);
-        expect(intents(ctx.db, wakeFinalizer.id)[0]).toMatchObject({
-          signalId: labelled[0]!.wakeNoticeId,
-          runId: labelled[0]!.runId,
-        });
-        expect(withNotice.length).toBeGreaterThanOrEqual(1);
-      } else if (row.memory) {
-        // The grant refuses the dispatch that cannot start its reserved run.
-        expect(held).toBe(true);
-        expect(dispatches).toEqual([{ callerRunActive: true, reservedRun: true }]);
-        expect(labelled).toEqual([]);
-        expect(intents(ctx.db, wakeFinalizer.id)).toHaveLength(0);
-        // The notice is in the thread: the caller run's history read carries it.
-        const { messages } = await ctx.memory!.recall({
-          threadId: parent.threadId,
-          resourceId: 'u1',
-          hideSignals: false,
-        });
-        expect(JSON.stringify(messages)).toContain(NOTICE);
-        expect(ctx.prompts[1]).toContain('what happened?');
-        expect(ctx.prompts[1]).toContain(NOTICE);
-        // The reservation is settled, never left pending, and close succeeds.
-        await parent.close();
-        expect(wakeEvidence(ctx.db).length).toBeGreaterThan(0);
-        for (const evidence of wakeEvidence(ctx.db)) expect(evidence.status).not.toBe('pending');
-      } else {
-        // Fork main's call: no reserved run; the caller run's next model input
-        // carries the notice, unlabelled.
-        expect(held).toBe(true);
-        expect(dispatches).toEqual([{ callerRunActive: true, reservedRun: false }]);
-        expect(labelled).toEqual([]);
-        expect(intents(ctx.db, wakeFinalizer.id)).toHaveLength(0);
-        expect(wakeEvidence(ctx.db)).toHaveLength(0);
+      if (row.delivery === 'caller-run-signal') {
+        // Main's unlabelled signal: exactly the caller run's next model input.
         expect(withNotice).toHaveLength(1);
         expect(withNotice[0]).toContain('what happened?');
+        expect(ctx.prompts[1]).not.toContain(NOTICE);
         expect(ctx.prompts.indexOf(withNotice[0]!)).toBeGreaterThan(1);
+      } else if (row.delivery === 'caller-run-row') {
+        // The caller run's history read carries the saved row.
+        expect(ctx.prompts[1]).toContain('what happened?');
+        expect(ctx.prompts[1]).toContain(NOTICE);
+      } else {
+        // The wake's own run (the next provider call after R0) carries it.
+        expect(ctx.prompts[1]).toContain(NOTICE);
+        expect(ctx.prompts[1]).not.toContain('what happened?');
       }
+
+      // Grant: admitted only in the allowlisted cells.
+      const labelled = starts.filter(s => s.origin === 'wake');
+      expect(dispatches.some(d => d.reservedRun)).toBe(row.grant);
+      if (row.grant && !row.callerRun) await poll(() => intents(ctx.db, wakeFinalizer.id).length === 1);
+      expect(intents(ctx.db, wakeFinalizer.id)).toHaveLength(row.grant && !row.callerRun ? 1 : 0);
+      if (row.grant && !row.callerRun) {
+        expect(intents(ctx.db, wakeFinalizer.id)[0]).toMatchObject({
+          signalId: labelled[0]?.wakeNoticeId,
+          runId: labelled[0]?.runId,
+        });
+      }
+      if (!row.grant && row.switchDuring !== 'admission') expect(wakeEvidence(ctx.db)).toHaveLength(0);
+      // Row 12's admission did land before the re-check released it.
+      if (row.switchDuring === 'admission') expect(wakeEvidence(ctx.db).length).toBeGreaterThan(0);
+
+      // Label: as main outside the allowlist; the reserved run's own inside it.
+      if (row.label === 'none') {
+        expect(labelled).toEqual([]);
+      } else {
+        expect(labelled).toHaveLength(1);
+        if (row.grant) expect(labelled[0]!.runId).toMatch(/^harness-wake-/);
+        else expect(labelled[0]!.runId).not.toMatch(/^harness-wake-/);
+      }
+
+      // Any reservation is settled, never left pending, and close succeeds.
+      await parent.close();
+      for (const evidence of wakeEvidence(ctx.db)) expect(evidence.status).not.toBe('pending');
     } finally {
       ctx.releaseAll();
       await ctx.harness.shutdown();

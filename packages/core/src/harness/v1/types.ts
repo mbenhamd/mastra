@@ -1181,10 +1181,12 @@ export interface HarnessConfigCommon {
        * differ from `finalizer.id`: consumers claim each kind by finalizer id.
        * The committed payload is a `HarnessWakeTerminalPayload` wrapping this
        * finalizer's payload. Earlier versions settle through `settleOnly`.
-       * The grant applies only when the notice's reminder row was saved to the
-       * parent's memory. A memory-less parent's wake stages no intent and is
-       * sent as without this option, so a caller run that is active at
-       * dispatch still receives the notice.
+       * The grant applies only when the notice's reminder row was saved by the
+       * dispatching agent's own fixed memory instance with no mode change
+       * since. Any other wake (a memory-less parent, a row saved to another
+       * mode's memory, function or inherited memory, a mode switch) stages no
+       * intent and is sent as without this option, so a caller run that is
+       * active at dispatch still receives the notice.
        */
       wakeFinalizer?: HarnessTerminalFinalizer;
     };
