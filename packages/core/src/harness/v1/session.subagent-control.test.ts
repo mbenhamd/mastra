@@ -20,6 +20,7 @@ import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
 import type { Session } from './session';
+import { SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import {
   createSubagentControlTool,
   SUBAGENT_CONTROL_TOOL_ID,
@@ -720,6 +721,212 @@ describe('subagent control tool — permission gate (real agent loop)', () => {
       const toolOutputs = events.filter(event => event.type === 'tool_end').map(event => (event as any).output);
       expect(toolOutputs.some(output => (output as any)?.action === 'status')).toBe(false);
     } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+/**
+ * PF-7632 — a detached `task_delegate` child outlives its parent turn. The
+ * parent must still accept a new user turn (which can stop or steer that
+ * child), so `isTurnActive()` excludes in-flight subagent executions while
+ * `isBusy()` keeps counting them for shutdown and `waitForIdle()`.
+ */
+describe('isTurnActive — user turns while a delegated child runs (real agent loop)', () => {
+  type StreamPart = Record<string, unknown>;
+  const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+  const text = (value: string): StreamPart[] => [
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: value },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: 'stop', usage },
+  ];
+  const toolCall = (toolCallId: string, toolName: string, input: unknown): StreamPart => ({
+    type: 'tool-call',
+    toolCallId,
+    toolName,
+    input: JSON.stringify(input),
+  });
+
+  /** A parent backed by a real Agent loop; `script` decides each model step. */
+  function buildRealLoopHarness(script: () => StreamPart[] | Promise<StreamPart[]>) {
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }, ...(await script())] as any),
+      }),
+    });
+    const parentAgent = new Agent({ id: 'parent-agent', name: 'parent-agent', instructions: 'coordinate', model });
+    const childAgent = new MockAgent({
+      id: 'child-agent',
+      defaultOutput: { terminalToolResult: completedOutcome('Worker finished') },
+    });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      subagents: subagentsConfig(),
+    });
+    return { harness, childAgent };
+  }
+
+  function holdChildRun(childAgent: MockAgent, summary: string): () => void {
+    let release!: () => void;
+    childAgent.enqueueRun({
+      holdUntil: new Promise<void>(r => (release = r)),
+      finishReason: 'stop',
+      terminalToolResult: completedOutcome(summary),
+    });
+    return release;
+  }
+
+  it('a new user turn is admitted while two delegated children run, and cancels one and steers the other', async () => {
+    let phase: 'delegate' | 'steer' | 'report' | 'idle' = 'delegate';
+    let openDelegationTurn!: () => void;
+    const delegationTurnGate = new Promise<void>(r => (openDelegationTurn = r));
+    const children: { a?: string; b?: string } = {};
+    let turnActiveDuringSteerTurn: boolean | undefined;
+    let parent!: Session;
+    const releases: Array<() => void> = [];
+    const { harness, childAgent } = buildRealLoopHarness(async () => {
+      switch (phase) {
+        case 'delegate':
+          // Turn 1 stays open while the test delegates through the turn's tools.
+          phase = 'idle';
+          await delegationTurnGate;
+          return text('DELEGATED');
+        case 'steer':
+          phase = 'report';
+          return [
+            toolCall('call-cancel', SUBAGENT_CONTROL_TOOL_ID, { action: 'cancel', subagentSessionId: children.a }),
+            toolCall('call-send', SUBAGENT_CONTROL_TOOL_ID, {
+              action: 'send',
+              subagentSessionId: children.b,
+              message: 'Only include trials after 2020.',
+            }),
+            { type: 'finish', finishReason: 'tool-calls', usage },
+          ];
+        case 'report':
+          phase = 'idle';
+          turnActiveDuringSteerTurn = parent.isTurnActive();
+          return text('Stopped the first task; redirected the second.');
+        default:
+          return text('ok');
+      }
+    });
+    try {
+      parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const sendSignal = vi.spyOn(childAgent, 'sendSignal');
+      const releaseA = holdChildRun(childAgent, 'first survey: done');
+      const releaseB = holdChildRun(childAgent, 'second survey: done');
+      releases.push(openDelegationTurn, releaseA, releaseB);
+
+      const delegationTurn = parent.message({ content: 'run two surveys in the background' });
+      await poll(() => parent.isRunning());
+      const tools = createPlanTaskTools(parent);
+      for (const [key, content] of [
+        ['a', 'first survey'],
+        ['b', 'second survey'],
+      ] as const) {
+        const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content } as any, toolCtx)) as any;
+        const delegated = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+          { taskId: task.taskId, agentType: 'worker' } as any,
+          toolCtx,
+        )) as any;
+        children[key] = delegated.subagentSessionId;
+      }
+      await poll(() =>
+        [children.a!, children.b!].every(id => harness._internalGetLiveSession(id)?.isRunning() === true),
+      );
+      openDelegationTurn();
+      await delegationTurn;
+      await poll(() => !parent.isRunning());
+
+      // The parent turn ended; both detached children still run.
+      expect(parent._internalSubagentExecutionsInFlight).toBe(2);
+      expect(parent.isBusy()).toBe(true);
+      expect(parent.isTurnActive()).toBe(false);
+
+      phase = 'steer';
+      const steerTurn = (await parent.message({ content: 'stop the first survey' })) as any;
+
+      expect(steerTurn.text).toContain('Stopped the first task');
+      expect(turnActiveDuringSteerTurn).toBe(true);
+      const controlOutputs = events
+        .filter(event => event.type === 'tool_end' && (event as any).toolName === SUBAGENT_CONTROL_TOOL_ID)
+        .map(event => (event as any).output);
+      expect(controlOutputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ action: 'cancel', subagentSessionId: children.a, cancel: 'acknowledged' }),
+          expect.objectContaining({ action: 'send', subagentSessionId: children.b, delivered: true }),
+        ]),
+      );
+      expect(sendSignal).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'system-reminder', contents: 'Only include trials after 2020.' }),
+        expect.anything(),
+      );
+
+      releaseA();
+      releaseB();
+      const run = control(parent);
+      const settledA = await run({ action: 'wait', subagentSessionId: children.a, timeoutMs: 5_000 });
+      const settledB = await run({ action: 'wait', subagentSessionId: children.b, timeoutMs: 5_000 });
+      expect(settledA.settledSubagents).toEqual([
+        expect.objectContaining({ subagentSessionId: children.a, status: 'failed', cancelRequested: true }),
+      ]);
+      expect(settledB.settledSubagents).toEqual([
+        expect.objectContaining({ subagentSessionId: children.b, status: 'completed' }),
+      ]);
+      await parent.waitForIdle({ timeoutMs: 5_000 });
+      expect(parent.isBusy()).toBe(false);
+      expect(parent.isTurnActive()).toBe(false);
+    } finally {
+      // Let held runs finish so a failed assertion surfaces instead of a drain timeout.
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+
+  it('an inline spawn_subagent reads as an active turn while its child runs', async () => {
+    let step = 0;
+    let observed: { turnActive: boolean; busy: boolean; inFlight: number } | undefined;
+    let parent!: Session;
+    let releaseChild = () => {};
+    const { harness, childAgent } = buildRealLoopHarness(() => {
+      step++;
+      return step === 1
+        ? [
+            toolCall('call-spawn', SPAWN_SUBAGENT_TOOL_ID, { agentType: 'worker', task: 'check one citation' }),
+            { type: 'finish', finishReason: 'tool-calls', usage },
+          ]
+        : text('checked');
+    });
+    try {
+      parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      releaseChild = holdChildRun(childAgent, 'citation checked');
+
+      const turn = parent.message({ content: 'check the citation' });
+      await poll(() => childAgent.streamCalls.length === 1);
+      observed = {
+        turnActive: parent.isTurnActive(),
+        busy: parent.isBusy(),
+        inFlight: parent._internalSubagentExecutionsInFlight,
+      };
+      releaseChild();
+      await turn;
+
+      expect(observed).toEqual({ turnActive: true, busy: true, inFlight: 1 });
+      expect(parent.isTurnActive()).toBe(false);
+      expect(parent.isBusy()).toBe(false);
+    } finally {
+      releaseChild();
       await harness.shutdown();
     }
   });

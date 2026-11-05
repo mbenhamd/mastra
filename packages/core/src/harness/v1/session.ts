@@ -5936,6 +5936,35 @@ export class Session {
     return false;
   }
 
+  /**
+   * True while the session owns turn-scoped work: an in-flight turn, an
+   * active queue drain, a queued item drained into a turn, items waiting in
+   * the pending queue, a pending `respondTo*` resume that has not been
+   * cancelled, or an `abortActiveWork()` / `resetPlanTasks()` that is still
+   * cancelling children. The last one matters because Stop aborts the turn
+   * again once its children are cancelled, which would also abort a turn
+   * admitted in between. So during that window it can be true while
+   * `isBusy()` is already false.
+   *
+   * It ignores in-flight subagent executions, which `isBusy()` counts. A
+   * detached `task_delegate` child keeps running after the parent turn ends,
+   * so `isBusy()` stays true until that child settles while `isTurnActive()`
+   * goes false once the turn does. An inline `spawn_subagent` runs inside a
+   * parent turn, so it still reads true through that turn. Hosts deciding
+   * whether to admit a new user turn should read this; shutdown and
+   * `waitForIdle()` keep using `isBusy()`. `skills.use()` and a synchronous
+   * structured `message({ output, sync: true })` still refuse while
+   * `isBusy()`.
+   */
+  isTurnActive(): boolean {
+    if (this._currentTurnAbortController !== undefined) return true;
+    if (this._activeWorkInvalidationsInFlight > 0) return true;
+    if (this._draining) return true;
+    if (this._currentQueuedItemId !== undefined) return true;
+    if ((this._record.pendingQueue?.length ?? 0) > 0) return true;
+    return this._record.pendingResume !== undefined && this._record.cancelRequest === undefined;
+  }
+
   /** Classify why the session is busy for `HarnessBusyError` (§4.5a). */
   private _busyReason(): 'in_flight' | 'pending_approval' | 'pending_suspension' | 'pending_question' | 'pending_plan' {
     const pending = this._record.pendingResume;

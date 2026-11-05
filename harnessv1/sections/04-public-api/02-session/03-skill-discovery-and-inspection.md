@@ -20,8 +20,9 @@
   // `SessionRecord` projection after hydration. `isBusy()` and
   // `waitForIdle(...)` use the session-owned idle boundary: no non-terminal
   // `currentRun` (`starting`, `running`, `waiting`, or `resuming`), no
-  // canonical pending approval/suspension/question/plan item, and an empty
-  // `SessionRecord.pendingQueue`. They do not wait for upstream channel inbox
+  // canonical pending approval/suspension/question/plan item, an empty
+  // `SessionRecord.pendingQueue`, and no in-flight inline or delegated
+  // subagent execution owned by this session. They do not wait for upstream channel inbox
   // retry, downstream outbox delivery, or unrelated background diagnostics.
   // `waitForIdle({ timeout })` rejects if the timeout elapses before that
   // boundary is reached and does not mutate session state; the rejection is not
@@ -40,6 +41,20 @@
   // proves the run is still active. Cancellation is not a session concern in
   // v1 — see §3.
   isBusy(): boolean;
+  // `isTurnActive()` is true for an in-flight turn, an active queue drain, a
+  // drained queued item, a non-empty `pendingQueue`, a pending resume that
+  // has not been cancelled, or an `abortActiveWork()` / `resetPlanTasks()`
+  // still cancelling children (Stop re-aborts the turn once they are
+  // cancelled; in that window it can be true while `isBusy()` is false).
+  // It ignores in-flight subagent executions, so a detached
+  // `task_delegate` child that outlives its parent turn reads
+  // `isBusy() === true` but `isTurnActive() === false`. An inline
+  // `spawn_subagent` still reads true through the turn that runs it. Hosts
+  // gating admission of a new user turn read this; shutdown and `waitForIdle`
+  // keep the broader `isBusy()` boundary, and `useSkill` and the synchronous
+  // structured-output form still refuse while `isBusy()`. It is local-only
+  // for now: `RemoteSession` exposes `isBusy()` but not `isTurnActive()`.
+  isTurnActive(): boolean;
   waitForIdle(opts?: { timeout?: number }): Promise<void>;
   getQueueDepth(): number;
   getCurrentRunId(): string | null;
