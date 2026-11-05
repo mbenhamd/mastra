@@ -843,11 +843,16 @@ describe('PF-7631 wake dispatch outcomes', () => {
       const never = new Promise<never>(() => {});
       return new Proxy(result, { get: (t, p) => (p === 'accepted' ? never : Reflect.get(t, p)) });
     }) as never);
-    // The native acceptance bound (SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS, 30 s) fires
-    // at once; every other timer keeps its delay.
+    // The wake's native acceptance bound (SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS,
+    // 30 s), the first 30 s timer armed after the wake's dispatch, fires at
+    // once; every other timer keeps its delay.
     const realSetTimeout = globalThis.setTimeout;
-    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) =>
-      realSetTimeout(fn, ms === 30_000 ? 0 : ms, ...args)) as never);
+    let acceptanceBoundShortened = false;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) => {
+      const shorten = ms === 30_000 && wakeDispatches === 1 && !acceptanceBoundShortened;
+      if (shorten) acceptanceBoundShortened = true;
+      return realSetTimeout(fn, shorten ? 0 : ms, ...args);
+    }) as never);
 
     releaseChild();
     await poll(() => wakeDispatches === 1);
