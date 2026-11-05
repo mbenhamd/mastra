@@ -22854,6 +22854,9 @@ export class Session {
   _restoreLiveAfterFailedClose(): void {
     if (this._state === 'closing' && this._record.closingAt === undefined && this._record.closedAt === undefined) {
       this._state = 'live';
+      // A settlement-notice delivery that bailed out when close began left its
+      // notice owed for the next owner; this process owns the session again.
+      this._scheduleDelegationReconcileRetry(0);
     }
   }
 
