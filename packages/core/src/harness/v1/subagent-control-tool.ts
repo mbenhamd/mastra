@@ -32,7 +32,7 @@ import { HarnessValidationError } from './errors';
 import { projectHarnessPublicError } from './events';
 import { readDelegationAttemptMetadata } from './plan-task-session';
 import type { ActiveSubagentState, Session } from './session';
-import { harnessSubagentResultSummarySchema } from './terminal-subagent-result';
+import { harnessSubagentResultSummarySchema, summarizeHarnessSubagentEventResult } from './terminal-subagent-result';
 import type { HarnessSubagentResultSummary } from './terminal-subagent-result';
 
 export const SUBAGENT_CONTROL_TOOL_ID = 'subagent';
@@ -46,6 +46,16 @@ export const SUBAGENT_CONTROL_MAX_WAIT_TARGETS = 16;
 export const SUBAGENT_CONTROL_MAX_MESSAGE_CHARS = 4_000;
 export const SUBAGENT_CONTROL_STATUS_LIMIT = 25;
 const SUBAGENT_CONTROL_TASK_PREVIEW_CHARS = 500;
+/**
+ * UTF-8 byte budget for the results in one `status` or `wait` output (the
+ * same budget as `plan_task_check`). A child named in the call, or one that
+ * settled during it, gets its full result while the budget allows; every
+ * other child gets a bounded preview.
+ */
+export const SUBAGENT_CONTROL_MAX_OUTPUT_BYTES = 64 * 1024;
+export const SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT =
+  'Some results are previews or were left out to keep this output small. To read one full result, call ' +
+  'subagent with action "status" and that subagentSessionId.';
 const WAIT_POLL_INTERVAL_MS = 100;
 const WAIT_POLL_MAX_INTERVAL_MS = 1_000;
 /**
@@ -78,6 +88,10 @@ const subagentViewSchema = z.object({
   startedAt: z.number().optional(),
   settledAt: z.number().optional(),
   result: harnessSubagentResultSummarySchema.optional(),
+  /** `result` is a bounded preview of the full result. */
+  resultPreview: z.boolean().optional(),
+  /** The child has a result, but it did not fit in this output. */
+  resultOmitted: z.boolean().optional(),
 });
 type SubagentView = z.infer<typeof subagentViewSchema>;
 
@@ -152,6 +166,9 @@ const outputSchema = z.object({
   action: z.enum(['status', 'wait', 'send', 'cancel']).optional(),
   subagents: z.array(subagentViewSchema).optional(),
   truncated: z.boolean().optional(),
+  /** status/wait: at least one result is a preview or was left out; `resultsHint` says how to read it. */
+  resultsShortened: z.boolean().optional(),
+  resultsHint: z.string().optional(),
   /** wait: children that settled before the timeout. */
   settledSubagents: z.array(subagentViewSchema).optional(),
   /** wait: children still running when the wait ended. */
@@ -199,6 +216,66 @@ function preview(text: string): string {
   return text.length <= SUBAGENT_CONTROL_TASK_PREVIEW_CHARS
     ? text
     : `${text.slice(0, SUBAGENT_CONTROL_TASK_PREVIEW_CHARS - 1)}…`;
+}
+
+const utf8 = new TextEncoder();
+
+function jsonBytes(value: unknown): number {
+  return utf8.encode(JSON.stringify(value)).byteLength;
+}
+
+function withoutResult(view: SubagentView): SubagentView {
+  const { result: _result, resultPreview: _preview, resultOmitted: _omitted, ...rest } = view;
+  return rest;
+}
+
+/**
+ * Fit the results in a `status`/`wait` output under
+ * SUBAGENT_CONTROL_MAX_OUTPUT_BYTES. `build` places views into the output
+ * envelope; `views` lists them in output order. Each view with a result gets
+ * its full result (only when its id is in `fullResultIds`), else a preview,
+ * else no result, whichever first fits the bytes still left. The envelope is
+ * measured once with every result left out and the shortened notice present,
+ * so each choice only adds its own byte delta to a running count.
+ */
+function boundResults(
+  build: (fit: (view: SubagentView) => SubagentView) => SubagentControlOutput,
+  views: readonly SubagentView[],
+  fullResultIds: ReadonlySet<string>,
+): SubagentControlOutput {
+  const omitted = (view: SubagentView): SubagentView =>
+    view.result === undefined ? view : { ...withoutResult(view), resultOmitted: true };
+  let remaining =
+    SUBAGENT_CONTROL_MAX_OUTPUT_BYTES -
+    jsonBytes({ ...build(omitted), resultsShortened: true, resultsHint: SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT });
+  const fitted = new Map<string, SubagentView>();
+  let shortened = false;
+  for (const view of views) {
+    if (view.result === undefined) continue;
+    const previewResult = summarizeHarnessSubagentEventResult(view.result);
+    const previewView =
+      JSON.stringify(previewResult) === JSON.stringify(view.result)
+        ? view
+        : { ...withoutResult(view), result: previewResult, resultPreview: true };
+    const options = fullResultIds.has(view.subagentSessionId) ? [view, previewView] : [previewView];
+    const omittedView = omitted(view);
+    const omittedBytes = jsonBytes(omittedView);
+    let chosen = omittedView;
+    for (const option of options) {
+      const delta = jsonBytes(option) - omittedBytes;
+      if (delta <= remaining) {
+        remaining -= delta;
+        chosen = option;
+        break;
+      }
+    }
+    if (chosen !== view) shortened = true;
+    fitted.set(view.subagentSessionId, chosen);
+  }
+  const output = build(view => fitted.get(view.subagentSessionId) ?? view);
+  return shortened
+    ? { ...output, resultsShortened: true, resultsHint: SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT }
+    : output;
 }
 
 function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
@@ -420,7 +497,11 @@ export function createSubagentControlTool(parent: Session) {
       limit: SUBAGENT_CONTROL_STATUS_LIMIT,
     });
     if (foreign.length > 0) return foreignError(foreign);
-    return { action: 'status', subagents: views, ...(truncated ? { truncated: true } : {}) };
+    return boundResults(
+      fit => ({ action: 'status', subagents: views.map(fit), ...(truncated ? { truncated: true } : {}) }),
+      views,
+      new Set(childId === undefined ? [] : [childId]),
+    );
   }
 
   async function wait(
@@ -436,6 +517,25 @@ export function createSubagentControlTool(parent: Session) {
     // storage read stalls past the deadline or the call is aborted.
     let lastSettled: SubagentView[] = [];
     let lastRunning: SubagentView[] = [];
+    // Full results go to named children and to children that settle during
+    // this call; a child already settled when the wait began gets a preview.
+    const fullResultIds = new Set(childIds ?? []);
+    let runningAtStart: ReadonlySet<string> | undefined;
+    const output = (extra: { timedOut: boolean; aborted?: true }): SubagentControlOutput => {
+      for (const view of lastSettled) {
+        if (runningAtStart?.has(view.subagentSessionId) === true) fullResultIds.add(view.subagentSessionId);
+      }
+      return boundResults(
+        fit => ({
+          action: 'wait',
+          settledSubagents: lastSettled.map(fit),
+          runningSubagents: lastRunning.map(fit),
+          ...extra,
+        }),
+        [...lastSettled, ...lastRunning],
+        fullResultIds,
+      );
+    };
     for (;;) {
       // The deadline decides when to stop polling, not how long a started read
       // may take: every read may run at least SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
@@ -459,18 +559,13 @@ export function createSubagentControlTool(parent: Session) {
               'nothing is known about the subagents yet. Retry the wait.',
           };
         }
-        return {
-          action: 'wait',
-          settledSubagents: lastSettled,
-          runningSubagents: lastRunning,
-          timedOut: !aborted,
-          ...(aborted ? { aborted: true } : {}),
-        };
+        return output({ timedOut: !aborted, ...(aborted ? { aborted: true as const } : {}) });
       }
       const { views, foreign } = resolution.value;
       if (foreign.length > 0) return foreignError(foreign);
       // Ownership is proven once; a child row deleted mid-wait then reads as closed.
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
+      runningAtStart ??= new Set(views.filter(view => !view.settled).map(view => view.subagentSessionId));
       // An implicit wait pins every child that was running when it started.
       targets ??= views.filter(view => !view.settled).map(view => view.subagentSessionId);
       const pinned = new Set(targets);
@@ -481,13 +576,7 @@ export function createSubagentControlTool(parent: Session) {
       const aborted = signal?.aborted === true;
       const timedOut = running.length > 0 && !aborted && Date.now() >= deadline;
       if (running.length === 0 || timedOut || aborted) {
-        return {
-          action: 'wait',
-          settledSubagents: lastSettled,
-          runningSubagents: lastRunning,
-          timedOut,
-          ...(aborted && running.length > 0 ? { aborted: true } : {}),
-        };
+        return output({ timedOut, ...(aborted && running.length > 0 ? { aborted: true as const } : {}) });
       }
       await abortable(Math.min(interval, Math.max(0, deadline - Date.now())), signal);
       interval = Math.min(interval * 2, WAIT_POLL_MAX_INTERVAL_MS);
@@ -615,6 +704,10 @@ export function createSubagentControlTool(parent: Session) {
       'on your own subagents. ' +
       '`status` lists them (or inspects one) with their status. Only a settled task_delegate subagent ' +
       'carries its result; a spawn_subagent result is returned by that spawn_subagent call only. ' +
+      `Results are kept under ${SUBAGENT_CONTROL_MAX_OUTPUT_BYTES} bytes per call: a subagent you name, or one that ` +
+      'settles during a wait, gets its full result; others get a preview (`resultPreview`), and a result that ' +
+      'does not fit is left out (`resultOmitted`). `resultsShortened` marks such an output; call `status` with ' +
+      'one subagentSessionId to read that full result. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
       'returns those settled and those still running. If the first status read stalls, wait fails with ' +
       '`harness.storage` (retry it); if a later read stalls past the timeout, the lists are the statuses from ' +

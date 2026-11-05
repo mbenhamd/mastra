@@ -111,12 +111,18 @@ async function openParentTurn(parent: Session, agent: MockAgent): Promise<() => 
 }
 
 /** Delegate one plan task; the child's run is held until the returned release fires. */
-async function delegateHeldChild(parent: Session, childAgent: MockAgent, content: string) {
+async function delegateHeldChild(
+  parent: Session,
+  childAgent: MockAgent,
+  content: string,
+  summary = `${content}: done`,
+) {
   let releaseChild!: () => void;
+  const runsBefore = childAgent.streamCalls.length;
   childAgent.enqueueRun({
     holdUntil: new Promise<void>(r => (releaseChild = r)),
     finishReason: 'stop',
-    terminalToolResult: completedOutcome(`${content}: done`),
+    terminalToolResult: completedOutcome(summary),
   });
   const tools = createPlanTaskTools(parent);
   const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content } as any, toolCtx)) as any;
@@ -124,7 +130,7 @@ async function delegateHeldChild(parent: Session, childAgent: MockAgent, content
     { taskId: task.taskId, agentType: 'worker' } as any,
     toolCtx,
   )) as any;
-  await poll(() => childAgent.streamCalls.length > 0);
+  await poll(() => childAgent.streamCalls.length > runsBefore);
   return { taskId: task.taskId as string, childId: delegated.subagentSessionId as string, releaseChild };
 }
 
@@ -650,6 +656,153 @@ describe('subagent control tool', () => {
     });
     expect(createSubagentControlTool(parent)).toBeDefined();
     expect(createSubagentControlTool(deepest)).toBeUndefined();
+    await harness.shutdown();
+  });
+});
+
+/** A summary of `bytes` ASCII bytes that starts with `label`. */
+function largeSummary(label: string, bytes: number): string {
+  return `${label} `.padEnd(bytes, 'x');
+}
+
+function utf8Length(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+type ResultPageRow = {
+  name: string;
+  /** Summary bytes per delegated child. */
+  sizes: number[];
+  /** Children (by index) settled before the call. */
+  settledBefore: number[];
+  /** Children (by index) released while the call runs. */
+  settledDuring: number[];
+  call: (ids: string[]) => Record<string, unknown>;
+  /** Expected result per child index in the output: full, preview, or omitted. */
+  expected: Record<number, 'full' | 'preview' | 'omitted'>;
+  shortened: boolean;
+};
+
+const resultPageRows: ResultPageRow[] = [
+  {
+    name: 'status listing: a child settled before the call gets a preview',
+    sizes: [20_000],
+    settledBefore: [0],
+    settledDuring: [],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'preview' },
+    shortened: true,
+  },
+  {
+    name: 'status naming a child settled before the call gets its full result',
+    sizes: [20_000],
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'status', subagentSessionId: ids[0] }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'status listing: a small result is complete as its preview and is not marked shortened',
+    sizes: [200],
+    settledBefore: [0],
+    settledDuring: [],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'status listing three large children stays under the budget with previews',
+    sizes: [40_000, 40_000, 40_000],
+    settledBefore: [0, 1, 2],
+    settledDuring: [],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'preview', 1: 'preview', 2: 'preview' },
+    shortened: true,
+  },
+  {
+    name: 'wait for every running child: a child that settles during the call gets its full result',
+    sizes: [20_000],
+    settledBefore: [],
+    settledDuring: [0],
+    call: () => ({ action: 'wait', timeoutMs: 5_000 }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'wait naming a child settled before the call gets its full result',
+    sizes: [20_000],
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'wait naming three large children over the budget: the first is full, the rest are previews',
+    sizes: [40_000, 40_000, 40_000],
+    settledBefore: [0, 1, 2],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full', 1: 'preview', 2: 'preview' },
+    shortened: true,
+  },
+];
+
+describe('subagent control tool — bounded result page', () => {
+  it.each(resultPageRows)('$name', async row => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
+    for (const [index, size] of row.sizes.entries()) {
+      const summary = largeSummary(`child-${index}`, size);
+      const child = await delegateHeldChild(parent, childAgent, `job ${index}`, summary);
+      children.push({ ...child, summary });
+    }
+    const settled = async (index: number) =>
+      (await run({ action: 'status', subagentSessionId: children[index]!.childId })).subagents?.[0]?.settled === true;
+    for (const index of row.settledBefore) {
+      children[index]!.releaseChild();
+      await poll(() => settled(index));
+    }
+
+    const pending = run(row.call(children.map(child => child.childId)));
+    for (const index of row.settledDuring) children[index]!.releaseChild();
+    const output = await pending;
+
+    expect(output.isError).toBeUndefined();
+    expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+    const views: any[] = output.subagents ?? output.settledSubagents;
+    for (const [index, expected] of Object.entries(row.expected)) {
+      const child = children[Number(index)]!;
+      const view = views.find(candidate => candidate.subagentSessionId === child.childId);
+      expect(view, `child ${index}`).toBeDefined();
+      if (expected === 'full') {
+        expect(view.result.text).toBe(child.summary);
+        expect(view.result.textTruncated).toBe(false);
+        expect(view.resultPreview).toBeUndefined();
+      } else if (expected === 'preview') {
+        expect(view.resultPreview).toBe(true);
+        expect(view.result.textTruncated).toBe(true);
+        expect(child.summary.startsWith(view.result.text.split('\n')[0])).toBe(true);
+        expect(new TextEncoder().encode(view.result.text).byteLength).toBeLessThan(5 * 1024);
+      } else {
+        expect(view.result).toBeUndefined();
+        expect(view.resultOmitted).toBe(true);
+      }
+    }
+    if (row.shortened) {
+      expect(output.resultsShortened).toBe(true);
+      expect(output.resultsHint).toMatch(/action "status" and that subagentSessionId/);
+    } else {
+      expect(output.resultsShortened).toBeUndefined();
+      expect(output.resultsHint).toBeUndefined();
+    }
+
+    for (const child of children) child.releaseChild();
+    closeTurn();
     await harness.shutdown();
   });
 });
