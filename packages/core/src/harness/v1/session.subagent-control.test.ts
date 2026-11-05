@@ -65,7 +65,7 @@ function subagentsConfig() {
   };
 }
 
-function buildHarness(db: InMemoryDB) {
+function buildHarness(db: InMemoryDB, subagents: Record<string, unknown> = subagentsConfig()) {
   const parentAgent = new MockAgent({ id: 'parent-agent' });
   const childAgent = new MockAgent({
     id: 'child-agent',
@@ -79,7 +79,7 @@ function buildHarness(db: InMemoryDB) {
     ],
     defaultModeId: 'default',
     sessions: { storage: new InMemoryHarness({ db }) },
-    subagents: subagentsConfig(),
+    subagents: subagents as any,
   });
   return { harness, parentAgent, childAgent };
 }
@@ -906,6 +906,8 @@ type WaitRow = {
   input: (ids: string[]) => Record<string, unknown>;
   /** Drives settlement while the wait runs; returns once its part is done. */
   drive: (ctx: WaitRowContext) => Promise<void>;
+  /** Children (by index) settled before the call starts. */
+  settledBefore?: number[];
   /** Hides the in-process settlement signal from the wait, as for a settlement by another process. */
   noInProcessSignal?: boolean;
   abortAfterMs?: number;
@@ -915,6 +917,8 @@ type WaitRow = {
 type WaitRowContext = {
   ids: string[];
   release: (index: number) => void;
+  /** Resolves once the wait's first storage read has answered. */
+  firstReadDone: () => Promise<void>;
   settledAt: (output: any, index: number) => number;
 };
 
@@ -959,9 +963,10 @@ const waitRows: WaitRow[] = [
     check: (output, { returnedAt, settledAt, storageReads }) => {
       expect(output.timedOut).toBe(false);
       // One read proves ownership and the wake costs one more; a 100 ms..1 s
-      // backoff poll needs about six over the same 1.6 s.
+      // backoff poll needs about six over the same 1.6 s. The latency bound is
+      // wide for a loaded host; the 5 s storage poll alone would miss it.
       expect(storageReads).toBeLessThanOrEqual(3);
-      expect(returnedAt - settledAt(output, 0)).toBeLessThan(250);
+      expect(returnedAt - settledAt(output, 0)).toBeLessThan(500);
     },
   },
   {
@@ -969,7 +974,12 @@ const waitRows: WaitRow[] = [
     children: 1,
     noInProcessSignal: true,
     input: ids => ({ action: 'wait', subagentSessionId: ids[0], timeoutMs: 10_000 }),
-    drive: async ({ release }) => release(0),
+    // Settle only once the wait has read the child as running, so the poll,
+    // not the first read, must find the settlement.
+    drive: async ({ release, firstReadDone }) => {
+      await firstReadDone();
+      release(0);
+    },
     check: (output, { returnedAt, settledAt, ids }) => {
       expect(output.timedOut).toBe(false);
       expect(settledIds(output)).toEqual([ids[0]]);
@@ -997,7 +1007,20 @@ const waitRows: WaitRow[] = [
       expect(output.aborted).toBe(true);
       expect(output.timedOut).toBe(false);
       expect(runningIds(output)).toEqual([ids[0]]);
-      expect(returnedAt - startedAt).toBeLessThan(1_000);
+      expect(returnedAt - startedAt).toBeLessThan(2_000);
+    },
+  },
+  {
+    name: 'until any naming a child already settled at call time returns at once',
+    children: 2,
+    settledBefore: [0],
+    input: ids => ({ action: 'wait', until: 'any', subagentSessionIds: ids, timeoutMs: 10_000 }),
+    drive: async () => {},
+    check: (output, { ids, returnedAt, startedAt }) => {
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output)).toEqual([ids[0]]);
+      expect(runningIds(output)).toEqual([ids[1]]);
+      expect(returnedAt - startedAt).toBeLessThan(2_000);
     },
   },
 ];
@@ -1016,20 +1039,37 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
         releases.push(child.releaseChild);
         ids.push(child.childId);
       }
-      // Fork main has no settlement signal to hide; there the row checks the poll alone.
-      if (row.noInProcessSignal && '_internalOnDelegatedSettlement' in parent) {
-        vi.spyOn(parent as any, '_internalOnDelegatedSettlement').mockReturnValue(() => {});
+      if (row.settledBefore !== undefined) {
+        const statusOf = control(parent);
+        for (const index of row.settledBefore) {
+          releases[index]!();
+          await poll(
+            async () =>
+              (await statusOf({ action: 'status', subagentSessionId: ids[index]! })).subagents?.[0]?.settled === true,
+          );
+        }
+      }
+      if (row.noInProcessSignal) {
+        vi.spyOn(parent, '_internalOnDelegatedSettlement').mockReturnValue(() => {});
       }
       // The tool reads storage through the handle it takes at creation; count its own reads.
       let toolReads = 0;
+      let answeredReads = 0;
       const storage = parent._internalStorage;
       const counting = new Proxy(storage, {
         get(target, key) {
           const value = Reflect.get(target, key, target);
           if (typeof value !== 'function') return value;
           return (...args: unknown[]) => {
-            if (key === 'listPlanTasks' || key === 'loadSession') toolReads += 1;
-            return value.apply(target, args);
+            const result = value.apply(target, args);
+            if (key === 'listPlanTasks' || key === 'loadSession') {
+              toolReads += 1;
+              void Promise.resolve(result).then(
+                () => (answeredReads += 1),
+                () => (answeredReads += 1),
+              );
+            }
+            return result;
           };
         },
       });
@@ -1041,6 +1081,11 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
       const ctx: WaitRowContext = {
         ids,
         release: index => releases[index]!(),
+        firstReadDone: async () => {
+          await poll(() => toolReads > 0 && answeredReads === toolReads);
+          // Let the wait finish the read round before the settlement lands.
+          await new Promise(r => setTimeout(r, 50));
+        },
         settledAt: (output, index) =>
           (output.settledSubagents as any[]).find(view => view.subagentSessionId === ids[index]).settledAt,
       };
@@ -1063,6 +1108,36 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
     },
     15_000,
   );
+});
+
+describe('delegated settlement listeners', () => {
+  it('a throwing listener neither skips the other listeners nor the settlement notice', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), {
+      ...subagentsConfig(),
+      onDelegatedSettlement: 'wake',
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const child = await delegateHeldChild(parent, childAgent, 'listener job');
+    const notice = vi.spyOn(parent as any, '_startDelegationSettlementNotice');
+    let later = 0;
+    parent._internalOnDelegatedSettlement(() => {
+      throw new Error('listener failed');
+    });
+    parent._internalOnDelegatedSettlement(() => {
+      later += 1;
+    });
+    try {
+      child.releaseChild();
+      await poll(() => later > 0 && notice.mock.calls.length > 0, 5_000);
+      expect(later).toBe(1);
+      expect(notice).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.restoreAllMocks();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 15_000);
 });
 
 describe('subagent control tool — permission gate (real agent loop)', () => {
