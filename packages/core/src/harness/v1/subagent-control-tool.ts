@@ -413,7 +413,9 @@ function boundResults(
       true,
       required,
     );
-    if (fitted === undefined) {
+    // A required child keeps its result (at least its preview) before the
+    // prefix grows; with no prefix left it is kept even without its result.
+    if (fitted === undefined || (keep > 0 && omitsRequiredResult(fitted, required))) {
       high = keep - 1;
     } else {
       best = fitted;
@@ -427,6 +429,14 @@ function boundResults(
       omittedSubagentCount: views.length,
       resultsHint: `${views.length} subagents were left out of this output. Call subagent with action "wait" and at most ${SUBAGENT_CONTROL_MAX_WAIT_TARGETS} subagentSessionIds at a time.`,
     }
+  );
+}
+
+/** Whether `output` left out the result of a `required` child. */
+function omitsRequiredResult(output: SubagentControlOutput, required: ReadonlySet<string>): boolean {
+  if (required.size === 0) return false;
+  return [...(output.subagents ?? []), ...(output.settledSubagents ?? []), ...(output.runningSubagents ?? [])].some(
+    view => view.resultOmitted === true && required.has(view.subagentSessionId),
   );
 }
 
