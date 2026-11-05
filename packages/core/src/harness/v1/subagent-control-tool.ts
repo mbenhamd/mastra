@@ -308,6 +308,10 @@ function boundResults(
   if (namedOne !== undefined && views.every(view => view.subagentSessionId === namedOne)) {
     return build(list => [...list]);
   }
+  // Room for the shortening notice is reserved only once something must be
+  // shortened: an output whose full results fit as they are carries no notice.
+  const unshortened = fitResults(build, views, views, fullResultIds, false);
+  if (unshortened !== undefined) return unshortened;
   const whole =
     fitResults(build, views, views, fullResultIds) ?? fitResults(build, views, views.map(shortTask), fullResultIds);
   if (whole !== undefined) return whole;
@@ -341,10 +345,12 @@ function boundResults(
 /**
  * Fit the results of `kept` (a prefix of `views`, possibly with shortened
  * task texts) into the output, or return undefined when even the children
- * with every result left out exceed the budget.
+ * with every result left out exceed the budget. With `reserveNotice` false
+ * no room is kept for the shortening notice, and any output that would need
+ * it is refused (undefined) instead.
  *
- * The envelope is measured once with every result left out and the notice
- * present, and each choice adds only its own byte delta to a running count.
+ * The envelope is measured once with every result left out (and the notice
+ * present when reserved), and each choice adds only its own byte delta to a running count.
  * The first pass gives every child its preview (a small result is its own
  * preview), or no result when even that does not fit. The second pass
  * upgrades children in `fullResultIds` to their full result, in order, while
@@ -356,6 +362,7 @@ function fitResults(
   views: readonly SubagentView[],
   kept: readonly SubagentView[],
   fullResultIds: ReadonlySet<string>,
+  reserveNotice = true,
 ): SubagentControlOutput | undefined {
   const keptIds = new Set(kept.map(view => view.subagentSessionId));
   const leftOut = views.filter(view => !keptIds.has(view.subagentSessionId)).map(view => view.subagentSessionId);
@@ -374,7 +381,8 @@ function fitResults(
         const keptView = byId.get(view.subagentSessionId);
         return keptView === undefined ? [] : [choose(keptView)];
       });
-  let remaining = SUBAGENT_CONTROL_MAX_OUTPUT_BYTES - jsonBytes({ ...build(placeWith(omitted)), ...notice });
+  let remaining =
+    SUBAGENT_CONTROL_MAX_OUTPUT_BYTES - jsonBytes({ ...build(placeWith(omitted)), ...(reserveNotice ? notice : {}) });
   if (remaining < 0) return undefined;
   const fitted = new Map<string, SubagentView>();
   const upgrades: Array<{ full: SubagentView; previewBytes: number }> = [];
@@ -419,7 +427,8 @@ function fitResults(
       return (fitted.get(view.subagentSessionId) ?? view) !== source;
     });
   const output = build(placeWith(view => fitted.get(view.subagentSessionId) ?? view));
-  return shortened ? { ...output, ...notice } : output;
+  if (!shortened) return output;
+  return reserveNotice ? { ...output, ...notice } : undefined;
 }
 
 function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
