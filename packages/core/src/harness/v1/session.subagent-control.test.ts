@@ -677,6 +677,16 @@ function escapedSummary(chars: number): string {
   return '"'.repeat(chars);
 }
 
+/**
+ * What a returning spawn_subagent call does to an inline child registered
+ * under `inline:<id>`: the parent drops its spawn record (keeping the child
+ * listed for the rest of the turn), then the child closes.
+ */
+async function returnInline(parent: Session, child: Session): Promise<void> {
+  parent._internalReturnInlineSubagent(`inline:${child.id}`);
+  await child.close();
+}
+
 function utf8Length(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
@@ -1189,10 +1199,9 @@ type ChildListRow = {
   followHint?: boolean;
   /**
    * Between pages, some inline children return the way a finished
-   * spawn_subagent call does (their spawn record is removed, then the child
-   * closes): three already read and three not read yet. They leave the list,
-   * which is the disclosed residual: later pages can shift, by at most one
-   * child per returned child already read.
+   * spawn_subagent call does (`returnInline`): three already read and three
+   * not read yet. They keep their place for the rest of the turn, so paging
+   * still sees every child exactly once.
    */
   settleBetweenPages?: boolean;
 };
@@ -1246,7 +1255,7 @@ const childListRows: ChildListRow[] = [
     followHint: true,
   },
   {
-    name: '1000 inline children, some returning between pages: no child seen twice, pages shift at most by the returned ones',
+    name: '1000 inline children, some returning between pages: each child seen exactly once, every page within 64 KiB',
     largeSettling: 0,
     running: 0,
     inline: 1000,
@@ -1343,22 +1352,16 @@ describe('subagent control tool — bounded child list', () => {
         // Page through the rest with the offset each hint gives, until a page leaves nothing out.
         const seen = [...listedIds];
         let page = output;
-        let readReturned = 0;
-        const unreadReturned = new Set<string>();
+        let returned = 0;
         while (page.omittedSubagentCount !== undefined) {
           const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
-          if (!row.settleBetweenPages) expect(offset).toBe(seen.length);
+          expect(offset).toBe(seen.length);
           if (row.settleBetweenPages) {
             const open = inlineSessions.filter(child => child.getRecord().closedAt === undefined);
             const read = open.filter(child => seen.includes(child.id)).slice(0, 3);
             const unread = open.filter(child => !seen.includes(child.id)).slice(0, 3);
-            for (const child of [...read, ...unread]) {
-              // spawn_subagent removes its record before the child closes.
-              active.delete(`inline:${child.id}`);
-              await child.close();
-            }
-            readReturned += read.length;
-            for (const child of unread) unreadReturned.add(child.id);
+            for (const child of [...read, ...unread]) await returnInline(parent, child);
+            returned += read.length + unread.length;
           }
           page = await run({ action: 'wait', timeoutMs: 0, offset });
           expect(page.isError).toBeUndefined();
@@ -1370,18 +1373,10 @@ describe('subagent control tool — bounded child list', () => {
           expect(ids.length).toBeGreaterThan(0);
           seen.push(...ids);
         }
-        // No child is seen twice.
+        // Every child is seen exactly once.
         expect(new Set(seen).size).toBe(seen.length);
-        if (!row.settleBetweenPages) {
-          expect([...seen].sort()).toEqual([...allIds].sort());
-          return;
-        }
-        // A returned child leaves the list: one not read yet is never listed, and
-        // each one already read can shift the later pages by one child.
-        expect(readReturned).toBeGreaterThan(3);
-        expect(seen.filter(id => unreadReturned.has(id))).toEqual([]);
-        const missed = allIds.filter(id => !seen.includes(id) && !unreadReturned.has(id));
-        expect(missed.length).toBeLessThanOrEqual(readReturned);
+        expect([...seen].sort()).toEqual([...allIds].sort());
+        if (row.settleBetweenPages) expect(returned).toBeGreaterThanOrEqual(6);
       } finally {
         for (const key of inlineKeys) active.delete(key);
         for (const child of children) child.releaseChild();
@@ -1686,6 +1681,123 @@ describe('subagent control tool — stable offsets', () => {
       await harness.shutdown();
     }
   }, 60_000);
+
+  /** Page an implicit list from offset 0 through the hints, running `between` before each next page. */
+  async function pageAll(
+    run: (input: Record<string, unknown>) => Promise<any>,
+    action: 'status' | 'wait',
+    between: (seen: readonly string[]) => Promise<void>,
+  ): Promise<string[]> {
+    const call = (offset: number) => run(action === 'wait' ? { action, timeoutMs: 0, offset } : { action, offset });
+    const seen: string[] = [];
+    let page = await call(0);
+    for (;;) {
+      expect(page.isError).toBeUndefined();
+      expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+      const views: any[] = action === 'wait' ? [...page.settledSubagents, ...page.runningSubagents] : page.subagents;
+      expect(views.length).toBeGreaterThan(0);
+      seen.push(...views.map(view => view.subagentSessionId as string));
+      if (page.omittedSubagentCount === undefined) return seen;
+      const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+      expect(offset).toBe(seen.length);
+      await between(seen);
+      page = await call(offset);
+    }
+  }
+
+  /** Return three open inline children already read and three not read yet. */
+  async function returnSome(parent: Session, sessions: readonly Session[], seen: readonly string[]): Promise<number> {
+    const open = sessions.filter(child => child.getRecord().closedAt === undefined);
+    const picked = [
+      ...open.filter(child => seen.includes(child.id)).slice(0, 3),
+      ...open.filter(child => !seen.includes(child.id)).slice(0, 3),
+    ];
+    for (const child of picked) await returnInline(parent, child);
+    return picked.length;
+  }
+
+  it('250 inline children, some returning between pages: wait and status each see every child exactly once', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    try {
+      const sessions = await addInlineChildren(harness, parent, 250);
+      keys = register(parent, sessions, () => Date.now());
+      const allIds = sessions.map(child => child.id).sort();
+      let returned = 0;
+      for (const action of ['wait', 'status'] as const) {
+        const seen = await pageAll(run, action, async read => {
+          returned += await returnSome(parent, sessions, read);
+        });
+        expect(new Set(seen).size).toBe(seen.length);
+        expect([...seen].sort()).toEqual(allIds);
+      }
+      expect(returned).toBeGreaterThan(6);
+    } finally {
+      unregister(parent, keys);
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('30 inline children started before 40 delegated ones, inline returning between pages: each child seen exactly once', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void }> = [];
+    let keys: string[] = [];
+    try {
+      const sessions = await addInlineChildren(harness, parent, 30);
+      const inlineStart = Date.now() - 60_000;
+      keys = register(parent, sessions, () => inlineStart);
+      for (let index = 0; index < 40; index += 1) {
+        children.push(await delegateHeldChild(parent, childAgent, `job ${index}`));
+      }
+      const allIds = [...sessions.map(child => child.id), ...children.map(child => child.childId)].sort();
+      let returned = 0;
+      const seen = await pageAll(run, 'status', async read => {
+        returned += await returnSome(parent, sessions, read);
+      });
+      expect(returned).toBeGreaterThanOrEqual(6);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual(allIds);
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('the record of returned inline children is cleared at each turn start and does not grow across turns', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const run = control(parent);
+    const record = () => parent._internalReturnedInlineSubagents();
+    for (let turn = 0; turn < 4; turn += 1) {
+      let release!: () => void;
+      parentAgent.enqueueRun({ holdUntil: new Promise<void>(r => (release = r)), finishReason: 'stop', text: 'done' });
+      const callsBefore = parentAgent.streamCalls.length;
+      const pending = parent.message({ content: `turn ${turn}` });
+      await poll(() => parentAgent.streamCalls.length > callsBefore);
+      // The turn boundary cleared the previous turn's returned children.
+      expect(record().size).toBe(0);
+      const sessions = await addInlineChildren(harness, parent, 5);
+      register(parent, sessions, () => Date.now());
+      for (const child of sessions) await returnInline(parent, child);
+      expect(record().size).toBe(5);
+      // Within the turn the returned children stay listed.
+      const listed = (await run({ action: 'status' })).subagents.map((view: any) => view.subagentSessionId);
+      expect([...listed].sort()).toEqual(sessions.map(child => child.id).sort());
+      release();
+      await pending.catch(() => {});
+      expect(record().size).toBe(5);
+    }
+    await harness.shutdown();
+  }, 30_000);
 
   it('children that start at the same time are ordered by id, whatever order they were registered in', async () => {
     const { harness, parentAgent } = buildHarness(new InMemoryDB());

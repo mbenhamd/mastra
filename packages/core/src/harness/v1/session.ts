@@ -1488,6 +1488,12 @@ export interface ActiveToolState {
  * Active-subagent tracking for `SessionDisplayState.activeSubagents`. Keyed
  * on the parent's `spawn_subagent` tool call id. Dropped on subagent close.
  */
+/** What the `subagent` control tool keeps of an inline child after its spawn_subagent call returned. */
+export interface ReturnedInlineSubagentState {
+  startedAt: number;
+  agentType: string;
+}
+
 export interface ActiveSubagentState {
   subagentSessionId: string;
   agentType: string;
@@ -2036,6 +2042,14 @@ export class Session {
     }
   >();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  /**
+   * Inline (`spawn_subagent`) children whose call returned during the current
+   * turn, so the `subagent` control tool keeps listing them at their place
+   * after they leave `_activeSubagents`. One small entry (start time and
+   * agent type; no task text or result) per spawn_subagent call that returned
+   * in this turn; cleared when the next turn begins (`_resetTurnTracking`).
+   */
+  private readonly _returnedInlineSubagents = new Map<string, ReturnedInlineSubagentState>();
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
@@ -3302,6 +3316,25 @@ export class Session {
     this._notifyMaybeIdle();
   }
 
+  /**
+   * @internal — a `spawn_subagent` call returned: drop its display entry and
+   * remember the child for the rest of this turn (see `_returnedInlineSubagents`).
+   */
+  _internalReturnInlineSubagent(toolCallId: string): void {
+    const state = this._activeSubagents.get(toolCallId);
+    if (state === undefined) return;
+    this._activeSubagents.delete(toolCallId);
+    this._returnedInlineSubagents.set(state.subagentSessionId, {
+      startedAt: state.startedAt,
+      agentType: state.agentType,
+    });
+  }
+
+  /** @internal — the inline children whose spawn_subagent call returned in this turn. */
+  _internalReturnedInlineSubagents(): ReadonlyMap<string, ReturnedInlineSubagentState> {
+    return this._returnedInlineSubagents;
+  }
+
   /** @internal — current shared count, exposed only for deterministic tests. */
   get _internalSubagentExecutionsInFlight(): number {
     return this._subagentExecutionsInFlight;
@@ -3386,6 +3419,7 @@ export class Session {
     this._activeTools.clear();
     this._toolInputBuffers.clear();
     this._subagentAnswerDecoders.clear();
+    this._returnedInlineSubagents.clear();
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
     // spanning multiple parent turns still renders.
