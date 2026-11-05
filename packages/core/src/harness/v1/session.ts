@@ -2045,15 +2045,15 @@ export class Session {
   /**
    * Inline (`spawn_subagent`) children whose call returned during the current
    * run, so the `subagent` control tool keeps listing them at their place
-   * after they leave `_activeSubagents`. One small entry (start time and
-   * agent type; no task text or result) per spawn_subagent call that returned
-   * in this run. Cleared only when a new run starts: `_beginTurn` with no turn
-   * in flight (`_openTurnControllers` empty). A message, signal or reminder
-   * that joins the active run does not clear it.
+   * after they leave `_activeSubagents`. The record belongs to exactly one run
+   * (`_returnedInlineRunId`): one small entry (start time and agent type; no
+   * task text or result) per spawn_subagent call that returned in that run.
+   * It is cleared when a read or write comes from a different runId, so a
+   * suspend and resume of the same run, or a message that joins it, keeps it.
    */
   private readonly _returnedInlineSubagents = new Map<string, ReturnedInlineSubagentState>();
-  /** Controllers from `_beginTurn` whose `_endTurn` has not run yet. */
-  private readonly _openTurnControllers = new Set<AbortController>();
+  /** The run that owns `_returnedInlineSubagents`. */
+  private _returnedInlineRunId: string | undefined;
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
@@ -3322,20 +3322,29 @@ export class Session {
 
   /**
    * @internal — a `spawn_subagent` call returned: drop its display entry and
-   * remember the child for the rest of this run (see `_returnedInlineSubagents`).
+   * remember the child for the rest of run `runId` (see `_returnedInlineSubagents`).
    */
-  _internalReturnInlineSubagent(toolCallId: string): void {
+  _internalReturnInlineSubagent(toolCallId: string, runId: string | undefined): void {
     const state = this._activeSubagents.get(toolCallId);
     if (state === undefined) return;
     this._activeSubagents.delete(toolCallId);
-    this._returnedInlineSubagents.set(state.subagentSessionId, {
+    this._returnedInlineSubagentsOf(runId).set(state.subagentSessionId, {
       startedAt: state.startedAt,
       agentType: state.agentType,
     });
   }
 
-  /** @internal — the inline children whose spawn_subagent call returned in this run. */
-  _internalReturnedInlineSubagents(): ReadonlyMap<string, ReturnedInlineSubagentState> {
+  /** @internal — the inline children whose spawn_subagent call returned in run `runId`. */
+  _internalReturnedInlineSubagents(runId: string | undefined): ReadonlyMap<string, ReturnedInlineSubagentState> {
+    return this._returnedInlineSubagentsOf(runId);
+  }
+
+  /** The record for `runId`; a different run's entries are dropped first. */
+  private _returnedInlineSubagentsOf(runId: string | undefined): Map<string, ReturnedInlineSubagentState> {
+    if (runId !== this._returnedInlineRunId) {
+      this._returnedInlineSubagents.clear();
+      this._returnedInlineRunId = runId;
+    }
     return this._returnedInlineSubagents;
   }
 
@@ -3368,10 +3377,6 @@ export class Session {
       this._assertSourceWriteGuardScope(sourceWriteGuard, 'observationalMemorySourceWriteGuard');
     }
     const controller = new AbortController();
-    // No turn in flight: this starts a new run, so the previous run's returned
-    // inline children leave the list. A turn that joins an active run keeps them.
-    if (this._openTurnControllers.size === 0) this._returnedInlineSubagents.clear();
-    this._openTurnControllers.add(controller);
     this._currentTurnAbortController = controller;
     this._turnsBegun += 1;
     this._resetTurnTracking();
@@ -3427,8 +3432,7 @@ export class Session {
     this._activeTools.clear();
     this._toolInputBuffers.clear();
     this._subagentAnswerDecoders.clear();
-    // `_returnedInlineSubagents` is cleared by `_beginTurn` only when a new run
-    // starts, not by a turn that joins the active run.
+    // `_returnedInlineSubagents` is keyed by runId, not by turn (see its field).
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
     // spanning multiple parent turns still renders.
@@ -3441,7 +3445,6 @@ export class Session {
    * idle state. Cumulative aggregates (`_tokenUsage`) are preserved.
    */
   private _endTurn(controller: AbortController): void {
-    this._openTurnControllers.delete(controller);
     this._turnAbortSignalCleanups.get(controller)?.();
     this._turnAbortSignalCleanups.delete(controller);
     if (this._currentTurnAbortController === controller) {
