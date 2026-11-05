@@ -3823,7 +3823,7 @@ export class Session {
    * id exists at all (a turn that failed before a run was reserved), no
    * lifecycle event is emitted — there was no run to start or end.
    */
-  private _emitAgentStart(runId: string | undefined, signalId?: string): void {
+  private _emitAgentStart(runId: string | undefined, signalId?: string, wakeNoticeId?: string): void {
     const id = runId ?? this._currentRunId;
     if (id === undefined) return;
     // Stamp the active run id at agent_start so subsequent streamed chunks —
@@ -3839,7 +3839,11 @@ export class Session {
       // projection's `operation` can link to the durable signal row.
       this._currentRunSignalId = signalId;
     }
-    this._emitTurnEvent({ type: 'agent_start', runId: id });
+    this._emitTurnEvent(
+      wakeNoticeId === undefined
+        ? { type: 'agent_start', runId: id }
+        : { type: 'agent_start', runId: id, origin: 'wake', wakeNoticeId },
+    );
   }
 
   private _emitAgentEnd(opts: {
@@ -14935,7 +14939,9 @@ export class Session {
    * wake that a Stop or an already-active run rejects instead of interleaving.
    * PF-7473: `requireActiveRun` is the opposite, interleave-only mode (it never
    * wakes an idle thread), and `assertAdmitted` re-proves the sender's own
-   * admission after subscription setup.
+   * admission after subscription setup. PF-7626: `wakeNoticeId` marks an idle
+   * wake as a settlement-notice wake, published on its `agent_start` only
+   * while the wake still holds its idle slot at dispatch.
    */
   private async _injectSystemReminder(
     content: string,
@@ -14943,6 +14949,7 @@ export class Session {
     internal?: {
       signalId?: string;
       admissionEpoch?: number;
+      wakeNoticeId?: string;
       requireActiveRun?: boolean;
       assertAdmitted?: () => void;
     },
@@ -15006,6 +15013,7 @@ export class Session {
         }
       };
       let dispatched;
+      let idleSlotLost = false;
       try {
         const toolSurface = this._buildToolSurface(mode, undefined);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
@@ -15033,6 +15041,20 @@ export class Session {
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
+        // An idle-only wake re-checks in the same tick as its dispatch. It
+        // refuses only a stale admission epoch: a Stop (`abortActiveWork`) or an
+        // edit/regenerate (`resetPlanTasks`, which cancels the owned child
+        // sessions) during the context await (the Stop contract: not stopped or
+        // cancelled since the settlement). If a caller turn began or started a
+        // run during the await, it keeps the slot: the content is sent exactly
+        // as fork main sends it; only the wake label is dropped, so that run is
+        // never announced as this wake.
+        if (idleOnlyEpoch !== undefined) {
+          if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
+            throw new HarnessBusyError(this.id, 'in_flight');
+          }
+          idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
+        }
 
         dispatched = agent.sendSignal(
           {
@@ -15055,7 +15077,7 @@ export class Session {
 
       // §10.2 agent_start carries the runId — emit it now the run is dispatched.
       // dispatched.signal.id is the originating signalId — stamped for the run projection.
-      this._emitAgentStart(dispatched.runId, dispatched.signal.id);
+      this._emitAgentStart(dispatched.runId, dispatched.signal.id, idleSlotLost ? undefined : internal?.wakeNoticeId);
 
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
@@ -24222,12 +24244,20 @@ export class Session {
         this._record.pendingResume === undefined &&
         (this._record.pendingQueue ?? []).length === 0;
       if (wakeIdle) {
-        await this._injectSystemReminder(content, { attributes, metadata }, { signalId, admissionEpoch });
+        await this._injectSystemReminder(
+          content,
+          { attributes, metadata },
+          { signalId, admissionEpoch, wakeNoticeId: signalId },
+        );
       }
     } catch {
-      // After the claim nothing is owed: a wake refused as busy lost its slot to
-      // a turn that reads the persisted row. Before it, the notice stays durable
-      // and the row is rewritten in place on retry, so copies cannot accumulate.
+      // After the claim nothing is owed. A wake that lost its slot during the
+      // context await is still sent exactly as fork main sends it, unlabelled.
+      // Refusals (a stale admission epoch from a Stop or an edit/regenerate via
+      // `resetPlanTasks`, or a run already active before the turn begins) drop
+      // the wake whether or not a row exists (PF-7679). Before the claim, the
+      // notice stays durable and the row is rewritten in place on retry, so
+      // copies cannot accumulate.
       if (!claimed) this._scheduleDelegationReconcileRetry(retryAttempt);
     } finally {
       this._delegationNoticesInFlight.delete(key);

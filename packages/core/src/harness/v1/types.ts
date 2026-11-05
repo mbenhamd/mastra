@@ -1397,6 +1397,8 @@ export interface HarnessConfigCommon {
      * - `'wake'`: persist it, then, once any running parent turn ended, start
      *   one follow-up turn if the parent is idle, has no queued turn or parked
      *   interaction, and was not stopped or cancelled since the settlement.
+     *   That run's `agent_start` carries `origin: 'wake'` and the notice's
+     *   `wakeNoticeId`.
      *
      * The owed notice is recorded with the durable settlement and delivered at
      * most once per child session and settlement digest, including after a
