@@ -1575,6 +1575,12 @@ export interface ActiveToolState {
  * Active-subagent tracking for `SessionDisplayState.activeSubagents`. Keyed
  * on the parent's `spawn_subagent` tool call id. Dropped on subagent close.
  */
+/** What the `subagent` control tool keeps of an inline child after its spawn_subagent call returned. */
+export interface ReturnedInlineSubagentState {
+  startedAt: number;
+  agentType: string;
+}
+
 export interface ActiveSubagentState {
   subagentSessionId: string;
   agentType: string;
@@ -2136,6 +2142,18 @@ export class Session {
     }
   >();
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
+  /**
+   * Inline (`spawn_subagent`) children whose call returned during the current
+   * run, so the `subagent` control tool keeps listing them at their place
+   * after they leave `_activeSubagents`. The record belongs to exactly one run
+   * (`_returnedInlineRunId`): one small entry (start time and agent type; no
+   * task text or result) per spawn_subagent call that returned in that run.
+   * It is cleared when a read or write comes from a different runId, so a
+   * suspend and resume of the same run, or a message that joins it, keeps it.
+   */
+  private readonly _returnedInlineSubagents = new Map<string, ReturnedInlineSubagentState>();
+  /** The run that owns `_returnedInlineSubagents`. */
+  private _returnedInlineRunId: string | undefined;
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
@@ -3459,6 +3477,34 @@ export class Session {
     this._notifyMaybeIdle();
   }
 
+  /**
+   * @internal — a `spawn_subagent` call returned: drop its display entry and
+   * remember the child for the rest of run `runId` (see `_returnedInlineSubagents`).
+   */
+  _internalReturnInlineSubagent(toolCallId: string, runId: string | undefined): void {
+    const state = this._activeSubagents.get(toolCallId);
+    if (state === undefined) return;
+    this._activeSubagents.delete(toolCallId);
+    this._returnedInlineSubagentsOf(runId).set(state.subagentSessionId, {
+      startedAt: state.startedAt,
+      agentType: state.agentType,
+    });
+  }
+
+  /** @internal — the inline children whose spawn_subagent call returned in run `runId`. */
+  _internalReturnedInlineSubagents(runId: string | undefined): ReadonlyMap<string, ReturnedInlineSubagentState> {
+    return this._returnedInlineSubagentsOf(runId);
+  }
+
+  /** The record for `runId`; a different run's entries are dropped first. */
+  private _returnedInlineSubagentsOf(runId: string | undefined): Map<string, ReturnedInlineSubagentState> {
+    if (runId !== this._returnedInlineRunId) {
+      this._returnedInlineSubagents.clear();
+      this._returnedInlineRunId = runId;
+    }
+    return this._returnedInlineSubagents;
+  }
+
   /** @internal — current shared count, exposed only for deterministic tests. */
   get _internalSubagentExecutionsInFlight(): number {
     return this._subagentExecutionsInFlight;
@@ -3543,6 +3589,7 @@ export class Session {
     this._activeTools.clear();
     this._toolInputBuffers.clear();
     this._subagentAnswerDecoders.clear();
+    // `_returnedInlineSubagents` is keyed by runId, not by turn (see its field).
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
     // spanning multiple parent turns still renders.

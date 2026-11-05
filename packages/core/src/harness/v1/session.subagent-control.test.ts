@@ -19,10 +19,11 @@ import { MockAgent } from './__test-utils__';
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
-import type { Session } from './session';
+import type { ActiveSubagentState, Session } from './session';
 import { SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import {
   createSubagentControlTool,
+  SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT,
   SUBAGENT_CONTROL_TOOL_ID,
   SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
 } from './subagent-control-tool';
@@ -84,11 +85,15 @@ function buildHarness(db: InMemoryDB) {
   return { harness, parentAgent, childAgent };
 }
 
-const toolCtx = {
-  abortSignal: new AbortController().signal,
-  agent: { toolCallId: 'tc-control', runId: 'mock-run' },
-  requestContext: { get: () => undefined },
-} as any;
+function toolCtxFor(runId: string) {
+  return {
+    abortSignal: new AbortController().signal,
+    agent: { toolCallId: 'tc-control', runId },
+    requestContext: { get: () => undefined },
+  } as any;
+}
+
+const toolCtx = toolCtxFor('mock-run');
 
 async function poll(pred: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
@@ -111,20 +116,27 @@ async function openParentTurn(parent: Session, agent: MockAgent): Promise<() => 
 }
 
 /** Delegate one plan task; the child's run is held until the returned release fires. */
-async function delegateHeldChild(parent: Session, childAgent: MockAgent, content: string) {
+async function delegateHeldChild(
+  parent: Session,
+  childAgent: MockAgent,
+  content: string,
+  summary = `${content}: done`,
+  taskBody?: string,
+) {
   let releaseChild!: () => void;
+  const runsBefore = childAgent.streamCalls.length;
   childAgent.enqueueRun({
     holdUntil: new Promise<void>(r => (releaseChild = r)),
     finishReason: 'stop',
-    terminalToolResult: completedOutcome(`${content}: done`),
+    terminalToolResult: completedOutcome(summary),
   });
   const tools = createPlanTaskTools(parent);
   const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content } as any, toolCtx)) as any;
   const delegated = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
-    { taskId: task.taskId, agentType: 'worker' } as any,
+    { taskId: task.taskId, agentType: 'worker', ...(taskBody !== undefined ? { task: taskBody } : {}) } as any,
     toolCtx,
   )) as any;
-  await poll(() => childAgent.streamCalls.length > 0);
+  await poll(() => childAgent.streamCalls.length > runsBefore);
   return { taskId: task.taskId as string, childId: delegated.subagentSessionId as string, releaseChild };
 }
 
@@ -153,10 +165,12 @@ async function awaitingInputChild(harness: Harness, parent: Session): Promise<Se
   return child;
 }
 
-function control(parent: Session) {
+/** The control tool as the model calls it from run `runId`. */
+function control(parent: Session, runId = 'mock-run') {
   const tool = createSubagentControlTool(parent);
   if (!tool) throw new Error('subagent control tool not registered');
-  return (input: Record<string, unknown>) => tool.execute!(input as any, toolCtx) as Promise<any>;
+  const ctx = toolCtxFor(runId);
+  return (input: Record<string, unknown>) => tool.execute!(input as any, ctx) as Promise<any>;
 }
 
 describe('subagent control tool', () => {
@@ -652,6 +666,987 @@ describe('subagent control tool', () => {
     expect(createSubagentControlTool(deepest)).toBeUndefined();
     await harness.shutdown();
   });
+});
+
+/** A summary of `bytes` ASCII bytes that starts with `label`. */
+function largeSummary(label: string, bytes: number): string {
+  return `${label} `.padEnd(bytes, 'x');
+}
+
+/** A summary of about `bytes` UTF-8 bytes in 4-byte characters. */
+function multibyteSummary(label: string, bytes: number): string {
+  return `${label} ${'\u{1F600}'.repeat(Math.floor((bytes - label.length - 1) / 4))}`;
+}
+
+/** A summary whose JSON form is about twice its UTF-8 size (every `"` is escaped). */
+function escapedSummary(chars: number): string {
+  return '"'.repeat(chars);
+}
+
+/**
+ * What a returning spawn_subagent call does to an inline child registered
+ * under `inline:<id>`: the parent drops its spawn record (keeping the child
+ * listed for the rest of the run), then the child closes.
+ */
+async function returnInline(parent: Session, child: Session, runId = 'mock-run'): Promise<void> {
+  parent._internalReturnInlineSubagent(`inline:${child.id}`, runId);
+  await child.close();
+}
+
+function utf8Length(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/** Give a settled delegation's stored result a tool trace, as a child that called tools would have. */
+function addStoredToolTrace(db: InMemoryDB, childId: string): void {
+  for (const [key, task] of db.harnessPlanTasks) {
+    const attempt = (task.metadata as any)?.mastraHarnessDelegationAttemptV1;
+    if (attempt?.subagentSessionId !== childId || attempt.settlement?.result === undefined) continue;
+    attempt.settlement.result.toolTrace = [{ toolName: 'searchPapers', calls: 2, errors: 0 }];
+    db.harnessPlanTasks.set(key, { ...task, version: task.version + 1 });
+    return;
+  }
+  throw new Error(`no settled delegation for ${childId}`);
+}
+
+type ResultPageRow = {
+  name: string;
+  /** Summary per delegated child. */
+  summaries: string[];
+  /** Task content for every child (defaults to a short label). */
+  taskContent?: string;
+  /** Children (by index) settled before the call. */
+  settledBefore: number[];
+  /** Children (by index) released while the call runs. */
+  settledDuring: number[];
+  /** Children (by index) whose stored result gets a tool trace once settled. */
+  traced?: number[];
+  call: (ids: string[]) => Record<string, unknown>;
+  /** Expected result per child index in the output: full, preview, or omitted. */
+  expected: Record<number, 'full' | 'preview' | 'omitted'>;
+  shortened: boolean;
+  /** The call names one child whose full result is larger than the page budget. */
+  overBudgetSingle?: boolean;
+  /** The full output is within the shortening notice's size of the budget. */
+  nearBudget?: boolean;
+};
+
+/** Two results of this size fill a two-child wait output to within the shortening notice's size of 64 KiB. */
+const NEAR_BUDGET_SUMMARY_BYTES = 32_080;
+
+const many = <T>(count: number, make: (index: number) => T): T[] => Array.from({ length: count }, (_, i) => make(i));
+
+const resultPageRows: ResultPageRow[] = [
+  {
+    name: 'wait naming two children whose full results just fit returns both in full, with no notice',
+    summaries: [largeSummary('child-0', NEAR_BUDGET_SUMMARY_BYTES), largeSummary('child-1', NEAR_BUDGET_SUMMARY_BYTES)],
+    settledBefore: [0, 1],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full', 1: 'full' },
+    shortened: false,
+    nearBudget: true,
+  },
+  {
+    name: 'status listing: a child settled before the call gets a preview',
+    summaries: [largeSummary('child-0', 20_000)],
+    settledBefore: [0],
+    settledDuring: [],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'preview' },
+    shortened: true,
+  },
+  {
+    name: 'status naming a child settled before the call gets its full result',
+    summaries: [largeSummary('child-0', 20_000)],
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'status', subagentSessionId: ids[0] }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'status listing: a small result is complete as its preview and is not marked shortened',
+    summaries: [largeSummary('child-0', 200)],
+    settledBefore: [0],
+    settledDuring: [],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'status listing: a tiny result with a tool trace is returned in full, not shortened',
+    summaries: [largeSummary('child-0', 200)],
+    settledBefore: [0],
+    settledDuring: [],
+    traced: [0],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'status listing three large children stays under the budget with previews',
+    summaries: many(3, i => largeSummary(`child-${i}`, 40_000)),
+    settledBefore: [0, 1, 2],
+    settledDuring: [],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'preview', 1: 'preview', 2: 'preview' },
+    shortened: true,
+  },
+  {
+    name: 'wait for every running child: a child that settles during the call gets its full result',
+    summaries: [largeSummary('child-0', 20_000)],
+    settledBefore: [],
+    settledDuring: [0],
+    call: () => ({ action: 'wait', timeoutMs: 5_000 }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'wait naming a child settled before the call gets its full result',
+    summaries: [largeSummary('child-0', 20_000)],
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
+    name: 'wait naming three large children over the budget: the first is full, the rest are previews',
+    summaries: many(3, i => largeSummary(`child-${i}`, 40_000)),
+    settledBefore: [0, 1, 2],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full', 1: 'preview', 2: 'preview' },
+    shortened: true,
+  },
+  {
+    name: 'wait naming three children of 4-byte characters counts UTF-8 bytes, not characters',
+    summaries: many(3, i => multibyteSummary(`child-${i}`, 30_000)),
+    settledBefore: [0, 1, 2],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full', 1: 'preview', 2: 'preview' },
+    shortened: true,
+  },
+  {
+    name: 'wait naming sixteen children: previews fill the page and the last results are left out',
+    summaries: many(16, i => largeSummary(`child-${i}`, 8_000)),
+    settledBefore: many(16, i => i),
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 15: 'omitted' },
+    shortened: true,
+  },
+  {
+    name: 'status naming one child larger than the page budget returns its full result and no hint',
+    summaries: [escapedSummary(32_500)],
+    taskContent: '"'.repeat(500),
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'status', subagentSessionId: ids[0] }),
+    expected: { 0: 'full' },
+    shortened: false,
+    overBudgetSingle: true,
+  },
+  {
+    name: 'wait naming one child larger than the page budget returns its full result and no hint',
+    summaries: [escapedSummary(32_500)],
+    taskContent: '"'.repeat(500),
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full' },
+    shortened: false,
+    overBudgetSingle: true,
+  },
+];
+
+describe('subagent control tool — bounded result page', () => {
+  it.each(resultPageRows)(
+    '$name',
+    async row => {
+      const db = new InMemoryDB();
+      const { harness, parentAgent, childAgent } = buildHarness(db);
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const closeTurn = await openParentTurn(parent, parentAgent);
+      const run = control(parent);
+      const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
+      try {
+        for (const [index, summary] of row.summaries.entries()) {
+          const child = await delegateHeldChild(parent, childAgent, row.taskContent ?? `job ${index}`, summary);
+          children.push({ ...child, summary });
+        }
+        const settled = async (index: number) =>
+          (await run({ action: 'status', subagentSessionId: children[index]!.childId })).subagents?.[0]?.settled ===
+          true;
+        for (const index of row.settledBefore) {
+          children[index]!.releaseChild();
+          await poll(() => settled(index));
+        }
+        for (const index of row.traced ?? []) addStoredToolTrace(db, children[index]!.childId);
+
+        const pending = run(row.call(children.map(child => child.childId)));
+        for (const index of row.settledDuring) children[index]!.releaseChild();
+        const output = await pending;
+
+        expect(output.isError).toBeUndefined();
+        if (!row.overBudgetSingle) expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+        const views: any[] = output.subagents ?? output.settledSubagents;
+        for (const [index, expected] of Object.entries(row.expected)) {
+          const child = children[Number(index)]!;
+          const view = views.find(candidate => candidate.subagentSessionId === child.childId);
+          expect(view, `child ${index}`).toBeDefined();
+          if (expected === 'full') {
+            expect(view.result.text).toBe(child.summary);
+            expect(view.result.textTruncated).toBe(false);
+            expect(view.resultPreview).toBeUndefined();
+            if (row.traced?.includes(Number(index))) {
+              expect(view.result.toolTrace).toEqual([{ toolName: 'searchPapers', calls: 2, errors: 0 }]);
+            }
+          } else if (expected === 'preview') {
+            expect(view.resultPreview).toBe(true);
+            expect(view.result.textTruncated).toBe(true);
+            expect(child.summary.startsWith(view.result.text.split('\n')[0])).toBe(true);
+            // A preview never splits a character: a lone surrogate makes encodeURIComponent throw.
+            expect(() => encodeURIComponent(view.result.text)).not.toThrow();
+            expect(new TextEncoder().encode(view.result.text).byteLength).toBeLessThan(5 * 1024);
+          } else {
+            expect(view.result).toBeUndefined();
+            expect(view.resultOmitted).toBe(true);
+          }
+        }
+        // The case is real only if the full result alone is over the page budget.
+        if (row.overBudgetSingle) expect(utf8Length(output)).toBeGreaterThan(64 * 1024);
+        // The case is real only if the shortening notice would not also fit.
+        if (row.nearBudget) {
+          const notice = { resultsShortened: true, resultsHint: SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT };
+          expect(utf8Length({ ...output, ...notice }), `output ${utf8Length(output)} B`).toBeGreaterThan(64 * 1024);
+        }
+        if (row.shortened) {
+          expect(output.resultsShortened).toBe(true);
+          expect(output.resultsHint).toMatch(/action "status"/);
+        } else {
+          expect(output.resultsShortened).toBeUndefined();
+          expect(output.resultsHint).toBeUndefined();
+        }
+      } finally {
+        for (const child of children) child.releaseChild();
+        closeTurn();
+        await harness.shutdown();
+      }
+    },
+    30_000,
+  );
+});
+
+/** A task text of `chars` 3-byte Japanese characters after a short label. */
+function japaneseTask(index: number, chars: number): string {
+  return `job ${index} ${'調査'.repeat(chars / 2)}`;
+}
+
+type ChildListRow = {
+  name: string;
+  /** Children whose 40 KB results settle while the wait runs (delegated first). */
+  largeSettling: number;
+  /** Delegated children that stay running, each with a 500-character Japanese task. */
+  running: number;
+  /**
+   * Inline (`spawn_subagent`) children running in this process, each with a
+   * 500-character Japanese task. Plan tasks cap delegated children at 100;
+   * inline children have no such cap.
+   */
+  inline?: number;
+  call: { action: 'wait'; timeoutMs: number };
+  /** Some children are left out and named in the hint. */
+  leavesOut: boolean;
+  /** Read every left-out child back through the calls the hint names. */
+  followHint?: boolean;
+  /**
+   * Between pages, some inline children return the way a finished
+   * spawn_subagent call does (`returnInline`): three already read and three
+   * not read yet. They keep their place for the rest of the run, so paging
+   * still sees every child exactly once.
+   */
+  settleBetweenPages?: boolean;
+};
+
+const childListRows: ChildListRow[] = [
+  {
+    name: '40 running children with 500-character multibyte tasks stay within 64 KiB, shortened',
+    largeSettling: 0,
+    running: 40,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: false,
+  },
+  {
+    name: '100 running children stay within 64 KiB with every child listed',
+    largeSettling: 0,
+    running: 100,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: false,
+  },
+  {
+    name: 'three large results settling beside 40 running children stay within 64 KiB',
+    largeSettling: 3,
+    running: 40,
+    call: { action: 'wait', timeoutMs: 1_500 },
+    leavesOut: false,
+  },
+  {
+    name: '250 running children: the last are left out, counted, and the hint gives the next offset',
+    largeSettling: 0,
+    running: 100,
+    inline: 150,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+  },
+  {
+    name: 'following the hint returns every left-out child, each call within 64 KiB and complete',
+    largeSettling: 0,
+    running: 100,
+    inline: 150,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+    followHint: true,
+  },
+  {
+    name: '1000 inline children page through the hint offsets, each child seen exactly once',
+    largeSettling: 0,
+    running: 0,
+    inline: 1000,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+    followHint: true,
+  },
+  {
+    name: '1000 inline children, some returning between pages: each child seen exactly once, every page within 64 KiB',
+    largeSettling: 0,
+    running: 0,
+    inline: 1000,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+    followHint: true,
+    settleBetweenPages: true,
+  },
+];
+
+describe('subagent control tool — bounded child list', () => {
+  it.each(childListRows)(
+    '$name',
+    async row => {
+      const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const closeTurn = await openParentTurn(parent, parentAgent);
+      const run = control(parent);
+      const children: Array<{ childId: string; releaseChild: () => void }> = [];
+      const active = (parent as any)._activeSubagents as Map<string, ActiveSubagentState>;
+      const inlineKeys: string[] = [];
+      const inlineSessions: Session[] = [];
+      try {
+        for (let index = 0; index < row.largeSettling + row.running; index += 1) {
+          const large = index < row.largeSettling;
+          children.push(
+            await delegateHeldChild(
+              parent,
+              childAgent,
+              `job ${index}`,
+              large ? largeSummary(`child-${index}`, 40_000) : undefined,
+              japaneseTask(index, 500),
+            ),
+          );
+        }
+        // An inline child is a real child session plus the parent's in-process
+        // record of the running spawn_subagent call.
+        for (let index = 0; index < (row.inline ?? 0); index += 1) {
+          const child = await harness.session({
+            resourceId: 'u1',
+            threadId: { fresh: true },
+            parentSessionId: parent.id,
+            origin: 'subagent-tool',
+            modeId: 'worker-mode',
+            subagentDepth: 1,
+          });
+          const key = `inline:${child.id}`;
+          active.set(key, {
+            subagentSessionId: child.id,
+            agentType: 'worker',
+            task: japaneseTask(row.running + index, 500),
+            parentToolCallId: `spawn-${index}`,
+            startedAt: Date.now(),
+            status: 'running',
+          });
+          inlineKeys.push(key);
+          inlineSessions.push(child);
+          children.push({ childId: child.id, releaseChild: () => {} });
+        }
+        const pending = run(row.call);
+        for (let index = 0; index < row.largeSettling; index += 1) children[index]!.releaseChild();
+        const output = await pending;
+
+        expect(output.isError).toBeUndefined();
+        expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+        expect(output.resultsShortened).toBe(true);
+        const listed: any[] = [...output.settledSubagents, ...output.runningSubagents];
+        const listedIds = listed.map(view => view.subagentSessionId as string);
+        if (row.largeSettling === 0) {
+          // The same call lists the same children in the same order.
+          const again = await run(row.call);
+          expect([...again.settledSubagents, ...again.runningSubagents].map(view => view.subagentSessionId)).toEqual(
+            listedIds,
+          );
+        }
+        const allIds = children.map(child => child.childId);
+        for (const view of listed) {
+          expect(new TextEncoder().encode(view.task).byteLength).toBeLessThanOrEqual(160);
+          expect(() => encodeURIComponent(view.task)).not.toThrow();
+        }
+        expect(output.settledSubagents).toHaveLength(row.largeSettling);
+        const leftOut = allIds.filter(id => !listedIds.includes(id));
+        if (!row.leavesOut) {
+          expect(leftOut).toEqual([]);
+          expect(output.omittedSubagentCount).toBeUndefined();
+          return;
+        }
+        expect(leftOut.length).toBeGreaterThan(0);
+        expect(output.omittedSubagentCount).toBe(leftOut.length);
+        // The hint reads on from the first left-out child.
+        expect(output.resultsHint).toContain(`action "wait", timeoutMs 0 and offset ${listed.length}`);
+        if (!row.followHint) return;
+
+        // Page through the rest with the offset each hint gives, until a page leaves nothing out.
+        const seen = [...listedIds];
+        let page = output;
+        let returned = 0;
+        while (page.omittedSubagentCount !== undefined) {
+          const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+          expect(offset).toBe(seen.length);
+          if (row.settleBetweenPages) {
+            const open = inlineSessions.filter(child => child.getRecord().closedAt === undefined);
+            const read = open.filter(child => seen.includes(child.id)).slice(0, 3);
+            const unread = open.filter(child => !seen.includes(child.id)).slice(0, 3);
+            for (const child of [...read, ...unread]) await returnInline(parent, child);
+            returned += read.length + unread.length;
+          }
+          page = await run({ action: 'wait', timeoutMs: 0, offset });
+          expect(page.isError).toBeUndefined();
+          expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+          const ids = [...page.settledSubagents, ...page.runningSubagents].map(
+            (view: any) => view.subagentSessionId as string,
+          );
+          // Every page moves on, so following the hint cannot loop.
+          expect(ids.length).toBeGreaterThan(0);
+          seen.push(...ids);
+        }
+        // Every child is seen exactly once.
+        expect(new Set(seen).size).toBe(seen.length);
+        expect([...seen].sort()).toEqual([...allIds].sort());
+        if (row.settleBetweenPages) expect(returned).toBeGreaterThanOrEqual(6);
+      } finally {
+        for (const key of inlineKeys) active.delete(key);
+        for (const child of children) child.releaseChild();
+        closeTurn();
+        await harness.shutdown();
+      }
+    },
+    120_000,
+  );
+});
+
+describe('subagent control tool — stable offsets', () => {
+  /** `count` real child sessions; `register` adds the parent's in-process spawn records for them. */
+  async function addInlineChildren(harness: Harness, parent: Session, count: number): Promise<Session[]> {
+    const sessions: Session[] = [];
+    for (let index = 0; index < count; index += 1) {
+      sessions.push(
+        await harness.session({
+          resourceId: 'u1',
+          threadId: { fresh: true },
+          parentSessionId: parent.id,
+          origin: 'subagent-tool',
+          modeId: 'worker-mode',
+          subagentDepth: 1,
+        }),
+      );
+    }
+    return sessions;
+  }
+
+  function register(parent: Session, sessions: readonly Session[], startedAt: (index: number) => number): string[] {
+    const active = (parent as any)._activeSubagents as Map<string, ActiveSubagentState>;
+    return sessions.map((child, index) => {
+      const key = `inline:${child.id}`;
+      active.set(key, {
+        subagentSessionId: child.id,
+        agentType: 'worker',
+        task: japaneseTask(index, 500),
+        parentToolCallId: `spawn-${index}`,
+        startedAt: startedAt(index),
+        status: 'running',
+      });
+      return key;
+    });
+  }
+
+  function unregister(parent: Session, keys: readonly string[]): void {
+    const active = (parent as any)._activeSubagents as Map<string, ActiveSubagentState>;
+    for (const key of keys) active.delete(key);
+  }
+
+  it('wait until all over more than a page: following hints from offset 0 returns every child once, with its result', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
+    let keys: string[] = [];
+    try {
+      // 100 delegated children (the plan-task cap) with results, plus 150 inline
+      // children, so even the children without their results exceed one page.
+      for (let index = 0; index < 100; index += 1) {
+        const summary = largeSummary(`child-${index}`, 3_000);
+        children.push({
+          ...(await delegateHeldChild(parent, childAgent, `job ${index}`, summary, japaneseTask(index, 500))),
+          summary,
+        });
+      }
+      const sessions = await addInlineChildren(harness, parent, 150);
+      keys = register(parent, sessions, () => Date.now());
+      const pending = run({ action: 'wait', timeoutMs: 20_000, offset: 0 });
+      for (const child of children) child.releaseChild();
+      for (const child of sessions) await child.close();
+      let page = await pending;
+      expect(page.timedOut).toBe(false);
+      expect(page.omittedSubagentCount).toBeGreaterThan(0);
+      const seen: string[] = [];
+      let pages = 0;
+      for (;;) {
+        pages += 1;
+        expect(page.isError).toBeUndefined();
+        expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+        expect(page.runningSubagents).toEqual([]);
+        for (const view of page.settledSubagents as any[]) {
+          seen.push(view.subagentSessionId);
+          const child = children.find(candidate => candidate.childId === view.subagentSessionId);
+          // An inline child's result is returned by its spawn_subagent call only.
+          if (child === undefined) continue;
+          // A result left out of a page is read by naming that child, as the hint says.
+          const full = view.resultOmitted
+            ? (await run({ action: 'status', subagentSessionId: view.subagentSessionId })).subagents[0]
+            : view;
+          expect(full.result.text).toBe(child.summary);
+        }
+        if (page.omittedSubagentCount === undefined) break;
+        const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+        expect(offset).toBe(seen.length);
+        page = await run({ action: 'wait', timeoutMs: 0, offset });
+      }
+      expect(pages).toBeGreaterThan(1);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual(
+        [...children.map(child => child.childId), ...sessions.map(child => child.id)].sort(),
+      );
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('delegated children settling between pages of a multi-page wait: each child seen once, each page within 64 KiB', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
+    const keys: string[] = [];
+    try {
+      // Each delegated child (3 KB result) is followed by two inline children,
+      // so the delegated ones are spread over every page of the list.
+      const sessions = await addInlineChildren(harness, parent, 200);
+      for (let index = 0; index < 100; index += 1) {
+        const summary = largeSummary(`child-${index}`, 3_000);
+        children.push({
+          ...(await delegateHeldChild(parent, childAgent, `job ${index}`, summary, japaneseTask(index, 500))),
+          summary,
+        });
+        keys.push(...register(parent, sessions.slice(index * 2, index * 2 + 2), () => Date.now()));
+      }
+      const released = new Set<string>();
+      const settle = async (child: { childId: string; releaseChild: () => void }) => {
+        child.releaseChild();
+        released.add(child.childId);
+        await poll(
+          async () =>
+            (await run({ action: 'status', subagentSessionId: child.childId })).subagents?.[0]?.settled === true,
+          10_000,
+        );
+      };
+      const allIds = [...children.map(child => child.childId), ...sessions.map(child => child.id)];
+      const seen: string[] = [];
+      let page = await run({ action: 'wait', timeoutMs: 0, offset: 0 });
+      let pages = 0;
+      for (;;) {
+        pages += 1;
+        expect(page.isError).toBeUndefined();
+        expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+        for (const view of page.settledSubagents as any[]) {
+          // A settled delegated child carries its result, or says it was left out.
+          expect(view.result !== undefined || view.resultOmitted === true).toBe(true);
+          expect(released.has(view.subagentSessionId)).toBe(true);
+        }
+        const ids = [...page.settledSubagents, ...page.runningSubagents].map(
+          (view: any) => view.subagentSessionId as string,
+        );
+        expect(ids.length).toBeGreaterThan(0);
+        seen.push(...ids);
+        if (page.omittedSubagentCount === undefined) break;
+        const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+        expect(offset).toBe(seen.length);
+        // Settle three delegated children already read and three not read yet.
+        const open = children.filter(child => !released.has(child.childId));
+        for (const child of [
+          ...open.filter(child => seen.includes(child.childId)).slice(0, 3),
+          ...open.filter(child => !seen.includes(child.childId)).slice(0, 3),
+        ]) {
+          await settle(child);
+        }
+        page = await run({ action: 'wait', timeoutMs: 0, offset });
+      }
+      expect(pages).toBeGreaterThan(1);
+      expect(released.size).toBeGreaterThanOrEqual(6);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual([...allIds].sort());
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('status over 250 children pages from offset 0 through the hints, each child once, each page within 64 KiB', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void }> = [];
+    let keys: string[] = [];
+    try {
+      for (let index = 0; index < 100; index += 1) {
+        children.push(await delegateHeldChild(parent, childAgent, `job ${index}`, undefined, japaneseTask(index, 500)));
+      }
+      const sessions = await addInlineChildren(harness, parent, 150);
+      keys = register(parent, sessions, () => Date.now());
+      const allIds = [...children.map(child => child.childId), ...sessions.map(child => child.id)];
+      const seen: string[] = [];
+      let page = await run({ action: 'status', offset: 0 });
+      for (;;) {
+        expect(page.isError).toBeUndefined();
+        expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+        const ids = (page.subagents as any[]).map(view => view.subagentSessionId as string);
+        expect(ids.length).toBeGreaterThan(0);
+        seen.push(...ids);
+        if (page.omittedSubagentCount === undefined) break;
+        expect(page.omittedSubagentCount).toBe(allIds.length - seen.length);
+        const offset = Number(/action "status" and offset (\d+)/.exec(page.resultsHint)![1]);
+        expect(offset).toBe(seen.length);
+        page = await run({ action: 'status', offset });
+      }
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual([...allIds].sort());
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  /** Page an implicit list from offset 0 through the hints, running `between` before each next page. */
+  async function pageAll(
+    run: (input: Record<string, unknown>) => Promise<any>,
+    action: 'status' | 'wait',
+    between: (seen: readonly string[]) => Promise<void>,
+  ): Promise<string[]> {
+    const call = (offset: number) => run(action === 'wait' ? { action, timeoutMs: 0, offset } : { action, offset });
+    const seen: string[] = [];
+    let page = await call(0);
+    for (;;) {
+      expect(page.isError).toBeUndefined();
+      expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+      const views: any[] = action === 'wait' ? [...page.settledSubagents, ...page.runningSubagents] : page.subagents;
+      expect(views.length).toBeGreaterThan(0);
+      seen.push(...views.map(view => view.subagentSessionId as string));
+      if (page.omittedSubagentCount === undefined) return seen;
+      const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+      expect(offset).toBe(seen.length);
+      await between(seen);
+      page = await call(offset);
+    }
+  }
+
+  /** Return three open inline children already read and three not read yet. */
+  async function returnSome(parent: Session, sessions: readonly Session[], seen: readonly string[]): Promise<number> {
+    const open = sessions.filter(child => child.getRecord().closedAt === undefined);
+    const picked = [
+      ...open.filter(child => seen.includes(child.id)).slice(0, 3),
+      ...open.filter(child => !seen.includes(child.id)).slice(0, 3),
+    ];
+    for (const child of picked) await returnInline(parent, child);
+    return picked.length;
+  }
+
+  it('250 inline children, some returning between pages: wait and status each see every child exactly once', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    try {
+      const sessions = await addInlineChildren(harness, parent, 250);
+      keys = register(parent, sessions, () => Date.now());
+      const allIds = sessions.map(child => child.id).sort();
+      let returned = 0;
+      for (const action of ['wait', 'status'] as const) {
+        const seen = await pageAll(run, action, async read => {
+          returned += await returnSome(parent, sessions, read);
+        });
+        expect(new Set(seen).size).toBe(seen.length);
+        expect([...seen].sort()).toEqual(allIds);
+      }
+      expect(returned).toBeGreaterThan(6);
+    } finally {
+      unregister(parent, keys);
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('30 inline children started before 40 delegated ones, inline returning between pages: each child seen exactly once', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void }> = [];
+    let keys: string[] = [];
+    try {
+      const sessions = await addInlineChildren(harness, parent, 30);
+      const inlineStart = Date.now() - 60_000;
+      keys = register(parent, sessions, () => inlineStart);
+      for (let index = 0; index < 40; index += 1) {
+        children.push(await delegateHeldChild(parent, childAgent, `job ${index}`));
+      }
+      const allIds = [...sessions.map(child => child.id), ...children.map(child => child.childId)].sort();
+      let returned = 0;
+      const seen = await pageAll(run, 'status', async read => {
+        returned += await returnSome(parent, sessions, read);
+      });
+      expect(returned).toBeGreaterThanOrEqual(6);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual(allIds);
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('the record of returned inline children belongs to one run: a suspend and resume keeps it, a new run clears it, and it does not grow across runs', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const recordSize = () => ((parent as any)._returnedInlineSubagents as Map<string, unknown>).size;
+    const currentRunId = () => (parent as any)._currentRunId as string | undefined;
+    const releases: Array<() => void> = [];
+    const hold = () => new Promise<void>(r => releases.push(r));
+    const pageIds = async (runId: string) => {
+      const run = control(parent, runId);
+      const seen: string[] = [];
+      let page = await run({ action: 'status', offset: 0 });
+      for (;;) {
+        seen.push(...(page.subagents as any[]).map(view => view.subagentSessionId as string));
+        if (page.omittedSubagentCount === undefined) return seen;
+        page = await run({ action: 'status', offset: Number(/offset (\d+)/.exec(page.resultsHint)![1]) });
+      }
+    };
+    try {
+      // Run 1: inline children return, the run suspends on an approval, then resumes as the same run.
+      parentAgent.enqueueRun({
+        holdUntil: hold(),
+        finishReason: 'suspended',
+        suspendPayload: { toolCallId: 'tc-approve', toolName: 'shell' },
+      });
+      const first = parent.message({ content: 'run 1' });
+      await poll(() => currentRunId() !== undefined);
+      const firstRunId = currentRunId()!;
+      const firstChildren = await addInlineChildren(harness, parent, 5);
+      register(parent, firstChildren, () => Date.now());
+      for (const child of firstChildren) await returnInline(parent, child, firstRunId);
+      releases.shift()!();
+      const suspended = (await first) as Record<string, unknown>;
+      expect(suspended.runId).toBe(firstRunId);
+      expect(recordSize()).toBe(5);
+      parentAgent.enqueueRun({ holdUntil: hold(), finishReason: 'stop', text: 'resumed', runId: firstRunId });
+      const resumeCallsBefore = parentAgent.resumeCalls.length;
+      const resumed = parent.respondToToolApproval({ approved: true });
+      void resumed.catch(() => {});
+      await poll(() => parentAgent.resumeCalls.length > resumeCallsBefore);
+      // The resume continues run 1, so its returned children are still listed, each once.
+      const afterResume = await pageIds(firstRunId);
+      expect(new Set(afterResume).size).toBe(afterResume.length);
+      expect([...afterResume].sort()).toEqual(firstChildren.map(child => child.id).sort());
+      expect(recordSize()).toBe(5);
+      releases.shift()!();
+      await resumed.catch(() => {});
+
+      // Runs 2 to 4: each new run starts from an empty record and holds only its own children.
+      let previousRunId = firstRunId;
+      for (let index = 2; index <= 4; index += 1) {
+        parentAgent.enqueueRun({ holdUntil: hold(), finishReason: 'stop', text: 'done' });
+        const callsBefore = parentAgent.streamCalls.length;
+        const pending = parent.message({ content: `run ${index}` });
+        await poll(() => parentAgent.streamCalls.length > callsBefore && currentRunId() !== undefined);
+        const runId = currentRunId()!;
+        expect(runId).not.toBe(previousRunId);
+        expect(await pageIds(runId)).toEqual([]);
+        expect(recordSize()).toBe(0);
+        const children = await addInlineChildren(harness, parent, 5);
+        register(parent, children, () => Date.now());
+        for (const child of children) await returnInline(parent, child, runId);
+        expect(recordSize()).toBe(5);
+        expect([...(await pageIds(runId))].sort()).toEqual(children.map(child => child.id).sort());
+        releases.shift()!();
+        await pending.catch(() => {});
+        expect(recordSize()).toBe(5);
+        previousRunId = runId;
+      }
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  }, 30_000);
+
+  it('a new run that starts while the previous turn is still finishing holds only its own returned children', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const recordSize = () => ((parent as any)._returnedInlineSubagents as Map<string, unknown>).size;
+    const currentRunId = () => (parent as any)._currentRunId as string | undefined;
+    const original = (parent as any)._endTurn as (controller: AbortController) => void;
+    let finishFirstTurn: (() => void) | undefined;
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    try {
+      parentAgent.enqueueRun({
+        holdUntil: new Promise<void>(r => (releaseFirst = r)),
+        finishReason: 'stop',
+        text: 'done',
+      });
+      const first = parent.message({ content: 'run 1' });
+      await poll(() => currentRunId() !== undefined);
+      const firstRunId = currentRunId()!;
+      const firstChildren = await addInlineChildren(harness, parent, 4);
+      register(parent, firstChildren, () => Date.now());
+      for (const child of firstChildren) await returnInline(parent, child, firstRunId);
+      // Run 1's turn stays open after its run ends, as its post-run bookkeeping would keep it.
+      (parent as any)._endTurn = function (this: unknown, controller: AbortController) {
+        if (finishFirstTurn === undefined) {
+          finishFirstTurn = () => original.call(this, controller);
+          return;
+        }
+        original.call(this, controller);
+      };
+      releaseFirst();
+      await first;
+      expect(finishFirstTurn).toBeDefined();
+
+      parentAgent.enqueueRun({
+        holdUntil: new Promise<void>(r => (releaseSecond = r)),
+        finishReason: 'stop',
+        text: 'done',
+      });
+      const callsBefore = parentAgent.streamCalls.length;
+      const second = parent.message({ content: 'run 2' });
+      void second.catch(() => {});
+      await poll(() => parentAgent.streamCalls.length > callsBefore && currentRunId() !== undefined);
+      const secondRunId = currentRunId()!;
+      expect(secondRunId).not.toBe(firstRunId);
+      const secondChildren = await addInlineChildren(harness, parent, 3);
+      register(parent, secondChildren, () => Date.now());
+      for (const child of secondChildren) await returnInline(parent, child, secondRunId);
+      expect(recordSize()).toBe(3);
+      const listed = (await control(parent, secondRunId)({ action: 'status' })).subagents.map(
+        (view: any) => view.subagentSessionId,
+      );
+      expect([...listed].sort()).toEqual(secondChildren.map(child => child.id).sort());
+    } finally {
+      releaseFirst?.();
+      releaseSecond?.();
+      finishFirstTurn?.();
+      await harness.shutdown();
+    }
+  }, 30_000);
+
+  it('a message that joins the active run keeps the returned inline children listed, each once', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    try {
+      const returned = await addInlineChildren(harness, parent, 5);
+      register(parent, returned, () => Date.now());
+      for (const child of returned) await returnInline(parent, child);
+      const running = await addInlineChildren(harness, parent, 3);
+      keys = register(parent, running, () => Date.now());
+      const turnsBefore = (parent as any)._turnsBegun as number;
+      // A second message while the run is active joins that run instead of starting a new one.
+      const joined = parent.message({ content: 'one more thing' });
+      void joined.catch(() => {});
+      await poll(() => ((parent as any)._turnsBegun as number) > turnsBefore);
+      const seen: string[] = [];
+      let page = await run({ action: 'status', offset: 0 });
+      for (;;) {
+        seen.push(...(page.subagents as any[]).map(view => view.subagentSessionId as string));
+        if (page.omittedSubagentCount === undefined) break;
+        page = await run({ action: 'status', offset: Number(/offset (\d+)/.exec(page.resultsHint)![1]) });
+      }
+      const allIds = [...returned, ...running].map(child => child.id);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual([...allIds].sort());
+    } finally {
+      unregister(parent, keys);
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 30_000);
+
+  it('children that start at the same time are ordered by id, whatever order they were registered in', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    try {
+      const sessions = await addInlineChildren(harness, parent, 6);
+      const sortedIds = sessions.map(child => child.id).sort();
+      // Register in reverse id order, all with one start time.
+      const reversed = [...sessions].sort((left, right) => (left.id < right.id ? 1 : -1));
+      const startedAt = Date.now();
+      keys = register(parent, reversed, () => startedAt);
+      const listed = await run({ action: 'status' });
+      expect((listed.subagents as any[]).map(view => view.subagentSessionId)).toEqual(sortedIds);
+      const waited = await run({ action: 'wait', timeoutMs: 0 });
+      expect((waited.runningSubagents as any[]).map(view => view.subagentSessionId)).toEqual(sortedIds);
+      const fromTwo = await run({ action: 'status', offset: 2 });
+      expect((fromTwo.subagents as any[]).map(view => view.subagentSessionId)).toEqual(sortedIds.slice(2));
+    } finally {
+      unregister(parent, keys);
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 30_000);
 });
 
 describe('subagent control tool — permission gate (real agent loop)', () => {

@@ -473,7 +473,7 @@ export function createSpawnSubagentTool(parent: Session) {
           answerStreamOpen = false;
           child._subagentAnswerDeltaListener = undefined;
           unsub();
-          activeMap.delete(toolCallId);
+          parent._internalReturnInlineSubagent(toolCallId, ctx.agent?.runId);
           // Auto-close the subagent-tool child per §5.6, but never join a
           // close already owned by an ancestor subtree. An ancestor close
           // drains this parent turn; the parent turn cannot finish until this
