@@ -292,14 +292,28 @@ async function loadAllTasks(port: PlanTaskSessionPort): Promise<HarnessPlanTask[
   return all;
 }
 
+function countLivePlanTasks(tasks: HarnessPlanTask[], finalStatus?: Map<string, HarnessPlanTaskStatus>): number {
+  let live = 0;
+  for (const task of tasks) {
+    if (!TERMINAL_PLAN_TASK_STATUSES.has(finalStatus?.get(task.taskId) ?? task.status)) live += 1;
+  }
+  return live;
+}
+
 /**
- * Admit a create against both plan bounds using the committed post-image: the
+ * Admit a mutation against both plan bounds using its committed post-image: the
  * structural rows plus the final statuses from rollup. Counting the post-image
- * (not `current + additions`) makes a new terminal task free and charges a
- * derived ancestor that a new child reopens.
+ * makes a new terminal task free and charges every task the mutation reopens
+ * (a completed leaf set back to pending, or a finished derived ancestor that a
+ * new or moved child reopens). A bound refuses only a mutation that GROWS its
+ * count past the limit, so a plan already over a bound can still be finished.
  */
-function assertPlanTaskCapacity(postTasks: HarnessPlanTask[], deltas: PlanTaskDelta[]): void {
-  if (postTasks.length > PLAN_TASK_MAX_STORED_NODES) {
+function assertPlanTaskCapacity(
+  preTasks: HarnessPlanTask[],
+  postTasks: HarnessPlanTask[],
+  deltas: PlanTaskDelta[],
+): void {
+  if (postTasks.length > PLAN_TASK_MAX_STORED_NODES && postTasks.length > preTasks.length) {
     throw new HarnessValidationError(
       'planTasks',
       `stored plan task limit is ${PLAN_TASK_MAX_STORED_NODES} nodes; requested mutation would store ${postTasks.length}`,
@@ -307,11 +321,8 @@ function assertPlanTaskCapacity(postTasks: HarnessPlanTask[], deltas: PlanTaskDe
   }
   const finalStatus = new Map<string, HarnessPlanTaskStatus>();
   for (const delta of deltas) finalStatus.set(delta.taskId, delta.status);
-  let live = 0;
-  for (const task of postTasks) {
-    if (!TERMINAL_PLAN_TASK_STATUSES.has(finalStatus.get(task.taskId) ?? task.status)) live += 1;
-  }
-  if (live > PLAN_TASK_MAX_NODES) {
+  const live = countLivePlanTasks(postTasks, finalStatus);
+  if (live > PLAN_TASK_MAX_NODES && live > countLivePlanTasks(preTasks)) {
     throw new HarnessValidationError(
       'planTasks',
       `plan task limit is ${PLAN_TASK_MAX_NODES} live (not completed, cancelled or failed) nodes; requested mutation would leave ${live}`,
@@ -756,7 +767,7 @@ export async function planTaskAdd(port: PlanTaskSessionPort, input: AddTaskInput
 
   const structuralOps: PlanTaskMutationOp[] = [{ kind: 'create', task: newTask }];
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
-  assertPlanTaskCapacity(postTasks, deltas);
+  assertPlanTaskCapacity(tasks, postTasks, deltas);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   emit(port, 'add', [taskId], deltas);
@@ -873,7 +884,7 @@ export async function planTaskDecompose(
 
   const structuralOps: PlanTaskMutationOp[] = created.map(task => ({ kind: 'create', task }));
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
-  assertPlanTaskCapacity(postTasks, deltas);
+  assertPlanTaskCapacity(tasks, postTasks, deltas);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   const ids = created.map(t => t.taskId);
@@ -955,6 +966,7 @@ export async function planTaskReparent(
     },
   ];
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
+  assertPlanTaskCapacity(tasks, postTasks, deltas);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   const affected = [taskId, ...(newParentTaskId ? [newParentTaskId] : []), ...(oldParentId ? [oldParentId] : [])];
@@ -1077,6 +1089,7 @@ export async function planTaskUpdate(
     structuralOps.push(fieldPatch);
   }
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
+  assertPlanTaskCapacity(tasks, postTasks, deltas);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   emit(port, 'update', [taskId], deltas);

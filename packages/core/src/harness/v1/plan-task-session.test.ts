@@ -350,6 +350,72 @@ describe('plan task capacity counts only live tasks', () => {
     }
   });
 
+  type ChangeRow = {
+    live: number;
+    attempt: 'reopen completed leaf' | 'reparent under finished parent' | 'edit content' | 'complete';
+    expected: 'accepted' | RegExp;
+  };
+  const changeRows: ChangeRow[] = [
+    { live: 99, attempt: 'reopen completed leaf', expected: 'accepted' },
+    { live: 100, attempt: 'reopen completed leaf', expected: /limit is 100 live/ },
+    { live: 99, attempt: 'reparent under finished parent', expected: 'accepted' },
+    { live: 100, attempt: 'reparent under finished parent', expected: /limit is 100 live/ },
+    { live: 100, attempt: 'edit content', expected: 'accepted' },
+    { live: 101, attempt: 'edit content', expected: 'accepted' },
+    { live: 100, attempt: 'complete', expected: 'accepted' },
+    { live: 101, attempt: 'complete', expected: 'accepted' },
+  ];
+
+  it.each(changeRows)('$live live + 150 finished, $attempt -> $expected', async ({ live, attempt, expected }) => {
+    const h = await setup();
+    // History: 146 finished rows, a completed leaf, and a finished parent (a
+    // derived root whose only child completed): 150 finished in all.
+    const completedLeaf = seedRow('completed');
+    const finishedParent = seedRow('completed', { statusSource: 'derived' });
+    const liveIds = await seedPlan(h, { terminal: 146, live });
+    await h.storage.mutatePlanTasksForSession({
+      fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
+      ops: [
+        { kind: 'create', task: completedLeaf },
+        { kind: 'create', task: finishedParent },
+        { kind: 'create', task: seedRow('completed', { parentTaskId: finishedParent.taskId }) },
+      ],
+    });
+    const before = await listAll(h.storage);
+    const target = liveIds[0]!;
+
+    const run = async (): Promise<() => void> => {
+      switch (attempt) {
+        case 'reopen completed leaf':
+          await planTaskUpdate(h.port, completedLeaf.taskId, { status: 'pending' });
+          return () => expect(after.get(completedLeaf.taskId)?.status).toBe('pending');
+        case 'reparent under finished parent':
+          await planTaskReparent(h.port, target, finishedParent.taskId);
+          return () => {
+            expect(after.get(target)?.parentTaskId).toBe(finishedParent.taskId);
+            expect(after.get(finishedParent.taskId)?.status).toBe('pending');
+          };
+        case 'edit content':
+          await planTaskUpdate(h.port, target, { content: 'renamed' });
+          return () => expect(after.get(target)?.content).toBe('renamed');
+        case 'complete':
+          await planTaskComplete(h.port, target);
+          return () => expect(after.get(target)?.status).toBe('completed');
+      }
+    };
+
+    let after = before;
+    if (expected === 'accepted') {
+      const assertCommitted = await run();
+      after = await listAll(h.storage);
+      assertCommitted();
+    } else {
+      await expect(run()).rejects.toThrow(expected);
+      // Refused before the storage write: nothing reopened, nothing moved.
+      expect(await listAll(h.storage)).toEqual(before);
+    }
+  });
+
   it('plans again after more than 100 tasks were spent across several finished plans', async () => {
     const { storage, port, summaries } = await setup();
     const roots: string[] = [];
