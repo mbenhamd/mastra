@@ -132,6 +132,57 @@ function toToolError(err: unknown): ToolError {
 }
 
 /**
+ * Idempotency key for a plan task created by one agent tool call. A retried
+ * call (same run, same tool call id) maps to the same key, so the session
+ * returns the task it already created instead of adding a second one. Direct
+ * (non-agent) executions get no key.
+ */
+function toolCallIdempotencyKey(
+  prefix: string,
+  agentContext: { toolCallId?: string; agentId?: unknown; messages?: unknown; runId?: string } | undefined,
+): string | undefined {
+  if (
+    agentContext?.toolCallId === undefined ||
+    typeof agentContext.agentId !== 'string' ||
+    !Array.isArray(agentContext.messages)
+  ) {
+    return undefined;
+  }
+  return `${prefix}:${sha256CanonicalJson({
+    runId: agentContext.runId ?? 'missing',
+    toolCallId: agentContext.toolCallId,
+  }).slice(0, 40)}`;
+}
+
+/** Cap `value` at `maxBytes` UTF-8 bytes without splitting a code point. */
+function capUtf8Bytes(value: string, maxBytes: number): string {
+  const encoder = new TextEncoder();
+  let bytes = 0;
+  let out = '';
+  for (const char of value) {
+    const charBytes = encoder.encode(char).byteLength;
+    if (bytes + charBytes > maxBytes) break;
+    bytes += charBytes;
+    out += char;
+  }
+  return out;
+}
+
+/**
+ * Title for the plan task `task_delegate` creates when the model omits
+ * `taskId`: the first non-blank line of the delegated task body, capped at the
+ * plan-task title limit. Undefined when the body has no visible text.
+ */
+function delegatedTaskTitle(task: string | undefined): string | undefined {
+  const firstLine = task
+    ?.split(/\r?\n/)
+    .map(line => line.trim())
+    .find(line => line.length > 0);
+  if (firstLine === undefined) return undefined;
+  return capUtf8Bytes(firstLine, PLAN_TASK_CONTENT_MAX_BYTES).trimEnd();
+}
+
+/**
  * Build the plan-task tools scoped to one session. Always returns the full set —
  * unlike `spawn_subagent`, plan tasks are universally available to a v1 agent.
  */
@@ -160,16 +211,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
     execute: async (input, context) => {
       try {
-        const agentContext = context?.agent;
-        const idempotencyKey =
-          agentContext?.toolCallId === undefined ||
-          typeof agentContext.agentId !== 'string' ||
-          !Array.isArray(agentContext.messages)
-            ? undefined
-            : `plan-task-add:${sha256CanonicalJson({
-                runId: agentContext.runId ?? 'missing',
-                toolCallId: agentContext.toolCallId,
-              }).slice(0, 40)}`;
+        const idempotencyKey = toolCallIdempotencyKey('plan-task-add', context?.agent);
         return await session._planTaskAdd(
           { ...input, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
           context?.abortSignal,
@@ -357,15 +399,23 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       : createTool({
           id: TASK_DELEGATE_TOOL_ID,
           description:
-            'Durably DELEGATE an existing plan task to a specialized subagent session. Unlike ' +
-            'spawn_subagent (which runs inline and blocks this turn), delegation hands the task off ' +
-            'to a subagent session whose completion this plan task tracks across turns: the task ' +
-            'stays in_progress until the subagent finishes, then rolls up completed or failed. Pass ' +
-            '`includeSubtree: true` to delegate the task and its descendants as one unit. Available ' +
-            'agent types:\n' +
+            'Durably DELEGATE a plan task to a specialized subagent session. Unlike spawn_subagent ' +
+            '(which runs inline and blocks this turn), delegation hands the task off to a subagent ' +
+            'session whose completion this plan task tracks across turns: the task stays in_progress ' +
+            'until the subagent finishes, then rolls up completed or failed. Pass `taskId` to delegate ' +
+            'a task already in the plan (required for a nested task or `includeSubtree: true`, which ' +
+            'delegates the task and its descendants as one unit). Omit `taskId` to delegate new work: ' +
+            'this call then adds a top-level plan task titled with the first line of `task` and ' +
+            'delegates it, so `task` is required. The result carries the plan task id either way. ' +
+            'Available agent types:\n' +
             subagentTypeList,
           inputSchema: z.object({
-            taskId: z.string().describe('Existing plan task to delegate.'),
+            taskId: z
+              .string()
+              .optional()
+              .describe(
+                'Existing plan task to delegate. Omit to add a new top-level plan task from `task` and delegate it.',
+              ),
             agentType: z.enum(subagentTypeIds as [string, ...string[]]).describe('Registered subagent type to run.'),
             task: z
               .string()
@@ -374,7 +424,8 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
               .optional()
               .describe(
                 'Self-contained task description for the subagent. The subagent does not see the parent ' +
-                  'conversation, so include every piece of context it needs. Defaults to the plan task title.',
+                  'conversation, so include every piece of context it needs. Defaults to the plan task title ' +
+                  'when `taskId` is given; required when it is omitted (its first line becomes the task title).',
               ),
             includeSubtree: z
               .boolean()
@@ -386,9 +437,27 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
             .object({ ...planTaskViewShape, subagentSessionId: z.string().optional(), ...errorShape })
             .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
           execute: async (input, context) => {
+            // Without a taskId, this call first adds a root plan task for the
+            // delegated work. The add carries the tool call's idempotency key,
+            // so a retried call reuses that task instead of adding another.
+            let createdTaskId: string | undefined;
             try {
+              let taskId = input.taskId;
+              if (taskId === undefined) {
+                const content = delegatedTaskTitle(input.task);
+                if (content === undefined) {
+                  throw new HarnessValidationError('task', 'is required when taskId is omitted');
+                }
+                const idempotencyKey = toolCallIdempotencyKey('plan-task-delegate-add', context?.agent);
+                const created = await session._planTaskAdd(
+                  { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
+                  context?.abortSignal,
+                );
+                taskId = created.taskId;
+                createdTaskId = created.taskId;
+              }
               return (await session._planTaskDelegate(
-                input,
+                { ...input, taskId },
                 context?.abortSignal,
                 context?.agent?.toolCallId,
                 context?.agent?.runId,
@@ -396,7 +465,11 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
                 context?.tracingContext,
               )) as any;
             } catch (err) {
-              return toToolError(err) as any;
+              // Name the plan task this call created so the model retries the
+              // delegation with that taskId rather than adding another task.
+              return (
+                createdTaskId === undefined ? toToolError(err) : { ...toToolError(err), taskId: createdTaskId }
+              ) as any;
             }
           },
         });
