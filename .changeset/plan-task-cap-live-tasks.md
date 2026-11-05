@@ -2,10 +2,10 @@
 '@mastra/core': patch
 ---
 
-Count only live plan tasks toward the 100-task limit. Completed, cancelled and failed tasks no longer block a new plan.
+Fixed the 100-task plan limit counting finished tasks. Only live tasks (not completed, cancelled or failed) count now, so a long session can start a new plan after spending more than 100 tasks.
 
-Refuse any plan-task change that raises the live count above 100. This covers adds, decomposes, status updates, reparents and delegations that reopen finished tasks.
+Changed every plan-task change (add, decompose, status update, reparent and delegate) to be refused when it would raise the live count above 100. A change that reopens finished tasks counts them as live. A delegation also reserves, as live, every task its settlement could reopen, so a settling child result never pushes the plan over the limit.
 
-Limit each session to 1000 stored plan tasks.
+Added a limit of 1000 stored plan tasks per session. At that limit, adding more tasks is refused until the application resets the plan with `Session.resetPlanTasks()`; finishing existing tasks still works.
 
-Page `plan_task_check` through the whole stored plan, so the current plan stays reachable after a long history.
+Fixed `plan_task_check` paging so it reads the whole stored plan and the current plan stays reachable after a long history.

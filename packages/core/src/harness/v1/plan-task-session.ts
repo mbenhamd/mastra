@@ -292,12 +292,61 @@ async function loadAllTasks(port: PlanTaskSessionPort): Promise<HarnessPlanTask[
   return all;
 }
 
-function countLivePlanTasks(tasks: HarnessPlanTask[], finalStatus?: Map<string, HarnessPlanTaskStatus>): number {
+function countLivePlanTasks(
+  tasks: HarnessPlanTask[],
+  finalStatus?: Map<string, HarnessPlanTaskStatus>,
+  reservedLive?: ReadonlySet<string>,
+): number {
   let live = 0;
   for (const task of tasks) {
-    if (!TERMINAL_PLAN_TASK_STATUSES.has(finalStatus?.get(task.taskId) ?? task.status)) live += 1;
+    if (
+      reservedLive?.has(task.taskId) ||
+      !TERMINAL_PLAN_TASK_STATUSES.has(finalStatus?.get(task.taskId) ?? task.status)
+    ) {
+      live += 1;
+    }
   }
   return live;
+}
+
+/**
+ * Tasks that open delegations may still reopen. `planTaskReconcileDelegation`
+ * must always be able to settle, so it has no capacity check of its own: it
+ * writes the child's outcome (`completed`, `blocked` or `failed`; `blocked` is
+ * live) to the delegated task and to every task in its subtree that is not
+ * completed or cancelled, and rollup then recomputes each ancestor up to the
+ * first explicitly terminal one. Every capacity check charges that worst case
+ * as live for each delegation that is still linked, so admission (and any
+ * later mutation) leaves room for the settlement.
+ */
+function delegationReservedLive(
+  tasks: HarnessPlanTask[],
+  finalStatus?: Map<string, HarnessPlanTaskStatus>,
+  finalSource?: Map<string, 'explicit' | 'derived'>,
+): Set<string> {
+  const reserved = new Set<string>();
+  if (!tasks.some(task => task.delegatedSubagentSessionId !== undefined)) return reserved;
+  const index = indexPlanTasks(tasks);
+  const statusOf = (task: HarnessPlanTask) => finalStatus?.get(task.taskId) ?? task.status;
+  for (const task of tasks) {
+    if (task.delegatedSubagentSessionId === undefined) continue;
+    for (const taskId of subtreeTaskIds(index, task.taskId)) {
+      const status = statusOf(index.byId.get(taskId)!);
+      if (taskId === task.taskId || (status !== 'completed' && status !== 'cancelled')) reserved.add(taskId);
+    }
+    const seen = new Set<string>();
+    let parentId = task.parentTaskId;
+    while (parentId !== undefined && !seen.has(parentId)) {
+      seen.add(parentId);
+      const parent = index.byId.get(parentId);
+      if (parent === undefined) break;
+      const source = finalSource?.get(parentId) ?? parent.statusSource;
+      if (source === 'explicit' && TERMINAL_PLAN_TASK_STATUSES.has(statusOf(parent))) break;
+      reserved.add(parentId);
+      parentId = parent.parentTaskId;
+    }
+  }
+  return reserved;
 }
 
 /**
@@ -305,8 +354,9 @@ function countLivePlanTasks(tasks: HarnessPlanTask[], finalStatus?: Map<string, 
  * structural rows plus the final statuses from rollup. Counting the post-image
  * makes a new terminal task free and charges every task the mutation reopens
  * (a completed leaf set back to pending, or a finished derived ancestor that a
- * new or moved child reopens). A bound refuses only a mutation that GROWS its
- * count past the limit, so a plan already over a bound can still be finished.
+ * new or moved child reopens), plus the worst case every open delegation can
+ * reopen when it settles. A bound refuses only a mutation that GROWS its count
+ * past the limit, so a plan already over a bound can still be finished.
  */
 function assertPlanTaskCapacity(
   preTasks: HarnessPlanTask[],
@@ -316,16 +366,23 @@ function assertPlanTaskCapacity(
   if (postTasks.length > PLAN_TASK_MAX_STORED_NODES && postTasks.length > preTasks.length) {
     throw new HarnessValidationError(
       'planTasks',
-      `stored plan task limit is ${PLAN_TASK_MAX_STORED_NODES} nodes; requested mutation would store ${postTasks.length}`,
+      `stored plan task limit is ${PLAN_TASK_MAX_STORED_NODES} nodes; requested mutation would store ${postTasks.length}. ` +
+        'Finished tasks stay stored until the application resets the plan (Session.resetPlanTasks).',
     );
   }
   const finalStatus = new Map<string, HarnessPlanTaskStatus>();
-  for (const delta of deltas) finalStatus.set(delta.taskId, delta.status);
-  const live = countLivePlanTasks(postTasks, finalStatus);
-  if (live > PLAN_TASK_MAX_NODES && live > countLivePlanTasks(preTasks)) {
+  const finalSource = new Map<string, 'explicit' | 'derived'>();
+  for (const delta of deltas) {
+    finalStatus.set(delta.taskId, delta.status);
+    finalSource.set(delta.taskId, delta.statusSource);
+  }
+  const reserved = delegationReservedLive(postTasks, finalStatus, finalSource);
+  const live = countLivePlanTasks(postTasks, finalStatus, reserved);
+  if (live > PLAN_TASK_MAX_NODES && live > countLivePlanTasks(preTasks, undefined, delegationReservedLive(preTasks))) {
     throw new HarnessValidationError(
       'planTasks',
-      `plan task limit is ${PLAN_TASK_MAX_NODES} live (not completed, cancelled or failed) nodes; requested mutation would leave ${live}`,
+      `plan task limit is ${PLAN_TASK_MAX_NODES} live (not completed, cancelled or failed) nodes; requested mutation would leave ${live}` +
+        (reserved.size > 0 ? ' (tasks an open delegation may reopen count as live until it settles)' : ''),
     );
   }
 }
@@ -795,7 +852,8 @@ export async function planTaskDecompose(
     throw new HarnessValidationError('children', 'decompose requires at least one child task');
   }
   // Every child is created pending (live), so an oversized call can never fit;
-  // reject it before the per-child validation and cycle work.
+  // reject it before the per-child validation and cycle work. The tool schema
+  // caps children too; this check protects direct callers.
   if (children.length > PLAN_TASK_MAX_NODES) {
     throw new HarnessValidationError(
       'planTasks',

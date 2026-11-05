@@ -128,5 +128,17 @@ describe('plan-task live cap across turns (PostgreSQL)', () => {
       cursor = page.nextCursor;
     } while (cursor !== undefined);
     expect(seen).toEqual([...roots, next.taskId]);
+
+    // An unfiltered paged read walks past the stored history to the current plan.
+    const all: string[] = [];
+    cursor = undefined;
+    do {
+      const page = await session._planTaskCheck({ limit: 100, ...(cursor ? { cursor } : {}) });
+      all.push(...page.tasks.map(task => task.taskId));
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    expect(all).toHaveLength(250);
+    expect(new Set(all).size).toBe(250);
+    expect(all.at(-100)).toBe(next.taskId);
   });
 });

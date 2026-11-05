@@ -447,6 +447,93 @@ describe('plan task capacity counts only live tasks', () => {
     }
   });
 
+  type DelegationRow = {
+    name: string;
+    live: number;
+    scope: 'failed subtree' | 'failed leaf';
+    then: 'settle blocked' | 'add';
+    expected: 'accepted' | RegExp;
+  };
+  // A delegation's settlement writes `blocked` (live) back over every failed
+  // task in its scope without a capacity check, so admission reserves them.
+  const delegationRows: DelegationRow[] = [
+    {
+      name: '97 live, delegate a failed root with 3 failed children (worst case 101)',
+      live: 97,
+      scope: 'failed subtree',
+      then: 'settle blocked',
+      expected: /limit is 100 live/,
+    },
+    {
+      name: '96 live, delegate a failed root with 3 failed children (worst case 100), settle blocked',
+      live: 96,
+      scope: 'failed subtree',
+      then: 'settle blocked',
+      expected: 'accepted',
+    },
+    {
+      name: '96 live, delegate a failed root with 3 failed children, then add while it is open',
+      live: 96,
+      scope: 'failed subtree',
+      then: 'add',
+      expected: /limit is 100 live/,
+    },
+    {
+      name: '99 live, delegate a failed leaf (worst case 100), settle blocked',
+      live: 99,
+      scope: 'failed leaf',
+      then: 'settle blocked',
+      expected: 'accepted',
+    },
+  ];
+
+  it.each(delegationRows)('$name -> $expected', async ({ live, scope, then, expected }) => {
+    const h = await setup();
+    const root = seedRow('failed');
+    const children =
+      scope === 'failed subtree' ? [1, 2, 3].map(() => seedRow('failed', { parentTaskId: root.taskId })) : [];
+    await seedPlan(h, { terminal: 150, live });
+    await h.storage.mutatePlanTasksForSession({
+      fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
+      ops: [root, ...children].map(task => ({ kind: 'create' as const, task })),
+    });
+    const before = await listAll(h.storage);
+    const countLive = (rows: Map<string, HarnessPlanTask>) =>
+      [...rows.values()].filter(row => !['completed', 'cancelled', 'failed'].includes(row.status)).length;
+
+    const delegate = () =>
+      planTaskDelegate(h.port, {
+        taskId: root.taskId,
+        subagentSessionId: 'sub-scope',
+        ...(children.length > 0 ? { includeSubtree: true } : {}),
+      });
+
+    if (then === 'add') {
+      await delegate();
+      const delegated = await listAll(h.storage);
+      await expect(planTaskAdd(h.port, { content: 'one more' })).rejects.toThrow(expected);
+      expect(await listAll(h.storage)).toEqual(delegated);
+      return;
+    }
+    if (expected !== 'accepted') {
+      await expect(delegate()).rejects.toThrow(expected);
+      // Refused at admission: no link, nothing started.
+      expect(await listAll(h.storage)).toEqual(before);
+      return;
+    }
+    await delegate();
+    const settled = await planTaskReconcileDelegation(h.port, {
+      taskId: root.taskId,
+      subagentSessionId: 'sub-scope',
+      outcome: 'blocked',
+    });
+    expect(settled.reconciled).toBe(true);
+    const after = await listAll(h.storage);
+    for (const task of [root, ...children]) expect(after.get(task.taskId)?.status).toBe('blocked');
+    expect(countLive(after)).toBe(live + 1 + children.length);
+    expect(countLive(after)).toBeLessThanOrEqual(PLAN_TASK_MAX_NODES);
+  });
+
   it('plans again after more than 100 tasks were spent across several finished plans', async () => {
     const { storage, port, summaries } = await setup();
     const roots: string[] = [];
@@ -487,6 +574,19 @@ describe('plan task capacity counts only live tasks', () => {
     expect(seen).toEqual([...roots, next.taskId]);
     const current = await planTaskCheck(port, { rootTaskId: next.taskId, limit: PLAN_TASK_CHECK_MAX_LIMIT });
     expect(current.tasks.map(task => task.taskId)).toEqual([next.taskId, ...nextSteps.map(step => step.taskId)]);
+
+    // An unfiltered paged read walks past the 150 stored history rows and
+    // reaches every task of the current plan.
+    const all: string[] = [];
+    cursor = undefined;
+    do {
+      const page = await planTaskCheck(port, { limit: PLAN_TASK_CHECK_MAX_LIMIT, cursor });
+      all.push(...page.tasks.map(task => task.taskId));
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    expect(all).toHaveLength(250);
+    expect(new Set(all).size).toBe(250);
+    expect(all.slice(-PLAN_TASK_MAX_NODES)).toEqual([next.taskId, ...nextSteps.map(step => step.taskId)]);
   });
 });
 
