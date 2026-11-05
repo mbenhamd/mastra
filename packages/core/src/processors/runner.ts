@@ -12,6 +12,7 @@ import { MastraError } from '../error';
 import { resolveModelConfig } from '../llm';
 import type { IMastraLogger } from '../logger';
 import { mergeStructuredOutputSourceDecision } from '../loop/shared/compose-step-input';
+import { hasHistoryLoadWatches, noteHistoryLoaded } from '../memory/history-load-watch';
 import type { MastraMemory } from '../memory/memory';
 import { parseMemoryRequestContext } from '../memory/types';
 import {
@@ -2304,6 +2305,18 @@ export class ProcessorRunner {
         }
         processorSpan?.error({ error: error as Error, endSpan: true });
         throw error;
+      }
+    }
+
+    // PF-7679: report the history this run's context carries after every input
+    // processor ran (trimming included), for an internal watch on its thread.
+    if (hasHistoryLoadWatches()) {
+      const memoryContext = parseMemoryRequestContext(requestContext);
+      const memoryInfo = memoryContext?.thread?.id ? undefined : messageList.serialize().memoryInfo;
+      const threadId = memoryContext?.thread?.id ?? memoryInfo?.threadId;
+      if (threadId) {
+        const ids = messageList.get.remembered.db().map(message => message.id);
+        noteHistoryLoaded(threadId, memoryContext?.resourceId ?? memoryInfo?.resourceId, ids);
       }
     }
 

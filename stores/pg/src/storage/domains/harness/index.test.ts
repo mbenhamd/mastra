@@ -3416,6 +3416,55 @@ describe('HarnessPG renewSessionLeaseSubtree (§5.8 / PF-821)', () => {
       expect(listed.tasks).toEqual([expect.objectContaining({ taskId: 'existing', status: 'pending', version: 1 })]);
     });
 
+    it('PF-7679: an owner whose lease expired cannot acknowledge its settlement-notice claim; the next holder can take it over', async () => {
+      const harness = store.stores.harness!;
+      const { sessionId, version } = await setupSession('plan-notice-claim-session');
+      const claim = { claimId: 'claim-a', ownerId: OWNER, claimedAt: 1_000 };
+      const claimed = {
+        mastraHarnessDelegationAttemptV1: {
+          settlement: { outcome: 'completed', notice: { mode: 'wake', digest: 'd'.repeat(64), claim } },
+        },
+      };
+      await harness.createPlanTask({
+        fence: fence(sessionId, version),
+        task: sampleTask(sessionId, { taskId: 'noticed', metadata: claimed }),
+      });
+      await harness.renewSessionLease({ sessionId, ownerId: OWNER, ttlMs: -1 });
+
+      // The delivered-ack removes the notice under the claimer's fence: refused.
+      const acknowledged = { mastraHarnessDelegationAttemptV1: { settlement: { outcome: 'completed' } } };
+      await expect(
+        harness.mutatePlanTasksForSession({
+          fence: fence(sessionId, version),
+          ops: [{ kind: 'update', taskId: 'noticed', ifVersion: 1, patch: { metadata: acknowledged } }],
+        }),
+      ).rejects.toBeInstanceOf(HarnessStorageLeaseConflictError);
+      const [kept] = (await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 })).tasks;
+      expect(kept).toMatchObject({ taskId: 'noticed', version: 1, metadata: claimed });
+
+      // The next lease holder overwrites the claim with its own (the takeover).
+      await harness.acquireSessionLease({ sessionId, ownerId: 'next-owner', ttlMs: 30_000 });
+      const current = await harness.loadSession({ harnessName: 'default', sessionId });
+      const takeover = {
+        mastraHarnessDelegationAttemptV1: {
+          settlement: {
+            outcome: 'completed',
+            notice: {
+              mode: 'wake',
+              digest: 'd'.repeat(64),
+              claim: { ...claim, claimId: 'claim-b', ownerId: 'next-owner' },
+            },
+          },
+        },
+      };
+      await harness.mutatePlanTasksForSession({
+        fence: fence(sessionId, current!.version, 'next-owner'),
+        ops: [{ kind: 'update', taskId: 'noticed', ifVersion: 1, patch: { metadata: takeover } }],
+      });
+      const [taken] = (await harness.listPlanTasks({ harnessName: 'default', sessionId, limit: 10 })).tasks;
+      expect(taken).toMatchObject({ version: 2, metadata: takeover });
+    });
+
     it('the session-owner fence rejects a stale session version', async () => {
       const harness = store.stores.harness!;
       const { sessionId, version } = await setupSession();
