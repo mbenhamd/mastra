@@ -1212,7 +1212,7 @@ const childListRows: ChildListRow[] = [
     leavesOut: false,
   },
   {
-    name: '250 running children: the last are left out, counted and named in the hint',
+    name: '250 running children: the last are left out, counted, and the hint gives the next offset',
     largeSettling: 0,
     running: 100,
     inline: 150,
@@ -1224,6 +1224,15 @@ const childListRows: ChildListRow[] = [
     largeSettling: 0,
     running: 100,
     inline: 150,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+    followHint: true,
+  },
+  {
+    name: '1000 inline children page through the hint offsets, each child seen exactly once',
+    largeSettling: 0,
+    running: 0,
+    inline: 1000,
     call: { action: 'wait', timeoutMs: 0 },
     leavesOut: true,
     followHint: true,
@@ -1307,21 +1316,27 @@ describe('subagent control tool — bounded child list', () => {
         }
         expect(leftOut.length).toBeGreaterThan(0);
         expect(output.omittedSubagentCount).toBe(leftOut.length);
-        expect(output.resultsHint).toMatch(/action "wait", timeoutMs 0 and subagentSessionIds/);
-        for (const id of leftOut) expect(output.resultsHint).toContain(id);
+        // The hint reads on from the first left-out child.
+        expect(output.resultsHint).toContain(`action "wait", timeoutMs 0 and offset ${listed.length}`);
         if (!row.followHint) return;
 
-        const readBack: string[] = [];
-        for (let start = 0; start < leftOut.length; start += 16) {
-          const chunk = leftOut.slice(start, start + 16);
-          const next = await run({ action: 'wait', subagentSessionIds: chunk, timeoutMs: 0 });
-          expect(next.isError).toBeUndefined();
-          expect(utf8Length(next)).toBeLessThanOrEqual(64 * 1024);
-          // A hinted call never leaves children out again, so the hint cannot loop.
-          expect(next.omittedSubagentCount).toBeUndefined();
-          readBack.push(...(next.runningSubagents as any[]).map(view => view.subagentSessionId));
+        // Page through the rest with the offset each hint gives, until a page leaves nothing out.
+        const seen = [...listedIds];
+        let page = output;
+        while (page.omittedSubagentCount !== undefined) {
+          const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+          expect(offset).toBe(seen.length);
+          page = await run({ action: 'wait', timeoutMs: 0, offset });
+          expect(page.isError).toBeUndefined();
+          expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+          const ids = (page.runningSubagents as any[]).map(view => view.subagentSessionId as string);
+          // Every page moves on, so following the hint cannot loop.
+          expect(ids.length).toBeGreaterThan(0);
+          seen.push(...ids);
         }
-        expect([...readBack].sort()).toEqual([...leftOut].sort());
+        // Every child is seen exactly once.
+        expect(new Set(seen).size).toBe(seen.length);
+        expect([...seen].sort()).toEqual([...allIds].sort());
       } finally {
         for (const key of inlineKeys) active.delete(key);
         for (const child of children) child.releaseChild();
