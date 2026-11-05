@@ -52,7 +52,7 @@ import { InMemoryStore } from '../../storage';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { createTool } from '../../tools';
-import { askUser } from '../../tools/builtin';
+import { askUser, submitPlan } from '../../tools/builtin';
 
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
@@ -1038,6 +1038,93 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       expect(rehydrated.getRecord().pendingResume?.resumedAt).toBeUndefined();
     } finally {
       await rehydratedHarness?.shutdown();
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// PF-7749 — built-in interaction tools pre-register with the run's id
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — built-in tools read ctx.agent.runId', () => {
+  // A pre-registered pending keeps the tool-supplied item id (the tool call
+  // id); a pending captured only from the suspended output is keyed
+  // `<kind>:<toolCallId>`. The item id therefore shows whether the tool
+  // reached the Harness registration with the agent run id.
+  async function suspendOn(toolName: 'ask_user' | 'submit_plan', toolCallId: string, inputJson: string) {
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: ++callCount === 1 ? toolCallStream(toolCallId, toolName, inputJson) : textStream(['unexpected']),
+      }),
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: `call ${toolName}`, model });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: toolName === 'ask_user' ? { ask_user: askUser } : { submit_plan: submitPlan },
+          harnessBuiltins: 'exclude',
+        },
+      ],
+      defaultModeId: 'default',
+    });
+    const session = await harness.session({ resourceId: `${toolName}-run-id-user`, threadId: { fresh: true } });
+    const events: HarnessEvent[] = [];
+    session.subscribe(event => events.push(event));
+    const suspended = (await session.message({ content: `use ${toolName}` })) as any;
+    const agentStart = events.find(event => event.type === 'agent_start') as { runId: string } | undefined;
+    return { harness, session, events, suspended, runId: agentStart?.runId };
+  }
+
+  it('ask_user registers its question with the active run id', async () => {
+    const { harness, session, events, suspended, runId } = await suspendOn(
+      'ask_user',
+      'question-run-id-call',
+      JSON.stringify({ question: 'Continue?' }),
+    );
+    try {
+      expect(suspended.finishReason).toBe('suspended');
+      expect(runId).toBe(suspended.runId);
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'question',
+        itemId: 'question-run-id-call',
+        runId,
+        toolCallId: 'question-run-id-call',
+      });
+      expect(events.filter(event => event.type === 'question_pending')).toEqual([
+        expect.objectContaining({ itemId: 'question-run-id-call', runId }),
+      ]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('submit_plan registers its plan approval with the active run id', async () => {
+    const { harness, session, events, suspended, runId } = await suspendOn(
+      'submit_plan',
+      'plan-run-id-call',
+      JSON.stringify({ title: 'Plan', plan: '1. Do the thing.' }),
+    );
+    try {
+      expect(suspended.finishReason).toBe('suspended');
+      expect(runId).toBe(suspended.runId);
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'plan-approval',
+        itemId: 'plan-run-id-call',
+        runId,
+        toolCallId: 'plan-run-id-call',
+      });
+      expect(events.filter(event => event.type === 'plan_approval_required')).toEqual([
+        expect.objectContaining({ itemId: 'plan-run-id-call', runId }),
+      ]);
+    } finally {
       await harness.shutdown();
     }
   });
