@@ -665,28 +665,58 @@ function largeSummary(label: string, bytes: number): string {
   return `${label} `.padEnd(bytes, 'x');
 }
 
+/** A summary of about `bytes` UTF-8 bytes in 4-byte characters. */
+function multibyteSummary(label: string, bytes: number): string {
+  return `${label} ${'\u{1F600}'.repeat(Math.floor((bytes - label.length - 1) / 4))}`;
+}
+
+/** A summary whose JSON form is about twice its UTF-8 size (every `"` is escaped). */
+function escapedSummary(chars: number): string {
+  return '"'.repeat(chars);
+}
+
 function utf8Length(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
+/** Give a settled delegation's stored result a tool trace, as a child that called tools would have. */
+function addStoredToolTrace(db: InMemoryDB, childId: string): void {
+  for (const [key, task] of db.harnessPlanTasks) {
+    const attempt = (task.metadata as any)?.mastraHarnessDelegationAttemptV1;
+    if (attempt?.subagentSessionId !== childId || attempt.settlement?.result === undefined) continue;
+    attempt.settlement.result.toolTrace = [{ toolName: 'searchPapers', calls: 2, errors: 0 }];
+    db.harnessPlanTasks.set(key, { ...task, version: task.version + 1 });
+    return;
+  }
+  throw new Error(`no settled delegation for ${childId}`);
+}
+
 type ResultPageRow = {
   name: string;
-  /** Summary bytes per delegated child. */
-  sizes: number[];
+  /** Summary per delegated child. */
+  summaries: string[];
+  /** Task content for every child (defaults to a short label). */
+  taskContent?: string;
   /** Children (by index) settled before the call. */
   settledBefore: number[];
   /** Children (by index) released while the call runs. */
   settledDuring: number[];
+  /** Children (by index) whose stored result gets a tool trace once settled. */
+  traced?: number[];
   call: (ids: string[]) => Record<string, unknown>;
   /** Expected result per child index in the output: full, preview, or omitted. */
   expected: Record<number, 'full' | 'preview' | 'omitted'>;
   shortened: boolean;
+  /** The call names one child whose full result is larger than the page budget. */
+  overBudgetSingle?: boolean;
 };
+
+const many = <T>(count: number, make: (index: number) => T): T[] => Array.from({ length: count }, (_, i) => make(i));
 
 const resultPageRows: ResultPageRow[] = [
   {
     name: 'status listing: a child settled before the call gets a preview',
-    sizes: [20_000],
+    summaries: [largeSummary('child-0', 20_000)],
     settledBefore: [0],
     settledDuring: [],
     call: () => ({ action: 'status' }),
@@ -695,7 +725,7 @@ const resultPageRows: ResultPageRow[] = [
   },
   {
     name: 'status naming a child settled before the call gets its full result',
-    sizes: [20_000],
+    summaries: [largeSummary('child-0', 20_000)],
     settledBefore: [0],
     settledDuring: [],
     call: ids => ({ action: 'status', subagentSessionId: ids[0] }),
@@ -704,7 +734,7 @@ const resultPageRows: ResultPageRow[] = [
   },
   {
     name: 'status listing: a small result is complete as its preview and is not marked shortened',
-    sizes: [200],
+    summaries: [largeSummary('child-0', 200)],
     settledBefore: [0],
     settledDuring: [],
     call: () => ({ action: 'status' }),
@@ -712,8 +742,18 @@ const resultPageRows: ResultPageRow[] = [
     shortened: false,
   },
   {
+    name: 'status listing: a tiny result with a tool trace is returned in full, not shortened',
+    summaries: [largeSummary('child-0', 200)],
+    settledBefore: [0],
+    settledDuring: [],
+    traced: [0],
+    call: () => ({ action: 'status' }),
+    expected: { 0: 'full' },
+    shortened: false,
+  },
+  {
     name: 'status listing three large children stays under the budget with previews',
-    sizes: [40_000, 40_000, 40_000],
+    summaries: many(3, i => largeSummary(`child-${i}`, 40_000)),
     settledBefore: [0, 1, 2],
     settledDuring: [],
     call: () => ({ action: 'status' }),
@@ -722,7 +762,7 @@ const resultPageRows: ResultPageRow[] = [
   },
   {
     name: 'wait for every running child: a child that settles during the call gets its full result',
-    sizes: [20_000],
+    summaries: [largeSummary('child-0', 20_000)],
     settledBefore: [],
     settledDuring: [0],
     call: () => ({ action: 'wait', timeoutMs: 5_000 }),
@@ -731,7 +771,7 @@ const resultPageRows: ResultPageRow[] = [
   },
   {
     name: 'wait naming a child settled before the call gets its full result',
-    sizes: [20_000],
+    summaries: [largeSummary('child-0', 20_000)],
     settledBefore: [0],
     settledDuring: [],
     call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
@@ -740,71 +780,123 @@ const resultPageRows: ResultPageRow[] = [
   },
   {
     name: 'wait naming three large children over the budget: the first is full, the rest are previews',
-    sizes: [40_000, 40_000, 40_000],
+    summaries: many(3, i => largeSummary(`child-${i}`, 40_000)),
     settledBefore: [0, 1, 2],
     settledDuring: [],
     call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
     expected: { 0: 'full', 1: 'preview', 2: 'preview' },
     shortened: true,
   },
+  {
+    name: 'wait naming three children of 4-byte characters counts UTF-8 bytes, not characters',
+    summaries: many(3, i => multibyteSummary(`child-${i}`, 30_000)),
+    settledBefore: [0, 1, 2],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full', 1: 'preview', 2: 'preview' },
+    shortened: true,
+  },
+  {
+    name: 'wait naming sixteen children: previews fill the page and the last results are left out',
+    summaries: many(16, i => largeSummary(`child-${i}`, 8_000)),
+    settledBefore: many(16, i => i),
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 15: 'omitted' },
+    shortened: true,
+  },
+  {
+    name: 'status naming one child larger than the page budget returns its full result and no hint',
+    summaries: [escapedSummary(32_500)],
+    taskContent: '"'.repeat(500),
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'status', subagentSessionId: ids[0] }),
+    expected: { 0: 'full' },
+    shortened: false,
+    overBudgetSingle: true,
+  },
+  {
+    name: 'wait naming one child larger than the page budget returns its full result and no hint',
+    summaries: [escapedSummary(32_500)],
+    taskContent: '"'.repeat(500),
+    settledBefore: [0],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full' },
+    shortened: false,
+    overBudgetSingle: true,
+  },
 ];
 
 describe('subagent control tool — bounded result page', () => {
-  it.each(resultPageRows)('$name', async row => {
-    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
-    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const closeTurn = await openParentTurn(parent, parentAgent);
-    const run = control(parent);
-    const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
-    for (const [index, size] of row.sizes.entries()) {
-      const summary = largeSummary(`child-${index}`, size);
-      const child = await delegateHeldChild(parent, childAgent, `job ${index}`, summary);
-      children.push({ ...child, summary });
-    }
-    const settled = async (index: number) =>
-      (await run({ action: 'status', subagentSessionId: children[index]!.childId })).subagents?.[0]?.settled === true;
-    for (const index of row.settledBefore) {
-      children[index]!.releaseChild();
-      await poll(() => settled(index));
-    }
-
-    const pending = run(row.call(children.map(child => child.childId)));
-    for (const index of row.settledDuring) children[index]!.releaseChild();
-    const output = await pending;
-
-    expect(output.isError).toBeUndefined();
-    expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
-    const views: any[] = output.subagents ?? output.settledSubagents;
-    for (const [index, expected] of Object.entries(row.expected)) {
-      const child = children[Number(index)]!;
-      const view = views.find(candidate => candidate.subagentSessionId === child.childId);
-      expect(view, `child ${index}`).toBeDefined();
-      if (expected === 'full') {
-        expect(view.result.text).toBe(child.summary);
-        expect(view.result.textTruncated).toBe(false);
-        expect(view.resultPreview).toBeUndefined();
-      } else if (expected === 'preview') {
-        expect(view.resultPreview).toBe(true);
-        expect(view.result.textTruncated).toBe(true);
-        expect(child.summary.startsWith(view.result.text.split('\n')[0])).toBe(true);
-        expect(new TextEncoder().encode(view.result.text).byteLength).toBeLessThan(5 * 1024);
-      } else {
-        expect(view.result).toBeUndefined();
-        expect(view.resultOmitted).toBe(true);
+  it.each(resultPageRows)(
+    '$name',
+    async row => {
+      const db = new InMemoryDB();
+      const { harness, parentAgent, childAgent } = buildHarness(db);
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const closeTurn = await openParentTurn(parent, parentAgent);
+      const run = control(parent);
+      const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
+      for (const [index, summary] of row.summaries.entries()) {
+        const child = await delegateHeldChild(parent, childAgent, row.taskContent ?? `job ${index}`, summary);
+        children.push({ ...child, summary });
       }
-    }
-    if (row.shortened) {
-      expect(output.resultsShortened).toBe(true);
-      expect(output.resultsHint).toMatch(/action "status" and that subagentSessionId/);
-    } else {
-      expect(output.resultsShortened).toBeUndefined();
-      expect(output.resultsHint).toBeUndefined();
-    }
+      const settled = async (index: number) =>
+        (await run({ action: 'status', subagentSessionId: children[index]!.childId })).subagents?.[0]?.settled === true;
+      for (const index of row.settledBefore) {
+        children[index]!.releaseChild();
+        await poll(() => settled(index));
+      }
+      for (const index of row.traced ?? []) addStoredToolTrace(db, children[index]!.childId);
 
-    for (const child of children) child.releaseChild();
-    closeTurn();
-    await harness.shutdown();
-  });
+      const pending = run(row.call(children.map(child => child.childId)));
+      for (const index of row.settledDuring) children[index]!.releaseChild();
+      const output = await pending;
+
+      expect(output.isError).toBeUndefined();
+      if (!row.overBudgetSingle) expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+      const views: any[] = output.subagents ?? output.settledSubagents;
+      for (const [index, expected] of Object.entries(row.expected)) {
+        const child = children[Number(index)]!;
+        const view = views.find(candidate => candidate.subagentSessionId === child.childId);
+        expect(view, `child ${index}`).toBeDefined();
+        if (expected === 'full') {
+          expect(view.result.text).toBe(child.summary);
+          expect(view.result.textTruncated).toBe(false);
+          expect(view.resultPreview).toBeUndefined();
+          if (row.traced?.includes(Number(index))) {
+            expect(view.result.toolTrace).toEqual([{ toolName: 'searchPapers', calls: 2, errors: 0 }]);
+          }
+        } else if (expected === 'preview') {
+          expect(view.resultPreview).toBe(true);
+          expect(view.result.textTruncated).toBe(true);
+          expect(child.summary.startsWith(view.result.text.split('\n')[0])).toBe(true);
+          // A preview never splits a character: a lone surrogate makes encodeURIComponent throw.
+          expect(() => encodeURIComponent(view.result.text)).not.toThrow();
+          expect(new TextEncoder().encode(view.result.text).byteLength).toBeLessThan(5 * 1024);
+        } else {
+          expect(view.result).toBeUndefined();
+          expect(view.resultOmitted).toBe(true);
+        }
+      }
+      // The case is real only if the full result alone is over the page budget.
+      if (row.overBudgetSingle) expect(utf8Length(output)).toBeGreaterThan(64 * 1024);
+      if (row.shortened) {
+        expect(output.resultsShortened).toBe(true);
+        expect(output.resultsHint).toMatch(/action "status"/);
+      } else {
+        expect(output.resultsShortened).toBeUndefined();
+        expect(output.resultsHint).toBeUndefined();
+      }
+
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    },
+    30_000,
+  );
 });
 
 type WaitRow = {
