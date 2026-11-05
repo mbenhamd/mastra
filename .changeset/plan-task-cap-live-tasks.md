@@ -8,4 +8,9 @@ Changed every plan-task change (add, decompose, status update, reparent and dele
 
 Added a limit of 1000 stored plan tasks per session. At that limit, adding more tasks is refused until the application resets the plan with `Session.resetPlanTasks()`; finishing existing tasks still works.
 
+```ts
+// Clear the stored plan (finished tasks included) so the model can plan again.
+await session.resetPlanTasks();
+```
+
 Fixed `plan_task_check` paging so it reads the whole stored plan and the current plan stays reachable after a long history.

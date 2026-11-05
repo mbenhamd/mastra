@@ -366,8 +366,9 @@ function assertPlanTaskCapacity(
   if (postTasks.length > PLAN_TASK_MAX_STORED_NODES && postTasks.length > preTasks.length) {
     throw new HarnessValidationError(
       'planTasks',
-      `stored plan task limit is ${PLAN_TASK_MAX_STORED_NODES} nodes; requested mutation would store ${postTasks.length}. ` +
-        'Finished tasks stay stored until the application resets the plan (Session.resetPlanTasks).',
+      `This session has reached the limit of ${PLAN_TASK_MAX_STORED_NODES} stored plan tasks ` +
+        `(the requested change would store ${postTasks.length}). Do not retry adding tasks. ` +
+        'Tell the user the plan must be reset by the application.',
     );
   }
   const finalStatus = new Map<string, HarnessPlanTaskStatus>();

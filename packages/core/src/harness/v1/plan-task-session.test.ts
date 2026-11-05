@@ -293,7 +293,8 @@ describe('plan task capacity counts only live tasks', () => {
       terminal: PLAN_TASK_MAX_STORED_NODES,
       live: 0,
       attempt: 'add',
-      expected: /stored plan task limit is 1000/,
+      expected:
+        /reached the limit of 1000 stored plan tasks.*Do not retry adding tasks\. Tell the user the plan must be reset by the application\./,
     },
   ];
 
