@@ -12554,6 +12554,43 @@ export class Session {
   }
 
   /**
+   * PF-7631: give up a wake grant before anything runs under it. The admission
+   * is cancelled through `cancelTerminalHandoff` (marked cancelled, its grant
+   * tombstoned), so no terminal result or intent is ever committed for it, and
+   * its reserved row is settled failed with `harness.terminal_cancelled`. It
+   * stays in flight until then, so dispatch recovery never interrupts it
+   * meanwhile; if the cancel does not land, it is released to recovery
+   * instead. Tracked, so a close waits for it.
+   */
+  private _cancelWakeTerminalAdmission(identity: HarnessTerminalIdentity): void {
+    const reason = { code: 'harness.terminal_cancelled', message: 'the wake gave up its grant before dispatch' };
+    void this._trackBackgroundTurnCompletion(
+      (async () => {
+        try {
+          const receipt = await this._storage.cancelTerminalHandoff({
+            harnessName: identity.harnessName,
+            sessionId: identity.sessionId,
+            sessionIncarnation: identity.sessionIncarnation,
+            admissionId: identity.admissionId,
+            admissionHash: identity.admissionHash,
+            executionGrant: identity.executionGrant,
+            reason,
+            cancelledAt: Date.now(),
+          });
+          if (receipt.status === 'cancelled' && receipt.admission !== undefined) {
+            await this._settleCancelledTerminalMessage(receipt.admission, reason.message);
+            this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+            return;
+          }
+        } catch {
+          // Recovery settles what the cancel did not.
+        }
+        this._releaseWakeTerminalAdmission(identity.admissionId);
+      })(),
+    );
+  }
+
+  /**
    * PF-7631: commit a wake turn's terminal outcome — its completed output or
    * the failure its own run rejected with. No caller retries a wake, so every
    * wake terminal commit goes through here: a failed attempt is surfaced as an
@@ -15351,14 +15388,15 @@ export class Session {
    * while the wake still holds its idle slot at dispatch, or when the dispatch
    * started the run its wake grant reserved.
    * PF-7631: with `wakeSettlement` and a registered wake finalizer, the wake
-   * turn is admitted under its Harness-minted grant and commits a terminal
-   * intent (`_admitWakeTerminalTurn`). The grant refuses a dispatch that
-   * cannot start its reserved run, so the notice then reaches a caller run only
-   * through its reminder row. It is therefore admitted only in the one case
-   * where that row is proven readable by the dispatching agent
-   * (`_wakeGrantAllowed`): `wakeReminderRow` says the row was saved by this
-   * agent's own fixed memory instance, with no mode change since. Every other
-   * case is fork main's call.
+   * turn may run under its Harness-minted grant and commit a terminal intent
+   * (`_admitWakeTerminalTurn`). The grant is kept only for a wake that still
+   * holds its idle slot at dispatch (no caller turn began, no run is active)
+   * and whose reminder row was saved by this dispatching agent's own fixed
+   * memory instance with no mode change since (`wakeReminderRow`,
+   * `_wakeGrantAllowed`); that wake then runs as the reserved wake run. A
+   * grant that no longer holds at dispatch is cancelled
+   * (`_cancelWakeTerminalAdmission`: no terminal result, no intent). Every
+   * other case is fork main's call.
    */
   private async _injectSystemReminder(
     content: string,
@@ -15487,6 +15525,8 @@ export class Session {
           internal.wakeSettlement !== undefined &&
           signalId !== undefined &&
           this._terminalWakeFinalizer !== undefined &&
+          this._currentTurnAbortController === turnAbortController &&
+          sub.activeRunId() === null &&
           this._wakeGrantAllowed(internal.wakeReminderRow, agent, effectiveModeId)
         ) {
           wakeAdmission = this._admitWakeTerminalTurn({
@@ -15506,26 +15546,31 @@ export class Session {
         // cancelled since the settlement). If a caller turn began or started a
         // run during the await, it keeps the slot: the content is sent exactly
         // as fork main sends it; only the wake label is dropped, so that run is
-        // never announced as this wake. PF-7631: a wake admitted under its grant
-        // is instead bound to the reserved run below; it never folds into a
-        // caller's run, and a dispatch that does not start that run is refused.
-        // The caller run then reads the notice from the reminder row, which the
-        // grant's allowlist proves this agent's memory holds: same agent, same
-        // fixed memory instance, no mode change since the save. That proof is
-        // re-checked here, in the same tick as the dispatch; if it no longer
-        // holds, the admission is released to recovery (no run starts under it)
-        // and the wake is sent as fork main sends it.
+        // never announced as this wake. PF-7631: the wake grant is kept only
+        // while the wake still holds the idle slot and its row is still proven
+        // to be in the dispatching agent's own memory with no mode change since
+        // (`_wakeGrantAllowed`). Both are re-checked here, in the same tick as
+        // the dispatch. If either no longer holds, the grant is cancelled (no
+        // run starts under it, no terminal result or intent is committed) and
+        // the wake is sent exactly as fork main sends it: a caller run that took
+        // the slot receives the notice as its next model input, unlabelled. A
+        // kept grant binds the dispatch to the reserved run.
         if (idleOnlyEpoch !== undefined) {
           if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
             throw new HarnessBusyError(this.id, 'in_flight');
           }
           idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
         }
-        if (wakeTerminal !== undefined && !this._wakeGrantAllowed(internal?.wakeReminderRow, agent, effectiveModeId)) {
-          const released = wakeTerminal;
+        if (
+          wakeTerminal !== undefined &&
+          (this._currentTurnAbortController !== turnAbortController ||
+            sub.activeRunId() !== null ||
+            !this._wakeGrantAllowed(internal?.wakeReminderRow, agent, effectiveModeId))
+        ) {
+          const givenUp = wakeTerminal;
           wakeAdmission = undefined;
           wakeTerminal = undefined;
-          this._releaseWakeTerminalAdmission(released.admissionId);
+          this._cancelWakeTerminalAdmission(givenUp);
         }
 
         dispatched = agent.sendSignal(
@@ -24809,8 +24854,8 @@ export class Session {
             admissionEpoch,
             wakeNoticeId: signalId,
             // PF-7631: the wake grant is considered only over a saved reminder
-            // row, and admitted only when `_wakeGrantAllowed` proves the
-            // dispatching agent reads it. Otherwise the call is fork main's, so
+            // row, and kept only while the wake holds the idle slot and
+            // `_wakeGrantAllowed` holds. Otherwise the call is fork main's, so
             // a caller run that took the slot still receives the notice as its
             // next model input.
             ...(reminderRow !== undefined
@@ -24828,11 +24873,8 @@ export class Session {
       }
     } catch {
       // After the claim nothing is owed. A wake that lost its slot during the
-      // context await is sent as fork main sends it, unlabelled, unless it was
-      // admitted under its wake grant (a registered wake finalizer, and the row
-      // saved by the dispatching agent's own fixed memory with no mode change
-      // since): that dispatch is refused busy, the reservation settles
-      // interrupted, and the caller run reads the notice from the saved row.
+      // context await is sent as fork main sends it, unlabelled; a wake grant
+      // it held is cancelled first, so it commits no terminal result or intent.
       // Refusals (a stale admission epoch from a Stop or an edit/regenerate via
       // `resetPlanTasks`, or a run already active before the turn begins) drop
       // the wake whether or not a row exists (PF-7679). Before the claim, the
@@ -24881,13 +24923,12 @@ export class Session {
   }
 
   /**
-   * PF-7631: the one case where a settlement wake may run under its grant. The
-   * grant refuses a dispatch that cannot start its reserved run, and a caller
-   * run that took the slot then reads the notice only from its reminder row.
-   * That is safe only when the dispatching agent reads that row: it is the
-   * agent whose memory saved it, its memory is that same fixed instance, and
-   * the mode is unchanged since the save. Synchronous, so it can be checked in
-   * the same tick as the dispatch. Any other case is fork main's path.
+   * PF-7631: the row side of the one case where a settlement wake may run under
+   * its grant (the other side is that the wake still holds the idle slot): the
+   * dispatching agent is the agent whose memory saved the row, its memory is
+   * that same fixed instance, and the mode is unchanged since the save.
+   * Synchronous, so it can be checked in the same tick as the dispatch. Any
+   * other case is fork main's path.
    */
   private _wakeGrantAllowed(row: WakeReminderRowOrigin | undefined, agent: Agent, modeId: string): boolean {
     return (

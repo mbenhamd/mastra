@@ -1181,12 +1181,16 @@ export interface HarnessConfigCommon {
        * differ from `finalizer.id`: consumers claim each kind by finalizer id.
        * The committed payload is a `HarnessWakeTerminalPayload` wrapping this
        * finalizer's payload. Earlier versions settle through `settleOnly`.
-       * The grant applies only when the notice's reminder row was saved by the
-       * dispatching agent's own fixed memory instance with no mode change
-       * since. Any other wake (a memory-less parent, a row saved to another
-       * mode's memory, function or inherited memory, a mode switch) stages no
-       * intent and is sent as without this option, so a caller run that is
-       * active at dispatch still receives the notice.
+       * The grant applies only to a wake that still holds its idle slot at
+       * dispatch (no caller turn began, no run is active) and whose reminder
+       * row was saved by the dispatching agent's own fixed memory instance
+       * with no mode change since. Any other wake (a caller turn took the
+       * slot, a memory-less parent, a row saved to another mode's memory,
+       * function or inherited memory, a mode switch) stages no intent and is
+       * sent as without this option, so a caller run still receives the
+       * notice as its next model input. A grant given up after its admission
+       * is cancelled: no terminal result and no intent; its `harness-wake:`
+       * reservation is settled failed with `harness.terminal_cancelled`.
        */
       wakeFinalizer?: HarnessTerminalFinalizer;
     };
