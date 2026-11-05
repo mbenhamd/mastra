@@ -15339,7 +15339,10 @@ export class Session {
    * started the run its wake grant reserved.
    * PF-7631: with `wakeSettlement` and a registered wake finalizer, the wake
    * turn is admitted under its Harness-minted grant and commits a terminal
-   * intent (`_admitWakeTerminalTurn`).
+   * intent (`_admitWakeTerminalTurn`). The settlement path passes
+   * `wakeSettlement` only when it saved the notice's reminder row, because the
+   * grant refuses a dispatch that cannot start its reserved run and the row is
+   * then the notice's only delivery. Without it the call is fork main's.
    */
   private async _injectSystemReminder(
     content: string,
@@ -15486,8 +15489,10 @@ export class Session {
         // run during the await, it keeps the slot: the content is sent exactly
         // as fork main sends it; only the wake label is dropped, so that run is
         // never announced as this wake. PF-7631: a wake admitted under its grant
-        // is instead bound to the reserved run below; it never folds into a
-        // caller's run, and a dispatch that does not start that run is refused.
+        // (registered wake finalizer, reminder row saved) is instead bound to the
+        // reserved run below; it never folds into a caller's run, and a dispatch
+        // that does not start that run is refused. The caller run reads the
+        // notice from the saved row.
         if (idleOnlyEpoch !== undefined) {
           if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
             throw new HarnessBusyError(this.id, 'in_flight');
@@ -24723,6 +24728,8 @@ export class Session {
       const memory = await this._resolveDelegationNoticeMemory(notice);
       // Shutdown may have begun while the notice was re-read and memory resolved.
       if (!live()) return;
+      // PF-7631: set only once the row is written; it alone admits the wake grant.
+      let reminderRowSaved = false;
       if (memory !== undefined && memory !== null) {
         await memory.saveMessages({
           messages: [
@@ -24738,6 +24745,7 @@ export class Session {
             }),
           ],
         });
+        reminderRowSaved = true;
       }
       if (!live()) return;
       if (notice.mode === 'remind') {
@@ -24767,17 +24775,27 @@ export class Session {
             signalId,
             admissionEpoch,
             wakeNoticeId: signalId,
-            wakeSettlement: {
-              taskId: notice.taskId,
-              subagentSessionId: notice.subagentSessionId,
-              outcome: notice.outcome,
-            },
+            // PF-7631: the wake grant only over a saved reminder row. Without a
+            // row the call is fork main's, so a caller run that took the slot
+            // still receives the notice as its next model input.
+            ...(reminderRowSaved
+              ? {
+                  wakeSettlement: {
+                    taskId: notice.taskId,
+                    subagentSessionId: notice.subagentSessionId,
+                    outcome: notice.outcome,
+                  },
+                }
+              : {}),
           },
         );
       }
     } catch {
       // After the claim nothing is owed. A wake that lost its slot during the
-      // context await is still sent exactly as fork main sends it, unlabelled.
+      // context await is sent as fork main sends it, unlabelled, unless it was
+      // admitted under its wake grant (a registered wake finalizer and a saved
+      // reminder row): that dispatch is refused busy, the reservation settles
+      // interrupted, and the caller run reads the notice from the saved row.
       // Refusals (a stale admission epoch from a Stop or an edit/regenerate via
       // `resetPlanTasks`, or a run already active before the turn begins) drop
       // the wake whether or not a row exists (PF-7679). Before the claim, the

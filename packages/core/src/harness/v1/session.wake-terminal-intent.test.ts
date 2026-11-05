@@ -11,6 +11,9 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { Agent } from '../../agent';
+import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
+import { MockMemory } from '../../memory/mock';
 import type { HarnessTerminalFinalizer, HarnessTerminalIntent } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
@@ -74,6 +77,8 @@ function buildHarness(
   terminalHandoff: Record<string, unknown> = { finalizer: messageFinalizer, wakeFinalizer },
 ) {
   const parentAgent = new MockAgent({ id: 'parent-agent', defaultOutput: { text: 'woken reply' } });
+  // The wake grant is admitted only over a saved reminder row, so the parent has memory.
+  vi.spyOn(parentAgent, 'getMemory').mockResolvedValue(new MockMemory() as never);
   const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
   const storage = new InMemoryHarness({
     db,
@@ -331,5 +336,237 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
         wakeFinalizer: { ...wakeFinalizer, id: messageFinalizer.id },
       }),
     ).toThrow(/wakeFinalizer/);
+  });
+});
+
+// The wake grant binds the wake to a reserved run and refuses a dispatch that
+// does not start it. That refusal is safe only when the reminder row is saved:
+// a caller run that took the slot reads the notice from its thread history.
+// Without a row, the wake is sent as fork main sends it, so the notice reaches
+// the caller run's next model input. Real Agent, so the rows read provider input.
+describe('PF-7631 wake grant only over a saved reminder row (real Agent model input)', () => {
+  const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+  const NOTICE = 'settled with outcome';
+
+  function realParent(withMemory: boolean) {
+    const prompts: string[] = [];
+    const holds = new Map<number, Promise<void>>();
+    const model = new MockLanguageModelV2({
+      doStream: async options => {
+        const call = prompts.length;
+        prompts.push(JSON.stringify((options as { prompt: unknown }).prompt));
+        await holds.get(call);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: `id-${call}`, modelId: 'mock-model-id', timestamp: new Date(0) },
+            { type: 'text-start', id: 't' },
+            { type: 'text-delta', id: 't', delta: `reply ${call}` },
+            { type: 'text-end', id: 't' },
+            { type: 'finish', finishReason: 'stop', usage },
+          ]),
+        };
+      },
+    });
+    const memory = withMemory ? new MockMemory() : undefined;
+    const parentAgent = new Agent({
+      id: 'parent-agent',
+      name: 'parent-agent',
+      instructions: 'coordinate the work',
+      model,
+      ...(memory ? { memory } : {}),
+    });
+    const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
+    const db = new InMemoryDB();
+    const storage = new InMemoryHarness({
+      db,
+      terminalHandoff: { enabled: true },
+      sessionRecordProjection: { enabled: true },
+    });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage, terminalHandoff: { finalizer: messageFinalizer, wakeFinalizer } as never },
+      subagents: {
+        maxDepth: 2,
+        onDelegatedSettlement: 'wake',
+        types: {
+          worker: {
+            agentId: 'child-agent',
+            modeId: 'worker-mode',
+            description: 'Background worker subagent',
+            defaultModelId: 'openai/gpt-4o-mini',
+            workspace: 'inherit',
+          },
+        },
+      },
+    });
+    const releases: Array<() => void> = [];
+    const holdCall = (call: number) => {
+      let release!: () => void;
+      holds.set(call, new Promise<void>(r => (release = r)));
+      releases.push(() => release());
+      return () => release();
+    };
+    const releaseAll = () => {
+      for (const release of releases) release();
+    };
+    return { harness, db, memory, parentAgent, childAgent, prompts, holdCall, releaseAll };
+  }
+
+  function wakeEvidence(db: InMemoryDB) {
+    return [...db.harnessMessageResultEvidence.values()].filter(
+      row => typeof row.admissionId === 'string' && row.admissionId.startsWith('harness-wake:'),
+    );
+  }
+
+  type Row = {
+    /** The delegating parent agent has memory, so the reminder row is saved. */
+    memory: boolean;
+    /** A caller turn starts a run during the wake's context build and is on its provider call at dispatch. */
+    callerRun: boolean;
+  };
+
+  it.each([
+    ['no caller run: the reserved run starts and keeps the wake label', { memory: true, callerRun: false }],
+    [
+      'caller run active, parent with memory: busy refusal, the caller run reads the saved row',
+      { memory: true, callerRun: true },
+    ],
+    [
+      'caller run active, memory-less parent: delivered unlabelled into the caller run, as on fork main',
+      { memory: false, callerRun: true },
+    ],
+  ] as Array<[string, Row]>)('%s', async (_label, row) => {
+    const ctx = realParent(row.memory);
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const starts: Array<Record<string, unknown>> = [];
+      const ended: string[] = [];
+      parent.subscribe(event => {
+        if (event.type === 'agent_start') starts.push({ ...event });
+        if (event.type === 'agent_end') ended.push((event as { runId: string }).runId);
+      });
+
+      // R0 delegates the task and ends; the child is held.
+      let releaseChild!: () => void;
+      ctx.childAgent.enqueueRun({
+        holdUntil: new Promise<void>(r => (releaseChild = r)),
+        finishReason: 'tool-calls',
+        terminalToolResult: completedReport,
+      });
+      const releaseR0 = ctx.holdCall(0);
+      const r0 = parent.message({ content: 'go' });
+      void r0.catch(() => {});
+      await poll(() => ctx.prompts.length === 1);
+      const tools = createPlanTaskTools(parent);
+      const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'background work' } as any, toolCtx)) as any;
+      await tools[TASK_DELEGATE_TOOL_ID]!.execute!({ taskId: task.taskId, agentType: 'worker' } as any, toolCtx);
+      await poll(() => ctx.childAgent.streamCalls.length === 1);
+      releaseR0();
+      await r0;
+
+      // Seam: when the claimed wake builds its turn context, start the caller's
+      // turn and wait until its run R1 is on its (held) provider call.
+      const releaseR1 = row.callerRun ? ctx.holdCall(1) : () => {};
+      let wakeAdmitted = false;
+      let held = false;
+      let user: Promise<unknown> | undefined;
+      const inject = (parent as any)._injectSystemReminder.bind(parent);
+      vi.spyOn(parent as any, '_injectSystemReminder').mockImplementation((...args: unknown[]) => {
+        wakeAdmitted = true;
+        return inject(...args);
+      });
+      const build = (parent as any)._buildTurnContextAndInstructions.bind(parent);
+      vi.spyOn(parent as any, '_buildTurnContextAndInstructions').mockImplementation(async (...args: unknown[]) => {
+        if (row.callerRun && wakeAdmitted && !held) {
+          held = true;
+          user = parent.message({ content: 'what happened?' });
+          void user.catch(() => {});
+          await poll(() => ctx.prompts.length === 2);
+        }
+        return build(...args);
+      });
+      let r1Released = !row.callerRun;
+      const dispatches: Array<{ callerRunActive: boolean; reservedRun: boolean }> = [];
+      const dispatchedRunIds: string[] = [];
+      const sendSignal = ctx.parentAgent.sendSignal.bind(ctx.parentAgent);
+      vi.spyOn(ctx.parentAgent, 'sendSignal').mockImplementation(((signal: { type?: string }, opts: any) => {
+        if (signal?.type !== 'system-reminder') return sendSignal(signal as never, opts);
+        dispatches.push({
+          callerRunActive: row.callerRun && ctx.prompts.length === 2 && !r1Released,
+          reservedRun: typeof opts?.runId === 'string' && opts.runId.startsWith('harness-wake-'),
+        });
+        const result = sendSignal(signal as never, opts);
+        dispatchedRunIds.push((result as { runId: string }).runId);
+        return result;
+      }) as never);
+
+      releaseChild();
+      await poll(() => wakeAdmitted);
+      if (row.callerRun) await poll(() => user !== undefined);
+      // The wake has either dispatched or been refused.
+      await poll(() => (parent as any)._delegationNoticesInFlight.size === 0);
+      r1Released = true;
+      releaseR1();
+      await user?.catch(() => {});
+      await poll(() => dispatchedRunIds.every(id => ended.includes(id)));
+      await parent.waitForIdle({ timeoutMs: 3000 });
+      expect((await planRow(parent, task.taskId))?.status).toBe('completed');
+
+      const withNotice = ctx.prompts.filter(p => p.includes(NOTICE));
+      const labelled = starts.filter(s => s.origin === 'wake');
+      if (!row.callerRun) {
+        // The reserved run starts and is announced as this wake.
+        expect(dispatches).toEqual([{ callerRunActive: false, reservedRun: true }]);
+        expect(labelled).toHaveLength(1);
+        expect(labelled[0]!.runId).toMatch(/^harness-wake-/);
+        await poll(() => intents(ctx.db, wakeFinalizer.id).length === 1);
+        expect(intents(ctx.db, wakeFinalizer.id)[0]).toMatchObject({
+          signalId: labelled[0]!.wakeNoticeId,
+          runId: labelled[0]!.runId,
+        });
+        expect(withNotice.length).toBeGreaterThanOrEqual(1);
+      } else if (row.memory) {
+        // The grant refuses the dispatch that cannot start its reserved run.
+        expect(held).toBe(true);
+        expect(dispatches).toEqual([{ callerRunActive: true, reservedRun: true }]);
+        expect(labelled).toEqual([]);
+        expect(intents(ctx.db, wakeFinalizer.id)).toHaveLength(0);
+        // The notice is in the thread: the caller run's history read carries it.
+        const { messages } = await ctx.memory!.recall({
+          threadId: parent.threadId,
+          resourceId: 'u1',
+          hideSignals: false,
+        });
+        expect(JSON.stringify(messages)).toContain(NOTICE);
+        expect(ctx.prompts[1]).toContain('what happened?');
+        expect(ctx.prompts[1]).toContain(NOTICE);
+        // The reservation is settled, never left pending, and close succeeds.
+        await parent.close();
+        expect(wakeEvidence(ctx.db).length).toBeGreaterThan(0);
+        for (const evidence of wakeEvidence(ctx.db)) expect(evidence.status).not.toBe('pending');
+      } else {
+        // Fork main's call: no reserved run; the caller run's next model input
+        // carries the notice, unlabelled.
+        expect(held).toBe(true);
+        expect(dispatches).toEqual([{ callerRunActive: true, reservedRun: false }]);
+        expect(labelled).toEqual([]);
+        expect(intents(ctx.db, wakeFinalizer.id)).toHaveLength(0);
+        expect(wakeEvidence(ctx.db)).toHaveLength(0);
+        expect(withNotice).toHaveLength(1);
+        expect(withNotice[0]).toContain('what happened?');
+        expect(ctx.prompts.indexOf(withNotice[0]!)).toBeGreaterThan(1);
+      }
+    } finally {
+      ctx.releaseAll();
+      await ctx.harness.shutdown();
+    }
   });
 });

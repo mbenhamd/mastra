@@ -15,6 +15,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { MockMemory } from '../../memory/mock';
 import type { HarnessTerminalFinalizer, HarnessTerminalIntent } from '../../storage/domains/harness';
 import { HarnessTerminalHandoffError } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
@@ -77,6 +78,8 @@ const toolCtx = {
 
 function buildHarness(db: InMemoryDB) {
   const parentAgent = new MockAgent({ id: 'parent-agent', defaultOutput: { text: 'woken reply' } });
+  // The wake grant is admitted only over a saved reminder row, so the parent has memory.
+  vi.spyOn(parentAgent, 'getMemory').mockResolvedValue(new MockMemory() as never);
   const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
   const storage = new InMemoryHarness({
     db,
