@@ -14941,8 +14941,9 @@ export class Session {
    * wakes an idle thread), and `assertAdmitted` re-proves the sender's own
    * admission after subscription setup. PF-7626: `wakeNoticeId` marks an idle
    * wake as a settlement-notice wake, published on its `agent_start`;
-   * `noticePersisted` says a reminder row already carries the content, so a
-   * wake that lost its idle slot may be dropped instead of dispatched.
+   * `noticeMemoryModeId` names the mode whose agent memory holds a reminder row
+   * with the content, so a wake that lost its idle slot may stand down when
+   * that is the agent it dispatches through.
    */
   private async _injectSystemReminder(
     content: string,
@@ -14951,7 +14952,7 @@ export class Session {
       signalId?: string;
       admissionEpoch?: number;
       wakeNoticeId?: string;
-      noticePersisted?: boolean;
+      noticeMemoryModeId?: string;
       requireActiveRun?: boolean;
       assertAdmitted?: () => void;
     },
@@ -15045,16 +15046,17 @@ export class Session {
         this._assertOpenForTurn('injectSystemReminder()');
         // An idle-only wake re-proves its slot in the same tick as its dispatch.
         // A caller turn that began or started a run during the context await
-        // keeps the slot, and that run is never announced as this wake. With a
-        // persisted reminder row the wake stands down, because that turn loads
-        // the row; without one the content is still sent, unlabelled, so the
-        // runtime delivers it to the caller's run or starts a run with it.
+        // keeps the slot, and that run is never announced as this wake. When the
+        // active mode's agent has the memory that holds the reminder row, the
+        // wake stands down, because that turn loads the row; otherwise the
+        // content is still sent, unlabelled, so the runtime delivers it to the
+        // caller's run or starts a run with it. A Stop always refuses.
         if (idleOnlyEpoch !== undefined) {
           idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
-          if (
-            !this._activeWorkAdmissionIsCurrent(idleOnlyEpoch) ||
-            (idleSlotLost && internal?.noticePersisted === true)
-          ) {
+          const rowInDispatchMemory =
+            internal?.noticeMemoryModeId !== undefined &&
+            this._harness.getAgentForMode(internal.noticeMemoryModeId) === agent;
+          if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch) || (idleSlotLost && rowInDispatchMemory)) {
             throw new HarnessBusyError(this.id, 'in_flight');
           }
         }
@@ -24207,7 +24209,8 @@ export class Session {
       // does: no synthetic broadcast run occupies the thread, so a following
       // idle wake is not mistaken for an interleave, and nothing is handed to
       // an ungated follow-up run.
-      const memory = await this._resolveDelegationNoticeMemory(notice);
+      const noticeMemory = await this._resolveDelegationNoticeMemory(notice);
+      const memory = noticeMemory?.memory;
       // Shutdown may have begun while the notice was re-read and memory resolved.
       if (!live()) return;
       if (memory !== undefined && memory !== null) {
@@ -24254,14 +24257,15 @@ export class Session {
             signalId,
             admissionEpoch,
             wakeNoticeId: signalId,
-            noticePersisted: memory !== undefined && memory !== null,
+            ...(noticeMemory !== undefined ? { noticeMemoryModeId: noticeMemory.modeId } : {}),
           },
         );
       }
     } catch {
       // After the claim nothing is owed. A wake that lost its slot during the
-      // context await stands down only when a persisted row reaches the turn
-      // that took it; a memory-less one is still sent, unlabelled. Refusals
+      // context await stands down only when the active mode's agent has the
+      // memory that holds the row, so the turn that took the slot loads it;
+      // otherwise it is still sent, unlabelled. Refusals
       // before the turn begins (a Stop, or a run already active) drop the wake
       // whether or not a row exists (PF-7679). Before the claim, the notice
       // stays durable and the row is rewritten in place on retry, so copies
@@ -24280,13 +24284,14 @@ export class Session {
    * task: binding requires memory there for `remind`, and the parent's next
    * turn in that mode reads the row from its thread history. Memory resolves
    * with the parent's own request context, as its turns do, so a dynamic memory
-   * resolver selects the parent's store. Undefined only when neither mode has
-   * memory (a Stop-downgraded `wake` notice of a memory-less parent, or a
-   * delegating mode removed from the configuration since).
+   * resolver selects the parent's store. Returns the mode whose agent supplied
+   * the memory with it. Undefined only when neither mode has memory (a
+   * Stop-downgraded `wake` notice of a memory-less parent, or a delegating mode
+   * removed from the configuration since).
    */
   private async _resolveDelegationNoticeMemory(
     notice: PendingDelegationSettlementNotice,
-  ): Promise<MastraMemory | undefined> {
+  ): Promise<{ memory: MastraMemory; modeId: string } | undefined> {
     const activeModeId = this._currentRunModeId ?? this._record.modeId;
     const modeIds = [activeModeId];
     if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
@@ -24303,7 +24308,7 @@ export class Session {
           : {}),
       });
       const memory = await agent.getMemory({ requestContext });
-      if (memory !== undefined && memory !== null) return memory;
+      if (memory !== undefined && memory !== null) return { memory, modeId };
     }
     return undefined;
   }

@@ -11,3 +11,5 @@ session.subscribe(event => {
   }
 });
 ```
+
+Differs from fork main: if Stop lands while a claimed wake builds its context, the notice is not delivered (honours the Stop contract 'not stopped or cancelled since the settlement').
