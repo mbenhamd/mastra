@@ -1604,6 +1604,55 @@ describe('subagent control tool — stable offsets', () => {
     }
   }, 60_000);
 
+  it('wait until any with an offset waits for a new settlement, and still returns the children already settled', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void }> = [];
+    try {
+      for (let index = 0; index < 4; index += 1) {
+        children.push(await delegateHeldChild(parent, childAgent, `job ${index}`));
+      }
+      // Children 0 and 1 settle before the wait starts.
+      for (const child of children.slice(0, 2)) {
+        child.releaseChild();
+        await poll(
+          async () =>
+            (await run({ action: 'status', subagentSessionId: child.childId })).subagents?.[0]?.settled === true,
+          10_000,
+        );
+      }
+      const startedAt = Date.now();
+      const pending = run({ action: 'wait', until: 'any', offset: 0, timeoutMs: 10_000 });
+      await new Promise(resolve => setTimeout(resolve, 300));
+      children[2]!.releaseChild();
+      const output = await pending;
+      // The wait ended on child 2's settlement, not on the children already settled.
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300);
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output).sort()).toEqual(
+        children
+          .slice(0, 3)
+          .map(child => child.childId)
+          .sort(),
+      );
+      expect(runningIds(output)).toEqual([children[3]!.childId]);
+      for (const view of output.settledSubagents as any[]) expect(view.result.text).toMatch(/^job \d: done$/);
+
+      // With nothing new settling, it blocks until the timeout.
+      const blockedAt = Date.now();
+      const blocked = await run({ action: 'wait', until: 'any', offset: 0, timeoutMs: 400 });
+      expect(Date.now() - blockedAt).toBeGreaterThanOrEqual(400);
+      expect(blocked.timedOut).toBe(true);
+      expect(runningIds(blocked)).toEqual([children[3]!.childId]);
+    } finally {
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 30_000);
+
   it('wait until any woken by a child far past the first page returns that child, within 64 KiB', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

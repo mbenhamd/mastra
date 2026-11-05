@@ -161,7 +161,8 @@ const inputSchema = z
         'status and wait without ids only: the position to start from in the list of all your subagents, ' +
           'running and settled, ordered by start time and then id. A subagent keeps its position when it ' +
           'settles. A wait with an offset returns the settled subagents from that position on and waits for ' +
-          'the running ones. When an output leaves subagents out, resultsHint gives the next offset. A ' +
+          'the running ones; only one of those running ones ends an until "any" wait. When an output leaves ' +
+          'subagents out, resultsHint gives the next offset. A ' +
           'subagent started between calls with the same or an earlier start time, or a spawn_subagent ' +
           'subagent whose spawn_subagent call has returned (it leaves the list), can shift later positions.',
       ),
@@ -938,7 +939,13 @@ export function createSubagentControlTool(parent: Session) {
       lastRunning = running;
       lastCurrent = current;
       const aborted = signal?.aborted === true;
-      const satisfied = running.length === 0 || (until === 'any' && lastSettled.length > 0);
+      // A wait with an offset also returns the children already settled on its
+      // page; only a child that was running when the wait began can end it.
+      const woke =
+        childIds === undefined
+          ? lastSettled.filter(view => runningAtStart?.has(view.subagentSessionId) === true)
+          : lastSettled;
+      const satisfied = running.length === 0 || (until === 'any' && woke.length > 0);
       const timedOut = !satisfied && !aborted && Date.now() >= deadline;
       if (satisfied || timedOut || aborted) {
         return output({ timedOut, ...(aborted && !satisfied ? { aborted: true as const } : {}) });
@@ -1084,7 +1091,8 @@ export function createSubagentControlTool(parent: Session) {
       `\`status\` lists at most ${SUBAGENT_CONTROL_STATUS_LIMIT} subagents per call, and \`resultsHint\` ` +
       'gives the offset of the next ones. `offset` is a place in the list of all your subagents, running and ' +
       'settled, ordered by start time and then id; a subagent keeps its place when it settles, and `wait` with ' +
-      'an offset also returns the settled subagents from that place on. A subagent started between calls with ' +
+      'an offset also returns the settled subagents from that place on (only a subagent that settles during ' +
+      'the call ends an `until: "any"` wait). A subagent started between calls with ' +
       'the same or an earlier start time, or a spawn_subagent subagent whose spawn_subagent call has returned ' +
       '(it leaves the list), can shift later places. A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
