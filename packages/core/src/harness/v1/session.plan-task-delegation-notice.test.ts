@@ -926,6 +926,8 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
       await user!.end();
       await deliveryFinished(parent, taskId);
 
+      // The interleave happened: the user's run started during the wake's context build.
+      expect(held).toBe(true);
       // The content is sent exactly as on fork main; no agent_start carries the wake identity.
       expect(starts.filter(s => 'origin' in s || 'wakeNoticeId' in s)).toEqual([]);
       expect(reminderCalls(parentAgent)).toHaveLength(1);
@@ -1087,13 +1089,19 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         },
       },
     });
+    const releases: Array<() => void> = [];
     /** Hold the provider call with this index until the returned release runs. */
     const holdCall = (call: number) => {
       let release!: () => void;
       holds.set(call, new Promise<void>(r => (release = r)));
+      releases.push(() => release());
       return () => release();
     };
-    return { harness, agents: [parentAgent, quietAgent], childAgent, prompts, holdCall };
+    /** Release every held provider call, so a failed assertion cannot park shutdown. */
+    const releaseAll = () => {
+      for (const release of releases) release();
+    };
+    return { harness, agents: [parentAgent, quietAgent], childAgent, prompts, holdCall, releaseAll };
   }
 
   function noticeCount(prompt: string): number {
@@ -1231,6 +1239,10 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       expect(held).toBe(true);
       expect(stopIssuedDuringBuild).toBe(row.stop);
       expect(ctx.prompts[1]).toContain('what happened?');
+      // R1 ran the agent of the mode the caller turn used: only the quiet agent's
+      // prompt carries its instructions.
+      if (row.callerQuietMode || row.switchToQuietMode) expect(ctx.prompts[1]).toContain('answer briefly');
+      else expect(ctx.prompts[1]).not.toContain('answer briefly');
       const withNotice = ctx.prompts.filter(p => p.includes(NOTICE));
       if (row.expected === 'nowhere') {
         expect(withNotice).toHaveLength(0);
@@ -1256,6 +1268,7 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       expect(starts.filter(s => 'origin' in s || 'wakeNoticeId' in s)).toEqual([]);
       expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
     } finally {
+      ctx.releaseAll();
       await ctx.harness.shutdown();
     }
   });

@@ -12,4 +12,4 @@ session.subscribe(event => {
 });
 ```
 
-Differs from fork main: if Stop lands while a claimed wake builds its context, the wake does not run (honours the Stop contract 'not stopped or cancelled since the settlement'). Without memory the notice is then not delivered; with memory, the persisted notice stays in thread history for the next turn.
+Differs from fork main: if Stop (`abortActiveWork`) or an edit/regenerate (`resetPlanTasks`) lands while a claimed wake builds its context, the wake does not run (honours the Stop contract 'not stopped or cancelled since the settlement'). Without memory the notice is then not delivered; when the active mode's agent has memory, the persisted notice stays in thread history for its next turn.

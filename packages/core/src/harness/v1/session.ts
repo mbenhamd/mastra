@@ -15041,8 +15041,10 @@ export class Session {
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
-        // An idle-only wake re-checks in the same tick as its dispatch. A Stop
-        // during the context await refuses it (the Stop contract: not stopped or
+        // An idle-only wake re-checks in the same tick as its dispatch. It
+        // refuses only a stale admission epoch: a Stop (`abortActiveWork`) or an
+        // edit/regenerate (`resetPlanTasks`, which cancels the owned child
+        // sessions) during the context await (the Stop contract: not stopped or
         // cancelled since the settlement). If a caller turn began or started a
         // run during the await, it keeps the slot: the content is sent exactly
         // as fork main sends it; only the wake label is dropped, so that run is
@@ -24251,7 +24253,8 @@ export class Session {
     } catch {
       // After the claim nothing is owed. A wake that lost its slot during the
       // context await is still sent exactly as fork main sends it, unlabelled.
-      // Refusals (a Stop, or a run already active before the turn begins) drop
+      // Refusals (a stale admission epoch from a Stop or an edit/regenerate via
+      // `resetPlanTasks`, or a run already active before the turn begins) drop
       // the wake whether or not a row exists (PF-7679). Before the claim, the
       // notice stays durable and the row is rewritten in place on retry, so
       // copies cannot accumulate.

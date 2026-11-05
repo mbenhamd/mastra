@@ -211,9 +211,10 @@ export interface AgentStartEvent extends HarnessEventBase {
   origin?: 'wake';
   /**
    * Present exactly when `origin` is `'wake'`: the opaque, stable id of the
-   * settlement notice this run delivers. It is also the id of the persisted
-   * `system-reminder` message on the thread, and it stays the same when the
-   * notice is redelivered after a restart. Treat it as opaque.
+   * settlement notice this run delivers. When the parent's memory persisted
+   * the notice, it is also the id of that `system-reminder` message on the
+   * thread; a parent without memory persists no message. It stays the same
+   * when the notice is redelivered after a restart. Treat it as opaque.
    */
   wakeNoticeId?: string;
   /** Run-start overrides committed for this turn, when any were applied. */
