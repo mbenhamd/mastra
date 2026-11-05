@@ -1891,6 +1891,47 @@ export async function planTaskAcknowledgeDelegationSettlementNotice(
   return true;
 }
 
+/**
+ * Re-owe a notice that this caller acknowledged (claimed) but could not deliver,
+ * with a version-fenced write. The notice is written back with the same digest,
+ * so the dedupe key is unchanged, and only while the task still carries exactly
+ * that settlement: same delegated session, no newer delegation, no notice owed,
+ * and a settlement whose recomputed digest is `digest`. Returns true only when
+ * the notice is owed again.
+ */
+export async function planTaskRestoreDelegationSettlementNotice(
+  port: PlanTaskSessionPort,
+  input: { taskId: string; subagentSessionId: string; digest: string; mode: DelegatedSettlementNoticeMode },
+): Promise<boolean> {
+  const snapshot = await port.storage.loadPlanTaskSubtree({
+    harnessName: port.harnessName,
+    sessionId: port.id,
+    rootTaskId: input.taskId,
+    limit: 1,
+  });
+  const task = snapshot.tasks.find(row => row.taskId === input.taskId);
+  if (task === undefined || task.delegatedSubagentSessionId !== undefined) return false;
+  const attempt = readDelegationAttemptMetadata(task, input.subagentSessionId);
+  if (attempt === undefined) return false;
+  const envelope = JSON.parse(JSON.stringify(task.metadata)) as Record<string, Record<string, Record<string, unknown>>>;
+  const settlement = envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement;
+  if (settlement === undefined || settlement === null || typeof settlement !== 'object') return false;
+  if (settlement.notice !== undefined) return false;
+  // The digest covers the settlement as committed, before its notice was added.
+  const digest = sha256CanonicalJsonChecked({
+    attemptId: attempt.attemptId,
+    subagentSessionId: attempt.subagentSessionId,
+    settlement: settlement as JsonValue,
+  });
+  if (digest !== input.digest) return false;
+  settlement.notice = { mode: input.mode, digest: input.digest };
+  await port.storage.mutatePlanTasksForSession({
+    fence: fence(port),
+    ops: [{ kind: 'update', taskId: task.taskId, ifVersion: task.version, patch: { metadata: envelope as JsonValue } }],
+  });
+  return true;
+}
+
 export interface CheckInput {
   rootTaskId?: string;
   depth?: number;
