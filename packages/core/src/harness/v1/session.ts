@@ -68,6 +68,7 @@ import {
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
+import type { MastraMemory } from '../../memory/memory';
 import type { TracingContext } from '../../observability';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -2039,6 +2040,8 @@ export class Session {
   private readonly _delegationDriverClaims = new Set<string>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
+  /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
+  private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -22069,7 +22072,9 @@ export class Session {
    * run publications, run-summary persistence, the `_flushChain` (record
    * writes and draft checkpoints), the in-flight draft checkpoint, the
    * event-persistence tail, the lease-renewal chain, orphaned-dispatch
-   * recovery, plan-task summary seeding and delegation reconcile. Failures
+   * recovery, plan-task summary seeding, delegation reconcile and delegated
+   * settlement-notice deliveries (whose reminder write goes through the agent's
+   * memory, outside the tracked Harness storage handle). Failures
    * stay with their owners; this only observes settlement, and loops until
    * nothing new was registered while it waited.
    */
@@ -22080,6 +22085,7 @@ export class Session {
       ...this._signalResultSettlements.values(),
       ...this._terminalCommitsByRunId.values(),
       ...this._recoveredRunPublications.values(),
+      ...this._delegationNoticeDeliveries,
       this._runSummaryPersistence,
       this._flushChain,
       this._eventPersistenceTail,
@@ -22877,7 +22883,19 @@ export class Session {
   _restoreLiveAfterFailedClose(): void {
     if (this._state === 'closing' && this._record.closingAt === undefined && this._record.closedAt === undefined) {
       this._state = 'live';
+      // A settlement-notice delivery that bailed out when close began left its
+      // notice owed for the next owner; this process owns the session again.
+      this._scheduleDelegationReconcileRetry(0);
     }
+  }
+
+  /**
+   * @internal — used by the Harness when a shutdown rolls back before its drain:
+   * a settlement-notice delivery that bailed out while shutdown was pending left
+   * its notice owed. A no-op unless the session is live.
+   */
+  _internalRearmDelegationReconcile(): void {
+    this._scheduleDelegationReconcileRetry(0);
   }
 
   /**
@@ -23538,6 +23556,7 @@ export class Session {
           expectedScopeFingerprint: scopeSnapshot.fingerprint,
           ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
           ...(parentRunId !== undefined ? { parentRunId } : {}),
+          parentModeId: this._currentRunModeId ?? this._record.modeId,
           ...(delegatedRequestContext !== undefined ? { requestContextApp: delegatedRequestContext.app } : {}),
         }),
       );
@@ -24049,7 +24068,7 @@ export class Session {
       );
       if (reconcileResult.reconciled) this._notifyDisplayRefresh();
       if (reconcileResult.notice !== undefined) {
-        void this._deliverDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
+        this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
       return reconcileResult.reconciled;
     } catch {
@@ -24101,17 +24120,35 @@ export class Session {
    *    Otherwise it acknowledges without waking. A crash between claim and wake
    *    loses at most that wake; the persisted reminder still reaches the next turn.
    *
-   * A cancelled parent drops the notice. A closed or torn-down parent leaves it
-   * owed for restart reconcile. A failure re-arms reconciliation with the
+   * A cancelled parent drops the notice. A closed or torn-down parent, or one
+   * whose Harness is shutting down, leaves it owed for restart reconcile; a
+   * running delivery is awaited by the shutdown barrier (PF-7595). A failure re-arms reconciliation with the
    * caller's backoff attempt.
    */
+  private _startDelegationSettlementNotice(
+    notice: PendingDelegationSettlementNotice,
+    admissionEpoch: number,
+    retryAttempt: number,
+  ): void {
+    // Tracked so shutdown's bounded settle awaits a reminder write in flight.
+    const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch, retryAttempt);
+    this._delegationNoticeDeliveries.add(delivery);
+    const untrack = () => {
+      this._delegationNoticeDeliveries.delete(delivery);
+    };
+    void delivery.then(untrack, untrack);
+  }
+
   private async _deliverDelegationSettlementNotice(
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
     retryAttempt: number,
   ): Promise<void> {
     const key = `${notice.subagentSessionId}:${notice.digest}`;
-    if (this._state !== 'live' || this.isClosing || this._delegationNoticesInFlight.has(key)) return;
+    // A shutting-down Harness starts no new delivery work; the notice stays
+    // owed for the next owner's reconcile.
+    const live = () => this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown();
+    if (!live() || this._delegationNoticesInFlight.has(key)) return;
     this._delegationNoticesInFlight.add(key);
     const firstEpoch = this._delegationNoticeEpochs.get(key);
     if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
@@ -24127,7 +24164,6 @@ export class Session {
         if (acknowledged) this._delegationNoticeEpochs.delete(key);
         return acknowledged;
       });
-    const live = () => this._state === 'live' && !this.isClosing;
     let claimed = false;
     try {
       if (!(await this._delegationNoticeIsOwed(notice))) {
@@ -24142,23 +24178,13 @@ export class Session {
       const content = delegationSettlementNoticeText(notice);
       const attributes = { type: 'delegated-task-settled' };
       const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-      // The active turn may run a per-turn mode override on another agent.
-      const agent = this._harness.getAgentForMode(this._currentRunModeId ?? this._record.modeId);
       // Write the reminder row directly, as the runtime's `persist` behaviour
       // does: no synthetic broadcast run occupies the thread, so a following
       // idle wake is not mistaken for an interleave, and nothing is handed to
       // an ungated follow-up run.
-      // Resolve memory with the parent's own context, as its turns do, so a
-      // dynamic memory resolver selects the parent's store.
-      const requestContext = await this._buildRequestContext({
-        modeId: this._currentRunModeId ?? this._record.modeId,
-        modelId: this._record.modelId,
-        abortSignal: new AbortController().signal,
-        ...(this._currentTurnRequestContext !== undefined
-          ? { persistedRequestContext: this._currentTurnRequestContext }
-          : {}),
-      });
-      const memory = await agent.getMemory({ requestContext });
+      const memory = await this._resolveDelegationNoticeMemory(notice);
+      // Shutdown may have begun while the notice was re-read and memory resolved.
+      if (!live()) return;
       if (memory !== undefined && memory !== null) {
         await memory.saveMessages({
           messages: [
@@ -24206,6 +24232,42 @@ export class Session {
     } finally {
       this._delegationNoticesInFlight.delete(key);
     }
+  }
+
+  /**
+   * Memory that receives a settlement reminder row. The active mode's agent
+   * memory comes first (a per-turn override may run another agent). When that
+   * agent has none (the parent switched to a memory-less mode that cannot
+   * delegate), the reminder goes to the memory of the mode that delegated the
+   * task: binding requires memory there for `remind`, and the parent's next
+   * turn in that mode reads the row from its thread history. Memory resolves
+   * with the parent's own request context, as its turns do, so a dynamic memory
+   * resolver selects the parent's store. Undefined only when neither mode has
+   * memory (a Stop-downgraded `wake` notice of a memory-less parent, or a
+   * delegating mode removed from the configuration since).
+   */
+  private async _resolveDelegationNoticeMemory(
+    notice: PendingDelegationSettlementNotice,
+  ): Promise<MastraMemory | undefined> {
+    const activeModeId = this._currentRunModeId ?? this._record.modeId;
+    const modeIds = [activeModeId];
+    if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
+      if (this._harness._hasMode(notice.parentModeId)) modeIds.push(notice.parentModeId);
+    }
+    for (const modeId of modeIds) {
+      const agent = this._harness.getAgentForMode(modeId);
+      const requestContext = await this._buildRequestContext({
+        modeId,
+        modelId: this._record.modelId,
+        abortSignal: new AbortController().signal,
+        ...(this._currentTurnRequestContext !== undefined
+          ? { persistedRequestContext: this._currentTurnRequestContext }
+          : {}),
+      });
+      const memory = await agent.getMemory({ requestContext });
+      if (memory !== undefined && memory !== null) return memory;
+    }
+    return undefined;
   }
 
   /** Exact re-read: the notice with this digest is still owed on its task. */
@@ -24565,7 +24627,7 @@ export class Session {
     }
 
     for (const owedNotice of owedNotices) {
-      void this._deliverDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
+      this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
     }
 
     let needsRetry = false;

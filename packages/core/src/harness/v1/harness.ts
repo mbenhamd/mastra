@@ -1826,6 +1826,21 @@ export class Harness {
           `references unknown agent "${mode.agentId}" — Mastra has no such agent registered`,
         );
       }
+      // `remind` persists the notice into the parent's memory thread for its
+      // next turn to read. A mode that can delegate (`task_delegate` ships with
+      // the Harness built-ins whenever a subagent type is registered) on a
+      // memory-less agent could never deliver it.
+      if (
+        this._subagentDelegatedSettlementNotice === 'remind' &&
+        this._subagentTypes.size > 0 &&
+        mode.harnessBuiltins !== 'exclude' &&
+        !agent.hasOwnMemory()
+      ) {
+        throw new HarnessConfigError(
+          'subagents.onDelegatedSettlement',
+          `'remind' persists the notice to the parent's memory, but mode "${mode.id}" can delegate and its agent "${mode.agentId}" has no memory; configure memory on that agent, set harnessBuiltins: 'exclude' on the mode, or use 'wake' or 'none'`,
+        );
+      }
     }
     for (const [agentType, def] of this._subagentTypes) {
       let agent: Agent | undefined;
@@ -2119,6 +2134,16 @@ export class Harness {
   /** @internal — how a parent session is told that a detached delegation settled. */
   _getSubagentDelegatedSettlementNotice(): 'remind' | 'wake' | 'none' {
     return this._subagentDelegatedSettlementNotice;
+  }
+
+  /** @internal — true from the start of `shutdown()` until it completes or rolls back. */
+  _internalIsShuttingDown(): boolean {
+    return this._shutdown;
+  }
+
+  /** @internal — whether `modeId` is a configured mode. */
+  _hasMode(modeId: string): boolean {
+    return this._modesById.has(modeId);
   }
 
   /** @internal — Session reads the resolved mode for per-turn overlays. */
@@ -7778,6 +7803,9 @@ export class Harness {
     if (this._liveSessions.size > 0) this._ensureLeaseRenewalLoop();
     this._ensureChannelInboxRecoveryLoop();
     this._ensurePendingInteractionExpirySweepLoop();
+    // A settlement-notice delivery that ran while shutdown was pending bailed
+    // out and left its notice owed; re-arm reconciliation on every live session.
+    for (const session of this._liveSessions.values()) session._internalRearmDelegationReconcile();
     throw new HarnessStorageError({ operation: 'session_save', cause: error });
   }
 
