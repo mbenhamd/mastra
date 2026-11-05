@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
+import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
@@ -1201,12 +1202,33 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
    */
   function realParent(
     withMemory: boolean,
-    shared?: { db: InMemoryDB; memory?: MockMemory; dynamicMemory?: boolean; memoryFactory?: () => MockMemory },
+    shared?: {
+      db: InMemoryDB;
+      memory?: MockMemory;
+      dynamicMemory?: boolean;
+      memoryFactory?: () => MockMemory;
+      /** The reply text of provider call `call` (default `reply <call>`). */
+      reply?: (call: number) => string;
+    },
     grant = false,
   ) {
     const prompts: string[] = [];
     const holds = new Map<number, Promise<void>>();
     const model = new MockLanguageModelV2({
+      // The structured sync `message()` path (`agent.generate`) calls this.
+      doGenerate: async options => {
+        const call = prompts.length;
+        prompts.push(JSON.stringify((options as { prompt: unknown }).prompt));
+        await holds.get(call);
+        const text = shared?.reply?.(call) ?? `reply ${call}`;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop' as const,
+          usage,
+          warnings: [],
+          content: [{ type: 'text' as const, text }],
+        };
+      },
       doStream: async options => {
         const call = prompts.length;
         prompts.push(JSON.stringify((options as { prompt: unknown }).prompt));
@@ -1218,7 +1240,7 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
             { type: 'stream-start', warnings: [] },
             { type: 'response-metadata', id: `id-${call}`, modelId: 'mock-model-id', timestamp: new Date(0) },
             { type: 'text-start', id: 't' },
-            { type: 'text-delta', id: 't', delta: `reply ${call}` },
+            { type: 'text-delta', id: 't', delta: shared?.reply?.(call) ?? `reply ${call}` },
             { type: 'text-end', id: 't' },
             { type: 'finish', finishReason: 'stop', usage },
           ]),
@@ -1904,6 +1926,86 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     }
   });
 
+  // Option A covers any in-process run on the parent thread, not only Harness
+  // turns. The direct stream waits on the thread reservation R0 holds, so it
+  // is started before R0 ends and awaited after.
+  it('a direct in-process agent.stream on the parent thread loads the row; no wake follows', async () => {
+    const ctx = realParent(true, { db: new InMemoryDB() });
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const starts = watchStarts(parent);
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      releaseChild();
+      await waitingForQuiescence(parent, taskId);
+      const [parentAgent] = ctx.agents;
+      const direct = parentAgent!
+        .stream('a direct question', { memory: { thread: parent.threadId, resource: 'u1' } })
+        .then(output => output.consumeStream());
+      void direct.catch(() => {});
+      // The direct stream is parked on R0's thread reservation, not on a provider call.
+      await new Promise(r => setTimeout(r, 100));
+      expect(ctx.prompts).toHaveLength(1);
+      await endR0();
+      await direct;
+      await deliveryFinished(parent, taskId);
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(ctx.prompts).toHaveLength(2);
+      expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+      expect(total(ctx.prompts)).toBe(1);
+      expect(starts.filter(s => s.origin === 'wake')).toEqual([]);
+      expect(outcomes.mock.calls.map(call => call[0])).toEqual(['history']);
+    } finally {
+      ctx.releaseAll();
+      await ctx.harness.shutdown();
+    }
+  });
+
+  // E.4 (P2-3): the structured `message({ sync: true, output })` path runs
+  // `agent.generate`; its run loads the row like any other. The delivery is
+  // parked before its quiescence check so the structured turn runs first.
+  it('a structured sync message on the parent loads the row; no wake follows', async () => {
+    const ctx = realParent(true, {
+      db: new InMemoryDB(),
+      reply: call => (call === 1 ? '{"answer":"42"}' : `reply ${call}`),
+    });
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const starts = watchStarts(parent);
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      let release!: () => void;
+      const gate = new Promise<void>(r => (release = r));
+      let parked = false;
+      const quiescence = (parent as any)._awaitDelegationNoticeQuiescence.bind(parent);
+      vi.spyOn(parent as any, '_awaitDelegationNoticeQuiescence').mockImplementation(async (...args: unknown[]) => {
+        if (!parked) {
+          parked = true;
+          await gate;
+        }
+        return quiescence(...args);
+      });
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      releaseChild();
+      await poll(() => parked);
+      await endR0();
+      const out = await parent.message({ content: 'compute', output: z.object({ answer: z.string() }), sync: true });
+      release();
+      await deliveryFinished(parent, taskId);
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(out).toEqual({ answer: '42' });
+      expect(ctx.prompts).toHaveLength(2);
+      expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+      expect(total(ctx.prompts)).toBe(1);
+      expect(starts.filter(s => s.origin === 'wake')).toEqual([]);
+      expect(outcomes.mock.calls.map(call => call[0])).toEqual(['history']);
+    } finally {
+      ctx.releaseAll();
+      await ctx.harness.shutdown();
+    }
+  });
+
   it('a history that excludes the row (lastMessages: 0) is not a delivery; the wake follows once', async () => {
     const ctx = realParent(true, { db: new InMemoryDB(), memory: new MockMemory({ options: { lastMessages: 0 } }) });
     try {
@@ -2220,6 +2322,88 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       } finally {
         held.release();
         a.releaseAll();
+        await a.harness.shutdown().catch(() => {});
+      }
+    });
+
+    // Design B, await point I3 (grant admission), with a registered wake
+    // finalizer: [interleaving, notices delivered, first outcome]. A Stop leaves
+    // no wake and the row reaches the next turn once; an abort, a close (the
+    // reopened session) and a lost lease (the next holder) deliver once.
+    it.each([
+      ['stop', 0, 'left_owed'],
+      ['abort', 1, 'left_owed'],
+      ['close', 1, 'left_owed'],
+      ['lease', 1, 'left_owed'],
+    ] as const)('await point I3 grant admission: %s', async (interleaving, notices, firstOutcome) => {
+      const db = new InMemoryDB();
+      const memory = new MockMemory();
+      const a = realParent(true, { db, memory }, true);
+      const b = realParent(true, { db, memory }, true);
+      let release = () => {};
+      try {
+        const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+        const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+        const { taskId, releaseChild, endR0 } = await delegateFromR0(a, parent);
+        await endR0();
+        const gate = new Promise<void>(r => (release = r));
+        let reach!: () => void;
+        const reached = new Promise<void>(r => (reach = r));
+        let armed = true;
+        const admit = a.storage.admitTerminalHandoff.bind(a.storage);
+        vi.spyOn(a.storage, 'admitTerminalHandoff').mockImplementation(async (input: any) => {
+          if (armed && JSON.stringify(input).includes('"harness-wake:')) {
+            armed = false;
+            reach();
+            await gate;
+          }
+          return admit(input);
+        });
+        releaseChild();
+        await reached;
+
+        let holder: Session = parent;
+        if (interleaving === 'stop') {
+          const stop = parent.abortActiveWork({ reason: 'user_requested' });
+          void stop.catch(() => {});
+          await new Promise(r => setTimeout(r, 20));
+          release();
+          await stop.catch(() => {});
+        } else if (interleaving === 'abort') {
+          parent.abort();
+          await new Promise(r => setTimeout(r, 20));
+          release();
+        } else if (interleaving === 'close') {
+          const closing = parent.close();
+          void closing.catch(() => {});
+          await new Promise(r => setTimeout(r, 20));
+          release();
+          await closing.catch(() => {});
+          holder = await a.harness.session({ sessionId: parent.id, resourceId: 'u1' });
+        } else {
+          crashParent(db, parent);
+          const record = (parent as any)._record;
+          (parent as any)._record = { ...record, leaseExpiresAt: Date.now() - 1 };
+          release();
+          await poll(() => (parent as any)._delegationNoticesInFlight.size === 0, 3000);
+          holder = await b.harness.session({ sessionId: parent.id, resourceId: 'u1' });
+        }
+        if (holder !== parent) await (holder as any)._reconcileDelegationsOnHydrate(0);
+        await deliveryFinished(holder, taskId);
+        await new Promise(r => setTimeout(r, 100));
+
+        expect(total(a.prompts, b.prompts)).toBe(notices);
+        expect(outcomes.mock.calls[0]?.[0]).toBe(firstOutcome);
+        expect(owedNotice(await planRow(holder, taskId))).toBeUndefined();
+        if (interleaving === 'stop') {
+          await holder.message({ content: 'next' });
+          expect(total(a.prompts, b.prompts)).toBe(1);
+        }
+      } finally {
+        release();
+        a.releaseAll();
+        b.releaseAll();
+        await b.harness.shutdown().catch(() => {});
         await a.harness.shutdown().catch(() => {});
       }
     });

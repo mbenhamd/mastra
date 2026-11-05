@@ -2162,29 +2162,6 @@ export class Harness {
     return this._shutdown;
   }
 
-  /**
-   * PF-7679: settlement-notice claims (`claimId`) this Harness instance holds
-   * and has not resolved yet. A stored claim with this instance's `ownerId`
-   * whose id is absent here belongs to an earlier tenure, a replaced session
-   * object, or a delivery that gave it up, so it may be taken over.
-   */
-  private readonly _liveNoticeClaims = new Set<string>();
-
-  /** @internal — record a notice claim as live, before its write is queued. */
-  _internalHoldNoticeClaim(claimId: string): void {
-    this._liveNoticeClaims.add(claimId);
-  }
-
-  /** @internal — the claim is resolved (cleared, delivered, refused, or given up). */
-  _internalReleaseNoticeClaim(claimId: string): void {
-    this._liveNoticeClaims.delete(claimId);
-  }
-
-  /** @internal — whether a stored notice claim may be taken over by this Harness. */
-  _internalNoticeClaimTakeoverEligible(claim: { claimId: string; ownerId: string }): boolean {
-    return claim.ownerId !== this.ownerId || !this._liveNoticeClaims.has(claim.claimId);
-  }
-
   /** @internal — whether `modeId` is a configured mode. */
   _hasMode(modeId: string): boolean {
     return this._modesById.has(modeId);

@@ -876,6 +876,34 @@ interface NoticeDelivery {
   epoch: number;
 }
 
+/**
+ * PF-7679: settlement-notice claims (`claimId`) each Harness instance holds and
+ * has not resolved yet. A stored claim with that instance's `ownerId` whose id
+ * is absent here belongs to an earlier tenure, a replaced session object, or a
+ * delivery that gave it up, so it may be taken over.
+ */
+const liveNoticeClaims = new WeakMap<Harness, Set<string>>();
+
+/** Record a notice claim as live in `harness`, before its write is queued. */
+function holdNoticeClaim(harness: Harness, claimId: string): void {
+  let held = liveNoticeClaims.get(harness);
+  if (held === undefined) {
+    held = new Set();
+    liveNoticeClaims.set(harness, held);
+  }
+  held.add(claimId);
+}
+
+/** The claim is resolved (cleared, delivered, refused, or given up). */
+function releaseNoticeClaim(harness: Harness, claimId: string): void {
+  liveNoticeClaims.get(harness)?.delete(claimId);
+}
+
+/** Whether a stored notice claim may be taken over by `harness`. */
+function noticeClaimTakeoverEligible(harness: Harness, claim: { claimId: string; ownerId: string }): boolean {
+  return claim.ownerId !== harness.ownerId || liveNoticeClaims.get(harness)?.has(claim.claimId) !== true;
+}
+
 // §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
 // itself is idempotency state, so only a recent window is needed, and a stored
 // result must never carry provider payloads large enough to push the session
@@ -25052,7 +25080,7 @@ export class Session {
     else admissionEpoch = firstEpoch;
     const delivery: NoticeDelivery = { key, notice, epoch: admissionEpoch };
     const ids = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-    const takeover = (claim: DelegationNoticeClaim) => this._harness._internalNoticeClaimTakeoverEligible(claim);
+    const takeover = (claim: DelegationNoticeClaim) => noticeClaimTakeoverEligible(this._harness, claim);
     // The claim this delivery holds (its write may have landed), until resolved.
     let claimId: string | undefined;
     let watch: HistoryLoadWatch | undefined;
@@ -25112,7 +25140,7 @@ export class Session {
         return 'dead';
       } finally {
         claimId = undefined;
-        this._harness._internalReleaseNoticeClaim(id);
+        releaseNoticeClaim(this._harness, id);
       }
     };
     // The wake ran (or a run loaded the row, or a fence ended it): acknowledge
@@ -25130,7 +25158,7 @@ export class Session {
         return 'left_owed';
       } finally {
         claimId = undefined;
-        this._harness._internalReleaseNoticeClaim(id);
+        releaseNoticeClaim(this._harness, id);
       }
     };
     try {
@@ -25194,7 +25222,7 @@ export class Session {
         // Live before its write is queued, so a racing reconcile never takes
         // this claim over.
         const id = randomUUID();
-        this._harness._internalHoldNoticeClaim(id);
+        holdNoticeClaim(this._harness, id);
         // The wake turn races the claim write against an abort; the outcome
         // below waits for the write itself, so it knows whether it claimed.
         let claimWrite: Promise<NoticeClaimResult> | undefined;
@@ -25211,7 +25239,7 @@ export class Session {
                 claimWrite = claim(id).then(
                   result => {
                     if (result === 'claimed') claimId = id;
-                    else this._harness._internalReleaseNoticeClaim(id);
+                    else releaseNoticeClaim(this._harness, id);
                     return result;
                   },
                   (error: unknown) => {
@@ -25240,7 +25268,7 @@ export class Session {
           return finishClaimed('wake');
         } catch (err) {
           let claimResult: NoticeClaimResult | 'failed' | undefined;
-          if (claimWrite === undefined) this._harness._internalReleaseNoticeClaim(id);
+          if (claimWrite === undefined) releaseNoticeClaim(this._harness, id);
           else claimResult = await claimWrite.catch(() => 'failed' as const);
           if (claimId === undefined) {
             if (claimResult === 'claim_lost') return 'superseded';
@@ -25365,7 +25393,7 @@ export class Session {
    * it is not live in this Harness).
    */
   private _delegationNoticeClaimable(notice: PendingDelegationSettlementNotice): boolean {
-    return notice.claim === undefined || this._harness._internalNoticeClaimTakeoverEligible(notice.claim);
+    return notice.claim === undefined || noticeClaimTakeoverEligible(this._harness, notice.claim);
   }
 
   /** Exact re-read: the notice with this digest is still owed on its task, and claimable. */
