@@ -23,6 +23,7 @@ import type { ActiveSubagentState, Session } from './session';
 import { SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import {
   createSubagentControlTool,
+  SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT,
   SUBAGENT_CONTROL_TOOL_ID,
   SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
 } from './subagent-control-tool';
@@ -710,11 +711,26 @@ type ResultPageRow = {
   shortened: boolean;
   /** The call names one child whose full result is larger than the page budget. */
   overBudgetSingle?: boolean;
+  /** The full output is within the shortening notice's size of the budget. */
+  nearBudget?: boolean;
 };
+
+/** Two results of this size fill a two-child wait output to within the shortening notice's size of 64 KiB. */
+const NEAR_BUDGET_SUMMARY_BYTES = 32_080;
 
 const many = <T>(count: number, make: (index: number) => T): T[] => Array.from({ length: count }, (_, i) => make(i));
 
 const resultPageRows: ResultPageRow[] = [
+  {
+    name: 'wait naming two children whose full results just fit returns both in full, with no notice',
+    summaries: [largeSummary('child-0', NEAR_BUDGET_SUMMARY_BYTES), largeSummary('child-1', NEAR_BUDGET_SUMMARY_BYTES)],
+    settledBefore: [0, 1],
+    settledDuring: [],
+    call: ids => ({ action: 'wait', subagentSessionIds: ids, timeoutMs: 1_000 }),
+    expected: { 0: 'full', 1: 'full' },
+    shortened: false,
+    nearBudget: true,
+  },
   {
     name: 'status listing: a child settled before the call gets a preview',
     summaries: [largeSummary('child-0', 20_000)],
@@ -840,61 +856,69 @@ describe('subagent control tool — bounded result page', () => {
       const closeTurn = await openParentTurn(parent, parentAgent);
       const run = control(parent);
       const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
-      for (const [index, summary] of row.summaries.entries()) {
-        const child = await delegateHeldChild(parent, childAgent, row.taskContent ?? `job ${index}`, summary);
-        children.push({ ...child, summary });
-      }
-      const settled = async (index: number) =>
-        (await run({ action: 'status', subagentSessionId: children[index]!.childId })).subagents?.[0]?.settled === true;
-      for (const index of row.settledBefore) {
-        children[index]!.releaseChild();
-        await poll(() => settled(index));
-      }
-      for (const index of row.traced ?? []) addStoredToolTrace(db, children[index]!.childId);
-
-      const pending = run(row.call(children.map(child => child.childId)));
-      for (const index of row.settledDuring) children[index]!.releaseChild();
-      const output = await pending;
-
-      expect(output.isError).toBeUndefined();
-      if (!row.overBudgetSingle) expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
-      const views: any[] = output.subagents ?? output.settledSubagents;
-      for (const [index, expected] of Object.entries(row.expected)) {
-        const child = children[Number(index)]!;
-        const view = views.find(candidate => candidate.subagentSessionId === child.childId);
-        expect(view, `child ${index}`).toBeDefined();
-        if (expected === 'full') {
-          expect(view.result.text).toBe(child.summary);
-          expect(view.result.textTruncated).toBe(false);
-          expect(view.resultPreview).toBeUndefined();
-          if (row.traced?.includes(Number(index))) {
-            expect(view.result.toolTrace).toEqual([{ toolName: 'searchPapers', calls: 2, errors: 0 }]);
-          }
-        } else if (expected === 'preview') {
-          expect(view.resultPreview).toBe(true);
-          expect(view.result.textTruncated).toBe(true);
-          expect(child.summary.startsWith(view.result.text.split('\n')[0])).toBe(true);
-          // A preview never splits a character: a lone surrogate makes encodeURIComponent throw.
-          expect(() => encodeURIComponent(view.result.text)).not.toThrow();
-          expect(new TextEncoder().encode(view.result.text).byteLength).toBeLessThan(5 * 1024);
-        } else {
-          expect(view.result).toBeUndefined();
-          expect(view.resultOmitted).toBe(true);
+      try {
+        for (const [index, summary] of row.summaries.entries()) {
+          const child = await delegateHeldChild(parent, childAgent, row.taskContent ?? `job ${index}`, summary);
+          children.push({ ...child, summary });
         }
-      }
-      // The case is real only if the full result alone is over the page budget.
-      if (row.overBudgetSingle) expect(utf8Length(output)).toBeGreaterThan(64 * 1024);
-      if (row.shortened) {
-        expect(output.resultsShortened).toBe(true);
-        expect(output.resultsHint).toMatch(/action "status"/);
-      } else {
-        expect(output.resultsShortened).toBeUndefined();
-        expect(output.resultsHint).toBeUndefined();
-      }
+        const settled = async (index: number) =>
+          (await run({ action: 'status', subagentSessionId: children[index]!.childId })).subagents?.[0]?.settled ===
+          true;
+        for (const index of row.settledBefore) {
+          children[index]!.releaseChild();
+          await poll(() => settled(index));
+        }
+        for (const index of row.traced ?? []) addStoredToolTrace(db, children[index]!.childId);
 
-      for (const child of children) child.releaseChild();
-      closeTurn();
-      await harness.shutdown();
+        const pending = run(row.call(children.map(child => child.childId)));
+        for (const index of row.settledDuring) children[index]!.releaseChild();
+        const output = await pending;
+
+        expect(output.isError).toBeUndefined();
+        if (!row.overBudgetSingle) expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+        const views: any[] = output.subagents ?? output.settledSubagents;
+        for (const [index, expected] of Object.entries(row.expected)) {
+          const child = children[Number(index)]!;
+          const view = views.find(candidate => candidate.subagentSessionId === child.childId);
+          expect(view, `child ${index}`).toBeDefined();
+          if (expected === 'full') {
+            expect(view.result.text).toBe(child.summary);
+            expect(view.result.textTruncated).toBe(false);
+            expect(view.resultPreview).toBeUndefined();
+            if (row.traced?.includes(Number(index))) {
+              expect(view.result.toolTrace).toEqual([{ toolName: 'searchPapers', calls: 2, errors: 0 }]);
+            }
+          } else if (expected === 'preview') {
+            expect(view.resultPreview).toBe(true);
+            expect(view.result.textTruncated).toBe(true);
+            expect(child.summary.startsWith(view.result.text.split('\n')[0])).toBe(true);
+            // A preview never splits a character: a lone surrogate makes encodeURIComponent throw.
+            expect(() => encodeURIComponent(view.result.text)).not.toThrow();
+            expect(new TextEncoder().encode(view.result.text).byteLength).toBeLessThan(5 * 1024);
+          } else {
+            expect(view.result).toBeUndefined();
+            expect(view.resultOmitted).toBe(true);
+          }
+        }
+        // The case is real only if the full result alone is over the page budget.
+        if (row.overBudgetSingle) expect(utf8Length(output)).toBeGreaterThan(64 * 1024);
+        // The case is real only if the shortening notice would not also fit.
+        if (row.nearBudget) {
+          const notice = { resultsShortened: true, resultsHint: SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT };
+          expect(utf8Length({ ...output, ...notice }), `output ${utf8Length(output)} B`).toBeGreaterThan(64 * 1024);
+        }
+        if (row.shortened) {
+          expect(output.resultsShortened).toBe(true);
+          expect(output.resultsHint).toMatch(/action "status"/);
+        } else {
+          expect(output.resultsShortened).toBeUndefined();
+          expect(output.resultsHint).toBeUndefined();
+        }
+      } finally {
+        for (const child of children) child.releaseChild();
+        closeTurn();
+        await harness.shutdown();
+      }
     },
     30_000,
   );
