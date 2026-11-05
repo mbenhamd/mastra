@@ -7,7 +7,8 @@
  *     `delegatedSubagentSessionId` link, drives the plan task `in_progress`, and
  *     does NOT block the parent turn;
  *   - the delegated subagent COMPLETING rolls the plan task up `completed` and
- *     cascades to ancestors; FAILING (cancel) rolls it up `failed`;
+ *     cascades to ancestors; FAILING rolls it up `failed`, and the parent's own
+ *     cancel rolls it up `cancelled`;
  *   - RECOVERY: a fresh Harness rehydrating a parent whose delegated subagent
  *     already terminalized rolls the plan task up; one still-live re-attaches the
  *     completion hook so a later terminalization still rolls up.
@@ -47,6 +48,7 @@ import {
 } from './plan-task-tool';
 import { MAX_INHERITED_REQUEST_CONTEXT_APP_BYTES } from './request-context-input';
 import { Session } from './session';
+import { createSubagentControlTool } from './subagent-control-tool';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
@@ -1467,6 +1469,85 @@ describe('task_delegate — rollup from subagent outcome', () => {
       await harness.shutdown();
     });
   }
+
+  // PF-7706: how each delegated settlement reaches the plan. The delegated task
+  // sits under a root next to an already-completed sibling, and a top-level
+  // task depends on it. `cancelled` is skipped work, so only the parent's own
+  // cancel leaves the root completed; a dependency still needs `completed`.
+  it.each([
+    {
+      shape: 'child completed',
+      settle: 'complete',
+      task: 'completed',
+      root: 'completed',
+      dependent: 'pending',
+    },
+    {
+      shape: 'parent cancels via the subagent tool',
+      settle: 'parent_cancel',
+      task: 'cancelled',
+      root: 'completed',
+      dependent: 'blocked',
+    },
+    {
+      shape: 'delegation deadline passes',
+      settle: 'timeout',
+      task: 'failed',
+      root: 'failed',
+      dependent: 'blocked',
+    },
+    {
+      shape: 'child reports failure',
+      settle: 'child_error',
+      task: 'failed',
+      root: 'failed',
+      dependent: 'blocked',
+    },
+  ] as const)('$shape: task $task, root $root, dependent $dependent', async ({ settle, task, root, dependent }) => {
+    const { harness, parentAgent, childAgent } = buildHarness(
+      new InMemoryDB(),
+      settle === 'timeout' ? { delegationTimeoutMs: 80 } : {},
+    );
+    let releaseChild!: () => void;
+    childAgent.enqueueRun({
+      holdUntil: settle === 'timeout' ? new Promise<void>(() => {}) : new Promise<void>(r => (releaseChild = r)),
+      finishReason: 'stop',
+      terminalToolResult: outcomeTerminalResult(settle === 'child_error' ? 'failed' : 'completed'),
+    });
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+    const add = async (input: Record<string, unknown>) =>
+      ((await tools[TASK_ADD_TOOL_ID]!.execute!(input as any, toolCtx)) as any).taskId as string;
+    const rootId = await add({ content: 'survey' });
+    const doneId = await add({ content: 'scope the survey', parentTaskId: rootId });
+    await tools[TASK_COMPLETE_TOOL_ID]!.execute!({ taskId: doneId } as any, toolCtx);
+    const delegatedId = await add({ content: 'screen the corpus', parentTaskId: rootId });
+    const dependentId = await add({ content: 'write the synthesis', blockedBy: [delegatedId] });
+    const delegated = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: delegatedId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    await poll(() => childAgent.streamCalls.length > 0);
+
+    if (settle === 'parent_cancel') {
+      const cancelled = await createSubagentControlTool(parent)!.execute!(
+        { action: 'cancel', subagentSessionId: delegated.subagentSessionId } as any,
+        toolCtx,
+      );
+      expect(cancelled).toMatchObject({ cancel: 'acknowledged' });
+    }
+    if (settle !== 'timeout') releaseChild();
+
+    await poll(async () => (await planRow(parent, delegatedId))?.delegatedSubagentSessionId === undefined, 3_000);
+    expect((await planRow(parent, delegatedId))?.status).toBe(task);
+    expect((await planRow(parent, rootId))?.status).toBe(root);
+    expect((await planRow(parent, dependentId))?.status).toBe(dependent);
+    const checked = (await tools[TASK_CHECK_TOOL_ID]!.execute!({ rootTaskId: delegatedId } as any, toolCtx)) as any;
+    expect(checked.tasks[0].delegation.status).toBe(task);
+    close();
+    await harness.shutdown();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2258,7 +2339,7 @@ describe('task_delegate — recovery on rehydrate', () => {
     const run = await interruptWithFailedPublication(db);
     try {
       await run.parentB._internalCancelOwnedSubagent(run.childId, 'subagent_cancelled');
-      await poll(async () => (await planRow(run.parentB, run.taskId))?.status === 'failed', 5_000);
+      await poll(async () => (await planRow(run.parentB, run.taskId))?.status === 'cancelled', 5_000);
 
       await expect(run.storage.loadRunSummary({ harnessName: 'default', runId: run.runId })).resolves.toMatchObject({
         runId: run.runId,
@@ -2954,7 +3035,7 @@ describe('subagent child — direct hydrate restores the persisted scope (M4 fai
 });
 
 describe('cancelSubagent (§SA1)', () => {
-  it('cancels an in-flight delegated child and rolls its plan task up to failed', async () => {
+  it('cancels an in-flight delegated child and rolls its plan task up to cancelled', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     // Hold the child mid-run so it is genuinely in-flight when we cancel it.
@@ -2975,8 +3056,8 @@ describe('cancelSubagent (§SA1)', () => {
     releaseChild();
     close();
 
-    // The delegation driver maps the child's cancelRequest → a FAILED plan task.
-    await poll(async () => (await planRow(parent, task.taskId))?.status === 'failed');
+    // The delegation driver maps the parent's own cancel → a CANCELLED plan task.
+    await poll(async () => (await planRow(parent, task.taskId))?.status === 'cancelled');
     await harness.shutdown();
   });
 

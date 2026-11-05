@@ -69,7 +69,7 @@ const planTaskViewShape = {
       attemptId: z.string(),
       parentToolCallId: z.string(),
       parentRunId: z.string().optional(),
-      status: z.enum(['running', 'completed', 'blocked', 'failed']),
+      status: z.enum(['running', 'completed', 'blocked', 'cancelled', 'failed']),
       startedAt: z.number(),
       deadlineAt: z.number(),
       result: harnessSubagentResultSummarySchema.optional(),

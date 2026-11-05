@@ -1170,10 +1170,13 @@ export async function planTaskReset(port: PlanTaskSessionPort): Promise<ResetPla
  *
  *   - `'completed'` → the plan task becomes `completed` (rollup cascades),
  *   - `'blocked'`   → the plan task becomes `blocked` (external service/input/dependency),
+ *   - `'cancelled'` → the plan task becomes `cancelled` (the parent itself
+ *     cancelled this child; rollup treats it as skipped),
  *   - `'failed'`    → the plan task becomes `failed` (covers subagent error,
- *     abort/cancel, and a fail-closed "subagent session gone/deleted").
+ *     timeout, any other abort/cancel, and a fail-closed "subagent session
+ *     gone/deleted").
  */
-export type DelegatedSubagentOutcome = 'completed' | 'blocked' | 'failed';
+export type DelegatedSubagentOutcome = 'completed' | 'blocked' | 'cancelled' | 'failed';
 
 export interface DelegateTaskInput {
   /** Existing plan task to delegate. */
@@ -1415,6 +1418,7 @@ export function readDelegationAttemptMetadata(
     if (
       (raw.settlement.outcome !== 'completed' &&
         raw.settlement.outcome !== 'blocked' &&
+        raw.settlement.outcome !== 'cancelled' &&
         raw.settlement.outcome !== 'failed') ||
       typeof raw.settlement.settledAt !== 'number' ||
       !Number.isFinite(raw.settlement.settledAt)

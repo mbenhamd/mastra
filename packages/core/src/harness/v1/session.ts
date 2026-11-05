@@ -271,7 +271,11 @@ import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagen
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
 import { createHarnessSubagentBudgetMeter, harnessSubagentBudgetExhaustedError } from './subagent-budget';
 import type { HarnessSubagentBudgetExhaustion, HarnessSubagentBudgetMeter } from './subagent-budget';
-import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-control-tool';
+import {
+  createSubagentControlTool,
+  SUBAGENT_CONTROL_CANCEL_REASON,
+  SUBAGENT_CONTROL_TOOL_ID,
+} from './subagent-control-tool';
 import { createSubagentOutcomeReportTool } from './subagent-outcome-tool';
 import { endDelegatedSubagentSpan, startDelegatedSubagentSpan } from './subagent-tracing';
 import type { DelegationDriveSettlement } from './subagent-tracing';
@@ -6469,7 +6473,7 @@ export class Session {
    * cascade as a full `cancel()` does for all children — so an inline
    * `spawn_subagent` child aborts its turn (the spawn tool's `finally` then closes
    * it), and a detached `task_delegate` child aborts + the delegation driver rolls
-   * its plan task up to `failed` (its `cancelRequest` is also honored by
+   * its plan task up to `cancelled` (its `cancelRequest` is also honored by
    * reconcile-on-rehydrate). Same-process only: a child owned by another live
    * instance is not reachable here.
    */
@@ -6524,7 +6528,7 @@ export class Session {
     const { unavailable } = await this._cancelOwnedSubagentSessions([subagentSessionId], reason, assertAdmitted);
     if (unavailable.includes(subagentSessionId)) return 'unavailable';
     // A cold delegated child has no live driver in this process; reconciliation
-    // maps its committed cancelRequest to a failed plan task. A live driver's
+    // maps its committed cancelRequest to a cancelled plan task. A live driver's
     // delegation is skipped by the reconcile pass, so this is safe either way.
     this._scheduleDelegationReconcileRetry(0);
     // The child committed its cancel, but a descendant below it could not be
@@ -23948,7 +23952,12 @@ export class Session {
         // produced report; a terminal tool normally ends the provider step as
         // `tool-calls`, so requiring `stop` would reject every real first-call
         // terminal delivery.
-        outcome = child._record.cancelRequest === undefined && report !== undefined ? report.outcome : 'failed';
+        outcome =
+          child._record.cancelRequest === undefined && report !== undefined
+            ? report.outcome
+            : isParentRequestedSubagentCancel(child._record.cancelRequest, this.id)
+              ? 'cancelled'
+              : 'failed';
         // The framework stopped the child at its per-type budget before it
         // reported an outcome: a typed partial result, not a generic failure.
         budgetExhausted =
@@ -23982,7 +23991,8 @@ export class Session {
       }
     } catch (error) {
       // Rejected signal/result, cancellation, expiry, or crash-orphan recovery.
-      outcome = 'failed';
+      // Only this parent's own cancel of the child settles as skipped work.
+      outcome = isParentRequestedSubagentCancel(child._record.cancelRequest, this.id) ? 'cancelled' : 'failed';
       publicError = projectHarnessPublicError(error);
     } finally {
       child._subagentAnswerDeltaListener = undefined;
@@ -24065,20 +24075,30 @@ export class Session {
     try {
       const durableResult =
         result ??
-        (outcome !== 'completed'
-          ? {
-              ...summarizeHarnessSubagentEventResult(
-                summarizeHarnessSubagentResult(undefined, {
-                  isError: true,
-                  error: {
-                    code: outcome === 'blocked' ? 'harness.delegation_blocked' : 'harness.delegation_failed',
-                    message: `The delegated task ${outcome} without usable terminal result evidence`,
-                  },
-                }),
-              ),
-              outcome,
-            }
-          : undefined);
+        (outcome === 'cancelled'
+          ? summarizeHarnessSubagentEventResult(
+              summarizeHarnessSubagentResult(undefined, {
+                isError: true,
+                error: {
+                  code: 'harness.subagent_cancelled',
+                  message: 'The delegated subagent was cancelled before it completed',
+                },
+              }),
+            )
+          : outcome !== 'completed'
+            ? {
+                ...summarizeHarnessSubagentEventResult(
+                  summarizeHarnessSubagentResult(undefined, {
+                    isError: true,
+                    error: {
+                      code: outcome === 'blocked' ? 'harness.delegation_blocked' : 'harness.delegation_failed',
+                      message: `The delegated task ${outcome} without usable terminal result evidence`,
+                    },
+                  }),
+                ),
+                outcome,
+              }
+            : undefined);
       const reconcileResult = await this._serializePlanTaskWrite(() =>
         planTaskReconcileDelegation(this._planTaskPort(), {
           taskId,
@@ -24684,14 +24704,15 @@ export class Session {
         continue;
       }
       const delegationAttempt = readDelegationAttemptMetadata(task, childId);
-      // A CANCELLED subagent is a FAILED delegation regardless of how the run
+      // A CANCELLED subagent never settles from its run, regardless of how the
       // finishReason landed — mirrors the live driver's `cancelRequest` override
-      // (a run can race to `complete` after a cancel, but the delegation was
-      // cancelled, so the plan task fails). Checked before the evidence so a
-      // `completed` evidence row from that race cannot mask the cancel. Preserve
-      // the framework-owned timeout reason across the crash window between the
-      // durable cancellation CAS and task reconciliation; otherwise recovery
-      // degrades a precise timeout into the generic delegation-failed result.
+      // (a run can race to `complete` after a cancel). This parent's own cancel
+      // settles the task `cancelled`; any other cancel fails it. Checked before
+      // the evidence so a `completed` evidence row from that race cannot mask
+      // the cancel. Preserve the framework-owned timeout reason across the crash
+      // window between the durable cancellation CAS and task reconciliation;
+      // otherwise recovery degrades a precise timeout into the generic
+      // delegation-failed result.
       if (childRecord.cancelRequest !== undefined) {
         if (!(await this._closeDelegatedChildForSettlement(childRecord, task.taskId))) {
           needsRetry = true;
@@ -24700,7 +24721,7 @@ export class Session {
         await this._reconcileDelegatedTask(
           task.taskId,
           childId,
-          'failed',
+          isParentRequestedSubagentCancel(childRecord.cancelRequest, this.id) ? 'cancelled' : 'failed',
           childRecord.cancelRequest.reason === 'delegation_timeout' && delegationAttempt !== undefined
             ? summarizeDelegationDeadline(delegationAttempt.deadlineAt)
             : undefined,
@@ -25320,4 +25341,17 @@ function createDeferred<T>(): Deferred<T> {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+/**
+ * True when `parentSessionId` itself asked to stop exactly this child: the
+ * `subagent` tool's cancel or `cancelSubagent`. A delegation timeout, the
+ * parent's own Stop cascading to its children, and a cancel from anyone else
+ * are not, so those settle the delegated task `failed`.
+ */
+function isParentRequestedSubagentCancel(
+  cancelRequest: SessionRecord['cancelRequest'],
+  parentSessionId: string,
+): boolean {
+  return cancelRequest?.requestedBy === parentSessionId && cancelRequest.reason === SUBAGENT_CONTROL_CANCEL_REASON;
 }
