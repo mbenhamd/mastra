@@ -68,6 +68,7 @@ import {
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
 import { ModelRouterLanguageModel } from '../../llm/model/router';
+import type { MastraMemory } from '../../memory/memory';
 import type { TracingContext } from '../../observability';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -534,9 +535,17 @@ type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepare
  * model that stays silent twice is allowed to finish (never loop). The loop
  * ignores continuation results for terminal tool delivery, and error, abort,
  * safety, and output-length finishes are left alone.
+ *
+ * A delegated child settles only through its terminal outcome report, so a
+ * response-only step cannot rescue it (PF-7507). When `subagentOutcomeReportToolId`
+ * is set, the one nudge instead asks for that report in one ordinary step whose
+ * active tools are exactly the report tool: the loop rejects any other call, and
+ * the run stops after that step. At the ordinary step ceiling no ordinary step
+ * is left, so the response-only recovery above applies unchanged.
  */
 function createHarnessEmptySynthesisOptions(
   reportConfiguredHookError: HarnessExecutionHookErrorReporter,
+  subagentOutcomeReportToolId?: string,
   subagentBudget?: HarnessSubagentBudgetMeter,
 ): {
   [AGENT_EXECUTION_OPTION_COMPOSERS]: () => AgentExecutionOptionComposers;
@@ -549,6 +558,9 @@ function createHarnessEmptySynthesisOptions(
       let responseOnlyReservedAtIteration: number | undefined;
       let responseOnlyPrepared = false;
       let ordinaryBudgetExhausted = false;
+      // Child report-only step (PF-7507): armed instead of `responseOnly`.
+      let reportOnly = false;
+      let reportOnlyReservedAtIteration: number | undefined;
       // Identity of this run segment for the subagent budget meter: a resume
       // builds new options, so its restarted iteration numbers are new steps,
       // while a replayed predicate in this segment is not counted twice.
@@ -558,6 +570,18 @@ function createHarnessEmptySynthesisOptions(
         onIterationComplete: existing => {
           const configured = existing as HarnessIterationCompleteHandler | undefined;
           const ordinary = async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
+            if (reportOnly) {
+              // A replayed predicate for the reserving iteration keeps the
+              // continuation without injecting the feedback a second time; the
+              // report step itself is the last one.
+              if (context.iteration === reportOnlyReservedAtIteration) return { continue: true };
+              try {
+                await configured?.(context);
+              } catch (error) {
+                reportConfiguredHookError('onIterationComplete', error);
+              }
+              return { continue: false };
+            }
             // The recovery phase gets one provider response, even if that
             // response tries to call a tool that prepareStep hid. Configured
             // observers still see this iteration, but cannot reopen it.
@@ -621,6 +645,22 @@ function createHarnessEmptySynthesisOptions(
             if (configuredResult?.continue === false) return configuredResult;
 
             nudged = true;
+            if (subagentOutcomeReportToolId !== undefined && !ordinaryBudgetExhausted) {
+              const reportFeedback =
+                'You finished your tool work without reporting the outcome. Call ' +
+                `${subagentOutcomeReportToolId} now, exactly once, with the outcome, a short summary, and evidence ` +
+                'from the tool results above. Do not claim an action ran unless its result confirms that. ' +
+                'No other tool is available.';
+              reportOnly = true;
+              reportOnlyReservedAtIteration = context.iteration;
+              return {
+                ...(configuredResult ?? {}),
+                continue: true,
+                feedback: configuredResult?.feedback
+                  ? `${configuredResult.feedback}\n\n${reportFeedback}`
+                  : reportFeedback,
+              };
+            }
             responseOnly = true;
             responseOnlyReservedAtIteration = context.iteration;
             const recoveryFeedback =
@@ -641,8 +681,13 @@ function createHarnessEmptySynthesisOptions(
           };
           if (subagentBudget === undefined) return ordinary;
           // The single predicate for Harness-reserved recovery steps; any new
-          // reserved step kind is added here.
-          const inRecoveryStep = () => responseOnly;
+          // reserved step kind is added here. `ordinary` arms the child
+          // report-only step (PF-7507) on any silent final step, including one
+          // at the budget. There the reopen marks the child exhausted and the
+          // step returns `continue: false`; the `exhausted` check below runs
+          // before `inRecoveryStep()`, so no later or replayed iteration can
+          // admit the armed report step past the budget.
+          const inRecoveryStep = () => responseOnly || reportOnly;
           return async (context: Parameters<HarnessIterationCompleteHandler>[0]) => {
             // A budget stop is terminal: no later or replayed iteration, and no
             // response-only recovery armed on the stopping step, reopens it.
@@ -706,6 +751,32 @@ function createHarnessEmptySynthesisOptions(
             }
             if (responseOnly && responseOnlyPrepared) {
               throw new HarnessResponseRecoveryAlreadyPreparedError();
+            }
+            if (reportOnly && subagentOutcomeReportToolId !== undefined) {
+              let configuredReportResult: Awaited<ReturnType<HarnessPrepareStep>>;
+              try {
+                configuredReportResult = await configured?.(args);
+              } catch (error) {
+                // The selection below replaces the configured one, so an
+                // optional observer failure must not strand the child's report.
+                reportConfiguredHookError('prepareStep', error);
+                configuredReportResult = undefined;
+              }
+              // The step keeps the session's own tool map, which always carries
+              // the report: a configured `tools` replacement could drop it.
+              // Narrowing the advertised tools costs the provider prompt cache
+              // (PF-5349), but only the report can settle a delegated child.
+              const {
+                tools: _configuredTools,
+                activeTools: _configuredActiveTools,
+                toolChoice: _configuredToolChoice,
+                ...configuredStepSettings
+              } = (configuredReportResult ?? {}) as Record<string, unknown>;
+              return {
+                ...configuredStepSettings,
+                activeTools: [subagentOutcomeReportToolId],
+                toolChoice: 'auto',
+              };
             }
             if (responseOnly) responseOnlyPrepared = true;
 
@@ -2062,6 +2133,8 @@ export class Session {
   private readonly _delegationDriverClaims = new Set<string>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
+  /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
+  private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -2503,13 +2576,18 @@ export class Session {
   }
 
   private _createEmptySynthesisOptions() {
-    return createHarnessEmptySynthesisOptions((hook, error) => {
-      try {
-        this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
-      } catch {
-        // Diagnostics must never suppress the caller-visible recovery.
-      }
-    }, this._subagentBudgetMeter());
+    return createHarnessEmptySynthesisOptions(
+      (hook, error) => {
+        try {
+          this._harness.mastra.getLogger().error(`Error in ${hook} hook:`, error);
+        } catch {
+          // Diagnostics must never suppress the caller-visible recovery.
+        }
+      },
+      // Matches `_buildToolSurface`: every subagent-tool child carries the report.
+      this._record.origin === 'subagent-tool' ? HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID : undefined,
+      this._subagentBudgetMeter(),
+    );
   }
 
   /**
@@ -6060,6 +6138,35 @@ export class Session {
     if (this._record.pendingResume !== undefined && this._record.cancelRequest === undefined) return true;
     if (this._subagentExecutionsInFlight > 0) return true;
     return false;
+  }
+
+  /**
+   * True while the session owns turn-scoped work: an in-flight turn, an
+   * active queue drain, a queued item drained into a turn, items waiting in
+   * the pending queue, a pending `respondTo*` resume that has not been
+   * cancelled, or an `abortActiveWork()` / `resetPlanTasks()` that is still
+   * cancelling children. The last one matters because Stop aborts the turn
+   * again once its children are cancelled, which would also abort a turn
+   * admitted in between. So during that window it can be true while
+   * `isBusy()` is already false.
+   *
+   * It ignores in-flight subagent executions, which `isBusy()` counts. A
+   * detached `task_delegate` child keeps running after the parent turn ends,
+   * so `isBusy()` stays true until that child settles while `isTurnActive()`
+   * goes false once the turn does. An inline `spawn_subagent` runs inside a
+   * parent turn, so it still reads true through that turn. Hosts deciding
+   * whether to admit a new user turn should read this; shutdown and
+   * `waitForIdle()` keep using `isBusy()`. `skills.use()` and a synchronous
+   * structured `message({ output, sync: true })` still refuse while
+   * `isBusy()`.
+   */
+  isTurnActive(): boolean {
+    if (this._currentTurnAbortController !== undefined) return true;
+    if (this._activeWorkInvalidationsInFlight > 0) return true;
+    if (this._draining) return true;
+    if (this._currentQueuedItemId !== undefined) return true;
+    if ((this._record.pendingQueue?.length ?? 0) > 0) return true;
+    return this._record.pendingResume !== undefined && this._record.cancelRequest === undefined;
   }
 
   /** Classify why the session is busy for `HarnessBusyError` (§4.5a). */
@@ -15227,7 +15334,9 @@ export class Session {
    * PF-7473: `requireActiveRun` is the opposite, interleave-only mode (it never
    * wakes an idle thread), and `assertAdmitted` re-proves the sender's own
    * admission after subscription setup. PF-7626: `wakeNoticeId` marks an idle
-   * wake as a settlement-notice wake, published on its `agent_start`.
+   * wake as a settlement-notice wake, published on its `agent_start` only
+   * while the wake still holds its idle slot at dispatch, or when the dispatch
+   * started the run its wake grant reserved.
    * PF-7631: with `wakeSettlement` and a registered wake finalizer, the wake
    * turn is admitted under its Harness-minted grant and commits a terminal
    * intent (`_admitWakeTerminalTurn`).
@@ -15325,6 +15434,7 @@ export class Session {
         }
       };
       let dispatched;
+      let idleSlotLost = false;
       try {
         const toolSurface = this._buildToolSurface(mode, undefined);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
@@ -15368,6 +15478,22 @@ export class Session {
           wakeTerminal = await Promise.race([wakeAdmission, activeTurnWaiter.promise]);
           assertOwnedReminderTurnNotDeleted();
         }
+        // An idle-only wake re-checks in the same tick as its dispatch. It
+        // refuses only a stale admission epoch: a Stop (`abortActiveWork`) or an
+        // edit/regenerate (`resetPlanTasks`, which cancels the owned child
+        // sessions) during the context await (the Stop contract: not stopped or
+        // cancelled since the settlement). If a caller turn began or started a
+        // run during the await, it keeps the slot: the content is sent exactly
+        // as fork main sends it; only the wake label is dropped, so that run is
+        // never announced as this wake. PF-7631: a wake admitted under its grant
+        // is instead bound to the reserved run below; it never folds into a
+        // caller's run, and a dispatch that does not start that run is refused.
+        if (idleOnlyEpoch !== undefined) {
+          if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
+            throw new HarnessBusyError(this.id, 'in_flight');
+          }
+          idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
+        }
 
         dispatched = agent.sendSignal(
           {
@@ -15402,7 +15528,13 @@ export class Session {
 
       // §10.2 agent_start carries the runId — emit it now the run is dispatched.
       // dispatched.signal.id is the originating signalId — stamped for the run projection.
-      this._emitAgentStart(dispatched.runId, dispatched.signal.id, internal?.wakeNoticeId);
+      // A run started under the wake grant is verified as the wake's own run
+      // above (action 'wake' on the reserved runId), so it keeps the label.
+      this._emitAgentStart(
+        dispatched.runId,
+        dispatched.signal.id,
+        idleSlotLost && wakeTerminal === undefined ? undefined : internal?.wakeNoticeId,
+      );
 
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
@@ -22478,7 +22610,9 @@ export class Session {
    * run publications, run-summary persistence, the `_flushChain` (record
    * writes and draft checkpoints), the in-flight draft checkpoint, the
    * event-persistence tail, the lease-renewal chain, orphaned-dispatch
-   * recovery, plan-task summary seeding and delegation reconcile. Failures
+   * recovery, plan-task summary seeding, delegation reconcile and delegated
+   * settlement-notice deliveries (whose reminder write goes through the agent's
+   * memory, outside the tracked Harness storage handle). Failures
    * stay with their owners; this only observes settlement, and loops until
    * nothing new was registered while it waited.
    */
@@ -22489,6 +22623,7 @@ export class Session {
       ...this._signalResultSettlements.values(),
       ...this._terminalCommitsByRunId.values(),
       ...this._recoveredRunPublications.values(),
+      ...this._delegationNoticeDeliveries,
       this._runSummaryPersistence,
       this._flushChain,
       this._eventPersistenceTail,
@@ -23286,7 +23421,19 @@ export class Session {
   _restoreLiveAfterFailedClose(): void {
     if (this._state === 'closing' && this._record.closingAt === undefined && this._record.closedAt === undefined) {
       this._state = 'live';
+      // A settlement-notice delivery that bailed out when close began left its
+      // notice owed for the next owner; this process owns the session again.
+      this._scheduleDelegationReconcileRetry(0);
     }
+  }
+
+  /**
+   * @internal — used by the Harness when a shutdown rolls back before its drain:
+   * a settlement-notice delivery that bailed out while shutdown was pending left
+   * its notice owed. A no-op unless the session is live.
+   */
+  _internalRearmDelegationReconcile(): void {
+    this._scheduleDelegationReconcileRetry(0);
   }
 
   /**
@@ -23947,6 +24094,7 @@ export class Session {
           expectedScopeFingerprint: scopeSnapshot.fingerprint,
           ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
           ...(parentRunId !== undefined ? { parentRunId } : {}),
+          parentModeId: this._currentRunModeId ?? this._record.modeId,
           ...(delegatedRequestContext !== undefined ? { requestContextApp: delegatedRequestContext.app } : {}),
         }),
       );
@@ -24458,7 +24606,7 @@ export class Session {
       );
       if (reconcileResult.reconciled) this._notifyDisplayRefresh();
       if (reconcileResult.notice !== undefined) {
-        void this._deliverDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
+        this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
       return reconcileResult.reconciled;
     } catch {
@@ -24510,17 +24658,35 @@ export class Session {
    *    Otherwise it acknowledges without waking. A crash between claim and wake
    *    loses at most that wake; the persisted reminder still reaches the next turn.
    *
-   * A cancelled parent drops the notice. A closed or torn-down parent leaves it
-   * owed for restart reconcile. A failure re-arms reconciliation with the
+   * A cancelled parent drops the notice. A closed or torn-down parent, or one
+   * whose Harness is shutting down, leaves it owed for restart reconcile; a
+   * running delivery is awaited by the shutdown barrier (PF-7595). A failure re-arms reconciliation with the
    * caller's backoff attempt.
    */
+  private _startDelegationSettlementNotice(
+    notice: PendingDelegationSettlementNotice,
+    admissionEpoch: number,
+    retryAttempt: number,
+  ): void {
+    // Tracked so shutdown's bounded settle awaits a reminder write in flight.
+    const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch, retryAttempt);
+    this._delegationNoticeDeliveries.add(delivery);
+    const untrack = () => {
+      this._delegationNoticeDeliveries.delete(delivery);
+    };
+    void delivery.then(untrack, untrack);
+  }
+
   private async _deliverDelegationSettlementNotice(
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
     retryAttempt: number,
   ): Promise<void> {
     const key = `${notice.subagentSessionId}:${notice.digest}`;
-    if (this._state !== 'live' || this.isClosing || this._delegationNoticesInFlight.has(key)) return;
+    // A shutting-down Harness starts no new delivery work; the notice stays
+    // owed for the next owner's reconcile.
+    const live = () => this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown();
+    if (!live() || this._delegationNoticesInFlight.has(key)) return;
     this._delegationNoticesInFlight.add(key);
     const firstEpoch = this._delegationNoticeEpochs.get(key);
     if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
@@ -24536,7 +24702,6 @@ export class Session {
         if (acknowledged) this._delegationNoticeEpochs.delete(key);
         return acknowledged;
       });
-    const live = () => this._state === 'live' && !this.isClosing;
     let claimed = false;
     try {
       if (!(await this._delegationNoticeIsOwed(notice))) {
@@ -24551,23 +24716,13 @@ export class Session {
       const content = delegationSettlementNoticeText(notice);
       const attributes = { type: 'delegated-task-settled' };
       const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-      // The active turn may run a per-turn mode override on another agent.
-      const agent = this._harness.getAgentForMode(this._currentRunModeId ?? this._record.modeId);
       // Write the reminder row directly, as the runtime's `persist` behaviour
       // does: no synthetic broadcast run occupies the thread, so a following
       // idle wake is not mistaken for an interleave, and nothing is handed to
       // an ungated follow-up run.
-      // Resolve memory with the parent's own context, as its turns do, so a
-      // dynamic memory resolver selects the parent's store.
-      const requestContext = await this._buildRequestContext({
-        modeId: this._currentRunModeId ?? this._record.modeId,
-        modelId: this._record.modelId,
-        abortSignal: new AbortController().signal,
-        ...(this._currentTurnRequestContext !== undefined
-          ? { persistedRequestContext: this._currentTurnRequestContext }
-          : {}),
-      });
-      const memory = await agent.getMemory({ requestContext });
+      const memory = await this._resolveDelegationNoticeMemory(notice);
+      // Shutdown may have begun while the notice was re-read and memory resolved.
+      if (!live()) return;
       if (memory !== undefined && memory !== null) {
         await memory.saveMessages({
           messages: [
@@ -24621,13 +24776,53 @@ export class Session {
         );
       }
     } catch {
-      // After the claim nothing is owed: a wake refused as busy lost its slot to
-      // a turn that reads the persisted row. Before it, the notice stays durable
-      // and the row is rewritten in place on retry, so copies cannot accumulate.
+      // After the claim nothing is owed. A wake that lost its slot during the
+      // context await is still sent exactly as fork main sends it, unlabelled.
+      // Refusals (a stale admission epoch from a Stop or an edit/regenerate via
+      // `resetPlanTasks`, or a run already active before the turn begins) drop
+      // the wake whether or not a row exists (PF-7679). Before the claim, the
+      // notice stays durable and the row is rewritten in place on retry, so
+      // copies cannot accumulate.
       if (!claimed) this._scheduleDelegationReconcileRetry(retryAttempt);
     } finally {
       this._delegationNoticesInFlight.delete(key);
     }
+  }
+
+  /**
+   * Memory that receives a settlement reminder row. The active mode's agent
+   * memory comes first (a per-turn override may run another agent). When that
+   * agent has none (the parent switched to a memory-less mode that cannot
+   * delegate), the reminder goes to the memory of the mode that delegated the
+   * task: binding requires memory there for `remind`, and the parent's next
+   * turn in that mode reads the row from its thread history. Memory resolves
+   * with the parent's own request context, as its turns do, so a dynamic memory
+   * resolver selects the parent's store. Undefined only when neither mode has
+   * memory (a Stop-downgraded `wake` notice of a memory-less parent, or a
+   * delegating mode removed from the configuration since).
+   */
+  private async _resolveDelegationNoticeMemory(
+    notice: PendingDelegationSettlementNotice,
+  ): Promise<MastraMemory | undefined> {
+    const activeModeId = this._currentRunModeId ?? this._record.modeId;
+    const modeIds = [activeModeId];
+    if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
+      if (this._harness._hasMode(notice.parentModeId)) modeIds.push(notice.parentModeId);
+    }
+    for (const modeId of modeIds) {
+      const agent = this._harness.getAgentForMode(modeId);
+      const requestContext = await this._buildRequestContext({
+        modeId,
+        modelId: this._record.modelId,
+        abortSignal: new AbortController().signal,
+        ...(this._currentTurnRequestContext !== undefined
+          ? { persistedRequestContext: this._currentTurnRequestContext }
+          : {}),
+      });
+      const memory = await agent.getMemory({ requestContext });
+      if (memory !== undefined && memory !== null) return memory;
+    }
+    return undefined;
   }
 
   /** Exact re-read: the notice with this digest is still owed on its task. */
@@ -24987,7 +25182,7 @@ export class Session {
     }
 
     for (const owedNotice of owedNotices) {
-      void this._deliverDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
+      this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
     }
 
     let needsRetry = false;

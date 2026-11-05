@@ -203,14 +203,18 @@ export interface AgentStartEvent extends HarnessEventBase {
    *
    * - `'wake'`: the Harness started this run to deliver a delegated-task
    *   settlement notice (`subagents.onDelegatedSettlement: 'wake'`). At most
-   *   one wake run starts per notice.
+   *   one wake run starts per notice. When a caller turn takes the parent's
+   *   slot while the wake prepares, the notice content is still sent; the
+   *   runtime delivers it to the caller's run or to a run it starts after
+   *   that, and neither run is labelled.
    */
   origin?: 'wake';
   /**
    * Present exactly when `origin` is `'wake'`: the opaque, stable id of the
-   * settlement notice this run delivers. It is also the id of the persisted
-   * `system-reminder` message on the thread, and it stays the same when the
-   * notice is redelivered after a restart. Treat it as opaque.
+   * settlement notice this run delivers. When the parent's memory persisted
+   * the notice, it is also the id of that `system-reminder` message on the
+   * thread; a parent without memory persists no message. It stays the same
+   * when the notice is redelivered after a restart. Treat it as opaque.
    */
   wakeNoticeId?: string;
   /** Run-start overrides committed for this turn, when any were applied. */

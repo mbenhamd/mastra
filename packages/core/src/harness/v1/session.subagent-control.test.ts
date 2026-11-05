@@ -20,7 +20,12 @@ import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
 import type { Session } from './session';
-import { createSubagentControlTool, SUBAGENT_CONTROL_TOOL_ID } from './subagent-control-tool';
+import { SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
+import {
+  createSubagentControlTool,
+  SUBAGENT_CONTROL_TOOL_ID,
+  SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
+} from './subagent-control-tool';
 import {
   HARNESS_SUBAGENT_OUTCOME_REPORT_KIND,
   HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
@@ -121,6 +126,31 @@ async function delegateHeldChild(parent: Session, childAgent: MockAgent, content
   )) as any;
   await poll(() => childAgent.streamCalls.length > 0);
   return { taskId: task.taskId as string, childId: delegated.subagentSessionId as string, releaseChild };
+}
+
+/** An own child suspended on a pending interaction (awaiting input, not settled). */
+async function awaitingInputChild(harness: Harness, parent: Session): Promise<Session> {
+  const child = await harness.session({
+    resourceId: 'u1',
+    threadId: { fresh: true },
+    parentSessionId: parent.id,
+    origin: 'subagent-tool',
+    modeId: 'worker-mode',
+    subagentDepth: 1,
+  });
+  const now = Date.now();
+  await (child as any)._flushUpdate((prev: any) => ({
+    ...prev,
+    pendingResume: {
+      kind: 'tool-approval',
+      runId: 'run-suspended',
+      toolCallId: 'tool-call-suspended',
+      source: 'parent',
+      requestedAt: now,
+      expiresAt: now + 600_000,
+    },
+  }));
+  return child;
 }
 
 function control(parent: Session) {
@@ -372,6 +402,211 @@ describe('subagent control tool', () => {
     await a.harness.shutdown();
   });
 
+  it('after a restart, a cancelled child that kept its suspension evidence reads as settled, not awaiting input', async () => {
+    const db = new InMemoryDB();
+    const a = buildHarness(db);
+    const b = buildHarness(db);
+    const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const child = await b.harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+      subagentTypeId: 'worker',
+    });
+    // The child suspended, then was cancelled; the cancel keeps pendingResume
+    // as audit evidence and nothing closed the child before its process stopped.
+    const now = Date.now();
+    await (child as any)._flushUpdate((prev: any) => ({
+      ...prev,
+      pendingResume: {
+        kind: 'tool-approval',
+        runId: 'run-suspended',
+        toolCallId: 'tool-call-suspended',
+        source: 'parent',
+        requestedAt: now,
+        expiresAt: now + 600_000,
+      },
+    }));
+    await child.cancel({ reason: 'subagent_cancelled' });
+    await b.harness.shutdown();
+    const stored = await parent._internalStorage.loadSession({ sessionId: child.id });
+    expect(stored).toMatchObject({ pendingResume: expect.anything(), cancelRequest: expect.anything() });
+    expect(stored?.closedAt).toBeUndefined();
+
+    const run = control(parent);
+    const inspected = await run({ action: 'status', subagentSessionId: child.id });
+    expect(inspected.subagents).toEqual([
+      expect.objectContaining({ subagentSessionId: child.id, cancelRequested: true, settled: true }),
+    ]);
+    expect(inspected.subagents[0].status).not.toBe('awaiting_input');
+    const waited = await run({ action: 'wait', subagentSessionId: child.id, timeoutMs: 200 });
+    expect(waited).toMatchObject({ action: 'wait', timedOut: false, runningSubagents: [] });
+    expect(waited.settledSubagents).toEqual([expect.objectContaining({ subagentSessionId: child.id })]);
+    await a.harness.shutdown();
+  });
+
+  it('wait stops at its timeout, or promptly on abort, while a later storage read stalls', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const child = await awaitingInputChild(harness, parent);
+    const tool = createSubagentControlTool(parent)!;
+    let releaseStorage!: () => void;
+    const gate = new Promise<void>(r => (releaseStorage = r));
+    // The first read (ownership proof and initial views) answers; every later one stalls.
+    let reads = 0;
+    const original = InMemoryHarness.prototype.listPlanTasks;
+    const stall = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(function (
+      this: InMemoryHarness,
+      ...args: Parameters<InMemoryHarness['listPlanTasks']>
+    ) {
+      reads += 1;
+      return reads === 1 ? original.apply(this, args) : gate.then(() => original.apply(this, args));
+    });
+    const guard = (ms: number) => {
+      let timer!: ReturnType<typeof setTimeout>;
+      const stalled = new Promise<'stalled'>(r => (timer = setTimeout(() => r('stalled'), ms)));
+      return { stalled, clear: () => clearTimeout(timer) };
+    };
+    try {
+      let started = Date.now();
+      let bound = guard(SUBAGENT_CONTROL_WAIT_READ_STALL_MS + 2_000);
+      const timed = await Promise.race([
+        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 50 } as any, toolCtx),
+        bound.stalled,
+      ]);
+      bound.clear();
+      expect(timed).toMatchObject({
+        action: 'wait',
+        timedOut: true,
+        settledSubagents: [],
+        runningSubagents: [expect.objectContaining({ subagentSessionId: child.id, status: 'awaiting_input' })],
+      });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+
+      reads = 0;
+      const abort = new AbortController();
+      started = Date.now();
+      // Past the first 100 ms poll interval, so the abort lands on a stalled read.
+      setTimeout(() => abort.abort(), 150);
+      bound = guard(1_000);
+      const aborted = await Promise.race([
+        tool.execute!({ action: 'wait', subagentSessionId: child.id, timeoutMs: 300_000 } as any, {
+          ...toolCtx,
+          abortSignal: abort.signal,
+        }),
+        bound.stalled,
+      ]);
+      bound.clear();
+      expect(aborted).toMatchObject({ action: 'wait', timedOut: false, aborted: true });
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(Date.now() - started).toBeLessThan(500);
+    } finally {
+      releaseStorage();
+      stall.mockRestore();
+    }
+    await harness.shutdown();
+  });
+
+  it('wait fails with a storage error, never an empty timeout, when its first storage read stalls', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const child = await awaitingInputChild(harness, parent);
+    let releaseStorage!: () => void;
+    const gate = new Promise<void>(r => (releaseStorage = r));
+    const original = InMemoryHarness.prototype.listPlanTasks;
+    const stall = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(function (
+      this: InMemoryHarness,
+      ...args: Parameters<InMemoryHarness['listPlanTasks']>
+    ) {
+      return gate.then(() => original.apply(this, args));
+    });
+    let guardTimer!: ReturnType<typeof setTimeout>;
+    const stalled = new Promise<'stalled'>(
+      r => (guardTimer = setTimeout(() => r('stalled'), SUBAGENT_CONTROL_WAIT_READ_STALL_MS + 2_000)),
+    );
+    try {
+      const started = Date.now();
+      const waited = await Promise.race([
+        control(parent)({ action: 'wait', subagentSessionId: child.id, timeoutMs: 50 }),
+        stalled,
+      ]);
+      expect(waited).toMatchObject({ isError: true, errorName: 'HarnessStorageError', code: 'harness.storage' });
+      expect(waited).not.toHaveProperty('timedOut');
+      expect(Date.now() - started).toBeGreaterThanOrEqual(SUBAGENT_CONTROL_WAIT_READ_STALL_MS - 5);
+    } finally {
+      clearTimeout(guardTimer);
+      releaseStorage();
+      stall.mockRestore();
+    }
+    await harness.shutdown();
+  });
+
+  it('wait over storage with a few ms of latency still proves ownership and reports fresh settlement', async () => {
+    const { harness } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const other = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const foreignChild = await harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: other.id,
+      origin: 'subagent-tool',
+      subagentDepth: 1,
+    });
+    const idleChild = await harness.session({
+      resourceId: 'u1',
+      threadId: { fresh: true },
+      parentSessionId: parent.id,
+      origin: 'subagent-tool',
+      modeId: 'worker-mode',
+      subagentDepth: 1,
+    });
+    const suspended = await awaitingInputChild(harness, parent);
+    const original = InMemoryHarness.prototype.listPlanTasks;
+    // Set for the last case: the first read that answers at or after this time
+    // settles the suspended child before it reads. The read that ends the wait
+    // answers at or after the deadline, so it always sees the settlement.
+    let settleChildFrom: number | undefined;
+    const latency = vi.spyOn(InMemoryHarness.prototype, 'listPlanTasks').mockImplementation(async function (
+      this: InMemoryHarness,
+      ...args: Parameters<InMemoryHarness['listPlanTasks']>
+    ) {
+      await new Promise(r => setTimeout(r, 5));
+      if (settleChildFrom !== undefined && Date.now() >= settleChildFrom) {
+        settleChildFrom = undefined;
+        await (suspended as any)._flushUpdate((prev: any) => ({ ...prev, pendingResume: undefined }));
+      }
+      return original.apply(this, args);
+    });
+    try {
+      const run = control(parent);
+      expect(await run({ action: 'wait', subagentSessionId: foreignChild.id, timeoutMs: 0 })).toMatchObject({
+        isError: true,
+        errorName: 'HarnessValidationError',
+      });
+      for (const timeoutMs of [0, 3]) {
+        expect(await run({ action: 'wait', subagentSessionId: idleChild.id, timeoutMs })).toMatchObject({
+          timedOut: false,
+          runningSubagents: [],
+          settledSubagents: [expect.objectContaining({ subagentSessionId: idleChild.id, settled: true })],
+        });
+      }
+      // The child settles as the deadline passes: the read that ends the wait must see it.
+      const timeoutMs = 1_000;
+      settleChildFrom = Date.now() + timeoutMs;
+      expect(await run({ action: 'wait', subagentSessionId: suspended.id, timeoutMs })).toMatchObject({
+        timedOut: false,
+        runningSubagents: [],
+        settledSubagents: [expect.objectContaining({ subagentSessionId: suspended.id, settled: true })],
+      });
+    } finally {
+      latency.mockRestore();
+    }
+    await harness.shutdown();
+  });
+
   it('send refuses a child with no active run instead of waking it', async () => {
     const { harness, childAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -486,6 +721,212 @@ describe('subagent control tool — permission gate (real agent loop)', () => {
       const toolOutputs = events.filter(event => event.type === 'tool_end').map(event => (event as any).output);
       expect(toolOutputs.some(output => (output as any)?.action === 'status')).toBe(false);
     } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+/**
+ * PF-7632 — a detached `task_delegate` child outlives its parent turn. The
+ * parent must still accept a new user turn (which can stop or steer that
+ * child), so `isTurnActive()` excludes in-flight subagent executions while
+ * `isBusy()` keeps counting them for shutdown and `waitForIdle()`.
+ */
+describe('isTurnActive — user turns while a delegated child runs (real agent loop)', () => {
+  type StreamPart = Record<string, unknown>;
+  const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+  const text = (value: string): StreamPart[] => [
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: value },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: 'stop', usage },
+  ];
+  const toolCall = (toolCallId: string, toolName: string, input: unknown): StreamPart => ({
+    type: 'tool-call',
+    toolCallId,
+    toolName,
+    input: JSON.stringify(input),
+  });
+
+  /** A parent backed by a real Agent loop; `script` decides each model step. */
+  function buildRealLoopHarness(script: () => StreamPart[] | Promise<StreamPart[]>) {
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }, ...(await script())] as any),
+      }),
+    });
+    const parentAgent = new Agent({ id: 'parent-agent', name: 'parent-agent', instructions: 'coordinate', model });
+    const childAgent = new MockAgent({
+      id: 'child-agent',
+      defaultOutput: { terminalToolResult: completedOutcome('Worker finished') },
+    });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      subagents: subagentsConfig(),
+    });
+    return { harness, childAgent };
+  }
+
+  function holdChildRun(childAgent: MockAgent, summary: string): () => void {
+    let release!: () => void;
+    childAgent.enqueueRun({
+      holdUntil: new Promise<void>(r => (release = r)),
+      finishReason: 'stop',
+      terminalToolResult: completedOutcome(summary),
+    });
+    return release;
+  }
+
+  it('a new user turn is admitted while two delegated children run, and cancels one and steers the other', async () => {
+    let phase: 'delegate' | 'steer' | 'report' | 'idle' = 'delegate';
+    let openDelegationTurn!: () => void;
+    const delegationTurnGate = new Promise<void>(r => (openDelegationTurn = r));
+    const children: { a?: string; b?: string } = {};
+    let turnActiveDuringSteerTurn: boolean | undefined;
+    let parent!: Session;
+    const releases: Array<() => void> = [];
+    const { harness, childAgent } = buildRealLoopHarness(async () => {
+      switch (phase) {
+        case 'delegate':
+          // Turn 1 stays open while the test delegates through the turn's tools.
+          phase = 'idle';
+          await delegationTurnGate;
+          return text('DELEGATED');
+        case 'steer':
+          phase = 'report';
+          return [
+            toolCall('call-cancel', SUBAGENT_CONTROL_TOOL_ID, { action: 'cancel', subagentSessionId: children.a }),
+            toolCall('call-send', SUBAGENT_CONTROL_TOOL_ID, {
+              action: 'send',
+              subagentSessionId: children.b,
+              message: 'Only include trials after 2020.',
+            }),
+            { type: 'finish', finishReason: 'tool-calls', usage },
+          ];
+        case 'report':
+          phase = 'idle';
+          turnActiveDuringSteerTurn = parent.isTurnActive();
+          return text('Stopped the first task; redirected the second.');
+        default:
+          return text('ok');
+      }
+    });
+    try {
+      parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      parent.subscribe(event => events.push(event));
+      const sendSignal = vi.spyOn(childAgent, 'sendSignal');
+      const releaseA = holdChildRun(childAgent, 'first survey: done');
+      const releaseB = holdChildRun(childAgent, 'second survey: done');
+      releases.push(openDelegationTurn, releaseA, releaseB);
+
+      const delegationTurn = parent.message({ content: 'run two surveys in the background' });
+      await poll(() => parent.isRunning());
+      const tools = createPlanTaskTools(parent);
+      for (const [key, content] of [
+        ['a', 'first survey'],
+        ['b', 'second survey'],
+      ] as const) {
+        const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content } as any, toolCtx)) as any;
+        const delegated = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+          { taskId: task.taskId, agentType: 'worker' } as any,
+          toolCtx,
+        )) as any;
+        children[key] = delegated.subagentSessionId;
+      }
+      await poll(() =>
+        [children.a!, children.b!].every(id => harness._internalGetLiveSession(id)?.isRunning() === true),
+      );
+      openDelegationTurn();
+      await delegationTurn;
+      await poll(() => !parent.isRunning());
+
+      // The parent turn ended; both detached children still run.
+      expect(parent._internalSubagentExecutionsInFlight).toBe(2);
+      expect(parent.isBusy()).toBe(true);
+      expect(parent.isTurnActive()).toBe(false);
+
+      phase = 'steer';
+      const steerTurn = (await parent.message({ content: 'stop the first survey' })) as any;
+
+      expect(steerTurn.text).toContain('Stopped the first task');
+      expect(turnActiveDuringSteerTurn).toBe(true);
+      const controlOutputs = events
+        .filter(event => event.type === 'tool_end' && (event as any).toolName === SUBAGENT_CONTROL_TOOL_ID)
+        .map(event => (event as any).output);
+      expect(controlOutputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ action: 'cancel', subagentSessionId: children.a, cancel: 'acknowledged' }),
+          expect.objectContaining({ action: 'send', subagentSessionId: children.b, delivered: true }),
+        ]),
+      );
+      expect(sendSignal).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'system-reminder', contents: 'Only include trials after 2020.' }),
+        expect.anything(),
+      );
+
+      releaseA();
+      releaseB();
+      const run = control(parent);
+      const settledA = await run({ action: 'wait', subagentSessionId: children.a, timeoutMs: 5_000 });
+      const settledB = await run({ action: 'wait', subagentSessionId: children.b, timeoutMs: 5_000 });
+      expect(settledA.settledSubagents).toEqual([
+        expect.objectContaining({ subagentSessionId: children.a, status: 'failed', cancelRequested: true }),
+      ]);
+      expect(settledB.settledSubagents).toEqual([
+        expect.objectContaining({ subagentSessionId: children.b, status: 'completed' }),
+      ]);
+      await parent.waitForIdle({ timeoutMs: 5_000 });
+      expect(parent.isBusy()).toBe(false);
+      expect(parent.isTurnActive()).toBe(false);
+    } finally {
+      // Let held runs finish so a failed assertion surfaces instead of a drain timeout.
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+
+  it('an inline spawn_subagent reads as an active turn while its child runs', async () => {
+    let step = 0;
+    let observed: { turnActive: boolean; busy: boolean; inFlight: number } | undefined;
+    let parent!: Session;
+    let releaseChild = () => {};
+    const { harness, childAgent } = buildRealLoopHarness(() => {
+      step++;
+      return step === 1
+        ? [
+            toolCall('call-spawn', SPAWN_SUBAGENT_TOOL_ID, { agentType: 'worker', task: 'check one citation' }),
+            { type: 'finish', finishReason: 'tool-calls', usage },
+          ]
+        : text('checked');
+    });
+    try {
+      parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      releaseChild = holdChildRun(childAgent, 'citation checked');
+
+      const turn = parent.message({ content: 'check the citation' });
+      await poll(() => childAgent.streamCalls.length === 1);
+      observed = {
+        turnActive: parent.isTurnActive(),
+        busy: parent.isBusy(),
+        inFlight: parent._internalSubagentExecutionsInFlight,
+      };
+      releaseChild();
+      await turn;
+
+      expect(observed).toEqual({ turnActive: true, busy: true, inFlight: 1 });
+      expect(parent.isTurnActive()).toBe(false);
+      expect(parent.isBusy()).toBe(false);
+    } finally {
+      releaseChild();
       await harness.shutdown();
     }
   });

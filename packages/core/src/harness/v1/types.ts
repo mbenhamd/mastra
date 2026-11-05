@@ -1406,7 +1406,12 @@ export interface HarnessConfigCommon {
      * - `'none'` (default): no notice; the parent model reads settlements with
      *   `plan_task_check`.
      * - `'remind'`: persist the reminder so the parent's next turn reads it.
-     *   Never starts a turn and never interleaves into a running one.
+     *   Never starts a turn and never interleaves into a running one. The
+     *   reminder is written through the parent agent's memory, so binding
+     *   rejects `'remind'` with a `HarnessConfigError` when a mode that can
+     *   delegate (Harness built-ins not excluded) uses an agent without memory.
+     *   A parent that switched to a memory-less mode since delegating gets the
+     *   reminder in the delegating mode's memory.
      * - `'wake'`: persist it, then, once any running parent turn ended, start
      *   one follow-up turn if the parent is idle, has no queued turn or parked
      *   interaction, and was not stopped or cancelled since the settlement.
