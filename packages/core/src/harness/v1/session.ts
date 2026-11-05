@@ -14940,7 +14940,9 @@ export class Session {
    * PF-7473: `requireActiveRun` is the opposite, interleave-only mode (it never
    * wakes an idle thread), and `assertAdmitted` re-proves the sender's own
    * admission after subscription setup. PF-7626: `wakeNoticeId` marks an idle
-   * wake as a settlement-notice wake, published on its `agent_start`.
+   * wake as a settlement-notice wake, published on its `agent_start`;
+   * `noticePersisted` says a reminder row already carries the content, so a
+   * wake that lost its idle slot may be dropped instead of dispatched.
    */
   private async _injectSystemReminder(
     content: string,
@@ -14949,6 +14951,7 @@ export class Session {
       signalId?: string;
       admissionEpoch?: number;
       wakeNoticeId?: string;
+      noticePersisted?: boolean;
       requireActiveRun?: boolean;
       assertAdmitted?: () => void;
     },
@@ -15012,6 +15015,7 @@ export class Session {
         }
       };
       let dispatched;
+      let idleSlotLost = false;
       try {
         const toolSurface = this._buildToolSurface(mode, undefined);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
@@ -15039,16 +15043,20 @@ export class Session {
         };
         assertOwnedReminderTurnNotDeleted();
         this._assertOpenForTurn('injectSystemReminder()');
-        // An idle-only wake re-proves idleness in the same tick as its dispatch:
-        // a caller turn that began or started a run during the context await
-        // keeps the slot, and that run is never announced as this wake.
-        if (
-          idleOnlyEpoch !== undefined &&
-          (this._currentTurnAbortController !== turnAbortController ||
-            sub.activeRunId() !== null ||
-            !this._activeWorkAdmissionIsCurrent(idleOnlyEpoch))
-        ) {
-          throw new HarnessBusyError(this.id, 'in_flight');
+        // An idle-only wake re-proves its slot in the same tick as its dispatch.
+        // A caller turn that began or started a run during the context await
+        // keeps the slot, and that run is never announced as this wake. With a
+        // persisted reminder row the wake stands down, because that turn loads
+        // the row; without one the content is still sent, unlabelled, so the
+        // runtime delivers it to the caller's run or starts a run with it.
+        if (idleOnlyEpoch !== undefined) {
+          idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
+          if (
+            !this._activeWorkAdmissionIsCurrent(idleOnlyEpoch) ||
+            (idleSlotLost && internal?.noticePersisted === true)
+          ) {
+            throw new HarnessBusyError(this.id, 'in_flight');
+          }
         }
 
         dispatched = agent.sendSignal(
@@ -15072,7 +15080,7 @@ export class Session {
 
       // §10.2 agent_start carries the runId — emit it now the run is dispatched.
       // dispatched.signal.id is the originating signalId — stamped for the run projection.
-      this._emitAgentStart(dispatched.runId, dispatched.signal.id, internal?.wakeNoticeId);
+      this._emitAgentStart(dispatched.runId, dispatched.signal.id, idleSlotLost ? undefined : internal?.wakeNoticeId);
 
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);
@@ -24242,13 +24250,22 @@ export class Session {
         await this._injectSystemReminder(
           content,
           { attributes, metadata },
-          { signalId, admissionEpoch, wakeNoticeId: signalId },
+          {
+            signalId,
+            admissionEpoch,
+            wakeNoticeId: signalId,
+            noticePersisted: memory !== undefined && memory !== null,
+          },
         );
       }
     } catch {
-      // After the claim nothing is owed: a wake refused as busy lost its slot to
-      // a turn that reads the persisted row. Before it, the notice stays durable
-      // and the row is rewritten in place on retry, so copies cannot accumulate.
+      // After the claim nothing is owed. A wake that lost its slot during the
+      // context await stands down only when a persisted row reaches the turn
+      // that took it; a memory-less one is still sent, unlabelled. Refusals
+      // before the turn begins (a Stop, or a run already active) drop the wake
+      // whether or not a row exists (PF-7679). Before the claim, the notice
+      // stays durable and the row is rewritten in place on retry, so copies
+      // cannot accumulate.
       if (!claimed) this._scheduleDelegationReconcileRetry(retryAttempt);
     } finally {
       this._delegationNoticesInFlight.delete(key);
