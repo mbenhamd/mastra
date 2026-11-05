@@ -1163,8 +1163,40 @@ export interface HarnessConfigCommon {
        * registered twice (including one equal to `finalizer`) is rejected.
        * Drop an entry only once `countPendingTerminalAdmissions` and
        * `countUndeliveredTerminalIntents` both report zero for it.
+       *
+       * Keep one id across versions: intents are delivered in per-session
+       * order only within one finalizer id (PF-7631), so an entry under a
+       * renamed id is not ordered against intents under the new id. An entry
+       * whose id equals `wakeFinalizer.id` is an earlier wake version and is
+       * settled with the wake payload envelope, so it requires `wakeFinalizer`.
        */
       settleOnly?: readonly HarnessTerminalFinalizer[];
+      /**
+       * Opt-in finalizer for settlement wake turns (PF-7631). With it, a turn
+       * the Harness starts to deliver a delegated-task settlement notice
+       * (`subagents.onDelegatedSettlement: 'wake'`) is admitted under a
+       * Harness-minted grant (`harness-wake:<wakeNoticeId>`, generation 1) and
+       * commits a terminal intent under this finalizer, so its reply survives
+       * a crash between the run's end and the consumer's write. Its id must
+       * differ from `finalizer.id`: consumers claim each kind by finalizer id.
+       * The committed payload is a `HarnessWakeTerminalPayload` wrapping this
+       * finalizer's payload. Earlier versions settle through `settleOnly`.
+       * The grant applies only to a wake that still holds its idle slot at
+       * dispatch (no caller turn began, no run is active) and whose reminder
+       * row was saved by the dispatching agent's own fixed memory instance
+       * with no mode change since. Any other wake (a caller turn took the
+       * slot, a memory-less parent, a row saved to another mode's memory,
+       * function or inherited memory, a mode switch) stages no intent and is
+       * sent as without this option, so a caller run still receives the
+       * notice as its next model input. A grant given up after its admission
+       * (a caller turn or a mode switch during it, a Stop, edit, delete or
+       * eviction before the dispatch, or a dispatch the runtime refused before
+       * any run started) is cancelled: no terminal result and no
+       * intent; its `harness-wake:` reservation is settled failed with
+       * `harness.terminal_cancelled`. If storage refuses the cancel, recovery
+       * settles the wake as interrupted (an aborted wake intent is possible).
+       */
+      wakeFinalizer?: HarnessTerminalFinalizer;
     };
 
     /**

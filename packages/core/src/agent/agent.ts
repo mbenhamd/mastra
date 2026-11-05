@@ -3285,6 +3285,16 @@ export class Agent<
   }
 
   /**
+   * The agent's own fixed memory instance, read without resolving: undefined
+   * for function memory, inherited memory, or none. `getMemory()` returns this
+   * same instance on every call while it is set.
+   * @internal
+   */
+  __fixedMemory(): MastraMemory | undefined {
+    return this.#memory !== undefined && typeof this.#memory !== 'function' ? this.#memory : undefined;
+  }
+
+  /**
    * Gets the memory instance for this agent, resolving function-based memory if necessary.
    * The memory system enables conversation persistence, semantic recall, and working memory.
    *

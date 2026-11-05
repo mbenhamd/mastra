@@ -501,10 +501,24 @@ export const harnessAttachmentUploadBodySchema = z
 
 export const harnessAttachmentUploadResponseSchema = attachmentRefSchema;
 
+/**
+ * The Harness reserves this admission-id namespace for its own settlement wake
+ * turns. A local constant instead of core's `HARNESS_WAKE_GRANT_KEY_PREFIX`:
+ * this package's `@mastra/core` peer range includes releases without it.
+ */
+export const HARNESS_WAKE_RESERVED_ADMISSION_PREFIX = 'harness-wake:';
+
+const harnessAdmissionIdSchema = z
+  .string()
+  .min(1)
+  .refine(id => !id.startsWith(HARNESS_WAKE_RESERVED_ADMISSION_PREFIX), {
+    message: 'admissionId uses the Harness-reserved wake namespace',
+  });
+
 export const harnessMessageAdmissionBodySchema = z
   .object({
     content: z.string().min(1),
-    admissionId: z.string().min(1),
+    admissionId: harnessAdmissionIdSchema,
     mode: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
     attachments: admissionAttachmentsSchema.shape.attachments,
@@ -531,7 +545,7 @@ const queueSchedulingNumberSchema = z
 export const harnessQueueAdmissionBodySchema = z
   .object({
     content: z.string().min(1),
-    admissionId: z.string().min(1),
+    admissionId: harnessAdmissionIdSchema,
     mode: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
     yolo: z.boolean().optional(),
