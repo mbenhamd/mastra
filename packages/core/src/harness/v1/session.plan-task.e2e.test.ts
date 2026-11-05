@@ -31,7 +31,7 @@
  * Only the LANGUAGE MODEL is mocked; the agent + tools + loop are real.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { Agent } from '../../agent';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
@@ -922,6 +922,135 @@ describe('Harness v1 plan-task E2E — PT9 rejected mutation surfaces isError, t
       expect(page.tasks).toHaveLength(1);
       expect(page.tasks[0].taskId).toBe(rootId);
       expect(page.tasks[0].parentTaskId).toBeUndefined();
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+// ===========================================================================
+// PT10 — task_delegate without taskId keys and replays by the REAL run id
+// ===========================================================================
+
+describe('Harness v1 plan-task E2E — PT10 taskId-less task_delegate across real runs', () => {
+  it('a later run that reuses a tool call id adds its own task instead of replaying another run’s child', async () => {
+    const childModel = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: toolCallStream(
+          'pt10-outcome',
+          'report_subagent_outcome',
+          JSON.stringify({
+            outcome: 'completed',
+            summary: 'Done.',
+            evidence: [{ kind: 'analysis', description: 'Handled the delegated test task.' }],
+          }),
+        ),
+      }),
+    });
+    const childAgent = new Agent({ id: 'child-agent', name: 'child-agent', instructions: 'do it', model: childModel });
+
+    // Every parent turn makes one task_delegate call with the SAME provider
+    // tool call id, as a model that numbers its calls per turn would.
+    const turnInputs: Array<() => Record<string, unknown>> = [];
+    let parentCall = 0;
+    const parentModel = new MockLanguageModelV2({
+      doStream: async () => {
+        parentCall++;
+        if (parentCall % 2 === 1) {
+          const input = turnInputs[(parentCall - 1) / 2]!();
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: toolCallStream('call_0', 'task_delegate', JSON.stringify({ agentType: 'worker', ...input })),
+          };
+        }
+        return { rawCall: { rawPrompt: null, rawSettings: {} }, warnings: [], stream: textStream(['Ok.']) };
+      },
+    });
+    const parentAgent = new Agent({
+      id: 'parent-agent',
+      name: 'parent-agent',
+      instructions: 'delegate',
+      model: parentModel,
+    });
+
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      subagents: {
+        maxDepth: 2,
+        types: {
+          worker: {
+            agentId: 'child-agent',
+            modeId: 'worker-mode',
+            description: 'Background worker subagent',
+            defaultModelId: 'openai/gpt-4o-mini',
+            workspace: 'inherit',
+          },
+        },
+      },
+    });
+    try {
+      const session = await harness.session({ resourceId: 'u-pt10', threadId: { fresh: true } });
+      const delegateEnds: ToolEndEvent[] = [];
+      session.subscribe(e => {
+        if (e.type === 'tool_end' && (e as any).toolName === 'task_delegate') delegateEnds.push(e as any);
+      });
+      const listTasks = async () =>
+        (await (session as any)._internalStorage.listPlanTasks({ sessionId: session.id, limit: 10 })).tasks as any[];
+
+      // Run 1: the call adds a task, then child creation fails once.
+      const originalSession = harness.session.bind(harness);
+      let failChild = true;
+      const sessionSpy = vi.spyOn(harness, 'session').mockImplementation(async (args: any) => {
+        if (failChild && args.parentSessionId === session.id) {
+          failChild = false;
+          throw new Error('transient child creation failure');
+        }
+        return originalSession(args);
+      });
+      turnInputs.push(() => ({ task: 'Original instructions' }));
+      await session.message({ content: 'run 1' });
+      expect(delegateEnds[0]!.output.isError).toBe(true);
+      const [firstTask] = await listTasks();
+      expect(firstTask?.content).toBe('Original instructions');
+
+      // Run 2: re-delegates that task by id with different text.
+      turnInputs.push(() => ({ taskId: firstTask.taskId, task: 'Different instructions' }));
+      await session.message({ content: 'run 2' });
+      const run2 = delegateEnds[1]!.output;
+      expect(run2.isError).toBeFalsy();
+      // The stored delegation carries the real run id of the agent run.
+      expect(typeof run2.delegation?.parentRunId).toBe('string');
+      expect(run2.delegation.parentRunId.length).toBeGreaterThan(0);
+
+      // Run 3: same tool call id and same text as run 1, in a new run.
+      turnInputs.push(() => ({ task: 'Original instructions' }));
+      await session.message({ content: 'run 3' });
+      const run3 = delegateEnds[2]!.output;
+
+      const summary = {
+        run3IsError: run3.isError ?? false,
+        run3ReturnedRun2Child: run3.subagentSessionId === run2.subagentSessionId,
+        run3TaskIsRun1Task: run3.taskId === firstTask.taskId,
+        run3ParentRunIsRun2: run3.delegation?.parentRunId === run2.delegation.parentRunId,
+        tasks: (await listTasks()).length,
+      };
+      expect(summary).toEqual({
+        run3IsError: false,
+        run3ReturnedRun2Child: false,
+        run3TaskIsRun1Task: false,
+        run3ParentRunIsRun2: false,
+        tasks: 2,
+      });
+      sessionSpy.mockRestore();
     } finally {
       await harness.shutdown();
     }

@@ -142,7 +142,8 @@ function toToolError(err: unknown): ToolError {
  */
 function toolCallIdempotencyKey(
   prefix: string,
-  agentContext: { toolCallId?: string; agentId?: unknown; messages?: unknown; runId?: string } | undefined,
+  agentContext: { toolCallId?: string; agentId?: unknown; messages?: unknown } | undefined,
+  runId: string | undefined,
   task?: string,
 ): string | undefined {
   if (
@@ -153,10 +154,23 @@ function toolCallIdempotencyKey(
     return undefined;
   }
   return `${prefix}:${sha256CanonicalJson({
-    runId: agentContext.runId ?? 'missing',
+    runId: runId ?? 'missing',
     toolCallId: agentContext.toolCallId,
     ...(task === undefined ? {} : { task }),
   }).slice(0, 40)}`;
+}
+
+/**
+ * The agent run a tool call belongs to. A real agent execution carries it at
+ * the context top level (`runId`), not under `agent`; prefer `agent.runId`
+ * when a caller sets it.
+ */
+function toolRunId(context: ToolExecutionContext | undefined): string | undefined {
+  if (context?.agent?.runId !== undefined) return context.agent.runId;
+  // `ToolExecutionContext` does not declare the top-level `runId` the tool
+  // builder passes, so read it without widening the public type.
+  const topLevel: unknown = context === undefined ? undefined : Reflect.get(context, 'runId');
+  return typeof topLevel === 'string' ? topLevel : undefined;
 }
 
 /** Cap `value` at `maxBytes` UTF-8 bytes without splitting a code point. */
@@ -267,7 +281,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
     execute: async (input, context) => {
       try {
-        const idempotencyKey = toolCallIdempotencyKey('plan-task-add', context?.agent);
+        const idempotencyKey = toolCallIdempotencyKey('plan-task-add', context?.agent, context?.agent?.runId);
         return await session._planTaskAdd(
           { ...input, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
           context?.abortSignal,
@@ -509,7 +523,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
             // execution of that call awaits the first one's result.
             const sharedKey =
               input.taskId === undefined && input.task !== undefined
-                ? toolCallIdempotencyKey('plan-task-delegate-add', context?.agent, input.task)
+                ? toolCallIdempotencyKey('plan-task-delegate-add', context?.agent, toolRunId(context), input.task)
                 : undefined;
             if (sharedKey === undefined) return (await delegate(input, context, undefined)) as any;
             let inFlight = inFlightDelegations.get(session);
@@ -561,7 +575,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
           { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
           context?.abortSignal,
         );
-        const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId, context?.agent?.runId);
+        const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId, toolRunId(context));
         if (replayed !== undefined) return replayed as any;
         taskId = added.taskId;
         addedTaskId = added.taskId;
@@ -570,7 +584,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
         { ...input, taskId },
         context?.abortSignal,
         context?.agent?.toolCallId,
-        context?.agent?.runId,
+        toolRunId(context),
         context?.requestContext,
         context?.tracingContext,
         admissionEpoch,
