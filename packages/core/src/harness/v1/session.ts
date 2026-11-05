@@ -1298,6 +1298,12 @@ async function waitForDelegationResult<T>(
   }
 }
 
+/** The public error of a delegated task its parent cancelled (`cancelled` outcome). */
+const DELEGATED_SUBAGENT_CANCELLED_ERROR = {
+  code: 'harness.subagent_cancelled',
+  message: 'The delegated subagent was cancelled before it completed',
+} as const;
+
 function summarizeDelegationDeadline(deadlineAt: number): HarnessSubagentResultSummary {
   const summary = summarizeHarnessSubagentEventResult(
     summarizeHarnessSubagentResult(undefined, {
@@ -23948,10 +23954,7 @@ export class Session {
         // deadline still settles `cancelled`, as restart reconcile would.
         if (isParentRequestedSubagentCancel(child._record.cancelRequest, this.id)) {
           outcome = 'cancelled';
-          publicError = {
-            code: 'harness.subagent_cancelled',
-            message: 'The delegated subagent was cancelled before it completed',
-          };
+          publicError = { ...DELEGATED_SUBAGENT_CANCELLED_ERROR };
         } else {
           outcome = 'failed';
           publicError = {
@@ -24012,9 +24015,11 @@ export class Session {
       }
     } catch (error) {
       // Rejected signal/result, cancellation, expiry, or crash-orphan recovery.
-      // Only this parent's own cancel of the child settles as skipped work.
-      outcome = isParentRequestedSubagentCancel(child._record.cancelRequest, this.id) ? 'cancelled' : 'failed';
-      publicError = projectHarnessPublicError(error);
+      // Only this parent's own cancel of the child settles as skipped work, and
+      // its error names the cancel rather than the rejection it caused.
+      const parentCancelled = isParentRequestedSubagentCancel(child._record.cancelRequest, this.id);
+      outcome = parentCancelled ? 'cancelled' : 'failed';
+      publicError = parentCancelled ? { ...DELEGATED_SUBAGENT_CANCELLED_ERROR } : projectHarnessPublicError(error);
     } finally {
       child._subagentAnswerDeltaListener = undefined;
       unsubProgress();
@@ -24100,10 +24105,7 @@ export class Session {
           ? summarizeHarnessSubagentEventResult(
               summarizeHarnessSubagentResult(undefined, {
                 isError: true,
-                error: {
-                  code: 'harness.subagent_cancelled',
-                  message: 'The delegated subagent was cancelled before it completed',
-                },
+                error: { ...DELEGATED_SUBAGENT_CANCELLED_ERROR },
               }),
             )
           : outcome !== 'completed'
@@ -24373,6 +24375,16 @@ export class Session {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Re-read the child: its committed cancel request when it is this parent's
+   * targeted cancel, else `undefined`. A failed read rejects, so recovery retries
+   * instead of settling.
+   */
+  private async _loadTargetedDelegationCancel(childId: string): Promise<SessionRecord['cancelRequest']> {
+    const latest = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
+    return isParentRequestedSubagentCancel(latest?.cancelRequest, this.id) ? latest?.cancelRequest : undefined;
   }
 
   /** Cancel timed-out work before closing it and releasing its plan ownership edge. */
@@ -24778,9 +24790,22 @@ export class Session {
           needsRetry = true;
           continue;
         }
-        await this._reconcileDelegatedTask(task.taskId, childId, durable.outcome, durable.result, {
-          childCancelRequest: childRecord.cancelRequest,
-        });
+        // A targeted cancel committed while the evidence read was pending wins
+        // over a failure, as it does in the live driver.
+        let targetedCancel: SessionRecord['cancelRequest'];
+        try {
+          targetedCancel = durable.outcome === 'failed' ? await this._loadTargetedDelegationCancel(childId) : undefined;
+        } catch {
+          needsRetry = true;
+          continue;
+        }
+        await this._reconcileDelegatedTask(
+          task.taskId,
+          childId,
+          targetedCancel !== undefined ? 'cancelled' : durable.outcome,
+          targetedCancel !== undefined ? undefined : durable.result,
+          { childCancelRequest: targetedCancel ?? childRecord.cancelRequest },
+        );
         continue;
       }
       // A close marker cannot prove useful work completed. Without terminal
@@ -24799,12 +24824,22 @@ export class Session {
           needsRetry = true;
           continue;
         }
+        // The first cancel wins: a targeted cancel committed while the evidence
+        // read was pending survives the deadline cancel and settles `cancelled`,
+        // as in the live deadline branch. A later one never replaces the timeout.
+        let targetedCancel: SessionRecord['cancelRequest'];
+        try {
+          targetedCancel = await this._loadTargetedDelegationCancel(childId);
+        } catch {
+          needsRetry = true;
+          continue;
+        }
         await this._reconcileDelegatedTask(
           task.taskId,
           childId,
-          'failed',
-          summarizeDelegationDeadline(delegationAttempt.deadlineAt),
-          { childCancelRequest: undefined },
+          targetedCancel !== undefined ? 'cancelled' : 'failed',
+          targetedCancel !== undefined ? undefined : summarizeDelegationDeadline(delegationAttempt.deadlineAt),
+          { childCancelRequest: targetedCancel },
         );
         continue;
       }
