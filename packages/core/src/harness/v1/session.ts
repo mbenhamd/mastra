@@ -2047,8 +2047,14 @@ export class Session {
    * or a later reconcile pass cannot launder a Stop that happened in between.
    */
   private readonly _delegationNoticeEpochs = new Map<string, number>();
-  /** Turns begun by this live session; a settlement wake skips if a turn began after its reminder was saved. */
+  /** Turns begun by this live session. */
   private _turnsBegun = 0;
+  /**
+   * Begun turns that started no fresh run: a message interleaved into an
+   * already-active run, or a turn that failed before its dispatch. Such a turn
+   * never loads thread history, so it cannot have read a settlement reminder.
+   */
+  private _turnsBegunWithoutFreshRun = 0;
   /** Framework-staged direct answers, held until the matching authoritative step-finish supplies the message id. */
   private readonly _pendingTerminalSubagentAnswers = new Map<
     string,
@@ -9726,7 +9732,14 @@ export class Session {
       activeTurnWaiter.cleanup();
       this._endTurn(turnAbortController);
     };
+    let countedWithoutFreshRun = false;
+    const countTurnWithoutFreshRun = () => {
+      if (countedWithoutFreshRun) return;
+      countedWithoutFreshRun = true;
+      this._turnsBegunWithoutFreshRun += 1;
+    };
     const failOwnedMessageTurnBeforeDispatch = (err: unknown) => {
+      countTurnWithoutFreshRun();
       finishOwnedMessageTurn();
       admissionStart?.reject(err);
       if (opts.admissionId !== undefined) this._messageAdmissionStarts.delete(opts.admissionId);
@@ -9890,6 +9903,8 @@ export class Session {
     // we deliberately do not reject post-reservation, because that would poison the retry.
     const activeRunIdBeforeMessageDispatch = sub.activeRunId();
     if (activeRunIdBeforeMessageDispatch !== null) {
+      // This message joins the active run, whose history was loaded at its start.
+      countTurnWithoutFreshRun();
       // _beginTurn above installs this call's transient bookkeeping, so when
       // another run became active while admission was in flight the live
       // fence may now be on the session field rather than in the snapshot
@@ -15041,7 +15056,8 @@ export class Session {
         this._assertOpenForTurn('injectSystemReminder()');
         // An idle-only wake re-proves idleness in the same tick as its dispatch:
         // a caller turn that began or started a run during the context await
-        // keeps the slot, and that run is never announced as this wake.
+        // keeps the slot, that run is never announced as this wake, and the
+        // notice's delivery loop decides whether to wake again.
         if (
           idleOnlyEpoch !== undefined &&
           (this._currentTurnAbortController !== turnAbortController ||
@@ -15066,6 +15082,8 @@ export class Session {
           },
         );
       } catch (err) {
+        // Nothing was dispatched, so this turn loaded no history.
+        this._turnsBegunWithoutFreshRun += 1;
         finishOwnedReminderTurn();
         throw err;
       }
@@ -24131,11 +24149,13 @@ export class Session {
    *    ungated follow-up run; the next parent turn reads it from history.
    * 3. Acknowledge with a version-fenced write that re-checks the notice is still
    *    owed (the claim). `remind` ends here and never starts a turn.
-   * 4. `wake` waits for the current parent turn to end, then claims and starts
-   *    one follow-up turn only when the parent is still idle, has no queued turn
-   *    or parked interaction, is not cancelled, and saw no Stop since settlement.
-   *    Otherwise it acknowledges without waking. A crash between claim and wake
-   *    loses at most that wake; the persisted reminder still reaches the next turn.
+   * 4. `wake` waits for the current parent turn to end, then claims. A cancel or
+   *    a Stop since settlement ends it without waking. With memory, so does a
+   *    fresh run begun after the save, because that run loaded the reminder row.
+   *    Otherwise it waits out queued turns, parked interactions and caller turns
+   *    that take the slot first, then starts one follow-up turn. A crash between
+   *    claim and wake loses at most that wake; a persisted reminder still
+   *    reaches the next turn.
    *
    * A cancelled parent drops the notice. A closed or torn-down parent, or one
    * whose Harness is shutting down, leaves it owed for restart reconcile; a
@@ -24223,32 +24243,52 @@ export class Session {
         await acknowledge();
         return;
       }
-      // A turn that begins after this save reads the row from history itself.
-      const turnsBegunAtSave = this._turnsBegun;
-      while (this.isRunning() && live()) await this._nextStateTransition(1_000);
-      if (!live()) return;
-      // The fenced acknowledgement is the claim: only its winner may wake.
-      if (!(await acknowledge())) return;
-      claimed = true;
-      const wakeIdle =
-        live() &&
-        this._turnsBegun === turnsBegunAtSave &&
-        this._record.cancelRequest === undefined &&
-        !this.isRunning() &&
-        this._activeWorkAdmissionIsCurrent(admissionEpoch) &&
-        this._record.pendingResume === undefined &&
-        (this._record.pendingQueue ?? []).length === 0;
-      if (wakeIdle) {
-        await this._injectSystemReminder(
-          content,
-          { attributes, metadata },
-          { signalId, admissionEpoch, wakeNoticeId: signalId },
-        );
+      // A fresh run whose turn begins after this save loads the row from
+      // history into its model input. A message interleaved into a run that was
+      // already active, or a turn that never dispatched, does not.
+      const persisted = memory !== undefined && memory !== null;
+      const freshTurns = () => this._turnsBegun - this._turnsBegunWithoutFreshRun;
+      const freshTurnsAtSave = freshTurns();
+      for (;;) {
+        while (this.isRunning() && live()) await this._nextStateTransition(1_000);
+        if (!live()) return;
+        if (!claimed) {
+          // The fenced acknowledgement is the claim: only its winner may wake.
+          if (!(await acknowledge())) return;
+          claimed = true;
+        }
+        // With memory, that fresh run already delivered the notice. Without
+        // memory there is no row, so only the wake itself can deliver it.
+        if (persisted && freshTurns() !== freshTurnsAtSave) return;
+        if (this._record.cancelRequest !== undefined || !this._activeWorkAdmissionIsCurrent(admissionEpoch)) return;
+        if (
+          this.isRunning() ||
+          this._record.pendingResume !== undefined ||
+          (this._record.pendingQueue ?? []).length > 0
+        ) {
+          await this._nextStateTransition(1_000);
+          continue;
+        }
+        try {
+          await this._injectSystemReminder(
+            content,
+            { attributes, metadata },
+            { signalId, admissionEpoch, wakeNoticeId: signalId },
+          );
+          return;
+        } catch (err) {
+          // A caller turn took the slot first. With memory, its fresh run loads
+          // the row; otherwise re-decide once that turn settles.
+          if (!(err instanceof HarnessBusyError)) throw err;
+          if (persisted && freshTurns() !== freshTurnsAtSave) return;
+          await this._nextStateTransition(1_000);
+        }
       }
     } catch {
-      // After the claim nothing is owed: a wake refused as busy lost its slot to
-      // a turn that reads the persisted row. Before it, the notice stays durable
-      // and the row is rewritten in place on retry, so copies cannot accumulate.
+      // After the claim nothing is owed: a wake that failed for any reason
+      // other than a busy parent is not retried. Before it, the notice stays
+      // durable and the row is rewritten in place on retry, so copies cannot
+      // accumulate.
       if (!claimed) this._scheduleDelegationReconcileRetry(retryAttempt);
     } finally {
       this._delegationNoticesInFlight.delete(key);
