@@ -16,6 +16,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { HarnessTerminalFinalizer, HarnessTerminalIntent } from '../../storage/domains/harness';
+import { HarnessTerminalHandoffError } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
@@ -617,8 +618,14 @@ describe('PF-7631 wake terminal commit re-drive (bounded), both callers through 
       // Still down: close is refused typed, the failed attempt is surfaced,
       // and the admission stays durable.
       const beforeClose = events.length;
-      await expect(parent.close()).rejects.toBeInstanceOf(HarnessSessionLockedError);
-      off();
+      const refusal = await parent.close().then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      // Refused by the parked scan, so the closing marker is cleared and the
+      // interaction stays with this live owner.
+      expect(refusal).toBeInstanceOf(HarnessSessionLockedError);
+      expect(refusal).toMatchObject({ currentOwnerId: 'parked-admission' });
       // One settlement attempt (the session is closing, so no re-drive), surfaced once.
       expect(storage.wakeCommits).toBe(5);
       expect(events.slice(beforeClose)).toEqual([
@@ -631,9 +638,55 @@ describe('PF-7631 wake terminal commit re-drive (bounded), both callers through 
       expect(parent.getRecord().pendingResume).toBeDefined();
       expect(wakeIntents(db)).toHaveLength(0);
       expect(wakeEvidence(db).map(row => row.status)).toEqual(['pending']);
-      await a.harness.shutdown().catch(() => {});
+
+      // Once storage recovers, the live owner's expiry timer settles it on its
+      // own: one more commit, the resumed reply, no new answer or close.
+      storage.down = false;
+      await poll(() => wakeIntents(db).length === 1, 5_000);
+      off();
+      expect(storage.wakeCommits).toBe(6);
+      expect(wakeIntents(db)[0]!.projection.payload).toMatchObject({ outcome: 'completed', reply: resumedReply });
+      expect(a.parentAgent.streamCalls).toHaveLength(streamsBefore);
+      await parent.close();
+      await a.harness.shutdown();
     },
   );
+
+  it('resumed wake run: a due close whose commit and wake probe both fail rejects with the raw handoff error', async () => {
+    const parked = await parkResumedWake();
+    const { db, a, parent, events, off, storage } = parked;
+    await failFirstAnswer(parked);
+
+    // Storage is out for the commit and for close's wake-admission probe read
+    // after it: close cannot tell the admission is a wake, so the narrowed
+    // contract applies and the raw error is surfaced (no typed refusal).
+    const load = a.storage.loadTerminalAdmissionByRun.bind(a.storage);
+    vi.spyOn(a.storage, 'loadTerminalAdmissionByRun').mockImplementation(async input => {
+      if (storage.wakeCommits >= 5) throw commitFailure();
+      return load(input);
+    });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + DISPATCH_CLAIM_LAPSED_MS);
+    for (const [key, r] of db.harnessSessions) {
+      if (r.id === parent.id) db.harnessSessions.set(key, { ...r, leaseExpiresAt: Date.now() + 60_000 });
+    }
+
+    const beforeClose = events.length;
+    const refusal = await parent.close().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    off();
+    expect(refusal).not.toBeInstanceOf(HarnessSessionLockedError);
+    expect(refusal).toBeInstanceOf(HarnessTerminalHandoffError);
+    expect(refusal).toMatchObject({ code: 'harness.terminal_pending' });
+    expect(storage.wakeCommits).toBe(5);
+    expect(events.slice(beforeClose)).toEqual([]);
+    expect(wakeIntents(db)).toHaveLength(0);
+    expect(wakeEvidence(db).map(row => row.status)).toEqual(['pending']);
+    expect(parent.getRecord().pendingResume).toBeDefined();
+    await a.harness.shutdown().catch(() => {});
+  });
 
   it('a Stop while a wake commit attempt is in flight ends the re-drive with no error event for the abort', async () => {
     const db = new InMemoryDB();
