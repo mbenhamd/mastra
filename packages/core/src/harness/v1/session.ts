@@ -5940,7 +5940,8 @@ export class Session {
    * cancelled, or an `abortActiveWork()` / `resetPlanTasks()` that is still
    * cancelling children. The last one matters because Stop aborts the turn
    * again once its children are cancelled, which would also abort a turn
-   * admitted in between.
+   * admitted in between. So during that window it can be true while
+   * `isBusy()` is already false.
    *
    * It ignores in-flight subagent executions, which `isBusy()` counts. A
    * detached `task_delegate` child keeps running after the parent turn ends,

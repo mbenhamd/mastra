@@ -507,7 +507,7 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
       expect(parent.isTurnActive()).toBe(false);
       expect(parent.isBusy()).toBe(true);
 
-      // Settlement and admission start in the same tick.
+      // Release the child, then admit a user turn without waiting for the settlement.
       releaseChild();
       const user = await heldUserTurn(parent, parentAgent, 'how are the tasks going?');
       releases.push(user.release);
@@ -573,7 +573,7 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
       releases.push(releaseChild);
       const turns = trackTurns(parent);
       // The notice is saved and claimed; the user's message lands before the
-      // wake reaches its own turn admission.
+      // wake reaches its own turn admission. Seam: the private wake injector.
       let user: ReturnType<typeof startHeldUserTurn> | undefined;
       let turnActiveBeforeAdmission: boolean | undefined;
       let turnActiveAtAdmission: boolean | undefined;
@@ -656,7 +656,8 @@ describe('user turns admitted while a delegated child runs (isTurnActive)', () =
       releases.push(releaseChild);
       const user = await heldUserTurn(parent, parentAgent, 'working on it?');
       releases.push(user.release);
-      // Hold Stop between the turn abort and the child cancellation.
+      // Hold Stop between the turn abort and the child cancellation. Seam: the
+      // private delegated-child discovery Stop awaits before cancelling.
       let releaseDiscovery!: () => void;
       const discoveryGate = new Promise<void>(r => (releaseDiscovery = r));
       releases.push(releaseDiscovery);

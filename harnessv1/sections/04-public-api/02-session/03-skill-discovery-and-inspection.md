@@ -45,7 +45,8 @@
   // drained queued item, a non-empty `pendingQueue`, a pending resume that
   // has not been cancelled, or an `abortActiveWork()` / `resetPlanTasks()`
   // still cancelling children (Stop re-aborts the turn once they are
-  // cancelled). It ignores in-flight subagent executions, so a detached
+  // cancelled; in that window it can be true while `isBusy()` is false).
+  // It ignores in-flight subagent executions, so a detached
   // `task_delegate` child that outlives its parent turn reads
   // `isBusy() === true` but `isTurnActive() === false`. An inline
   // `spawn_subagent` still reads true through the turn that runs it. Hosts
