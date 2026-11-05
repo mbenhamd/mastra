@@ -352,7 +352,15 @@ describe('plan task capacity counts only live tasks', () => {
 
   type ChangeRow = {
     live: number;
-    attempt: 'reopen completed leaf' | 'reparent under finished parent' | 'edit content' | 'complete';
+    attempt:
+      | 'reopen completed leaf'
+      | 'reparent under finished parent'
+      | 'edit content'
+      | 'complete'
+      | 'delegate failed leaf'
+      | 'delegate completed leaf of finished parent'
+      | 'delegate pending leaf'
+      | 'in_progress back to pending';
     expected: 'accepted' | RegExp;
   };
   const changeRows: ChangeRow[] = [
@@ -364,21 +372,28 @@ describe('plan task capacity counts only live tasks', () => {
     { live: 101, attempt: 'edit content', expected: 'accepted' },
     { live: 100, attempt: 'complete', expected: 'accepted' },
     { live: 101, attempt: 'complete', expected: 'accepted' },
+    { live: 100, attempt: 'delegate failed leaf', expected: /limit is 100 live/ },
+    { live: 100, attempt: 'delegate completed leaf of finished parent', expected: /limit is 100 live/ },
+    { live: 100, attempt: 'delegate pending leaf', expected: 'accepted' },
+    { live: 101, attempt: 'in_progress back to pending', expected: 'accepted' },
   ];
 
   it.each(changeRows)('$live live + 150 finished, $attempt -> $expected', async ({ live, attempt, expected }) => {
     const h = await setup();
-    // History: 146 finished rows, a completed leaf, and a finished parent (a
-    // derived root whose only child completed): 150 finished in all.
+    // History: 145 finished rows, a completed leaf, a failed leaf, and a
+    // finished parent (a derived root whose only child completed): 150 in all.
     const completedLeaf = seedRow('completed');
+    const failedLeaf = seedRow('failed');
     const finishedParent = seedRow('completed', { statusSource: 'derived' });
-    const liveIds = await seedPlan(h, { terminal: 146, live });
+    const finishedChild = seedRow('completed', { parentTaskId: finishedParent.taskId });
+    const liveIds = await seedPlan(h, { terminal: 145, live });
     await h.storage.mutatePlanTasksForSession({
       fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
       ops: [
         { kind: 'create', task: completedLeaf },
+        { kind: 'create', task: failedLeaf },
         { kind: 'create', task: finishedParent },
-        { kind: 'create', task: seedRow('completed', { parentTaskId: finishedParent.taskId }) },
+        { kind: 'create', task: finishedChild },
       ],
     });
     const before = await listAll(h.storage);
@@ -401,6 +416,22 @@ describe('plan task capacity counts only live tasks', () => {
         case 'complete':
           await planTaskComplete(h.port, target);
           return () => expect(after.get(target)?.status).toBe('completed');
+        case 'delegate failed leaf':
+          await planTaskDelegate(h.port, { taskId: failedLeaf.taskId, subagentSessionId: 'sub-failed' });
+          return () => expect(after.get(failedLeaf.taskId)?.status).toBe('in_progress');
+        case 'delegate completed leaf of finished parent':
+          await planTaskDelegate(h.port, { taskId: finishedChild.taskId, subagentSessionId: 'sub-child' });
+          return () => expect(after.get(finishedParent.taskId)?.status).toBe('in_progress');
+        case 'delegate pending leaf':
+          await planTaskDelegate(h.port, { taskId: target, subagentSessionId: 'sub-pending' });
+          return () => {
+            expect(after.get(target)?.status).toBe('in_progress');
+            expect(after.get(target)?.delegatedSubagentSessionId).toBe('sub-pending');
+          };
+        case 'in_progress back to pending':
+          await planTaskUpdate(h.port, target, { status: 'in_progress' });
+          await planTaskUpdate(h.port, target, { status: 'pending' });
+          return () => expect(after.get(target)?.status).toBe('pending');
       }
     };
 

@@ -1735,6 +1735,7 @@ export async function planTaskDelegate(port: PlanTaskSessionPort, input: Delegat
     },
   ];
   const { ops, deltas } = buildCommitOps(postTasks, structuralOps, staged);
+  assertPlanTaskCapacity(tasks, postTasks, deltas);
   await port.storage.mutatePlanTasksForSession({ fence: fence(port), ops });
   refreshSummary(port, postTasks, deltas);
   emit(port, 'delegate', [input.taskId], deltas);
