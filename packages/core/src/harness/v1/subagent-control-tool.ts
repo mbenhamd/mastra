@@ -86,11 +86,27 @@ const CHILD_LOAD_BATCH = 16;
  */
 export const SUBAGENT_CONTROL_WAIT_READ_STALL_MS = 1_000;
 
-const subagentStatusEnum = z.enum(['running', 'awaiting_input', 'idle', 'completed', 'blocked', 'failed', 'closed']);
+const subagentStatusEnum = z.enum([
+  'running',
+  'awaiting_input',
+  'idle',
+  'completed',
+  'blocked',
+  'cancelled',
+  'failed',
+  'closed',
+]);
 type SubagentStatus = z.infer<typeof subagentStatusEnum>;
 
 /** A child whose status is one of these has nothing left to wait for. */
-const SETTLED_STATUSES: ReadonlySet<SubagentStatus> = new Set(['idle', 'completed', 'blocked', 'failed', 'closed']);
+const SETTLED_STATUSES: ReadonlySet<SubagentStatus> = new Set([
+  'idle',
+  'completed',
+  'blocked',
+  'cancelled',
+  'failed',
+  'closed',
+]);
 
 const subagentViewSchema = z.object({
   subagentSessionId: z.string(),
@@ -670,7 +686,7 @@ export function createSubagentControlTool(parent: Session) {
     } else if (delegated !== undefined && delegated.status === 'completed') {
       status = 'completed';
     } else if (delegated !== undefined && (delegated.status === 'failed' || delegated.status === 'cancelled')) {
-      status = 'failed';
+      status = delegated.status;
     } else if (record.closedAt !== undefined && delegated?.delegatedSubagentSessionId !== childId) {
       // Terminal lifecycle wins over suspension metadata a cancel preserves.
       status = 'closed';

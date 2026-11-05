@@ -26,6 +26,46 @@ export interface HarnessTerminalExecutionGrant {
   generation: number;
 }
 
+/**
+ * PF-7631: grant keys in this namespace are minted only by the Harness, one
+ * per settlement wake turn (`harness-wake:<wakeNoticeId>`, generation 1).
+ * Public admission paths reject a caller-supplied key or admission id in it.
+ */
+export const HARNESS_WAKE_GRANT_KEY_PREFIX = 'harness-wake:';
+
+/** Whether a grant key or admission id is in the Harness-reserved wake namespace. */
+export function isHarnessWakeReservedKey(key: string): boolean {
+  return typeof key === 'string' && key.startsWith(HARNESS_WAKE_GRANT_KEY_PREFIX);
+}
+
+/** The Harness-minted grant of the settlement wake turn for one notice. */
+export function harnessWakeExecutionGrant(wakeNoticeId: string): HarnessTerminalExecutionGrant {
+  return { key: `${HARNESS_WAKE_GRANT_KEY_PREFIX}${wakeNoticeId}`, generation: 1 };
+}
+
+/**
+ * PF-7631: the projection payload of a settlement wake turn's terminal intent
+ * (`sessions.terminalHandoff.wakeFinalizer`). The Harness wraps the registered
+ * wake finalizer's payload as `reply` and adds the wake identity, so a
+ * consumer reads it without parsing ids or reminder text.
+ */
+export interface HarnessWakeTerminalPayload {
+  [key: string]: JsonValue;
+  origin: 'wake';
+  /** Opaque id of the delivered settlement notice; equals `agent_start.wakeNoticeId`. */
+  wakeNoticeId: string;
+  /** The wake run; equals the intent's `runId`. */
+  runId: string;
+  /** The delegated plan task whose settlement woke the session. */
+  taskId: string;
+  /** The delegated child session that settled. */
+  subagentSessionId: string;
+  /** The settled task's outcome, as the notice reported it. */
+  outcome: 'completed' | 'blocked' | 'failed';
+  /** The registered wake finalizer's own payload. */
+  reply: JsonValue;
+}
+
 export interface HarnessTerminalIdentity {
   harnessName: string;
   sessionId: string;
@@ -354,6 +394,38 @@ export interface HarnessTerminalClaimInput {
   limit: number;
   now?: number;
   leaseMs?: number;
+  /**
+   * Claim only intents committed under one of these finalizer ids (any
+   * version). Omitted claims every finalizer's intents. Per-session delivery
+   * order holds within one finalizer id, so a consumer of one kind is never
+   * held behind another kind's unsettled intent.
+   */
+  finalizerIds?: readonly string[];
+}
+
+/** Upper bound on `HarnessTerminalClaimInput.finalizerIds` entries. */
+export const MAX_HARNESS_TERMINAL_CLAIM_FINALIZER_IDS = 64;
+
+/**
+ * Validates a claim's finalizer filter: absent, or a non-empty bounded list of
+ * bounded ids. Returns the distinct ids, or `undefined` for no filter.
+ */
+export function normalizeHarnessTerminalClaimFinalizerIds(
+  finalizerIds: readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (finalizerIds === undefined) return undefined;
+  if (
+    !Array.isArray(finalizerIds) ||
+    finalizerIds.length === 0 ||
+    finalizerIds.length > MAX_HARNESS_TERMINAL_CLAIM_FINALIZER_IDS
+  ) {
+    throw new HarnessTerminalHandoffValidationError(
+      'finalizerIds',
+      `must be a non-empty array of at most ${MAX_HARNESS_TERMINAL_CLAIM_FINALIZER_IDS} finalizer ids`,
+    );
+  }
+  finalizerIds.forEach((id, index) => boundedId(id, `finalizerIds[${index}]`));
+  return [...new Set(finalizerIds)];
 }
 
 export interface HarnessTerminalClaimReceipt {

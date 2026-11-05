@@ -559,6 +559,12 @@ export interface SessionRecord {
     reason?: string;
     /** Free-form actor label, for example an A2A task id or route id. */
     requestedBy?: string;
+    /**
+     * Harness-owned: set only when the parent session `requestedBy` cancelled
+     * exactly this child (`cancelSubagent` or the `subagent` tool). A cascade,
+     * Stop, timeout or public `cancel()` never sets it.
+     */
+    targeted?: true;
   };
 }
 

@@ -92,6 +92,7 @@ import {
   HARNESS_MESSAGE_RESULT_ERASED_CODE,
   contentFreeHarnessTerminalReason,
   harnessTerminalIntentId,
+  normalizeHarnessTerminalClaimFinalizerIds,
   prepareHarnessTerminalAdmission,
   prepareHarnessTerminalProjection,
   terminalClaimId,
@@ -6461,12 +6462,18 @@ export class HarnessPG extends HarnessStorage {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) {
       throw new HarnessTerminalHandoffValidationError('leaseMs', 'must be a positive safe integer');
     }
+    const finalizerIds = normalizeHarnessTerminalClaimFinalizerIds(input.finalizerIds);
+    const finalizerFilter =
+      finalizerIds === undefined ? '' : `AND candidate.finalizer_id IN (${finalizerIds.map(() => '?').join(', ')})`;
     const tx = await this.#client.transaction('write');
     try {
+      // Per-session order holds within one finalizer id (PF-7631): one kind's
+      // unsettled intent never holds another kind's delivery.
       const candidates = await tx.execute({
         sql: `SELECT candidate.*
               FROM ${TABLE_HARNESS_TERMINAL_INTENTS} AS candidate
               WHERE candidate.harness_name = ?
+                ${finalizerFilter}
                 AND candidate.status IN ('pending', 'failed', 'claimed')
                 AND (candidate.status <> 'claimed' OR candidate.claim_expires_at IS NULL OR candidate.claim_expires_at <= ?)
                 AND (candidate.status <> 'failed' OR candidate.next_attempt_at IS NULL OR candidate.next_attempt_at <= ?)
@@ -6475,12 +6482,13 @@ export class HarnessPG extends HarnessStorage {
                   WHERE earlier.harness_name = candidate.harness_name
                     AND earlier.session_id = candidate.session_id
                     AND earlier.session_incarnation = candidate.session_incarnation
+                    AND earlier.finalizer_id = candidate.finalizer_id
                     AND earlier.revision < candidate.revision
                     AND earlier.status NOT IN ('acked', 'dead', 'fenced')
                 )
               ORDER BY candidate.created_at ASC, candidate.revision ASC, candidate.id ASC
               LIMIT ? FOR UPDATE SKIP LOCKED`,
-        args: [harnessName, now, now, input.limit],
+        args: [harnessName, ...(finalizerIds ?? []), now, now, input.limit],
       });
       const claimed: HarnessTerminalIntent[] = [];
       for (const raw of candidates.rows) {

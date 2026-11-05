@@ -14,7 +14,12 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
-import type { JsonValue, SessionRecord } from '../../storage/domains/harness/types';
+import type {
+  HarnessPlanTask,
+  HarnessPlanTaskStatus,
+  JsonValue,
+  SessionRecord,
+} from '../../storage/domains/harness/types';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { HarnessPlanTaskCycleError, HarnessPlanTaskInProgressConflictError } from './plan-task-hierarchy';
 import {
@@ -33,6 +38,7 @@ import {
   PLAN_TASK_CHECK_MAX_LIMIT,
   PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
   PLAN_TASK_MAX_NODES,
+  PLAN_TASK_MAX_STORED_NODES,
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
 import type { PlanTaskSessionPort, PlanTaskSummary, PlanTaskUpdatedPayload } from './plan-task-session';
@@ -95,7 +101,7 @@ async function setup(): Promise<Harness> {
 }
 
 async function listAll(storage: InMemoryHarness) {
-  const out = await storage.listPlanTasks({ sessionId: SESSION_ID, limit: 1000 });
+  const out = await storage.listPlanTasks({ sessionId: SESSION_ID, limit: 5000 });
   return new Map(out.tasks.map(t => [t.taskId, t]));
 }
 
@@ -144,7 +150,7 @@ describe('planTaskAdd', () => {
       Array.from({ length: PLAN_TASK_MAX_NODES - 1 }, (_, index) => ({ content: `child-${index}` })),
     );
 
-    await expect(planTaskAdd(port, { content: 'over budget' })).rejects.toThrow(/limit is 100 nodes/);
+    await expect(planTaskAdd(port, { content: 'over budget' })).rejects.toThrow(/limit is 100 live/);
     expect((await listAll(storage)).size).toBe(PLAN_TASK_MAX_NODES);
   });
 
@@ -160,7 +166,7 @@ describe('planTaskAdd', () => {
 
     await expect(
       planTaskDecompose(port, root.taskId, [{ content: 'too-many-a' }, { content: 'too-many-b' }]),
-    ).rejects.toThrow(/limit is 100 nodes/);
+    ).rejects.toThrow(/limit is 100 live/);
     expect(await listAll(storage)).toEqual(before);
   });
 
@@ -177,6 +183,411 @@ describe('planTaskAdd', () => {
     expect(stored.get(parent.taskId)?.statusSource).toBe('derived');
     expect(stored.get(parent.taskId)?.status).toBe('in_progress'); // rolled up from child
     expect(stored.get(child.taskId)?.status).toBe('in_progress');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live-task capacity: finished tasks never block a new plan
+// ---------------------------------------------------------------------------
+
+let seedSeq = 0;
+function seedRow(status: HarnessPlanTaskStatus, extra: Partial<HarnessPlanTask> = {}): HarnessPlanTask {
+  seedSeq += 1;
+  return {
+    taskId: `seed-${seedSeq}`,
+    harnessName: 'default',
+    sessionId: SESSION_ID,
+    resourceId: 'r1',
+    threadId: 't1',
+    order: seedSeq,
+    status,
+    statusSource: 'explicit',
+    content: `seed ${seedSeq}`,
+    createdAt: 0,
+    updatedAt: 0,
+    version: 1,
+    ...extra,
+  };
+}
+
+/**
+ * Write rows straight to storage, bypassing the plan writer's capacity check,
+ * so a test can stand up any history (including one the writer would refuse).
+ * `terminal` rows rotate completed / cancelled / failed; `live` rows are
+ * pending roots. Returns the live root ids.
+ */
+async function seedPlan(h: Harness, counts: { terminal: number; live: number }): Promise<string[]> {
+  const terminalStatuses: HarnessPlanTaskStatus[] = ['completed', 'cancelled', 'failed'];
+  const rows: HarnessPlanTask[] = [];
+  for (let i = 0; i < counts.terminal; i++) rows.push(seedRow(terminalStatuses[i % 3]!));
+  const live = Array.from({ length: counts.live }, () => seedRow('pending'));
+  rows.push(...live);
+  for (let i = 0; i < rows.length; i += 200) {
+    await h.storage.mutatePlanTasksForSession({
+      fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
+      ops: rows.slice(i, i + 200).map(task => ({ kind: 'create' as const, task })),
+    });
+  }
+  return live.map(task => task.taskId);
+}
+
+describe('plan task capacity counts only live tasks', () => {
+  type CapRow = {
+    name: string;
+    terminal: number;
+    live: number;
+    attempt: 'add' | 'add completed' | 'add under finished parent' | 'decompose 5' | 'decompose 6';
+    expected: 'accepted' | RegExp;
+  };
+  const rows: CapRow[] = [
+    { name: '98 live + 150 finished, add', terminal: 150, live: 98, attempt: 'add', expected: 'accepted' },
+    { name: '99 live + 150 finished, add', terminal: 150, live: 99, attempt: 'add', expected: 'accepted' },
+    { name: '100 live + 150 finished, add', terminal: 150, live: 100, attempt: 'add', expected: /limit is 100 live/ },
+    { name: '101 live + 150 finished, add', terminal: 150, live: 101, attempt: 'add', expected: /limit is 100 live/ },
+    { name: '99 live, no history, add', terminal: 0, live: 99, attempt: 'add', expected: 'accepted' },
+    { name: '100 live, no history, add', terminal: 0, live: 100, attempt: 'add', expected: /limit is 100 live/ },
+    {
+      name: '100 live + 150 finished, add an already-completed task',
+      terminal: 150,
+      live: 100,
+      attempt: 'add completed',
+      expected: 'accepted',
+    },
+    {
+      name: '98 live + 150 finished, child reopens its finished parent (child + parent = 100)',
+      terminal: 150,
+      live: 98,
+      attempt: 'add under finished parent',
+      expected: 'accepted',
+    },
+    {
+      name: '99 live + 150 finished, child reopens its finished parent (child + parent = 101)',
+      terminal: 150,
+      live: 99,
+      attempt: 'add under finished parent',
+      expected: /limit is 100 live/,
+    },
+    {
+      name: '95 live + 150 finished, decompose 5',
+      terminal: 150,
+      live: 95,
+      attempt: 'decompose 5',
+      expected: 'accepted',
+    },
+    {
+      name: '95 live + 150 finished, decompose 6',
+      terminal: 150,
+      live: 95,
+      attempt: 'decompose 6',
+      expected: /limit is 100 live/,
+    },
+    {
+      name: `${PLAN_TASK_MAX_STORED_NODES - 1} finished, add`,
+      terminal: PLAN_TASK_MAX_STORED_NODES - 1,
+      live: 0,
+      attempt: 'add',
+      expected: 'accepted',
+    },
+    {
+      name: `${PLAN_TASK_MAX_STORED_NODES} finished, add`,
+      terminal: PLAN_TASK_MAX_STORED_NODES,
+      live: 0,
+      attempt: 'add',
+      expected:
+        /reached the limit of 1000 stored plan tasks.*Do not retry adding tasks\. Tell the user the plan must be reset by the application\./,
+    },
+  ];
+
+  it.each(rows)('$name -> $expected', async ({ terminal, live, attempt, expected }) => {
+    const h = await setup();
+    // A finished parent: a derived root whose only child completed. It is
+    // seeded with the terminal rows, so it costs nothing until reopened.
+    const finishedParent =
+      attempt === 'add under finished parent' ? seedRow('completed', { statusSource: 'derived' }) : undefined;
+    const liveIds = await seedPlan(h, {
+      terminal: terminal - (finishedParent ? 2 : 0),
+      live,
+    });
+    if (finishedParent) {
+      await h.storage.mutatePlanTasksForSession({
+        fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
+        ops: [
+          { kind: 'create', task: finishedParent },
+          { kind: 'create', task: seedRow('completed', { parentTaskId: finishedParent.taskId }) },
+        ],
+      });
+    }
+    const before = await listAll(h.storage);
+
+    const run = async () => {
+      switch (attempt) {
+        case 'add':
+          return [await planTaskAdd(h.port, { content: 'next plan' })];
+        case 'add completed':
+          return [await planTaskAdd(h.port, { content: 'already done', status: 'completed' })];
+        case 'add under finished parent':
+          return [await planTaskAdd(h.port, { content: 'follow-up', parentTaskId: finishedParent!.taskId })];
+        case 'decompose 5':
+        case 'decompose 6': {
+          const n = attempt === 'decompose 5' ? 5 : 6;
+          return planTaskDecompose(
+            h.port,
+            liveIds[0]!,
+            Array.from({ length: n }, (_, i) => ({ content: `step ${i}` })),
+          );
+        }
+      }
+    };
+
+    if (expected === 'accepted') {
+      const created = await run();
+      const after = await listAll(h.storage);
+      expect(after.size).toBe(before.size + created.length);
+      for (const view of created) expect(after.get(view.taskId)?.content).toBe(view.content);
+    } else {
+      await expect(run()).rejects.toThrow(expected);
+      // Rejected before any write: no partial child, no reopened parent.
+      expect(await listAll(h.storage)).toEqual(before);
+    }
+  });
+
+  type ChangeRow = {
+    live: number;
+    attempt:
+      | 'reopen completed leaf'
+      | 'reparent under finished parent'
+      | 'edit content'
+      | 'complete'
+      | 'delegate failed leaf'
+      | 'delegate completed leaf of finished parent'
+      | 'delegate pending leaf'
+      | 'in_progress back to pending';
+    expected: 'accepted' | RegExp;
+  };
+  const changeRows: ChangeRow[] = [
+    { live: 99, attempt: 'reopen completed leaf', expected: 'accepted' },
+    { live: 100, attempt: 'reopen completed leaf', expected: /limit is 100 live/ },
+    { live: 99, attempt: 'reparent under finished parent', expected: 'accepted' },
+    { live: 100, attempt: 'reparent under finished parent', expected: /limit is 100 live/ },
+    { live: 100, attempt: 'edit content', expected: 'accepted' },
+    { live: 101, attempt: 'edit content', expected: 'accepted' },
+    { live: 100, attempt: 'complete', expected: 'accepted' },
+    { live: 101, attempt: 'complete', expected: 'accepted' },
+    { live: 100, attempt: 'delegate failed leaf', expected: /limit is 100 live/ },
+    { live: 100, attempt: 'delegate completed leaf of finished parent', expected: /limit is 100 live/ },
+    { live: 100, attempt: 'delegate pending leaf', expected: 'accepted' },
+    { live: 101, attempt: 'in_progress back to pending', expected: 'accepted' },
+  ];
+
+  it.each(changeRows)('$live live + 150 finished, $attempt -> $expected', async ({ live, attempt, expected }) => {
+    const h = await setup();
+    // History: 145 finished rows, a completed leaf, a failed leaf, and a
+    // finished parent (a derived root whose only child completed): 150 in all.
+    const completedLeaf = seedRow('completed');
+    const failedLeaf = seedRow('failed');
+    const finishedParent = seedRow('completed', { statusSource: 'derived' });
+    const finishedChild = seedRow('completed', { parentTaskId: finishedParent.taskId });
+    const liveIds = await seedPlan(h, { terminal: 145, live });
+    await h.storage.mutatePlanTasksForSession({
+      fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
+      ops: [
+        { kind: 'create', task: completedLeaf },
+        { kind: 'create', task: failedLeaf },
+        { kind: 'create', task: finishedParent },
+        { kind: 'create', task: finishedChild },
+      ],
+    });
+    const before = await listAll(h.storage);
+    const target = liveIds[0]!;
+
+    const run = async (): Promise<() => void> => {
+      switch (attempt) {
+        case 'reopen completed leaf':
+          await planTaskUpdate(h.port, completedLeaf.taskId, { status: 'pending' });
+          return () => expect(after.get(completedLeaf.taskId)?.status).toBe('pending');
+        case 'reparent under finished parent':
+          await planTaskReparent(h.port, target, finishedParent.taskId);
+          return () => {
+            expect(after.get(target)?.parentTaskId).toBe(finishedParent.taskId);
+            expect(after.get(finishedParent.taskId)?.status).toBe('pending');
+          };
+        case 'edit content':
+          await planTaskUpdate(h.port, target, { content: 'renamed' });
+          return () => expect(after.get(target)?.content).toBe('renamed');
+        case 'complete':
+          await planTaskComplete(h.port, target);
+          return () => expect(after.get(target)?.status).toBe('completed');
+        case 'delegate failed leaf':
+          await planTaskDelegate(h.port, { taskId: failedLeaf.taskId, subagentSessionId: 'sub-failed' });
+          return () => expect(after.get(failedLeaf.taskId)?.status).toBe('in_progress');
+        case 'delegate completed leaf of finished parent':
+          await planTaskDelegate(h.port, { taskId: finishedChild.taskId, subagentSessionId: 'sub-child' });
+          return () => expect(after.get(finishedParent.taskId)?.status).toBe('in_progress');
+        case 'delegate pending leaf':
+          await planTaskDelegate(h.port, { taskId: target, subagentSessionId: 'sub-pending' });
+          return () => {
+            expect(after.get(target)?.status).toBe('in_progress');
+            expect(after.get(target)?.delegatedSubagentSessionId).toBe('sub-pending');
+          };
+        case 'in_progress back to pending':
+          await planTaskUpdate(h.port, target, { status: 'in_progress' });
+          await planTaskUpdate(h.port, target, { status: 'pending' });
+          return () => expect(after.get(target)?.status).toBe('pending');
+      }
+    };
+
+    let after = before;
+    if (expected === 'accepted') {
+      const assertCommitted = await run();
+      after = await listAll(h.storage);
+      assertCommitted();
+    } else {
+      await expect(run()).rejects.toThrow(expected);
+      // Refused before the storage write: nothing reopened, nothing moved.
+      expect(await listAll(h.storage)).toEqual(before);
+    }
+  });
+
+  type DelegationRow = {
+    name: string;
+    live: number;
+    scope: 'failed subtree' | 'failed leaf';
+    then: 'settle blocked' | 'add';
+    expected: 'accepted' | RegExp;
+  };
+  // A delegation's settlement writes `blocked` (live) back over every failed
+  // task in its scope without a capacity check, so admission reserves them.
+  const delegationRows: DelegationRow[] = [
+    {
+      name: '97 live, delegate a failed root with 3 failed children (worst case 101)',
+      live: 97,
+      scope: 'failed subtree',
+      then: 'settle blocked',
+      expected: /limit is 100 live/,
+    },
+    {
+      name: '96 live, delegate a failed root with 3 failed children (worst case 100), settle blocked',
+      live: 96,
+      scope: 'failed subtree',
+      then: 'settle blocked',
+      expected: 'accepted',
+    },
+    {
+      name: '96 live, delegate a failed root with 3 failed children, then add while it is open',
+      live: 96,
+      scope: 'failed subtree',
+      then: 'add',
+      expected: /limit is 100 live/,
+    },
+    {
+      name: '99 live, delegate a failed leaf (worst case 100), settle blocked',
+      live: 99,
+      scope: 'failed leaf',
+      then: 'settle blocked',
+      expected: 'accepted',
+    },
+  ];
+
+  it.each(delegationRows)('$name -> $expected', async ({ live, scope, then, expected }) => {
+    const h = await setup();
+    const root = seedRow('failed');
+    const children =
+      scope === 'failed subtree' ? [1, 2, 3].map(() => seedRow('failed', { parentTaskId: root.taskId })) : [];
+    await seedPlan(h, { terminal: 150, live });
+    await h.storage.mutatePlanTasksForSession({
+      fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
+      ops: [root, ...children].map(task => ({ kind: 'create' as const, task })),
+    });
+    const before = await listAll(h.storage);
+    const countLive = (rows: Map<string, HarnessPlanTask>) =>
+      [...rows.values()].filter(row => !['completed', 'cancelled', 'failed'].includes(row.status)).length;
+
+    const delegate = () =>
+      planTaskDelegate(h.port, {
+        taskId: root.taskId,
+        subagentSessionId: 'sub-scope',
+        ...(children.length > 0 ? { includeSubtree: true } : {}),
+      });
+
+    if (then === 'add') {
+      await delegate();
+      const delegated = await listAll(h.storage);
+      await expect(planTaskAdd(h.port, { content: 'one more' })).rejects.toThrow(expected);
+      expect(await listAll(h.storage)).toEqual(delegated);
+      return;
+    }
+    if (expected !== 'accepted') {
+      await expect(delegate()).rejects.toThrow(expected);
+      // Refused at admission: no link, nothing started.
+      expect(await listAll(h.storage)).toEqual(before);
+      return;
+    }
+    await delegate();
+    const settled = await planTaskReconcileDelegation(h.port, {
+      taskId: root.taskId,
+      subagentSessionId: 'sub-scope',
+      outcome: 'blocked',
+    });
+    expect(settled.reconciled).toBe(true);
+    const after = await listAll(h.storage);
+    for (const task of [root, ...children]) expect(after.get(task.taskId)?.status).toBe('blocked');
+    expect(countLive(after)).toBe(live + 1 + children.length);
+    expect(countLive(after)).toBeLessThanOrEqual(PLAN_TASK_MAX_NODES);
+  });
+
+  it('plans again after more than 100 tasks were spent across several finished plans', async () => {
+    const { storage, port, summaries } = await setup();
+    const roots: string[] = [];
+    // Five requests, each a root plus 29 steps the agent finishes: 150 tasks.
+    for (let round = 0; round < 5; round++) {
+      const root = await planTaskAdd(port, { content: `request ${round}` });
+      roots.push(root.taskId);
+      const steps = await planTaskDecompose(
+        port,
+        root.taskId,
+        Array.from({ length: 29 }, (_, i) => ({ content: `request ${round} step ${i}` })),
+      );
+      for (const step of steps) await planTaskComplete(port, step.taskId);
+    }
+    const spent = await listAll(storage);
+    expect(spent.size).toBe(150);
+    for (const rootId of roots) expect(spent.get(rootId)?.status).toBe('completed');
+
+    // The next request still gets a full 100-task live plan.
+    const next = await planTaskAdd(port, { content: 'request 5' });
+    const nextSteps = await planTaskDecompose(
+      port,
+      next.taskId,
+      Array.from({ length: PLAN_TASK_MAX_NODES - 1 }, (_, i) => ({ content: `request 5 step ${i}` })),
+    );
+    expect(nextSteps).toHaveLength(PLAN_TASK_MAX_NODES - 1);
+    await expect(planTaskAdd(port, { content: 'one too many' })).rejects.toThrow(/limit is 100 live/);
+    expect(summaries.at(-1)).toMatchObject({ total: 250, rootCount: 6, byStatus: { completed: 150, pending: 100 } });
+
+    // The current plan is reachable through the paged check after the history.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await planTaskCheck(port, { depth: 0, limit: 2, cursor });
+      seen.push(...page.tasks.map(task => task.taskId));
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    expect(seen).toEqual([...roots, next.taskId]);
+    const current = await planTaskCheck(port, { rootTaskId: next.taskId, limit: PLAN_TASK_CHECK_MAX_LIMIT });
+    expect(current.tasks.map(task => task.taskId)).toEqual([next.taskId, ...nextSteps.map(step => step.taskId)]);
+
+    // An unfiltered paged read walks past the 150 stored history rows and
+    // reaches every task of the current plan.
+    const all: string[] = [];
+    cursor = undefined;
+    do {
+      const page = await planTaskCheck(port, { limit: PLAN_TASK_CHECK_MAX_LIMIT, cursor });
+      all.push(...page.tasks.map(task => task.taskId));
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    expect(all).toHaveLength(250);
+    expect(new Set(all).size).toBe(250);
+    expect(all.slice(-PLAN_TASK_MAX_NODES)).toEqual([next.taskId, ...nextSteps.map(step => step.taskId)]);
   });
 });
 
@@ -1143,8 +1554,8 @@ describe('clampPlanTaskCheckLimit', () => {
   it('planTaskCheck never reads more than the cap even when handed a hostile limit', async () => {
     const { storage, port } = await setup();
     const root = await planTaskAdd(port, { content: 'root' });
-    // Fill the largest valid plan; a hostile caller still cannot raise the read
-    // limit above the plan's transaction-safe node budget.
+    // Fill a full live plan; a hostile caller still cannot raise the read
+    // limit above the stored-plan bound.
     const n = PLAN_TASK_MAX_NODES - 1;
     for (let i = 0; i < n; i++) {
       await planTaskAdd(port, { content: `c${i}`, parentTaskId: root.taskId });
@@ -1157,8 +1568,8 @@ describe('clampPlanTaskCheckLimit', () => {
     }) as typeof storage.loadPlanTaskSubtree;
 
     const res = await planTaskCheck(port, { rootTaskId: root.taskId, limit: 10_000_000 });
-    expect(observedLimits).toContain(PLAN_TASK_CHECK_MAX_LIMIT);
-    expect(Math.max(...observedLimits)).toBe(PLAN_TASK_CHECK_MAX_LIMIT);
+    // The storage read is bounded by the stored-plan cap; the page by the check cap.
+    expect(Math.max(...observedLimits)).toBe(PLAN_TASK_MAX_STORED_NODES);
     expect(res.tasks.length).toBeLessThanOrEqual(PLAN_TASK_CHECK_MAX_LIMIT);
     expect(res.truncated).toBe(false);
   });

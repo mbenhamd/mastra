@@ -756,10 +756,11 @@ type HarnessSubagentOutcomeEvidence = HarnessSubagentOutcomeReport['evidence'][n
  * - a claim that cites a `toolCallId` must match that exact call's recorded
  *   name and status;
  * - a claim without an id (models are never shown framework call ids) binds to
- *   one distinct recorded call with the same tool name and status, in
- *   execution order that no other item already cites. A call whose receipts
- *   disagree on name/status is never bound this way, and a claim with no
- *   unclaimed matching call is rejected.
+ *   the first recorded call, in execution order, with the same tool name and
+ *   status that no other item already cites; when every such call is already
+ *   cited, it re-binds to the first of them (the same receipt described
+ *   twice). A call whose receipts disagree on name/status is never bound this
+ *   way, and a claim with no matching call at all is rejected.
  *
  * Returns the report with every `tool-result` item carrying its bound
  * framework id, or undefined when any claim is not backed by the ledger.
@@ -781,7 +782,7 @@ function bindHarnessSubagentOutcomeEvidence(
       ? [{ toolCallId, toolName: first.toolName, status: first.status }]
       : [];
   });
-  // Calls cited by exact id are already claimed; id-less claims bind elsewhere.
+  // Calls cited by exact id are already claimed; id-less claims prefer others.
   const claimed = new Set(
     report.evidence.flatMap(item =>
       item.kind === 'tool-result' && item.toolCallId !== undefined ? [item.toolCallId] : [],
@@ -807,12 +808,13 @@ function bindHarnessSubagentOutcomeEvidence(
       }
       evidence.push(item);
     } else {
-      const call = unambiguousCalls.find(
-        candidate =>
-          !claimed.has(candidate.toolCallId) &&
-          candidate.toolName === item.toolName &&
-          candidate.status === item.status,
-      );
+      const matches = (candidate: (typeof unambiguousCalls)[number]) =>
+        candidate.toolName === item.toolName && candidate.status === item.status;
+      // Prefer a call no other item cites. A further description of a receipt
+      // already cited re-binds to it (PF-7506) instead of discarding the report.
+      const call =
+        unambiguousCalls.find(candidate => !claimed.has(candidate.toolCallId) && matches(candidate)) ??
+        unambiguousCalls.find(matches);
       if (call === undefined) return undefined;
       claimed.add(call.toolCallId);
       evidence.push({ ...item, toolCallId: call.toolCallId });
