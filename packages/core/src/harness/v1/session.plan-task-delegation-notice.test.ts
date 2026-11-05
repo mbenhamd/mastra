@@ -8,13 +8,14 @@
  * so delivery survives a restart and happens at most once.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { MockMemory } from '../../memory/mock';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
 import { MockAgent } from './__test-utils__';
+import { HarnessConfigError } from './errors';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
 import type { Session } from './session';
@@ -44,13 +45,22 @@ const completedReport = {
 
 function buildHarness(db: InMemoryDB, onDelegatedSettlement: NoticeMode, memory?: MockMemory) {
   const parentAgent = new MockAgent({ id: 'parent-agent' });
-  if (memory !== undefined) vi.spyOn(parentAgent, 'getMemory').mockResolvedValue(memory as never);
   const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
+  // A memory-less mode that cannot delegate, like a governed workflow step.
+  const quietAgent = new MockAgent({ id: 'quiet-agent' });
+  if (memory !== undefined) {
+    // Both modes can delegate, so `remind` requires memory on both agents.
+    for (const agent of [parentAgent, childAgent]) {
+      vi.spyOn(agent, 'hasOwnMemory').mockReturnValue(true);
+      vi.spyOn(agent, 'getMemory').mockResolvedValue(memory as never);
+    }
+  }
   const harness = new Harness({
-    agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+    agents: { 'parent-agent': parentAgent, 'child-agent': childAgent, 'quiet-agent': quietAgent } as any,
     modes: [
       { id: 'default', agentId: 'parent-agent' },
       { id: 'worker-mode', agentId: 'child-agent' },
+      { id: 'quiet-mode', agentId: 'quiet-agent', harnessBuiltins: 'exclude' },
     ],
     defaultModeId: 'default',
     sessions: { storage: new InMemoryHarness({ db }) },
@@ -146,21 +156,23 @@ async function delegateFromParentTurn(
 }
 
 /** Hold reminder-row writes to the parent thread until the returned release is called. */
-function gatedMemory(): { memory: MockMemory; release: () => void; entered: Promise<void> } {
+function gatedMemory(): { memory: MockMemory; release: () => void; entered: Promise<void>; written: () => boolean } {
   const memory = new MockMemory();
   let release!: () => void;
   const gate = new Promise<void>(r => (release = r));
   let enter!: () => void;
   const entered = new Promise<void>(r => (enter = r));
+  let written = false;
   const save = memory.saveMessages.bind(memory);
   vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
-    if (args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) {
-      enter();
-      await gate;
-    }
-    return save(args);
+    if (!args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) return save(args);
+    enter();
+    await gate;
+    const saved = await save(args);
+    written = true;
+    return saved;
   });
-  return { memory, release, entered };
+  return { memory, release, entered, written: () => written };
 }
 
 function crashParent(db: InMemoryDB, parent: Session): void {
@@ -178,6 +190,155 @@ function reminderCalls(agent: MockAgent) {
 describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', () => {
   it('rejects an unknown notice mode', () => {
     expect(() => buildHarness(new InMemoryDB(), 'shout' as never)).toThrow(/onDelegatedSettlement/);
+  });
+
+  it('rejects remind when a delegation-capable mode has no memory to persist the reminder into', () => {
+    const build = () => buildHarness(new InMemoryDB(), 'remind');
+    expect(build).toThrow(HarnessConfigError);
+    expect(build).toThrow(/subagents\.onDelegatedSettlement.*mode "default".*no memory/);
+  });
+
+  it('accepts remind on a memory-less mode when no subagent type exists to delegate to', async () => {
+    const harness = new Harness({
+      agents: { 'parent-agent': new MockAgent({ id: 'parent-agent' }) } as any,
+      modes: [{ id: 'default', agentId: 'parent-agent' }],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      subagents: { maxDepth: 2, onDelegatedSettlement: 'remind', types: {} },
+    });
+    const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    // Without a subagent type there is no task_delegate, so no reminder can be owed.
+    expect(Object.keys(createPlanTaskTools(session))).not.toContain(TASK_DELEGATE_TOOL_ID);
+    await harness.shutdown();
+  });
+
+  it('shutdown does not report success while a reminder write is still pending', async () => {
+    const gated = gatedMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', gated.memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+
+    releaseChild();
+    await gated.entered;
+    // At the deadline the shutdown fails and names the outstanding work.
+    await expect(harness.shutdown({ drainTimeoutMs: 200 })).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({ message: expect.stringContaining('Session storage work did not settle') }),
+    });
+
+    let shutdownSettled = false;
+    const retry = harness.shutdown({ drainTimeoutMs: 30_000 }).finally(() => {
+      shutdownSettled = true;
+    });
+    await new Promise(r => setTimeout(r, 50));
+    expect(shutdownSettled).toBe(false);
+    gated.release();
+    await expect(retry).resolves.toBeUndefined();
+    expect(gated.written()).toBe(true);
+  });
+
+  it('a notice left owed by a shutdown that then fails is delivered once the session is live again', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    // The delivery parks while resolving the parent's memory.
+    let releaseMemory!: () => void;
+    const memoryGate = new Promise<void>(r => (releaseMemory = r));
+    let memoryEntered!: () => void;
+    const entered = new Promise<void>(r => (memoryEntered = r));
+    vi.spyOn(parentAgent, 'getMemory').mockImplementationOnce(async () => {
+      memoryEntered();
+      await memoryGate;
+      return memory as never;
+    });
+    // Other shutdown storage work stalls past the drain deadline.
+    let releaseStall!: () => void;
+    const stall = new Promise<void>(r => (releaseStall = r));
+    const append = InMemoryHarness.prototype.appendSessionEvent;
+    const appendSpy = vi
+      .spyOn(InMemoryHarness.prototype, 'appendSessionEvent')
+      .mockImplementation(async function (this: InMemoryHarness, record) {
+        if (parent.isClosing) await stall;
+        return append.call(this, record);
+      });
+    onTestFinished(() => appendSpy.mockRestore());
+
+    releaseChild();
+    await entered;
+    const shutdown = harness.shutdown({ drainTimeoutMs: 300 });
+    // Shutdown has begun, so the delivery bails out and leaves the notice owed.
+    await poll(() => parent.isClosing);
+    releaseMemory();
+    await expect(shutdown).rejects.toMatchObject({ name: 'HarnessStorageError' });
+    expect(parent.isClosing).toBe(false);
+    expect(owedNotice(await planRow(parent, taskId))).toMatchObject({ mode: 'remind' });
+
+    // No new trigger: the restored session delivers the owed notice itself.
+    releaseStall();
+    await deliveryFinished(parent, taskId);
+    const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+    expect(messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'))).toHaveLength(1);
+    await harness.shutdown();
+  });
+
+  it('a notice left owed while shutdown waited on a session close is delivered after the shutdown rolls back', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const other = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    // The delivery parks while resolving the parent's memory.
+    let releaseMemory!: () => void;
+    const memoryGate = new Promise<void>(r => (releaseMemory = r));
+    let memoryEntered!: () => void;
+    const entered = new Promise<void>(r => (memoryEntered = r));
+    vi.spyOn(parentAgent, 'getMemory').mockImplementationOnce(async () => {
+      memoryEntered();
+      await memoryGate;
+      return memory as never;
+    });
+    // Another session's close stalls in storage past the shutdown deadline.
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>(r => (releaseClose = r));
+    let closeEntered!: () => void;
+    const closeStalled = new Promise<void>(r => (closeEntered = r));
+    const save = InMemoryHarness.prototype.saveSession;
+    const saveSpy = vi
+      .spyOn(InMemoryHarness.prototype, 'saveSession')
+      .mockImplementation(async function (this: InMemoryHarness, record, opts) {
+        if (record.id === other.id && other.isClosing) {
+          closeEntered();
+          await closeGate;
+        }
+        return save.call(this, record, opts);
+      });
+    onTestFinished(() => {
+      releaseClose();
+      saveSpy.mockRestore();
+    });
+    const closing = other.close().catch(() => {});
+    await closeStalled;
+
+    releaseChild();
+    await entered;
+    const shutdown = harness.shutdown({ drainTimeoutMs: 300 });
+    // Shutdown is pending, so the delivery bails out and leaves the notice owed.
+    releaseMemory();
+    await expect(shutdown).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({ message: expect.stringContaining('Session close') }),
+    });
+    expect(owedNotice(await planRow(parent, taskId))).toMatchObject({ mode: 'remind' });
+
+    // No new trigger, and the close is still stalled: the rolled-back harness
+    // delivers the owed notice itself.
+    await deliveryFinished(parent, taskId);
+    const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+    expect(messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'))).toHaveLength(1);
+    releaseClose();
+    await closing;
+    await harness.shutdown();
   });
 
   it('default config records no notice and never wakes the idle parent', async () => {
@@ -209,6 +370,23 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     expect(reminders).toHaveLength(1);
     expect(JSON.stringify(reminders[0]!.content)).toContain(taskId);
     expect(parentAgent.streamCalls).toHaveLength(1);
+    await harness.shutdown();
+  });
+
+  it('remind persists into the delegating mode memory after the parent switched to a memory-less mode', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    await parent.switchMode({ mode: 'quiet-mode' });
+
+    releaseChild();
+    await deliveryFinished(parent, taskId);
+
+    const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+    const reminders = messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'));
+    expect(reminders).toHaveLength(1);
+    expect(JSON.stringify(reminders[0]!.content)).toContain(taskId);
     await harness.shutdown();
   });
 
