@@ -594,10 +594,6 @@ describe('Harness subagent outcome terminal contract', () => {
         [pythonClaim],
         [{ toolCallId: 'call_py', toolName: 'run_python_analysis', status: 'error' }],
       ),
-      // Two claimed runs, one recorded run.
-      claimsMoreRunsThanRecorded: resultFor([pythonClaim, pythonClaim], ranOnce),
-      // The one recorded run is already cited by its exact id.
-      reclaimsCitedRun: resultFor([{ ...pythonClaim, toolCallId: 'call_py' }, pythonClaim], ranOnce),
       // An id that is not in the ledger, such as a sandbox request id.
       unknownId: resultFor([{ ...pythonClaim, toolCallId: 'sandbox-request-7' }], ranOnce),
       // A bound id must still satisfy the report schema's id limit.
@@ -618,6 +614,117 @@ describe('Harness subagent outcome terminal contract', () => {
       expect(verifyHarnessSubagentOutcomeReport(rawResult), name).toBeUndefined();
       expect(summarizeHarnessSubagentResult(rawResult), name).toMatchObject({ status: 'error' });
     }
+  });
+
+  // PF-7506: every citation shape of id-less and id-cited tool-result evidence.
+  // A second description of a recorded receipt re-binds to it; a claim with no
+  // recorded call of that name and status behind it still rejects the report.
+  describe('binds each tool-result citation shape to the receipt ledger', () => {
+    const claim = (toolName: string, status: 'success' | 'error' = 'success', toolCallId?: string) => ({
+      kind: 'tool-result',
+      toolName,
+      status,
+      description: `Observed ${toolName} (${status}).`,
+      ...(toolCallId === undefined ? {} : { toolCallId }),
+    });
+    type Receipts = Parameters<typeof withHarnessSubagentToolReceipts>[1];
+    const resultFor = (evidence: unknown[], receipts: Receipts) =>
+      withHarnessSubagentToolReceipts(
+        { finishReason: 'tool-calls', terminalToolResult: outcomeEnvelope(outcomeReport('completed', { evidence })) },
+        receipts,
+      );
+    const ok = (toolCallId: string, toolName: string) => ({ toolCallId, toolName, status: 'success' as const });
+    const failed = (toolCallId: string, toolName: string) => ({ toolCallId, toolName, status: 'error' as const });
+    // The observed PF-7506 child: one search, one read, the read cited twice.
+    const searchThenRead = [ok('call_search', 'search_papers'), ok('call_read', 'read_paper_content')];
+    const readTwice = [ok('call_read_1', 'read_paper_content'), ok('call_read_2', 'read_paper_content')];
+
+    it.each([
+      ['one id-less claim, one matching call', [claim('read_paper_content')], searchThenRead, ['call_read']],
+      [
+        'the same call described twice without ids (PF-7506)',
+        [claim('read_paper_content'), claim('read_paper_content')],
+        searchThenRead,
+        ['call_read', 'call_read'],
+      ],
+      [
+        'a call cited by id, then described again without an id',
+        [claim('read_paper_content', 'success', 'call_read'), claim('read_paper_content')],
+        searchThenRead,
+        ['call_read', 'call_read'],
+      ],
+      [
+        'two id-less claims, two matching calls: distinct calls in execution order',
+        [claim('read_paper_content'), claim('read_paper_content')],
+        readTwice,
+        ['call_read_1', 'call_read_2'],
+      ],
+      [
+        'three id-less claims, two matching calls: the extra one re-binds to the first',
+        [claim('read_paper_content'), claim('read_paper_content'), claim('read_paper_content')],
+        readTwice,
+        ['call_read_1', 'call_read_2', 'call_read_1'],
+      ],
+      [
+        'different tools, each cited once without an id',
+        [claim('search_papers'), claim('read_paper_content')],
+        searchThenRead,
+        ['call_search', 'call_read'],
+      ],
+      [
+        'a failed call cited as failed beside a successful one',
+        [claim('read_paper_content'), claim('search_papers', 'error'), claim('search_papers', 'error')],
+        [ok('call_read', 'read_paper_content'), failed('call_search', 'search_papers')],
+        ['call_read', 'call_search', 'call_search'],
+      ],
+    ] as const)('accepts %s', (_name, evidence, receipts, boundIds) => {
+      const rawResult = resultFor([...evidence], [...receipts]);
+      const verified = verifyHarnessSubagentOutcomeReport(rawResult);
+      expect(verified?.evidence.map(item => item.toolCallId)).toEqual(boundIds);
+      expect(summarizeHarnessSubagentResult(rawResult)).toMatchObject({ status: 'success', outcome: 'completed' });
+      // The compacted ledger holds each cited receipt once and re-verifies.
+      const projected = projectHarnessSubagentOutcomeReceipts(rawResult);
+      expect(projected.map(receipt => receipt.toolCallId)).toEqual(
+        receipts.map(receipt => receipt.toolCallId).filter(id => boundIds.includes(id)),
+      );
+      expect(
+        verifyHarnessSubagentOutcomeReport({
+          finishReason: 'tool-calls',
+          terminalToolResult: outcomeEnvelope(outcomeReport('completed', { evidence: [...evidence] })),
+          toolResults: { items: projected, verificationOnly: true },
+        })?.evidence.map(item => item.toolCallId),
+      ).toEqual(boundIds);
+    });
+
+    it.each([
+      ['a tool the child never called', [claim('read_paper_content')], [ok('call_search', 'search_papers')]],
+      [
+        'a re-cited receipt beside a claim with no call behind it',
+        [claim('read_paper_content'), claim('read_paper_content'), claim('verify_text_against_sources')],
+        searchThenRead,
+      ],
+      [
+        'a success claim whose only matching call failed',
+        [claim('read_paper_content'), claim('search_papers')],
+        [ok('call_read', 'read_paper_content'), failed('call_search', 'search_papers')],
+      ],
+      [
+        'a failure claim whose only matching call succeeded',
+        [claim('read_paper_content'), claim('read_paper_content', 'error')],
+        searchThenRead,
+      ],
+      ['an id-cited claim with the wrong tool name', [claim('search_papers', 'success', 'call_read')], searchThenRead],
+      ['an id that is not in the ledger', [claim('read_paper_content', 'success', 'request-7')], searchThenRead],
+      [
+        're-citing a call whose receipts disagree on status',
+        [claim('read_paper_content'), claim('read_paper_content')],
+        [ok('call_read', 'read_paper_content'), failed('call_read', 'read_paper_content')],
+      ],
+    ] as const)('rejects %s', (_name, evidence, receipts) => {
+      const rawResult = resultFor([...evidence], [...receipts]);
+      expect(verifyHarnessSubagentOutcomeReport(rawResult)).toBeUndefined();
+      expect(summarizeHarnessSubagentResult(rawResult)).toMatchObject({ status: 'error' });
+    });
   });
 
   it('verifies failed tool evidence from bounded Harness stream receipts omitted by FullOutput.toolResults', () => {
