@@ -1188,8 +1188,11 @@ type ChildListRow = {
   /** Read every left-out child back through the calls the hint names. */
   followHint?: boolean;
   /**
-   * Between pages, settle (close) some inline children already read and some
-   * not yet read; paging must still see every child exactly once.
+   * Between pages, some inline children return the way a finished
+   * spawn_subagent call does (their spawn record is removed, then the child
+   * closes): three already read and three not read yet. They leave the list,
+   * which is the disclosed residual: later pages can shift, by at most one
+   * child per returned child already read.
    */
   settleBetweenPages?: boolean;
 };
@@ -1243,7 +1246,7 @@ const childListRows: ChildListRow[] = [
     followHint: true,
   },
   {
-    name: '1000 inline children, some settling between pages: each child seen exactly once, every page within 64 KiB',
+    name: '1000 inline children, some returning between pages: no child seen twice, pages shift at most by the returned ones',
     largeSettling: 0,
     running: 0,
     inline: 1000,
@@ -1340,17 +1343,22 @@ describe('subagent control tool — bounded child list', () => {
         // Page through the rest with the offset each hint gives, until a page leaves nothing out.
         const seen = [...listedIds];
         let page = output;
-        let settledBetween = 0;
+        let readReturned = 0;
+        const unreadReturned = new Set<string>();
         while (page.omittedSubagentCount !== undefined) {
           const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
-          expect(offset).toBe(seen.length);
+          if (!row.settleBetweenPages) expect(offset).toBe(seen.length);
           if (row.settleBetweenPages) {
-            // Settle three children already read and three not read yet.
             const open = inlineSessions.filter(child => child.getRecord().closedAt === undefined);
             const read = open.filter(child => seen.includes(child.id)).slice(0, 3);
             const unread = open.filter(child => !seen.includes(child.id)).slice(0, 3);
-            for (const child of [...read, ...unread]) await child.close();
-            settledBetween += read.length + unread.length;
+            for (const child of [...read, ...unread]) {
+              // spawn_subagent removes its record before the child closes.
+              active.delete(`inline:${child.id}`);
+              await child.close();
+            }
+            readReturned += read.length;
+            for (const child of unread) unreadReturned.add(child.id);
           }
           page = await run({ action: 'wait', timeoutMs: 0, offset });
           expect(page.isError).toBeUndefined();
@@ -1362,10 +1370,18 @@ describe('subagent control tool — bounded child list', () => {
           expect(ids.length).toBeGreaterThan(0);
           seen.push(...ids);
         }
-        // Every child is seen exactly once.
+        // No child is seen twice.
         expect(new Set(seen).size).toBe(seen.length);
-        expect([...seen].sort()).toEqual([...allIds].sort());
-        if (row.settleBetweenPages) expect(settledBetween).toBeGreaterThan(6);
+        if (!row.settleBetweenPages) {
+          expect([...seen].sort()).toEqual([...allIds].sort());
+          return;
+        }
+        // A returned child leaves the list: one not read yet is never listed, and
+        // each one already read can shift the later pages by one child.
+        expect(readReturned).toBeGreaterThan(3);
+        expect(seen.filter(id => unreadReturned.has(id))).toEqual([]);
+        const missed = allIds.filter(id => !seen.includes(id) && !unreadReturned.has(id));
+        expect(missed.length).toBeLessThanOrEqual(readReturned);
       } finally {
         for (const key of inlineKeys) active.delete(key);
         for (const child of children) child.releaseChild();
@@ -1470,6 +1486,78 @@ describe('subagent control tool — stable offsets', () => {
       expect([...seen].sort()).toEqual(
         [...children.map(child => child.childId), ...sessions.map(child => child.id)].sort(),
       );
+    } finally {
+      unregister(parent, keys);
+      for (const child of children) child.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('delegated children settling between pages of a multi-page wait: each child seen once, each page within 64 KiB', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    const children: Array<{ childId: string; releaseChild: () => void; summary: string }> = [];
+    const keys: string[] = [];
+    try {
+      // Each delegated child (3 KB result) is followed by two inline children,
+      // so the delegated ones are spread over every page of the list.
+      const sessions = await addInlineChildren(harness, parent, 200);
+      for (let index = 0; index < 100; index += 1) {
+        const summary = largeSummary(`child-${index}`, 3_000);
+        children.push({
+          ...(await delegateHeldChild(parent, childAgent, `job ${index}`, summary, japaneseTask(index, 500))),
+          summary,
+        });
+        keys.push(...register(parent, sessions.slice(index * 2, index * 2 + 2), () => Date.now()));
+      }
+      const released = new Set<string>();
+      const settle = async (child: { childId: string; releaseChild: () => void }) => {
+        child.releaseChild();
+        released.add(child.childId);
+        await poll(
+          async () =>
+            (await run({ action: 'status', subagentSessionId: child.childId })).subagents?.[0]?.settled === true,
+          10_000,
+        );
+      };
+      const allIds = [...children.map(child => child.childId), ...sessions.map(child => child.id)];
+      const seen: string[] = [];
+      let page = await run({ action: 'wait', timeoutMs: 0, offset: 0 });
+      let pages = 0;
+      for (;;) {
+        pages += 1;
+        expect(page.isError).toBeUndefined();
+        expect(utf8Length(page)).toBeLessThanOrEqual(64 * 1024);
+        for (const view of page.settledSubagents as any[]) {
+          // A settled delegated child carries its result, or says it was left out.
+          expect(view.result !== undefined || view.resultOmitted === true).toBe(true);
+          expect(released.has(view.subagentSessionId)).toBe(true);
+        }
+        const ids = [...page.settledSubagents, ...page.runningSubagents].map(
+          (view: any) => view.subagentSessionId as string,
+        );
+        expect(ids.length).toBeGreaterThan(0);
+        seen.push(...ids);
+        if (page.omittedSubagentCount === undefined) break;
+        const offset = Number(/offset (\d+)/.exec(page.resultsHint)![1]);
+        expect(offset).toBe(seen.length);
+        // Settle three delegated children already read and three not read yet.
+        const open = children.filter(child => !released.has(child.childId));
+        for (const child of [
+          ...open.filter(child => seen.includes(child.childId)).slice(0, 3),
+          ...open.filter(child => !seen.includes(child.childId)).slice(0, 3),
+        ]) {
+          await settle(child);
+        }
+        page = await run({ action: 'wait', timeoutMs: 0, offset });
+      }
+      expect(pages).toBeGreaterThan(1);
+      expect(released.size).toBeGreaterThanOrEqual(6);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect([...seen].sort()).toEqual([...allIds].sort());
     } finally {
       unregister(parent, keys);
       for (const child of children) child.releaseChild();
