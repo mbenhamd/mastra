@@ -807,6 +807,172 @@ describe('subagent control tool — bounded result page', () => {
   });
 });
 
+type WaitRow = {
+  name: string;
+  children: number;
+  /** Builds the wait input from the child ids. */
+  input: (ids: string[]) => Record<string, unknown>;
+  /** Drives settlement while the wait runs; returns once its part is done. */
+  drive: (ctx: WaitRowContext) => Promise<void>;
+  /** Hides the in-process settlement signal from the wait, as for a settlement by another process. */
+  noInProcessSignal?: boolean;
+  abortAfterMs?: number;
+  check: (output: any, ctx: WaitRowContext & { returnedAt: number; startedAt: number; storageReads: number }) => void;
+};
+
+type WaitRowContext = {
+  ids: string[];
+  release: (index: number) => void;
+  settledAt: (output: any, index: number) => number;
+};
+
+const settledIds = (output: any) => (output.settledSubagents as any[]).map(view => view.subagentSessionId);
+const runningIds = (output: any) => (output.runningSubagents as any[]).map(view => view.subagentSessionId);
+
+const waitRows: WaitRow[] = [
+  {
+    name: 'until any returns when the first of two children settles',
+    children: 2,
+    input: () => ({ action: 'wait', until: 'any', timeoutMs: 10_000 }),
+    drive: async ({ release }) => release(0),
+    check: (output, { ids }) => {
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output)).toEqual([ids[0]]);
+      expect(runningIds(output)).toEqual([ids[1]]);
+    },
+  },
+  {
+    name: 'until all (the default) returns only when both children settle',
+    children: 2,
+    input: () => ({ action: 'wait', timeoutMs: 10_000 }),
+    drive: async ({ release }) => {
+      release(0);
+      await new Promise(r => setTimeout(r, 300));
+      release(1);
+    },
+    check: (output, { ids }) => {
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output).sort()).toEqual([...ids].sort());
+      expect(runningIds(output)).toEqual([]);
+    },
+  },
+  {
+    name: 'an in-process settlement wakes the wait at once, with few storage reads',
+    children: 1,
+    input: ids => ({ action: 'wait', subagentSessionId: ids[0], timeoutMs: 10_000 }),
+    drive: async ({ release }) => {
+      await new Promise(r => setTimeout(r, 1_600));
+      release(0);
+    },
+    check: (output, { returnedAt, settledAt, storageReads }) => {
+      expect(output.timedOut).toBe(false);
+      // One read proves ownership and the wake costs one more; a 100 ms..1 s
+      // backoff poll needs about six over the same 1.6 s.
+      expect(storageReads).toBeLessThanOrEqual(3);
+      expect(returnedAt - settledAt(output, 0)).toBeLessThan(250);
+    },
+  },
+  {
+    name: 'a settlement with no in-process signal (another process) is still found by the storage poll',
+    children: 1,
+    noInProcessSignal: true,
+    input: ids => ({ action: 'wait', subagentSessionId: ids[0], timeoutMs: 10_000 }),
+    drive: async ({ release }) => release(0),
+    check: (output, { returnedAt, settledAt, ids }) => {
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output)).toEqual([ids[0]]);
+      expect(returnedAt - settledAt(output, 0)).toBeLessThan(6_000);
+    },
+  },
+  {
+    name: 'until any still times out when no child settles',
+    children: 2,
+    input: () => ({ action: 'wait', until: 'any', timeoutMs: 200 }),
+    drive: async () => {},
+    check: (output, { ids }) => {
+      expect(output.timedOut).toBe(true);
+      expect(settledIds(output)).toEqual([]);
+      expect(runningIds(output).sort()).toEqual([...ids].sort());
+    },
+  },
+  {
+    name: 'an abort ends the wait promptly with the children still running',
+    children: 1,
+    abortAfterMs: 100,
+    input: () => ({ action: 'wait', timeoutMs: 10_000 }),
+    drive: async () => {},
+    check: (output, { ids, returnedAt, startedAt }) => {
+      expect(output.aborted).toBe(true);
+      expect(output.timedOut).toBe(false);
+      expect(runningIds(output)).toEqual([ids[0]]);
+      expect(returnedAt - startedAt).toBeLessThan(1_000);
+    },
+  },
+];
+
+describe('subagent control tool — wait until any, woken by settlement', () => {
+  it.each(waitRows)(
+    '$name',
+    async row => {
+      const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const closeTurn = await openParentTurn(parent, parentAgent);
+      const releases: Array<() => void> = [];
+      const ids: string[] = [];
+      for (let index = 0; index < row.children; index += 1) {
+        const child = await delegateHeldChild(parent, childAgent, `wait job ${index}`);
+        releases.push(child.releaseChild);
+        ids.push(child.childId);
+      }
+      // Fork main has no settlement signal to hide; there the row checks the poll alone.
+      if (row.noInProcessSignal && '_internalOnDelegatedSettlement' in parent) {
+        vi.spyOn(parent as any, '_internalOnDelegatedSettlement').mockReturnValue(() => {});
+      }
+      // The tool reads storage through the handle it takes at creation; count its own reads.
+      let toolReads = 0;
+      const storage = parent._internalStorage;
+      const counting = new Proxy(storage, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== 'function') return value;
+          return (...args: unknown[]) => {
+            if (key === 'listPlanTasks' || key === 'loadSession') toolReads += 1;
+            return value.apply(target, args);
+          };
+        },
+      });
+      Object.defineProperty(parent, '_internalStorage', { value: counting, configurable: true });
+      const tool = createSubagentControlTool(parent)!;
+      delete (parent as any)._internalStorage;
+      const controller = new AbortController();
+      if (row.abortAfterMs !== undefined) setTimeout(() => controller.abort(), row.abortAfterMs);
+      const ctx: WaitRowContext = {
+        ids,
+        release: index => releases[index]!(),
+        settledAt: (output, index) =>
+          (output.settledSubagents as any[]).find(view => view.subagentSessionId === ids[index]).settledAt,
+      };
+      const startedAt = Date.now();
+      try {
+        const pending = tool.execute!(row.input(ids) as any, {
+          ...toolCtx,
+          abortSignal: controller.signal,
+        }) as Promise<any>;
+        await row.drive(ctx);
+        const output = await pending;
+        const returnedAt = Date.now();
+        row.check(output, { ...ctx, returnedAt, startedAt, storageReads: toolReads });
+      } finally {
+        vi.restoreAllMocks();
+        for (const release of releases) release();
+        closeTurn();
+        await harness.shutdown();
+      }
+    },
+    15_000,
+  );
+});
+
 describe('subagent control tool — permission gate (real agent loop)', () => {
   it('a host deny removes the tool before the model sees it, so it never runs', async () => {
     const testUsage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };

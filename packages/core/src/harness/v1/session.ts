@@ -2038,6 +2038,8 @@ export class Session {
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
+  /** In-process listeners told when this process settles one of this session's delegated tasks. */
+  private readonly _delegatedSettlementListeners = new Set<() => void>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
@@ -6487,6 +6489,19 @@ export class Session {
     } catch {
       // Best-effort: a late race (child already settling/closed) must not throw.
     }
+  }
+
+  /**
+   * @internal — call `listener` each time this process durably settles one of
+   * this session's delegated tasks. A settlement written by another process is
+   * not signalled; readers that must see it still poll storage. Returns the
+   * unsubscribe function.
+   */
+  _internalOnDelegatedSettlement(listener: () => void): () => void {
+    this._delegatedSettlementListeners.add(listener);
+    return () => {
+      this._delegatedSettlementListeners.delete(listener);
+    };
   }
 
   /**
@@ -24088,7 +24103,10 @@ export class Session {
           ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
         }),
       );
-      if (reconcileResult.reconciled) this._notifyDisplayRefresh();
+      if (reconcileResult.reconciled) {
+        this._notifyDisplayRefresh();
+        for (const listener of Array.from(this._delegatedSettlementListeners)) listener();
+      }
       if (reconcileResult.notice !== undefined) {
         this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
