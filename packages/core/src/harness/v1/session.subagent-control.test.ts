@@ -19,7 +19,7 @@ import { MockAgent } from './__test-utils__';
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
-import type { Session } from './session';
+import type { ActiveSubagentState, Session } from './session';
 import { SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import {
   createSubagentControlTool,
@@ -116,6 +116,7 @@ async function delegateHeldChild(
   childAgent: MockAgent,
   content: string,
   summary = `${content}: done`,
+  taskBody?: string,
 ) {
   let releaseChild!: () => void;
   const runsBefore = childAgent.streamCalls.length;
@@ -127,7 +128,7 @@ async function delegateHeldChild(
   const tools = createPlanTaskTools(parent);
   const task = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content } as any, toolCtx)) as any;
   const delegated = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
-    { taskId: task.taskId, agentType: 'worker' } as any,
+    { taskId: task.taskId, agentType: 'worker', ...(taskBody !== undefined ? { task: taskBody } : {}) } as any,
     toolCtx,
   )) as any;
   await poll(() => childAgent.streamCalls.length > runsBefore);
@@ -1138,6 +1139,174 @@ describe('delegated settlement listeners', () => {
       await harness.shutdown();
     }
   }, 15_000);
+});
+
+/** A task text of `chars` 3-byte Japanese characters after a short label. */
+function japaneseTask(index: number, chars: number): string {
+  return `job ${index} ${'調査'.repeat(chars / 2)}`;
+}
+
+type ChildListRow = {
+  name: string;
+  /** Children whose 40 KB results settle while the wait runs (delegated first). */
+  largeSettling: number;
+  /** Delegated children that stay running, each with a 500-character Japanese task. */
+  running: number;
+  /**
+   * Inline (`spawn_subagent`) children running in this process, each with a
+   * 500-character Japanese task. Plan tasks cap delegated children at 100;
+   * inline children have no such cap.
+   */
+  inline?: number;
+  call: { action: 'wait'; timeoutMs: number };
+  /** Some children are left out and named in the hint. */
+  leavesOut: boolean;
+  /** Read every left-out child back through the calls the hint names. */
+  followHint?: boolean;
+};
+
+const childListRows: ChildListRow[] = [
+  {
+    name: '40 running children with 500-character multibyte tasks stay within 64 KiB, shortened',
+    largeSettling: 0,
+    running: 40,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: false,
+  },
+  {
+    name: '100 running children stay within 64 KiB with every child listed',
+    largeSettling: 0,
+    running: 100,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: false,
+  },
+  {
+    name: 'three large results settling beside 40 running children stay within 64 KiB',
+    largeSettling: 3,
+    running: 40,
+    call: { action: 'wait', timeoutMs: 1_500 },
+    leavesOut: false,
+  },
+  {
+    name: '250 running children: the last are left out, counted and named in the hint',
+    largeSettling: 0,
+    running: 100,
+    inline: 150,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+  },
+  {
+    name: 'following the hint returns every left-out child, each call within 64 KiB and complete',
+    largeSettling: 0,
+    running: 100,
+    inline: 150,
+    call: { action: 'wait', timeoutMs: 0 },
+    leavesOut: true,
+    followHint: true,
+  },
+];
+
+describe('subagent control tool — bounded child list', () => {
+  it.each(childListRows)(
+    '$name',
+    async row => {
+      const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const closeTurn = await openParentTurn(parent, parentAgent);
+      const run = control(parent);
+      const children: Array<{ childId: string; releaseChild: () => void }> = [];
+      const active = (parent as any)._activeSubagents as Map<string, ActiveSubagentState>;
+      const inlineKeys: string[] = [];
+      try {
+        for (let index = 0; index < row.largeSettling + row.running; index += 1) {
+          const large = index < row.largeSettling;
+          children.push(
+            await delegateHeldChild(
+              parent,
+              childAgent,
+              `job ${index}`,
+              large ? largeSummary(`child-${index}`, 40_000) : undefined,
+              japaneseTask(index, 500),
+            ),
+          );
+        }
+        // An inline child is a real child session plus the parent's in-process
+        // record of the running spawn_subagent call.
+        for (let index = 0; index < (row.inline ?? 0); index += 1) {
+          const child = await harness.session({
+            resourceId: 'u1',
+            threadId: { fresh: true },
+            parentSessionId: parent.id,
+            origin: 'subagent-tool',
+            modeId: 'worker-mode',
+            subagentDepth: 1,
+          });
+          const key = `inline:${child.id}`;
+          active.set(key, {
+            subagentSessionId: child.id,
+            agentType: 'worker',
+            task: japaneseTask(row.running + index, 500),
+            parentToolCallId: `spawn-${index}`,
+            startedAt: Date.now(),
+            status: 'running',
+          });
+          inlineKeys.push(key);
+          children.push({ childId: child.id, releaseChild: () => {} });
+        }
+        const pending = run(row.call);
+        for (let index = 0; index < row.largeSettling; index += 1) children[index]!.releaseChild();
+        const output = await pending;
+
+        expect(output.isError).toBeUndefined();
+        expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+        expect(output.resultsShortened).toBe(true);
+        const listed: any[] = [...output.settledSubagents, ...output.runningSubagents];
+        const listedIds = listed.map(view => view.subagentSessionId as string);
+        if (row.largeSettling === 0) {
+          // The same call lists the same children in the same order.
+          const again = await run(row.call);
+          expect([...again.settledSubagents, ...again.runningSubagents].map(view => view.subagentSessionId)).toEqual(
+            listedIds,
+          );
+        }
+        const allIds = children.map(child => child.childId);
+        for (const view of listed) {
+          expect(new TextEncoder().encode(view.task).byteLength).toBeLessThanOrEqual(160);
+          expect(() => encodeURIComponent(view.task)).not.toThrow();
+        }
+        expect(output.settledSubagents).toHaveLength(row.largeSettling);
+        const leftOut = allIds.filter(id => !listedIds.includes(id));
+        if (!row.leavesOut) {
+          expect(leftOut).toEqual([]);
+          expect(output.omittedSubagentCount).toBeUndefined();
+          return;
+        }
+        expect(leftOut.length).toBeGreaterThan(0);
+        expect(output.omittedSubagentCount).toBe(leftOut.length);
+        expect(output.resultsHint).toMatch(/action "wait", timeoutMs 0 and subagentSessionIds/);
+        for (const id of leftOut) expect(output.resultsHint).toContain(id);
+        if (!row.followHint) return;
+
+        const readBack: string[] = [];
+        for (let start = 0; start < leftOut.length; start += 16) {
+          const chunk = leftOut.slice(start, start + 16);
+          const next = await run({ action: 'wait', subagentSessionIds: chunk, timeoutMs: 0 });
+          expect(next.isError).toBeUndefined();
+          expect(utf8Length(next)).toBeLessThanOrEqual(64 * 1024);
+          // A hinted call never leaves children out again, so the hint cannot loop.
+          expect(next.omittedSubagentCount).toBeUndefined();
+          readBack.push(...(next.runningSubagents as any[]).map(view => view.subagentSessionId));
+        }
+        expect([...readBack].sort()).toEqual([...leftOut].sort());
+      } finally {
+        for (const key of inlineKeys) active.delete(key);
+        for (const child of children) child.releaseChild();
+        closeTurn();
+        await harness.shutdown();
+      }
+    },
+    120_000,
+  );
 });
 
 describe('subagent control tool — permission gate (real agent loop)', () => {

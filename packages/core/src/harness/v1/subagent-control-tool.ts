@@ -51,19 +51,25 @@ export const SUBAGENT_CONTROL_MAX_MESSAGE_CHARS = 4_000;
 export const SUBAGENT_CONTROL_STATUS_LIMIT = 25;
 const SUBAGENT_CONTROL_TASK_PREVIEW_CHARS = 500;
 /**
- * UTF-8 byte budget for a `status` listing or a multi-child `wait` (the same
- * budget as `plan_task_check`). A child named in the call, or one that
- * settled during it, gets its full result while the budget allows; every
- * other child gets a bounded preview. A call that names exactly one child
- * returns that child's full result whatever its size: the terminal result
- * caps in `terminal-subagent-result.ts` already bound it.
+ * UTF-8 byte budget for a whole `status` listing or multi-child `wait` output
+ * (the same budget as `plan_task_check`). A child named in the call, or one
+ * that settled during it, gets its full result while the budget allows; every
+ * other child gets a bounded preview. When the children's own fields still do
+ * not fit, task texts are shortened, and then the last children are left out
+ * and named in `resultsHint`. A call that names exactly one child returns that
+ * child's full result whatever its size: the terminal result caps in
+ * `terminal-subagent-result.ts` already bound it.
  */
 export const SUBAGENT_CONTROL_MAX_OUTPUT_BYTES = 64 * 1024;
 /** A full result no larger than this is never replaced by a preview. */
 const SUBAGENT_CONTROL_SMALL_RESULT_BYTES = MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES;
+/** UTF-8 bytes of task text a child keeps once task texts are shortened. */
+const SUBAGENT_CONTROL_SHORT_TASK_BYTES = 160;
+/** At most this many left-out children are named in `resultsHint`. */
+const SUBAGENT_CONTROL_HINT_MAX_IDS = 512;
 export const SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT =
-  'Some results are previews or were left out to keep this output small. To read one full result, call ' +
-  'subagent with action "status" and only that subagentSessionId.';
+  'Some results or task texts are previews or were left out to keep this output small. To read one in full, ' +
+  'call subagent with action "status" and only that subagentSessionId.';
 const WAIT_POLL_INTERVAL_MS = 100;
 const WAIT_POLL_MAX_INTERVAL_MS = 1_000;
 /**
@@ -192,8 +198,13 @@ const outputSchema = z.object({
   action: z.enum(['status', 'wait', 'send', 'cancel']).optional(),
   subagents: z.array(subagentViewSchema).optional(),
   truncated: z.boolean().optional(),
-  /** status/wait: at least one result is a preview or was left out; `resultsHint` says how to read it. */
+  /**
+   * status/wait: at least one result or task text is a preview or was left
+   * out, or some children were left out; `resultsHint` says how to read them.
+   */
   resultsShortened: z.boolean().optional(),
+  /** status/wait: how many children were left out of this output; `resultsHint` names them. */
+  omittedSubagentCount: z.number().int().optional(),
   resultsHint: z.string().optional(),
   /** wait: children that settled before the timeout. */
   settledSubagents: z.array(subagentViewSchema).optional(),
@@ -255,37 +266,137 @@ function withoutResult(view: SubagentView): SubagentView {
   return rest;
 }
 
+/** `text` cut to at most `maxBytes` UTF-8 bytes on a character boundary, with an ellipsis when cut. */
+function trimUtf8(text: string, maxBytes: number): string {
+  if (utf8.encode(text).byteLength <= maxBytes) return text;
+  const ellipsis = '…';
+  let budget = maxBytes - utf8.encode(ellipsis).byteLength;
+  let kept = '';
+  for (const char of text) {
+    const bytes = utf8.encode(char).byteLength;
+    if (bytes > budget) break;
+    budget -= bytes;
+    kept += char;
+  }
+  return `${kept}${ellipsis}`;
+}
+
+function shortTask(view: SubagentView): SubagentView {
+  if (view.task === undefined) return view;
+  const task = trimUtf8(view.task, SUBAGENT_CONTROL_SHORT_TASK_BYTES);
+  return task === view.task ? view : { ...view, task };
+}
+
+/** The hint naming the children left out of an output, so a narrower call can read them. */
+function omittedHint(ids: readonly string[]): string {
+  const named = ids.slice(0, SUBAGENT_CONTROL_HINT_MAX_IDS);
+  return (
+    `${ids.length} subagents were left out of this output. To read them, call subagent with action "wait", ` +
+    `timeoutMs 0 and subagentSessionIds set to at most ${SUBAGENT_CONTROL_MAX_WAIT_TARGETS} of these ids per call` +
+    `${named.length < ids.length ? ` (the first ${named.length} are listed)` : ''}: ${named.join(', ')}. ` +
+    SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT
+  );
+}
+
+type PlaceViews = (list: readonly SubagentView[]) => SubagentView[];
+
 /**
- * Fit the results in a `status`/`wait` output under
- * SUBAGENT_CONTROL_MAX_OUTPUT_BYTES. `build` places views into the output
- * envelope; `views` lists them in output order.
+ * Keep a `status`/`wait` output under SUBAGENT_CONTROL_MAX_OUTPUT_BYTES.
+ * `build` places views into the output envelope; `views` lists them in output
+ * order.
  *
  * An output that holds only the one child the call names is returned whole.
- * Otherwise the envelope is measured once with every result left out and the
- * shortened notice present, and each choice adds only its own byte delta to a
- * running count. The first pass gives every child its preview (a small result
- * is its own preview), or no result when even that does not fit. The second
- * pass upgrades children in `fullResultIds` to their full result, in order,
- * while the budget allows, so one large result never starves the previews of
- * the others.
+ * Otherwise, in order, until the children fit:
+ *
+ *   1. their results are fitted (see `fitResults`);
+ *   2. their task texts are cut to SUBAGENT_CONTROL_SHORT_TASK_BYTES and the
+ *      results fitted again;
+ *   3. only the longest prefix of the children that fits is kept; the rest
+ *      are counted in `omittedSubagentCount` and named in `resultsHint`, which
+ *      points at a `wait` over at most SUBAGENT_CONTROL_MAX_WAIT_TARGETS ids.
+ *      That many children always fit, so following the hint never returns
+ *      the same shortened output.
  */
 function boundResults(
-  build: (fit: (view: SubagentView) => SubagentView) => SubagentControlOutput,
+  build: (place: PlaceViews) => SubagentControlOutput,
   views: readonly SubagentView[],
   fullResultIds: ReadonlySet<string>,
   namedOne: string | undefined,
 ): SubagentControlOutput {
   if (namedOne !== undefined && views.every(view => view.subagentSessionId === namedOne)) {
-    return build(view => view);
+    return build(list => [...list]);
   }
+  const whole =
+    fitResults(build, views, views, fullResultIds) ?? fitResults(build, views, views.map(shortTask), fullResultIds);
+  if (whole !== undefined) return whole;
+  const short = views.map(shortTask);
+  // The envelope grows with each kept child (a child's own fields are larger
+  // than its id in the hint), so the largest prefix that fits is found by
+  // bisection.
+  let low = 0;
+  let high = views.length - 1;
+  let best: SubagentControlOutput | undefined;
+  while (low <= high) {
+    const keep = Math.floor((low + high) / 2);
+    const fitted = fitResults(build, views, short.slice(0, keep), fullResultIds);
+    if (fitted === undefined) {
+      high = keep - 1;
+    } else {
+      best = fitted;
+      low = keep + 1;
+    }
+  }
+  return (
+    best ?? {
+      ...build(() => []),
+      resultsShortened: true,
+      omittedSubagentCount: views.length,
+      resultsHint: `${views.length} subagents were left out of this output. Call subagent with action "wait" and at most ${SUBAGENT_CONTROL_MAX_WAIT_TARGETS} subagentSessionIds at a time.`,
+    }
+  );
+}
+
+/**
+ * Fit the results of `kept` (a prefix of `views`, possibly with shortened
+ * task texts) into the output, or return undefined when even the children
+ * with every result left out exceed the budget.
+ *
+ * The envelope is measured once with every result left out and the notice
+ * present, and each choice adds only its own byte delta to a running count.
+ * The first pass gives every child its preview (a small result is its own
+ * preview), or no result when even that does not fit. The second pass
+ * upgrades children in `fullResultIds` to their full result, in order, while
+ * the budget allows, so one large result never starves the previews of the
+ * others.
+ */
+function fitResults(
+  build: (place: PlaceViews) => SubagentControlOutput,
+  views: readonly SubagentView[],
+  kept: readonly SubagentView[],
+  fullResultIds: ReadonlySet<string>,
+): SubagentControlOutput | undefined {
+  const keptIds = new Set(kept.map(view => view.subagentSessionId));
+  const leftOut = views.filter(view => !keptIds.has(view.subagentSessionId)).map(view => view.subagentSessionId);
+  const notice = {
+    resultsShortened: true,
+    ...(leftOut.length > 0 ? { omittedSubagentCount: leftOut.length } : {}),
+    resultsHint: leftOut.length > 0 ? omittedHint(leftOut) : SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT,
+  };
   const omitted = (view: SubagentView): SubagentView =>
     view.result === undefined ? view : { ...withoutResult(view), resultOmitted: true };
-  let remaining =
-    SUBAGENT_CONTROL_MAX_OUTPUT_BYTES -
-    jsonBytes({ ...build(omitted), resultsShortened: true, resultsHint: SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT });
+  const byId = new Map(kept.map(view => [view.subagentSessionId, view]));
+  const placeWith =
+    (choose: (view: SubagentView) => SubagentView): PlaceViews =>
+    list =>
+      list.flatMap(view => {
+        const keptView = byId.get(view.subagentSessionId);
+        return keptView === undefined ? [] : [choose(keptView)];
+      });
+  let remaining = SUBAGENT_CONTROL_MAX_OUTPUT_BYTES - jsonBytes({ ...build(placeWith(omitted)), ...notice });
+  if (remaining < 0) return undefined;
   const fitted = new Map<string, SubagentView>();
   const upgrades: Array<{ full: SubagentView; previewBytes: number }> = [];
-  for (const view of views) {
+  for (const view of kept) {
     if (view.result === undefined) continue;
     const fullBytes = jsonBytes(view);
     let preview = view;
@@ -318,11 +429,15 @@ function boundResults(
     remaining -= delta;
     fitted.set(full.subagentSessionId, full);
   }
-  const shortened = views.some(view => view.result !== undefined && fitted.get(view.subagentSessionId) !== view);
-  const output = build(view => fitted.get(view.subagentSessionId) ?? view);
-  return shortened
-    ? { ...output, resultsShortened: true, resultsHint: SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT }
-    : output;
+  const original = new Map(views.map(view => [view.subagentSessionId, view]));
+  const shortened =
+    leftOut.length > 0 ||
+    kept.some(view => {
+      const source = original.get(view.subagentSessionId)!;
+      return (fitted.get(view.subagentSessionId) ?? view) !== source;
+    });
+  const output = build(placeWith(view => fitted.get(view.subagentSessionId) ?? view));
+  return shortened ? { ...output, ...notice } : output;
 }
 
 /** Resolve after `ms`, on abort, or when the function handed to `arm` is called. */
@@ -566,7 +681,7 @@ export function createSubagentControlTool(parent: Session) {
     });
     if (foreign.length > 0) return foreignError(foreign);
     return boundResults(
-      fit => ({ action: 'status', subagents: views.map(fit), ...(truncated ? { truncated: true } : {}) }),
+      place => ({ action: 'status', subagents: place(views), ...(truncated ? { truncated: true } : {}) }),
       views,
       new Set(childId === undefined ? [] : [childId]),
       childId,
@@ -631,10 +746,10 @@ export function createSubagentControlTool(parent: Session) {
         if (runningAtStart?.has(view.subagentSessionId) === true) fullResultIds.add(view.subagentSessionId);
       }
       return boundResults(
-        fit => ({
+        place => ({
           action: 'wait',
-          settledSubagents: lastSettled.map(fit),
-          runningSubagents: lastRunning.map(fit),
+          settledSubagents: place(lastSettled),
+          runningSubagents: place(lastRunning),
           ...extra,
         }),
         [...lastSettled, ...lastRunning],
@@ -819,11 +934,13 @@ export function createSubagentControlTool(parent: Session) {
       'on your own subagents. ' +
       '`status` lists them (or inspects one) with their status. Only a settled task_delegate subagent ' +
       'carries its result; a spawn_subagent result is returned by that spawn_subagent call only. ' +
-      `Listings and multi-subagent waits keep results under ${SUBAGENT_CONTROL_MAX_OUTPUT_BYTES} bytes: a subagent ` +
+      `Listings and multi-subagent waits stay under ${SUBAGENT_CONTROL_MAX_OUTPUT_BYTES} bytes: a subagent ` +
       'you name, or one that settles during a wait, gets its full result while it fits; others get a preview ' +
-      '(`resultPreview`), and a result that does not fit is left out (`resultOmitted`). `resultsShortened` marks ' +
-      'such an output. A call naming exactly one subagent always returns its full result, so call `status` with ' +
-      'only that subagentSessionId to read it. ' +
+      '(`resultPreview`), and a result that does not fit is left out (`resultOmitted`). If the subagents still ' +
+      'do not fit, task texts are shortened, then the last subagents are left out (`omittedSubagentCount`) and ' +
+      '`resultsHint` names them for a `wait` with timeoutMs 0. `resultsShortened` marks such an output. A call ' +
+      'naming exactly one subagent always returns its full result, so call `status` with only that ' +
+      'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
       'returns those settled and those still running; with `until: "any"` it returns once one of them has ' +
       'settled. If the first status read stalls, wait fails with ' +
