@@ -143,8 +143,12 @@ const inputSchema = z
       .min(0)
       .optional()
       .describe(
-        'status and wait without ids only: skip this many subagents of the list (newest first; for wait, of ' +
-          'the running ones). When an output leaves subagents out, resultsHint gives the next offset.',
+        'status and wait without ids only: the position to start from in the list of all your subagents, ' +
+          'running and settled, ordered by start time and then id. A subagent keeps its position when it ' +
+          'settles. A wait with an offset returns the settled subagents from that position on and waits for ' +
+          'the running ones. When an output leaves subagents out, resultsHint gives the next offset. A ' +
+          'subagent started between calls with the same or an earlier start time, or a spawn_subagent ' +
+          'subagent whose spawn_subagent call has returned (it leaves the list), can shift later positions.',
       ),
     message: z
       .string()
@@ -289,28 +293,44 @@ function shortTask(view: SubagentView): SubagentView {
 }
 
 /**
- * How a call reads the children its output left out: `next(kept)` names the
- * call that continues after the first `kept` children. Undefined for a call
- * that names its children; that hint lists the left-out ids instead.
+ * How an implicit-list call reads the children its output left out. `position`
+ * maps each child to its place in the call's stable list (every child in
+ * scope, ordered by start time and then id), so the hint's offset is the
+ * place of the first child left out, whatever settled in between. `tail`
+ * counts the children after the call's page that it never read (a `status`
+ * listing past SUBAGENT_CONTROL_STATUS_LIMIT). Undefined for a call that names
+ * its children; that hint lists the left-out ids instead.
  */
-type Continuation = ((kept: number) => string) | undefined;
+type Continuation =
+  | {
+      action: 'status' | 'wait';
+      position: ReadonlyMap<string, number>;
+      tail?: { count: number; nextOffset: number };
+    }
+  | undefined;
 
 /** The hint for the children left out of an output, so a narrower call can read them. */
-function omittedHint(ids: readonly string[], kept: number, continuation: Continuation): string {
-  const how =
-    continuation !== undefined
-      ? continuation(kept)
-      : `call subagent with action "wait", timeoutMs 0 and subagentSessionIds set to at most ` +
-        `${SUBAGENT_CONTROL_MAX_WAIT_TARGETS} of these ids per call: ${ids.join(', ')}`;
-  return `${ids.length} subagents were left out of this output. To read them, ${how}. ${SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT}`;
+function omittedHint(ids: readonly string[], continuation: Continuation): string {
+  let how: string;
+  let count = ids.length;
+  if (continuation === undefined) {
+    how =
+      `call subagent with action "wait", timeoutMs 0 and subagentSessionIds set to at most ` +
+      `${SUBAGENT_CONTROL_MAX_WAIT_TARGETS} of these ids per call: ${ids.join(', ')}`;
+  } else {
+    count += continuation.tail?.count ?? 0;
+    const offset = ids.length > 0 ? continuation.position.get(ids[0]!)! : continuation.tail!.nextOffset;
+    how =
+      continuation.action === 'wait'
+        ? `call subagent with action "wait", timeoutMs 0 and offset ${offset}`
+        : `call subagent with action "status" and offset ${offset}`;
+  }
+  return `${count} subagents were left out of this output. To read them, ${how}. ${SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT}`;
 }
 
-/** The implicit-list call that continues after `offset` children. */
-function continueAt(action: 'status' | 'wait', offset: number): Continuation {
-  return kept =>
-    action === 'wait'
-      ? `call subagent with action "wait", timeoutMs 0 and offset ${offset + kept}`
-      : `call subagent with action "status" and offset ${offset + kept}`;
+/** Children ordered by start time, then id, so every process pages them alike. */
+function byStart(left: [string, number], right: [string, number]): number {
+  return left[1] - right[1] || (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0);
 }
 
 type PlaceViews = (list: readonly SubagentView[]) => SubagentView[];
@@ -328,7 +348,8 @@ type PlaceViews = (list: readonly SubagentView[]) => SubagentView[];
  *      results fitted again;
  *   3. only the longest prefix of the children that fits is kept; the rest
  *      are counted in `omittedSubagentCount`. For an implicit list,
- *      `resultsHint` gives the `offset` of the first one left out; each page
+ *      `resultsHint` gives the stable-list place (`offset`) of the first one
+ *      left out, plus any `status` children past its limit; each page
  *      keeps at least one child, so paging always moves on. A call that names
  *      its children (at most SUBAGENT_CONTROL_MAX_WAIT_TARGETS, which always
  *      fit) never leaves one out; if it did, the hint would list their ids.
@@ -403,11 +424,11 @@ function fitResults(
 ): SubagentControlOutput | undefined {
   const keptIds = new Set(kept.map(view => view.subagentSessionId));
   const leftOut = views.filter(view => !keptIds.has(view.subagentSessionId)).map(view => view.subagentSessionId);
+  const omittedCount = leftOut.length + (continuation?.tail?.count ?? 0);
   const notice = {
     resultsShortened: true,
-    ...(leftOut.length > 0 ? { omittedSubagentCount: leftOut.length } : {}),
-    resultsHint:
-      leftOut.length > 0 ? omittedHint(leftOut, kept.length, continuation) : SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT,
+    ...(omittedCount > 0 ? { omittedSubagentCount: omittedCount } : {}),
+    resultsHint: omittedCount > 0 ? omittedHint(leftOut, continuation) : SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT,
   };
   const omitted = (view: SubagentView): SubagentView =>
     view.result === undefined ? view : { ...withoutResult(view), resultOmitted: true };
@@ -459,7 +480,7 @@ function fitResults(
   }
   const original = new Map(views.map(view => [view.subagentSessionId, view]));
   const shortened =
-    leftOut.length > 0 ||
+    omittedCount > 0 ||
     kept.some(view => {
       const source = original.get(view.subagentSessionId)!;
       return (fitted.get(view.subagentSessionId) ?? view) !== source;
@@ -638,10 +659,19 @@ export function createSubagentControlTool(parent: Session) {
   async function resolveChildren(
     childIds: readonly string[] | undefined,
     opts: { limit?: number; knownOwned?: ReadonlySet<string>; offset?: number } = {},
-  ): Promise<{ views: SubagentView[]; foreign: string[]; truncated: boolean }> {
+  ): Promise<{
+    views: SubagentView[];
+    foreign: string[];
+    truncated: boolean;
+    position: Map<string, number>;
+    tail?: { count: number; nextOffset: number };
+  }> {
     const delegated = await loadDelegatedTasks();
     const activeById = new Map(activeSubagents().map(state => [state.subagentSessionId, state]));
     let ids: string[];
+    // An implicit list is every known child, oldest first, so a child keeps its
+    // place when it settles and a new child joins at the end.
+    const position = new Map<string, number>();
     if (childIds !== undefined) {
       ids = Array.from(new Set(childIds));
     } else {
@@ -650,15 +680,14 @@ export function createSubagentControlTool(parent: Session) {
       for (const [id, task] of delegated) {
         if (!known.has(id)) known.set(id, readDelegationAttemptMetadata(task, id)?.startedAt ?? task.createdAt);
       }
-      ids = Array.from(known.entries())
-        .sort((left, right) => right[1] - left[1])
-        .map(([id]) => id)
-        .slice(opts.offset ?? 0);
+      const ordered = Array.from(known.entries()).sort(byStart);
+      ordered.forEach(([id], index) => position.set(id, index));
+      ids = ordered.map(([id]) => id).slice(opts.offset ?? 0);
     }
     const views: SubagentView[] = [];
     const foreign: string[] = [];
     for (const id of ids) {
-      // ids are newest-first: one view past the limit is enough to flag truncation.
+      // One view past the limit is enough to flag truncation.
       if (opts.limit !== undefined && views.length > opts.limit) break;
       const { record, live } = await loadChildRecord(id);
       if (isOwnChild(record)) {
@@ -677,7 +706,15 @@ export function createSubagentControlTool(parent: Session) {
       }
     }
     const truncated = opts.limit !== undefined && views.length > opts.limit;
-    return { views: truncated ? views.slice(0, opts.limit) : views, foreign, truncated };
+    if (!truncated) return { views, foreign, truncated, position };
+    const nextOffset = position.get(views[opts.limit!]!.subagentSessionId)!;
+    return {
+      views: views.slice(0, opts.limit),
+      foreign,
+      truncated,
+      position,
+      tail: { count: position.size - nextOffset, nextOffset },
+    };
   }
 
   function foreignError(ids: readonly string[]): SubagentControlOutput {
@@ -685,17 +722,17 @@ export function createSubagentControlTool(parent: Session) {
   }
 
   async function status(childId: string | undefined, offset = 0): Promise<SubagentControlOutput> {
-    const { views, foreign, truncated } = await resolveChildren(childId === undefined ? undefined : [childId], {
-      limit: SUBAGENT_CONTROL_STATUS_LIMIT,
-      offset,
-    });
+    const { views, foreign, truncated, position, tail } = await resolveChildren(
+      childId === undefined ? undefined : [childId],
+      { limit: SUBAGENT_CONTROL_STATUS_LIMIT, offset },
+    );
     if (foreign.length > 0) return foreignError(foreign);
     return boundResults(
       place => ({ action: 'status', subagents: place(views), ...(truncated ? { truncated: true } : {}) }),
       views,
       new Set(childId === undefined ? [] : [childId]),
       childId,
-      childId === undefined ? continueAt('status', offset) : undefined,
+      childId === undefined ? { action: 'status', position, ...(tail !== undefined ? { tail } : {}) } : undefined,
     );
   }
 
@@ -703,7 +740,7 @@ export function createSubagentControlTool(parent: Session) {
     childIds: readonly string[] | undefined,
     timeoutMs: number,
     signal: AbortSignal | undefined,
-    offset = 0,
+    offset: number | undefined,
   ): Promise<SubagentControlOutput> {
     const deadline = Date.now() + timeoutMs;
     let targets = childIds;
@@ -714,8 +751,9 @@ export function createSubagentControlTool(parent: Session) {
     let lastSettled: SubagentView[] = [];
     let lastRunning: SubagentView[] = [];
     // The pinned children in pinned order: an implicit wait leaves out a tail
-    // of this list, so the next offset counts from its start.
+    // of this list, and the hint gives the stable-list place of its first child.
     let lastCurrent: SubagentView[] = [];
+    let position: ReadonlyMap<string, number> = new Map();
     // Full results go to named children and to children that settle during
     // this call; a child already settled when the wait began gets a preview.
     const fullResultIds = new Set(childIds ?? []);
@@ -735,7 +773,7 @@ export function createSubagentControlTool(parent: Session) {
         childIds === undefined ? lastCurrent : [...lastSettled, ...lastRunning],
         fullResultIds,
         namedOne,
-        childIds === undefined ? continueAt('wait', offset) : undefined,
+        childIds === undefined ? { action: 'wait', position } : undefined,
       );
     };
     for (;;) {
@@ -743,7 +781,10 @@ export function createSubagentControlTool(parent: Session) {
       // may take: every read may run at least SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
       // even when it starts at the deadline.
       const resolution = await settleWithin(
-        resolveChildren(targets, knownOwned === undefined ? {} : { knownOwned }),
+        resolveChildren(
+          targets,
+          targets === undefined ? { offset: offset ?? 0 } : knownOwned === undefined ? {} : { knownOwned },
+        ),
         Math.max(deadline, Date.now() + SUBAGENT_CONTROL_WAIT_READ_STALL_MS),
         signal,
       );
@@ -768,11 +809,13 @@ export function createSubagentControlTool(parent: Session) {
       // Ownership is proven once; a child row deleted mid-wait then reads as closed.
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
       runningAtStart ??= new Set(views.filter(view => !view.settled).map(view => view.subagentSessionId));
-      // An implicit wait pins every child that was running when it started.
-      targets ??= views
-        .filter(view => !view.settled)
-        .map(view => view.subagentSessionId)
-        .slice(offset);
+      // An implicit wait pins every child that was running when it started;
+      // with an offset it pins every child from that place of the stable list,
+      // so the settled ones on its page are returned too.
+      if (targets === undefined) {
+        position = resolution.value.position;
+        targets = views.filter(view => offset !== undefined || !view.settled).map(view => view.subagentSessionId);
+      }
       const pinned = new Set(targets);
       const current = views.filter(view => pinned.has(view.subagentSessionId));
       const running = current.filter(view => !view.settled);
@@ -914,7 +957,13 @@ export function createSubagentControlTool(parent: Session) {
       'you name, or one that settles during a wait, gets its full result while it fits; others get a preview ' +
       '(`resultPreview`), and a result that does not fit is left out (`resultOmitted`). If the subagents still ' +
       'do not fit, task texts are shortened, then the last subagents are left out (`omittedSubagentCount`) and ' +
-      '`resultsHint` gives the `offset` that reads on from them. `resultsShortened` marks such an output. A call ' +
+      '`resultsHint` gives the `offset` that reads on from them; `resultsShortened` marks such an output. ' +
+      `\`status\` lists at most ${SUBAGENT_CONTROL_STATUS_LIMIT} subagents per call, and \`resultsHint\` ` +
+      'gives the offset of the next ones. `offset` is a place in the list of all your subagents, running and ' +
+      'settled, ordered by start time and then id; a subagent keeps its place when it settles, and `wait` with ' +
+      'an offset also returns the settled subagents from that place on. A subagent started between calls with ' +
+      'the same or an earlier start time, or a spawn_subagent subagent whose spawn_subagent call has returned ' +
+      '(it leaves the list), can shift later places. A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
       'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
@@ -939,7 +988,7 @@ export function createSubagentControlTool(parent: Session) {
       try {
         switch (input.action) {
           case 'status':
-            return await status(input.subagentSessionId, input.offset);
+            return await status(input.subagentSessionId, input.offset ?? 0);
           case 'wait':
             return await wait(ids, input.timeoutMs ?? SUBAGENT_CONTROL_DEFAULT_WAIT_MS, ctx?.abortSignal, input.offset);
           case 'send':
