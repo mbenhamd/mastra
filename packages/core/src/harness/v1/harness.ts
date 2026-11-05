@@ -7803,6 +7803,9 @@ export class Harness {
     if (this._liveSessions.size > 0) this._ensureLeaseRenewalLoop();
     this._ensureChannelInboxRecoveryLoop();
     this._ensurePendingInteractionExpirySweepLoop();
+    // A settlement-notice delivery that ran while shutdown was pending bailed
+    // out and left its notice owed; re-arm reconciliation on every live session.
+    for (const session of this._liveSessions.values()) session._internalRearmDelegationReconcile();
     throw new HarnessStorageError({ operation: 'session_save', cause: error });
   }
 

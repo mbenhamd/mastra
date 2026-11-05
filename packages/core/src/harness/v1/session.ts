@@ -22861,6 +22861,15 @@ export class Session {
   }
 
   /**
+   * @internal — used by the Harness when a shutdown rolls back before its drain:
+   * a settlement-notice delivery that bailed out while shutdown was pending left
+   * its notice owed. A no-op unless the session is live.
+   */
+  _internalRearmDelegationReconcile(): void {
+    this._scheduleDelegationReconcileRetry(0);
+  }
+
+  /**
    * @internal — used by the Harness after close starts. New work is rejected
    * immediately while previously admitted flushes serialize before the marker.
    */

@@ -282,6 +282,65 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await harness.shutdown();
   });
 
+  it('a notice left owed while shutdown waited on a session close is delivered after the shutdown rolls back', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', memory);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const other = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+    // The delivery parks while resolving the parent's memory.
+    let releaseMemory!: () => void;
+    const memoryGate = new Promise<void>(r => (releaseMemory = r));
+    let memoryEntered!: () => void;
+    const entered = new Promise<void>(r => (memoryEntered = r));
+    vi.spyOn(parentAgent, 'getMemory').mockImplementationOnce(async () => {
+      memoryEntered();
+      await memoryGate;
+      return memory as never;
+    });
+    // Another session's close stalls in storage past the shutdown deadline.
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>(r => (releaseClose = r));
+    let closeEntered!: () => void;
+    const closeStalled = new Promise<void>(r => (closeEntered = r));
+    const save = InMemoryHarness.prototype.saveSession;
+    const saveSpy = vi
+      .spyOn(InMemoryHarness.prototype, 'saveSession')
+      .mockImplementation(async function (this: InMemoryHarness, record, opts) {
+        if (record.id === other.id && other.isClosing) {
+          closeEntered();
+          await closeGate;
+        }
+        return save.call(this, record, opts);
+      });
+    onTestFinished(() => {
+      releaseClose();
+      saveSpy.mockRestore();
+    });
+    const closing = other.close().catch(() => {});
+    await closeStalled;
+
+    releaseChild();
+    await entered;
+    const shutdown = harness.shutdown({ drainTimeoutMs: 300 });
+    // Shutdown is pending, so the delivery bails out and leaves the notice owed.
+    releaseMemory();
+    await expect(shutdown).rejects.toMatchObject({
+      name: 'HarnessStorageError',
+      cause: expect.objectContaining({ message: expect.stringContaining('Session close') }),
+    });
+    expect(owedNotice(await planRow(parent, taskId))).toMatchObject({ mode: 'remind' });
+
+    // No new trigger, and the close is still stalled: the rolled-back harness
+    // delivers the owed notice itself.
+    await deliveryFinished(parent, taskId);
+    const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+    expect(messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'))).toHaveLength(1);
+    releaseClose();
+    await closing;
+    await harness.shutdown();
+  });
+
   it('default config records no notice and never wakes the idle parent', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), undefined);
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
