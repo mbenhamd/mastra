@@ -265,6 +265,93 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     expect(gated.written()).toBe(true);
   });
 
+  it('aborting a message that waits on a pending reminder save releases it before the save ends', async () => {
+    const gated = gatedMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', gated.memory);
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releaseChild();
+      await gated.entered;
+      const barrier = vi.spyOn(parent as any, '_awaitNoticeSaves');
+      let settled = false;
+      const turn = parent.message({ content: 'anything new?' }).finally(() => (settled = true));
+      void turn.catch(() => {});
+      await poll(() => barrier.mock.calls.length > 0);
+      parent.abort();
+      await poll(() => settled, 1000);
+      await expect(turn).rejects.toBeDefined();
+      expect(parentAgent.streamCalls).toHaveLength(1);
+      expect(gated.written()).toBe(false);
+    } finally {
+      gated.release();
+      await harness.shutdown();
+    }
+  });
+
+  it('an admitted signal never dispatches on a dispatch claim another owner took during a reminder save', async () => {
+    const gated = gatedMemory();
+    const db = new InMemoryDB();
+    const { harness, parentAgent, childAgent } = buildHarness(db, 'wake', gated.memory);
+    const caller = new AbortController();
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releaseChild();
+      await gated.entered;
+      const barrier = vi.spyOn(parent as any, '_awaitNoticeSaves');
+      const sendSignal = vi.spyOn(parentAgent, 'sendSignal');
+      const admissionId = 'held-save-signal';
+      const turn = parent.signal({ content: 'are we there yet?', admissionId, abortSignal: caller.signal });
+      void Promise.resolve(turn).catch(() => {});
+      await poll(() => barrier.mock.calls.length > 0);
+
+      // While the save is held, another owner holds the durable dispatch claim.
+      const storage = new InMemoryHarness({ db });
+      const identity = (parent as any)._signalAdmissionIdentity(admissionId) as { signalId: string; idleRunId: string };
+      const scope = {
+        harnessName: (parent as any)._record.harnessName as string,
+        sessionId: parent.id,
+        resourceId: 'u1',
+        threadId: parent.threadId,
+      };
+      const current = (await storage.loadMessageResultEvidence({ ...scope, signalId: identity.signalId })) as any;
+      const foreign = {
+        state: 'dispatching',
+        attemptId: 'foreign-owner-attempt',
+        claimExpiresAt: Date.now() + 30_000,
+        delivery: 'idle',
+        runId: identity.idleRunId,
+      };
+      const swapped = await storage.compareAndSwapSignalDispatch({
+        ...scope,
+        signalId: identity.signalId,
+        admissionId: current.admissionId,
+        admissionHash: current.admissionHash,
+        operationKind: 'signal',
+        expected: current.dispatch ?? { state: 'reserved' },
+        next: foreign as never,
+        updatedAt: Date.now(),
+      });
+      expect(swapped.applied).toBe(true);
+
+      gated.release();
+      await poll(() => gated.written());
+      await new Promise(r => setTimeout(r, 300));
+
+      expect(sendSignal.mock.calls.filter(([s]) => (s as { type?: string })?.type === 'user-message')).toEqual([]);
+      const after = (await storage.loadMessageResultEvidence({ ...scope, signalId: identity.signalId })) as any;
+      expect(after.dispatch).toMatchObject({ state: 'dispatching', attemptId: 'foreign-owner-attempt' });
+      // The settlement notice is not delivered under the lost claim either.
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      expect(owedNotice(await planRow(parent, taskId))).toBeDefined();
+    } finally {
+      caller.abort();
+      gated.release();
+      await harness.shutdown({ drainTimeoutMs: 2000 }).catch(() => {});
+    }
+  });
+
   it('a notice left owed by a shutdown that then fails is delivered once the session is live again', async () => {
     const memory = new MockMemory();
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'remind', memory);
@@ -1452,6 +1539,95 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     }
   });
 
+  // The provider prompt, not storage, proves where the notice landed: (a) the
+  // claimed wake's own run, (b) a user turn admitted at the wake's entry, which
+  // loads the saved row from history while the wake is dropped.
+  it.each([
+    ['claimed wake: the wake run prompt carries the notice', 'wake'],
+    ['user turn admitted just before the wake: its prompt carries the notice', 'user-turn'],
+  ] as const)('%s', async (_label, path) => {
+    const ctx = realParent(true);
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const starts = watchStarts(parent);
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      await endR0();
+      let user: Promise<unknown> | undefined;
+      if (path === 'user-turn') {
+        const inject = (parent as any)._injectSystemReminder.bind(parent);
+        vi.spyOn(parent as any, '_injectSystemReminder').mockImplementation((...args: unknown[]) => {
+          if (user === undefined) {
+            user = parent.message({ content: 'what happened?' });
+            void user.catch(() => {});
+          }
+          return inject(...args);
+        });
+      }
+      releaseChild();
+      await deliveryFinished(parent, taskId);
+      if (user !== undefined) await user;
+      await parent.waitForIdle({ timeoutMs: 2000 });
+
+      expect(ctx.prompts).toHaveLength(2);
+      expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+      expect(total(ctx.prompts)).toBe(1);
+      if (path === 'user-turn') {
+        expect(user).toBeDefined();
+        expect(ctx.prompts[1]).toContain('what happened?');
+        expect(starts.filter(s => s.origin === 'wake')).toHaveLength(0);
+      } else {
+        expect(starts.filter(s => s.origin === 'wake')).toHaveLength(1);
+      }
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+    } finally {
+      ctx.releaseAll();
+      await ctx.harness.shutdown();
+    }
+  });
+
+  // Another runtime wins the thread lease after the local idle check: it holds
+  // run R, so the runtime answers a grant-less claimed wake as its `ifActive`
+  // says: folded into R (`deliver`) or refused (`discard`).
+  it('a grant-less claimed wake that loses the thread to another runtime is not labelled and is retried', async () => {
+    const ctx = realParent(false);
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const starts = watchStarts(parent);
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      await endR0();
+      const [parentAgent] = ctx.agents;
+      const sendSignal = parentAgent!.sendSignal.bind(parentAgent);
+      const lost: Array<{ ifActive: unknown }> = [];
+      vi.spyOn(parentAgent!, 'sendSignal').mockImplementation(((signal: any, opts: any) => {
+        if (signal?.type !== 'system-reminder' || lost.length > 0) return sendSignal(signal, opts);
+        lost.push({ ifActive: opts?.ifActive?.behavior });
+        const action = opts?.ifActive?.behavior === 'discard' ? 'discard' : 'deliver';
+        return {
+          runId: 'lost-wake-run',
+          signal: { ...signal, id: signal.id ?? 'lost-signal' },
+          accepted: Promise.resolve({ action, runId: action === 'deliver' ? 'foreign-run-r' : 'lost-wake-run' }),
+        };
+      }) as never);
+      releaseChild();
+      await poll(() => lost.length === 1);
+      // The lost dispatch never announces a wake run.
+      await new Promise(r => setTimeout(r, 50));
+      expect(starts.filter(s => s.runId === 'lost-wake-run')).toEqual([]);
+      await deliveryFinished(parent, taskId);
+      await poll(() => total(ctx.prompts) > 0);
+
+      expect(lost).toEqual([{ ifActive: 'discard' }]);
+      expect(starts.filter(s => s.runId === 'lost-wake-run')).toEqual([]);
+      // The refused attempt re-owed the notice; the retry woke and delivered it once.
+      expect(total(ctx.prompts)).toBe(1);
+      expect(starts.filter(s => s.origin === 'wake')).toHaveLength(1);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+    } finally {
+      ctx.releaseAll();
+      await ctx.harness.shutdown({ drainTimeoutMs: 2000 }).catch(() => {});
+    }
+  }, 15_000);
+
   it.each(MEMORY)(
     'row 3: a caller turn begun before the save dispatches after it; one delivery (%s)',
     async (_l, memory) => {
@@ -1548,6 +1724,36 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     },
   );
 
+  it('row 8d: a close while a fresh run that loaded the row is still running does not re-wake after reopen', async () => {
+    const ctx = realParent(true);
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      const queued = parent.queue({ content: 'queued follow-up' });
+      void Promise.resolve(queued).catch(() => {});
+      await poll(() => ((parent as any)._record.pendingQueue ?? []).length === 1);
+      releaseChild();
+      await waitingForQuiescence(parent, taskId);
+      // R1 (the queued turn) dispatches after the save and loads the row; hold it.
+      const releaseR1 = ctx.holdCall(1);
+      await endR0();
+      await poll(() => ctx.prompts.length === 2);
+      expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+      const closing = parent.close();
+      releaseR1();
+      await closing;
+      await poll(() => (parent as any)._delegationNoticesInFlight.size === 0);
+      const reopened = await ctx.harness.session({ sessionId: parent.id, resourceId: 'u1' });
+      await poll(async () => owedNotice(await planRow(reopened, taskId)) === undefined);
+      await poll(() => (reopened as any)._delegationNoticesInFlight.size === 0);
+      await reopened.waitForIdle({ timeoutMs: 2000 });
+      expect(total(ctx.prompts)).toBe(1);
+    } finally {
+      ctx.releaseAll();
+      await ctx.harness.shutdown();
+    }
+  });
+
   it.each(MEMORY)(
     'row 8c: a crash during the wait leaves the notice owed; the next owner delivers once (%s)',
     async (_l, memory) => {
@@ -1627,6 +1833,112 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     function wakeIntents(db: InMemoryDB) {
       return [...db.harnessTerminalIntents.values()].filter(i => i.finalizerId === wakeFinalizer.id);
     }
+
+    /** Hold the acknowledgement of the wake admission's dispatch-claim write (the write itself commits). */
+    function holdWakeClaimAck(ctx: ReturnType<typeof realParent>) {
+      const cas = ctx.storage.compareAndSwapSignalDispatch.bind(ctx.storage);
+      let stamped!: () => void;
+      const written = new Promise<void>(r => (stamped = r));
+      let release!: () => void;
+      const ack = new Promise<void>(r => (release = r));
+      vi.spyOn(ctx.storage, 'compareAndSwapSignalDispatch').mockImplementation(async (input: any) => {
+        const receipt = await cas(input);
+        if (String(input.admissionId).startsWith('harness-wake:')) {
+          stamped();
+          await ack;
+        }
+        return receipt;
+      });
+      return { written, release };
+    }
+
+    it('an owner whose wake claim lapsed before its last write was acknowledged never dispatches the wake', async () => {
+      const db = new InMemoryDB();
+      const memory = new MockMemory();
+      const a = realParent(true, { db, memory }, true);
+      const b = realParent(true, { db, memory }, true);
+      // The last write before the dispatch is the settlement notice claim: it
+      // commits, but its acknowledgement reaches A only after the lapse.
+      let written!: () => void;
+      const claimWritten = new Promise<void>(r => (written = r));
+      let releaseAck!: () => void;
+      const ack = new Promise<void>(r => (releaseAck = r));
+      const held = { written: claimWritten, release: () => releaseAck() };
+      try {
+        const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+        const startsA = watchStarts(parentA);
+        const inject = (parentA as any)._injectSystemReminder.bind(parentA);
+        vi.spyOn(parentA as any, '_injectSystemReminder').mockImplementation(
+          (content: unknown, opts: unknown, internal: any) => {
+            const claimNotice = internal?.claimNotice as (() => Promise<boolean>) | undefined;
+            if (claimNotice === undefined) return inject(content, opts, internal);
+            return inject(content, opts, {
+              ...internal,
+              claimNotice: async () => {
+                const won = await claimNotice();
+                written();
+                await ack;
+                return won;
+              },
+            });
+          },
+        );
+        const { releaseChild, endR0 } = await delegateFromR0(a, parentA);
+        await endR0();
+        releaseChild();
+        await held.written;
+        // The grant was admitted before the claim.
+        expect(wakeAdmissions(db)).toHaveLength(1);
+        // The claim and A's session lease lapse; B recovers the wake as aborted.
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(Date.now() + 31_000);
+        await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+        expect(wakeIntents(db).map(i => i.terminalResult.status)).toEqual(['aborted']);
+        held.release();
+        await poll(() => (parentA as any)._delegationNoticesInFlight.size === 0);
+        await poll(() => !parentA.isRunning());
+
+        expect(a.prompts).toHaveLength(1);
+        expect(total(a.prompts)).toBe(0);
+        expect(startsA.filter(s => s.origin === 'wake')).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+        held.release();
+        a.releaseAll();
+        b.releaseAll();
+        await b.harness.shutdown().catch(() => {});
+        await a.harness.shutdown().catch(() => {});
+      }
+    });
+
+    it('a Stop during a wake admission leaves no per-run grant state behind', async () => {
+      const db = new InMemoryDB();
+      const a = realParent(true, { db }, true);
+      const held = holdWakeClaimAck(a);
+      try {
+        const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+        const { taskId, releaseChild, endR0 } = await delegateFromR0(a, parent);
+        await endR0();
+        releaseChild();
+        await held.written;
+        await parent.abortActiveWork({ reason: 'user_requested' });
+        held.release();
+        await poll(() => wakeAdmissions(db).length === 1 && wakeAdmissions(db)[0]!.status === 'cancelled', 3000);
+        await poll(() => (parent as any)._wakeTerminalAdmissionsInFlight.size === 0, 3000);
+        await deliveryFinished(parent, taskId);
+
+        expect((parent as any)._terminalStagingAdmissions.size).toBe(0);
+        expect((parent as any)._nativeTerminalRunIds.size).toBe(0);
+        // A later turn runs normally and is not treated as the cancelled grant's run.
+        await parent.message({ content: 'next' });
+        expect((parent as any)._nativeTerminalRunIds.size).toBe(0);
+        expect(a.prompts.at(-1)).toContain('next');
+      } finally {
+        held.release();
+        a.releaseAll();
+        await a.harness.shutdown().catch(() => {});
+      }
+    });
 
     it.each([
       ['slot-lost', 'same process'],

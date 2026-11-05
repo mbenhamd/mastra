@@ -10037,9 +10037,15 @@ export class Session {
       // output when a usable result existed but turned out to be a generation
       // failure (tripwire / missing object). Undefined when generate threw.
       let observedFull: FullOutput<unknown> | undefined;
-      // PF-7679: never load history during a settlement reminder save.
+      // PF-7679: never load history during a settlement reminder save. Raced, so
+      // an abort or Stop still releases the turn while a save is pending.
       if (this._noticeSaves.size > 0) {
-        await this._awaitNoticeSaves();
+        try {
+          await Promise.race([this._awaitNoticeSaves(), activeTurnWaiter.promise]);
+        } catch (err) {
+          failOwnedMessageTurnBeforeDispatch(err);
+          throw redactPublicBoundaryRejection(err);
+        }
         assertOwnedMessageTurnNotDeleted();
       }
       // A structured generate always starts a fresh run.
@@ -10422,8 +10428,14 @@ export class Session {
 
     // PF-7679: never load history during a settlement reminder save. Before the
     // lapsed-claim check, so a claim that lapses during this wait is still seen.
+    // Raced, so an abort or Stop still releases the turn while a save is pending.
     if (this._noticeSaves.size > 0) {
-      await this._awaitNoticeSaves();
+      try {
+        await Promise.race([this._awaitNoticeSaves(), activeTurnWaiter.promise]);
+      } catch (err) {
+        failOwnedMessageTurnBeforeDispatch(err);
+        throw redactPublicBoundaryRejection(err);
+      }
       assertOwnedMessageTurnNotDeleted();
     }
 
@@ -12485,7 +12497,7 @@ export class Session {
     settlement: Pick<PendingDelegationSettlementNotice, 'taskId' | 'subagentSessionId' | 'outcome'>;
     modeId: string;
     modelId: string;
-  }): Promise<HarnessTerminalIdentity> {
+  }): Promise<{ identity: HarnessTerminalIdentity; claimExpiresAt: number }> {
     const finalizer = this._terminalWakeFinalizer!;
     const sessionIncarnation = this._record.sessionIncarnation;
     if (sessionIncarnation === undefined || sessionIncarnation.length === 0) {
@@ -12543,6 +12555,7 @@ export class Session {
       // An existing reservation means another attempt owns this notice's wake.
       if (!reservation.created) throw new HarnessBusyError(this.id, 'in_flight');
       await this._admitTerminalHandoff(identity, seed, undefined, finalizer);
+      const claimExpiresAt = Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS;
       const stamped = await this._storage.compareAndSwapSignalDispatch({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -12556,7 +12569,7 @@ export class Session {
         next: {
           state: 'dispatching',
           attemptId: `wake-dispatch-${randomUUID()}`,
-          claimExpiresAt: Date.now() + SIGNAL_DISPATCH_CLAIM_TTL_MS,
+          claimExpiresAt,
           delivery: 'idle',
           runId: identity.runId,
         },
@@ -12564,7 +12577,7 @@ export class Session {
         updatedAt: Date.now(),
       });
       if (!stamped.applied) throw new HarnessBusyError(this.id, 'in_flight');
-      return identity;
+      return { identity, claimExpiresAt };
     } catch (error) {
       this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
       // A reservation left behind is settled interrupted by dispatch recovery.
@@ -12626,6 +12639,12 @@ export class Session {
           });
           if (receipt.status === 'cancelled' || receipt.status === 'duplicate') {
             await this._settleCancelledTerminalMessage(receipt.admission ?? identity, reason.message);
+            // Nothing ran under the cancelled grant: drop its per-run state, as
+            // a terminal commit does.
+            this._terminalTokenAccountedRunIds.delete(identity.runId);
+            this._stagedTerminalRunIds.delete(identity.runId);
+            this._terminalStagingAdmissions.delete(identity.runId);
+            this._nativeTerminalRunIds.delete(identity.runId);
             this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
             return;
           }
@@ -14854,7 +14873,7 @@ export class Session {
         if (signalAdmission === undefined) {
           // PF-7679: never load history during a settlement reminder save.
           if (this._noticeSaves.size > 0) {
-            await this._awaitNoticeSaves();
+            await Promise.race([this._awaitNoticeSaves(), activeTurnWaiter.promise]);
             assertOwnedSignalTurnNotDeleted();
             this._assertOpenForTurn('signal()');
           }
@@ -14913,6 +14932,14 @@ export class Session {
               }
             }
 
+            // PF-7679: never load history during a settlement reminder save. The
+            // wait comes before the dispatch claim, so no claim is held while a
+            // save runs.
+            if (this._noticeSaves.size > 0) {
+              await Promise.race([this._awaitNoticeSaves(), activeTurnWaiter.promise]);
+              assertOwnedSignalTurnNotDeleted();
+              this._assertOpenForTurn('signal()');
+            }
             const claim = await this._claimSignalDispatch(
               signalAdmission,
               { delivery: 'idle', runId: signalAdmission.identity.idleRunId },
@@ -14932,10 +14959,13 @@ export class Session {
               }
               continue;
             }
+            // A save that began during the claim write: give the claim back and
+            // wait for the save before claiming again.
+            if (this._noticeSaves.size > 0) {
+              await releaseSignalDispatch(claim.dispatch);
+              continue;
+            }
 
-            // PF-7679: never load history during a settlement reminder save.
-            // The dispatch claim's heartbeat starts after it.
-            if (this._noticeSaves.size > 0) await this._awaitNoticeSaves();
             let dispatching = claim.dispatch;
             const heartbeat = this._startSignalDispatchClaimHeartbeat(signalAdmission, dispatching);
             let heartbeatStopped = false;
@@ -15536,6 +15566,8 @@ export class Session {
       void activeTurnWaiter.promise.catch(() => {});
       // PF-7631: the terminal identity of a settlement wake turn, once admitted.
       let wakeTerminal: HarnessTerminalIdentity | undefined;
+      // When the admitted wake's durable dispatch claim expires.
+      let wakeClaimExpiresAt = 0;
       // The wake admission attempt, kept even when a Stop, delete or eviction
       // wins the race against it, and whether its terminal commit landed.
       let wakeAdmission: Promise<HarnessTerminalIdentity> | undefined;
@@ -15616,17 +15648,19 @@ export class Session {
           sub.activeRunId() === null &&
           this._wakeGrantAllowed(internal.wakeReminderRow, agent, effectiveModeId)
         ) {
-          const admission = this._admitWakeTerminalTurn({
+          const claimed = this._admitWakeTerminalTurn({
             wakeNoticeId: internal.wakeNoticeId,
             signalId,
             settlement: internal.wakeSettlement,
             modeId: effectiveModeId,
             modelId: this._record.modelId,
           });
+          const admission = claimed.then(({ identity }) => identity);
+          void admission.catch(() => {});
           wakeAdmission = admission;
           const admitted = await Promise.race([
-            admission.then(
-              identity => ({ identity }),
+            claimed.then(
+              ({ identity, claimExpiresAt }) => ({ identity, claimExpiresAt }),
               (error: unknown) => ({ error }),
             ),
             activeTurnWaiter.promise,
@@ -15643,6 +15677,7 @@ export class Session {
             }
           } else {
             wakeTerminal = admitted.identity;
+            wakeClaimExpiresAt = admitted.claimExpiresAt;
           }
           assertOwnedReminderTurnNotDeleted();
         }
@@ -15694,6 +15729,15 @@ export class Session {
           this._cancelWakeTerminalAdmission(givenUp);
         }
 
+        // Last step before `sendSignal`, as in message(): never dispatch a granted
+        // wake on a dispatch claim or session lease that lapsed during the
+        // awaits above, when another owner may already have recovered it. The
+        // grant is then cancelled or released by the turn's cleanup.
+        if (wakeTerminal !== undefined && !this._dispatchClaimStillHeld(wakeClaimExpiresAt)) {
+          this._scheduleOrphanRecheck(Date.now());
+          throw new HarnessBusyError(this.id, 'in_flight');
+        }
+        const idleOnlyDispatch = wakeTerminal !== undefined || internal?.claimNotice !== undefined;
         dispatched = agent.sendSignal(
           {
             type: 'system-reminder',
@@ -15705,15 +15749,20 @@ export class Session {
           {
             resourceId: this.resourceId,
             threadId: this.threadId,
-            // An admitted wake binds its grant to the run this dispatch starts:
-            // it must never fold into a run that appeared meanwhile.
-            ...(wakeTerminal !== undefined ? { runId: wakeTerminal.runId, ifActive: { behavior: 'discard' } } : {}),
+            // An admitted wake binds its grant to the run this dispatch starts.
+            // Neither it nor a claimed settlement wake (PF-7679) may fold into a
+            // run that appeared meanwhile, here or in another process.
+            ...(wakeTerminal !== undefined ? { runId: wakeTerminal.runId } : {}),
+            ...(idleOnlyDispatch ? { ifActive: { behavior: 'discard' } } : {}),
             ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
           },
         );
         this._noteOwnedDispatch(agent, dispatched);
         wakeDispatchSent = true;
-        if (wakeTerminal !== undefined) {
+        if (idleOnlyDispatch) {
+          // PF-7679: the wake run, its label and agent_start exist only once the
+          // runtime accepted this dispatch as a wake on the run it returned.
+          const expectedRunId = wakeTerminal?.runId ?? dispatched.runId;
           // Bounded as message() bounds it. On a timeout the turn is aborted,
           // so a native stream that did start never runs without an owner; the
           // admission is then released to dispatch recovery.
@@ -15729,7 +15778,7 @@ export class Session {
             if (err instanceof NativeSignalAcceptanceTimeoutError) turnAbortController.abort(err);
             throw err;
           }
-          if (accepted.action !== 'wake' || accepted.runId !== wakeTerminal.runId) {
+          if (accepted.action !== 'wake' || accepted.runId !== expectedRunId) {
             // A `discard` (the dispatch binds `ifActive: 'discard'`) proves no
             // run started: the grant is cancelled like one given up before the
             // dispatch. Any other outcome is left to dispatch recovery, which
@@ -15738,7 +15787,7 @@ export class Session {
               wakeDispatchSent = false;
               // PF-7679: a run took the slot; the settlement notice is re-owed.
               if (internal?.claimNotice !== undefined) throw new DelegationNoticeWakeNotSentError('slot_lost');
-            } else {
+            } else if (wakeTerminal !== undefined) {
               this._scheduleOrphanRecheck(Date.now());
             }
             throw new HarnessBusyError(this.id, 'in_flight');
@@ -25016,15 +25065,17 @@ export class Session {
       const rowDelivered = () => this._noticeRowDelivered(reminderRow, saveTick);
       for (;;) {
         // PF-7679: wait for quiescence before the claim, so a close, shutdown or
-        // crash during the wait leaves the notice owed.
-        await this._awaitDelegationNoticeQuiescence(live);
-        if (!live()) return;
-        if (this._record.cancelRequest !== undefined || !this._activeWorkAdmissionIsCurrent(admissionEpoch)) {
-          // A Stop or edit since the settlement: the row stays; no wake.
+        // crash during the wait leaves the notice owed. A fresh run that already
+        // loaded the row ends the wait: the notice was delivered, even if a
+        // close follows before that run ends.
+        await this._awaitDelegationNoticeQuiescence(() => live() && !rowDelivered());
+        if (rowDelivered()) {
           await acknowledge();
           return;
         }
-        if (rowDelivered()) {
+        if (!live()) return;
+        if (this._record.cancelRequest !== undefined || !this._activeWorkAdmissionIsCurrent(admissionEpoch)) {
+          // A Stop or edit since the settlement: the row stays; no wake.
           await acknowledge();
           return;
         }
