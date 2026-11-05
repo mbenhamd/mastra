@@ -13,6 +13,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { Agent } from '../../agent';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { MockMemory } from '../../memory/mock';
+import type { HarnessTerminalFinalizer } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 
@@ -31,6 +32,26 @@ import {
 } from './terminal-subagent-result';
 
 type NoticeMode = 'remind' | 'wake' | 'none' | undefined;
+
+const messageFinalizer: HarnessTerminalFinalizer = {
+  id: 'doxa.chat',
+  version: '2026-09-28',
+  finalize: async ({ result }) => ({
+    projectionKind: 'chat.summary',
+    projectionId: result.runId,
+    payload: { status: result.status },
+  }),
+};
+
+const wakeFinalizer: HarnessTerminalFinalizer = {
+  id: 'doxa.chat-wake',
+  version: '2026-11-04',
+  finalize: async ({ result }) => ({
+    projectionKind: 'chat.wake',
+    projectionId: result.runId,
+    payload: { status: result.status },
+  }),
+};
 
 const completedReport = {
   status: 'success' as const,
@@ -1096,8 +1117,11 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   const NOTICE = 'settled with outcome';
 
-  /** `default` runs `parent-agent` (memory optional); `quiet-mode` runs a memory-less agent. */
-  function realParent(withMemory: boolean, shared?: { db: InMemoryDB; memory?: MockMemory }) {
+  /**
+   * `default` runs `parent-agent` (memory optional); `quiet-mode` runs a
+   * memory-less agent. `grant` registers the message and wake finalizers.
+   */
+  function realParent(withMemory: boolean, shared?: { db: InMemoryDB; memory?: MockMemory }, grant = false) {
     const prompts: string[] = [];
     const holds = new Map<number, Promise<void>>();
     const model = new MockLanguageModelV2({
@@ -1128,6 +1152,10 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       ...(memory ? { memory } : {}),
     });
     const quietAgent = new Agent({ id: 'quiet-agent', name: 'quiet-agent', instructions: 'answer briefly', model });
+    const storage = new InMemoryHarness({
+      db: shared?.db ?? new InMemoryDB(),
+      ...(grant ? { terminalHandoff: { enabled: true }, sessionRecordProjection: { enabled: true } } : {}),
+    });
     const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
     const harness = new Harness({
       agents: { 'parent-agent': parentAgent, 'quiet-agent': quietAgent, 'child-agent': childAgent } as any,
@@ -1137,7 +1165,9 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         { id: 'quiet-mode', agentId: 'quiet-agent', harnessBuiltins: 'exclude' },
       ],
       defaultModeId: 'default',
-      sessions: { storage: new InMemoryHarness({ db: shared?.db ?? new InMemoryDB() }) },
+      sessions: grant
+        ? { storage, terminalHandoff: { finalizer: messageFinalizer, wakeFinalizer } as never }
+        : { storage },
       subagents: {
         maxDepth: 2,
         onDelegatedSettlement: 'wake',
@@ -1164,7 +1194,7 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     const releaseAll = () => {
       for (const release of releases) release();
     };
-    return { harness, agents: [parentAgent, quietAgent], childAgent, prompts, holdCall, releaseAll };
+    return { harness, storage, agents: [parentAgent, quietAgent], childAgent, prompts, holdCall, releaseAll };
   }
 
   function noticeCount(prompt: string): number {
@@ -1576,4 +1606,169 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       }
     },
   );
+
+  /**
+   * PF-7679 × PF-7631: a wake grant given up after its admission (a lost slot,
+   * a `discard` acceptance, a dispatch that throws, a Stop, a mode switch), or
+   * orphaned by a crash between the admission and the claim, leaves a durable
+   * reservation under the per-notice grant key. A later delivery of the same
+   * notice, in this process or by the next owner, is refused that grant: it
+   * must still deliver, without the grant, in a bounded number of attempts.
+   * Every row runs with `wakeFinalizer` registered and parent memory (the grant
+   * needs the dispatching agent's own memory to hold the row).
+   */
+  describe('a wake grant given up after its admission (wakeFinalizer registered)', () => {
+    type GiveUp = 'slot-lost' | 'discard' | 'dispatch-throws' | 'stop' | 'mode-switch' | 'crash-before-claim';
+    type Retry = 'same process' | 'next owner';
+
+    function wakeAdmissions(db: InMemoryDB) {
+      return [...db.harnessTerminalAdmissions.values()].filter(a => a.admissionId.startsWith('harness-wake:'));
+    }
+    function wakeIntents(db: InMemoryDB) {
+      return [...db.harnessTerminalIntents.values()].filter(i => i.finalizerId === wakeFinalizer.id);
+    }
+
+    it.each([
+      ['slot-lost', 'same process'],
+      ['slot-lost', 'next owner'],
+      ['discard', 'same process'],
+      ['discard', 'next owner'],
+      ['dispatch-throws', 'same process'],
+      ['dispatch-throws', 'next owner'],
+      ['stop', 'same process'],
+      ['stop', 'next owner'],
+      ['mode-switch', 'same process'],
+      ['mode-switch', 'next owner'],
+      ['crash-before-claim', 'next owner'],
+    ] as Array<[GiveUp, Retry]>)('%s, retried by the %s: one delivery, bounded attempts', async (giveUp, retry) => {
+      const db = new InMemoryDB();
+      const sharedMemory = new MockMemory();
+      const a = realParent(true, { db, memory: sharedMemory }, true);
+      const b = realParent(true, { db, memory: sharedMemory }, true);
+      let releaseHangs!: () => void;
+      const hang = new Promise<void>(r => (releaseHangs = r));
+      let parentB: Session | undefined;
+      try {
+        const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+        const startsA = watchStarts(parentA);
+        const proto = Object.getPrototypeOf(parentA);
+        let attempts = 0;
+        const inject = proto._injectSystemReminder as (...args: unknown[]) => Promise<unknown>;
+        const countSpy = vi.spyOn(proto, '_injectSystemReminder').mockImplementation(function (
+          this: Session,
+          ...args: unknown[]
+        ) {
+          attempts += 1;
+          return inject.apply(this, args);
+        });
+        onTestFinished(() => countSpy.mockRestore());
+
+        const { taskId, releaseChild, endR0 } = await delegateFromR0(a, parentA);
+        await endR0();
+
+        // The give-up seams, all on owner A's first wake attempt.
+        let admitted = false;
+        let gaveUp = false;
+        let caller: Promise<unknown> | undefined;
+        const admit = a.storage.admitTerminalHandoff.bind(a.storage);
+        vi.spyOn(a.storage, 'admitTerminalHandoff').mockImplementation(async (input: any) => {
+          if (!JSON.stringify(input).includes('"harness-wake:') || admitted) return admit(input);
+          admitted = true;
+          if (giveUp === 'slot-lost') {
+            // A caller turn on the memory-less `quiet-mode` takes the slot during
+            // the admission; it never reads the row, so the notice is re-owed.
+            a.holdCall(1);
+            caller = parentA.message({ content: 'what happened?', mode: 'quiet-mode' } as never);
+            void caller.catch(() => {});
+            await poll(() => a.prompts.length === 2);
+          }
+          if (giveUp === 'stop') void parentA.abortActiveWork({ reason: 'user_requested' });
+          if (giveUp === 'mode-switch') await parentA.switchMode({ mode: 'quiet-mode' });
+          const receipt = await admit(input);
+          if (giveUp === 'crash-before-claim') {
+            crashParent(db, parentA);
+            gaveUp = true;
+            await hang;
+          }
+          return receipt;
+        });
+        const [parentAgent] = a.agents;
+        const sendSignal = parentAgent!.sendSignal.bind(parentAgent);
+        vi.spyOn(parentAgent!, 'sendSignal').mockImplementation(((signal: any, opts: any) => {
+          const reserved = typeof opts?.runId === 'string' && opts.runId.startsWith('harness-wake-');
+          if (signal?.type === 'system-reminder' && reserved && !gaveUp) {
+            if (giveUp === 'discard') {
+              gaveUp = true;
+              return { signal, runId: opts.runId, accepted: Promise.resolve({ action: 'discard' }) };
+            }
+            if (giveUp === 'dispatch-throws') {
+              gaveUp = true;
+              throw new Error('runtime refused the dispatch');
+            }
+          }
+          return sendSignal(signal, opts);
+        }) as never);
+        if (giveUp === 'slot-lost' || giveUp === 'stop' || giveUp === 'mode-switch') {
+          const mark = () => (gaveUp = true);
+          void poll(() => admitted, 5000).then(mark, () => {});
+        }
+        // Next owner: owner A crashes after its give-up, before any retry runs
+        // (its next wait for quiescence never returns).
+        if (retry === 'next owner') {
+          const quiescence = (parentA as any)._awaitDelegationNoticeQuiescence.bind(parentA);
+          vi.spyOn(parentA as any, '_awaitDelegationNoticeQuiescence').mockImplementation(
+            async (...args: unknown[]) => {
+              if (gaveUp) await hang;
+              return quiescence(...args);
+            },
+          );
+        }
+
+        releaseChild();
+        await poll(() => admitted && gaveUp, 3000);
+
+        let owner: Session = parentA;
+        if (retry === 'next owner') {
+          if (giveUp === 'slot-lost' || giveUp === 'discard' || giveUp === 'dispatch-throws') {
+            // The given-up grant is cancelled before the crash.
+            await poll(() => wakeAdmissions(db).some(w => w.status === 'cancelled'), 3000);
+          }
+          crashParent(db, parentA);
+          parentB = await b.harness.session({ sessionId: parentA.id, resourceId: 'u1' });
+          owner = parentB;
+        } else if (caller !== undefined) {
+          a.releaseAll();
+          await caller.catch(() => {});
+        }
+        await deliveryFinished(owner, taskId);
+
+        if (giveUp === 'stop') {
+          // The Stop contract: no wake; the saved row reaches the next turn once.
+          expect(total(a.prompts, b.prompts)).toBe(0);
+          await owner.message({ content: 'next' });
+        }
+        expect(total(a.prompts, b.prompts)).toBe(1);
+        expect(owedNotice(await planRow(owner, taskId))).toBeUndefined();
+        expect(attempts).toBeLessThanOrEqual(3);
+        // A delivery after a given-up grant runs without one, so it stages no
+        // wake intent. Only the admission A orphaned by its crash is settled by
+        // dispatch recovery, as an aborted wake (PF-7631).
+        expect(wakeIntents(db).map(i => i.terminalResult.status)).toEqual(
+          giveUp === 'crash-before-claim' ? ['aborted'] : [],
+        );
+        if (giveUp !== 'stop' && retry === 'same process') {
+          expect(startsA.filter(s => s.origin === 'wake')).toHaveLength(1);
+        }
+        if (giveUp !== 'stop' && giveUp !== 'crash-before-claim') {
+          await poll(() => wakeAdmissions(db).length === 1 && wakeAdmissions(db)[0]!.status === 'cancelled', 3000);
+        }
+      } finally {
+        releaseHangs();
+        a.releaseAll();
+        b.releaseAll();
+        await b.harness.shutdown();
+        await a.harness.shutdown().catch(() => {});
+      }
+    });
+  });
 });

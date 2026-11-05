@@ -15457,8 +15457,12 @@ export class Session {
    * memory instance with no mode change since (`wakeReminderRow`,
    * `_wakeGrantAllowed`); that wake then runs as the reserved wake run. A
    * grant that no longer holds at dispatch is cancelled
-   * (`_cancelWakeTerminalAdmission`: no terminal result, no intent). Every
-   * other case is fork main's call.
+   * (`_cancelWakeTerminalAdmission`: no terminal result, no intent).
+   * PF-7679: a settlement wake (`claimNotice`) never folds into a caller turn:
+   * a lost idle slot re-owes the notice (`slot_lost`). A refused grant
+   * admission (an earlier attempt's reservation for this notice exists, or is
+   * still being cancelled) never reads as a lost slot: the wake runs without a
+   * grant, as a wake outside the allowlist does, and stages no intent.
    */
   private async _injectSystemReminder(
     content: string,
@@ -15576,7 +15580,6 @@ export class Session {
         }
       };
       let dispatched;
-      let idleSlotLost = false;
       try {
         const toolSurface = this._buildToolSurface(mode, undefined);
         this._setCurrentTurnReplacementToolSurface(toolSurface);
@@ -15613,14 +15616,34 @@ export class Session {
           sub.activeRunId() === null &&
           this._wakeGrantAllowed(internal.wakeReminderRow, agent, effectiveModeId)
         ) {
-          wakeAdmission = this._admitWakeTerminalTurn({
+          const admission = this._admitWakeTerminalTurn({
             wakeNoticeId: internal.wakeNoticeId,
             signalId,
             settlement: internal.wakeSettlement,
             modeId: effectiveModeId,
             modelId: this._record.modelId,
           });
-          wakeTerminal = await Promise.race([wakeAdmission, activeTurnWaiter.promise]);
+          wakeAdmission = admission;
+          const admitted = await Promise.race([
+            admission.then(
+              identity => ({ identity }),
+              (error: unknown) => ({ error }),
+            ),
+            activeTurnWaiter.promise,
+          ]);
+          if ('error' in admitted) {
+            wakeAdmission = undefined;
+            // PF-7679: the grant key is per notice, so a reservation left by an
+            // earlier attempt (given up, cancelling, or orphaned by a crash)
+            // refuses this one as busy. That is not a lost slot: the claim, not
+            // the grant, keeps the delivery exactly once, so the wake runs
+            // without a grant. Any other refusal fails the attempt as before.
+            if (internal.claimNotice === undefined || !(admitted.error instanceof HarnessBusyError)) {
+              throw admitted.error;
+            }
+          } else {
+            wakeTerminal = admitted.identity;
+          }
           assertOwnedReminderTurnNotDeleted();
         }
         // PF-7679: never load history during a settlement reminder save.
@@ -15636,30 +15659,25 @@ export class Session {
           assertOwnedReminderTurnNotDeleted();
           this._assertOpenForTurn('injectSystemReminder()');
         }
-        // An idle-only wake re-checks in the same tick as its dispatch. It
-        // refuses only a stale admission epoch: a Stop (`abortActiveWork`) or an
+        // An idle-only wake re-checks in the same tick as its dispatch. A stale
+        // admission epoch refuses it: a Stop (`abortActiveWork`) or an
         // edit/regenerate (`resetPlanTasks`, which cancels the owned child
-        // sessions) during the context await (the Stop contract: not stopped or
-        // cancelled since the settlement). If a caller turn began or started a
-        // run during the await, it keeps the slot: the content is sent exactly
-        // as fork main sends it; only the wake label is dropped, so that run is
-        // never announced as this wake. PF-7631: the wake grant is kept only
-        // while the wake still holds the idle slot and its row is still proven
-        // to be in the dispatching agent's own memory with no mode change since
-        // (`_wakeGrantAllowed`). Both are re-checked here, in the same tick as
-        // the dispatch. If either no longer holds, the grant is cancelled (no
-        // run starts under it, no terminal result or intent is committed) and
-        // the wake is sent exactly as fork main sends it: a caller run that took
-        // the slot receives the notice as its next model input, unlabelled. A
-        // kept grant binds the dispatch to the reserved run.
+        // sessions) during its awaits (the Stop contract: not stopped or
+        // cancelled since the settlement). PF-7679: if a caller turn began or
+        // started a run during the awaits, the wake never folds into it: it
+        // throws `slot_lost`, and its delivery restores the notice and waits for
+        // that turn to end. PF-7631: the wake grant is kept only while its row
+        // is still proven to be in the dispatching agent's own memory with no
+        // mode change since (`_wakeGrantAllowed`), re-checked here in the same
+        // tick as the dispatch. If that no longer holds, the grant is cancelled
+        // (no run starts under it, no terminal result or intent is committed)
+        // and the wake is sent without it. A kept grant binds the dispatch to
+        // the reserved run.
         if (idleOnlyEpoch !== undefined) {
           if (!this._activeWorkAdmissionIsCurrent(idleOnlyEpoch)) {
             throw new HarnessBusyError(this.id, 'in_flight');
           }
-          idleSlotLost = this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null;
-          // PF-7679: a claimed settlement wake never folds into a caller turn;
-          // its delivery restores the notice and waits for the turn to end.
-          if (idleSlotLost && internal?.claimNotice !== undefined) {
+          if (this._currentTurnAbortController !== turnAbortController || sub.activeRunId() !== null) {
             throw new DelegationNoticeWakeNotSentError('slot_lost');
           }
         }
@@ -15733,13 +15751,10 @@ export class Session {
 
       // §10.2 agent_start carries the runId — emit it now the run is dispatched.
       // dispatched.signal.id is the originating signalId — stamped for the run projection.
-      // A run started under the wake grant is verified as the wake's own run
-      // above (action 'wake' on the reserved runId), so it keeps the label.
-      this._emitAgentStart(
-        dispatched.runId,
-        dispatched.signal.id,
-        idleSlotLost && wakeTerminal === undefined ? undefined : internal?.wakeNoticeId,
-      );
+      // A wake reaches here only while it held the idle slot at dispatch, or
+      // as the reserved run its grant bound (verified above: action 'wake' on
+      // the reserved runId), so it keeps the label.
+      this._emitAgentStart(dispatched.runId, dispatched.signal.id, internal?.wakeNoticeId);
 
       const completion = this._awaitRunCompletion(dispatched.runId);
       const completionOrDelete = Promise.race([completion, activeTurnWaiter.promise]);

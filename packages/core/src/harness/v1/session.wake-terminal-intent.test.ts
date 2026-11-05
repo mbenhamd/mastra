@@ -343,9 +343,11 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
 // The wake grant binds the wake to a reserved run. It is kept only in the one
 // proven case: the wake still holds the idle slot at dispatch, and the
 // dispatching agent's own fixed memory saved the row with no mode change since.
-// Every other case, including every caller run that took the slot, is fork
-// main's path: delivery and label as main, and no intent. A grant given up
-// after its admission is cancelled: no terminal result, no intent.
+// Every other case runs without a grant and stages no intent. PF-7679: a
+// caller run that takes the slot never receives the wake signal; it reads the
+// row from history, or the wake runs after it. A grant given up after its
+// admission is cancelled (no terminal result, no intent), and a later attempt
+// for the same notice runs without a grant.
 //
 // Dimensions under a registered wake finalizer: the delegating mode (`default`,
 // `parent-agent`) vs the active mode at settlement (same, a per-mode agent
@@ -359,8 +361,8 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
 //   mode's memory first, so the delegating side is never read: rows 7/8;
 // - a shared agent with no memory: no row, rows 3/4;
 // - a mode switch together with a caller run, or a caller in any other cell:
-//   a caller that takes the slot always gives the grant up (rows 2, 8, 10,
-//   14-16), and the switch alone already takes main's path (rows 11-13).
+//   a caller that takes the slot gives a held grant up (rows 16, 17), and the
+//   switch alone already runs without a grant (rows 11-13).
 describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   const NOTICE = 'settled with outcome';
@@ -621,6 +623,19 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
         grant: false,
         delivery: 'caller-loads-row',
         label: 'none',
+      },
+    ],
+    [
+      '17 per-turn override caller on a memory-less agent during the grant admission: cancelled, the wake runs after it without a grant',
+      {
+        ...base,
+        active: 'default',
+        callerRun: true,
+        callerMode: 'other-mode',
+        callerDuring: 'admission',
+        grant: false,
+        delivery: 'wake-after-caller',
+        label: 'wake',
       },
     ],
   ] as Array<[string, Row]>)('%s', async (_label, row) => {
