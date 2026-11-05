@@ -1052,13 +1052,13 @@ describe('Harness v1 real-agent E2E — built-in tools read ctx.agent.runId', ()
   // id); a pending captured only from the suspended output is keyed
   // `<kind>:<toolCallId>`. The item id therefore shows whether the tool
   // reached the Harness registration with the agent run id.
-  async function suspendOn(toolName: 'ask_user' | 'submit_plan', toolCallId: string, inputJson: string) {
+  async function sessionWith(toolName: 'ask_user' | 'submit_plan', toolCallId: string, inputJson: string) {
     let callCount = 0;
     const model = new MockLanguageModelV2({
       doStream: async () => ({
         rawCall: { rawPrompt: null, rawSettings: {} },
         warnings: [],
-        stream: ++callCount === 1 ? toolCallStream(toolCallId, toolName, inputJson) : textStream(['unexpected']),
+        stream: ++callCount === 1 ? toolCallStream(toolCallId, toolName, inputJson) : textStream(['resumed']),
       }),
     });
     const agent = new Agent({ id: 'default', name: 'default', instructions: `call ${toolName}`, model });
@@ -1078,10 +1078,61 @@ describe('Harness v1 real-agent E2E — built-in tools read ctx.agent.runId', ()
     const session = await harness.session({ resourceId: `${toolName}-run-id-user`, threadId: { fresh: true } });
     const events: HarnessEvent[] = [];
     session.subscribe(event => events.push(event));
+    return { harness, session, events };
+  }
+
+  async function suspendOn(toolName: 'ask_user' | 'submit_plan', toolCallId: string, inputJson: string) {
+    const { harness, session, events } = await sessionWith(toolName, toolCallId, inputJson);
     const suspended = (await session.message({ content: `use ${toolName}` })) as any;
     const agentStart = events.find(event => event.type === 'agent_start') as { runId: string } | undefined;
     return { harness, session, events, suspended, runId: agentStart?.runId };
   }
+
+  // A signal-origin run that parks on a pre-registered interaction settles its
+  // signal only when the parked pending still names the originating signal.
+  async function expectSignalSettlesAfterResponse(
+    toolName: 'ask_user' | 'submit_plan',
+    toolCallId: string,
+    inputJson: string,
+    respond: (session: Awaited<ReturnType<typeof sessionWith>>['session']) => Promise<unknown>,
+  ) {
+    const { harness, session, events } = await sessionWith(toolName, toolCallId, inputJson);
+    try {
+      const handle = await session.signal({ content: `use ${toolName}` });
+      const suspended = (await handle.result) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume).toMatchObject({ itemId: toolCallId, originSignalId: handle.id });
+
+      await respond(session);
+
+      await waitFor(() => events.some(event => event.type === 'signal_completed'), 'signal_completed');
+      expect(events.filter(event => event.type === 'signal_completed')).toEqual([
+        expect.objectContaining({ signalId: handle.id, runId: suspended.runId }),
+      ]);
+      const lookup = await session.lookupMessageResult(handle.id);
+      expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+    } finally {
+      await harness.shutdown();
+    }
+  }
+
+  it('a signal-origin ask_user settles its signal after the answer', async () => {
+    await expectSignalSettlesAfterResponse(
+      'ask_user',
+      'signal-question-call',
+      JSON.stringify({ question: 'Continue?' }),
+      session => session.respondToQuestion({ answer: 'yes' }),
+    );
+  });
+
+  it('a signal-origin submit_plan settles its signal after the approval', async () => {
+    await expectSignalSettlesAfterResponse(
+      'submit_plan',
+      'signal-plan-call',
+      JSON.stringify({ plan: '1. Do the thing.' }),
+      session => session.respondToPlanApproval({ approved: true }),
+    );
+  });
 
   it('ask_user registers its question with the active run id', async () => {
     const { harness, session, events, suspended, runId } = await suspendOn(

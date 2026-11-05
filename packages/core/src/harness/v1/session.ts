@@ -16143,6 +16143,19 @@ export class Session {
             const currentKey = current === undefined ? undefined : pendingInteractionGenerationKey(current);
             if (currentKey !== opts.restoreFence.expectedKey) return prev;
           }
+          // A tool-registered pending (ctx.registerQuestion / registerPlanApproval
+          // / registerSandboxAccess) is written mid-turn without the turn's
+          // origin. Settlement and queue routing read `queuedItemId` /
+          // `originSignalId` off the parked pending, so adopt the captured
+          // origin when the registered pending lacks it.
+          const originToAdopt = {
+            ...(current?.queuedItemId === undefined && pending.queuedItemId !== undefined
+              ? { queuedItemId: pending.queuedItemId }
+              : {}),
+            ...(current?.originSignalId === undefined && pending.originSignalId !== undefined
+              ? { originSignalId: pending.originSignalId }
+              : {}),
+          };
           if (
             current === undefined ||
             current.runId !== full.runId ||
@@ -16150,7 +16163,8 @@ export class Session {
             (pending.accountedTokenUsage === undefined &&
               pending.toolReceipts === undefined &&
               pending.toolReceiptsOverflow !== true &&
-              pending.subagentBudgetSpent === undefined)
+              pending.subagentBudgetSpent === undefined &&
+              Object.keys(originToAdopt).length === 0)
           ) {
             return prev;
           }
@@ -16159,6 +16173,7 @@ export class Session {
             ...prev,
             pendingResume: {
               ...current,
+              ...originToAdopt,
               ...(pending.accountedTokenUsage !== undefined
                 ? { accountedTokenUsage: pending.accountedTokenUsage }
                 : {}),
