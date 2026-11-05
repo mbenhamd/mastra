@@ -2044,12 +2044,16 @@ export class Session {
   private readonly _activeSubagents = new Map<string, ActiveSubagentState>();
   /**
    * Inline (`spawn_subagent`) children whose call returned during the current
-   * turn, so the `subagent` control tool keeps listing them at their place
+   * run, so the `subagent` control tool keeps listing them at their place
    * after they leave `_activeSubagents`. One small entry (start time and
    * agent type; no task text or result) per spawn_subagent call that returned
-   * in this turn; cleared when the next turn begins (`_resetTurnTracking`).
+   * in this run. Cleared only when a new run starts: `_beginTurn` with no turn
+   * in flight (`_openTurnControllers` empty). A message, signal or reminder
+   * that joins the active run does not clear it.
    */
   private readonly _returnedInlineSubagents = new Map<string, ReturnedInlineSubagentState>();
+  /** Controllers from `_beginTurn` whose `_endTurn` has not run yet. */
+  private readonly _openTurnControllers = new Set<AbortController>();
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
@@ -3318,7 +3322,7 @@ export class Session {
 
   /**
    * @internal — a `spawn_subagent` call returned: drop its display entry and
-   * remember the child for the rest of this turn (see `_returnedInlineSubagents`).
+   * remember the child for the rest of this run (see `_returnedInlineSubagents`).
    */
   _internalReturnInlineSubagent(toolCallId: string): void {
     const state = this._activeSubagents.get(toolCallId);
@@ -3330,7 +3334,7 @@ export class Session {
     });
   }
 
-  /** @internal — the inline children whose spawn_subagent call returned in this turn. */
+  /** @internal — the inline children whose spawn_subagent call returned in this run. */
   _internalReturnedInlineSubagents(): ReadonlyMap<string, ReturnedInlineSubagentState> {
     return this._returnedInlineSubagents;
   }
@@ -3364,6 +3368,10 @@ export class Session {
       this._assertSourceWriteGuardScope(sourceWriteGuard, 'observationalMemorySourceWriteGuard');
     }
     const controller = new AbortController();
+    // No turn in flight: this starts a new run, so the previous run's returned
+    // inline children leave the list. A turn that joins an active run keeps them.
+    if (this._openTurnControllers.size === 0) this._returnedInlineSubagents.clear();
+    this._openTurnControllers.add(controller);
     this._currentTurnAbortController = controller;
     this._turnsBegun += 1;
     this._resetTurnTracking();
@@ -3419,7 +3427,8 @@ export class Session {
     this._activeTools.clear();
     this._toolInputBuffers.clear();
     this._subagentAnswerDecoders.clear();
-    this._returnedInlineSubagents.clear();
+    // `_returnedInlineSubagents` is cleared by `_beginTurn` only when a new run
+    // starts, not by a turn that joins the active run.
     // `_activeSubagents` is keyed by parent tool call id and naturally drops
     // entries on subagent close; do not clear here so a long-running subagent
     // spanning multiple parent turns still renders.
@@ -3432,6 +3441,7 @@ export class Session {
    * idle state. Cumulative aggregates (`_tokenUsage`) are preserved.
    */
   private _endTurn(controller: AbortController): void {
+    this._openTurnControllers.delete(controller);
     this._turnAbortSignalCleanups.get(controller)?.();
     this._turnAbortSignalCleanups.delete(controller);
     if (this._currentTurnAbortController === controller) {

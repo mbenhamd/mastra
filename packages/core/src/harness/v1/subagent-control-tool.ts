@@ -163,10 +163,10 @@ const inputSchema = z
           'running and settled, ordered oldest first (by start time, then id). A subagent keeps its position ' +
           'when it settles. A wait with an offset returns the settled subagents from that position on and ' +
           'waits for the running ones; as in every wait without ids, only a subagent that settles during the ' +
-          'call ends an until "any" wait. When an ' +
-          'output leaves subagents out, resultsHint gives the next offset. Positions can shift only when a subagent starts between calls with the same or an earlier ' +
-          'start time, or when a new turn begins: a spawn_subagent subagent whose call returned in an earlier ' +
-          'turn is no longer listed.',
+          'call ends an until "any" wait. When an output leaves subagents out, resultsHint gives the next ' +
+          'offset. Positions can shift only when a subagent starts between calls with the same or an earlier ' +
+          'start time, or when a new run begins: a spawn_subagent subagent whose call returned in an earlier ' +
+          'run is no longer listed. A message that joins the current run does not start a new one.',
       ),
     message: z
       .string()
@@ -742,8 +742,8 @@ export function createSubagentControlTool(parent: Session) {
     } else {
       const known = new Map<string, number>();
       for (const [id, state] of activeById) known.set(id, state.startedAt);
-      // An inline child whose spawn_subagent call returned in this turn keeps
-      // its place, so paging within a turn never skips a child.
+      // An inline child whose spawn_subagent call returned in this run keeps
+      // its place, so paging within a run never skips a child.
       for (const [id, state] of returnedById) if (!known.has(id)) known.set(id, state.startedAt);
       for (const [id, task] of delegated) {
         if (!known.has(id)) known.set(id, attemptOf(task, id)?.startedAt ?? task.createdAt);
@@ -1110,8 +1110,9 @@ export function createSubagentControlTool(parent: Session) {
       'place when it settles, and `wait` with an offset also returns the settled subagents from that place ' +
       'on (in a wait without ids, only a subagent that settles during the call ends an `until: "any"` ' +
       'wait; with ids, a named subagent already settled ends it at once). Places can shift only ' +
-      'when a subagent starts between calls with the same or an earlier start time, or when a new turn ' +
-      'begins: a spawn_subagent subagent whose call returned in an earlier turn is no longer listed. A call ' +
+      'when a subagent starts between calls with the same or an earlier start time, or when a new run ' +
+      'begins: a spawn_subagent subagent whose call returned in an earlier run is no longer listed (a ' +
+      'message that joins the current run does not start a new one). A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
       'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
