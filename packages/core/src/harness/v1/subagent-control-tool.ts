@@ -139,7 +139,8 @@ const inputSchema = z
       .optional()
       .describe(
         'wait only: "all" (default) returns when every target has settled; "any" returns as soon as one ' +
-          'target has settled, including one that had already settled.',
+          'target has settled. With ids, a named subagent that had already settled ends an "any" wait at ' +
+          'once; without ids, only a subagent that settles during the call ends it.',
       ),
     timeoutMs: z
       .number()
@@ -161,7 +162,8 @@ const inputSchema = z
         'status and wait without ids only: the position to start from in the list of all your subagents, ' +
           'running and settled, ordered oldest first (by start time, then id). A subagent keeps its position ' +
           'when it settles. A wait with an offset returns the settled subagents from that position on and ' +
-          'waits for the running ones; only one of those running ones ends an until "any" wait. When an ' +
+          'waits for the running ones; as in every wait without ids, only a subagent that settles during the ' +
+          'call ends an until "any" wait. When an ' +
           'output leaves subagents out, resultsHint gives the next offset. Positions can shift only when a subagent starts between calls with the same or an earlier ' +
           'start time, or when a new turn begins: a spawn_subagent subagent whose call returned in an earlier ' +
           'turn is no longer listed.',
@@ -1106,7 +1108,8 @@ export function createSubagentControlTool(parent: Session) {
       'gives the offset of the next ones. Listings without ids are ordered oldest first (by start time, then ' +
       'id). `offset` is a place in that list of all your subagents, running and settled; a subagent keeps its ' +
       'place when it settles, and `wait` with an offset also returns the settled subagents from that place ' +
-      'on (only a subagent that settles during the call ends an `until: "any"` wait). Places can shift only ' +
+      'on (in a wait without ids, only a subagent that settles during the call ends an `until: "any"` ' +
+      'wait; with ids, a named subagent already settled ends it at once). Places can shift only ' +
       'when a subagent starts between calls with the same or an earlier start time, or when a new turn ' +
       'begins: a spawn_subagent subagent whose call returned in an earlier turn is no longer listed. A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
