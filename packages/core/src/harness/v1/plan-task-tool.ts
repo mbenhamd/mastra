@@ -198,8 +198,11 @@ const DELEGATION_WITHOUT_CHILD_RESULT_CODES = new Set(['harness.delegation_faile
 /**
  * A retry of a taskId-less `task_delegate` call resolves to the task the first
  * attempt added. When that attempt already delegated it, return the first
- * call's success view instead of an "already delegated" refusal. Only an
- * attempt by this exact tool call qualifies, and an attempt that settled
+ * call's success view instead of an "already delegated" refusal. Only a
+ * delegation by this exact tool call in this exact run qualifies: when another
+ * run (or another call) has since delegated the task, the retry follows the
+ * normal delegation rules instead, which refuse a task already delegated to an
+ * active subagent and name its id. An attempt that settled
  * without a result from its child (for example, child creation failed) does
  * not, so its retry follows the normal re-delegation rules and creates a child.
  */
@@ -207,9 +210,15 @@ function replayedDelegation(
   task: PlanTaskView,
   idempotencyKey: string | undefined,
   toolCallId: string | undefined,
+  runId: string | undefined,
 ): (PlanTaskView & { subagentSessionId: string }) | undefined {
   const delegation = task.delegation;
-  if (idempotencyKey === undefined || delegation === undefined || delegation.parentToolCallId !== toolCallId) {
+  if (
+    idempotencyKey === undefined ||
+    delegation === undefined ||
+    delegation.parentToolCallId !== toolCallId ||
+    delegation.parentRunId !== runId
+  ) {
     return undefined;
   }
   if (delegation.status !== 'running' && delegation.status !== 'completed') {
@@ -456,30 +465,40 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
             'delegates it, so `task` is required. The result carries the plan task id either way. ' +
             'Available agent types:\n' +
             subagentTypeList,
-          inputSchema: z.object({
-            taskId: z
-              .string()
-              .optional()
-              .describe(
-                'Existing plan task to delegate. Omit to add a new top-level plan task from `task` and delegate it.',
-              ),
-            agentType: z.enum(subagentTypeIds as [string, ...string[]]).describe('Registered subagent type to run.'),
-            task: z
-              .string()
-              .min(1)
-              .max(PLAN_TASK_DELEGATED_BODY_MAX_BYTES)
-              .optional()
-              .describe(
-                'Self-contained task description for the subagent. The subagent does not see the parent ' +
-                  'conversation, so include every piece of context it needs. Defaults to the plan task title ' +
-                  'when `taskId` is given; required when it is omitted (its first line becomes the task title).',
-              ),
-            includeSubtree: z
-              .boolean()
-              .optional()
-              .describe('Delegate the task AND its descendants as one unit (surfaced to the subagent).'),
-            modelOverride: z.string().optional().describe('Model id override; falls back to the subagent default.'),
-          }),
+          inputSchema: z
+            .object({
+              taskId: z
+                .string()
+                .optional()
+                .describe(
+                  'Existing plan task to delegate. Omit to add a new top-level plan task from `task` and delegate it.',
+                ),
+              agentType: z.enum(subagentTypeIds as [string, ...string[]]).describe('Registered subagent type to run.'),
+              task: z
+                .string()
+                .min(1)
+                .max(PLAN_TASK_DELEGATED_BODY_MAX_BYTES)
+                .optional()
+                .describe(
+                  'Self-contained task description for the subagent. The subagent does not see the parent ' +
+                    'conversation, so include every piece of context it needs. Defaults to the plan task title ' +
+                    'when `taskId` is given; required when it is omitted (its first line becomes the task title).',
+                ),
+              includeSubtree: z
+                .boolean()
+                .optional()
+                .describe('Delegate the task AND its descendants as one unit (surfaced to the subagent).'),
+              modelOverride: z.string().optional().describe('Model id override; falls back to the subagent default.'),
+            })
+            .superRefine((input, ctx) => {
+              if (input.taskId === undefined && (input.task === undefined || input.task.trim().length === 0)) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  path: ['task'],
+                  message: 'is required when taskId is omitted and must have at least one non-blank line',
+                });
+              }
+            }),
           outputSchema: z
             .object({ ...planTaskViewShape, subagentSessionId: z.string().optional(), ...errorShape })
             .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
@@ -529,6 +548,8 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
       let taskId = input.taskId;
       if (taskId === undefined) {
         const content = delegatedTaskTitle(input.task);
+        // The input schema refuses this for tool calls; a direct call that
+        // skipped validation still gets a typed refusal.
         if (content === undefined) {
           throw new HarnessValidationError('task', 'is required when taskId is omitted');
         }
@@ -540,7 +561,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
           { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
           context?.abortSignal,
         );
-        const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId);
+        const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId, context?.agent?.runId);
         if (replayed !== undefined) return replayed as any;
         taskId = added.taskId;
         addedTaskId = added.taskId;

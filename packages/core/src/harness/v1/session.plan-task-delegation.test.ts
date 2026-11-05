@@ -251,10 +251,10 @@ describe('task_delegate registration', () => {
 
 describe('task_delegate — with or without taskId', () => {
   /** Agent-call context: carries the tool call identity that keys idempotent task creation. */
-  const agentCallCtx = (toolCallId: string) =>
+  const agentCallCtx = (toolCallId: string, runId = 'mock-run') =>
     ({
       abortSignal: new AbortController().signal,
-      agent: { agentId: 'parent-agent', messages: [], toolCallId, runId: 'mock-run' },
+      agent: { agentId: 'parent-agent', messages: [], toolCallId, runId },
       requestContext: { get: () => undefined },
     }) as any;
 
@@ -268,6 +268,10 @@ describe('task_delegate — with or without taskId', () => {
     toolCallId?: string;
     /** Pass the taskId the first call's result named. */
     withFirstResultTaskId?: true;
+    /** Pass the id of the plan task the first call added. */
+    withAddedTaskId?: true;
+    /** Agent run id; defaults to the shared run. */
+    runId?: string;
   };
   type ResultSummary =
     | { ok: true; taskId: 'target' | 'other'; sameChildAsFirstSuccess: boolean }
@@ -372,6 +376,27 @@ describe('task_delegate — with or without taskId', () => {
       },
     },
     {
+      name: 'with taskId and without task the input schema accepts the call and delegates the task',
+      existingTask: true,
+      calls: [{ withExistingTaskId: true }],
+      expected: { addedTitles: [], results: [ok()], targetLinked: true },
+    },
+    {
+      name: "a replay after another run re-delegated the task does not return that run's child",
+      failChildCreationOnce: true,
+      calls: [
+        { task: 'Original instructions', runId: 'run1', toolCallId: 'call1' },
+        { task: 'Different instructions', withAddedTaskId: true, runId: 'run2', toolCallId: 'call1' },
+        { task: 'Original instructions', runId: 'run1', toolCallId: 'call1' },
+      ],
+      expected: {
+        addedTitles: ['Original instructions'],
+        results: [refused('HarnessError'), ok(), refused('HarnessValidationError', { field: 'taskId' })],
+        targetLinked: true,
+        lastChildReceives: 'Different instructions',
+      },
+    },
+    {
       name: 'a same-call retry after child creation failed creates a real child',
       failChildCreationOnce: true,
       calls: [
@@ -406,20 +431,20 @@ describe('task_delegate — with or without taskId', () => {
       },
     },
     {
-      name: 'without taskId and without task is refused before any task is added',
+      name: 'without taskId and without task is refused by the input schema before any task is added',
       calls: [{}],
       expected: {
         addedTitles: [],
-        results: [refused('HarnessValidationError', { field: 'task' })],
+        results: [refused('ToolInputValidationError', { field: 'task' })],
         targetLinked: false,
       },
     },
     {
-      name: 'without taskId and a blank task is refused before any task is added',
+      name: 'without taskId and a blank task is refused by the input schema before any task is added',
       calls: [{ task: ' \n\t\n ' }],
       expected: {
         addedTitles: [],
-        results: [refused('HarnessValidationError', { field: 'task' })],
+        results: [refused('ToolInputValidationError', { field: 'task' })],
         targetLinked: false,
       },
     },
@@ -544,15 +569,16 @@ describe('task_delegate — with or without taskId', () => {
       });
     }
     const results: any[] = [];
-    const run = (call: Call) =>
+    const run = async (call: Call) =>
       tools[TASK_DELEGATE_TOOL_ID]!.execute!(
         {
           agentType: 'worker',
           ...(call.withExistingTaskId ? { taskId: existing } : {}),
           ...(call.withFirstResultTaskId ? { taskId: results[0]?.taskId } : {}),
+          ...(call.withAddedTaskId ? { taskId: (await listTasks()).find(t => !before.has(t.taskId))?.taskId } : {}),
           ...(call.task !== undefined ? { task: call.task } : {}),
         } as any,
-        agentCallCtx(call.toolCallId ?? 'tc-delegate'),
+        agentCallCtx(call.toolCallId ?? 'tc-delegate', call.runId),
       );
     if (row.parallel) {
       results.push(...(await Promise.all(row.calls.map(run))));
@@ -569,24 +595,33 @@ describe('task_delegate — with or without taskId', () => {
     const added = (await listTasks()).filter(t => !before.has(t.taskId));
     const targetId = row.calls.some(call => call.withExistingTaskId) ? existing : added[0]?.taskId;
     const target = targetId === undefined ? undefined : await planRow(caller, targetId);
-    const firstSuccess = results.find(r => !r.isError);
+    const firstSuccess = results.find(r => !r.isError && r.error !== true);
     const summary = {
       addedTitles: added.map(t => t.content),
       results: results.map(
         (r): ResultSummary =>
-          r.isError
+          r.error === true
             ? {
+                // The tool's input schema refused the call before execute ran.
                 ok: false,
-                errorName: r.errorName,
-                ...(r.field !== undefined ? { field: r.field } : {}),
-                namesAddedTask: r.taskId !== undefined && r.taskId === added[0]?.taskId,
-                retryHint: /retry task_delegate with taskId "[^"]+" and the same `task`/.test(r.message ?? ''),
+                errorName: 'ToolInputValidationError',
+                field: Object.keys(r.validationErrors?.fields ?? {}).join(','),
+                namesAddedTask: false,
+                retryHint: false,
               }
-            : {
-                ok: true,
-                taskId: r.taskId === targetId ? 'target' : 'other',
-                sameChildAsFirstSuccess: r.subagentSessionId === firstSuccess.subagentSessionId,
-              },
+            : r.isError
+              ? {
+                  ok: false,
+                  errorName: r.errorName,
+                  ...(r.field !== undefined ? { field: r.field } : {}),
+                  namesAddedTask: r.taskId !== undefined && r.taskId === added[0]?.taskId,
+                  retryHint: /retry task_delegate with taskId "[^"]+" and the same `task`/.test(r.message ?? ''),
+                }
+              : {
+                  ok: true,
+                  taskId: r.taskId === targetId ? 'target' : 'other',
+                  sameChildAsFirstSuccess: r.subagentSessionId === firstSuccess.subagentSessionId,
+                },
       ),
       targetLinked: target?.delegatedSubagentSessionId !== undefined,
       ...(row.expected.childStarted === undefined
