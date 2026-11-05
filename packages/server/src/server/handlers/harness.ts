@@ -36,6 +36,7 @@ import {
   harnessAttachmentPathParams,
   harnessAttachmentUploadBodySchema,
   harnessAttachmentUploadResponseSchema,
+  HARNESS_WAKE_RESERVED_ADMISSION_PREFIX,
   harnessGoalBodySchema,
   harnessGoalResponseSchema,
   harnessInboxPathParams,
@@ -585,14 +586,10 @@ function objectRequestBody(requestBody: unknown, label: string): Record<string, 
 }
 
 /**
- * The Harness reserves this admission-id namespace for its own settlement wake
- * turns. Core sessions refuse it as well, but an admission route must refuse it
- * before any side effect (URL attachment fetch and upload, session load). Kept
- * as a local check instead of core's `isHarnessWakeReservedKey`: this package's
- * `@mastra/core` peer range includes releases that predate that export.
+ * The admission body schemas refuse the Harness-reserved wake namespace; this
+ * repeats it for a direct handler call, before any side effect (URL attachment
+ * fetch and upload, session load). Core sessions refuse it as well.
  */
-const HARNESS_WAKE_RESERVED_ADMISSION_PREFIX = 'harness-wake:';
-
 function assertAdmissionIdNotReserved(body: Record<string, unknown>, label: string): void {
   if (typeof body.admissionId === 'string' && body.admissionId.startsWith(HARNESS_WAKE_RESERVED_ADMISSION_PREFIX)) {
     throwHarnessHttpError(400, 'harness.validation', `${label} admissionId uses the Harness-reserved wake namespace`, {

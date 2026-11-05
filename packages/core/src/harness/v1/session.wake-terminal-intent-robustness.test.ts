@@ -376,6 +376,11 @@ describe('PF-7631 wake terminal commit re-drive (bounded), both callers through 
     const parent = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const { events, off } = errorEvents(parent);
     observed = events;
+    const wakeAgentEnds: Array<Record<string, unknown>> = [];
+    const offAgentEnds = parent.subscribe(event => {
+      if (event.type === 'agent_end' && String(event.runId).startsWith('harness-wake-'))
+        wakeAgentEnds.push({ ...event });
+    });
     const { releaseChild } = await delegateFromAdmittedTurn(parent, a.parentAgent, a.childAgent);
     // The wake run itself: completed, or failed by its own output.
     a.parentAgent.enqueueRun(caller === 'rejected' ? { failWith: new Error('provider rejected the wake run') } : {});
@@ -428,6 +433,10 @@ describe('PF-7631 wake terminal commit re-drive (bounded), both callers through 
     // Past the whole backoff window: the in-turn re-drive stopped at the cap.
     await new Promise(r => setTimeout(r, 1_200));
     expect(wakeCommits).toBe(4);
+    // The commit never landed: as for message(), the live turn leaves agent_end
+    // to the final settlement instead of reporting a failure it cannot know.
+    offAgentEnds();
+    expect(wakeAgentEnds).toEqual([]);
     expect(commitErrorEvents(events)).toHaveLength(4);
     expect(runErrors(events)).toHaveLength(caller === 'rejected' ? 1 : 0);
 
@@ -796,6 +805,76 @@ describe('PF-7631 wake admission interrupted at each await', () => {
       status: 'failed',
       error: { code: dispatched ? 'harness.run_interrupted' : 'harness.terminal_cancelled' },
     });
+    await harness.shutdown();
+  });
+});
+
+type DispatchOutcome = 'sendSignal throws synchronously' | 'accepted discard' | 'accepted never settles';
+
+describe('PF-7631 wake dispatch outcomes', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it.each<{ outcome: DispatchOutcome }>([
+    { outcome: 'sendSignal throws synchronously' },
+    { outcome: 'accepted discard' },
+    { outcome: 'accepted never settles' },
+  ])('$outcome', async ({ outcome }) => {
+    const db = new InMemoryDB();
+    const { harness, parentAgent, childAgent } = buildHarness(db);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const { releaseChild } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
+    const real = parentAgent.sendSignal.bind(parentAgent);
+    let wakeDispatches = 0;
+    vi.spyOn(parentAgent, 'sendSignal').mockImplementation(((signal: any, target: any) => {
+      if (typeof target?.runId !== 'string' || !target.runId.startsWith('harness-wake-')) return real(signal, target);
+      wakeDispatches += 1;
+      if (outcome === 'sendSignal throws synchronously') throw new Error('refused before any run reservation');
+      if (outcome === 'accepted discard') {
+        return {
+          signal: { ...signal, id: signal.id },
+          runId: target.runId,
+          accepted: Promise.resolve({ action: 'discard' }),
+        };
+      }
+      const result = real(signal, target);
+      const never = new Promise<never>(() => {});
+      return new Proxy(result, { get: (t, p) => (p === 'accepted' ? never : Reflect.get(t, p)) });
+    }) as never);
+    // The native acceptance bound (SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS, 30 s) fires
+    // at once; every other timer keeps its delay.
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) =>
+      realSetTimeout(fn, ms === 30_000 ? 0 : ms, ...args)) as never);
+
+    releaseChild();
+    await poll(() => wakeDispatches === 1);
+    // The wake turn is released, not parked on the acknowledgement.
+    await poll(() => !parent.isRunning());
+    await poll(() => wakeInFlight(parent).size === 0);
+    vi.mocked(globalThis.setTimeout).mockRestore();
+    await parent.close();
+
+    // A synchronous throw comes before any run reservation, and a `discard`
+    // proves nothing ran: the grant is cancelled, with no terminal result and
+    // no intent. A timed-out acknowledgement is ambiguous (the run may have
+    // started), so the aborted turn is left to recovery, which settles it
+    // interrupted.
+    const admissions = [...db.harnessTerminalAdmissions.values()].filter(a =>
+      a.admissionId.startsWith('harness-wake:'),
+    );
+    const ambiguous = outcome === 'accepted never settles';
+    expect(wakeIntents(db)).toHaveLength(ambiguous ? 1 : 0);
+    expect(admissions.map(a => a.status)).toEqual([ambiguous ? 'committed' : 'cancelled']);
+    expect(wakeEvidence(db)).toHaveLength(1);
+    expect(wakeEvidence(db)[0]).toMatchObject({
+      status: 'failed',
+      error: { code: ambiguous ? 'harness.run_interrupted' : 'harness.terminal_cancelled' },
+    });
+    expect(wakeInFlight(parent).size).toBe(0);
+    for (const evidence of wakeEvidence(db)) expect(evidence.status).not.toBe('pending');
     await harness.shutdown();
   });
 });

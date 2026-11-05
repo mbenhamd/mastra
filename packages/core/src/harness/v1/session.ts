@@ -12555,8 +12555,9 @@ export class Session {
 
   /**
    * PF-7631: give up a wake grant before anything runs under it: a lost idle
-   * slot or row proof at the dispatch re-check, or a Stop, edit, delete or
-   * eviction during the admission. The admission is cancelled through
+   * slot or row proof at the dispatch re-check, a Stop, edit, delete or
+   * eviction during the admission, or a dispatch the runtime refused before
+   * any run started (a synchronous throw, a `discard`). The admission is cancelled through
    * `cancelTerminalHandoff` (marked cancelled, its grant tombstoned; an
    * already-cancelled `duplicate` counts the same, as for a suspension), so no
    * terminal result or intent is committed for it, and its reserved row is
@@ -15470,7 +15471,9 @@ export class Session {
       // wins the race against it, and whether its terminal commit landed.
       let wakeAdmission: Promise<HarnessTerminalIdentity> | undefined;
       let wakeSettled = false;
-      // Whether the dispatch was sent: before it, nothing can run under the grant.
+      // Whether a run may have started under the grant: set once `sendSignal`
+      // returns (a synchronous throw comes before any run reservation), and
+      // cleared again by a `discard` acceptance, which proves nothing ran.
       let wakeDispatchSent = false;
       const finishOwnedReminderTurn = () => {
         if (wakeAdmission !== undefined) {
@@ -15589,7 +15592,6 @@ export class Session {
           this._cancelWakeTerminalAdmission(givenUp);
         }
 
-        wakeDispatchSent = true;
         dispatched = agent.sendSignal(
           {
             type: 'system-reminder',
@@ -15607,12 +15609,30 @@ export class Session {
             ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
           },
         );
+        wakeDispatchSent = true;
         if (wakeTerminal !== undefined) {
-          const accepted = await Promise.race([dispatched.accepted, activeTurnWaiter.promise]);
+          // Bounded as message() bounds it. On a timeout the turn is aborted,
+          // so a native stream that did start never runs without an owner; the
+          // admission is then released to dispatch recovery.
+          let accepted: Awaited<typeof dispatched.accepted>;
+          try {
+            accepted = await this._awaitSignalNativeAcceptance(
+              dispatched.accepted,
+              turnAbortSignal,
+              activeTurnWaiter.promise,
+              'injectSystemReminder().wake',
+            );
+          } catch (err) {
+            if (err instanceof NativeSignalAcceptanceTimeoutError) turnAbortController.abort(err);
+            throw err;
+          }
           if (accepted.action !== 'wake' || accepted.runId !== wakeTerminal.runId) {
-            // Nothing runs under the grant; the pending reservation is left to
-            // dispatch recovery, which settles it interrupted.
-            this._scheduleOrphanRecheck(Date.now());
+            // A `discard` (the dispatch binds `ifActive: 'discard'`) proves no
+            // run started: the grant is cancelled like one given up before the
+            // dispatch. Any other outcome is left to dispatch recovery, which
+            // settles it interrupted.
+            if (accepted.action === 'discard') wakeDispatchSent = false;
+            else this._scheduleOrphanRecheck(Date.now());
             throw new HarnessBusyError(this.id, 'in_flight');
           }
         }
@@ -15715,7 +15735,10 @@ export class Session {
                 this._scheduleOrphanRecheck(Date.now());
               }
             }
-            if (!agentEndEmitted) {
+            // A wake whose terminal commit did not land leaves agent_end to
+            // its final settlement, as message() does: its failure was already
+            // surfaced as an `error` event, and recovery publishes the outcome.
+            if (!agentEndEmitted && (wakeTerminal === undefined || wakeSettled)) {
               this._emitTurnEvent({
                 type: 'agent_end',
                 finishReason: turnAbortSignal.aborted ? 'aborted' : 'error',

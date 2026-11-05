@@ -255,7 +255,7 @@ export class MockAgent extends Agent<any, any, any> {
     const finishedPromise = new Promise<void>(resolve => {
       finishedResolve = resolve;
     });
-    let status: 'running' | 'finished' | 'failed' = 'running';
+    let status = 'running' as 'running' | 'finished' | 'failed';
     const fullStream = (async function* () {
       for (const chunk of chunks) yield chunk;
       // If a test asked us to hold the run mid-flight, keep the stream
@@ -288,7 +288,8 @@ export class MockAgent extends Agent<any, any, any> {
         ...(spec.suspendPayload ? { payload: spec.suspendPayload } : {}),
         finishReason: merged.finishReason,
       } as any;
-      status = 'finished';
+      // A surfaced `failWith` failure stays failed whichever drain finishes last.
+      if (status !== 'failed') status = 'finished';
       finishedResolve();
     })();
 

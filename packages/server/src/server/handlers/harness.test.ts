@@ -19,6 +19,8 @@ import {
   createHarnessSessionBodySchema,
   harnessChannelDiagnosticsQuerySchema,
   harnessChannelDiagnosticsResponseSchema,
+  harnessMessageAdmissionBodySchema,
+  harnessQueueAdmissionBodySchema,
 } from '../schemas/harness';
 import { HARNESS_ROUTES } from '../server-adapter/routes/harness';
 
@@ -1945,6 +1947,16 @@ describe('Harness server routes', () => {
       expect(session.admitQueue).not.toHaveBeenCalled();
     },
   );
+
+  it.each([
+    { route: 'messages', schema: harnessMessageAdmissionBodySchema },
+    { route: 'queue', schema: harnessQueueAdmissionBodySchema },
+  ])('the $route admission body schema refuses a reserved wake admissionId', ({ schema }) => {
+    const reserved = schema.safeParse({ content: 'hello', admissionId: `${HARNESS_WAKE_GRANT_KEY_PREFIX}forged` });
+    expect(reserved.success).toBe(false);
+    expect(reserved.error?.issues[0]?.path).toEqual(['admissionId']);
+    expect(schema.safeParse({ content: 'hello', admissionId: 'client-turn-1' }).success).toBe(true);
+  });
 
   it('rejects URL digest mismatches before upload or queue admission', async () => {
     const session = {

@@ -1189,8 +1189,9 @@ export interface HarnessConfigCommon {
        * function or inherited memory, a mode switch) stages no intent and is
        * sent as without this option, so a caller run still receives the
        * notice as its next model input. A grant given up after its admission
-       * (a caller turn or a mode switch during it, or a Stop, edit, delete or
-       * eviction before the dispatch) is cancelled: no terminal result and no
+       * (a caller turn or a mode switch during it, a Stop, edit, delete or
+       * eviction before the dispatch, or a dispatch the runtime refused before
+       * any run started) is cancelled: no terminal result and no
        * intent; its `harness-wake:` reservation is settled failed with
        * `harness.terminal_cancelled`. If storage refuses the cancel, recovery
        * settles the wake as interrupted (an aborted wake intent is possible).
