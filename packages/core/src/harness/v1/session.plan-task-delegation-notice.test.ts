@@ -540,3 +540,244 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     await harness.shutdown();
   });
 });
+
+/**
+ * PF-7632 — hosts that gate user-turn admission on `isTurnActive()` now admit a
+ * user turn while a detached child still runs. These rows pin how such a turn
+ * interacts with the child's settlement, a settlement wake, and Stop.
+ */
+describe('user turns admitted while a delegated child runs (isTurnActive)', () => {
+  /** Count overlapping parent turns from the public event stream. */
+  function trackTurns(parent: Session) {
+    const order: string[] = [];
+    let active = 0;
+    let maxActive = 0;
+    parent.subscribe(event => {
+      if (event.type === 'agent_start') {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        order.push('start');
+      } else if (event.type === 'agent_end') {
+        active -= 1;
+        order.push('end');
+      }
+    });
+    return { order, maxActive: () => maxActive };
+  }
+
+  /** Start a user turn whose model run is held; `release` lets it finish. */
+  function startHeldUserTurn(parent: Session, parentAgent: MockAgent, content: string) {
+    let release!: () => void;
+    parentAgent.enqueueRun({ holdUntil: new Promise<void>(r => (release = r)), finishReason: 'stop', text: content });
+    const turn = parent.message({ content });
+    void turn.catch(() => {});
+    return {
+      turn,
+      release,
+      end: async () => {
+        release();
+        await turn;
+      },
+    };
+  }
+
+  async function heldUserTurn(parent: Session, parentAgent: MockAgent, content: string) {
+    const before = parentAgent.streamCalls.length;
+    const held = startHeldUserTurn(parent, parentAgent, content);
+    await poll(() => parentAgent.streamCalls.length === before + 1);
+    return held;
+  }
+
+  it('a user turn admitted as the child settles loses no settlement and never overlaps another turn', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), undefined);
+    const releases: Array<() => void> = [];
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releases.push(releaseChild);
+      const turns = trackTurns(parent);
+      expect(parent.isTurnActive()).toBe(false);
+      expect(parent.isBusy()).toBe(true);
+
+      // Release the child, then admit a user turn without waiting for the settlement.
+      releaseChild();
+      const user = await heldUserTurn(parent, parentAgent, 'how are the tasks going?');
+      releases.push(user.release);
+      expect(parent.isTurnActive()).toBe(true);
+      await poll(async () => (await planRow(parent, taskId))?.status === 'completed');
+      await user.end();
+      await parent.waitForIdle({ timeoutMs: 2000 });
+
+      expect(parent.isTurnActive()).toBe(false);
+      expect(parent.isBusy()).toBe(false);
+      expect(parent._internalSubagentExecutionsInFlight).toBe(0);
+      expect((await planRow(parent, taskId))?.status).toBe('completed');
+      expect(turns.order).toEqual(['start', 'end']);
+      expect(turns.maxActive()).toBe(1);
+      expect(parentAgent.streamCalls).toHaveLength(2);
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+
+  it('a settlement wake owed during an admitted user turn starts exactly once, after that turn ends', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
+    const releases: Array<() => void> = [];
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      // The user turn here did not delegate: it was admitted on isTurnActive()
+      // after the delegating turn had already ended.
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releases.push(releaseChild);
+      const turns = trackTurns(parent);
+      expect(parent.isTurnActive()).toBe(false);
+
+      const user = await heldUserTurn(parent, parentAgent, 'anything new?');
+      releases.push(user.release);
+      releaseChild();
+      await poll(async () => (await planRow(parent, taskId))?.status === 'completed');
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      expect(turns.order).toEqual(['start']);
+
+      await user.end();
+      await deliveryFinished(parent, taskId);
+
+      expect(reminderCalls(parentAgent)).toHaveLength(1);
+      expect(String((reminderCalls(parentAgent)[0]!.messages as { contents?: unknown }).contents)).toContain(taskId);
+      expect(turns.order).toEqual(['start', 'end', 'start', 'end']);
+      expect(turns.maxActive()).toBe(1);
+      expect(parent.isTurnActive()).toBe(false);
+      expect(parent.isBusy()).toBe(false);
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+
+  it('a user turn admitted just before the claimed wake begins keeps the only turn; the wake is dropped', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    const releases: Array<() => void> = [];
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releases.push(releaseChild);
+      const turns = trackTurns(parent);
+      // The notice is saved and claimed; the user's message lands before the
+      // wake reaches its own turn admission. Seam: the private wake injector.
+      let user: ReturnType<typeof startHeldUserTurn> | undefined;
+      let turnActiveBeforeAdmission: boolean | undefined;
+      let turnActiveAtAdmission: boolean | undefined;
+      const inject = (parent as any)._injectSystemReminder.bind(parent);
+      vi.spyOn(parent as any, '_injectSystemReminder').mockImplementation((...args: unknown[]) => {
+        if (user === undefined) {
+          turnActiveBeforeAdmission = parent.isTurnActive();
+          user = startHeldUserTurn(parent, parentAgent, 'what happened?');
+          releases.push(user.release);
+          turnActiveAtAdmission = parent.isTurnActive();
+        }
+        return inject(...args);
+      });
+
+      releaseChild();
+      await poll(() => user !== undefined);
+      await poll(async () => (parent as any)._delegationNoticesInFlight.size === 0);
+      await user!.end();
+      await deliveryFinished(parent, taskId);
+
+      expect(turnActiveBeforeAdmission).toBe(false);
+      expect(turnActiveAtAdmission).toBe(true);
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      expect(turns.order).toEqual(['start', 'end']);
+      expect(turns.maxActive()).toBe(1);
+      // The user turn reads the persisted notice from history instead.
+      const { messages } = await memory.recall({ threadId: parent.threadId, resourceId: 'u1', hideSignals: false });
+      expect(messages.filter(m => JSON.stringify(m.content).includes('settled with outcome'))).toHaveLength(1);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+
+  it('aborting an admitted user turn leaves the child running; Stop (abortActiveWork) cancels it', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake');
+    const releases: Array<() => void> = [];
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, childId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releases.push(releaseChild);
+      const childRunning = () => harness._internalGetLiveSession(childId)?.isRunning() === true;
+
+      const first = await heldUserTurn(parent, parentAgent, 'never mind');
+      releases.push(first.release);
+      parent.abort();
+      await first.turn.catch(() => {});
+      await poll(() => !parent.isRunning());
+      expect(parent.isTurnActive()).toBe(false);
+      expect(parent.isBusy()).toBe(true);
+      expect(childRunning()).toBe(true);
+      expect((await planRow(parent, taskId))?.status).toBe('in_progress');
+
+      const second = await heldUserTurn(parent, parentAgent, 'stop everything');
+      releases.push(second.release);
+      const stopped = await parent.abortActiveWork({ reason: 'user_requested' });
+      await second.turn.catch(() => {});
+      releaseChild();
+      await poll(async () => (await planRow(parent, taskId))?.status === 'failed');
+      await parent.waitForIdle({ timeoutMs: 2000 });
+
+      expect(stopped.cancelledSubagentSessionIds).toEqual([childId]);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      expect(parent.isTurnActive()).toBe(false);
+      expect(parent.isBusy()).toBe(false);
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+
+  it('reads as an active turn until Stop finishes cancelling children, so a message admitted after Stop survives', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), undefined);
+    const releases: Array<() => void> = [];
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { childId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      releases.push(releaseChild);
+      const user = await heldUserTurn(parent, parentAgent, 'working on it?');
+      releases.push(user.release);
+      // Hold Stop between the turn abort and the child cancellation. Seam: the
+      // private delegated-child discovery Stop awaits before cancelling.
+      let releaseDiscovery!: () => void;
+      const discoveryGate = new Promise<void>(r => (releaseDiscovery = r));
+      releases.push(releaseDiscovery);
+      const listDelegated = (parent as any)._listDelegatedSubagentSessionIds.bind(parent);
+      vi.spyOn(parent as any, '_listDelegatedSubagentSessionIds').mockImplementation(async () => {
+        await discoveryGate;
+        return listDelegated();
+      });
+
+      const stopping = parent.abortActiveWork({ reason: 'user_requested' });
+      await user.turn.catch(() => {});
+      await poll(() => !parent.isRunning());
+      expect(parent.isTurnActive()).toBe(true);
+
+      releaseDiscovery();
+      const stopped = await stopping;
+      releaseChild();
+      expect(stopped.cancelledSubagentSessionIds).toEqual([childId]);
+      expect(parent.isTurnActive()).toBe(false);
+
+      parentAgent.enqueueRun({ finishReason: 'stop', text: 'next answer' });
+      const next = (await parent.message({ content: 'start over' })) as { text?: string; finishReason?: string };
+      expect(next.finishReason).toBe('stop');
+      expect(next.text).toBe('next answer');
+      await parent.waitForIdle({ timeoutMs: 2000 });
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
+    }
+  });
+});
