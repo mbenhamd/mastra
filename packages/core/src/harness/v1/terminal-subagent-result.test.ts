@@ -677,6 +677,28 @@ describe('Harness subagent outcome terminal contract', () => {
         [ok('call_read', 'read_paper_content'), failed('call_search', 'search_papers')],
         ['call_read', 'call_search', 'call_search'],
       ],
+      [
+        'an id-less claim before an id-cited one on the same tool: the id-less claim takes the other call',
+        [claim('read_paper_content'), claim('read_paper_content', 'success', 'call_read_1')],
+        readTwice,
+        ['call_read_2', 'call_read_1'],
+      ],
+      [
+        'the same call cited twice by id',
+        [claim('read_paper_content', 'success', 'call_read'), claim('read_paper_content', 'success', 'call_read')],
+        searchThenRead,
+        ['call_read', 'call_read'],
+      ],
+      [
+        'an id-less claim beside a call whose receipts disagree: it binds the unambiguous call',
+        [claim('read_paper_content')],
+        [
+          ok('call_mixed', 'read_paper_content'),
+          failed('call_mixed', 'read_paper_content'),
+          ok('call_read', 'read_paper_content'),
+        ],
+        ['call_read'],
+      ],
     ] as const)('accepts %s', (_name, evidence, receipts, boundIds) => {
       const rawResult = resultFor([...evidence], [...receipts]);
       const verified = verifyHarnessSubagentOutcomeReport(rawResult);
@@ -696,17 +718,13 @@ describe('Harness subagent outcome terminal contract', () => {
       ).toEqual(boundIds);
     });
 
+    // Never-called tools, unknown ids, a success claim on a failed call and a
+    // call with disagreeing receipts alone are rejected in the table above.
     it.each([
-      ['a tool the child never called', [claim('read_paper_content')], [ok('call_search', 'search_papers')]],
       [
         'a re-cited receipt beside a claim with no call behind it',
         [claim('read_paper_content'), claim('read_paper_content'), claim('verify_text_against_sources')],
         searchThenRead,
-      ],
-      [
-        'a success claim whose only matching call failed',
-        [claim('read_paper_content'), claim('search_papers')],
-        [ok('call_read', 'read_paper_content'), failed('call_search', 'search_papers')],
       ],
       [
         'a failure claim whose only matching call succeeded',
@@ -714,11 +732,19 @@ describe('Harness subagent outcome terminal contract', () => {
         searchThenRead,
       ],
       ['an id-cited claim with the wrong tool name', [claim('search_papers', 'success', 'call_read')], searchThenRead],
-      ['an id that is not in the ledger', [claim('read_paper_content', 'success', 'request-7')], searchThenRead],
       [
-        're-citing a call whose receipts disagree on status',
-        [claim('read_paper_content'), claim('read_paper_content')],
-        [ok('call_read', 'read_paper_content'), failed('call_read', 'read_paper_content')],
+        'an id-cited claim with the wrong status',
+        [claim('search_papers'), claim('read_paper_content', 'error', 'call_read')],
+        searchThenRead,
+      ],
+      [
+        're-citing when the only other matching call has disagreeing receipts',
+        [claim('read_paper_content', 'success', 'call_read'), claim('read_paper_content', 'error')],
+        [
+          ok('call_read', 'read_paper_content'),
+          ok('call_mixed', 'read_paper_content'),
+          failed('call_mixed', 'read_paper_content'),
+        ],
       ],
     ] as const)('rejects %s', (_name, evidence, receipts) => {
       const rawResult = resultFor([...evidence], [...receipts]);
