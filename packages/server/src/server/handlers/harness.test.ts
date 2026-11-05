@@ -11,6 +11,7 @@ import {
   HarnessRuntimeDriftError,
 } from '@mastra/core/harness/v1';
 import { RequestContext, MASTRA_RESOURCE_ID_KEY } from '@mastra/core/request-context';
+import { HARNESS_WAKE_GRANT_KEY_PREFIX } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 
 import { HTTPException } from '../http-exception';
@@ -18,6 +19,8 @@ import {
   createHarnessSessionBodySchema,
   harnessChannelDiagnosticsQuerySchema,
   harnessChannelDiagnosticsResponseSchema,
+  harnessMessageAdmissionBodySchema,
+  harnessQueueAdmissionBodySchema,
 } from '../schemas/harness';
 import { HARNESS_ROUTES } from '../server-adapter/routes/harness';
 
@@ -1891,6 +1894,68 @@ describe('Harness server routes', () => {
     expect(harness.getFileConfig).toHaveBeenCalled();
     expect(harness.attachments.upload).not.toHaveBeenCalled();
     expect(session.admitMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { route: 'messages', handler: POST_HARNESS_MESSAGE_ROUTE.handler, field: 'files' },
+    { route: 'queue', handler: POST_HARNESS_QUEUE_ROUTE.handler, field: 'attachments' },
+  ])(
+    'refuses a reserved wake admissionId on $route before any URL fetch, upload or session load',
+    async ({ handler, field }) => {
+      const session = { admitMessage: vi.fn(), admitQueue: vi.fn() };
+      const harness = {
+        getFileConfig: vi.fn(() => ({ allowPrivateNetworkUrls: true })),
+        session: vi.fn(async () => session),
+        attachments: { upload: vi.fn() },
+      };
+      const mastra = { getHarness: vi.fn(() => harness) };
+      let urlRequests = 0;
+
+      await withUrlServer(
+        (_request, response) => {
+          urlRequests += 1;
+          response.writeHead(200, { 'content-type': 'text/plain' });
+          response.end('url-bytes');
+        },
+        async baseUrl => {
+          const body = await expectHarnessHttpError(
+            handler(
+              makeParams({
+                mastra,
+                name: 'code',
+                sessionId: 'session-1',
+                requestBody: {
+                  content: 'hello',
+                  // Core's own reserved prefix: the route check cannot drift from it.
+                  admissionId: `${HARNESS_WAKE_GRANT_KEY_PREFIX}forged`,
+                  [field]: [{ kind: 'url', url: `${baseUrl}/remote.txt`, name: 'remote.txt' }],
+                },
+              }),
+            ),
+            400,
+            'harness.validation',
+          );
+          expect(body).toMatchObject({ details: { field: 'admissionId' } });
+        },
+      );
+
+      expect(urlRequests).toBe(0);
+      expect(mastra.getHarness).not.toHaveBeenCalled();
+      expect(harness.session).not.toHaveBeenCalled();
+      expect(harness.attachments.upload).not.toHaveBeenCalled();
+      expect(session.admitMessage).not.toHaveBeenCalled();
+      expect(session.admitQueue).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { route: 'messages', schema: harnessMessageAdmissionBodySchema },
+    { route: 'queue', schema: harnessQueueAdmissionBodySchema },
+  ])('the $route admission body schema refuses a reserved wake admissionId', ({ schema }) => {
+    const reserved = schema.safeParse({ content: 'hello', admissionId: `${HARNESS_WAKE_GRANT_KEY_PREFIX}forged` });
+    expect(reserved.success).toBe(false);
+    expect(reserved.error?.issues[0]?.path).toEqual(['admissionId']);
+    expect(schema.safeParse({ content: 'hello', admissionId: 'client-turn-1' }).success).toBe(true);
   });
 
   it('rejects URL digest mismatches before upload or queue admission', async () => {

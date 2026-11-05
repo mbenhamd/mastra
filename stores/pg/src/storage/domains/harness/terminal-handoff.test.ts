@@ -718,6 +718,89 @@ describe('HarnessPG native terminal handoff', () => {
     expect(replay.status).toBe('duplicate');
   });
 
+  // PF-7631: a wake turn's intent (its own finalizer id) and a message turn's
+  // intent in one session are claimed and acked independently. Neither kind's
+  // unsettled intent holds the other kind's delivery.
+  it('claims and acks two finalizer kinds in one session independently', async () => {
+    const session = await createNativeSession(harness(), 'session-kinds');
+    const message = admissionFor(session, 'kinds-message');
+    const wake: HarnessTerminalAdmissionInput = {
+      ...admissionFor(session, 'kinds-wake'),
+      admissionId: 'harness-wake:notice-kinds',
+      executionGrant: { key: 'harness-wake:notice-kinds', generation: 1 },
+      finalizerId: 'doxa.chat-wake',
+      seed: { origin: 'wake', wakeNoticeId: 'notice-kinds' },
+    };
+    const laterMessage = admissionFor(session, 'kinds-message-2');
+    // Session order: message (rev 1), wake (rev 2), message (rev 3).
+    for (const [input, tag] of [
+      [message, 'kinds-message'],
+      [wake, 'kinds-wake'],
+      [laterMessage, 'kinds-message-2'],
+    ] as const) {
+      await harness().writeMessageResultEvidence(pendingEvidence(input));
+      await harness().admitTerminalHandoff(input);
+      await expect(harness().commitTerminalHandoff(commitInput(input, tag))).resolves.toMatchObject({
+        status: 'committed',
+      });
+    }
+    const now = Date.now();
+
+    // The wake consumer gets the wake intent although the earlier message
+    // intent is still pending.
+    const wakeClaim = await harness().claimTerminalIntents({
+      harnessName: HARNESS,
+      consumerId: 'wake-worker',
+      limit: 10,
+      now,
+      finalizerIds: ['doxa.chat-wake'],
+    });
+    expect(wakeClaim.intents.map(intent => intent.admissionId)).toEqual(['harness-wake:notice-kinds']);
+
+    // The message consumer gets only message intents, in session order: the
+    // first one now, and the later one is not held by the still-claimed wake.
+    const first = await harness().claimTerminalIntents({
+      harnessName: HARNESS,
+      consumerId: 'message-worker',
+      limit: 10,
+      now,
+      finalizerIds: ['doxa.chat'],
+    });
+    expect(first.intents.map(intent => intent.admissionId)).toEqual(['admission-kinds-message']);
+    await expect(
+      harness().ackTerminalIntent({ ...claimIdentityOf(first.intents[0]!, 'message-worker'), now: now + 1 }),
+    ).resolves.toMatchObject({ status: 'acked' });
+    const second = await harness().claimTerminalIntents({
+      harnessName: HARNESS,
+      consumerId: 'message-worker',
+      limit: 10,
+      now: now + 2,
+      finalizerIds: ['doxa.chat'],
+    });
+    expect(second.intents.map(intent => intent.admissionId)).toEqual(['admission-kinds-message-2']);
+    await expect(
+      harness().ackTerminalIntent({ ...claimIdentityOf(second.intents[0]!, 'message-worker'), now: now + 3 }),
+    ).resolves.toMatchObject({ status: 'acked' });
+
+    // The wake intent is still held by its own claim and acks on its own.
+    await expect(
+      harness().ackTerminalIntent({ ...claimIdentityOf(wakeClaim.intents[0]!, 'wake-worker'), now: now + 4 }),
+    ).resolves.toMatchObject({ status: 'acked' });
+    await expect(harness().getTerminalQueuePressure({ harnessName: HARNESS })).resolves.toEqual({
+      pendingIntents: 0,
+      pendingBytes: 0,
+    });
+    await expect(
+      harness().claimTerminalIntents({
+        harnessName: HARNESS,
+        consumerId: 'message-worker',
+        limit: 1,
+        now,
+        finalizerIds: [],
+      }),
+    ).rejects.toBeInstanceOf(HarnessTerminalHandoffValidationError);
+  });
+
   it('binds claim settlement to the consumer that minted the claim', async () => {
     const session = await createNativeSession(harness(), 'session-consumer');
     const input = admissionFor(session, 'consumer');
