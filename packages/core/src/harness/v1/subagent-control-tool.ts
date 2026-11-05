@@ -31,7 +31,7 @@ import { createTool } from '../../tools/tool';
 import { HarnessValidationError } from './errors';
 import { projectHarnessPublicError } from './events';
 import { readDelegationAttemptMetadata } from './plan-task-session';
-import type { ActiveSubagentState, Session } from './session';
+import type { ActiveSubagentState, ReturnedInlineSubagentState, Session } from './session';
 import {
   harnessSubagentResultSummarySchema,
   MAX_HARNESS_SUBAGENT_EVENT_TEXT_BYTES,
@@ -144,11 +144,12 @@ const inputSchema = z
       .optional()
       .describe(
         'status and wait without ids only: the position to start from in the list of all your subagents, ' +
-          'running and settled, ordered by start time and then id. A subagent keeps its position when it ' +
-          'settles. A wait with an offset returns the settled subagents from that position on and waits for ' +
-          'the running ones. When an output leaves subagents out, resultsHint gives the next offset. A ' +
-          'subagent started between calls with the same or an earlier start time, or a spawn_subagent ' +
-          'subagent whose spawn_subagent call has returned (it leaves the list), can shift later positions.',
+          'running and settled, ordered oldest first (by start time, then id). A subagent keeps its position ' +
+          'when it settles. A wait with an offset returns the settled subagents from that position on and ' +
+          'waits for the running ones. When an output leaves subagents out, resultsHint gives the next ' +
+          'offset. Positions can shift only when a subagent starts between calls with the same or an earlier ' +
+          'start time, or when a new turn begins: a spawn_subagent subagent whose call returned in an earlier ' +
+          'turn is no longer listed.',
       ),
     message: z
       .string()
@@ -593,6 +594,7 @@ export function createSubagentControlTool(parent: Session) {
     live: boolean,
     active: ActiveSubagentState | undefined,
     delegated: HarnessPlanTask | undefined,
+    returned?: ReturnedInlineSubagentState,
   ): SubagentView {
     const attempt = delegated === undefined ? undefined : readDelegationAttemptMetadata(delegated, childId);
     let status: SubagentStatus;
@@ -630,18 +632,18 @@ export function createSubagentControlTool(parent: Session) {
       status = 'idle';
     }
     const task = attempt?.taskBody ?? active?.task;
-    const startedAt = attempt?.startedAt ?? active?.startedAt;
+    const startedAt = attempt?.startedAt ?? active?.startedAt ?? returned?.startedAt;
+    const inlineAgentType = active?.agentType ?? returned?.agentType;
     return {
       subagentSessionId: childId,
-      source: delegated !== undefined ? 'delegated' : active !== undefined ? 'inline' : 'session',
+      source:
+        delegated !== undefined ? 'delegated' : active !== undefined || returned !== undefined ? 'inline' : 'session',
       status,
       settled: SETTLED_STATUSES.has(status),
       cancelRequested: record.cancelRequest !== undefined,
       live,
       ...(record.subagentTypeId !== undefined ? { agentType: record.subagentTypeId } : {}),
-      ...(active?.agentType !== undefined && record.subagentTypeId === undefined
-        ? { agentType: active.agentType }
-        : {}),
+      ...(inlineAgentType !== undefined && record.subagentTypeId === undefined ? { agentType: inlineAgentType } : {}),
       ...(task !== undefined ? { task: preview(task) } : {}),
       ...(delegated !== undefined ? { taskId: delegated.taskId } : {}),
       ...(startedAt !== undefined ? { startedAt } : {}),
@@ -668,6 +670,7 @@ export function createSubagentControlTool(parent: Session) {
   }> {
     const delegated = await loadDelegatedTasks();
     const activeById = new Map(activeSubagents().map(state => [state.subagentSessionId, state]));
+    const returnedById = parent._internalReturnedInlineSubagents();
     let ids: string[];
     // An implicit list is every known child, oldest first, so a child keeps its
     // place when it settles and a new child joins at the end.
@@ -677,6 +680,9 @@ export function createSubagentControlTool(parent: Session) {
     } else {
       const known = new Map<string, number>();
       for (const [id, state] of activeById) known.set(id, state.startedAt);
+      // An inline child whose spawn_subagent call returned in this turn keeps
+      // its place, so paging within a turn never skips a child.
+      for (const [id, state] of returnedById) if (!known.has(id)) known.set(id, state.startedAt);
       for (const [id, task] of delegated) {
         if (!known.has(id)) known.set(id, readDelegationAttemptMetadata(task, id)?.startedAt ?? task.createdAt);
       }
@@ -691,7 +697,16 @@ export function createSubagentControlTool(parent: Session) {
       if (opts.limit !== undefined && views.length > opts.limit) break;
       const { record, live } = await loadChildRecord(id);
       if (isOwnChild(record)) {
-        views.push(project(id, record, live, activeById.get(id), delegated.get(id)));
+        views.push(
+          project(
+            id,
+            record,
+            live,
+            activeById.get(id),
+            delegated.get(id),
+            activeById.has(id) ? undefined : returnedById.get(id),
+          ),
+        );
       } else if (record === null && opts.knownOwned?.has(id) === true) {
         views.push({
           subagentSessionId: id,
@@ -959,11 +974,12 @@ export function createSubagentControlTool(parent: Session) {
       'do not fit, task texts are shortened, then the last subagents are left out (`omittedSubagentCount`) and ' +
       '`resultsHint` gives the `offset` that reads on from them; `resultsShortened` marks such an output. ' +
       `\`status\` lists at most ${SUBAGENT_CONTROL_STATUS_LIMIT} subagents per call, and \`resultsHint\` ` +
-      'gives the offset of the next ones. `offset` is a place in the list of all your subagents, running and ' +
-      'settled, ordered by start time and then id; a subagent keeps its place when it settles, and `wait` with ' +
-      'an offset also returns the settled subagents from that place on. A subagent started between calls with ' +
-      'the same or an earlier start time, or a spawn_subagent subagent whose spawn_subagent call has returned ' +
-      '(it leaves the list), can shift later places. A call ' +
+      'gives the offset of the next ones. Listings without ids are ordered oldest first (by start time, then ' +
+      'id). `offset` is a place in that list of all your subagents, running and settled; a subagent keeps its ' +
+      'place when it settles, and `wait` with an offset also returns the settled subagents from that place ' +
+      'on. Places can shift only when a subagent starts between calls with the same or an earlier start ' +
+      'time, or when a new turn begins: a spawn_subagent subagent whose call returned in an earlier turn is ' +
+      'no longer listed. A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
       'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
