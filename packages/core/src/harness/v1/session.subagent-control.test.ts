@@ -85,11 +85,15 @@ function buildHarness(db: InMemoryDB) {
   return { harness, parentAgent, childAgent };
 }
 
-const toolCtx = {
-  abortSignal: new AbortController().signal,
-  agent: { toolCallId: 'tc-control', runId: 'mock-run' },
-  requestContext: { get: () => undefined },
-} as any;
+function toolCtxFor(runId: string) {
+  return {
+    abortSignal: new AbortController().signal,
+    agent: { toolCallId: 'tc-control', runId },
+    requestContext: { get: () => undefined },
+  } as any;
+}
+
+const toolCtx = toolCtxFor('mock-run');
 
 async function poll(pred: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
   const start = Date.now();
@@ -161,10 +165,12 @@ async function awaitingInputChild(harness: Harness, parent: Session): Promise<Se
   return child;
 }
 
-function control(parent: Session) {
+/** The control tool as the model calls it from run `runId`. */
+function control(parent: Session, runId = 'mock-run') {
   const tool = createSubagentControlTool(parent);
   if (!tool) throw new Error('subagent control tool not registered');
-  return (input: Record<string, unknown>) => tool.execute!(input as any, toolCtx) as Promise<any>;
+  const ctx = toolCtxFor(runId);
+  return (input: Record<string, unknown>) => tool.execute!(input as any, ctx) as Promise<any>;
 }
 
 describe('subagent control tool', () => {
@@ -682,8 +688,8 @@ function escapedSummary(chars: number): string {
  * under `inline:<id>`: the parent drops its spawn record (keeping the child
  * listed for the rest of the run), then the child closes.
  */
-async function returnInline(parent: Session, child: Session): Promise<void> {
-  parent._internalReturnInlineSubagent(`inline:${child.id}`);
+async function returnInline(parent: Session, child: Session, runId = 'mock-run'): Promise<void> {
+  parent._internalReturnInlineSubagent(`inline:${child.id}`, runId);
   await child.close();
 }
 
@@ -1448,31 +1454,138 @@ describe('subagent control tool — stable offsets', () => {
     }
   }, 60_000);
 
-  it('the record of returned inline children is cleared when each new run starts and does not grow across runs', async () => {
+  it('the record of returned inline children belongs to one run: a suspend and resume keeps it, a new run clears it, and it does not grow across runs', async () => {
     const { harness, parentAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const run = control(parent);
-    const record = () => parent._internalReturnedInlineSubagents();
-    for (let turn = 0; turn < 4; turn += 1) {
-      let release!: () => void;
-      parentAgent.enqueueRun({ holdUntil: new Promise<void>(r => (release = r)), finishReason: 'stop', text: 'done' });
-      const callsBefore = parentAgent.streamCalls.length;
-      const pending = parent.message({ content: `turn ${turn}` });
-      await poll(() => parentAgent.streamCalls.length > callsBefore);
-      // The new run cleared the previous run's returned children.
-      expect(record().size).toBe(0);
-      const sessions = await addInlineChildren(harness, parent, 5);
-      register(parent, sessions, () => Date.now());
-      for (const child of sessions) await returnInline(parent, child);
-      expect(record().size).toBe(5);
-      // Within the run the returned children stay listed.
-      const listed = (await run({ action: 'status' })).subagents.map((view: any) => view.subagentSessionId);
-      expect([...listed].sort()).toEqual(sessions.map(child => child.id).sort());
-      release();
-      await pending.catch(() => {});
-      expect(record().size).toBe(5);
+    const recordSize = () => ((parent as any)._returnedInlineSubagents as Map<string, unknown>).size;
+    const currentRunId = () => (parent as any)._currentRunId as string | undefined;
+    const releases: Array<() => void> = [];
+    const hold = () => new Promise<void>(r => releases.push(r));
+    const pageIds = async (runId: string) => {
+      const run = control(parent, runId);
+      const seen: string[] = [];
+      let page = await run({ action: 'status', offset: 0 });
+      for (;;) {
+        seen.push(...(page.subagents as any[]).map(view => view.subagentSessionId as string));
+        if (page.omittedSubagentCount === undefined) return seen;
+        page = await run({ action: 'status', offset: Number(/offset (\d+)/.exec(page.resultsHint)![1]) });
+      }
+    };
+    try {
+      // Run 1: inline children return, the run suspends on an approval, then resumes as the same run.
+      parentAgent.enqueueRun({
+        holdUntil: hold(),
+        finishReason: 'suspended',
+        suspendPayload: { toolCallId: 'tc-approve', toolName: 'shell' },
+      });
+      const first = parent.message({ content: 'run 1' });
+      await poll(() => currentRunId() !== undefined);
+      const firstRunId = currentRunId()!;
+      const firstChildren = await addInlineChildren(harness, parent, 5);
+      register(parent, firstChildren, () => Date.now());
+      for (const child of firstChildren) await returnInline(parent, child, firstRunId);
+      releases.shift()!();
+      const suspended = (await first) as Record<string, unknown>;
+      expect(suspended.runId).toBe(firstRunId);
+      expect(recordSize()).toBe(5);
+      parentAgent.enqueueRun({ holdUntil: hold(), finishReason: 'stop', text: 'resumed', runId: firstRunId });
+      const resumeCallsBefore = parentAgent.resumeCalls.length;
+      const resumed = parent.respondToToolApproval({ approved: true });
+      void resumed.catch(() => {});
+      await poll(() => parentAgent.resumeCalls.length > resumeCallsBefore);
+      // The resume continues run 1, so its returned children are still listed, each once.
+      const afterResume = await pageIds(firstRunId);
+      expect(new Set(afterResume).size).toBe(afterResume.length);
+      expect([...afterResume].sort()).toEqual(firstChildren.map(child => child.id).sort());
+      expect(recordSize()).toBe(5);
+      releases.shift()!();
+      await resumed.catch(() => {});
+
+      // Runs 2 to 4: each new run starts from an empty record and holds only its own children.
+      let previousRunId = firstRunId;
+      for (let index = 2; index <= 4; index += 1) {
+        parentAgent.enqueueRun({ holdUntil: hold(), finishReason: 'stop', text: 'done' });
+        const callsBefore = parentAgent.streamCalls.length;
+        const pending = parent.message({ content: `run ${index}` });
+        await poll(() => parentAgent.streamCalls.length > callsBefore && currentRunId() !== undefined);
+        const runId = currentRunId()!;
+        expect(runId).not.toBe(previousRunId);
+        expect(await pageIds(runId)).toEqual([]);
+        expect(recordSize()).toBe(0);
+        const children = await addInlineChildren(harness, parent, 5);
+        register(parent, children, () => Date.now());
+        for (const child of children) await returnInline(parent, child, runId);
+        expect(recordSize()).toBe(5);
+        expect([...(await pageIds(runId))].sort()).toEqual(children.map(child => child.id).sort());
+        releases.shift()!();
+        await pending.catch(() => {});
+        expect(recordSize()).toBe(5);
+        previousRunId = runId;
+      }
+    } finally {
+      for (const release of releases) release();
+      await harness.shutdown();
     }
-    await harness.shutdown();
+  }, 30_000);
+
+  it('a new run that starts while the previous turn is still finishing holds only its own returned children', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const recordSize = () => ((parent as any)._returnedInlineSubagents as Map<string, unknown>).size;
+    const currentRunId = () => (parent as any)._currentRunId as string | undefined;
+    const original = (parent as any)._endTurn as (controller: AbortController) => void;
+    let finishFirstTurn: (() => void) | undefined;
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    try {
+      parentAgent.enqueueRun({
+        holdUntil: new Promise<void>(r => (releaseFirst = r)),
+        finishReason: 'stop',
+        text: 'done',
+      });
+      const first = parent.message({ content: 'run 1' });
+      await poll(() => currentRunId() !== undefined);
+      const firstRunId = currentRunId()!;
+      const firstChildren = await addInlineChildren(harness, parent, 4);
+      register(parent, firstChildren, () => Date.now());
+      for (const child of firstChildren) await returnInline(parent, child, firstRunId);
+      // Run 1's turn stays open after its run ends, as its post-run bookkeeping would keep it.
+      (parent as any)._endTurn = function (this: unknown, controller: AbortController) {
+        if (finishFirstTurn === undefined) {
+          finishFirstTurn = () => original.call(this, controller);
+          return;
+        }
+        original.call(this, controller);
+      };
+      releaseFirst();
+      await first;
+      expect(finishFirstTurn).toBeDefined();
+
+      parentAgent.enqueueRun({
+        holdUntil: new Promise<void>(r => (releaseSecond = r)),
+        finishReason: 'stop',
+        text: 'done',
+      });
+      const callsBefore = parentAgent.streamCalls.length;
+      const second = parent.message({ content: 'run 2' });
+      void second.catch(() => {});
+      await poll(() => parentAgent.streamCalls.length > callsBefore && currentRunId() !== undefined);
+      const secondRunId = currentRunId()!;
+      expect(secondRunId).not.toBe(firstRunId);
+      const secondChildren = await addInlineChildren(harness, parent, 3);
+      register(parent, secondChildren, () => Date.now());
+      for (const child of secondChildren) await returnInline(parent, child, secondRunId);
+      expect(recordSize()).toBe(3);
+      const listed = (await control(parent, secondRunId)({ action: 'status' })).subagents.map(
+        (view: any) => view.subagentSessionId,
+      );
+      expect([...listed].sort()).toEqual(secondChildren.map(child => child.id).sort());
+    } finally {
+      releaseFirst?.();
+      releaseSecond?.();
+      finishFirstTurn?.();
+      await harness.shutdown();
+    }
   }, 30_000);
 
   it('a message that joins the active run keeps the returned inline children listed, each once', async () => {

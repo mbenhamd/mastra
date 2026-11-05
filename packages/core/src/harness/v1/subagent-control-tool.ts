@@ -148,8 +148,9 @@ const inputSchema = z
           'when it settles. A wait with an offset returns the settled subagents from that position on and ' +
           'waits for the running ones. When an output leaves subagents out, resultsHint gives the next ' +
           'offset. Positions can shift only when a subagent starts between calls with the same or an earlier ' +
-          'start time, or when a new run begins: a spawn_subagent subagent whose call returned in an earlier ' +
-          'run is no longer listed. A message that joins the current run does not start a new one.',
+          'start time, or when a new run begins (a resume continues the same run, and a message that joins ' +
+          'the current run does not start a new one): a spawn_subagent subagent whose call returned in an ' +
+          'earlier run is no longer listed.',
       ),
     message: z
       .string()
@@ -659,6 +660,7 @@ export function createSubagentControlTool(parent: Session) {
    * id in `knownOwned` whose row has since been deleted reads as closed.
    */
   async function resolveChildren(
+    runId: string | undefined,
     childIds: readonly string[] | undefined,
     opts: { limit?: number; knownOwned?: ReadonlySet<string>; offset?: number } = {},
   ): Promise<{
@@ -670,7 +672,7 @@ export function createSubagentControlTool(parent: Session) {
   }> {
     const delegated = await loadDelegatedTasks();
     const activeById = new Map(activeSubagents().map(state => [state.subagentSessionId, state]));
-    const returnedById = parent._internalReturnedInlineSubagents();
+    const returnedById = parent._internalReturnedInlineSubagents(runId);
     let ids: string[];
     // An implicit list is every known child, oldest first, so a child keeps its
     // place when it settles and a new child joins at the end.
@@ -736,8 +738,13 @@ export function createSubagentControlTool(parent: Session) {
     return validationError('subagentSessionId', `not a subagent of this session: ${ids.join(', ')}`);
   }
 
-  async function status(childId: string | undefined, offset = 0): Promise<SubagentControlOutput> {
+  async function status(
+    runId: string | undefined,
+    childId: string | undefined,
+    offset = 0,
+  ): Promise<SubagentControlOutput> {
     const { views, foreign, truncated, position, tail } = await resolveChildren(
+      runId,
       childId === undefined ? undefined : [childId],
       { limit: SUBAGENT_CONTROL_STATUS_LIMIT, offset },
     );
@@ -752,6 +759,7 @@ export function createSubagentControlTool(parent: Session) {
   }
 
   async function wait(
+    runId: string | undefined,
     childIds: readonly string[] | undefined,
     timeoutMs: number,
     signal: AbortSignal | undefined,
@@ -797,6 +805,7 @@ export function createSubagentControlTool(parent: Session) {
       // even when it starts at the deadline.
       const resolution = await settleWithin(
         resolveChildren(
+          runId,
           targets,
           targets === undefined ? { offset: offset ?? 0 } : knownOwned === undefined ? {} : { knownOwned },
         ),
@@ -848,11 +857,12 @@ export function createSubagentControlTool(parent: Session) {
   }
 
   async function send(
+    runId: string | undefined,
     childId: string,
     message: string,
     signal: AbortSignal | undefined,
   ): Promise<SubagentControlOutput> {
-    const { views, foreign } = await resolveChildren([childId]);
+    const { views, foreign } = await resolveChildren(runId, [childId]);
     if (foreign.length > 0) return foreignError(foreign);
     const view = views[0]!;
     const child = harness._internalGetLiveSession(childId);
@@ -889,8 +899,12 @@ export function createSubagentControlTool(parent: Session) {
     return { action: 'send', subagentSessionId: childId, delivered: true, status: view.status };
   }
 
-  async function cancel(childId: string, signal: AbortSignal | undefined): Promise<SubagentControlOutput> {
-    const before = await resolveChildren([childId]);
+  async function cancel(
+    runId: string | undefined,
+    childId: string,
+    signal: AbortSignal | undefined,
+  ): Promise<SubagentControlOutput> {
+    const before = await resolveChildren(runId, [childId]);
     if (before.foreign.length > 0) return foreignError(before.foreign);
     const view = before.views[0]!;
     if (view.settled && view.status !== 'idle') {
@@ -950,7 +964,7 @@ export function createSubagentControlTool(parent: Session) {
       };
     }
     const incomplete = delivery === 'delivered_incomplete';
-    const after = (await resolveChildren([childId])).views[0];
+    const after = (await resolveChildren(runId, [childId])).views[0];
     return {
       action: 'cancel',
       subagentSessionId: childId,
@@ -978,8 +992,9 @@ export function createSubagentControlTool(parent: Session) {
       'id). `offset` is a place in that list of all your subagents, running and settled; a subagent keeps its ' +
       'place when it settles, and `wait` with an offset also returns the settled subagents from that place ' +
       'on. Places can shift only when a subagent starts between calls with the same or an earlier start ' +
-      'time, or when a new run begins: a spawn_subagent subagent whose call returned in an earlier run is ' +
-      'no longer listed (a message that joins the current run does not start a new one). A call ' +
+      'time, or when a new run begins (a resume continues the same run, and a message that joins the ' +
+      'current run does not start a new one): a spawn_subagent subagent whose call returned in an earlier ' +
+      'run is no longer listed. A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
       'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
@@ -1001,16 +1016,24 @@ export function createSubagentControlTool(parent: Session) {
           : input.subagentSessionId !== undefined
             ? [input.subagentSessionId]
             : undefined;
+      // The run this call belongs to: inline children returned in it stay listed.
+      const runId = ctx?.agent?.runId;
       try {
         switch (input.action) {
           case 'status':
-            return await status(input.subagentSessionId, input.offset ?? 0);
+            return await status(runId, input.subagentSessionId, input.offset ?? 0);
           case 'wait':
-            return await wait(ids, input.timeoutMs ?? SUBAGENT_CONTROL_DEFAULT_WAIT_MS, ctx?.abortSignal, input.offset);
+            return await wait(
+              runId,
+              ids,
+              input.timeoutMs ?? SUBAGENT_CONTROL_DEFAULT_WAIT_MS,
+              ctx?.abortSignal,
+              input.offset,
+            );
           case 'send':
-            return await send(input.subagentSessionId!, input.message!, ctx?.abortSignal);
+            return await send(runId, input.subagentSessionId!, input.message!, ctx?.abortSignal);
           case 'cancel':
-            return await cancel(input.subagentSessionId!, ctx?.abortSignal);
+            return await cancel(runId, input.subagentSessionId!, ctx?.abortSignal);
         }
       } catch (err) {
         const publicError = projectHarnessPublicError(err);
