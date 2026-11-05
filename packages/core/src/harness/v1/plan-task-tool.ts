@@ -33,6 +33,7 @@ import {
   PLAN_TASK_DELEGATED_BODY_MAX_BYTES,
   PLAN_TASK_MAX_NODES,
 } from './plan-task-session';
+import type { PlanTaskView } from './plan-task-session';
 import type { Session } from './session';
 import { formatSubagentTypeList } from './spawn-subagent-tool';
 import { harnessSubagentResultSummarySchema } from './terminal-subagent-result';
@@ -180,6 +181,27 @@ function delegatedTaskTitle(task: string | undefined): string | undefined {
     .find(line => line.length > 0);
   if (firstLine === undefined) return undefined;
   return capUtf8Bytes(firstLine, PLAN_TASK_CONTENT_MAX_BYTES).trimEnd();
+}
+
+/**
+ * A retry of a taskId-less `task_delegate` call resolves to the task the first
+ * attempt added. When that attempt already delegated it, return the first
+ * call's success view instead of an "already delegated" refusal. Only an
+ * attempt by this exact tool call qualifies, and an attempt that failed before
+ * its child reported anything does not, so its retry follows the normal
+ * re-delegation rules.
+ */
+function replayedDelegation(
+  task: PlanTaskView,
+  idempotencyKey: string | undefined,
+  toolCallId: string | undefined,
+): (PlanTaskView & { subagentSessionId: string }) | undefined {
+  const delegation = task.delegation;
+  if (idempotencyKey === undefined || delegation === undefined || delegation.parentToolCallId !== toolCallId) {
+    return undefined;
+  }
+  if (delegation.status === 'failed' && delegation.result === undefined) return undefined;
+  return { ...task, subagentSessionId: delegation.subagentSessionId };
 }
 
 /**
@@ -439,8 +461,8 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
           execute: async (input, context) => {
             // Without a taskId, this call first adds a root plan task for the
             // delegated work. The add carries the tool call's idempotency key,
-            // so a retried call reuses that task instead of adding another.
-            let createdTaskId: string | undefined;
+            // so a retry of the same tool call resolves to the same task.
+            let addedTaskId: string | undefined;
             try {
               let taskId = input.taskId;
               if (taskId === undefined) {
@@ -448,13 +470,33 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
                 if (content === undefined) {
                   throw new HarnessValidationError('task', 'is required when taskId is omitted');
                 }
+                // Refuse a delegation that cannot start (closed session, Stop
+                // in flight, unknown type, depth cap) before adding a task,
+                // so a refused call leaves nothing behind in the plan.
+                session._planTaskDelegatePreflight(input, context?.abortSignal);
                 const idempotencyKey = toolCallIdempotencyKey('plan-task-delegate-add', context?.agent);
-                const created = await session._planTaskAdd(
-                  { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
-                  context?.abortSignal,
-                );
-                taskId = created.taskId;
-                createdTaskId = created.taskId;
+                let added: PlanTaskView;
+                try {
+                  added = await session._planTaskAdd(
+                    { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
+                    context?.abortSignal,
+                  );
+                } catch (err) {
+                  // The key is derived from the tool call, so a mismatch means
+                  // this same call was retried with a different `task`.
+                  if (err instanceof HarnessValidationError && err.field === 'idempotencyKey') {
+                    throw new HarnessValidationError(
+                      'task',
+                      'this tool call already added a plan task from a different `task`; ' +
+                        'call plan_task_check and pass that taskId',
+                    );
+                  }
+                  throw err;
+                }
+                const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId);
+                if (replayed !== undefined) return replayed as any;
+                taskId = added.taskId;
+                addedTaskId = added.taskId;
               }
               return (await session._planTaskDelegate(
                 { ...input, taskId },
@@ -465,11 +507,19 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
                 context?.tracingContext,
               )) as any;
             } catch (err) {
-              // Name the plan task this call created so the model retries the
-              // delegation with that taskId rather than adding another task.
-              return (
-                createdTaskId === undefined ? toToolError(err) : { ...toToolError(err), taskId: createdTaskId }
-              ) as any;
+              // At the concurrency limit the added task stays pending: name it
+              // so the model retries with that taskId instead of adding another.
+              if (addedTaskId !== undefined && err instanceof HarnessSubagentConcurrencyLimitError) {
+                const error = toToolError(err);
+                return {
+                  ...error,
+                  taskId: addedTaskId,
+                  message:
+                    `${error.message} Plan task "${addedTaskId}" was added and is still pending; retry ` +
+                    `task_delegate with taskId "${addedTaskId}" after a running subagent settles.`,
+                } as any;
+              }
+              return toToolError(err) as any;
             }
           },
         });

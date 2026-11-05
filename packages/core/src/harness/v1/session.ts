@@ -335,6 +335,7 @@ import type {
   SessionSignalOptions,
   SessionSignalResult,
   SetStateOptions,
+  SubagentDefinition,
   ToolCategory,
   ActivityTimelineOptions,
   SessionActivityTimeline,
@@ -23480,6 +23481,44 @@ export class Session {
   // -------------------------------------------------------------------------
 
   /**
+   * Liveness, admission, subagent type, and §8 depth checks shared by
+   * `task_delegate` and its preflight. Reads only: nothing is written.
+   */
+  private _preflightPlanTaskDelegate(
+    input: { agentType: string; modelOverride?: string },
+    callerSignal?: AbortSignal,
+  ): { admissionEpoch: number; def: SubagentDefinition; childDepth: number } {
+    this._assertLive('task_delegate');
+    const admissionEpoch = this._captureActiveWorkAdmission('task_delegate');
+    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
+    const def = this._harness._getSubagentType(input.agentType);
+    if (!def) {
+      throw new HarnessValidationError('agentType', `unknown subagent type "${input.agentType}"`);
+    }
+    if (input.modelOverride !== undefined && typeof input.modelOverride !== 'string') {
+      throw new HarnessValidationError('modelOverride', 'must be a string when provided');
+    }
+    // §8 depth cap — fail closed BEFORE creating any child record (mirrors the
+    // spawn tool's pre-creation gate).
+    const childDepth = this.subagentDepth + 1;
+    const maxDepth = this._harness._getSubagentMaxDepth();
+    if (childDepth > maxDepth) {
+      throw new HarnessSubagentDepthExceededError(maxDepth, childDepth);
+    }
+    return { admissionEpoch, def, childDepth };
+  }
+
+  /**
+   * @internal — `task_delegate` without a `taskId`. Runs the checks that do not
+   * depend on a plan task, so the tool can refuse a delegation that cannot
+   * start before it adds the task. Throws the same errors `_planTaskDelegate`
+   * would; writes nothing.
+   */
+  _planTaskDelegatePreflight(input: { agentType: string; modelOverride?: string }, callerSignal?: AbortSignal): void {
+    this._preflightPlanTaskDelegate(input, callerSignal);
+  }
+
+  /**
    * @internal — `task_delegate`. Spawn/create a subagent SESSION for `taskId`,
    * durably link it (`delegatedSubagentSessionId`), drive the task `in_progress`,
    * and arm the live completion hook. Returns the view + the created subagent
@@ -23502,28 +23541,11 @@ export class Session {
     callerRequestContext?: RequestContext,
     parentTracingContext?: TracingContext,
   ): Promise<PlanTaskView & { subagentSessionId: string }> {
-    this._assertLive('task_delegate');
-    const admissionEpoch = this._captureActiveWorkAdmission('task_delegate');
-    this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
-    const def = this._harness._getSubagentType(input.agentType);
-    if (!def) {
-      throw new HarnessValidationError('agentType', `unknown subagent type "${input.agentType}"`);
-    }
-    if (input.modelOverride !== undefined && typeof input.modelOverride !== 'string') {
-      throw new HarnessValidationError('modelOverride', 'must be a string when provided');
-    }
+    const { admissionEpoch, def, childDepth } = this._preflightPlanTaskDelegate(input, callerSignal);
     const delegatedRequestContext = projectInheritedRequestContextApp(
       callerRequestContext,
       this._harness._getSubagentInheritedRequestContextAppKeys(),
     );
-
-    // §8 depth cap — fail closed BEFORE creating any child record (mirrors the
-    // spawn tool's pre-creation gate).
-    const childDepth = this.subagentDepth + 1;
-    const maxDepth = this._harness._getSubagentMaxDepth();
-    if (childDepth > maxDepth) {
-      throw new HarnessSubagentDepthExceededError(maxDepth, childDepth);
-    }
 
     // Reject unknown, already-running, or dependency-blocked tasks before
     // reserving capacity or creating a durable child. The fenced link commit

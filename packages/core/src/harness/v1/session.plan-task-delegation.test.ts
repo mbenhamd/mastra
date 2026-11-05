@@ -95,6 +95,7 @@ function buildHarness(
   db: InMemoryDB,
   opts: {
     maxConcurrent?: number;
+    maxDepth?: number;
     delegationTimeoutMs?: number;
     maxLive?: number;
     allowInline?: boolean;
@@ -117,7 +118,7 @@ function buildHarness(
     defaultModeId: 'default',
     sessions: { storage, ...(opts.maxLive !== undefined ? { maxLive: opts.maxLive } : {}) },
     subagents: {
-      maxDepth: 2,
+      maxDepth: opts.maxDepth ?? 2,
       ...(opts.maxConcurrent !== undefined ? { maxConcurrent: opts.maxConcurrent } : {}),
       ...(opts.delegationTimeoutMs !== undefined ? { delegationTimeoutMs: opts.delegationTimeoutMs } : {}),
       ...(opts.inheritRequestContextAppKeys !== undefined
@@ -257,170 +258,224 @@ describe('task_delegate — with or without taskId', () => {
       requestContext: { get: () => undefined },
     }) as any;
 
-  async function allTasks(parent: Session) {
-    return (await parent._internalStorage.listPlanTasks({ sessionId: parent.id, limit: 100 })).tasks;
-  }
-
-  const longTitle = 'é'.repeat(300); // 600 UTF-8 bytes; the title limit is 512.
-
+  type Call = {
+    task?: string;
+    /** Pass the pre-existing task's id. */
+    withExistingTaskId?: true;
+    /** Settle the slot-holding delegation before this call. */
+    freeSlotFirst?: true;
+  };
+  type ResultSummary =
+    | { ok: true; taskId: 'target'; sameChildAsFirstSuccess: boolean }
+    | { ok: false; errorName: string; field?: string; namesAddedTask: boolean; retryHint: boolean };
   type Row = {
     name: string;
-    /** Existing root tasks added before the delegate call (by task_add). */
-    existing: number;
-    /** Index into `existing` to pass as taskId, or none. */
-    passTaskId?: number;
-    task?: string;
-    /** Calls made with the same tool call id (a retried call). */
-    calls: number;
+    /** Start with one task added by task_add. */
+    existingTask?: true;
     maxConcurrent?: number;
-    /** Occupy every concurrency slot before the delegate call. */
-    saturate?: boolean;
-    expectError?: { errorName?: string; field?: string };
-    /** Plan tasks after the call(s), including `existing` and any saturating task. */
-    expectTaskCount: number;
-    /** Title of the delegated (or attempted) task when the call adds it. */
-    expectTitle?: string;
-    expectDelegated: boolean;
+    /** Occupy the only concurrency slot with another delegation first. */
+    saturate?: true;
+    /** Call from a session already at the configured max subagent depth. */
+    atMaxDepth?: true;
+    /** Every call uses the same tool call id (a retry). */
+    calls: Call[];
+    expected: {
+      /** Titles of the plan tasks the task_delegate calls added. */
+      addedTitles: string[];
+      results: ResultSummary[];
+      /** The target (existing or added) task is linked to a running subagent at the end. */
+      targetLinked: boolean;
+    };
   };
+
+  const ok = (sameChildAsFirstSuccess = true): ResultSummary => ({
+    ok: true,
+    taskId: 'target',
+    sameChildAsFirstSuccess,
+  });
+  const refused = (
+    errorName: string,
+    extra: { field?: string; namesAddedTask?: boolean; retryHint?: boolean } = {},
+  ): ResultSummary => ({
+    ok: false,
+    errorName,
+    ...(extra.field !== undefined ? { field: extra.field } : {}),
+    namesAddedTask: extra.namesAddedTask ?? false,
+    retryHint: extra.retryHint ?? false,
+  });
 
   const rows: Row[] = [
     {
       name: 'with taskId delegates that task and adds none',
-      existing: 1,
-      passTaskId: 0,
-      task: 'Summarize the trial.',
-      calls: 1,
-      expectTaskCount: 1,
-      expectDelegated: true,
+      existingTask: true,
+      calls: [{ withExistingTaskId: true, task: 'Summarize the trial.' }],
+      expected: { addedTitles: [], results: [ok()], targetLinked: true },
     },
     {
       name: 'without taskId adds a root task titled by the first line and delegates it',
-      existing: 1,
-      task: '  Screen the 40 abstracts\nInclusion: RCTs only.\nReturn a table.',
-      calls: 1,
-      expectTaskCount: 2,
-      expectTitle: 'Screen the 40 abstracts',
-      expectDelegated: true,
+      existingTask: true,
+      calls: [{ task: '  Screen the 40 abstracts\nInclusion: RCTs only.\nReturn a table.' }],
+      expected: { addedTitles: ['Screen the 40 abstracts'], results: [ok()], targetLinked: true },
     },
     {
       name: 'without taskId caps a long first line at the title limit',
-      existing: 0,
-      task: `${longTitle}\nDetails.`,
-      calls: 1,
-      expectTaskCount: 1,
-      expectTitle: 'é'.repeat(256),
-      expectDelegated: true,
+      calls: [{ task: `${'é'.repeat(300)}\nDetails.` }],
+      expected: { addedTitles: ['é'.repeat(256)], results: [ok()], targetLinked: true },
     },
     {
-      name: 'a retried call without taskId reuses its task (no second task)',
-      existing: 0,
-      task: 'Extract outcomes',
-      calls: 2,
-      expectTaskCount: 1,
-      expectTitle: 'Extract outcomes',
-      expectDelegated: true,
-      // The retry finds the task already delegated by the first attempt.
-      expectError: { field: 'taskId' },
+      name: 'without taskId never splits a character at the title limit',
+      calls: [{ task: `a${'é'.repeat(300)}` }],
+      expected: { addedTitles: [`a${'é'.repeat(255)}`], results: [ok()], targetLinked: true },
+    },
+    {
+      name: 'a retried call without taskId returns the first success and adds no second task',
+      calls: [{ task: 'Extract outcomes' }, { task: 'Extract outcomes' }],
+      expected: { addedTitles: ['Extract outcomes'], results: [ok(), ok()], targetLinked: true },
+    },
+    {
+      name: 'a retried call with a different task is refused on task, not idempotencyKey',
+      calls: [{ task: 'Extract outcomes' }, { task: 'Extract harms' }],
+      expected: {
+        addedTitles: ['Extract outcomes'],
+        results: [ok(), refused('HarnessValidationError', { field: 'task' })],
+        targetLinked: true,
+      },
     },
     {
       name: 'without taskId and without task is refused before any task is added',
-      existing: 0,
-      calls: 1,
-      expectTaskCount: 0,
-      expectDelegated: false,
-      expectError: { field: 'task' },
+      calls: [{}],
+      expected: {
+        addedTitles: [],
+        results: [refused('HarnessValidationError', { field: 'task' })],
+        targetLinked: false,
+      },
     },
     {
       name: 'without taskId and a blank task is refused before any task is added',
-      existing: 0,
-      task: ' \n\t\n ',
-      calls: 1,
-      expectTaskCount: 0,
-      expectDelegated: false,
-      expectError: { field: 'task' },
+      calls: [{ task: ' \n\t\n ' }],
+      expected: {
+        addedTitles: [],
+        results: [refused('HarnessValidationError', { field: 'task' })],
+        targetLinked: false,
+      },
     },
     {
-      name: 'without taskId at the concurrency limit is refused and names the task it added',
-      existing: 0,
-      task: 'Appraise risk of bias',
-      calls: 1,
+      name: 'without taskId at max depth is refused before any task is added',
+      atMaxDepth: true,
+      calls: [{ task: 'Go one level deeper' }],
+      expected: {
+        addedTitles: [],
+        results: [refused('HarnessSubagentDepthExceededError')],
+        targetLinked: false,
+      },
+    },
+    {
+      name: 'without taskId at the concurrency limit keeps the task pending and says how to retry',
       maxConcurrent: 1,
       saturate: true,
-      expectTaskCount: 2,
-      expectTitle: 'Appraise risk of bias',
-      expectDelegated: false,
-      expectError: { errorName: 'HarnessSubagentConcurrencyLimitError' },
+      calls: [{ task: 'Appraise risk of bias' }],
+      expected: {
+        addedTitles: ['Appraise risk of bias'],
+        results: [refused('HarnessSubagentConcurrencyLimitError', { namesAddedTask: true, retryHint: true })],
+        targetLinked: false,
+      },
+    },
+    {
+      name: 'a retry after the concurrency limit clears delegates the same task',
+      maxConcurrent: 1,
+      saturate: true,
+      calls: [{ task: 'Appraise risk of bias' }, { task: 'Appraise risk of bias', freeSlotFirst: true }],
+      expected: {
+        addedTitles: ['Appraise risk of bias'],
+        results: [refused('HarnessSubagentConcurrencyLimitError', { namesAddedTask: true, retryHint: true }), ok()],
+        targetLinked: true,
+      },
     },
   ];
 
   it.each(rows)('$name', async row => {
-    const { harness, parentAgent, childAgent } = buildHarness(
-      new InMemoryDB(),
-      row.maxConcurrent !== undefined ? { maxConcurrent: row.maxConcurrent } : {},
-    );
-    let releaseChild!: () => void;
-    childAgent.enqueueRun({ holdUntil: new Promise<void>(r => (releaseChild = r)), finishReason: 'stop' });
-    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
-    const close = await openParentTurn(parent, parentAgent);
-    const tools = createPlanTaskTools(parent);
-    const existing: string[] = [];
-    for (let i = 0; i < row.existing; i++) {
-      const added = (await tools[TASK_ADD_TOOL_ID]!.execute!({ content: `existing ${i}` } as any, toolCtx)) as any;
-      existing.push(added.taskId);
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), {
+      ...(row.maxConcurrent !== undefined ? { maxConcurrent: row.maxConcurrent } : {}),
+      ...(row.atMaxDepth ? { maxDepth: 1 } : {}),
+    });
+    // Hold every delegated child so links stay observable; release in order.
+    const releases: Array<() => void> = [];
+    for (let i = 0; i < 3; i++) {
+      childAgent.enqueueRun({ holdUntil: new Promise<void>(r => releases.push(r)), finishReason: 'stop' });
     }
+    const root = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const caller = row.atMaxDepth
+      ? await harness.session({
+          resourceId: 'u1',
+          threadId: { fresh: true },
+          parentSessionId: root.id,
+          origin: 'subagent-tool',
+          subagentDepth: 1,
+        })
+      : root;
+    const close = await openParentTurn(caller, parentAgent);
+    const tools = createPlanTaskTools(caller);
+    const existing = row.existingTask
+      ? ((await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'existing' } as any, toolCtx)) as any).taskId
+      : undefined;
+    let blockerTaskId: string | undefined;
     if (row.saturate) {
-      const blocker = (await tools[TASK_ADD_TOOL_ID]!.execute!(
-        { content: 'occupies the slot' } as any,
-        toolCtx,
-      )) as any;
+      blockerTaskId = ((await tools[TASK_ADD_TOOL_ID]!.execute!({ content: 'holds the slot' } as any, toolCtx)) as any)
+        .taskId;
       const held = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
-        { taskId: blocker.taskId, agentType: 'worker' } as any,
+        { taskId: blockerTaskId, agentType: 'worker' } as any,
         agentCallCtx('tc-saturate'),
       )) as any;
       expect(held.isError).toBeFalsy();
     }
-    const before = new Set((await allTasks(parent)).map(t => t.taskId));
+    const listTasks = async () =>
+      (await caller._internalStorage.listPlanTasks({ sessionId: caller.id, limit: 100 })).tasks;
+    const before = new Set((await listTasks()).map(t => t.taskId));
 
-    const input = {
-      agentType: 'worker',
-      ...(row.passTaskId !== undefined ? { taskId: existing[row.passTaskId] } : {}),
-      ...(row.task !== undefined ? { task: row.task } : {}),
-    };
     const results: any[] = [];
-    for (let i = 0; i < row.calls; i++) {
+    for (const call of row.calls) {
+      if (call.freeSlotFirst) {
+        releases[0]!();
+        await poll(async () => (await planRow(caller, blockerTaskId!))?.status === 'completed');
+        await poll(() => caller._internalSubagentExecutionsInFlight === 0);
+      }
+      const input = {
+        agentType: 'worker',
+        ...(call.withExistingTaskId ? { taskId: existing } : {}),
+        ...(call.task !== undefined ? { task: call.task } : {}),
+      };
       results.push(await tools[TASK_DELEGATE_TOOL_ID]!.execute!(input as any, agentCallCtx('tc-delegate')));
     }
 
-    const after = await allTasks(parent);
-    expect(after).toHaveLength(row.expectTaskCount);
-    const added = after.filter(t => !before.has(t.taskId));
-    const target = row.passTaskId !== undefined ? after.find(t => t.taskId === existing[row.passTaskId!]) : added[0];
-    if (row.passTaskId !== undefined) expect(added).toHaveLength(0);
-    if (row.expectTitle !== undefined) {
-      expect(added).toHaveLength(1);
-      expect(target?.content).toBe(row.expectTitle);
-      expect(target?.parentTaskId).toBeUndefined();
-    }
+    const added = (await listTasks()).filter(t => !before.has(t.taskId));
+    const targetId = row.calls.some(call => call.withExistingTaskId) ? existing : added[0]?.taskId;
+    const target = targetId === undefined ? undefined : await planRow(caller, targetId);
+    const firstSuccess = results.find(r => !r.isError);
+    const summary = {
+      addedTitles: added.map(t => t.content),
+      results: results.map(
+        (r): ResultSummary =>
+          r.isError
+            ? {
+                ok: false,
+                errorName: r.errorName,
+                ...(r.field !== undefined ? { field: r.field } : {}),
+                namesAddedTask: r.taskId !== undefined && r.taskId === added[0]?.taskId,
+                retryHint: /retry task_delegate with taskId/.test(r.message ?? ''),
+              }
+            : {
+                ok: true,
+                taskId: r.taskId === targetId ? 'target' : r.taskId,
+                sameChildAsFirstSuccess: r.subagentSessionId === firstSuccess.subagentSessionId,
+              },
+      ),
+      targetLinked: target?.delegatedSubagentSessionId !== undefined,
+    };
+    expect(summary).toEqual(row.expected);
+    // Added tasks are always top-level.
+    expect(added.map(t => t.parentTaskId)).toEqual(added.map(() => undefined));
 
-    const first = results[0];
-    const last = results[results.length - 1];
-    if (row.expectDelegated) {
-      expect(first.isError).toBeFalsy();
-      expect(first.taskId).toBe(target?.taskId);
-      expect(first.subagentSessionId).toEqual(expect.any(String));
-      expect(target?.delegatedSubagentSessionId).toBe(first.subagentSessionId);
-    } else if (target !== undefined) {
-      expect(target.delegatedSubagentSessionId).toBeUndefined();
-    }
-    if (row.expectError !== undefined) {
-      expect(last).toMatchObject({ isError: true, ...row.expectError });
-      // An error after the call added its task names that task for a retry.
-      if (target !== undefined && row.expectTitle !== undefined) expect(last.taskId).toBe(target.taskId);
-    } else {
-      expect(last.isError).toBeFalsy();
-    }
-
-    releaseChild();
+    releases.forEach(release => release());
     close();
     await harness.shutdown();
   });
