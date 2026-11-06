@@ -248,6 +248,39 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
     await harness.shutdown();
   });
 
+  it('a targeted delegation_timeout cancel settles cancelled and its wake commits outcome cancelled', async () => {
+    const db = new InMemoryDB();
+    const { harness, parentAgent, childAgent } = buildHarness(db);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const starts: Array<Record<string, unknown>> = [];
+    const off = parent.subscribe(event => {
+      if (event.type === 'agent_start') starts.push({ ...event });
+    });
+    const { taskId, childId } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
+
+    // A targeted cancel with the timeout reason settles `cancelled` and, unlike
+    // the parent's own Stop/cancel, still owes the parent a settlement notice.
+    await parent.cancelSubagent({ subagentSessionId: childId, reason: 'delegation_timeout' });
+    await poll(() => reminderCalls(parentAgent).length === 1);
+    await poll(() => intents(db, wakeFinalizer.id).length === 1);
+    await parent.waitForIdle({ timeoutMs: 3000 });
+    off();
+
+    const wakeStart = starts.find(start => start.origin === 'wake')!;
+    const [wake] = intents(db, wakeFinalizer.id);
+    expect(wake!.projection.payload).toEqual({
+      origin: 'wake',
+      wakeNoticeId: wakeStart.wakeNoticeId,
+      runId: wakeStart.runId,
+      taskId,
+      subagentSessionId: childId,
+      outcome: 'cancelled',
+      reply: { status: 'completed', text: 'woken reply' },
+    });
+    expect((await planRow(parent, taskId))?.status).toBe('cancelled');
+    await harness.shutdown();
+  });
+
   it('a crash between the wake run end and its intent write is settled once on restart without re-running', async () => {
     const db = new InMemoryDB();
     const a = buildHarness(db);
