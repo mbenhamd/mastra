@@ -71,6 +71,14 @@ export const SUBAGENT_CONTROL_RESULTS_SHORTENED_HINT =
 const WAIT_POLL_INTERVAL_MS = 100;
 const WAIT_POLL_MAX_INTERVAL_MS = 1_000;
 /**
+ * Storage poll interval while every child a `wait` still waits for is a
+ * delegated task. A settlement in this process wakes the wait at once, so
+ * this poll only finds a settlement written by another process.
+ */
+export const SUBAGENT_CONTROL_WAIT_STORAGE_POLL_MS = 5_000;
+/** Children whose rows one storage round loads at the same time. */
+const CHILD_LOAD_BATCH = 16;
+/**
  * How long a `wait` poll's storage read may run past the wait deadline. The
  * deadline decides when to stop polling, never how long a started read may
  * take; only a read still pending this long after it started (and after the
@@ -142,6 +150,14 @@ const inputSchema = z
       .max(SUBAGENT_CONTROL_MAX_WAIT_TARGETS)
       .optional()
       .describe('wait only: several subagent ids. Omit both ids to wait for every running subagent.'),
+    until: z
+      .enum(['any', 'all'])
+      .optional()
+      .describe(
+        'wait only: "all" (default) returns when every target has settled; "any" returns as soon as one ' +
+          'target has settled. With ids, a named subagent that had already settled ends an "any" wait at ' +
+          'once; without ids, only a subagent that settles during the call ends it.',
+      ),
     timeoutMs: z
       .number()
       .int()
@@ -162,7 +178,8 @@ const inputSchema = z
         'status and wait without ids only: the position to start from in the list of all your subagents, ' +
           'running and settled, ordered oldest first (by start time, then id). A subagent keeps its position ' +
           'when it settles. A wait with an offset returns the settled subagents from that position on and ' +
-          'waits for the running ones. When an output leaves subagents out, resultsHint gives the next ' +
+          'waits for the running ones; as in every wait without ids, only a subagent that settles during the ' +
+          'call ends an until "any" wait. When an output leaves subagents out, resultsHint gives the next ' +
           'offset. Positions can shift only when a subagent starts between calls with the same or an earlier ' +
           'start time, or when a new run begins (a resume continues the same run, and a message that joins ' +
           'the current run does not start a new one): a spawn_subagent subagent whose call returned in an ' +
@@ -196,11 +213,14 @@ const inputSchema = z
         message: 'pass subagentSessionId or subagentSessionIds, not both',
       });
     }
-    if (input.action !== 'wait' && (input.subagentSessionIds !== undefined || input.timeoutMs !== undefined)) {
+    if (
+      input.action !== 'wait' &&
+      (input.subagentSessionIds !== undefined || input.timeoutMs !== undefined || input.until !== undefined)
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['action'],
-        message: 'subagentSessionIds and timeoutMs are only valid for wait',
+        message: 'subagentSessionIds, timeoutMs and until are only valid for wait',
       });
     }
     if (
@@ -378,29 +398,44 @@ function boundResults(
   fullResultIds: ReadonlySet<string>,
   namedOne: string | undefined,
   continuation?: Continuation,
+  required: ReadonlySet<string> = new Set(),
 ): SubagentControlOutput {
   if (namedOne !== undefined && views.every(view => view.subagentSessionId === namedOne)) {
     return build(list => [...list]);
   }
   // Room for the shortening notice is reserved only once something must be
   // shortened: an output whose full results fit as they are carries no notice.
-  const unshortened = fitResults(build, views, views, fullResultIds, continuation, false);
+  const unshortened = fitResults(build, views, views, fullResultIds, continuation, false, required);
   if (unshortened !== undefined) return unshortened;
   const whole =
-    fitResults(build, views, views, fullResultIds, continuation) ??
-    fitResults(build, views, views.map(shortTask), fullResultIds, continuation);
+    fitResults(build, views, views, fullResultIds, continuation, true, required) ??
+    fitResults(build, views, views.map(shortTask), fullResultIds, continuation, true, required);
   if (whole !== undefined) return whole;
+  // A required child (one whose settlement ended an `until: "any"` wait) is
+  // always kept, wherever it sits; the prefix is taken from the others.
   const short = views.map(shortTask);
+  const shortRequired = short.filter(view => required.has(view.subagentSessionId));
+  const shortRest = short.filter(view => !required.has(view.subagentSessionId));
   // The envelope grows with each kept child (a child's own fields are larger
   // than its id in the hint), so the largest prefix that fits is found by
   // bisection.
   let low = 0;
-  let high = views.length - 1;
+  let high = shortRest.length - 1;
   let best: SubagentControlOutput | undefined;
   while (low <= high) {
     const keep = Math.floor((low + high) / 2);
-    const fitted = fitResults(build, views, short.slice(0, keep), fullResultIds, continuation);
-    if (fitted === undefined) {
+    const fitted = fitResults(
+      build,
+      views,
+      [...shortRequired, ...shortRest.slice(0, keep)],
+      fullResultIds,
+      continuation,
+      true,
+      required,
+    );
+    // A required child keeps its result (at least its preview) before the
+    // prefix grows; with no prefix left it is kept even without its result.
+    if (fitted === undefined || (keep > 0 && omitsRequiredResult(fitted, required))) {
       high = keep - 1;
     } else {
       best = fitted;
@@ -417,6 +452,14 @@ function boundResults(
   );
 }
 
+/** Whether `output` left out the result of a `required` child. */
+function omitsRequiredResult(output: SubagentControlOutput, required: ReadonlySet<string>): boolean {
+  if (required.size === 0) return false;
+  return [...(output.subagents ?? []), ...(output.settledSubagents ?? []), ...(output.runningSubagents ?? [])].some(
+    view => view.resultOmitted === true && required.has(view.subagentSessionId),
+  );
+}
+
 /**
  * Fit the results of `kept` (a prefix of `views`, possibly with shortened
  * task texts) into the output, or return undefined when even the children
@@ -430,7 +473,7 @@ function boundResults(
  * preview), or no result when even that does not fit. The second pass
  * upgrades children in `fullResultIds` to their full result, in order, while
  * the budget allows, so one large result never starves the previews of the
- * others.
+ * others. Both passes serve the `required` children first.
  */
 function fitResults(
   build: (place: PlaceViews) => SubagentControlOutput,
@@ -439,6 +482,7 @@ function fitResults(
   fullResultIds: ReadonlySet<string>,
   continuation: Continuation,
   reserveNotice = true,
+  required: ReadonlySet<string> = new Set(),
 ): SubagentControlOutput | undefined {
   const keptIds = new Set(kept.map(view => view.subagentSessionId));
   const leftOut = views.filter(view => !keptIds.has(view.subagentSessionId)).map(view => view.subagentSessionId);
@@ -463,7 +507,12 @@ function fitResults(
   if (remaining < 0) return undefined;
   const fitted = new Map<string, SubagentView>();
   const upgrades: Array<{ full: SubagentView; previewBytes: number }> = [];
-  for (const view of kept) {
+  // Required children take the budget first, then the rest in output order.
+  const byPriority = [
+    ...kept.filter(view => required.has(view.subagentSessionId)),
+    ...kept.filter(view => !required.has(view.subagentSessionId)),
+  ];
+  for (const view of byPriority) {
     if (view.result === undefined) continue;
     const fullBytes = jsonBytes(view);
     let preview = view;
@@ -508,18 +557,18 @@ function fitResults(
   return reserveNotice ? { ...output, ...notice } : undefined;
 }
 
-function abortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
+/** Resolve after `ms`, on abort, or when the function handed to `arm` is called. */
+function wakeable(ms: number, signal: AbortSignal | undefined, arm: (wake: () => void) => void): Promise<void> {
   return new Promise(resolve => {
     if (signal?.aborted) return resolve();
-    const onAbort = () => {
+    const done = () => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
       resolve();
     };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, { once: true });
+    arm(done);
   });
 }
 
@@ -577,6 +626,19 @@ export function createSubagentControlTool(parent: Session) {
   const activeSubagents = () =>
     Array.from((parent as unknown as { _activeSubagents: Map<string, ActiveSubagentState> })._activeSubagents.values());
 
+  type DelegationAttemptMetadata = ReturnType<typeof readDelegationAttemptMetadata>;
+  // Parsing an attempt hashes its task body (up to 64 KiB); a task row's
+  // `version` advances on every write, so one parse serves each version.
+  const attemptCache = new Map<string, { version: number; attempt: DelegationAttemptMetadata }>();
+  function attemptOf(task: HarnessPlanTask, childId?: string): DelegationAttemptMetadata {
+    let cached = attemptCache.get(task.taskId);
+    if (cached === undefined || cached.version !== task.version) {
+      cached = { version: task.version, attempt: readDelegationAttemptMetadata(task) };
+      attemptCache.set(task.taskId, cached);
+    }
+    return childId === undefined || cached.attempt?.subagentSessionId === childId ? cached.attempt : undefined;
+  }
+
   async function loadDelegatedTasks(): Promise<Map<string, HarnessPlanTask>> {
     const byChild = new Map<string, HarnessPlanTask>();
     let cursor: string | undefined;
@@ -585,7 +647,7 @@ export function createSubagentControlTool(parent: Session) {
       for (const task of page.tasks) {
         // Settlement clears the live link but keeps the attempt (and its result)
         // in the task metadata, so index both.
-        const childId = task.delegatedSubagentSessionId ?? readDelegationAttemptMetadata(task)?.subagentSessionId;
+        const childId = task.delegatedSubagentSessionId ?? attemptOf(task)?.subagentSessionId;
         if (childId !== undefined) byChild.set(childId, task);
       }
       if (!page.cursor || page.tasks.length === 0) break;
@@ -613,7 +675,7 @@ export function createSubagentControlTool(parent: Session) {
     delegated: HarnessPlanTask | undefined,
     returned?: ReturnedInlineSubagentState,
   ): SubagentView {
-    const attempt = delegated === undefined ? undefined : readDelegationAttemptMetadata(delegated, childId);
+    const attempt = delegated === undefined ? undefined : attemptOf(delegated, childId);
     let status: SubagentStatus;
     let result: HarnessSubagentResultSummary | undefined;
     let settledAt: number | undefined;
@@ -702,7 +764,7 @@ export function createSubagentControlTool(parent: Session) {
       // its place, so paging within a run never skips a child.
       for (const [id, state] of returnedById) if (!known.has(id)) known.set(id, state.startedAt);
       for (const [id, task] of delegated) {
-        if (!known.has(id)) known.set(id, readDelegationAttemptMetadata(task, id)?.startedAt ?? task.createdAt);
+        if (!known.has(id)) known.set(id, attemptOf(task, id)?.startedAt ?? task.createdAt);
       }
       const ordered = Array.from(known.entries()).sort(byStart);
       ordered.forEach(([id], index) => position.set(id, index));
@@ -710,32 +772,40 @@ export function createSubagentControlTool(parent: Session) {
     }
     const views: SubagentView[] = [];
     const foreign: string[] = [];
-    for (const id of ids) {
+    let next = 0;
+    while (next < ids.length) {
       // One view past the limit is enough to flag truncation.
       if (opts.limit !== undefined && views.length > opts.limit) break;
-      const { record, live } = await loadChildRecord(id);
-      if (isOwnChild(record)) {
-        views.push(
-          project(
-            id,
-            record,
-            live,
-            activeById.get(id),
-            delegated.get(id),
-            activeById.has(id) ? undefined : returnedById.get(id),
-          ),
-        );
-      } else if (record === null && opts.knownOwned?.has(id) === true) {
-        views.push({
-          subagentSessionId: id,
-          source: 'session',
-          status: 'closed',
-          settled: true,
-          cancelRequested: false,
-          live: false,
-        });
-      } else if (childIds !== undefined) {
-        foreign.push(id);
+      const room =
+        opts.limit === undefined ? CHILD_LOAD_BATCH : Math.min(CHILD_LOAD_BATCH, opts.limit + 1 - views.length);
+      const batch = ids.slice(next, next + room);
+      next += batch.length;
+      const loaded = await Promise.all(batch.map(id => loadChildRecord(id)));
+      for (const [index, id] of batch.entries()) {
+        const { record, live } = loaded[index]!;
+        if (isOwnChild(record)) {
+          views.push(
+            project(
+              id,
+              record,
+              live,
+              activeById.get(id),
+              delegated.get(id),
+              activeById.has(id) ? undefined : returnedById.get(id),
+            ),
+          );
+        } else if (record === null && opts.knownOwned?.has(id) === true) {
+          views.push({
+            subagentSessionId: id,
+            source: 'session',
+            status: 'closed',
+            settled: true,
+            cancelRequested: false,
+            live: false,
+          });
+        } else if (childIds !== undefined) {
+          foreign.push(id);
+        }
       }
     }
     const truncated = opts.limit !== undefined && views.length > opts.limit;
@@ -778,8 +848,45 @@ export function createSubagentControlTool(parent: Session) {
     runId: string | undefined,
     childIds: readonly string[] | undefined,
     timeoutMs: number,
+    until: 'any' | 'all',
     signal: AbortSignal | undefined,
     offset: number | undefined,
+  ): Promise<SubagentControlOutput> {
+    // A delegated settlement in this process wakes the wait at once; `woken`
+    // also covers one that lands while a storage read is in flight.
+    let woken = false;
+    let wake: (() => void) | undefined;
+    const unsubscribe = parent._internalOnDelegatedSettlement(() => {
+      woken = true;
+      wake?.();
+    });
+    try {
+      return await waitLoop(runId, childIds, timeoutMs, until, signal, offset, {
+        consume: () => {
+          const was = woken;
+          woken = false;
+          return was;
+        },
+        sleep: (ms: number) =>
+          wakeable(ms, signal, done => {
+            wake = done;
+          }).then(() => {
+            wake = undefined;
+          }),
+      });
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  async function waitLoop(
+    runId: string | undefined,
+    childIds: readonly string[] | undefined,
+    timeoutMs: number,
+    until: 'any' | 'all',
+    signal: AbortSignal | undefined,
+    offset: number | undefined,
+    settlement: { consume: () => boolean; sleep: (ms: number) => Promise<void> },
   ): Promise<SubagentControlOutput> {
     const deadline = Date.now() + timeoutMs;
     let targets = childIds;
@@ -813,12 +920,23 @@ export function createSubagentControlTool(parent: Session) {
         fullResultIds,
         namedOne,
         childIds === undefined ? { action: 'wait', position } : undefined,
+        // The children whose settlement ended an `until: "any"` wait are always
+        // in its output, even past the page the budget keeps; they may then
+        // appear again on a later page.
+        until === 'any'
+          ? new Set(
+              lastSettled
+                .filter(view => runningAtStart?.has(view.subagentSessionId) === true)
+                .map(view => view.subagentSessionId),
+            )
+          : undefined,
       );
     };
     for (;;) {
       // The deadline decides when to stop polling, not how long a started read
       // may take: every read may run at least SUBAGENT_CONTROL_WAIT_READ_STALL_MS,
       // even when it starts at the deadline.
+      settlement.consume();
       const resolution = await settleWithin(
         resolveChildren(
           runId,
@@ -863,11 +981,25 @@ export function createSubagentControlTool(parent: Session) {
       lastRunning = running;
       lastCurrent = current;
       const aborted = signal?.aborted === true;
-      const timedOut = running.length > 0 && !aborted && Date.now() >= deadline;
-      if (running.length === 0 || timedOut || aborted) {
-        return output({ timedOut, ...(aborted && running.length > 0 ? { aborted: true as const } : {}) });
+      // A wait with an offset also returns the children already settled on its
+      // page; only a child that was running when the wait began can end it.
+      const woke =
+        childIds === undefined
+          ? lastSettled.filter(view => runningAtStart?.has(view.subagentSessionId) === true)
+          : lastSettled;
+      const satisfied = running.length === 0 || (until === 'any' && woke.length > 0);
+      const timedOut = !satisfied && !aborted && Date.now() >= deadline;
+      if (satisfied || timedOut || aborted) {
+        return output({ timedOut, ...(aborted && !satisfied ? { aborted: true as const } : {}) });
       }
-      await abortable(Math.min(interval, Math.max(0, deadline - Date.now())), signal);
+      // Only a delegated settlement is signalled; any other child keeps the
+      // short backoff poll.
+      const pollMs = running.every(view => view.source === 'delegated')
+        ? SUBAGENT_CONTROL_WAIT_STORAGE_POLL_MS
+        : interval;
+      if (!settlement.consume()) {
+        await settlement.sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+      }
       interval = Math.min(interval * 2, WAIT_POLL_MAX_INTERVAL_MS);
     }
   }
@@ -1007,14 +1139,18 @@ export function createSubagentControlTool(parent: Session) {
       'gives the offset of the next ones. Listings without ids are ordered oldest first (by start time, then ' +
       'id). `offset` is a place in that list of all your subagents, running and settled; a subagent keeps its ' +
       'place when it settles, and `wait` with an offset also returns the settled subagents from that place ' +
-      'on. Places can shift only when a subagent starts between calls with the same or an earlier start ' +
-      'time, or when a new run begins (a resume continues the same run, and a message that joins the ' +
-      'current run does not start a new one): a spawn_subagent subagent whose call returned in an earlier ' +
-      'run is no longer listed. A call ' +
+      'on (in a wait without ids, only a subagent that settles during the call ends an `until: "any"` ' +
+      'wait; with ids, a named subagent already settled ends it at once). Places can shift only when a ' +
+      'subagent starts between calls with the same or an earlier start time, or when a new run begins (a ' +
+      'resume continues the same run, and a message that joins the current run does not start a new one): ' +
+      'a spawn_subagent subagent whose call returned in an earlier run is no longer listed. A call ' +
       'naming exactly one subagent always returns its full result, so call `status` with only that ' +
       'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
-      'returns those settled and those still running. If the first status read stalls, wait fails with ' +
+      'returns those settled and those still running; with `until: "any"` it returns once one of them has ' +
+      'settled, and the subagents that settled during the call are always in the output, even when the rest ' +
+      'of the list is cut short (they may then appear again on a later page). If the first status read ' +
+      'stalls, wait fails with ' +
       '`harness.storage` (retry it); if a later read stalls past the timeout, the lists are the statuses from ' +
       'its last completed read and may be stale. ' +
       '`send` adds an instruction to a subagent whose run is in progress. It is rejected for a subagent ' +
@@ -1043,6 +1179,7 @@ export function createSubagentControlTool(parent: Session) {
               runId,
               ids,
               input.timeoutMs ?? SUBAGENT_CONTROL_DEFAULT_WAIT_MS,
+              input.until ?? 'all',
               ctx?.abortSignal,
               input.offset,
             );
