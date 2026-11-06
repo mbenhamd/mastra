@@ -1600,11 +1600,17 @@ describe('subagent control tool — stable offsets', () => {
       for (const child of returned) await returnInline(parent, child);
       const running = await addInlineChildren(harness, parent, 3);
       keys = register(parent, running, () => Date.now());
-      const turnsBefore = (parent as any)._turnsBegun as number;
+      const callsBefore = parentAgent.streamCalls.length;
+      const sendSignal = vi.spyOn(parentAgent, 'sendSignal');
       // A second message while the run is active joins that run instead of starting a new one.
       const joined = parent.message({ content: 'one more thing' });
       void joined.catch(() => {});
-      await poll(() => ((parent as any)._turnsBegun as number) > turnsBefore);
+      const joinedCall = () =>
+        sendSignal.mock.calls.findIndex(([signal]) => (signal as { contents?: unknown }).contents === 'one more thing');
+      await poll(() => joinedCall() >= 0);
+      const signalResult = sendSignal.mock.results[joinedCall()]!.value as { accepted: Promise<{ action: string }> };
+      await expect(signalResult.accepted).resolves.toMatchObject({ action: 'deliver' });
+      expect(parentAgent.streamCalls.length).toBe(callsBefore);
       const seen: string[] = [];
       let page = await run({ action: 'status', offset: 0 });
       for (;;) {
