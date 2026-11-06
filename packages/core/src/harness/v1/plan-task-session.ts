@@ -1352,12 +1352,24 @@ interface DelegationAttemptMetadata {
     settledAt: number;
     result?: HarnessSubagentResultSummary;
     /** Parent notice still owed for this settlement; removed once delivered. */
-    notice?: { mode: DelegatedSettlementNoticeMode; digest: string };
+    notice?: { mode: DelegatedSettlementNoticeMode; digest: string; claim?: DelegationNoticeClaim };
   };
 }
 
 /** How an owed parent notice is delivered (`subagents.onDelegatedSettlement`). */
 export type DelegatedSettlementNoticeMode = 'remind' | 'wake';
+
+/**
+ * PF-7679: the claim a Harness owner holds on an owed notice while it delivers
+ * it. The notice stays durable under the claim until the claimer acknowledges
+ * the delivery or clears the claim. A claim is valid only while its claimer
+ * holds the session lease; `claimedAt` is diagnostic only.
+ */
+export interface DelegationNoticeClaim {
+  claimId: string;
+  ownerId: string;
+  claimedAt: number;
+}
 
 /**
  * A parent notice recorded with a committed delegation settlement and not yet
@@ -1372,6 +1384,8 @@ export interface PendingDelegationSettlementNotice {
   outcome: DelegatedSubagentOutcome;
   /** Mode the parent delegated from, when recorded. */
   parentModeId?: string;
+  /** PF-7679: the delivery claim on this notice, when one is held. */
+  claim?: DelegationNoticeClaim;
 }
 
 function sha256Text(value: string): string {
@@ -1454,6 +1468,23 @@ function settledDelegationAttemptMetadata(
   if (attempt.parentModeId !== undefined) encoded.parentModeId = attempt.parentModeId;
   if (attempt.hadPriorMetadata) encoded.priorMetadata = attempt.priorMetadata!;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: encoded };
+}
+
+/** A well-formed notice claim, as `{ claim }`; a malformed one is dropped (it is then never valid). */
+function parseDelegationNoticeClaim(raw: unknown): { claim?: DelegationNoticeClaim } {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const claim = raw as Record<string, unknown>;
+  if (
+    typeof claim.claimId !== 'string' ||
+    claim.claimId.length === 0 ||
+    typeof claim.ownerId !== 'string' ||
+    claim.ownerId.length === 0 ||
+    typeof claim.claimedAt !== 'number' ||
+    !Number.isFinite(claim.claimedAt)
+  ) {
+    return {};
+  }
+  return { claim: { claimId: claim.claimId, ownerId: claim.ownerId, claimedAt: claim.claimedAt } };
 }
 
 /**
@@ -1545,7 +1576,11 @@ export function readDelegationAttemptMetadata(
       (rawNotice.mode === 'remind' || rawNotice.mode === 'wake') &&
       typeof rawNotice.digest === 'string' &&
       rawNotice.digest.length > 0
-        ? { mode: rawNotice.mode as DelegatedSettlementNoticeMode, digest: rawNotice.digest }
+        ? {
+            mode: rawNotice.mode as DelegatedSettlementNoticeMode,
+            digest: rawNotice.digest,
+            ...parseDelegationNoticeClaim(rawNotice.claim),
+          }
         : undefined;
     settlement = {
       outcome: raw.settlement.outcome,
@@ -1948,6 +1983,7 @@ export function readPendingDelegationSettlementNotice(
     digest: settlement.notice.digest,
     outcome: settlement.outcome,
     ...(attempt.parentModeId !== undefined ? { parentModeId: attempt.parentModeId } : {}),
+    ...(settlement.notice.claim !== undefined ? { claim: settlement.notice.claim } : {}),
   };
 }
 
@@ -1973,16 +2009,18 @@ export async function planTaskDowngradeDelegationWakeNotices(port: PlanTaskSessi
   return ops.length;
 }
 
-/**
- * Remove an owed parent notice with a version-fenced write. Returns true only
- * for the caller whose write removed it, so concurrent deliverers of the same
- * notice cannot both act on it. A notice already removed, replaced by a newer
- * delegation, or carrying another digest returns false.
- */
-export async function planTaskAcknowledgeDelegationSettlementNotice(
+/** The task row and its raw envelope copy, when it still owes this exact notice. */
+async function loadOwedNoticeForWrite(
   port: PlanTaskSessionPort,
   input: { taskId: string; subagentSessionId: string; digest: string },
-): Promise<boolean> {
+): Promise<
+  | {
+      task: HarnessPlanTask;
+      pending: PendingDelegationSettlementNotice;
+      envelope: Record<string, Record<string, Record<string, Record<string, unknown>>>>;
+    }
+  | undefined
+> {
   const snapshot = await port.storage.loadPlanTaskSubtree({
     harnessName: port.harnessName,
     sessionId: port.id,
@@ -1990,15 +2028,100 @@ export async function planTaskAcknowledgeDelegationSettlementNotice(
     limit: 1,
   });
   const task = snapshot.tasks.find(row => row.taskId === input.taskId);
-  if (task === undefined) return false;
+  if (task === undefined) return undefined;
   const pending = readPendingDelegationSettlementNotice(task);
-  if (pending?.subagentSessionId !== input.subagentSessionId || pending.digest !== input.digest) return false;
-  const envelope = JSON.parse(JSON.stringify(task.metadata)) as Record<string, Record<string, Record<string, unknown>>>;
-  delete envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement!.notice;
-  await port.storage.mutatePlanTasksForSession({
+  if (pending?.subagentSessionId !== input.subagentSessionId || pending.digest !== input.digest) return undefined;
+  // The raw envelope is copied, so fields this reader does not model survive.
+  const envelope = JSON.parse(JSON.stringify(task.metadata)) as Record<
+    string,
+    Record<string, Record<string, Record<string, unknown>>>
+  >;
+  return { task, pending, envelope };
+}
+
+function updateNoticeTask(port: PlanTaskSessionPort, task: HarnessPlanTask, envelope: unknown): Promise<unknown> {
+  return port.storage.mutatePlanTasksForSession({
     fence: fence(port),
     ops: [{ kind: 'update', taskId: task.taskId, ifVersion: task.version, patch: { metadata: envelope as JsonValue } }],
   });
+}
+
+/**
+ * Remove an owed parent notice with a version-fenced write. Returns true only
+ * for the caller whose write removed it. A notice already removed, replaced by
+ * a newer delegation, or carrying another digest returns false. PF-7679: a
+ * claimed notice is removed only by its claimer (`claimId`), or when its claim
+ * is one `takeover` accepts (its claimer lost the lease or is gone); a newer
+ * claim is never removed by a stale claimer.
+ */
+export async function planTaskAcknowledgeDelegationSettlementNotice(
+  port: PlanTaskSessionPort,
+  input: {
+    taskId: string;
+    subagentSessionId: string;
+    digest: string;
+    claimId?: string;
+    takeover?: (claim: DelegationNoticeClaim) => boolean;
+  },
+): Promise<boolean> {
+  const owed = await loadOwedNoticeForWrite(port, input);
+  if (owed === undefined) return false;
+  const claim = owed.pending.claim;
+  if (claim !== undefined && claim.claimId !== input.claimId && input.takeover?.(claim) !== true) return false;
+  delete owed.envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement!.notice;
+  await updateNoticeTask(port, owed.task, owed.envelope);
+  return true;
+}
+
+/**
+ * PF-7679: claim an owed notice for delivery with a version-fenced write. The
+ * notice stays owed under the claim. Refused (`claim_lost`) when the notice is
+ * gone, moved to another digest, or held by a claim `takeover` does not accept;
+ * a claim it accepts is overwritten, so one of two racing takers wins on the
+ * version.
+ */
+export async function planTaskClaimDelegationSettlementNotice(
+  port: PlanTaskSessionPort,
+  input: {
+    taskId: string;
+    subagentSessionId: string;
+    digest: string;
+    claim: DelegationNoticeClaim;
+    takeover: (claim: DelegationNoticeClaim) => boolean;
+  },
+): Promise<'claimed' | 'claim_lost'> {
+  const owed = await loadOwedNoticeForWrite(port, input);
+  if (owed === undefined) return 'claim_lost';
+  const current = owed.pending.claim;
+  if (current !== undefined && !input.takeover(current)) return 'claim_lost';
+  owed.envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement!.notice!.claim = { ...input.claim };
+  await updateNoticeTask(port, owed.task, owed.envelope);
+  return 'claimed';
+}
+
+/**
+ * PF-7679: release this caller's claim without a delivery, so the notice is
+ * owed again under the same digest. Only the claim's own `claimId` clears it.
+ * The mode never upgrades: `mode` applies only when it is `remind` (a stale
+ * fence), and a stored `remind` (a Stop downgrade) stays. Returns true when
+ * the claim was cleared.
+ */
+export async function planTaskClearDelegationSettlementNoticeClaim(
+  port: PlanTaskSessionPort,
+  input: {
+    taskId: string;
+    subagentSessionId: string;
+    digest: string;
+    claimId: string;
+    mode: DelegatedSettlementNoticeMode;
+  },
+): Promise<boolean> {
+  const owed = await loadOwedNoticeForWrite(port, input);
+  if (owed === undefined || owed.pending.claim?.claimId !== input.claimId) return false;
+  const notice = owed.envelope[DELEGATION_ATTEMPT_METADATA_KEY]!.settlement!.notice!;
+  delete notice.claim;
+  if (input.mode === 'remind') notice.mode = 'remind';
+  await updateNoticeTask(port, owed.task, owed.envelope);
   return true;
 }
 
