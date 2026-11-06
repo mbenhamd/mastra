@@ -2,4 +2,16 @@
 '@mastra/core': patch
 ---
 
-When a parent cancels its delegated task with reason `delegation_timeout`, the task settles `cancelled` and the parent's settlement wake now runs and records the `cancelled` outcome. Before, the wake was refused. Fixes a typecheck failure on main. `@mastra/core/storage` now exports `HARNESS_DELEGATED_SETTLEMENT_OUTCOMES`, `HarnessDelegatedSettlementOutcome` and `isHarnessDelegatedSettlementOutcome`.
+A parent session is now woken when it cancels a delegated task with reason `delegation_timeout`. The wake records the task's `cancelled` outcome; before this, the wake was refused. `HarnessWakeTerminalPayload.outcome` now accepts `'cancelled'`.
+
+To handle every settlement outcome in a wake payload, check it with the new guard from `@mastra/core/storage`:
+
+```ts
+import { isHarnessDelegatedSettlementOutcome } from '@mastra/core/storage';
+
+if (isHarnessDelegatedSettlementOutcome(payload.outcome) && payload.outcome === 'cancelled') {
+  // the parent cancelled this delegated task; decide whether to retry it
+}
+```
+
+`HARNESS_DELEGATED_SETTLEMENT_OUTCOMES` lists all four outcomes, and `HarnessDelegatedSettlementOutcome` is their type.
