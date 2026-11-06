@@ -1605,9 +1605,11 @@ describe('subagent control tool — stable offsets', () => {
       // A second message while the run is active joins that run instead of starting a new one.
       const joined = parent.message({ content: 'one more thing' });
       void joined.catch(() => {});
-      await poll(() =>
-        sendSignal.mock.calls.some(([signal]) => (signal as { contents?: unknown }).contents === 'one more thing'),
-      );
+      const joinedCall = () =>
+        sendSignal.mock.calls.findIndex(([signal]) => (signal as { contents?: unknown }).contents === 'one more thing');
+      await poll(() => joinedCall() >= 0);
+      const signalResult = sendSignal.mock.results[joinedCall()]!.value as { accepted: Promise<{ action: string }> };
+      await expect(signalResult.accepted).resolves.toMatchObject({ action: 'deliver' });
       expect(parentAgent.streamCalls.length).toBe(callsBefore);
       const seen: string[] = [];
       let page = await run({ action: 'status', offset: 0 });
