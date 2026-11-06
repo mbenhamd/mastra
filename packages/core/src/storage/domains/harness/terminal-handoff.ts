@@ -44,6 +44,20 @@ export function harnessWakeExecutionGrant(wakeNoticeId: string): HarnessTerminal
 }
 
 /**
+ * PF-7761: every outcome a delegated plan task settles with, and so every
+ * outcome a settlement notice and its wake turn report. The Harness's
+ * `DelegatedSubagentOutcome` and the wake payload both derive from this list.
+ */
+export const HARNESS_DELEGATED_SETTLEMENT_OUTCOMES = ['completed', 'blocked', 'cancelled', 'failed'] as const;
+
+export type HarnessDelegatedSettlementOutcome = (typeof HARNESS_DELEGATED_SETTLEMENT_OUTCOMES)[number];
+
+/** Whether a value is a delegated settlement outcome. */
+export function isHarnessDelegatedSettlementOutcome(value: unknown): value is HarnessDelegatedSettlementOutcome {
+  return (HARNESS_DELEGATED_SETTLEMENT_OUTCOMES as readonly unknown[]).includes(value);
+}
+
+/**
  * PF-7631: the projection payload of a settlement wake turn's terminal intent
  * (`sessions.terminalHandoff.wakeFinalizer`). The Harness wraps the registered
  * wake finalizer's payload as `reply` and adds the wake identity, so a
@@ -61,7 +75,7 @@ export interface HarnessWakeTerminalPayload {
   /** The delegated child session that settled. */
   subagentSessionId: string;
   /** The settled task's outcome, as the notice reported it. */
-  outcome: 'completed' | 'blocked' | 'failed';
+  outcome: HarnessDelegatedSettlementOutcome;
   /** The registered wake finalizer's own payload. */
   reply: JsonValue;
 }
