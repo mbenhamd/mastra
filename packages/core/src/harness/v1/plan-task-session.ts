@@ -22,6 +22,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import type { HarnessStorage } from '../../storage/domains/harness';
+import { isHarnessDelegatedSettlementOutcome } from '../../storage/domains/harness/terminal-handoff';
+import type { HarnessDelegatedSettlementOutcome } from '../../storage/domains/harness/terminal-handoff';
 import type {
   HarnessPlanTask,
   HarnessPlanTaskStatus,
@@ -1282,7 +1284,7 @@ export async function planTaskReset(port: PlanTaskSessionPort): Promise<ResetPla
  *     timeout, any other abort/cancel, and a fail-closed "subagent session
  *     gone/deleted").
  */
-export type DelegatedSubagentOutcome = 'completed' | 'blocked' | 'cancelled' | 'failed';
+export type DelegatedSubagentOutcome = HarnessDelegatedSettlementOutcome;
 
 export interface DelegateTaskInput {
   /** Existing plan task to delegate. */
@@ -1553,10 +1555,7 @@ export function readDelegationAttemptMetadata(
     if (raw.settlement === null || typeof raw.settlement !== 'object' || Array.isArray(raw.settlement))
       return undefined;
     if (
-      (raw.settlement.outcome !== 'completed' &&
-        raw.settlement.outcome !== 'blocked' &&
-        raw.settlement.outcome !== 'cancelled' &&
-        raw.settlement.outcome !== 'failed') ||
+      !isHarnessDelegatedSettlementOutcome(raw.settlement.outcome) ||
       typeof raw.settlement.settledAt !== 'number' ||
       !Number.isFinite(raw.settlement.settledAt)
     ) {
