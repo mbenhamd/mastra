@@ -3136,6 +3136,27 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
     return () => failed;
   }
 
+  /**
+   * Throw from the first `times` delivered-acks (a single update whose
+   * settlement no longer carries the notice), before they reach storage.
+   * Returns the count of ack writes seen, failed or not.
+   */
+  function failAckWrites(parent: Session, times: number): () => number {
+    const storage = parent._internalStorage;
+    const mutate = storage.mutatePlanTasksForSession.bind(storage);
+    let attempts = 0;
+    vi.spyOn(storage, 'mutatePlanTasksForSession').mockImplementation(async (input: any) => {
+      const [op] = input.ops;
+      const settlement = op?.patch?.metadata?.mastraHarnessDelegationAttemptV1?.settlement;
+      if (input.ops.length === 1 && op.kind === 'update' && settlement !== undefined && !('notice' in settlement)) {
+        attempts += 1;
+        if (attempts <= times) throw new Error('transient storage failure');
+      }
+      return mutate(input);
+    });
+    return () => attempts;
+  }
+
   it('a delivered-ack that fails once is retried under the live claim; the parent wakes once', async () => {
     const memory = new MockMemory();
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
@@ -3147,14 +3168,14 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
       // still holds, so its stream calls alone could miss a duplicate.
       const dispatches = vi.spyOn(parentAgent, 'sendSignal');
       const wakes = () => dispatches.mock.calls.filter(([signal]) => (signal as any)?.type === 'system-reminder');
-      // The first plan-task write after the wake is dispatched is its ack.
-      const failed = failWriteOnce(parent, () => reminderCalls(parentAgent).length === 1);
+      const ackAttempts = failAckWrites(parent, 1);
       releaseChild();
-      await poll(failed);
+      await poll(() => ackAttempts() >= 2);
       await deliveryFinished(parent, taskId);
       // Past the first reconcile retry (500 ms), which a dead claim would get.
       await sleep(1_500);
 
+      expect(ackAttempts()).toBe(2);
       expect(wakes()).toHaveLength(1);
       expect(reminderCalls(parentAgent)).toHaveLength(1);
       expect(outcomes.mock.calls.map(call => call[0])).toEqual(['wake']);
@@ -3184,6 +3205,150 @@ describe('settlement notice claim lease and fence matrix (PF-7679)', () => {
       expect(outcomes.mock.calls.map(call => call[0])).toEqual(['wake']);
       expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
       expect(hasHistoryLoadWatches()).toBe(false);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('an ack failing past the backoff cap leaves the claim stored and dead; the reconcile takeover delivers again (a disclosed duplicate wake)', async () => {
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), 'wake', memory);
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      const logs = vi.spyOn(parent as any, '_logDelegationNotice');
+      const dispatches = vi.spyOn(parentAgent, 'sendSignal');
+      const wakes = () => dispatches.mock.calls.filter(([signal]) => (signal as any)?.type === 'system-reminder');
+      // No real wait: each backoff returns at once while under the cap
+      // (500 ms * 2^attempt stays within 30 s for attempts 0 to 5).
+      vi.spyOn(parent as any, '_delegationNoticeBackoff').mockImplementation(
+        (async (attempt: number, live: () => boolean) => attempt < 6 && live()) as never,
+      );
+      // Every ack of the first delivery fails: 1 attempt and 6 retries.
+      const ackAttempts = failAckWrites(parent, 7);
+      releaseChild();
+      await poll(() => outcomes.mock.calls.length >= 1);
+      const stored = owedNotice(await planRow(parent, taskId)) as { claim?: { ownerId: string } } | undefined;
+
+      expect(outcomes.mock.calls[0]?.[0]).toBe('left_owed');
+      expect(ackAttempts()).toBe(7);
+      expect(stored?.claim?.ownerId).toBe(harness.ownerId);
+      // The claim id left the live set: the stored claim may be taken over.
+      expect((parent as any)._delegationNoticeClaimable(stored)).toBe(true);
+      expect(logs).toHaveBeenCalledWith(
+        'error',
+        'settlement notice acknowledgement given up; claim left dead, so it may be taken over and wake twice',
+        expect.anything(),
+        expect.objectContaining({ message: 'transient storage failure' }),
+      );
+
+      // The reconcile retry (500 ms) takes the dead claim over and wakes
+      // again: the duplicate the give-up discloses. `MockAgent` folds that
+      // second wake into the run it still holds, so it ends `lost` (counted
+      // as delivered); the dispatch count shows the duplicate.
+      await poll(() => outcomes.mock.calls.length >= 2, 3_000);
+      await deliveryFinished(parent, taskId);
+
+      expect(outcomes.mock.calls.map(call => call[0])).toEqual(['left_owed', 'lost']);
+      expect(wakes()).toHaveLength(2);
+      expect(ackAttempts()).toBe(8);
+      expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      expect(hasHistoryLoadWatches()).toBe(false);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it.each([
+    ['a live claim of this owner', 'own-live'],
+    ['a foreign claim whose owner holds the lease', 'foreign-lease'],
+  ] as const)('a failed claim write over %s ends superseded and never claims again', async (_label, cell) => {
+    const db = new InMemoryDB();
+    const memory = new MockMemory();
+    const { harness, parentAgent, childAgent } = buildHarness(db, 'wake', memory);
+    const restoreRecords: Array<() => void> = [];
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, childId, releaseChild } = await delegateFromParentTurn(parent, parentAgent, childAgent);
+      const outcomes = vi.spyOn(parent as any, '_settleDelegationNoticeOutcome');
+      const other =
+        cell === 'own-live'
+          ? { claimId: 'claim-live', ownerId: harness.ownerId, claimedAt: 1_000 }
+          : { claimId: 'claim-foreign', ownerId: 'other-owner', claimedAt: 1_000 };
+      if (cell === 'own-live') {
+        // Another delivery of this Harness holds `claim-live`.
+        const claimable = (parent as any)._delegationNoticeClaimable.bind(parent);
+        vi.spyOn(parent as any, '_delegationNoticeClaimable').mockImplementation(((n: any) =>
+          n.claim?.claimId === 'claim-live' ? false : claimable(n)) as never);
+      }
+      const port = (parent as any)._planTaskPort();
+      const storage = parent._internalStorage;
+      const mutate = storage.mutatePlanTasksForSession.bind(storage);
+      let claimWrites = 0;
+      vi.spyOn(storage, 'mutatePlanTasksForSession').mockImplementation(async (input: any) => {
+        if (!JSON.stringify(input.ops).includes('"claim":{')) return mutate(input);
+        claimWrites += 1;
+        if (claimWrites > 1) return mutate(input);
+        // The delivery's claim write never lands: the other claim lands first.
+        const notice = readPendingDelegationSettlementNotice((await planRow(parent, taskId))!)!;
+        const key = { taskId, subagentSessionId: childId, digest: notice.digest };
+        expect(
+          await planTaskClaimDelegationSettlementNotice(port, { ...key, claim: other, takeover: () => true }),
+        ).toBe('claimed');
+        if (cell === 'foreign-lease') {
+          // Its owner holds the lease in storage; this session has not seen it.
+          for (const [recordKey, record] of db.harnessSessions) {
+            if (record.ownerId !== (parent as any)._internalOwnerId) continue;
+            db.harnessSessions.set(recordKey, {
+              ...record,
+              ownerId: 'other-owner',
+              leaseExpiresAt: Date.now() + 60_000,
+            });
+            restoreRecords.push(() => db.harnessSessions.set(recordKey, record));
+          }
+        }
+        throw new Error('transient storage failure');
+      });
+      releaseChild();
+      await poll(() => outcomes.mock.calls.length >= 1);
+      // The other claim stays owed: no delivery runs, past the first backoff
+      // (500 ms) when a re-claim would land.
+      await poll(() => (parent as any)._delegationNoticesInFlight.size === 0);
+      await sleep(1_000);
+
+      expect(outcomes.mock.calls.map(call => call[0])).toEqual(['superseded']);
+      // The failed claim write and the other claim's write; no third.
+      expect(claimWrites).toBe(2);
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      expect((owedNotice(await planRow(parent, taskId)) as { claim?: unknown }).claim).toEqual(other);
+    } finally {
+      for (const restore of restoreRecords) restore();
+      await harness.shutdown();
+    }
+  });
+
+  it('a reconcile pass disposes only row watches kept before its listing began', async () => {
+    const { harness } = buildHarness(new InMemoryDB(), 'wake', new MockMemory());
+    try {
+      const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const watches: Map<string, { dispose: () => void }> = (parent as any)._delegationNoticeWatches;
+      const before = { dispose: vi.fn() };
+      const during = { dispose: vi.fn() };
+      watches.set('child-before:digest', before);
+      const storage = parent._internalStorage;
+      const list = storage.listPlanTasks.bind(storage);
+      vi.spyOn(storage, 'listPlanTasks').mockImplementation(async (input: any) => {
+        // A delivery that ends `left_owed` while the listing runs keeps its watch.
+        watches.set('child-during:digest', during);
+        return list(input);
+      });
+      await (parent as any)._reconcileDelegationsOnHydrate(0);
+
+      expect(before.dispose).toHaveBeenCalledTimes(1);
+      expect(during.dispose).not.toHaveBeenCalled();
+      expect([...watches.keys()]).toEqual(['child-during:digest']);
+      watches.delete('child-during:digest');
     } finally {
       await harness.shutdown();
     }

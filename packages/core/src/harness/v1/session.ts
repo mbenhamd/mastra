@@ -25253,15 +25253,7 @@ export class Session {
     // The claim this delivery holds (its write may have landed), until resolved.
     let claimId: string | undefined;
     let watch = this._delegationNoticeWatches.get(key);
-    // Wait the reconcile backoff for `attempt` (0-based), unless the session
-    // stops being live. False once the backoff passes its cap, or not live.
-    const backoff = async (attempt: number): Promise<boolean> => {
-      const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
-      if (backoffMs > DELEGATION_RECONCILE_RETRY_MAX_MS) return false;
-      const until = Date.now() + backoffMs;
-      while (live() && Date.now() < until) await this._nextStateTransition(until - Date.now());
-      return live();
-    };
+    const backoff = (attempt: number): Promise<boolean> => this._delegationNoticeBackoff(attempt, live);
     // Unserialized body: the caller runs it inside `_withNoticeFence`. A held
     // claim removes only itself; an unclaimed delivery removes a notice with no
     // claim or a claim reconcile may take over.
@@ -25314,8 +25306,15 @@ export class Session {
           });
           if (cleared) return 'cleared';
           // Not ours: a claim write that never landed leaves the notice owed
-          // and claimable; only another live claim or a moved digest supersedes.
-          return (await this._delegationNoticeIsOwed(notice)) ? 'cleared' : 'superseded';
+          // with no claim, or a dead claim of this owner. A moved digest, a
+          // claim live here, or a foreign claim (its owner may hold the lease
+          // in storage) supersedes: this delivery never claims over it again.
+          const current = await this._loadDelegationNotice(notice);
+          const reclaimable =
+            current !== undefined &&
+            (current.claim === undefined ||
+              (current.claim.ownerId === this._harness.ownerId && this._delegationNoticeClaimable(current)));
+          return reclaimable ? 'cleared' : 'superseded';
         });
       } catch (error) {
         this._logDelegationNotice('warn', 'settlement notice claim could not be cleared', notice, error);
@@ -25617,8 +25616,10 @@ export class Session {
     return notice.claim === undefined || noticeClaimTakeoverEligible(this._harness, notice.claim);
   }
 
-  /** Exact re-read: the notice with this digest is still owed on its task, and claimable. */
-  private async _delegationNoticeIsOwed(notice: PendingDelegationSettlementNotice): Promise<boolean> {
+  /** Exact re-read: the stored notice, while the one with this digest is still owed on its task. */
+  private async _loadDelegationNotice(
+    notice: PendingDelegationSettlementNotice,
+  ): Promise<PendingDelegationSettlementNotice | undefined> {
     const snapshot = await this._storage.loadPlanTaskSubtree({
       harnessName: this._record.harnessName,
       sessionId: this.id,
@@ -25627,11 +25628,28 @@ export class Session {
     });
     const task = snapshot.tasks.find(row => row.taskId === notice.taskId);
     const current = task === undefined ? undefined : readPendingDelegationSettlementNotice(task);
-    return (
-      current?.subagentSessionId === notice.subagentSessionId &&
-      current.digest === notice.digest &&
-      this._delegationNoticeClaimable(current)
-    );
+    return current?.subagentSessionId === notice.subagentSessionId && current.digest === notice.digest
+      ? current
+      : undefined;
+  }
+
+  /** Exact re-read: the notice with this digest is still owed on its task, and claimable. */
+  private async _delegationNoticeIsOwed(notice: PendingDelegationSettlementNotice): Promise<boolean> {
+    const current = await this._loadDelegationNotice(notice);
+    return current !== undefined && this._delegationNoticeClaimable(current);
+  }
+
+  /**
+   * PF-7750: wait the reconcile backoff for `attempt` (0-based) of a notice
+   * write retry, unless the session stops being live. False once the backoff
+   * passes its cap, or not live.
+   */
+  private async _delegationNoticeBackoff(attempt: number, live: () => boolean): Promise<boolean> {
+    const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
+    if (backoffMs > DELEGATION_RECONCILE_RETRY_MAX_MS) return false;
+    const until = Date.now() + backoffMs;
+    while (live() && Date.now() < until) await this._nextStateTransition(until - Date.now());
+    return live();
   }
 
   /**
@@ -25962,6 +25980,9 @@ export class Session {
     const delegated: HarnessPlanTask[] = [];
     const owedNotices: PendingDelegationSettlementNotice[] = [];
     const owedKeys = new Set<string>();
+    // PF-7750: only watches kept before the listing began may be disposed; one
+    // kept while it ran belongs to a notice the listing may have missed.
+    const keptBeforeListing = new Set(this._delegationNoticeWatches.keys());
     try {
       for (;;) {
         const page = await this._storage.listPlanTasks({
@@ -25993,7 +26014,7 @@ export class Session {
 
     // PF-7679: a row watch kept for a retry ends once its notice is no longer
     // owed (another owner or path resolved it), so no watch outlives it.
-    this._disposeKeptDelegationNoticeWatches(key => !owedKeys.has(key));
+    this._disposeKeptDelegationNoticeWatches(key => keptBeforeListing.has(key) && !owedKeys.has(key));
     for (const owedNotice of owedNotices) {
       this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
     }
@@ -26258,14 +26279,6 @@ export class Session {
     return current?.delegatedSubagentSessionId === childId && !TERMINAL_PLAN_TASK_STATUSES.has(current.status);
   }
 
-  /**
-   * @internal — persistent retry for reconcile-on-rehydrate. A transient/CAS/
-   * locked failure re-arms the scan with capped exponential backoff for as long
-   * as the parent remains live. This intentionally has no small attempt ceiling:
-   * another process may legitimately hold a child lease longer than one retry
-   * window. At most one timer is armed, preventing retry fan-out. A fresh
-   * capacity release (`attempt === 0`) replaces a slower pending timer.
-   */
   /** PF-7679: dispose the kept row watches whose key `drop` selects, unless a delivery of it runs. */
   private _disposeKeptDelegationNoticeWatches(drop: (key: string) => boolean): void {
     for (const [key, watch] of this._delegationNoticeWatches) {
@@ -26275,6 +26288,14 @@ export class Session {
     }
   }
 
+  /**
+   * @internal — persistent retry for reconcile-on-rehydrate. A transient/CAS/
+   * locked failure re-arms the scan with capped exponential backoff for as long
+   * as the parent remains live. This intentionally has no small attempt ceiling:
+   * another process may legitimately hold a child lease longer than one retry
+   * window. At most one timer is armed, preventing retry fan-out. A fresh
+   * capacity release (`attempt === 0`) replaces a slower pending timer.
+   */
   private _scheduleDelegationReconcileRetry(attempt: number): void {
     if (this._state !== 'live') return;
     if (this._delegationReconcileRetryTimers.size > 0) {
