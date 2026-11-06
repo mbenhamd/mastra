@@ -2310,13 +2310,22 @@ export class ProcessorRunner {
 
     // PF-7679: report the history this run's context carries after every input
     // processor ran (trimming included), for an internal watch on its thread.
+    // A failure here never fails the run: the load is then not recorded, so a
+    // settlement wake may follow it (a duplicate), and it is logged as an error.
     if (hasHistoryLoadWatches()) {
-      const memoryContext = parseMemoryRequestContext(requestContext);
-      const memoryInfo = memoryContext?.thread?.id ? undefined : messageList.serialize().memoryInfo;
-      const threadId = memoryContext?.thread?.id ?? memoryInfo?.threadId;
-      if (threadId) {
-        const ids = messageList.get.remembered.db().map(message => message.id);
-        noteHistoryLoaded(threadId, memoryContext?.resourceId ?? memoryInfo?.resourceId, ids);
+      try {
+        const memoryContext = parseMemoryRequestContext(requestContext);
+        const memoryInfo = memoryContext?.thread?.id ? undefined : messageList.serialize().memoryInfo;
+        const threadId = memoryContext?.thread?.id ?? memoryInfo?.threadId;
+        if (threadId) {
+          const ids = messageList.get.remembered.db().map(message => message.id);
+          noteHistoryLoaded(threadId, memoryContext?.resourceId ?? memoryInfo?.resourceId, ids);
+        }
+      } catch (error) {
+        this.logger.error('History load not recorded for a settlement notice watch; a duplicate wake may follow', {
+          agent: this.agentName,
+          error,
+        });
       }
     }
 
