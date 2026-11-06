@@ -953,6 +953,7 @@ export class CoreToolBuilder extends MastraBase {
               ...(execOptions.mcp ? { mcp: execOptions.mcp } : {}),
               agent: {
                 agentId: options.agentId || '',
+                runId: restBaseContext.runId,
                 toolCallId: execOptions.toolCallId || '',
                 messages: execOptions.messages || [],
                 getMessages: execOptions.getMessages,

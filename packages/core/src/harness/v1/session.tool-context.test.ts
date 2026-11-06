@@ -271,6 +271,7 @@ describe('HarnessRequestContext — §15 pending registration acceptance', () =>
     await session.message({ content: 'capture context' });
     const slot = getHarnessSlot(agent.streamCalls);
 
+    (session as any)._currentRunId = 'run-question-1';
     await (slot.registerQuestion as any)({
       questionId: 'question-1',
       question: 'Pick one',
@@ -315,6 +316,7 @@ describe('HarnessRequestContext — §15 pending registration acceptance', () =>
     await session.message({ content: 'capture plan context', mode: 'plan' });
     const slot = getHarnessSlot(agent.streamCalls);
 
+    (session as any)._currentRunId = 'run-plan-1';
     await (slot.registerPlanApproval as any)({
       planId: 'plan-1',
       title: 'Plan title',

@@ -52,7 +52,7 @@ import { InMemoryStore } from '../../storage';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
 import { createTool } from '../../tools';
-import { askUser } from '../../tools/builtin';
+import { askUser, submitPlan } from '../../tools/builtin';
 
 import type { HarnessEvent } from './events';
 import { Harness } from './harness';
@@ -1040,6 +1040,574 @@ describe('Harness v1 real-agent E2E — replacement mode tool boundary', () => {
       await rehydratedHarness?.shutdown();
       await harness.shutdown();
     }
+  });
+});
+
+// ===========================================================================
+// PF-7749 — built-in interaction tools pre-register with the run's id
+// ===========================================================================
+
+describe('Harness v1 real-agent E2E — built-in tools read ctx.agent.runId', () => {
+  // A pre-registered pending keeps the tool-supplied item id (the tool call
+  // id); a pending captured only from the suspended output is keyed
+  // `<kind>:<toolCallId>`. The item id therefore shows whether the tool
+  // reached the Harness registration with the agent run id.
+  async function sessionWith(toolName: 'ask_user' | 'submit_plan', toolCallId: string, inputJson: string) {
+    let callCount = 0;
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: ++callCount === 1 ? toolCallStream(toolCallId, toolName, inputJson) : textStream(['resumed']),
+      }),
+    });
+    const agent = new Agent({ id: 'default', name: 'default', instructions: `call ${toolName}`, model });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        {
+          id: 'default',
+          agentId: 'default',
+          tools: toolName === 'ask_user' ? { ask_user: askUser } : { submit_plan: submitPlan },
+          harnessBuiltins: 'exclude',
+        },
+      ],
+      defaultModeId: 'default',
+    });
+    const session = await harness.session({ resourceId: `${toolName}-run-id-user`, threadId: { fresh: true } });
+    const events: HarnessEvent[] = [];
+    session.subscribe(event => events.push(event));
+    return { harness, session, events };
+  }
+
+  async function suspendOn(toolName: 'ask_user' | 'submit_plan', toolCallId: string, inputJson: string) {
+    const { harness, session, events } = await sessionWith(toolName, toolCallId, inputJson);
+    const suspended = (await session.message({ content: `use ${toolName}` })) as any;
+    const agentStart = events.find(event => event.type === 'agent_start') as { runId: string } | undefined;
+    return { harness, session, events, suspended, runId: agentStart?.runId };
+  }
+
+  // A signal-origin run that parks on a pre-registered interaction settles its
+  // signal only when the parked pending still names the originating signal.
+  async function expectSignalSettlesAfterResponse(
+    toolName: 'ask_user' | 'submit_plan',
+    toolCallId: string,
+    inputJson: string,
+    respond: (session: Awaited<ReturnType<typeof sessionWith>>['session']) => Promise<unknown>,
+  ) {
+    const { harness, session, events } = await sessionWith(toolName, toolCallId, inputJson);
+    try {
+      const handle = await session.signal({ content: `use ${toolName}` });
+      const suspended = (await handle.result) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume).toMatchObject({ itemId: toolCallId, originSignalId: handle.id });
+
+      await respond(session);
+
+      await waitFor(() => events.some(event => event.type === 'signal_completed'), 'signal_completed');
+      expect(events.filter(event => event.type === 'signal_completed')).toEqual([
+        expect.objectContaining({ signalId: handle.id, runId: suspended.runId }),
+      ]);
+      const lookup = await session.lookupMessageResult(handle.id);
+      expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+    } finally {
+      await harness.shutdown();
+    }
+  }
+
+  it('a signal-origin ask_user settles its signal after the answer', async () => {
+    await expectSignalSettlesAfterResponse(
+      'ask_user',
+      'signal-question-call',
+      JSON.stringify({ question: 'Continue?' }),
+      session => session.respondToQuestion({ answer: 'yes' }),
+    );
+  });
+
+  it('a signal-origin submit_plan settles its signal after the approval', async () => {
+    await expectSignalSettlesAfterResponse(
+      'submit_plan',
+      'signal-plan-call',
+      JSON.stringify({ plan: '1. Do the thing.' }),
+      session => session.respondToPlanApproval({ approved: true }),
+    );
+  });
+
+  it('ask_user registers its question with the active run id', async () => {
+    const { harness, session, events, suspended, runId } = await suspendOn(
+      'ask_user',
+      'question-run-id-call',
+      JSON.stringify({ question: 'Continue?' }),
+    );
+    try {
+      expect(suspended.finishReason).toBe('suspended');
+      expect(runId).toBe(suspended.runId);
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'question',
+        itemId: 'question-run-id-call',
+        runId,
+        toolCallId: 'question-run-id-call',
+      });
+      expect(events.filter(event => event.type === 'question_pending')).toEqual([
+        expect.objectContaining({ itemId: 'question-run-id-call', runId }),
+      ]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('submit_plan registers its plan approval with the active run id', async () => {
+    const { harness, session, events, suspended, runId } = await suspendOn(
+      'submit_plan',
+      'plan-run-id-call',
+      JSON.stringify({ title: 'Plan', plan: '1. Do the thing.' }),
+    );
+    try {
+      expect(suspended.finishReason).toBe('suspended');
+      expect(runId).toBe(suspended.runId);
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'plan-approval',
+        itemId: 'plan-run-id-call',
+        runId,
+        toolCallId: 'plan-run-id-call',
+      });
+      expect(events.filter(event => event.type === 'plan_approval_required')).toEqual([
+        expect.objectContaining({ itemId: 'plan-run-id-call', runId }),
+      ]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
+
+describe('Harness v1 real-agent E2E — interaction pre-registration stays with the run that owns it', () => {
+  const question = { question: 'Continue?' };
+  const plan = { plan: '1. Do the thing.' };
+
+  /** One provider step that calls every listed tool, in order. */
+  function toolCallsStream(...toolCalls: Array<[toolCallId: string, toolName: string, input: unknown]>) {
+    return convertArrayToReadableStream([
+      { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', id: 'id-tools', modelId: 'mock-model-id', timestamp: new Date(0) },
+      ...toolCalls.map(([toolCallId, toolName, input]) => ({
+        type: 'tool-call',
+        toolCallId,
+        toolName,
+        input: JSON.stringify(input),
+        providerExecuted: false,
+      })),
+      { type: 'finish', finishReason: 'tool-calls', usage: testUsage },
+    ]);
+  }
+
+  /** A mock model that plays `steps` in order, one per provider call. */
+  function scriptedModel(steps: Array<() => ReadableStream<any>>) {
+    let call = 0;
+    return new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: (steps[call++] ?? (() => textStream(['unexpected step'])))(),
+      }),
+    });
+  }
+
+  async function harnessSession(
+    steps: Array<() => ReadableStream<any>>,
+    tools: Record<string, any> = { ask_user: askUser, submit_plan: submitPlan },
+  ) {
+    const agent = new Agent({ id: 'default', name: 'default', instructions: 'ask', model: scriptedModel(steps) });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default', tools, harnessBuiltins: 'exclude' }],
+      defaultModeId: 'default',
+    });
+    const session = await harness.session({ resourceId: 'pre-registration-user', threadId: { fresh: true } });
+    const events: HarnessEvent[] = [];
+    session.subscribe(event => events.push(event));
+    return { harness, session, events };
+  }
+
+  const pendingCall = (session: { getRecord(): { pendingResume?: { kind: string; toolCallId: string } } }) => {
+    const pending = session.getRecord().pendingResume;
+    return pending && { kind: pending.kind, toolCallId: pending.toolCallId };
+  };
+  const failedToolEnds = (events: HarnessEvent[]) =>
+    events.filter(event => event.type === 'tool_end' && (event as { isError?: boolean }).isError);
+
+  it('a resumed run that asks again parks the second question', async () => {
+    const { harness, session, events } = await harnessSession([
+      () => toolCallsStream(['q1', 'ask_user', question]),
+      () => toolCallsStream(['q2', 'ask_user', question]),
+      () => textStream(['done']),
+    ]);
+    try {
+      expect(((await session.message({ content: 'ask twice' })) as any).finishReason).toBe('suspended');
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).finishReason).toBe('suspended');
+      expect(pendingCall(session)).toEqual({ kind: 'question', toolCallId: 'q2' });
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).text).toBe('done');
+      expect(failedToolEnds(events)).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('a resumed run that submits a plan parks the plan approval', async () => {
+    const { harness, session, events } = await harnessSession([
+      () => toolCallsStream(['q1', 'ask_user', question]),
+      () => toolCallsStream(['p2', 'submit_plan', plan]),
+      () => textStream(['done']),
+    ]);
+    try {
+      expect(((await session.message({ content: 'ask, then plan' })) as any).finishReason).toBe('suspended');
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).finishReason).toBe('suspended');
+      expect(pendingCall(session)).toEqual({ kind: 'plan-approval', toolCallId: 'p2' });
+      expect(((await session.respondToPlanApproval({ approved: true })) as any).text).toBe('done');
+      expect(failedToolEnds(events)).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('a run resumed from a tool approval parks the question it asks next', async () => {
+    const approveMe = createTool({
+      id: 'approveMe',
+      description: 'needs approval',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: async () => ({ ok: true }),
+    });
+    const { harness, session, events } = await harnessSession(
+      [
+        () => toolCallsStream(['a1', 'approveMe', {}]),
+        () => toolCallsStream(['q2', 'ask_user', question]),
+        () => textStream(['done']),
+      ],
+      { ask_user: askUser, approveMe },
+    );
+    try {
+      expect(((await session.message({ content: 'approve, then ask' })) as any).finishReason).toBe('suspended');
+      expect(((await session.respondToToolApproval({ approved: true })) as any).finishReason).toBe('suspended');
+      expect(pendingCall(session)).toEqual({ kind: 'question', toolCallId: 'q2' });
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).text).toBe('done');
+      expect(failedToolEnds(events)).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('two questions asked in one step are parked one after the other', async () => {
+    const { harness, session, events } = await harnessSession([
+      () => toolCallsStream(['q1', 'ask_user', question], ['q2', 'ask_user', { question: 'And then?' }]),
+      () => textStream(['done']),
+    ]);
+    try {
+      expect(((await session.message({ content: 'ask both' })) as any).finishReason).toBe('suspended');
+      expect(pendingCall(session)).toEqual({ kind: 'question', toolCallId: 'q1' });
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).finishReason).toBe('suspended');
+      expect(pendingCall(session)).toEqual({ kind: 'question', toolCallId: 'q2' });
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).text).toBe('done');
+      expect(failedToolEnds(events)).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('a question and a plan in one step are parked one after the other', async () => {
+    const { harness, session, events } = await harnessSession([
+      () => toolCallsStream(['q1', 'ask_user', question], ['p2', 'submit_plan', plan]),
+      () => textStream(['done']),
+    ]);
+    try {
+      expect(((await session.message({ content: 'ask and plan' })) as any).finishReason).toBe('suspended');
+      expect(pendingCall(session)).toEqual({ kind: 'question', toolCallId: 'q1' });
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).finishReason).toBe('suspended');
+      expect(pendingCall(session)).toEqual({ kind: 'plan-approval', toolCallId: 'p2' });
+      expect(((await session.respondToPlanApproval({ approved: true })) as any).text).toBe('done');
+      expect(failedToolEnds(events)).toEqual([]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('a question from an agent-as-tool child is not registered on the parent session', async () => {
+    const child = new Agent({
+      id: 'child',
+      name: 'child',
+      description: 'asks the user',
+      instructions: 'ask',
+      model: scriptedModel([
+        () => toolCallsStream(['child-q', 'ask_user', question]),
+        () => textStream(['child done']),
+      ]),
+      tools: { ask_user: askUser },
+    });
+    const parent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'delegate',
+      model: scriptedModel([
+        () => toolCallsStream(['parent-call', 'agent-child', { prompt: 'ask the user' }]),
+        () => textStream(['parent done']),
+      ]),
+      agents: { child },
+    });
+    const harness = new Harness({
+      agents: { default: parent } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default', harnessBuiltins: 'exclude' }],
+      defaultModeId: 'default',
+    });
+    try {
+      const session = await harness.session({ resourceId: 'agent-tool-user', threadId: { fresh: true } });
+      const events: HarnessEvent[] = [];
+      session.subscribe(event => events.push(event));
+      const suspended = (await session.message({ content: 'delegate' })) as any;
+
+      expect(suspended.finishReason).toBe('suspended');
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'tool-suspension',
+        runId: suspended.runId,
+        toolCallId: 'parent-call',
+      });
+      expect(
+        events
+          .filter(event => event.type === 'question_pending' || event.type === 'tool_suspension_required')
+          .map(event => [event.type, (event as { toolCallId: string }).toolCallId]),
+      ).toEqual([['tool_suspension_required', 'parent-call']]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('keeps the queued origin and the plan-mode transition on a pre-registered pending', async () => {
+    const agent = new Agent({
+      id: 'default',
+      name: 'default',
+      instructions: 'plan',
+      model: scriptedModel([() => toolCallsStream(['p1', 'submit_plan', plan]), () => textStream(['built'])]),
+    });
+    const harness = new Harness({
+      agents: { default: agent } as any,
+      storage: new InMemoryStore(),
+      modes: [
+        {
+          id: 'plan',
+          agentId: 'default',
+          tools: { submit_plan: submitPlan },
+          harnessBuiltins: 'exclude',
+          transitionsTo: 'build',
+        },
+        { id: 'build', agentId: 'default', harnessBuiltins: 'exclude' },
+      ],
+      defaultModeId: 'plan',
+    });
+    try {
+      const session = await harness.session({ resourceId: 'queued-plan-user', threadId: { fresh: true } });
+      const queued = session.queue({ content: 'plan it' });
+      await waitFor(() => session.getRecord().pendingResume !== undefined, 'queued plan approval');
+
+      expect(session.getRecord().pendingResume).toMatchObject({
+        kind: 'plan-approval',
+        itemId: 'p1',
+        queuedItemId: expect.any(String),
+        transitionModeId: 'build',
+      });
+      await session.respondToPlanApproval({ approved: true });
+      expect(((await queued) as any).text).toBe('built');
+      expect(session.getCurrentModeId()).toBe('build');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it('a delegated child session registers its question on its own run', async () => {
+    const child = new Agent({
+      id: 'child-agent',
+      name: 'child-agent',
+      instructions: 'ask',
+      model: scriptedModel([
+        () => toolCallsStream(['child-q', 'ask_user', question]),
+        () => textStream(['child done']),
+      ]),
+    });
+    const harness = new Harness({
+      agents: { 'child-agent': child } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'child-agent', tools: { ask_user: askUser }, harnessBuiltins: 'exclude' }],
+      defaultModeId: 'default',
+      subagents: { types: { asker: { agentId: 'child-agent', description: 'asks the user' } } },
+    });
+    try {
+      const session = await harness.session({
+        resourceId: 'child-user',
+        threadId: { fresh: true },
+        subagentTypeId: 'asker',
+      });
+      const suspended = (await session.message({ content: 'ask' })) as any;
+      expect(session.getRecord().pendingResume).toMatchObject({ itemId: 'child-q', runId: suspended.runId });
+      expect(((await session.respondToQuestion({ answer: 'yes' })) as any).text).toBe('child done');
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  describe('when the owning process dies', () => {
+    /**
+     * Two Harness instances over one store. The first is abandoned without a
+     * shutdown, as a crash would leave it; its session lease is then expired so
+     * the second instance adopts the session.
+     */
+    function sharedStore() {
+      const storage = new InMemoryStore();
+      const db = new InMemoryDB();
+      const sessionStorage = new InMemoryHarness({ db });
+      const harnessWith = (askTool: any, steps: Array<() => ReadableStream<any>>) =>
+        new Harness({
+          agents: {
+            default: new Agent({
+              id: 'default',
+              name: 'default',
+              instructions: 'ask',
+              model: scriptedModel(steps),
+              tools: { ask_user: askTool },
+            }),
+          } as any,
+          storage,
+          modes: [{ id: 'default', agentId: 'default', harnessBuiltins: 'exclude' }],
+          defaultModeId: 'default',
+          sessions: { storage: sessionStorage },
+        });
+      const crash = () => {
+        for (const [key, row] of db.harnessSessions) {
+          db.harnessSessions.set(key, { ...row, leaseExpiresAt: Date.now() - 60_000 });
+        }
+      };
+      return { harnessWith, crash, db };
+    }
+
+    it('releases a question registered by a run that never suspended', async () => {
+      const { harnessWith, crash } = sharedStore();
+      // The real ask_user registers its question, then the process dies before
+      // the tool's suspension is reached.
+      const askThenDie = createTool({
+        id: 'ask_user',
+        description: 'ask the user',
+        inputSchema: z.object({ question: z.string() }),
+        execute: async (input, ctx: any) =>
+          askUser.execute!(input as any, { ...ctx, agent: { ...ctx.agent, suspend: () => new Promise(() => {}) } }),
+      });
+      const first = harnessWith(askThenDie, [() => toolCallsStream(['q1', 'ask_user', question])]);
+      const second = harnessWith(askUser, [() => textStream(['after restart'])]);
+      try {
+        const session = await first.session({ resourceId: 'crash-user', threadId: { fresh: true } });
+        void session.message({ content: 'ask' }).catch(() => undefined);
+        await waitFor(() => session.getRecord().pendingResume !== undefined, 'pre-registered question');
+        crash();
+
+        const adopted = await second.session({ resourceId: 'crash-user', threadId: session.threadId });
+        expect(adopted.getRecord().pendingResume).toBeUndefined();
+      } finally {
+        await second.shutdown();
+      }
+    });
+
+    it('releases a sandbox-access request registered by a run that never suspended', async () => {
+      const { harnessWith, crash } = sharedStore();
+      // A tool registers a sandbox-access request through the harness slot,
+      // then the process dies before the tool suspends.
+      const requestThenDie = createTool({
+        id: 'ask_user',
+        description: 'request sandbox access',
+        inputSchema: z.object({ question: z.string() }),
+        execute: async (_input, ctx: any) => {
+          await ctx.requestContext.get('harness').registerSandboxAccess({
+            requestId: 's1',
+            semanticType: 'command',
+            runId: ctx.agent.runId,
+            toolCallId: ctx.agent.toolCallId,
+          });
+          return new Promise(() => {});
+        },
+      });
+      const first = harnessWith(requestThenDie, [() => toolCallsStream(['s1', 'ask_user', question])]);
+      const second = harnessWith(askUser, [() => textStream(['after restart'])]);
+      try {
+        const session = await first.session({ resourceId: 'sandbox-crash-user', threadId: { fresh: true } });
+        void session.message({ content: 'run it' }).catch(() => undefined);
+        await waitFor(() => session.getRecord().pendingResume?.kind === 'sandbox-access', 'registered sandbox access');
+        crash();
+
+        const adopted = await second.session({ resourceId: 'sandbox-crash-user', threadId: session.threadId });
+        expect(adopted.getRecord().pendingResume).toBeUndefined();
+      } finally {
+        await second.shutdown();
+      }
+    });
+
+    it('leaves a question whose expiry was already claimed to the expiry settlement', async () => {
+      const { harnessWith, crash, db } = sharedStore();
+      const askThenDie = createTool({
+        id: 'ask_user',
+        description: 'ask the user',
+        inputSchema: z.object({ question: z.string() }),
+        execute: async (input, ctx: any) =>
+          askUser.execute!(input as any, { ...ctx, agent: { ...ctx.agent, suspend: () => new Promise(() => {}) } }),
+      });
+      const first = harnessWith(askThenDie, [() => toolCallsStream(['q1', 'ask_user', question])]);
+      const second = harnessWith(askUser, [() => textStream(['after restart'])]);
+      try {
+        const session = await first.session({ resourceId: 'claimed-expiry-user', threadId: { fresh: true } });
+        void session.message({ content: 'ask' }).catch(() => undefined);
+        await waitFor(() => session.getRecord().pendingResume !== undefined, 'pre-registered question');
+        // The first owner had claimed the question's expiry when it died.
+        const now = Date.now();
+        for (const [key, row] of db.harnessSessions) {
+          if (row.pendingResume === undefined) continue;
+          db.harnessSessions.set(key, {
+            ...row,
+            pendingResume: {
+              ...row.pendingResume,
+              requestedAt: now - 120_000,
+              expiresAt: now - 60_000,
+              expiryStartedAt: now - 30_000,
+            },
+          });
+        }
+        crash();
+
+        const adopted = await second.session({ resourceId: 'claimed-expiry-user', threadId: session.threadId });
+        await waitFor(() => adopted.getRecord().pendingResume === undefined, 'expiry settled');
+        expect(Object.values(adopted.getRecord().expiredPendingInteractions ?? {})).toEqual([
+          expect.objectContaining({
+            itemId: 'q1',
+            kind: 'question',
+            error: expect.objectContaining({ code: 'harness.pending_interaction_expired' }),
+          }),
+        ]);
+      } finally {
+        await second.shutdown();
+      }
+    });
+
+    it('keeps a question whose run is suspended and resumes it after adoption', async () => {
+      const { harnessWith, crash } = sharedStore();
+      const first = harnessWith(askUser, [() => toolCallsStream(['q1', 'ask_user', question])]);
+      const second = harnessWith(askUser, [() => textStream(['answered after restart'])]);
+      try {
+        const session = await first.session({ resourceId: 'suspended-user', threadId: { fresh: true } });
+        expect(((await session.message({ content: 'ask' })) as any).finishReason).toBe('suspended');
+        crash();
+
+        const adopted = await second.session({ resourceId: 'suspended-user', threadId: session.threadId });
+        expect(pendingCall(adopted)).toEqual({ kind: 'question', toolCallId: 'q1' });
+        expect(((await adopted.respondToQuestion({ answer: 'yes' })) as any).text).toBe('answered after restart');
+      } finally {
+        await second.shutdown();
+      }
+    });
   });
 });
 

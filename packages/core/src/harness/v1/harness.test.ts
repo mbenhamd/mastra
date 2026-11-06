@@ -3694,6 +3694,7 @@ describe('Harness v1 — lifecycle', () => {
     const close = s.close();
     await waitFor(() => s.getRecord().closingAt !== undefined, 'session closing marker');
 
+    (s as any)._currentRunId = 'run-1';
     await expect(
       (s as any)._registerQuestion({
         questionId: 'q1',
