@@ -4659,10 +4659,12 @@ export class Harness {
     });
     const adoptedHere = existing === undefined;
     try {
-      // Reconcile before publishing readiness. An overdue durable interaction
-      // is terminalized first, then orphaned message dispatches are
+      // Reconcile before publishing readiness. A pre-registered interaction
+      // whose run never suspended is released first; an overdue durable
+      // interaction is terminalized next, then orphaned message dispatches are
       // interrupted, then lost delegation hooks are repaired. Queue replay
       // cannot start until every recovery barrier has succeeded.
+      await session._releaseUnsuspendedPendingOnHydrate();
       await session._reconcilePendingInteractionExpiryOnHydrate();
       // Admitted message dispatches orphaned by a dead owner are interrupted
       // (never re-run) while this process holds the adopted lease. A dispatch

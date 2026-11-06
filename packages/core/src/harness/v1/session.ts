@@ -2044,6 +2044,40 @@ function owesRecoveredCompletion(
  */
 type WakeReminderRowOrigin = { agent: Agent; memory: MastraMemory; modeId: string; modeEpoch: number };
 
+/**
+ * [PF-7749] `agentic-loop` row statuses that mean the run is not parked on a
+ * suspension: it was still executing when its owner died (an executing run's
+ * row reads `pending` or `running`), or it finished.
+ */
+const UNSUSPENDED_AGENTIC_LOOP_STATUSES: ReadonlySet<string> = new Set([
+  'pending',
+  'running',
+  'success',
+  'failed',
+  'tripwire',
+  'canceled',
+  'bailed',
+  'skipped',
+]);
+
+/**
+ * [PF-7749] The pending-interaction slot as seen by a tool pre-registration:
+ * `free` (nothing parked), `held` (this same call is already parked, so the
+ * registration is a no-op), or `occupied` (another interaction holds it — a
+ * second suspending call in the same step, or the answered interaction a
+ * resumed run is still parked on). An occupied slot is left to the suspend
+ * capture, which parks the call exactly as an unregistered one.
+ */
+function preRegistrationSlot(
+  current: PendingResume | undefined,
+  kind: PendingResume['kind'],
+  runId: string,
+  toolCallId: string,
+): 'free' | 'held' | 'occupied' {
+  if (current === undefined) return 'free';
+  return current.kind === kind && current.runId === runId && current.toolCallId === toolCallId ? 'held' : 'occupied';
+}
+
 export class Session {
   /** Stable identity. Frozen at construction. */
   readonly id: string;
@@ -4298,6 +4332,38 @@ export class Session {
         : Math.max(0, dueAt - Date.now()),
     );
     this._pendingInteractionExpiryTimer.unref?.();
+  }
+
+  /**
+   * @internal — [PF-7749] hydration releases a pre-registered interaction
+   * whose run never reached its suspension. `ask_user` / `submit_plan`
+   * register their pending before they suspend; when the owner dies in
+   * between, the run's `agentic-loop` row is left running (or finished) and
+   * the interaction can never be resumed. Without pre-registration nothing is
+   * parked in that window, so the pending is removed. Hydration runs under
+   * the adopted lease, so no live owner can still move that row. A pending is
+   * kept when its run row is suspended, paused or waiting, or missing (for
+   * example a durable agent's own workflow), when a resume already claimed
+   * it, and when its run is live in this process.
+   */
+  async _releaseUnsuspendedPendingOnHydrate(): Promise<void> {
+    const pending = this._record.pendingResume;
+    if (pending === undefined || pending.resumedAt !== undefined) return;
+    if (pending.kind !== 'question' && pending.kind !== 'plan-approval') return;
+    if (this._currentTurnAbortController !== undefined) return;
+    const workflows = await this._harness.mastra.getStorage()?.getStore('workflows');
+    if (typeof workflows?.getWorkflowRunById !== 'function') return;
+    const run = await workflows.getWorkflowRunById({ workflowName: 'agentic-loop', runId: pending.runId });
+    const status = run !== null && typeof run.snapshot === 'object' ? run.snapshot.status : undefined;
+    if (status === undefined || !UNSUSPENDED_AGENTIC_LOOP_STATUSES.has(status)) return;
+    const releasedKey = pendingInteractionGenerationKey(pending);
+    await this._flushUpdate(prev => {
+      if (prev.pendingResume === undefined || pendingInteractionGenerationKey(prev.pendingResume) !== releasedKey) {
+        return prev;
+      }
+      const { pendingResume: _released, ...rest } = prev;
+      return rest;
+    });
   }
 
   /** @internal — called after the Harness has installed its event bridge. */
@@ -22382,6 +22448,17 @@ export class Session {
     return parts as AgentSignalContents;
   }
 
+  /**
+   * [PF-7749] Whether a tool's interaction pre-registration belongs to this
+   * session's active run. A nested agent-as-tool run inherits this session's
+   * Harness slot but is not this session's run; its interaction stays with
+   * the suspend capture of the run that owns it. A registration without a run
+   * id targets the active run.
+   */
+  private _ownsPreRegistrationRun(runId: string | undefined): boolean {
+    return runId === undefined || runId === this._currentRunId;
+  }
+
   private async _registerQuestion(
     params: RegisterQuestionParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
@@ -22404,6 +22481,7 @@ export class Session {
     if (!runId) {
       throw new HarnessValidationError('ctx.registerQuestion.runId', 'active run id is required');
     }
+    if (!this._ownsPreRegistrationRun(params.runId)) return;
     const pending: PendingResume = {
       kind: 'question',
       itemId: params.questionId,
@@ -22439,17 +22517,14 @@ export class Session {
       },
     };
     let registered = false;
+    let occupied = false;
     await this._flushUpdate(prev => {
-      const current = prev.pendingResume;
-      if (current) {
-        if (current.kind === 'question' && current.runId === runId && current.toolCallId === toolCallId) {
-          return prev;
-        }
-        throw new HarnessValidationError('ctx.registerQuestion', `pending resume is already "${current.kind}"`);
-      }
-      registered = true;
-      return { ...prev, pendingResume: pending };
+      const slot = preRegistrationSlot(prev.pendingResume, 'question', runId, toolCallId);
+      registered = slot === 'free';
+      occupied = slot === 'occupied';
+      return registered ? { ...prev, pendingResume: pending } : prev;
     });
+    if (occupied) return;
     if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
     if (!registered) return;
     if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);
@@ -22559,6 +22634,7 @@ export class Session {
     if (!runId) {
       throw new HarnessValidationError('ctx.registerPlanApproval.runId', 'active run id is required');
     }
+    if (!this._ownsPreRegistrationRun(params.runId)) return;
     const submittingModeId = params.modeId ?? this._record.modeId;
     const submittingMode = this._harness._getMode(submittingModeId);
     const pending: PendingResume = {
@@ -22594,17 +22670,14 @@ export class Session {
       ...(submittingMode.transitionsTo ? { transitionModeId: submittingMode.transitionsTo } : {}),
     };
     let registered = false;
+    let occupied = false;
     await this._flushUpdate(prev => {
-      const current = prev.pendingResume;
-      if (current) {
-        if (current.kind === 'plan-approval' && current.runId === runId && current.toolCallId === toolCallId) {
-          return prev;
-        }
-        throw new HarnessValidationError('ctx.registerPlanApproval', `pending resume is already "${current.kind}"`);
-      }
-      registered = true;
-      return { ...prev, pendingResume: pending };
+      const slot = preRegistrationSlot(prev.pendingResume, 'plan-approval', runId, toolCallId);
+      registered = slot === 'free';
+      occupied = slot === 'occupied';
+      return registered ? { ...prev, pendingResume: pending } : prev;
     });
+    if (occupied) return;
     if (pending.toolSurfaceFence !== undefined) this._retainCurrentReplacementToolSurface(runId);
     if (!registered) return;
     if (this._record.pendingResume) this._emitPendingEvent(this._record.pendingResume);

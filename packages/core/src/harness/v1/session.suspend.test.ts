@@ -566,6 +566,7 @@ describe('Session — suspend capture on message()', () => {
     const { harness } = setup();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
 
+    (session as any)._currentRunId = 'run-registered';
     await (session as any)._registerQuestion({
       questionId: 'tc-registered',
       question: 'registered prompt',
@@ -604,6 +605,7 @@ describe('Session — suspend capture on message()', () => {
 
     // Arm the turn yolo as the queued-drain / resume paths do.
     (session as any)._currentTurnYolo = true;
+    (session as any)._currentRunId = 'run-yolo-q';
     await (session as any)._registerQuestion({
       questionId: 'tc-yolo-q',
       question: 'proceed?',
@@ -623,6 +625,7 @@ describe('Session — suspend capture on message()', () => {
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
 
     // _currentTurnYolo defaults false; do not arm it.
+    (session as any)._currentRunId = 'run-plain-q';
     await (session as any)._registerQuestion({
       questionId: 'tc-plain-q',
       question: 'proceed?',
@@ -641,6 +644,7 @@ describe('Session — suspend capture on message()', () => {
     const { harness } = setup();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
 
+    (session as any)._currentRunId = 'run-sandbox';
     await (session as any)._registerQuestion({
       questionId: 'sandbox-registered',
       question: 'Allow access?',
@@ -678,6 +682,7 @@ describe('Session — suspend capture on message()', () => {
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     await session.switchMode({ mode: 'planner' });
 
+    (session as any)._currentRunId = 'run-plan';
     await (session as any)._registerPlanApproval({
       planId: 'tc-plan',
       title: 'registered title',
