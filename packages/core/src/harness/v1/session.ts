@@ -4336,20 +4336,24 @@ export class Session {
 
   /**
    * @internal — [PF-7749] hydration releases a pre-registered interaction
-   * whose run never reached its suspension. `ask_user` / `submit_plan`
-   * register their pending before they suspend; when the owner dies in
-   * between, the run's `agentic-loop` row is left running (or finished) and
-   * the interaction can never be resumed. Without pre-registration nothing is
-   * parked in that window, so the pending is removed. Hydration runs under
-   * the adopted lease, so no live owner can still move that row. A pending is
-   * kept when its run row is suspended, paused or waiting, or missing (for
-   * example a durable agent's own workflow), when a resume already claimed
-   * it, and when its run is live in this process.
+   * whose run never reached its suspension. `ask_user` / `submit_plan` (and
+   * tools calling `registerQuestion` / `registerPlanApproval` /
+   * `registerSandboxAccess`) register their pending before they suspend; when
+   * the owner dies in between, the run's `agentic-loop` row is left running
+   * (or finished) and the interaction can never be resumed. Without
+   * pre-registration nothing is parked in that window, so the pending is
+   * removed. Hydration runs under the adopted lease, so no live owner can
+   * still move that row. A pending is kept when its run row is suspended,
+   * paused or waiting, or missing (for example a durable agent's own
+   * workflow), when a resume already claimed it, when an expiry or discard
+   * already claimed it (`expiryStartedAt`: the deadline reconcile that runs
+   * next finishes that settlement, including its queue and signal evidence),
+   * and when its run is live in this process.
    */
   async _releaseUnsuspendedPendingOnHydrate(): Promise<void> {
     const pending = this._record.pendingResume;
-    if (pending === undefined || pending.resumedAt !== undefined) return;
-    if (pending.kind !== 'question' && pending.kind !== 'plan-approval') return;
+    if (pending === undefined || pending.resumedAt !== undefined || pending.expiryStartedAt !== undefined) return;
+    if (pending.kind !== 'question' && pending.kind !== 'plan-approval' && pending.kind !== 'sandbox-access') return;
     if (this._currentTurnAbortController !== undefined) return;
     const workflows = await this._harness.mastra.getStorage()?.getStore('workflows');
     if (typeof workflows?.getWorkflowRunById !== 'function') return;

@@ -2,9 +2,10 @@
 '@mastra/core': patch
 ---
 
-The built-in `ask_user` and `submit_plan` tools now pre-register their question or plan approval with the harness only for the session's own active run, and only while no other question or approval is waiting. Otherwise the call is parked when the run suspends, as before. This means:
+`ask_user` and `submit_plan` in a Harness now register their question or plan approval when the tool runs, instead of only when the run pauses.
 
-- an agent-as-tool child never registers a question on its parent session;
-- a second question after a resume, or two questions in one step, are asked one after the other.
+- They register only for the session's own active run, and only while no other question or approval is waiting. Otherwise the request is recorded when the run pauses, as before.
+- A question from an agent used as a tool never appears on the parent session.
+- A second question after a resume, or two questions in one step, are asked one after the other.
 
-After a restart, a question or plan approval whose run never reached its suspension is released, so it no longer stays parked with no way to answer it.
+Fixed questions, plan approvals and sandbox-access requests that could not be answered after a restart. If the process stopped before the run paused for the answer, the Harness now drops the request when it reopens the session. A request that had already started expiring finishes expiring instead.

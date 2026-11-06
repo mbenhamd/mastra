@@ -2,6 +2,15 @@
 '@mastra/core': patch
 ---
 
-Tools run by an agent now receive the run id as `ctx.agent.runId`.
+Fixed `ctx.agent.runId` being empty in tools run by an agent. Tools now receive the run id there. Before, only the top-level `ctx.runId` had it.
 
-`AgentToolExecutionContext` already declared `runId`, but the agent tool builder left it unset, so the value was only available as the top-level `ctx.runId`. Inside a Harness, `ask_user` and `submit_plan` read `ctx.agent.runId` to register their pending question or plan approval before suspending, and `task_delegate` reads it to record the parent run of a delegated subagent. Those registrations now happen, with the same run id the Harness reports on `agent_start`.
+```ts
+const tool = createTool({
+  id: 'note-run',
+  description: 'Records which run called it',
+  inputSchema: z.object({}),
+  execute: async (_input, ctx) => ({ runId: ctx.agent?.runId }),
+});
+```
+
+Inside a Harness, `ask_user`, `submit_plan` and `task_delegate` now use the same run id that the Harness reports on `agent_start`.

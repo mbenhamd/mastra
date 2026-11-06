@@ -1485,7 +1485,7 @@ describe('Harness v1 real-agent E2E — interaction pre-registration stays with 
           db.harnessSessions.set(key, { ...row, leaseExpiresAt: Date.now() - 60_000 });
         }
       };
-      return { harnessWith, crash };
+      return { harnessWith, crash, db };
     }
 
     it('releases a question registered by a run that never suspended', async () => {
@@ -1509,6 +1509,84 @@ describe('Harness v1 real-agent E2E — interaction pre-registration stays with 
 
         const adopted = await second.session({ resourceId: 'crash-user', threadId: session.threadId });
         expect(adopted.getRecord().pendingResume).toBeUndefined();
+      } finally {
+        await second.shutdown();
+      }
+    });
+
+    it('releases a sandbox-access request registered by a run that never suspended', async () => {
+      const { harnessWith, crash } = sharedStore();
+      // A tool registers a sandbox-access request through the harness slot,
+      // then the process dies before the tool suspends.
+      const requestThenDie = createTool({
+        id: 'ask_user',
+        description: 'request sandbox access',
+        inputSchema: z.object({ question: z.string() }),
+        execute: async (_input, ctx: any) => {
+          await ctx.requestContext.get('harness').registerSandboxAccess({
+            requestId: 's1',
+            semanticType: 'command',
+            runId: ctx.agent.runId,
+            toolCallId: ctx.agent.toolCallId,
+          });
+          return new Promise(() => {});
+        },
+      });
+      const first = harnessWith(requestThenDie, [() => toolCallsStream(['s1', 'ask_user', question])]);
+      const second = harnessWith(askUser, [() => textStream(['after restart'])]);
+      try {
+        const session = await first.session({ resourceId: 'sandbox-crash-user', threadId: { fresh: true } });
+        void session.message({ content: 'run it' }).catch(() => undefined);
+        await waitFor(() => session.getRecord().pendingResume?.kind === 'sandbox-access', 'registered sandbox access');
+        crash();
+
+        const adopted = await second.session({ resourceId: 'sandbox-crash-user', threadId: session.threadId });
+        expect(adopted.getRecord().pendingResume).toBeUndefined();
+      } finally {
+        await second.shutdown();
+      }
+    });
+
+    it('leaves a question whose expiry was already claimed to the expiry settlement', async () => {
+      const { harnessWith, crash, db } = sharedStore();
+      const askThenDie = createTool({
+        id: 'ask_user',
+        description: 'ask the user',
+        inputSchema: z.object({ question: z.string() }),
+        execute: async (input, ctx: any) =>
+          askUser.execute!(input as any, { ...ctx, agent: { ...ctx.agent, suspend: () => new Promise(() => {}) } }),
+      });
+      const first = harnessWith(askThenDie, [() => toolCallsStream(['q1', 'ask_user', question])]);
+      const second = harnessWith(askUser, [() => textStream(['after restart'])]);
+      try {
+        const session = await first.session({ resourceId: 'claimed-expiry-user', threadId: { fresh: true } });
+        void session.message({ content: 'ask' }).catch(() => undefined);
+        await waitFor(() => session.getRecord().pendingResume !== undefined, 'pre-registered question');
+        // The first owner had claimed the question's expiry when it died.
+        const now = Date.now();
+        for (const [key, row] of db.harnessSessions) {
+          if (row.pendingResume === undefined) continue;
+          db.harnessSessions.set(key, {
+            ...row,
+            pendingResume: {
+              ...row.pendingResume,
+              requestedAt: now - 120_000,
+              expiresAt: now - 60_000,
+              expiryStartedAt: now - 30_000,
+            },
+          });
+        }
+        crash();
+
+        const adopted = await second.session({ resourceId: 'claimed-expiry-user', threadId: session.threadId });
+        await waitFor(() => adopted.getRecord().pendingResume === undefined, 'expiry settled');
+        expect(Object.values(adopted.getRecord().expiredPendingInteractions ?? {})).toEqual([
+          expect.objectContaining({
+            itemId: 'q1',
+            kind: 'question',
+            error: expect.objectContaining({ code: 'harness.pending_interaction_expired' }),
+          }),
+        ]);
       } finally {
         await second.shutdown();
       }
