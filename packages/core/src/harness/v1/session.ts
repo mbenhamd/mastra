@@ -94,6 +94,7 @@ import {
   HarnessTerminalFinalizationPendingError,
   assertJsonValue as assertBoundedTerminalJsonValue,
   harnessWakeExecutionGrant,
+  isHarnessDelegatedSettlementOutcome,
   isHarnessWakeReservedKey,
   validateHarnessTerminalExecutionGrant,
 } from '../../storage/domains/harness';
@@ -1580,7 +1581,7 @@ function readHarnessWakeTerminalSeed(seed: JsonValue): HarnessWakeTerminalSeed {
     typeof value.wakeNoticeId !== 'string' ||
     typeof value.taskId !== 'string' ||
     typeof value.subagentSessionId !== 'string' ||
-    (value.outcome !== 'completed' && value.outcome !== 'blocked' && value.outcome !== 'failed')
+    !isHarnessDelegatedSettlementOutcome(value.outcome)
   ) {
     throw new HarnessTerminalHandoffValidationError('seed', 'is not a settlement wake seed');
   }
