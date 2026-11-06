@@ -248,6 +248,39 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
     await harness.shutdown();
   });
 
+  it('a targeted delegation_timeout cancel settles cancelled and its wake commits outcome cancelled', async () => {
+    const db = new InMemoryDB();
+    const { harness, parentAgent, childAgent } = buildHarness(db);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const starts: Array<Record<string, unknown>> = [];
+    const off = parent.subscribe(event => {
+      if (event.type === 'agent_start') starts.push({ ...event });
+    });
+    const { taskId, childId } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
+
+    // A targeted cancel with the timeout reason settles `cancelled` and, unlike
+    // the parent's own Stop/cancel, still owes the parent a settlement notice.
+    await parent.cancelSubagent({ subagentSessionId: childId, reason: 'delegation_timeout' });
+    await poll(() => reminderCalls(parentAgent).length === 1);
+    await poll(() => intents(db, wakeFinalizer.id).length === 1);
+    await parent.waitForIdle({ timeoutMs: 3000 });
+    off();
+
+    const wakeStart = starts.find(start => start.origin === 'wake')!;
+    const [wake] = intents(db, wakeFinalizer.id);
+    expect(wake!.projection.payload).toEqual({
+      origin: 'wake',
+      wakeNoticeId: wakeStart.wakeNoticeId,
+      runId: wakeStart.runId,
+      taskId,
+      subagentSessionId: childId,
+      outcome: 'cancelled',
+      reply: { status: 'completed', text: 'woken reply' },
+    });
+    expect((await planRow(parent, taskId))?.status).toBe('cancelled');
+    await harness.shutdown();
+  });
+
   it('a crash between the wake run end and its intent write is settled once on restart without re-running', async () => {
     const db = new InMemoryDB();
     const a = buildHarness(db);
@@ -343,9 +376,11 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
 // The wake grant binds the wake to a reserved run. It is kept only in the one
 // proven case: the wake still holds the idle slot at dispatch, and the
 // dispatching agent's own fixed memory saved the row with no mode change since.
-// Every other case, including every caller run that took the slot, is fork
-// main's path: delivery and label as main, and no intent. A grant given up
-// after its admission is cancelled: no terminal result, no intent.
+// Every other case runs without a grant and stages no intent. PF-7679: a
+// caller run that takes the slot never receives the wake signal; it reads the
+// row from history, or the wake runs after it. A grant given up after its
+// admission is cancelled (no terminal result, no intent), and a later attempt
+// for the same notice runs without a grant.
 //
 // Dimensions under a registered wake finalizer: the delegating mode (`default`,
 // `parent-agent`) vs the active mode at settlement (same, a per-mode agent
@@ -359,8 +394,8 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
 //   mode's memory first, so the delegating side is never read: rows 7/8;
 // - a shared agent with no memory: no row, rows 3/4;
 // - a mode switch together with a caller run, or a caller in any other cell:
-//   a caller that takes the slot always gives the grant up (rows 2, 8, 10,
-//   14-16), and the switch alone already takes main's path (rows 11-13).
+//   a caller that takes the slot gives a held grant up (rows 16, 17), and the
+//   switch alone already runs without a grant (rows 11-13).
 describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   const NOTICE = 'settled with outcome';
@@ -380,8 +415,14 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
     switchDuring: 'none' | 'build' | 'admission';
     switchTo?: ModeId;
     grant: boolean;
-    /** The run main delivers to, and how the notice reaches it. */
-    delivery: 'wake-run' | 'caller-run-fold' | 'caller-run-signal' | 'dispatcher-run';
+    /**
+     * The run that delivers the notice. PF-7679: a caller run that takes the
+     * slot never receives the wake signal. `caller-loads-row`: the caller run
+     * dispatched after the save on the agent whose memory holds the row, so it
+     * read the notice from history and no wake is sent. `wake-after-caller`:
+     * the claimed wake re-owes the notice and runs after the caller run ends.
+     */
+    delivery: 'wake-run' | 'caller-loads-row' | 'wake-after-caller';
     label: 'wake' | 'none';
   };
 
@@ -481,29 +522,29 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
       { ...base, active: 'default', grant: true, delivery: 'wake-run', label: 'wake' },
     ],
     [
-      '2 same mode, memory, caller run: main, folded into the caller run',
-      { ...base, active: 'default', callerRun: true, grant: false, delivery: 'caller-run-fold', label: 'none' },
+      '2 same mode, memory, caller run: the caller run reads the row, no wake',
+      { ...base, active: 'default', callerRun: true, grant: false, delivery: 'caller-loads-row', label: 'none' },
     ],
     [
       '3 same mode, memory-less, no caller: main, labelled as main',
       { ...base, parentMemory: false, active: 'default', grant: false, delivery: 'wake-run', label: 'wake' },
     ],
     [
-      '4 same mode, memory-less, caller run: main, unlabelled into the caller run',
+      '4 same mode, memory-less, caller run: the wake runs after it, labelled',
       {
         ...base,
         parentMemory: false,
         active: 'default',
         callerRun: true,
         grant: false,
-        delivery: 'caller-run-signal',
-        label: 'none',
+        delivery: 'wake-after-caller',
+        label: 'wake',
       },
     ],
     // Active mode on another agent at settlement.
     [
-      '5 W4c: row in the delegating memory, active memory-less, caller run: main',
-      { ...base, active: 'other-mode', callerRun: true, grant: false, delivery: 'caller-run-signal', label: 'none' },
+      '5 W4c: row in the delegating memory, active memory-less, caller run: the wake runs after it',
+      { ...base, active: 'other-mode', callerRun: true, grant: false, delivery: 'wake-after-caller', label: 'wake' },
     ],
     [
       '6 row in the delegating memory, active memory-less, no caller: main, labelled',
@@ -522,7 +563,7 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
       },
     ],
     [
-      '8 delegating memory-less, active memory, caller run: main, folded into the caller run',
+      '8 delegating memory-less, active memory, caller run: the caller run reads the row, no wake',
       {
         ...base,
         parentMemory: false,
@@ -530,7 +571,7 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
         active: 'other-mode',
         callerRun: true,
         grant: false,
-        delivery: 'caller-run-fold',
+        delivery: 'caller-loads-row',
         label: 'none',
       },
     ],
@@ -540,8 +581,8 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
       { ...base, active: 'shared-mode', grant: true, delivery: 'wake-run', label: 'wake' },
     ],
     [
-      '10 shared agent, memory, caller run: main, folded into the caller run',
-      { ...base, active: 'shared-mode', callerRun: true, grant: false, delivery: 'caller-run-fold', label: 'none' },
+      '10 shared agent, memory, caller run: the caller run reads the row, no wake',
+      { ...base, active: 'shared-mode', callerRun: true, grant: false, delivery: 'caller-loads-row', label: 'none' },
     ],
     // A mode switch during the wake's awaits.
     [
@@ -582,39 +623,52 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
     ],
     // The caller run's own agent.
     [
-      '14 per-turn override caller on a memory-less agent: main, unlabelled run on the dispatching agent',
+      '14 per-turn override caller on a memory-less agent: GRANT, the wake runs after it',
       {
         ...base,
         active: 'default',
         callerRun: true,
         callerMode: 'other-mode',
-        grant: false,
-        delivery: 'dispatcher-run',
-        label: 'none',
+        grant: true,
+        delivery: 'wake-after-caller',
+        label: 'wake',
       },
     ],
     [
-      '15 per-turn override caller on the same agent: main, folded into the caller run',
+      '15 per-turn override caller on the same agent: the caller run reads the row, no wake',
       {
         ...base,
         active: 'default',
         callerRun: true,
         callerMode: 'shared-mode',
         grant: false,
-        delivery: 'caller-run-fold',
+        delivery: 'caller-loads-row',
         label: 'none',
       },
     ],
     [
-      '16 same-mode caller during the grant admission: cancelled, main, folded into the caller run',
+      '16 same-mode caller during the grant admission: cancelled, the caller run reads the row',
       {
         ...base,
         active: 'default',
         callerRun: true,
         callerDuring: 'admission',
         grant: false,
-        delivery: 'caller-run-fold',
+        delivery: 'caller-loads-row',
         label: 'none',
+      },
+    ],
+    [
+      '17 per-turn override caller on a memory-less agent during the grant admission: cancelled, the wake runs after it without a grant',
+      {
+        ...base,
+        active: 'default',
+        callerRun: true,
+        callerMode: 'other-mode',
+        callerDuring: 'admission',
+        grant: false,
+        delivery: 'wake-after-caller',
+        label: 'wake',
       },
     ],
   ] as Array<[string, Row]>)('%s', async (_label, row) => {
@@ -661,10 +715,19 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
         void user.catch(() => {});
         await poll(() => ctx.prompts.length === 2);
       };
+      let firstWakeSettled = false;
       const inject = (parent as any)._injectSystemReminder.bind(parent);
       vi.spyOn(parent as any, '_injectSystemReminder').mockImplementation((...args: unknown[]) => {
+        const first = !wakeAdmitted;
         wakeAdmitted = true;
-        return inject(...args);
+        const attempt = inject(...args) as Promise<unknown>;
+        if (first) {
+          void attempt.then(
+            () => (firstWakeSettled = true),
+            () => (firstWakeSettled = true),
+          );
+        }
+        return attempt;
       });
       const build = (parent as any)._buildTurnContextAndInstructions.bind(parent);
       vi.spyOn(parent as any, '_buildTurnContextAndInstructions').mockImplementation(async (...args: unknown[]) => {
@@ -708,11 +771,13 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
       releaseChild();
       await poll(() => wakeAdmitted);
       if (row.callerRun) await poll(() => user !== undefined);
-      // The wake has either dispatched or been refused.
-      await poll(() => (parent as any)._delegationNoticesInFlight.size === 0);
+      // The first wake attempt has dispatched or been refused (PF-7679: it never
+      // dispatches while a caller run holds the slot).
+      await poll(() => firstWakeSettled);
       r1Released = true;
       releaseR1();
       await user?.catch(() => {});
+      await poll(() => (parent as any)._delegationNoticesInFlight.size === 0);
       // Delivery is asserted before the runs are required to have ended.
       const runsEnded = await poll(() => dispatchedRunIds.every(id => ended.includes(id))).then(
         () => true,
@@ -722,24 +787,18 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
       if (row.callerRun) expect(held).toBe(true);
 
       // Delivery first: the notice reaches the run main delivers it to.
+      // PF-7679: exactly one provider prompt carries the notice, once.
       const withNotice = ctx.prompts.filter(p => p.includes(NOTICE));
-      if (row.delivery === 'caller-run-signal') {
-        // Main's unlabelled signal: exactly the caller run's next model input.
-        expect(withNotice).toHaveLength(1);
-        expect(withNotice[0]).toContain('what happened?');
-        expect(ctx.prompts[1]).not.toContain(NOTICE);
-        expect(ctx.prompts.indexOf(withNotice[0]!)).toBeGreaterThan(1);
-      } else if (row.delivery === 'caller-run-fold') {
-        // Main's unlabelled signal folds into the caller run: its next model
-        // input carries the notice (its first already reads the saved row).
+      expect(withNotice).toHaveLength(1);
+      expect(withNotice[0]!.split(NOTICE)).toHaveLength(2);
+      if (row.delivery === 'caller-loads-row') {
+        // The caller run's first model input read the saved row from history.
         expect(ctx.prompts[1]).toContain('what happened?');
         expect(ctx.prompts[1]).toContain(NOTICE);
-        expect(ctx.prompts.slice(2).some(p => p.includes('what happened?') && p.includes(NOTICE))).toBe(true);
-      } else if (row.delivery === 'dispatcher-run') {
-        // The caller runs another agent, so main's unlabelled signal starts a
-        // run on the dispatching agent; that run's model input carries it.
-        expect(withNotice).toHaveLength(1);
-        expect(withNotice[0]).not.toContain('what happened?');
+      } else if (row.delivery === 'wake-after-caller') {
+        // The caller run never sees it; the wake, sent after it ended, does.
+        expect(ctx.prompts[1]).toContain('what happened?');
+        expect(ctx.prompts[1]).not.toContain(NOTICE);
         expect(ctx.prompts.indexOf(withNotice[0]!)).toBeGreaterThan(1);
       } else {
         // The wake's own run (the next provider call after R0) carries it.
@@ -754,7 +813,10 @@ describe('PF-7631 wake grant allowlist (real Agent model input)', () => {
       // Grant: kept only in the allowlisted cells; a caller run gets main's call.
       const labelled = starts.filter(s => s.origin === 'wake');
       expect(dispatches.some(d => d.reservedRun)).toBe(row.grant);
-      if (row.callerRun) expect(dispatches).toEqual([{ callerRunActive: true, reservedRun: false }]);
+      if (row.delivery === 'caller-loads-row') expect(dispatches).toEqual([]);
+      if (row.delivery === 'wake-after-caller') {
+        expect(dispatches).toEqual([{ callerRunActive: false, reservedRun: row.grant }]);
+      }
       if (row.grant) await poll(() => intents(ctx.db, wakeFinalizer.id).length === 1);
       expect(intents(ctx.db, wakeFinalizer.id)).toHaveLength(row.grant ? 1 : 0);
       if (row.grant) {
