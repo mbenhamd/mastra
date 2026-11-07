@@ -31,6 +31,20 @@ export type AskUserSelectionMode = 'single_select' | 'multi_select';
  */
 export type AskUserAnswer = string | string[];
 
+const answerSchema = z.union([z.string(), z.array(z.string())]);
+
+/**
+ * Resume payload accepted by `askUserTool`: the bare answer from
+ * `agent.resumeStream(answer)`, or the `{ answer }` envelope that
+ * `session.respondToQuestion({ answer })` sends inside a Harness.
+ */
+const askUserToolResumeSchema = z.union([answerSchema, z.object({ answer: answerSchema })]);
+type AskUserToolResume = z.infer<typeof askUserToolResumeSchema>;
+
+function answerFromResume(resume: AskUserToolResume): AskUserAnswer {
+  return typeof resume === 'string' || Array.isArray(resume) ? resume : resume.answer;
+}
+
 /**
  * Payload carried by the native `tool-call-suspended` event when `ask_user` pauses.
  * Hosts read this to render the question, choices, and selection mode.
@@ -91,6 +105,9 @@ export function formatQuestionAnswer(answer: AskUserAnswer): string {
  * `tool-call-suspended` event and persist run state. The host renders the question,
  * collects the user's answer, and continues the run via `agent.resumeStream(answer)`;
  * the tool re-runs with `resumeData` set to the answer and returns it to the model.
+ * Inside a Harness the question is registered with the session, and
+ * `session.respondToQuestion({ answer })` resumes it with `{ answer }`; both shapes
+ * are accepted.
  *
  * When executed without an agent `suspend` (e.g. direct invocation outside an agent
  * run), the tool returns a readable fallback prompt so the question and choices are
@@ -118,9 +135,14 @@ export const askUserTool = createTool({
     options: z.array(optionSchema).optional(),
     selectionMode: z.enum(['single_select', 'multi_select']).optional(),
   }),
-  resumeSchema: z.union([z.string(), z.array(z.string())]),
+  resumeSchema: askUserToolResumeSchema,
   execute: async ({ question, options, selectionMode }, context) => {
     try {
+      const resumeData = context?.agent?.resumeData as AskUserToolResume | undefined;
+      if (resumeData !== undefined) {
+        return { content: `User answered: ${formatQuestionAnswer(answerFromResume(resumeData))}`, isError: false };
+      }
+
       if (selectionMode && !options?.length) {
         return {
           content: 'Failed to ask user: selectionMode requires options.',
@@ -129,11 +151,6 @@ export const askUserTool = createTool({
       }
 
       const resolvedSelectionMode = options?.length ? (selectionMode ?? 'single_select') : undefined;
-
-      const resumeData = context?.agent?.resumeData as AskUserAnswer | undefined;
-      if (resumeData !== undefined) {
-        return { content: `User answered: ${formatQuestionAnswer(resumeData)}`, isError: false };
-      }
 
       const suspend = context?.agent?.suspend;
       if (suspend) {

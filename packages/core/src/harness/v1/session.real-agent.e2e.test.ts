@@ -51,7 +51,7 @@ import { MockMemory } from '../../memory/mock';
 import { InMemoryStore } from '../../storage';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
-import { createTool } from '../../tools';
+import { askUserTool, createTool } from '../../tools';
 import { askUser, submitPlan } from '../../tools/builtin';
 
 import type { HarnessEvent } from './events';
@@ -1252,6 +1252,59 @@ describe('Harness v1 real-agent E2E — interaction pre-registration stays with 
     } finally {
       await harness.shutdown();
     }
+  });
+
+  describe('askUserTool answered through the session', () => {
+    const toolEndOutput = (events: HarnessEvent[], toolCallId: string) =>
+      (events.find(event => event.type === 'tool_end' && event.toolCallId === toolCallId) as { output?: unknown })
+        ?.output;
+
+    it.each([
+      ['a free-text answer', { question: 'Which colour?' }, 'Blue', 'User answered: Blue'],
+      [
+        'a multi-select answer',
+        {
+          question: 'Which ones?',
+          options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }],
+          selectionMode: 'multi_select',
+        },
+        ['A', 'C'],
+        'User answered: A, C',
+      ],
+    ])('resumes with %s', async (_label, input, answer, content) => {
+      const { harness, session, events } = await harnessSession(
+        [() => toolCallsStream(['q1', 'ask_user', input]), () => textStream(['done'])],
+        { ask_user: askUserTool },
+      );
+      try {
+        expect(((await session.message({ content: 'ask' })) as any).finishReason).toBe('suspended');
+        expect(pendingCall(session)).toEqual({ kind: 'question', toolCallId: 'q1' });
+        expect(((await session.respondToQuestion({ answer })) as any).text).toBe('done');
+        expect(toolEndOutput(events, 'q1')).toEqual({ content, isError: false });
+        expect(session.getRecord().pendingResume).toBeUndefined();
+      } finally {
+        await harness.shutdown();
+      }
+    });
+
+    it('refuses an answer that is neither text nor a list of labels and keeps the question open', async () => {
+      const { harness, session, events } = await harnessSession(
+        [() => toolCallsStream(['q1', 'ask_user', { question: 'Which colour?' }]), () => textStream(['done'])],
+        { ask_user: askUserTool },
+      );
+      try {
+        expect(((await session.message({ content: 'ask' })) as any).finishReason).toBe('suspended');
+        await expect(session.respondToQuestion({ answer: 42 })).rejects.toMatchObject({
+          cause: expect.objectContaining({ message: expect.stringMatching(/does not match the resumeSchema/) }),
+        });
+        expect(pendingCall(session)).toEqual({ kind: 'question', toolCallId: 'q1' });
+        expect(toolEndOutput(events, 'q1')).toBeUndefined();
+        expect(((await session.respondToQuestion({ answer: 'Blue' })) as any).text).toBe('done');
+        expect(toolEndOutput(events, 'q1')).toEqual({ content: 'User answered: Blue', isError: false });
+      } finally {
+        await harness.shutdown();
+      }
+    });
   });
 
   it('a resumed run that submits a plan parks the plan approval', async () => {

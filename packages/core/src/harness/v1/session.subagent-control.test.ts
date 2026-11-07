@@ -9,11 +9,13 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { Agent } from '../../agent';
 import { convertArrayToReadableStream, MockLanguageModelV2 } from '../../agent/__tests__/mock-model';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
+import { createTool } from '../../tools';
 
 import { MockAgent } from './__test-utils__';
 import type { HarnessEvent } from './events';
@@ -2255,4 +2257,126 @@ describe('isTurnActive — user turns while a delegated child runs (real agent l
       await harness.shutdown();
     }
   });
+});
+
+describe('returned inline subagents — real agent loop', () => {
+  const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+  const stream = (parts: unknown[]) => ({
+    rawCall: { rawPrompt: null, rawSettings: {} },
+    warnings: [],
+    stream: convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }, ...parts] as any),
+  });
+  const callTool = (toolCallId: string, toolName: string, input: Record<string, unknown>) =>
+    stream([
+      { type: 'tool-call', toolCallId, toolName, input: JSON.stringify(input) },
+      { type: 'finish', finishReason: 'tool-calls', usage },
+    ]);
+  const say = (text: string) =>
+    stream([
+      { type: 'text-start', id: 't' },
+      { type: 'text-delta', id: 't', delta: text },
+      { type: 'text-end', id: 't' },
+      { type: 'finish', finishReason: 'stop', usage },
+    ]);
+  const spawn = (toolCallId: string) =>
+    callTool(toolCallId, SPAWN_SUBAGENT_TOOL_ID, { agentType: 'worker', task: `job ${toolCallId}` });
+  const status = (toolCallId: string) => callTool(toolCallId, SUBAGENT_CONTROL_TOOL_ID, { action: 'status' });
+
+  function realHarness(script: Array<() => ReturnType<typeof stream>>) {
+    let call = 0;
+    const model = new MockLanguageModelV2({ doStream: async () => script[call++]!() });
+    const gate = createTool({
+      id: 'gate',
+      description: 'A step that needs approval.',
+      inputSchema: z.object({}),
+      requireApproval: true,
+      execute: async () => 'approved',
+    });
+    const parentAgent = new Agent({
+      id: 'parent-agent',
+      name: 'parent-agent',
+      instructions: 'Run subagents.',
+      model,
+      tools: { gate },
+    });
+    const childAgent = new MockAgent({
+      id: 'child-agent',
+      defaultOutput: { terminalToolResult: completedOutcome('Worker finished') },
+    });
+    const harness = new Harness({
+      agents: { 'parent-agent': parentAgent, 'child-agent': childAgent } as any,
+      modes: [
+        { id: 'default', agentId: 'parent-agent' },
+        { id: 'worker-mode', agentId: 'child-agent' },
+      ],
+      defaultModeId: 'default',
+      sessions: { storage: new InMemoryHarness({ db: new InMemoryDB() }) },
+      subagents: subagentsConfig(),
+    });
+    return harness;
+  }
+
+  function track(session: Session) {
+    const ends: any[] = [];
+    session.subscribe(event => {
+      if (event.type === 'tool_end') ends.push(event);
+    });
+    const spawned = () =>
+      ends
+        .filter(event => event.toolName === SPAWN_SUBAGENT_TOOL_ID)
+        .map(event => event.output?.subagentSessionId as string);
+    const listings = () =>
+      ends
+        .filter(event => event.toolName === SUBAGENT_CONTROL_TOOL_ID)
+        .map(event => ((event.output?.subagents ?? []) as any[]).map(view => view.subagentSessionId as string));
+    return { spawned, listings };
+  }
+
+  it('a new run lists only its own returned inline children', async () => {
+    const harness = realHarness([
+      () => spawn('a'),
+      () => status('s1'),
+      () => say('run 1 done'),
+      () => status('s2'),
+      () => spawn('b'),
+      () => status('s3'),
+      () => say('run 2 done'),
+    ]);
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { spawned, listings } = track(session);
+      const first = (await session.message({ content: 'run 1' })) as any;
+      const second = (await session.message({ content: 'run 2' })) as any;
+      expect(first.runId).not.toBe(second.runId);
+      const [childA, childB] = spawned();
+      expect(childA).toBeDefined();
+      expect(childB).toBeDefined();
+      // Run 1 lists its returned child; run 2 starts without it and lists only its own.
+      expect(listings()).toEqual([[childA], [], [childB]]);
+    } finally {
+      await harness.shutdown();
+    }
+  }, 30_000);
+
+  it('a suspend on a tool approval and its resume continue one run, which still lists its returned child once', async () => {
+    const harness = realHarness([
+      () => spawn('a'),
+      () => callTool('g', 'gate', {}),
+      () => status('s1'),
+      () => say('done'),
+    ]);
+    try {
+      const session = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { spawned, listings } = track(session);
+      const suspended = (await session.message({ content: 'go' })) as any;
+      expect(suspended.finishReason).toBe('suspended');
+      const resumed = (await session.respondToToolApproval({ approved: true })) as any;
+      expect(resumed.runId).toBe(suspended.runId);
+      const [childA] = spawned();
+      expect(childA).toBeDefined();
+      expect(listings()).toEqual([[childA]]);
+    } finally {
+      await harness.shutdown();
+    }
+  }, 30_000);
 });
