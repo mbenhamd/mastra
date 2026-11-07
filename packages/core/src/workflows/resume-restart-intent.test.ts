@@ -16,13 +16,21 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../events/event-emitter';
+import { pruneAgentLoopSnapshot } from '../loop/workflows/prune-snapshot';
 import { Mastra } from '../mastra';
 import type { MastraStorage } from '../storage';
 import { MockStore } from '../storage/mock';
 import { createWorkflow } from './create';
 import { createStep as createEventedStep, createWorkflow as createEventedWorkflow } from './evented';
+import { resumeAnswerIsPersistable } from './resume-claim';
 import type { WorkflowRunState, WorkflowRunStatus } from './types';
 import { createStep } from './workflow';
+
+// Counts the resume-claim probe; it still runs the real check.
+vi.mock('./resume-claim', async importOriginal => {
+  const actual = await importOriginal<typeof import('./resume-claim')>();
+  return { ...actual, resumeAnswerIsPersistable: vi.fn(actual.resumeAnswerIsPersistable) };
+});
 
 type Behaviour = 'block' | 'run';
 type Engine = 'default' | 'evented';
@@ -45,7 +53,18 @@ interface HostBehaviour {
 
 type PruneSnapshot = (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState;
 
-function hostWorkflow(engine: Engine, behaviour: HostBehaviour, pruneSnapshot?: PruneSnapshot) {
+type ShouldPersistSnapshot = (params: { workflowStatus: WorkflowRunStatus }) => boolean;
+
+interface HostOptions {
+  pruneSnapshot?: PruneSnapshot;
+  shouldPersistSnapshot?: ShouldPersistSnapshot;
+}
+
+function hostWorkflow(
+  engine: Engine,
+  behaviour: HostBehaviour,
+  { pruneSnapshot, shouldPersistSnapshot }: HostOptions = {},
+) {
   const step = (engine === 'evented' ? createEventedStep : createStep) as typeof createStep;
   const workflowOf = (engine === 'evented' ? createEventedWorkflow : createWorkflow) as typeof createWorkflow;
   const seen = { review: [] as unknown[], apply: [] as unknown[], publish: [] as unknown[] };
@@ -94,7 +113,10 @@ function hostWorkflow(engine: Engine, behaviour: HostBehaviour, pruneSnapshot?: 
     id: 'checkpoint-flow',
     inputSchema: z.object({ draft: z.string() }),
     outputSchema: z.object({ published: z.string() }),
-    ...(pruneSnapshot ? { options: { pruneSnapshot } } : {}),
+    options: {
+      ...(pruneSnapshot ? { pruneSnapshot } : {}),
+      ...(shouldPersistSnapshot ? { shouldPersistSnapshot } : {}),
+    },
   })
     .then(review)
     .then(apply)
@@ -111,9 +133,9 @@ async function host(
   engine: Engine,
   storage: MastraStorage,
   behaviour: HostBehaviour,
-  { startWorkers = true, pruneSnapshot }: { startWorkers?: boolean; pruneSnapshot?: PruneSnapshot } = {},
+  { startWorkers = true, ...options }: { startWorkers?: boolean } & HostOptions = {},
 ) {
-  const h = hostWorkflow(engine, behaviour, pruneSnapshot);
+  const h = hostWorkflow(engine, behaviour, options);
   const mastra = new Mastra({
     logger: false,
     storage,
@@ -344,19 +366,26 @@ function pruneRunningResumeData(edit: (resumePayload: unknown) => unknown): Prun
   };
 }
 
-describe('resume data and the pruneSnapshot hook (PF-7806)', () => {
+describe('resume data and the persistence options (PF-7806)', () => {
   const revise = { decision: 'revise' as const, draft: 'v2-edited' };
+  const strip = pruneRunningResumeData(() => undefined);
+  const redact = pruneRunningResumeData(data => ({ ...(data as object), draft: 'redacted' }));
+  const skipRunning: ShouldPersistSnapshot = ({ workflowStatus }) => workflowStatus !== 'running';
 
-  // The claim stores no more resume data than the resumed step's own `running` write keeps.
-  // A hook that strips it leaves no stored answer, so restart behaves exactly as it did before
-  // PF-7806 (base c181752097): it re-runs `review` without resume data, `review` suspends again
-  // with its original payload, and nothing after it runs.
-  it.each(['default', 'evented'] as const)(
-    '%s engine: a hook that strips running resume data stores no answer, and restart re-runs review without it and suspends again',
-    async engine => {
+  // A claim stores exactly the caller's answer or nothing: only where the resumed step's own
+  // `running` write would persist it unchanged. When it would not, nothing is stored and restart
+  // behaves exactly as before PF-7806 (base c181752097): it re-runs `review` without resume
+  // data, `review` suspends again with its original payload, and nothing after it runs.
+  it.each([
+    ['default', 'a pruneSnapshot hook that strips', { pruneSnapshot: strip }],
+    ['evented', 'a pruneSnapshot hook that strips', { pruneSnapshot: strip }],
+    ['default', 'a pruneSnapshot hook that redacts', { pruneSnapshot: redact }],
+    ['default', 'shouldPersistSnapshot excluding', { shouldPersistSnapshot: skipRunning }],
+  ] as const)(
+    '%s engine: %s the running resume data stores no answer, and restart re-runs review without it and suspends again',
+    async (engine, _, options) => {
       const storage = new MockStore();
-      const pruneSnapshot = pruneRunningResumeData(() => undefined);
-      const a = await host(engine, storage, { review: 'block', apply: 'run', publish: 'run' }, { pruneSnapshot });
+      const a = await host(engine, storage, { review: 'block', apply: 'run', publish: 'run' }, options);
       const runA = await a.workflow.createRun();
       expect((await runA.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
       void runA.resume({ step: 'review', resumeData: revise });
@@ -366,7 +395,7 @@ describe('resume data and the pruneSnapshot hook (PF-7806)', () => {
       expect(stranded?.resumeIntent).toBeUndefined();
       await crash(storage, runA.runId, a.mastra);
 
-      const b = await host(engine, storage, { review: 'run', apply: 'run', publish: 'run' }, { pruneSnapshot });
+      const b = await host(engine, storage, { review: 'run', apply: 'run', publish: 'run' }, options);
       const result = await within((async () => (await b.workflow.createRun({ runId: runA.runId })).restart())());
       if (engine === 'evented') await b.mastra.stopWorkers();
       expect(b.seen.review).toEqual([undefined]);
@@ -379,37 +408,208 @@ describe('resume data and the pruneSnapshot hook (PF-7806)', () => {
     },
   );
 
-  // A hook that keeps running snapshots unchanged (and only prunes terminal ones) keeps the
-  // answer; a hook that rewrites it stores the rewritten value, as the step's own write would.
-  it.each([
-    ['leaves running snapshots unchanged', (data: unknown) => data, revise, 'v2-edited'],
-    [
-      'redacts a field',
-      (data: unknown) => ({ ...(data as object), draft: 'redacted' }),
-      { decision: 'revise', draft: 'redacted' },
-      'redacted',
-    ],
-  ] as const)(
-    'a hook that %s stores what the step write would keep, and restart continues with it',
-    async (_, edit, storedAnswer, expectedDraft) => {
-      const storage = new MockStore();
-      const pruneSnapshot = pruneRunningResumeData(edit);
-      const a = await host('default', storage, { review: 'block', apply: 'run', publish: 'run' }, { pruneSnapshot });
-      const runA = await a.workflow.createRun();
-      expect((await runA.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
-      void runA.resume({ step: 'review', resumeData: revise });
-      await a.started.review;
-      expect((await load(storage, runA.runId))?.resumeIntent?.resumePayload).toEqual(storedAnswer);
-      await crash(storage, runA.runId, a.mastra);
+  // A hook that keeps running snapshots unchanged (and only prunes terminal ones, like the
+  // PapersFlow Systematic Review hook) keeps the answer, and restart continues with it.
+  it('a pruneSnapshot hook that leaves running snapshots unchanged stores the answer, and restart continues with it', async () => {
+    const storage = new MockStore();
+    const options = { pruneSnapshot: pruneRunningResumeData(data => data) };
+    const a = await host('default', storage, { review: 'block', apply: 'run', publish: 'run' }, options);
+    const runA = await a.workflow.createRun();
+    expect((await runA.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+    void runA.resume({ step: 'review', resumeData: revise });
+    await a.started.review;
+    expect((await load(storage, runA.runId))?.resumeIntent?.resumePayload).toEqual(revise);
+    await crash(storage, runA.runId, a.mastra);
 
-      const b = await host('default', storage, { review: 'run', apply: 'run', publish: 'run' }, { pruneSnapshot });
-      const result = await within((async () => (await b.workflow.createRun({ runId: runA.runId })).restart())());
-      expect(b.seen.review).toEqual([storedAnswer]);
-      expect(b.seen.apply).toEqual([expectedDraft]);
-      expect(result.status).toBe('success');
-      if (result.status === 'success') expect(result.result).toEqual({ published: expectedDraft });
-    },
-  );
+    const b = await host('default', storage, { review: 'run', apply: 'run', publish: 'run' }, options);
+    const result = await within((async () => (await b.workflow.createRun({ runId: runA.runId })).restart())());
+    expect(b.seen.review).toEqual([revise]);
+    expect(b.seen.apply).toEqual(['v2-edited']);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') expect(result.result).toEqual({ published: 'v2-edited' });
+  });
+
+  // The check runs before the claim, so a throwing hook fails resume() and claims nothing.
+  it('a pruneSnapshot hook that throws on the resumed step fails resume() and leaves the run suspended', async () => {
+    const storage = new MockStore();
+    const failure = new Error('prune failed');
+    const pruneSnapshot: PruneSnapshot = ({ snapshot, workflowStatus }) => {
+      const review = snapshot.context?.review as { resumePayload?: unknown } | undefined;
+      if (workflowStatus === 'running' && review?.resumePayload !== undefined) throw failure;
+      return snapshot;
+    };
+    const a = await host('default', storage, { review: 'run', apply: 'run', publish: 'run' }, { pruneSnapshot });
+    const run = await a.workflow.createRun();
+    expect((await run.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+    const before = await load(storage, run.runId);
+    await expect(run.resume({ step: 'review', resumeData: revise })).rejects.toBe(failure);
+    const after = await load(storage, run.runId);
+    expect(after?.status).toBe('suspended');
+    expect(after?.lifecycleResumeAttempt).toBe(before?.lifecycleResumeAttempt);
+    expect(after?.resumeIntent).toBeUndefined();
+    expect(a.seen.review).toEqual([undefined]);
+  });
+
+  // An agent-loop resume arrives already claimed (resumeClaimed, as loop/workflows/stream.ts
+  // does), so no claim of this run is written and the check never runs; a plain resume of the
+  // same workflow runs it.
+  it('an already-claimed resume with pruneAgentLoopSnapshot does not run the check', async () => {
+    const storage = new MockStore();
+    const probe = vi.mocked(resumeAnswerIsPersistable);
+    const a = await host(
+      'default',
+      storage,
+      { review: 'run', apply: 'run', publish: 'run' },
+      { pruneSnapshot: pruneAgentLoopSnapshot },
+    );
+    const store = (await storage.getStore('workflows'))!;
+
+    const claimed = await a.workflow.createRun();
+    expect((await claimed.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+    const snapshot = (await load(storage, claimed.runId))!;
+    expect(
+      await store.updateWorkflowState({
+        workflowName: 'checkpoint-flow',
+        runId: claimed.runId,
+        opts: {
+          status: 'running',
+          expectedStatus: 'suspended',
+          expectedExecutionGeneration: snapshot.executionGeneration,
+          expectedLifecycleResumeAttempt: snapshot.lifecycleResumeAttempt ?? 0,
+          lifecycleResumeAttempt: (snapshot.lifecycleResumeAttempt ?? 0) + 1,
+        },
+      }),
+    ).toBeTruthy();
+    probe.mockClear();
+    const result = await claimed.resumeClaimed({ step: 'review', resumeData: revise, claimedSnapshot: snapshot });
+    expect(result.status).toBe('success');
+    expect(probe).not.toHaveBeenCalled();
+
+    const plain = await a.workflow.createRun();
+    expect((await plain.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+    probe.mockClear();
+    expect((await plain.resume({ step: 'review', resumeData: revise })).status).toBe('success');
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Fork #399: a resume claim writes `running` whatever `shouldPersistSnapshot` says. When the
+// policy then declines the snapshot the resume settles with, the row returns to the suspended
+// snapshot it had before the resume, so a finished run is not left `running` for recovery.
+describe('a resume whose settled snapshot shouldPersistSnapshot declines (fork #399)', () => {
+  function declinedFlow(shouldPersistSnapshot: ShouldPersistSnapshot, duringAfterStep?: () => Promise<void>) {
+    const counts = { resumeStep: 0, afterStep: 0 };
+    const seenResumeData: unknown[] = [];
+    const resumeStep = createStep({
+      id: 'resume-step',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      resumeSchema: z.object({ ok: z.boolean() }),
+      execute: async ({ resumeData, suspend }) => {
+        counts.resumeStep++;
+        seenResumeData.push(resumeData);
+        if (!resumeData) return suspend({});
+        return { ok: resumeData.ok };
+      },
+    });
+    const afterStep = createStep({
+      id: 'after-step',
+      inputSchema: z.object({ ok: z.boolean() }),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute: async ({ inputData }) => {
+        counts.afterStep++;
+        await duringAfterStep?.();
+        return inputData;
+      },
+    });
+    const wf = createWorkflow({
+      id: 'declined-flow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      options: { shouldPersistSnapshot },
+    })
+      .then(resumeStep)
+      .then(afterStep)
+      .commit();
+    const storage = new MockStore();
+    const mastra = new Mastra({ storage, workflows: { wf }, logger: false });
+    return { counts, seenResumeData, storage, workflow: mastra.getWorkflow('wf') };
+  }
+
+  async function finishResumeThenRecover(shouldPersistSnapshot: ShouldPersistSnapshot) {
+    const flow = declinedFlow(shouldPersistSnapshot);
+    const store = (await flow.storage.getStore('workflows'))!;
+    const writes = vi.spyOn(store, 'updateWorkflowState');
+    const run = await flow.workflow.createRun();
+    const loadRow = () => store.loadWorkflowSnapshot({ workflowName: 'declined-flow', runId: run.runId });
+
+    expect((await run.start({ inputData: {} })).status).toBe('suspended');
+    const suspended = await loadRow();
+    expect((await run.resume({ step: 'resume-step', resumeData: { ok: true } })).status).toBe('success');
+    const afterResume = await loadRow();
+    await flow.workflow.restartAllActiveWorkflowRuns();
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const storedAnswers = writes.mock.calls.filter(([args]) => args.opts?.resumeIntent !== undefined).length;
+    return { ...flow, suspended, afterResume, afterRecovery: await loadRow(), storedAnswers };
+  }
+
+  it('a policy that persists only suspended snapshots stores no answer, returns the row to suspended, and recovery runs nothing', async () => {
+    const r = await finishResumeThenRecover(({ workflowStatus }) => workflowStatus === 'suspended');
+    expect(r.storedAnswers).toBe(0);
+    expect(r.afterResume?.status).toBe('suspended');
+    expect(r.afterResume?.resumeIntent).toBeUndefined();
+    expect(r.afterResume?.context['resume-step']).toEqual(r.suspended?.context['resume-step']);
+    expect(r.seenResumeData).toEqual([undefined, { ok: true }]);
+    expect(r.counts).toEqual({ resumeStep: 2, afterStep: 1 });
+    expect(r.afterRecovery?.status).toBe('suspended');
+  });
+
+  it('a policy that declines only the success snapshot clears the stored answer with the row back at suspended, and recovery runs nothing', async () => {
+    const r = await finishResumeThenRecover(({ workflowStatus }) => workflowStatus !== 'success');
+    // `running` is persisted, so the claim stored the answer; no step write replaced the claim
+    // (a resume writes no `running` update over a row this process saw `suspended`), and the
+    // declined `success` returns the row to its suspended snapshot without the answer.
+    expect(r.storedAnswers).toBe(1);
+    expect(r.afterResume?.status).toBe('suspended');
+    expect(r.afterResume?.resumeIntent).toBeUndefined();
+    expect(r.afterResume?.context['resume-step']).toEqual(r.suspended?.context['resume-step']);
+    expect(r.seenResumeData).toEqual([undefined, { ok: true }]);
+    expect(r.counts).toEqual({ resumeStep: 2, afterStep: 1 });
+    expect(r.afterRecovery?.status).toBe('suspended');
+  });
+
+  it('does not return the row to suspended once another execution has claimed it', async () => {
+    let store: Awaited<ReturnType<MockStore['getStore']>>;
+    let runId = '';
+    const flow = declinedFlow(
+      ({ workflowStatus }) => workflowStatus === 'suspended',
+      async () => {
+        // Another host's restart claim installs its own lineage while this resume still runs.
+        await store!.updateWorkflowState({
+          workflowName: 'declined-flow',
+          runId,
+          opts: { executionGeneration: 'other-host-generation', lifecycleResumeAttempt: 0, expectedStatus: 'running' },
+        });
+      },
+    );
+    store = (await flow.storage.getStore('workflows'))!;
+    const run = await flow.workflow.createRun();
+    runId = run.runId;
+    expect((await run.start({ inputData: {} })).status).toBe('suspended');
+    await run.resume({ step: 'resume-step', resumeData: { ok: true } });
+    const row = await store!.loadWorkflowSnapshot({ workflowName: 'declined-flow', runId });
+    expect(flow.counts.afterStep).toBe(1);
+    expect(row?.status).toBe('running');
+    expect(row?.executionGeneration).toBe('other-host-generation');
+
+    // Control: the same resume without the other claim does return its row to suspended.
+    const control = await flow.workflow.createRun();
+    runId = 'no-such-run';
+    expect((await control.start({ inputData: {} })).status).toBe('suspended');
+    await control.resume({ step: 'resume-step', resumeData: { ok: true } });
+    const controlRow = await store!.loadWorkflowSnapshot({ workflowName: 'declined-flow', runId: control.runId });
+    expect(controlRow?.status).toBe('suspended');
+  });
 });
 
 describe('restart() after a crash during a nested resume (PF-7806)', () => {
@@ -486,7 +686,13 @@ function childResumeHost(
     blockAfter = false,
     registerParent = true,
     registerChild = false,
-  }: { blockAfter?: boolean; registerParent?: boolean; registerChild?: boolean } = {},
+    parentPruneSnapshot,
+  }: {
+    blockAfter?: boolean;
+    registerParent?: boolean;
+    registerChild?: boolean;
+    parentPruneSnapshot?: PruneSnapshot;
+  } = {},
 ) {
   const seen = { gate: [] as unknown[], after: [] as unknown[] };
   const afterStarted = deferred();
@@ -525,6 +731,7 @@ function childResumeHost(
     id: 'parent-flow',
     inputSchema: z.object({}),
     outputSchema: z.object({ note: z.string() }),
+    ...(parentPruneSnapshot ? { options: { pruneSnapshot: parentPruneSnapshot } } : {}),
   })
     .then(nested)
     .commit();
@@ -540,8 +747,8 @@ function childResumeHost(
 }
 
 /** Resumes the child directly and crashes the host while the step after the resumed one runs. */
-async function crashDuringDirectChildResume(storage: MastraStorage) {
-  const a = childResumeHost(storage, { blockAfter: true });
+async function crashDuringDirectChildResume(storage: MastraStorage, parentPruneSnapshot?: PruneSnapshot) {
+  const a = childResumeHost(storage, { blockAfter: true, parentPruneSnapshot });
   const runA = await a.parent.createRun();
   expect((await runA.start({ inputData: {} })).status).toBe('suspended');
   const childRun = await a.nested.createRun({ runId: runA.runId });
@@ -580,6 +787,20 @@ describe('recovery after a crash during a direct nested-child resume (PF-7806)',
       await b.mastra.shutdown();
     },
   );
+
+  // The parent row stores the answer only where the parent's own nested-step write would keep it.
+  it('a parent whose pruneSnapshot hook strips the answer stores no parent intent', async () => {
+    const storage = new MockStore();
+    const runId = await crashDuringDirectChildResume(
+      storage,
+      pruneRunningResumeData(() => undefined),
+    );
+    expect((await loadParent(storage, runId))?.status).toBe('running');
+    expect((await loadParent(storage, runId))?.resumeIntent).toBeUndefined();
+    const store = (await storage.getStore('workflows'))!;
+    const child = await store.loadWorkflowSnapshot({ workflowName: 'child-flow', runId });
+    expect(child?.resumeIntent?.resumePayload).toEqual({ note: 'edited' });
+  });
 
   // While a parent restart drives the child, a restart of the child on its own (another host's
   // sweep, or the same host's) is refused, so `gate` runs once, inside the parent's restart.

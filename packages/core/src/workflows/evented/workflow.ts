@@ -106,7 +106,7 @@ import type { ClassifierStepOutput } from '../entry-executors';
 import { workflowRunNotSuspendedError, workflowSnapshotNotFoundError } from '../lifecycle-errors';
 import { createWorkflowExecutionGeneration, requireWorkflowExecutionGeneration } from '../lifecycle-events';
 import type { WorkflowExecutionGeneration, WorkflowStepLifecycleStateMap } from '../lifecycle-events';
-import { createWorkflowResumeIntent, persistableResumePayload } from '../resume-claim';
+import { createWorkflowResumeIntent } from '../resume-claim';
 import { getEntryId } from '../step-entry';
 import { createStepFromClassifier } from '../step-factories';
 import type { ClassifierStepOptions } from '../step-factories';
@@ -2901,35 +2901,24 @@ export class EventedRun<
       `Workflow run ${this.workflowId}/${this.runId}`,
     );
     const forEachIndex = params.label !== undefined ? snapshotResumeLabel?.foreachIndex : params.forEachIndex;
-    // The claim stores the resume data only as far as the resumed step's own write would keep it.
-    const persistedResume = persistableResumePayload({
-      snapshot,
-      stepId: steps[0]!,
-      resumePayload: resumeDataToUse,
-      pruneSnapshot: this.executionEngine.options?.pruneSnapshot,
-    });
-    if (!persistedResume.kept) {
-      this.mastra
-        ?.getLogger()
-        ?.debug(
-          `[Workflow ${this.workflowId}] pruneSnapshot removes the resume data of step ${steps[0]}, so run ${this.runId} stores no resume input for restart()`,
-        );
-    }
     await this.claimResume({
       workflowsStore,
       snapshot,
       executionGeneration,
-      // The claim is the durable record of this input until the resumed step settles.
-      resumeIntent: persistedResume.kept
-        ? createWorkflowResumeIntent({
-            snapshot,
-            executionGeneration,
-            steps,
-            resumePayload: persistedResume.resumePayload,
-            label: params.label,
-            forEachIndex,
-          })
-        : undefined,
+      // The claim is the durable record of this input until the resumed step settles. It stores
+      // the data only where the resumed step would persist it unchanged.
+      resumeIntent:
+        workflowsStore?.supportsConcurrentUpdates() &&
+        this.resumeAnswerIsPersistable({ snapshot, stepId: steps[0]!, resumePayload: resumeDataToUse })
+          ? createWorkflowResumeIntent({
+              snapshot,
+              executionGeneration,
+              steps,
+              resumePayload: resumeDataToUse,
+              label: params.label,
+              forEachIndex,
+            })
+          : undefined,
     });
     const lifecycleExecution = this.restoreLifecycleExecution(snapshot);
     this.workflowRunStatus = 'running';

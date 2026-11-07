@@ -1,43 +1,85 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { IMastraLogger } from '../logger';
 import type { WorkflowsStorage } from '../storage/domains/workflows/base';
+import { deepEqual } from '../utils/deep-equal';
+import type { ExecutionEngineOptions } from './execution-engine';
 import { cloneLifecyclePayload } from './handlers/entry';
 import { workflowSnapshotNotFoundError } from './lifecycle-errors';
-import type { WorkflowResumeIntentV1, WorkflowRunState, WorkflowRunStatus } from './types';
+import type { WorkflowResumeIntentV1, WorkflowRunState } from './types';
+import { omitPriorCompletionFields } from './utils';
 
-type PruneSnapshot = (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState;
+/** The parts of an execution engine's options that decide what a step write persists. */
+export interface ResumeAnswerPersistence {
+  options: Pick<ExecutionEngineOptions, 'pruneSnapshot' | 'shouldPersistSnapshot'> | undefined;
+  /** A run-scoped override of `options.shouldPersistSnapshot`, which wins as it does for step writes. */
+  persistenceOverride?: ExecutionEngineOptions['shouldPersistSnapshot'];
+}
 
 /**
- * The resume data a resume claim may store: what the resumed step's own `running` write would
- * persist through the workflow's `pruneSnapshot` hook, so the claim never keeps data the hook
- * strips from every other persisted copy. `{ kept: false }` when the hook removes the data; the
- * claim then stores no resume input and a restart behaves as before.
+ * Whether a resume claim may store the accepted resume data. A claim stores either exactly the
+ * caller's data or nothing: the data is kept only where the resumed step's own `running` write
+ * would persist it unchanged. The probe is that write's snapshot: the run `running` and the
+ * resumed step recorded as `handlers/step.ts` records it. When `shouldPersistSnapshot` would not
+ * persist it, or `pruneSnapshot` removes or changes the data, the claim stores no resume input
+ * and a restart behaves as before.
+ *
+ * A throwing hook propagates, so the caller fails before its claim.
  */
-export function persistableResumePayload({
+export function resumeAnswerIsPersistable({
   snapshot,
   stepId,
   resumePayload,
-  pruneSnapshot,
+  persistence,
 }: {
   snapshot: WorkflowRunState;
   stepId: string;
   resumePayload: unknown;
-  pruneSnapshot: PruneSnapshot | undefined;
-}): { kept: true; resumePayload: unknown } | { kept: false } {
-  if (!pruneSnapshot || resumePayload === undefined) return { kept: true, resumePayload };
-  const probe = cloneLifecyclePayload(snapshot) as WorkflowRunState;
-  probe.status = 'running';
-  probe.context = {
-    ...probe.context,
-    [stepId]: {
-      ...(probe.context?.[stepId] as object | undefined),
-      status: 'running',
-      resumePayload: cloneLifecyclePayload(resumePayload),
+  persistence: ResumeAnswerPersistence;
+}): boolean {
+  const options = persistence.options;
+  const persistencePredicate = persistence.persistenceOverride ?? options?.shouldPersistSnapshot;
+  const prunes = !!options?.pruneSnapshot && resumePayload !== undefined;
+  if (!persistencePredicate && !prunes) return true;
+
+  const prior = (snapshot.context?.[stepId] ?? {}) as Record<string, unknown>;
+  const resumePath = snapshot.suspendedPaths?.[stepId];
+  const probe: WorkflowRunState = {
+    ...snapshot,
+    status: 'running',
+    context: {
+      ...snapshot.context,
+      [stepId]: {
+        ...omitPriorCompletionFields(prior),
+        resumePayload,
+        ...(prior.suspendPayload !== undefined ? { suspendPayload: prior.suspendPayload } : {}),
+        resumedAt: Date.now(),
+        status: 'running',
+      },
+    } as WorkflowRunState['context'],
+    activeStepsPath: {
+      ...snapshot.activeStepsPath,
+      ...(resumePath === undefined ? {} : { [stepId]: resumePath }),
     },
-  } as WorkflowRunState['context'];
-  const pruned = pruneSnapshot({ snapshot: probe, workflowStatus: 'running' });
+  };
+
+  if (
+    persistencePredicate &&
+    !persistencePredicate({
+      stepResults: probe.context as Parameters<ExecutionEngineOptions['shouldPersistSnapshot']>[0]['stepResults'],
+      workflowStatus: 'running',
+    })
+  ) {
+    return false;
+  }
+  if (!prunes) return true;
+  // The hook gets its own copy, as at the step-write persist site, so it cannot change the loaded
+  // snapshot or the caller's data.
+  const pruned = options!.pruneSnapshot!({
+    snapshot: cloneLifecyclePayload(probe) as WorkflowRunState,
+    workflowStatus: 'running',
+  });
   const persisted = (pruned?.context?.[stepId] as { resumePayload?: unknown } | undefined)?.resumePayload;
-  return persisted === undefined ? { kept: false } : { kept: true, resumePayload: persisted };
+  return deepEqual(persisted, resumePayload);
 }
 
 /**
