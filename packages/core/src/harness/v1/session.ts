@@ -25100,7 +25100,7 @@ export class Session {
   ): Promise<boolean> {
     if (this._state === 'closed') return false;
     const noticeMode =
-      notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest);
+      notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
     // A Stop that starts after this point must still suppress the wake.
     const noticeAdmissionEpoch = this._activeWorkAdmissionEpoch;
     try {
@@ -25162,21 +25162,26 @@ export class Session {
   }
 
   /**
-   * Notice mode for a detached settlement, or undefined for none. A settlement
-   * caused by this parent's own Stop/cancel cascade owes no notice; a durable
-   * delegation timeout is a real settlement the parent model must learn about.
+   * Notice mode for a detached settlement, or undefined for none. While this
+   * parent is itself cancelled, nothing is owed. Otherwise a `completed`
+   * settlement always owes its notice, even when a cancel landed on the child
+   * after its result was read. This parent's own targeted cancel (whatever its
+   * reason) suppresses only the `cancelled` settlement it caused, and its own
+   * Stop/reset cascade owes none. The driver's durable delegation timeout is an
+   * untargeted cancel and a real settlement the parent model must learn about.
    */
   private _delegatedSettlementNoticeMode(
     childCancelRequest: SessionRecord['cancelRequest'],
+    outcome: DelegatedSubagentOutcome,
   ): DelegatedSettlementNoticeMode | undefined {
     const configured = this._harness._getSubagentDelegatedSettlementNotice();
     if (configured === 'none') return undefined;
     if (this._record.cancelRequest !== undefined) return undefined;
-    if (
-      childCancelRequest !== undefined &&
-      childCancelRequest.requestedBy === this.id &&
-      childCancelRequest.reason !== 'delegation_timeout'
-    ) {
+    if (outcome === 'completed') return configured;
+    if (isParentRequestedSubagentCancel(childCancelRequest, this.id)) {
+      return outcome === 'cancelled' ? undefined : configured;
+    }
+    if (childCancelRequest?.requestedBy === this.id && childCancelRequest.reason !== 'delegation_timeout') {
       return undefined;
     }
     return configured;
@@ -25793,13 +25798,36 @@ export class Session {
   }
 
   /**
-   * Re-read the child: its committed cancel request when it is this parent's
-   * targeted cancel, else `undefined`. A failed read rejects, so recovery retries
-   * instead of settling.
+   * Re-read the child's committed cancel request, from any source, or
+   * `undefined` when none is committed. A failed read rejects, so recovery
+   * retries instead of settling.
    */
-  private async _loadTargetedDelegationCancel(childId: string): Promise<SessionRecord['cancelRequest']> {
+  private async _loadDelegationCancel(childId: string): Promise<SessionRecord['cancelRequest']> {
     const latest = await this._storage.loadSession({ harnessName: this._record.harnessName, sessionId: childId });
-    return isParentRequestedSubagentCancel(latest?.cancelRequest, this.id) ? latest?.cancelRequest : undefined;
+    return latest?.cancelRequest;
+  }
+
+  /**
+   * Settle a delegated task from a cancel committed on its child. Only this
+   * parent's targeted marker, not the reason, makes it `cancelled`; any other
+   * cancel fails it, keeping a framework timeout's precise deadline result.
+   */
+  private async _reconcileDelegationFromCancel(
+    taskId: string,
+    childId: string,
+    cancelRequest: NonNullable<SessionRecord['cancelRequest']>,
+    deadlineAt: number | undefined,
+  ): Promise<void> {
+    const parentCancelled = isParentRequestedSubagentCancel(cancelRequest, this.id);
+    await this._reconcileDelegatedTask(
+      taskId,
+      childId,
+      parentCancelled ? 'cancelled' : 'failed',
+      !parentCancelled && cancelRequest.reason === 'delegation_timeout' && deadlineAt !== undefined
+        ? summarizeDelegationDeadline(deadlineAt)
+        : undefined,
+      { childCancelRequest: cancelRequest },
+    );
   }
 
   /** Cancel timed-out work before closing it and releasing its plan ownership edge. */
@@ -26176,18 +26204,11 @@ export class Session {
           needsRetry = true;
           continue;
         }
-        // The targeted marker, not the reason, decides the outcome.
-        const parentCancelled = isParentRequestedSubagentCancel(childRecord.cancelRequest, this.id);
-        await this._reconcileDelegatedTask(
+        await this._reconcileDelegationFromCancel(
           task.taskId,
           childId,
-          parentCancelled ? 'cancelled' : 'failed',
-          !parentCancelled &&
-            childRecord.cancelRequest.reason === 'delegation_timeout' &&
-            delegationAttempt !== undefined
-            ? summarizeDelegationDeadline(delegationAttempt.deadlineAt)
-            : undefined,
-          { childCancelRequest: childRecord.cancelRequest },
+          childRecord.cancelRequest,
+          delegationAttempt?.deadlineAt,
         );
         continue;
       }
@@ -26219,22 +26240,27 @@ export class Session {
           needsRetry = true;
           continue;
         }
-        // A targeted cancel committed while the evidence read was pending wins
-        // over any evidence outcome, as it does in the live driver.
-        let targetedCancel: SessionRecord['cancelRequest'];
+        // A cancel committed while the evidence read was pending wins over any
+        // evidence outcome, by the same rule as a cancel committed before it.
+        let committedCancel: SessionRecord['cancelRequest'];
         try {
-          targetedCancel = await this._loadTargetedDelegationCancel(childId);
+          committedCancel = await this._loadDelegationCancel(childId);
         } catch {
           needsRetry = true;
           continue;
         }
-        await this._reconcileDelegatedTask(
-          task.taskId,
-          childId,
-          targetedCancel !== undefined ? 'cancelled' : durable.outcome,
-          targetedCancel !== undefined ? undefined : durable.result,
-          { childCancelRequest: targetedCancel ?? childRecord.cancelRequest },
-        );
+        if (committedCancel !== undefined) {
+          await this._reconcileDelegationFromCancel(
+            task.taskId,
+            childId,
+            committedCancel,
+            delegationAttempt.deadlineAt,
+          );
+          continue;
+        }
+        await this._reconcileDelegatedTask(task.taskId, childId, durable.outcome, durable.result, {
+          childCancelRequest: undefined,
+        });
         continue;
       }
       // A close marker cannot prove useful work completed. Without terminal
@@ -26258,7 +26284,8 @@ export class Session {
         // as in the live deadline branch. A later one never replaces the timeout.
         let targetedCancel: SessionRecord['cancelRequest'];
         try {
-          targetedCancel = await this._loadTargetedDelegationCancel(childId);
+          const committedCancel = await this._loadDelegationCancel(childId);
+          targetedCancel = isParentRequestedSubagentCancel(committedCancel, this.id) ? committedCancel : undefined;
         } catch {
           needsRetry = true;
           continue;
