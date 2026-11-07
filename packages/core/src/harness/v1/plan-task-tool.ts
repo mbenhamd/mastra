@@ -21,6 +21,7 @@ import { createTool } from '../../tools/tool';
 import type { ToolExecutionContext } from '../../tools/types';
 import { sha256CanonicalJson } from './canonical-json';
 import {
+  HarnessDelegationAlreadyCompletedError,
   HarnessError,
   HarnessSubagentConcurrencyLimitError,
   HarnessSubagentDepthExceededError,
@@ -97,6 +98,9 @@ interface ToolError {
   field?: string;
   reason?: string;
   message: string;
+  taskId?: string;
+  subagentSessionId?: string;
+  outcome?: 'completed';
 }
 
 /** Project a thrown harness error into the `isError` payload shape. */
@@ -108,6 +112,19 @@ function toToolError(err: unknown): ToolError {
       field: err.field,
       reason: err.reason,
       message: err.message,
+    };
+  }
+  // Name the completed child so the model reads its result instead of
+  // redoing the work.
+  if (err instanceof HarnessDelegationAlreadyCompletedError) {
+    return {
+      isError: true,
+      errorName: err.name,
+      code: err.code,
+      message: err.message,
+      taskId: err.taskId,
+      subagentSessionId: err.subagentSessionId,
+      outcome: err.outcome,
     };
   }
   // These are constructed framework control-flow errors intended to help the
@@ -203,7 +220,8 @@ const DELEGATION_WITHOUT_CHILD_RESULT_CODES = new Set(['harness.delegation_faile
  * delegation by this exact tool call in this exact run qualifies: when another
  * run (or another call) has since delegated the task, the retry follows the
  * normal delegation rules instead, which refuse a task already delegated to an
- * active subagent and name its id. An attempt that settled
+ * active subagent, or whose delegation already completed, and name the child's
+ * id. An attempt that settled
  * without a result from its child (for example, child creation failed) does
  * not, so its retry follows the normal re-delegation rules and creates a child.
  */
@@ -501,7 +519,13 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
               }
             }),
           outputSchema: z
-            .object({ ...planTaskViewShape, subagentSessionId: z.string().optional(), ...errorShape })
+            .object({
+              ...planTaskViewShape,
+              subagentSessionId: z.string().optional(),
+              /** Set on a `harness.delegation_already_completed` refusal. */
+              outcome: z.literal('completed').optional(),
+              ...errorShape,
+            })
             .partial({ taskId: true, order: true, status: true, statusSource: true, content: true }),
           execute: async (input, context) => {
             // Without a taskId, this call first adds a root plan task for the

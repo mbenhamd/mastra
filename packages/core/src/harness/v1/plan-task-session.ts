@@ -32,7 +32,7 @@ import type {
   PlanTaskMutationOp,
 } from '../../storage/domains/harness/types';
 import { assertJsonValue, sha256CanonicalJsonChecked } from './canonical-json';
-import { HarnessValidationError } from './errors';
+import { HarnessDelegationAlreadyCompletedError, HarnessValidationError } from './errors';
 import {
   assertNoBlockedByCycle,
   assertNoPlanTaskCombinedCycle,
@@ -1618,6 +1618,14 @@ function assertDelegationScopeEligible(
       'taskId',
       `task "${task.taskId}" is already delegated to active subagent session "${task.delegatedSubagentSessionId}"`,
     );
+  }
+  // Finished work is not redone: a completed task whose latest delegation
+  // completed is refused for every call, naming the child whose result holds
+  // the work. A failed, blocked, or cancelled delegation can be delegated
+  // again, and so can a task the plan has since reopened.
+  const latestDelegation = readDelegationAttemptMetadata(task);
+  if (task.status === 'completed' && latestDelegation?.settlement?.outcome === 'completed') {
+    throw new HarnessDelegationAlreadyCompletedError(task.taskId, latestDelegation.subagentSessionId);
   }
 
   const ancestorOwner = task.parentTaskId === undefined ? undefined : delegatedOwnerOf(index, task.parentTaskId);

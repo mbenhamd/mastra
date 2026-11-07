@@ -822,6 +822,30 @@ export class HarnessSubagentConcurrencyLimitError extends Error {
 }
 
 /**
+ * `task_delegate` named a completed plan task whose latest delegation completed it.
+ * Delegating it again would redo finished work in a new subagent, so the call
+ * is refused without reserving capacity or creating a child. The refusal names
+ * the completed child session and its outcome so the model reads that
+ * delegation's result (`plan_task_check`) instead. A task whose latest
+ * delegation failed, was blocked, or was cancelled, or a task the plan has
+ * since reopened, can still be delegated again.
+ */
+export class HarnessDelegationAlreadyCompletedError extends HarnessError {
+  readonly name = 'HarnessDelegationAlreadyCompletedError';
+  readonly code = 'harness.delegation_already_completed';
+  readonly outcome = 'completed' as const;
+  constructor(
+    public readonly taskId: string,
+    public readonly subagentSessionId: string,
+  ) {
+    super(
+      `task "${taskId}" was already delegated to subagent session "${subagentSessionId}", which settled with ` +
+        'outcome "completed"; read that delegation\'s result with plan_task_check instead of delegating the task again',
+    );
+  }
+}
+
+/**
  * Durable write rejected by the storage adapter — exhausted the harness's
  * one transparent retry. `cause` carries the underlying storage error.
  */
