@@ -1,3 +1,16 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+import { Composio } from '@composio/core';
+import type {
+  ConnectedAccountListResponse,
+  Tool as ComposioTool,
+  ToolListParams as ComposioToolListParams,
+  ToolKitItem,
+} from '@composio/core';
+import { MastraProvider } from '@composio/mastra';
+import type { MastraToolCollection } from '@composio/mastra';
+import { MASTRA_RESOURCE_ID_KEY } from '@mastra/core/request-context';
+import type { RequestContext } from '@mastra/core/request-context';
 import type {
   AuthFlowStatus,
   AuthorizeOpts,
@@ -16,18 +29,6 @@ import type {
 } from '@mastra/core/tool-provider';
 import { BaseToolProvider } from '@mastra/core/tool-provider';
 import type { ToolAction } from '@mastra/core/tools';
-import { MASTRA_RESOURCE_ID_KEY } from '@mastra/core/request-context';
-import type { RequestContext } from '@mastra/core/request-context';
-
-import { Composio } from '@composio/core';
-import type {
-  ConnectedAccountListResponse,
-  Tool as ComposioTool,
-  ToolListParams as ComposioToolListParams,
-  ToolKitItem,
-} from '@composio/core';
-import { MastraProvider } from '@composio/mastra';
-import type { MastraToolCollection } from '@composio/mastra';
 
 export interface ComposioToolProviderConfig extends BaseToolProviderOptions {
   /** Composio API key. */
@@ -56,7 +57,79 @@ export interface ComposioToolProviderConfig extends BaseToolProviderOptions {
    * Composio marks SHARED accounts as experimental.
    */
   sharedConnections?: ComposioSharedConnectionsConfig;
+  /**
+   * Approval policy for resolved tools. `true` requires approval for every
+   * tool; a function decides per tool from the tags Composio advertises for it
+   * (`readOnlyHint`, `createHint`, `updateHint`, `destructiveHint`, ...).
+   * A tool whose tags are unknown (connection-management session tools) is
+   * passed `tags: []`, so a "not read-only" policy requires approval for it.
+   *
+   * SECURITY: tags are Composio's hints, decided once at resolution time. Treat
+   * them as trusted only as far as you trust Composio's catalog.
+   */
+  requireToolApproval?: boolean | ComposioRequireToolApproval;
+  /**
+   * Forwarded to both Composio clients. `false` stops the SDK's anonymous
+   * usage analytics. Absent keeps the SDK default.
+   */
+  allowTracking?: boolean;
 }
+
+/** What {@link ComposioToolProviderConfig.requireToolApproval} decides on. */
+export interface ComposioToolApprovalInput {
+  /** The Composio tool slug. */
+  slug: string;
+  /** The toolkit slug, when Composio reports one. */
+  toolkit?: string;
+  /** The tool's Composio tags; empty when unknown. */
+  tags: readonly string[];
+}
+
+export type ComposioRequireToolApproval = (tool: ComposioToolApprovalInput) => boolean;
+
+/** The Composio identity one tool call executes as. */
+export interface ComposioCallIdentity {
+  /** The Composio `userId` bucket. */
+  userId: string;
+  /** The exact connected account; absent lets Composio pick within the bucket. */
+  connectedAccountId?: string;
+}
+
+/** Inputs handed to a {@link ComposioCallIdentityResolver}. */
+export interface ComposioCallIdentityInput {
+  /** The live request context of this tool call. */
+  requestContext?: RequestContext;
+  /** The Composio tool slug being called. */
+  toolSlug: string;
+  /** The toolkit slug, when Composio reports one. */
+  toolkit?: string;
+}
+
+/**
+ * Server-side resolver of the identity one catalog tool call executes as.
+ * Returning `undefined` refuses the call before anything reaches Composio.
+ * Must never trust client-supplied context values.
+ */
+export type ComposioCallIdentityResolver = (
+  input: ComposioCallIdentityInput,
+) => Promise<ComposioCallIdentity | undefined> | ComposioCallIdentity | undefined;
+
+/** Options for {@link ComposioToolProvider.resolveCatalogTools}. */
+export interface ResolveComposioCatalogToolsOpts {
+  /** Composio tool slugs to materialise. */
+  toolSlugs: string[];
+  /** Per-tool description overrides keyed by slug. */
+  toolMeta?: Record<string, { description?: string; toolkit?: string }>;
+  /** Decides each call's identity from that call's request context. */
+  resolveIdentity: ComposioCallIdentityResolver;
+}
+
+/**
+ * The bucket catalog tools are fetched under. Only schemas are read with it;
+ * every execution replaces it with the resolved call identity, and a call
+ * without one is refused, so no call ever executes as this id.
+ */
+const CATALOG_SCHEMA_USER_ID = '__mastra_catalog_schema__';
 
 /** ACL applied to Composio SHARED accounts. Mirrors Composio's `aclConfigForShared`. */
 export interface ComposioSharedAccountAcl {
@@ -133,6 +206,8 @@ export class ComposioToolProvider extends BaseToolProvider {
   readonly userIdResolver?: ComposioUserIdResolver;
 
   private readonly apiKey: string;
+  private readonly requireToolApproval?: boolean | ComposioRequireToolApproval;
+  private readonly allowTracking?: boolean;
   private readonly sharedConnections?: ComposioSharedConnectionsConfig;
   private rawClient: Composio | null = null;
   private mastraClient: Composio<MastraProvider> | null = null;
@@ -146,13 +221,19 @@ export class ComposioToolProvider extends BaseToolProvider {
     this.apiKey = config.apiKey;
     this.userIdResolver = config.userIdResolver;
     this.sharedConnections = config.sharedConnections;
+    this.requireToolApproval = config.requireToolApproval;
+    this.allowTracking = config.allowTracking;
+  }
+
+  private trackingOption(): { allowTracking?: boolean } {
+    return this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking };
   }
 
   // ── client cache ──────────────────────────────────────────────────────
 
   private getRawClient(): Composio {
     if (!this.rawClient) {
-      this.rawClient = new Composio({ apiKey: this.apiKey });
+      this.rawClient = new Composio({ apiKey: this.apiKey, ...this.trackingOption() });
     }
     return this.rawClient;
   }
@@ -162,6 +243,7 @@ export class ComposioToolProvider extends BaseToolProvider {
       this.mastraClient = new Composio({
         apiKey: this.apiKey,
         provider: new MastraProvider(),
+        ...this.trackingOption(),
       });
     }
     return this.mastraClient;
@@ -231,6 +313,10 @@ export class ComposioToolProvider extends BaseToolProvider {
     const sessionToolSlugs = opts.toolSlugs.filter(slug => COMPOSIO_CONNECTION_MANAGEMENT_TOOLS.has(slug));
     const directToolSlugs = opts.toolSlugs.filter(slug => !COMPOSIO_CONNECTION_MANAGEMENT_TOOLS.has(slug));
     const mastraTools: MastraToolCollection = {};
+    // Raw tags and toolkit per slug, read from the raw schema `tools.get`
+    // hands `modifySchema` before `@composio/mastra` wraps it (the wrapper
+    // drops tags). Feeds `requireToolApproval`.
+    const rawToolFacts = new Map<string, { toolkit?: string; tags: readonly string[] }>();
 
     if (directToolSlugs.length > 0) {
       const modifiers = {
@@ -244,6 +330,21 @@ export class ComposioToolProvider extends BaseToolProvider {
             params.connectedAccountId = identity.connectionId;
           }
           return params;
+        },
+        modifySchema: ({
+          toolSlug,
+          toolkitSlug,
+          schema,
+        }: {
+          toolSlug: string;
+          toolkitSlug: string;
+          schema: ComposioTool;
+        }) => {
+          rawToolFacts.set(toolSlug, {
+            toolkit: toolkitSlug || schema.toolkit?.slug,
+            tags: Array.isArray(schema.tags) ? schema.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+          });
+          return schema;
         },
       };
 
@@ -292,10 +393,32 @@ export class ComposioToolProvider extends BaseToolProvider {
         }
       }
 
+      const approval = this.approvalFor(
+        slug,
+        rawToolFacts.get(slug) ?? rawToolFacts.get(key),
+        opts.toolMeta?.[slug]?.toolkit,
+      );
+      if (approval !== undefined) {
+        (tool as unknown as { requireApproval?: boolean }).requireApproval = approval;
+      }
+
       result[slug] = tool as ToolAction<any, any, any>;
     }
 
     return result;
+  }
+
+  /** The configured approval decision for one resolved tool; `undefined` leaves the tool as built. */
+  private approvalFor(
+    slug: string,
+    facts: { toolkit?: string; tags: readonly string[] } | undefined,
+    fallbackToolkit: string | undefined,
+  ): boolean | undefined {
+    const policy = this.requireToolApproval;
+    if (policy === undefined || policy === false) return undefined;
+    if (policy === true) return true;
+    const toolkit = facts?.toolkit ?? fallbackToolkit;
+    return policy({ slug, ...(toolkit ? { toolkit } : {}), tags: facts?.tags ?? [] }) === true;
   }
 
   /**
@@ -367,6 +490,104 @@ export class ComposioToolProvider extends BaseToolProvider {
       userId: opts.authorId && opts.authorId.length > 0 ? opts.authorId : resolveInternalUserId(opts.requestContext),
       connectionId: opts.connectionId,
     };
+  }
+
+  /**
+   * Tools for a catalog that is built once and shared by every caller (for
+   * example a ToolSearch catalog registered when the agent is constructed).
+   *
+   * {@link resolveToolsVNext} binds one identity when it resolves. Here the
+   * schemas are resolved once and each call resolves its own identity from
+   * its own request context through `resolveIdentity`, so one registered
+   * tool executes as whichever user called it, against that user's account.
+   * A call whose identity does not resolve throws before reaching Composio.
+   * `requireToolApproval` applies as in {@link resolveToolsVNext}.
+   */
+  async resolveCatalogTools(opts: ResolveComposioCatalogToolsOpts): Promise<Record<string, ToolAction<any, any, any>>> {
+    if (opts.toolSlugs.length === 0) return {};
+    const slugs = opts.toolSlugs.filter(slug => !COMPOSIO_CONNECTION_MANAGEMENT_TOOLS.has(slug));
+    if (slugs.length !== opts.toolSlugs.length) {
+      throw new Error('[composio] connection-management tools need a caller-scoped session, not a shared catalog');
+    }
+    const callIdentity = new AsyncLocalStorage<ComposioCallIdentity>();
+    const rawToolFacts = new Map<string, { toolkit?: string; tags: readonly string[] }>();
+    const modifiers = {
+      beforeExecute: ({ params }: { params: { connectedAccountId?: string; userId?: string } }) => {
+        const identity = callIdentity.getStore();
+        if (!identity) {
+          throw new Error('[composio] a catalog tool executed without its call identity');
+        }
+        params.userId = identity.userId;
+        if (identity.connectedAccountId) {
+          params.connectedAccountId = identity.connectedAccountId;
+        } else {
+          delete params.connectedAccountId;
+        }
+        return params;
+      },
+      modifySchema: ({
+        toolSlug,
+        toolkitSlug,
+        schema,
+      }: {
+        toolSlug: string;
+        toolkitSlug: string;
+        schema: ComposioTool;
+      }) => {
+        rawToolFacts.set(toolSlug, {
+          toolkit: toolkitSlug || schema.toolkit?.slug,
+          tags: Array.isArray(schema.tags) ? schema.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+        });
+        return schema;
+      },
+    };
+    const resolved = (await this.getMastraClient().tools.get(
+      CATALOG_SCHEMA_USER_ID,
+      { tools: slugs },
+      modifiers,
+    )) as MastraToolCollection;
+
+    const result: Record<string, ToolAction<any, any, any>> = {};
+    for (const [key, tool] of Object.entries(resolved)) {
+      if (!tool) continue;
+      const slug = (tool as { id?: string }).id ?? key;
+      const facts = rawToolFacts.get(slug) ?? rawToolFacts.get(key);
+      const toolkit = facts?.toolkit ?? opts.toolMeta?.[slug]?.toolkit;
+      const descOverride = opts.toolMeta?.[slug]?.description;
+      if (descOverride) {
+        (tool as unknown as { description: string }).description = descOverride;
+      }
+      const execute = (tool as { execute?: (input: unknown, context?: unknown) => Promise<unknown> }).execute;
+      if (typeof execute !== 'function') continue;
+      (tool as { execute?: (input: unknown, context?: unknown) => Promise<unknown> }).execute = async (
+        input: unknown,
+        context?: unknown,
+      ) => {
+        const requestContext = (context as { requestContext?: RequestContext } | undefined)?.requestContext;
+        const identity = await opts.resolveIdentity({
+          requestContext,
+          toolSlug: slug,
+          ...(toolkit ? { toolkit } : {}),
+        });
+        const userId = typeof identity?.userId === 'string' ? identity.userId.trim() : '';
+        if (!identity || userId.length === 0 || userId === CATALOG_SCHEMA_USER_ID) {
+          throw new Error(`[composio] no execution identity for ${slug}`);
+        }
+        return callIdentity.run(
+          {
+            userId,
+            ...(identity.connectedAccountId ? { connectedAccountId: identity.connectedAccountId } : {}),
+          },
+          () => execute.call(tool, input, context),
+        );
+      };
+      const approval = this.approvalFor(slug, facts, toolkit);
+      if (approval !== undefined) {
+        (tool as unknown as { requireApproval?: boolean }).requireApproval = approval;
+      }
+      result[slug] = tool as ToolAction<any, any, any>;
+    }
+    return result;
   }
 
   // ── auth surface ──────────────────────────────────────────────────────

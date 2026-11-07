@@ -188,6 +188,20 @@ const editor = new MastraEditor({
       "Opt in to Composio SHARED connected accounts. When set, connections authorized with `scope: 'shared'` are created as Composio SHARED accounts. `acl` accepts `allowAllUsers`, `allowedUserIds`, and `notAllowedUserIds`. Omit `acl` to keep Composio's deny-by-default access.",
     isOptional: true,
   },
+  {
+    name: 'requireToolApproval',
+    type: 'boolean | ((tool: ComposioToolApprovalInput) => boolean)',
+    description:
+      'Sets `requireApproval` on resolved tools. `true` requires approval for every tool. A function receives `{ slug, toolkit, tags }` and decides per tool from the tags Composio publishes, such as `readOnlyHint` or `destructiveHint`. Tools with unknown tags receive `tags: []`.',
+    isOptional: true,
+  },
+  {
+    name: 'allowTracking',
+    type: 'boolean',
+    description:
+      "Passed to both Composio clients. Set it to `false` to turn off the Composio SDK's usage analytics. When omitted, the SDK default applies.",
+    isOptional: true,
+  },
 ]}
 />
 
@@ -339,6 +353,38 @@ const composio = new ComposioToolProvider({
 Use the same namespaced ID when creating Composio connections and shared-account ACL entries. For example, Bob's Composio user ID in this setup is `acme:bob`.
 
 Throw from `userIdResolver` to deny the request. During stored-agent resolution, Mastra logs the failure and omits tools associated with that connection, so no tool call reaches Composio. Other connections continue to resolve. When calling `resolveToolsVNext()` directly, the error is returned to the caller instead.
+
+### Require approval for write tools
+
+Composio tags each tool with hints such as `readOnlyHint`, `createHint`, and `destructiveHint`. This configuration lets read-only tools run directly and suspends every other tool call until the user approves it:
+
+```typescript title="src/mastra/index.ts"
+import { ComposioToolProvider } from '@mastra/editor/composio'
+
+const composio = new ComposioToolProvider({
+  apiKey: process.env.COMPOSIO_API_KEY!,
+  requireToolApproval: tool => !tool.tags.includes('readOnlyHint'),
+})
+```
+
+The decision is made when the tools resolve. A suspended call emits a `tool-call-approval` chunk and runs only after it's approved.
+
+### Share one catalog across users
+
+`resolveToolsVNext()` binds a single identity when the tools resolve. When one tool set is registered once and serves every caller, for example a tool search catalog built when the agent is constructed, use `resolveCatalogTools()` instead. It resolves the schemas once. On each call, `resolveIdentity` derives that call's Composio user ID and connected account from its own request context:
+
+```typescript title="src/mastra/tools/composio.ts"
+const tools = await composio.resolveCatalogTools({
+  toolSlugs: ['GMAIL_FETCH_EMAILS', 'GMAIL_SEND_EMAIL'],
+  resolveIdentity: async ({ requestContext, toolkit }) => {
+    const user = requestContext?.get('user') as { id: string } | undefined
+    if (!user) return undefined
+    return { userId: `acme:${user.id}`, connectedAccountId: await accountFor(user.id, toolkit) }
+  },
+})
+```
+
+Returning `undefined` refuses the call before it reaches Composio. Connection management tools need a session owned by the caller, so `resolveCatalogTools()` rejects them. `requireToolApproval` applies to catalog tools as well.
 
 ### Connection management tools
 
