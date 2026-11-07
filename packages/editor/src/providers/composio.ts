@@ -316,7 +316,7 @@ export class ComposioToolProvider extends BaseToolProvider {
     // Raw tags and toolkit per slug, read from the raw schema `tools.get`
     // hands `modifySchema` before `@composio/mastra` wraps it (the wrapper
     // drops tags). Feeds `requireToolApproval`.
-    const rawToolFacts = new Map<string, { toolkit?: string; tags: readonly string[] }>();
+    const rawToolFacts: ToolFactsBySlug = new Map();
 
     if (directToolSlugs.length > 0) {
       const modifiers = {
@@ -331,21 +331,7 @@ export class ComposioToolProvider extends BaseToolProvider {
           }
           return params;
         },
-        modifySchema: ({
-          toolSlug,
-          toolkitSlug,
-          schema,
-        }: {
-          toolSlug: string;
-          toolkitSlug: string;
-          schema: ComposioTool;
-        }) => {
-          rawToolFacts.set(toolSlug, {
-            toolkit: toolkitSlug || schema.toolkit?.slug,
-            tags: Array.isArray(schema.tags) ? schema.tags.filter((tag): tag is string => typeof tag === 'string') : [],
-          });
-          return schema;
-        },
+        modifySchema: captureToolFacts(rawToolFacts),
       };
 
       Object.assign(
@@ -411,7 +397,7 @@ export class ComposioToolProvider extends BaseToolProvider {
   /** The configured approval decision for one resolved tool; `undefined` leaves the tool as built. */
   private approvalFor(
     slug: string,
-    facts: { toolkit?: string; tags: readonly string[] } | undefined,
+    facts: ToolFacts | undefined,
     fallbackToolkit: string | undefined,
   ): boolean | undefined {
     const policy = this.requireToolApproval;
@@ -510,7 +496,7 @@ export class ComposioToolProvider extends BaseToolProvider {
       throw new Error('[composio] connection-management tools need a caller-scoped session, not a shared catalog');
     }
     const callIdentity = new AsyncLocalStorage<ComposioCallIdentity>();
-    const rawToolFacts = new Map<string, { toolkit?: string; tags: readonly string[] }>();
+    const rawToolFacts: ToolFactsBySlug = new Map();
     const modifiers = {
       beforeExecute: ({ params }: { params: { connectedAccountId?: string; userId?: string } }) => {
         const identity = callIdentity.getStore();
@@ -525,21 +511,7 @@ export class ComposioToolProvider extends BaseToolProvider {
         }
         return params;
       },
-      modifySchema: ({
-        toolSlug,
-        toolkitSlug,
-        schema,
-      }: {
-        toolSlug: string;
-        toolkitSlug: string;
-        schema: ComposioTool;
-      }) => {
-        rawToolFacts.set(toolSlug, {
-          toolkit: toolkitSlug || schema.toolkit?.slug,
-          tags: Array.isArray(schema.tags) ? schema.tags.filter((tag): tag is string => typeof tag === 'string') : [],
-        });
-        return schema;
-      },
+      modifySchema: captureToolFacts(rawToolFacts),
     };
     const resolved = (await this.getMastraClient().tools.get(
       CATALOG_SCHEMA_USER_ID,
@@ -923,6 +895,29 @@ function mapComposioStatus(status: string, isDisabled: boolean): ExistingConnect
     default:
       return 'pending';
   }
+}
+
+/** Tags and toolkit Composio reports for one tool, captured before the Mastra wrapper drops them. */
+type ToolFacts = { toolkit?: string; tags: readonly string[] };
+type ToolFactsBySlug = Map<string, ToolFacts>;
+
+/**
+ * A `modifySchema` modifier that records each raw tool's toolkit and tags and
+ * returns the schema unchanged. The SDK passes `toolkitSlug` as `"unknown"`
+ * when Composio omits the toolkit; that is recorded as absent so a caller's
+ * `toolMeta` toolkit still applies.
+ */
+function captureToolFacts(into: ToolFactsBySlug) {
+  return ({ toolSlug, toolkitSlug, schema }: { toolSlug: string; toolkitSlug: string; schema: ComposioTool }) => {
+    const reported = [toolkitSlug, schema.toolkit?.slug].find(
+      (slug): slug is string => typeof slug === 'string' && slug.length > 0 && slug !== 'unknown',
+    );
+    into.set(toolSlug, {
+      ...(reported ? { toolkit: reported } : {}),
+      tags: Array.isArray(schema.tags) ? schema.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+    });
+    return schema;
+  };
 }
 
 // Mirror of `MASTRA_USER_KEY` from `@mastra/server`. Inlined to avoid a

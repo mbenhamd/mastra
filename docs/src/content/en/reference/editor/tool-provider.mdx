@@ -371,20 +371,63 @@ The decision is made when the tools resolve. A suspended call emits a `tool-call
 
 ### Share one catalog across users
 
-`resolveToolsVNext()` binds a single identity when the tools resolve. When one tool set is registered once and serves every caller, for example a tool search catalog built when the agent is constructed, use `resolveCatalogTools()` instead. It resolves the schemas once. On each call, `resolveIdentity` derives that call's Composio user ID and connected account from its own request context:
+`resolveToolsVNext()` binds a single identity when the tools resolve. When one tool set is registered once and serves every caller, for example a tool search catalog built when the agent is constructed, use `resolveCatalogTools()` instead. It resolves the schemas once. On each call, `resolveIdentity` derives that call's Composio user ID and connected account from its own request context.
+
+Derive the identity only from server-populated context, such as the authenticated user under `MASTRA_USER_KEY`. This example looks up the caller's account for the tool's toolkit in the application's own records:
 
 ```typescript title="src/mastra/tools/composio.ts"
-const tools = await composio.resolveCatalogTools({
+import { MASTRA_USER_KEY } from '@mastra/server/auth'
+import { ComposioToolProvider } from '@mastra/editor/composio'
+import { findConnectedAccount } from './connected-accounts'
+
+const composio = new ComposioToolProvider({
+  apiKey: process.env.COMPOSIO_API_KEY!,
+  requireToolApproval: tool => !tool.tags.includes('readOnlyHint'),
+})
+
+export const composioTools = await composio.resolveCatalogTools({
   toolSlugs: ['GMAIL_FETCH_EMAILS', 'GMAIL_SEND_EMAIL'],
   resolveIdentity: async ({ requestContext, toolkit }) => {
-    const user = requestContext?.get('user') as { id: string } | undefined
-    if (!user) return undefined
-    return { userId: `acme:${user.id}`, connectedAccountId: await accountFor(user.id, toolkit) }
+    const user = requestContext?.getRaw(MASTRA_USER_KEY)
+    if (
+      typeof user !== 'object' ||
+      user === null ||
+      !('id' in user) ||
+      typeof user.id !== 'string'
+    ) {
+      return undefined
+    }
+    const accountId = toolkit ? await findConnectedAccount(user.id, toolkit) : undefined
+    return accountId ? { userId: `acme:${user.id}`, connectedAccountId: accountId } : undefined
   },
 })
 ```
 
-Returning `undefined` refuses the call before it reaches Composio. Connection management tools need a session owned by the caller, so `resolveCatalogTools()` rejects them. `requireToolApproval` applies to catalog tools as well.
+<PropertiesTable
+  content={[
+  {
+    name: 'toolSlugs',
+    type: 'string[]',
+    description: 'Composio tool slugs to resolve. Connection management tools are rejected.',
+  },
+  {
+    name: 'toolMeta',
+    type: 'Record<string, { description?: string; toolkit?: string }>',
+    description: "Per-tool description overrides, and a toolkit used when Composio doesn't report one.",
+    isOptional: true,
+  },
+  {
+    name: 'resolveIdentity',
+    type: '(input: { requestContext?: RequestContext; toolSlug: string; toolkit?: string }) => ComposioCallIdentity | undefined | Promise<ComposioCallIdentity | undefined>',
+    description:
+      'Runs on every call. Returns `{ userId, connectedAccountId? }`. Without `connectedAccountId`, Composio picks an account within the user ID.',
+  },
+]}
+/>
+
+`resolveCatalogTools()` returns the tools keyed by slug. It throws when `toolSlugs` contains a connection management tool, because those tools need a session owned by the caller. A call throws before it reaches Composio when `resolveIdentity` returns `undefined`, a blank user ID, or the reserved ID `__mastra_catalog_schema__` that the schemas are fetched under. `requireToolApproval` applies to catalog tools as well.
+
+An approved call executes with the request context of the resumed run. Ensure that a resumed run carries the original caller's context.
 
 ### Connection management tools
 

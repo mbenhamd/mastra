@@ -1480,7 +1480,10 @@ describe('ComposioToolProvider — approval from Composio tags', () => {
 describe('ComposioToolProvider — shared catalog tools', () => {
   // PF-7867: a ToolSearch catalog is registered once per agent, so the same
   // tool object serves every caller. Each call must execute as its own user.
-  async function catalog(resolveIdentity: (input: { requestContext?: RequestContext }) => unknown) {
+  async function catalog(
+    resolveIdentity: (input: { requestContext?: RequestContext; toolkit?: string }) => unknown,
+    options: { reportedToolkit?: string; toolMeta?: Record<string, { toolkit?: string }> } = {},
+  ) {
     const { createTool } = await import('@mastra/core/tools');
     const { z } = await import('zod');
     const integration = new ComposioToolProvider({
@@ -1505,7 +1508,11 @@ describe('ComposioToolProvider — shared catalog tools', () => {
         const out: Record<string, unknown> = {};
         for (const slug of filters.tools) {
           const tags = slug === 'GMAIL_FETCH_EMAILS' ? ['readOnlyHint'] : ['createHint'];
-          await modifiers.modifySchema({ toolSlug: slug, toolkitSlug: 'gmail', schema: { slug, tags } });
+          await modifiers.modifySchema({
+            toolSlug: slug,
+            toolkitSlug: options.reportedToolkit ?? 'gmail',
+            schema: { slug, tags },
+          });
           out[slug] = createTool({
             id: slug,
             description: slug,
@@ -1515,7 +1522,8 @@ describe('ComposioToolProvider — shared catalog tools', () => {
               const params = (await modifiers.beforeExecute({
                 toolSlug: slug,
                 toolkitSlug: 'gmail',
-                params: { userId: fetchedAs, arguments: {} },
+                // A stale account id the identity must replace or clear.
+                params: { userId: fetchedAs, connectedAccountId: 'ca_stale', arguments: {} },
               })) as { userId?: string; connectedAccountId?: string };
               sent.push({ fetchedAs, userId: params.userId, connectedAccountId: params.connectedAccountId });
               return { ok: true };
@@ -1527,6 +1535,7 @@ describe('ComposioToolProvider — shared catalog tools', () => {
     );
     const tools = await integration.resolveCatalogTools({
       toolSlugs: ['GMAIL_FETCH_EMAILS', 'GMAIL_SEND_EMAIL'],
+      ...(options.toolMeta ? { toolMeta: options.toolMeta } : {}),
       resolveIdentity: input => resolveIdentity(input) as never,
     });
     return { tools, sent };
@@ -1557,6 +1566,57 @@ describe('ComposioToolProvider — shared catalog tools', () => {
     expect(sent).toEqual([]);
     expect((tools.GMAIL_SEND_EMAIL as { requireApproval?: boolean }).requireApproval).toBe(true);
     expect((tools.GMAIL_FETCH_EMAILS as { requireApproval?: boolean }).requireApproval).toBe(false);
+  });
+
+  it('keeps concurrent callers of one tool on their own identities', async () => {
+    const { tools, sent } = await catalog(async ({ requestContext }) => {
+      const user = requestContext?.get('user') as string;
+      // Alice resolves last, so her call starts first and finishes after Bob's.
+      await new Promise(resolve => setTimeout(resolve, user === 'alice' ? 20 : 0));
+      return { userId: `pf:${user}`, connectedAccountId: `ca_${user}` };
+    });
+    const read = tools.GMAIL_FETCH_EMAILS!;
+    await Promise.all(
+      ['alice', 'bob'].map(user =>
+        read.execute!({ q: 'x' }, { requestContext: createRequestContext({ user }) } as never),
+      ),
+    );
+    expect(sent.map(call => [call.userId, call.connectedAccountId])).toEqual([
+      ['pf:bob', 'ca_bob'],
+      ['pf:alice', 'ca_alice'],
+    ]);
+  });
+
+  it('clears a stale account id when the identity names none', async () => {
+    const { tools, sent } = await catalog(() => ({ userId: 'pf:alice' }));
+    await tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never);
+    expect(sent).toEqual([
+      { fetchedAs: '__mastra_catalog_schema__', userId: 'pf:alice', connectedAccountId: undefined },
+    ]);
+  });
+
+  it.each([
+    ['a blank user id', { userId: '   ' }],
+    ['the catalog schema bucket', { userId: '__mastra_catalog_schema__' }],
+  ])('refuses %s before reaching Composio', async (_label, identity) => {
+    const { tools, sent } = await catalog(() => identity);
+    await expect(
+      tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never),
+    ).rejects.toThrow('no execution identity');
+    expect(sent).toEqual([]);
+  });
+
+  it('hands resolveIdentity the toolMeta toolkit when Composio reports it as unknown', async () => {
+    const toolkits: Array<string | undefined> = [];
+    const { tools } = await catalog(
+      ({ toolkit }) => {
+        toolkits.push(toolkit);
+        return { userId: 'pf:alice' };
+      },
+      { reportedToolkit: 'unknown', toolMeta: { GMAIL_FETCH_EMAILS: { toolkit: 'gmail' } } },
+    );
+    await tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never);
+    expect(toolkits).toEqual(['gmail']);
   });
 
   it('rejects connection-management tools in a shared catalog', async () => {
