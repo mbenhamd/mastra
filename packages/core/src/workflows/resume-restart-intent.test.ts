@@ -493,9 +493,14 @@ describe('recovery after a crash during a direct nested-child resume (PF-7806)',
 
   // While a parent restart drives the child, a restart of the child on its own (another host's
   // sweep, or the same host's) is refused, so `gate` runs once, inside the parent's restart.
-  it.each([['another host'], ['the same host']])(
+  it.each([
+    ['another host', true],
+    ['the same host', true],
+    // Only the live lease of the parent's restart on host Y makes X defer.
+    ['another host that cannot recover the parent', false],
+  ])(
     'a sweep on %s while the parent restart drives the child leaves the child to the parent',
-    async where => {
+    async (where, xRegistersParent) => {
       const storage = new MockStore();
       const runId = await crashDuringDirectChildResume(storage);
       const store = (await storage.getStore('workflows'))!;
@@ -519,7 +524,10 @@ describe('recovery after a crash during a direct nested-child resume (PF-7806)',
       const parentRestart = (await y.parent.createRun({ runId })).restart();
       await within(reached.promise);
 
-      const x = where === 'the same host' ? y : childResumeHost(storage, { registerChild: true });
+      const x =
+        where === 'the same host'
+          ? y
+          : childResumeHost(storage, { registerParent: xRegistersParent, registerChild: true });
       await within(x.mastra.restartAllActiveWorkflowRuns());
       await expect(within((await x.nested.createRun({ runId })).restart())).rejects.toMatchObject({
         id: 'WORKFLOW_RESTART_DEFERRED_TO_PARENT',

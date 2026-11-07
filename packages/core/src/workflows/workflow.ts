@@ -3869,10 +3869,16 @@ export class Workflow<
           return;
         }
         if (error instanceof MastraError && error.id === 'WORKFLOW_RESTART_DEFERRED_TO_PARENT') {
-          this.logger.debug('Skipped restarting nested workflow run driven by its parent', {
-            workflowId: this.id,
-            runId: runSnapshot.runId,
-          });
+          this.logger.warn(
+            'Skipped restarting nested workflow run driven by its parent; it waits for the parent run to be restarted',
+            {
+              workflowId: this.id,
+              runId: runSnapshot.runId,
+              parentWorkflowId: error.details?.parentWorkflowId,
+              parentRunId: error.details?.parentRunId,
+              parentStepId: error.details?.parentStepId,
+            },
+          );
           return;
         }
         this.logger.error('Failed to restart workflow run', { workflowId: this.id, runId: runSnapshot.runId, error });

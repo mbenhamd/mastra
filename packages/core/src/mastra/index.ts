@@ -5025,13 +5025,24 @@ export class Mastra<
       if (error instanceof MastraError && error.id === 'WORKFLOW_RESTART_DEFERRED_TO_PARENT') {
         // The parent run drives this nested run. A parent held by a live process is re-checked
         // once its lease could have lapsed; otherwise this sweep restarts the parent itself.
-        this.#logger.debug('Skipped restarting nested workflow run driven by its parent', {
-          workflow: workflowName,
-          runId,
-        });
         const parentLeaseExpiresAt = error.details?.parentLeaseExpiresAt;
         const retryAt = typeof parentLeaseExpiresAt === 'string' ? Date.parse(parentLeaseExpiresAt) : NaN;
-        if (!Number.isNaN(retryAt)) this.#scheduleWorkflowRecoveryRecheck(workflowName, runId, retryAt);
+        const deferral = {
+          workflow: workflowName,
+          runId,
+          parentWorkflow: error.details?.parentWorkflowId,
+          parentRunId: error.details?.parentRunId,
+          parentStepId: error.details?.parentStepId,
+        };
+        if (!Number.isNaN(retryAt)) {
+          this.#logger.debug('Skipped restarting nested workflow run driven by its parent', deferral);
+          this.#scheduleWorkflowRecoveryRecheck(workflowName, runId, retryAt);
+          return;
+        }
+        this.#logger.warn(
+          'Skipped restarting nested workflow run driven by its parent; it waits for the parent run to be restarted',
+          deferral,
+        );
         return;
       }
       const context = { workflow: workflowName, runId, error };
