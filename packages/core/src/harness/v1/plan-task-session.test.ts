@@ -351,6 +351,33 @@ describe('plan task capacity counts only live tasks', () => {
     }
   });
 
+  it(`${PLAN_TASK_MAX_STORED_NODES} stored, completing an existing task -> accepted`, async () => {
+    const h = await setup();
+    const [target] = await seedPlan(h, { terminal: PLAN_TASK_MAX_STORED_NODES - 1, live: 1 });
+
+    const view = await planTaskComplete(h.port, target!);
+
+    expect(view.status).toBe('completed');
+    const after = await listAll(h.storage);
+    expect(after.size).toBe(PLAN_TASK_MAX_STORED_NODES);
+    expect(after.get(target!)?.status).toBe('completed');
+  });
+
+  it(`${PLAN_TASK_MAX_STORED_NODES} stored, add refused, reset -> add accepted`, async () => {
+    const h = await setup();
+    await seedPlan(h, { terminal: PLAN_TASK_MAX_STORED_NODES, live: 0 });
+    await expect(planTaskAdd(h.port, { content: 'refused' })).rejects.toThrow(/reached the limit of 1000 stored/);
+
+    // planTaskReset is the plan op Session.resetPlanTasks() commits.
+    const reset = await planTaskReset(h.port);
+    const view = await planTaskAdd(h.port, { content: 'fresh plan' });
+
+    expect(reset.deletedCount).toBe(PLAN_TASK_MAX_STORED_NODES);
+    const after = await listAll(h.storage);
+    expect(after.size).toBe(1);
+    expect(after.get(view.taskId)?.content).toBe('fresh plan');
+  });
+
   type ChangeRow = {
     live: number;
     attempt:
