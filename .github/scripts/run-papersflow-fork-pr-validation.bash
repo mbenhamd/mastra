@@ -5047,6 +5047,7 @@ run_validator_self_tests() {
     "$fixture_repo/workflows/inngest/src" \
     "$fixture_repo/workflows/temporal/src" \
     "$fixture_repo/packages/schema-compat/src/provider-compats" \
+    "$fixture_repo/packages/editor/src/providers" \
     "$fixture_repo/node_modules" \
     "$mock_bin"
   # The production validator is copied to RUNNER_TEMP and resolves TypeScript
@@ -5460,6 +5461,15 @@ run_validator_self_tests() {
     done
     printf '%s\n' "import { it } from 'vitest';" "it('openai live compat', () => {});" \
       > packages/schema-compat/src/provider-compats/openai.e2e.test.ts
+    printf '%s\n' '{}' > packages/editor/package.json
+    printf '%s\n' 'export const composioEntry = true;' > packages/editor/src/composio.ts
+    printf '%s\n' 'export const retiredEditorHelper = true;' > packages/editor/src/retired-helper.ts
+    printf '%s\n' 'export const composioProvider = true;' \
+      > packages/editor/src/providers/composio.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('composio provider', () => {});" \
+      > packages/editor/src/providers/composio.test.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('editor libsql', () => {});" \
+      > packages/editor/src/editor-libsql.integration.test.ts
     printf '%s\n' \
       'name: Fork validation fixture' \
       'jobs:' \
@@ -8033,6 +8043,91 @@ NODE
   assert_contains 'require a dedicated fork-safe workflow or suite-specific infrastructure' "$output"
   assert_contains 'packages/schema-compat/src/provider-compats/openai.e2e.test.ts' "$output"
   assert_not_contains '--dir packages/schema-compat exec vitest run' "$command_log"
+
+  # PF-7885: Editor is an owned workspace. Every edit builds the package with
+  # its workspace dependency graph, compiles and lints only the changed Editor
+  # files that exist at the head (the package-wide typecheck is broken on the
+  # base), and runs each changed unit test file. The LibSQL integration suite
+  # still fails closed before any test runs.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const composioProvider = "approval-catalog";' \
+      > packages/editor/src/providers/composio.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('composio approval catalog', () => {});" \
+      > packages/editor/src/providers/composio.test.ts
+    git add .
+    git commit -q -m 'exercise Editor owned workspace'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/editor-owned-workspace-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_not_contains 'do not have an owned fork-safe validation target' "$output"
+  assert_contains 'Running changed test file in full: packages/editor/src/providers/composio.test.ts' "$output"
+  assert_line_count 1 'turbo build --filter ./packages/editor' "$command_log"
+  assert_line_count 1 \
+    '--dir packages/editor exec tsc-files --noEmit src/providers/composio.test.ts src/providers/composio.ts' \
+    "$command_log"
+  assert_line_count 1 \
+    'exec oxlint --no-error-on-unmatched-pattern packages/editor/src/providers/composio.test.ts packages/editor/src/providers/composio.ts' \
+    "$command_log"
+  assert_line_matches \
+    '^--dir packages/editor exec vitest run --reporter=dot --reporter=json --outputFile\.json=[^ ]+ src/providers/composio\.test\.ts$' \
+    "$command_log"
+  assert_line_match_count 1 '^--dir packages/editor exec vitest run ' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const composioEntry = "approval-catalog";' > packages/editor/src/composio.ts
+    git rm -q packages/editor/src/retired-helper.ts
+    git add .
+    git commit -q -m 'exercise Editor source-only change with a deletion'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/editor-source-only-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'No changed test files detected. Build and type checks completed.' "$output"
+  assert_line_count 1 'turbo build --filter ./packages/editor' "$command_log"
+  # The deleted file never reaches the compiler or the linter.
+  assert_line_count 1 '--dir packages/editor exec tsc-files --noEmit src/composio.ts' "$command_log"
+  assert_line_count 1 \
+    'exec oxlint --no-error-on-unmatched-pattern packages/editor/src/composio.ts' \
+    "$command_log"
+  assert_not_contains 'retired-helper' "$command_log"
+  assert_not_contains '--dir packages/editor exec vitest run' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' "import { it } from 'vitest';" "it('editor libsql round trip', () => {});" \
+      > packages/editor/src/editor-libsql.integration.test.ts
+    git add .
+    git commit -q -m 'edit Editor LibSQL integration suite'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/editor-integration-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'Editor LibSQL integration fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'require a dedicated fork-safe workflow or suite-specific infrastructure' "$output"
+  assert_contains 'packages/editor/src/editor-libsql.integration.test.ts' "$output"
+  assert_not_contains '--dir packages/editor exec vitest run' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -14231,7 +14326,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/editor | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     packages/memory/integration-tests)
       # PF-4233 admits exactly one real-PostgreSQL suite from this nested,
       # separately locked package. Its manifest, lockfile, Vitest config,
@@ -15650,6 +15745,46 @@ if workspace_changed packages/schema-compat; then
   run_with_validation_budget 900 pnpm --filter ./packages/schema-compat --fail-if-no-match build
   run_with_validation_budget 600 pnpm --filter ./packages/schema-compat --fail-if-no-match exec tsc --noEmit
   run_with_validation_budget 600 pnpm --filter ./packages/schema-compat --fail-if-no-match lint
+fi
+
+if workspace_changed packages/editor; then
+  # PF-7885: Editor's tsdown build, its typecheck, and its tests resolve Core,
+  # Memory, Schema Compat, LibSQL, MCP, and Hono through their dist exports.
+  # Build the package together with its complete workspace dependency graph
+  # (turbo build depends on ^build) before compiling or testing it.
+  run_with_validation_budget 900 pnpm turbo build --filter ./packages/editor
+  # The package `typecheck` script (tsc --noEmit over src/**) fails on the
+  # pinned base with TS2590 in src/ee/agent-builder-agent.ts, unrelated to any
+  # PR that has reached this gate. Compile each changed Editor TypeScript file,
+  # production and test alike, with its import closure through tsc-files under
+  # the package compiler options instead. A changed file that reaches the
+  # broken module still fails here; the error is never filtered or ignored.
+  mapfile -t editor_typecheck_files < <(
+    while IFS= read -r file; do
+      if [[ "$file" =~ ^packages/editor/src/.*\.ts$ ]] && git_regular_file_at_head "$file"; then
+        printf '%s\n' "${file#packages/editor/}"
+      fi
+    done < "$changed_files"
+  )
+  if (( ${#editor_typecheck_files[@]} > 0 )); then
+    run_with_validation_budget 600 \
+      pnpm --dir packages/editor exec tsc-files --noEmit "${editor_typecheck_files[@]}"
+  fi
+  # The package declares no `lint` script and is not lint-clean on the base
+  # (mostly mastra(import-order)). Lint only the changed Editor sources with the
+  # root oxlint configuration, as MastraCode's changed-file gate does: a touched
+  # file must be clean, like the changed-file oxfmt check above, while untouched
+  # files keep their existing findings.
+  mapfile -t editor_lint_files < <(
+    while IFS= read -r file; do
+      if [[ "$file" =~ ^packages/editor/.*\.(ts|tsx|js|jsx|mjs|cjs)$ ]] && git_regular_file_at_head "$file"; then
+        printf '%s\n' "$file"
+      fi
+    done < "$changed_files"
+  )
+  if (( ${#editor_lint_files[@]} > 0 )); then
+    run_with_validation_budget 600 pnpm exec oxlint --no-error-on-unmatched-pattern "${editor_lint_files[@]}"
+  fi
 fi
 
 if workspace_changed packages/server; then

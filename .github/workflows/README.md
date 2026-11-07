@@ -194,7 +194,11 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   changes need their own reviewed validator lane. Unknown Client SDK sources and
   tests remain fail-closed. MCP runs its
   package typecheck, build, lint, and changed-test
-  coverage. Nested
+  coverage. Editor (PF-7885) builds with its workspace dependency graph, then
+  compiles and lints only its changed files that exist at the head, because the
+  package-wide typecheck and root oxlint both fail on the base; a touched file
+  must be clean. Changed unit tests run, and its LibSQL integration suite stays
+  fail-closed. Nested
   fixture manifests are not treated as workspace boundaries. The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and
   fails closed when a changed workspace has no owned fork-safe validation
