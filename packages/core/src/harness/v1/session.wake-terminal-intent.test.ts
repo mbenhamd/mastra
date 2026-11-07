@@ -248,7 +248,7 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
     await harness.shutdown();
   });
 
-  it('a targeted delegation_timeout cancel settles cancelled and its wake commits outcome cancelled', async () => {
+  it('a targeted cancel with the delegation_timeout reason settles cancelled and owes no notice', async () => {
     const db = new InMemoryDB();
     const { harness, parentAgent, childAgent } = buildHarness(db);
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
@@ -256,29 +256,82 @@ describe('settlement wake terminal intent (sessions.terminalHandoff.wakeFinalize
     const off = parent.subscribe(event => {
       if (event.type === 'agent_start') starts.push({ ...event });
     });
-    const { taskId, childId } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
+    try {
+      const { taskId, childId } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
 
-    // A targeted cancel with the timeout reason settles `cancelled` and, unlike
-    // the parent's own Stop/cancel, still owes the parent a settlement notice.
-    await parent.cancelSubagent({ subagentSessionId: childId, reason: 'delegation_timeout' });
-    await poll(() => reminderCalls(parentAgent).length === 1);
-    await poll(() => intents(db, wakeFinalizer.id).length === 1);
-    await parent.waitForIdle({ timeoutMs: 3000 });
-    off();
+      // The parent's own targeted cancel owes no notice, whatever its reason;
+      // only the driver's untargeted deadline cancel does.
+      await parent.cancelSubagent({ subagentSessionId: childId, reason: 'delegation_timeout' });
+      await poll(async () => (await planRow(parent, taskId))?.delegatedSubagentSessionId === undefined);
+      await parent.waitForIdle({ timeoutMs: 3000 });
 
-    const wakeStart = starts.find(start => start.origin === 'wake')!;
-    const [wake] = intents(db, wakeFinalizer.id);
-    expect(wake!.projection.payload).toEqual({
-      origin: 'wake',
-      wakeNoticeId: wakeStart.wakeNoticeId,
-      runId: wakeStart.runId,
-      taskId,
-      subagentSessionId: childId,
-      outcome: 'cancelled',
-      reply: { status: 'completed', text: 'woken reply' },
+      const settled = await planRow(parent, taskId);
+      expect(settled?.status).toBe('cancelled');
+      expect((settled?.metadata as any)?.mastraHarnessDelegationAttemptV1?.settlement).toMatchObject({
+        outcome: 'cancelled',
+      });
+      expect((settled?.metadata as any)?.mastraHarnessDelegationAttemptV1?.settlement?.notice).toBeUndefined();
+      expect(reminderCalls(parentAgent)).toHaveLength(0);
+      expect(intents(db, wakeFinalizer.id)).toHaveLength(0);
+      expect(starts.filter(start => start.origin === 'wake')).toHaveLength(0);
+    } finally {
+      off();
+      await harness.shutdown();
+    }
+  });
+
+  it('a targeted cancel landing after the result was read settles completed and still wakes the parent', async () => {
+    const db = new InMemoryDB();
+    const { harness, parentAgent, childAgent } = buildHarness(db);
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const starts: Array<Record<string, unknown>> = [];
+    const off = parent.subscribe(event => {
+      if (event.type === 'agent_start') starts.push({ ...event });
     });
-    expect((await planRow(parent, taskId))?.status).toBe('cancelled');
-    await harness.shutdown();
+    // The targeted cancel commits as the driver closes the child, after it read the result.
+    let cancelledOnClose = false;
+    const originalSession = harness.session.bind(harness);
+    vi.spyOn(harness, 'session').mockImplementation(async (options: any) => {
+      const resolved = await originalSession(options);
+      if (options.parentSessionId === parent.id) {
+        const originalClose = resolved.close.bind(resolved);
+        vi.spyOn(resolved, 'close').mockImplementation(async () => {
+          if (cancelledOnClose) return originalClose();
+          // The parent's own targeted cancel, as `cancelSubagent` records it.
+          await (resolved as any)._cancelInternal(
+            { reason: 'subagent_cancelled', requestedBy: parent.id },
+            parent.id,
+            undefined,
+            true,
+          );
+          cancelledOnClose = resolved.getRecord().cancelRequest?.targeted === true;
+          return originalClose();
+        });
+      }
+      return resolved;
+    });
+    try {
+      const { taskId, childId, releaseChild } = await delegateFromAdmittedTurn(parent, parentAgent, childAgent);
+
+      releaseChild();
+      await poll(() => reminderCalls(parentAgent).length === 1);
+      await poll(() => intents(db, wakeFinalizer.id).length === 1);
+      await parent.waitForIdle({ timeoutMs: 3000 });
+
+      expect(cancelledOnClose).toBe(true);
+      expect((await planRow(parent, taskId))?.status).toBe('completed');
+      const wakeStart = starts.find(start => start.origin === 'wake')!;
+      expect(intents(db, wakeFinalizer.id)[0]!.projection.payload).toMatchObject({
+        origin: 'wake',
+        wakeNoticeId: wakeStart.wakeNoticeId,
+        taskId,
+        subagentSessionId: childId,
+        outcome: 'completed',
+      });
+    } finally {
+      off();
+      await harness.shutdown();
+    }
   });
 
   it('a crash between the wake run end and its intent write is settled once on restart without re-running', async () => {
