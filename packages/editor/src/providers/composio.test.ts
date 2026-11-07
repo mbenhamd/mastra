@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { resolveStoredToolProviders } from '@mastra/core/tool-provider';
 import type { ToolProviders } from '@mastra/core/tool-provider';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── module mocks ────────────────────────────────────────────────────────
 // `vi.hoisted` because the mock factory below is hoisted above all other
@@ -63,11 +63,11 @@ vi.mock('@composio/mastra', () => ({
   },
 }));
 
-// Import after mocks are registered.
-import { ComposioToolProvider } from './composio';
 // Public entry-point surface (`@mastra/editor/composio`) — type-only imports
 // verify the resolver types are exported where consumers import them from.
 import type { ComposioUserIdResolver, ComposioUserIdResolverInput, ComposioToolProviderConfig } from '../composio';
+// Import after mocks are registered (vi.mock is hoisted either way).
+import { ComposioToolProvider } from './composio';
 
 function getRawInstance(): FakeComposioInstance {
   return composioInstances.find(i => !i.hasProvider)!;
