@@ -125,7 +125,7 @@ import { derivePredicateLabel, evaluatePredicate } from './predicate';
 import type { Predicate } from './predicate';
 import { claimWorkflowRestart, workflowRestartNotClaimedError } from './restart-claim';
 import { claimWorkflowResume, createWorkflowResumeIntent, getRestartableWorkflowResumeIntent } from './resume-claim';
-import { claimWorkflowRunOwnership, WORKFLOW_RUN_LEASE_TTL_MS } from './run-ownership';
+import { claimWorkflowRunOwnership } from './run-ownership';
 import type { WorkflowRunOwnership } from './run-ownership';
 import { validateCron } from './scheduler/cron';
 import type { WorkflowScheduleConfig } from './scheduler/types';
@@ -3607,11 +3607,17 @@ export class Workflow<
           Object.keys(nestedSnapshot.suspendedPaths ?? {}).length > 0
         ) {
           // The resume claim is only written by stores with atomic updates, so a claim-only
-          // snapshot implies one; compare-and-set so a concurrent caller's claim is not re-armed.
+          // snapshot implies one; compare-and-set on the lineage read here so a concurrent
+          // caller's claim or restart is not re-armed.
           const released = await workflowsStore!.updateWorkflowState({
             workflowName: this.id,
             runId: run.runId,
-            opts: { status: 'suspended', expectedStatus: nestedStatus },
+            opts: {
+              status: 'suspended',
+              expectedStatus: nestedStatus,
+              expectedExecutionGeneration: nestedSnapshot.executionGeneration ?? null,
+              expectedLifecycleResumeAttempt: nestedSnapshot.lifecycleResumeAttempt ?? 0,
+            },
           });
           if (released) {
             nestedStatus = 'suspended';
@@ -3857,6 +3863,13 @@ export class Workflow<
       } catch (error) {
         if (error instanceof MastraError && error.id === 'WORKFLOW_RESTART_RUN_OWNED') {
           this.logger.debug('Skipped restarting workflow run owned by a live process', {
+            workflowId: this.id,
+            runId: runSnapshot.runId,
+          });
+          return;
+        }
+        if (error instanceof MastraError && error.id === 'WORKFLOW_RESTART_DEFERRED_TO_PARENT') {
+          this.logger.debug('Skipped restarting nested workflow run driven by its parent', {
             workflowId: this.id,
             runId: runSnapshot.runId,
           });
@@ -7096,8 +7109,8 @@ export class Run<
     // resume instead of re-executing the suspended step without its input. Every
     // other running snapshot restarts from its recorded progress as before.
     const resumeIntent = getRestartableWorkflowResumeIntent(snapshot);
-    if (resumeIntent && this.parentWorkflow && !drivenByParent) {
-      await this.#deferToParentContinuingResume(workflowsStore, this.parentWorkflow);
+    if (this.parentWorkflow && !drivenByParent) {
+      await this.#deferToParentDriving(workflowsStore, this.parentWorkflow, resumeIntent);
     }
     const restartData = resumeIntent
       ? undefined
@@ -7240,35 +7253,62 @@ export class Run<
   }
 
   /**
-   * A nested run whose parent continues an accepted resume through it is
-   * recovered by the parent's restart; restarting it on its own as well would
-   * run the resumed step twice. Throws `WORKFLOW_RESTART_RUN_OWNED`, so the
-   * recovery sweep re-checks it later instead of failing.
+   * Nested runs take no ownership lease of their own: the parent's execution drives them. A
+   * restart of a nested run while its parent drives it, or will once its recovery restarts it,
+   * would execute the same steps twice, so it is refused with
+   * `WORKFLOW_RESTART_DEFERRED_TO_PARENT`.
+   *
+   * The parent drives this run when its row is active and either its current lineage runs this
+   * run's step or an accepted resume it continues targets this run. That parent is recovered
+   * when a live process holds its lease (the recovery sweep re-checks this run once the lease
+   * could have lapsed) or when this Mastra's recovery sweep restarts its workflow. Otherwise
+   * nothing would drive the parent, and this run restarts on its own as before.
    */
-  async #deferToParentContinuingResume(
+  async #deferToParentDriving(
     workflowsStore: WorkflowsStorage | undefined,
     parent: NestedWorkflowParent,
+    resumeIntent: WorkflowResumeIntentV1 | undefined,
   ): Promise<void> {
-    const parentSnapshot = await workflowsStore?.loadWorkflowSnapshot({
+    if (!workflowsStore) return;
+    const parentSnapshot = await workflowsStore.loadWorkflowSnapshot({
       workflowName: parent.workflowId,
       runId: parent.runId,
     });
-    const parentIntent = parentSnapshot ? getRestartableWorkflowResumeIntent(parentSnapshot) : undefined;
-    if (parentIntent?.steps[0] !== parent.stepId) return;
+    if (parentSnapshot?.status !== 'running' && parentSnapshot?.status !== 'waiting') return;
+    const parentStep = parentSnapshot.context?.[parent.stepId] as { status?: unknown } | undefined;
+    const parentIntent = getRestartableWorkflowResumeIntent(parentSnapshot);
+    const resumeTargetsThisRun =
+      parentIntent !== undefined &&
+      parentIntent.steps[0] === parent.stepId &&
+      parentIntent.forEachIndex === parent.foreachIndex &&
+      // The rest of the parent's resume path continues inside this run, so it must lead to the
+      // step this run resumes; an empty rest resumes this run's suspended step.
+      (resumeIntent === undefined ||
+        parentIntent.steps.slice(1).every((step, index) => resumeIntent.steps[index] === step));
+    if (parentStep?.status !== 'running' && !resumeTargetsThisRun) return;
+
+    const parentLease = (await workflowsStore.supportsRunFencing())
+      ? await workflowsStore.getRunOwnership({ runId: parent.runId })
+      : null;
+    const parentLeaseExpiresAt = parentLease?.live ? (parentLease.leaseExpiresAt?.toISOString() ?? null) : null;
+    if (!parentLease?.live && !this.#mastra?.__sweepRestartsWorkflow(parent.workflowId)) return;
+
     throw new MastraError({
-      id: 'WORKFLOW_RESTART_RUN_OWNED',
+      id: 'WORKFLOW_RESTART_DEFERRED_TO_PARENT',
       domain: ErrorDomain.MASTRA_WORKFLOW,
       category: ErrorCategory.USER,
       text:
-        `Workflow "${this.workflowId}" run "${this.runId}" continues a resume that its parent workflow ` +
-        `"${parent.workflowId}" run "${parent.runId}" is recovering, so it was not restarted on its own. ` +
+        `Workflow "${this.workflowId}" run "${this.runId}" is driven by its parent workflow ` +
+        `"${parent.workflowId}" run "${parent.runId}", so it was not restarted on its own. ` +
         `Restart the parent run instead.`,
       details: {
         workflowId: this.workflowId,
         runId: this.runId,
         parentWorkflowId: parent.workflowId,
         parentRunId: parent.runId,
-        leaseExpiresAt: new Date(Date.now() + WORKFLOW_RUN_LEASE_TTL_MS).toISOString(),
+        parentStepId: parent.stepId,
+        reason: 'driven_by_parent',
+        parentLeaseExpiresAt,
       },
     });
   }

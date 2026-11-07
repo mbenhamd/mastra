@@ -386,6 +386,86 @@ describe('restart() after a crash during a nested resume (PF-7806)', () => {
   });
 });
 
+/**
+ * A parent (`parent-flow`) whose only step is a nested workflow (`child-flow`): `gate` suspends
+ * until resumed with a note, then `after` runs. Both share the parent's run id.
+ */
+function childResumeHost(
+  storage: MastraStorage,
+  {
+    blockAfter = false,
+    registerParent = true,
+    registerChild = false,
+  }: { blockAfter?: boolean; registerParent?: boolean; registerChild?: boolean } = {},
+) {
+  const seen = { gate: [] as unknown[], after: [] as unknown[] };
+  const afterStarted = deferred();
+  const never = new Promise<never>(() => {});
+  const gate = createStep({
+    id: 'gate',
+    inputSchema: z.object({}),
+    outputSchema: z.object({ note: z.string() }),
+    resumeSchema: z.object({ note: z.string() }),
+    execute: async ({ resumeData, suspend }) => {
+      seen.gate.push(resumeData);
+      if (resumeData === undefined) return suspend({});
+      return resumeData;
+    },
+  });
+  const after = createStep({
+    id: 'after',
+    inputSchema: z.object({ note: z.string() }),
+    outputSchema: z.object({ note: z.string() }),
+    execute: async ({ inputData }) => {
+      seen.after.push(inputData);
+      afterStarted.resolve();
+      if (blockAfter) await never;
+      return inputData;
+    },
+  });
+  const nested = createWorkflow({
+    id: 'child-flow',
+    inputSchema: z.object({}),
+    outputSchema: z.object({ note: z.string() }),
+  })
+    .then(gate)
+    .then(after)
+    .commit();
+  const parent = createWorkflow({
+    id: 'parent-flow',
+    inputSchema: z.object({}),
+    outputSchema: z.object({ note: z.string() }),
+  })
+    .then(nested)
+    .commit();
+  const mastra = new Mastra({
+    logger: false,
+    storage,
+    workflows: {
+      ...(registerParent ? { 'parent-flow': parent } : {}),
+      ...(registerChild ? { 'child-flow': nested } : {}),
+    },
+  });
+  return { parent, nested, mastra, seen, afterStarted: afterStarted.promise };
+}
+
+/** Resumes the child directly and crashes the host while the step after the resumed one runs. */
+async function crashDuringDirectChildResume(storage: MastraStorage) {
+  const a = childResumeHost(storage, { blockAfter: true });
+  const runA = await a.parent.createRun();
+  expect((await runA.start({ inputData: {} })).status).toBe('suspended');
+  const childRun = await a.nested.createRun({ runId: runA.runId });
+  void childRun.resume({ step: 'gate', resumeData: { note: 'edited' } });
+  await a.afterStarted;
+  await crash(storage, runA.runId);
+  return runA.runId;
+}
+
+async function loadParent(storage: MastraStorage, runId: string) {
+  const store = (await storage.getStore('workflows'))!;
+  return store.loadWorkflowSnapshot({ workflowName: 'parent-flow', runId });
+}
+
 describe('recovery after a crash during a direct nested-child resume (PF-7806)', () => {
   // P2-2: resuming the child run directly claims the parent too, and the parent continues only
   // once the child settles. The parent's claim stores the resume through the child, so the
@@ -397,80 +477,90 @@ describe('recovery after a crash during a direct nested-child resume (PF-7806)',
     'the recovery sweep completes the parent and the child step sees the accepted data (%s)',
     async (_, registerChild) => {
       const storage = new MockStore();
-      const build = (blockAfter: boolean) => {
-        const seen = { gate: [] as unknown[], after: [] as unknown[] };
-        const afterStarted = deferred();
-        const never = new Promise<never>(() => {});
-        const gate = createStep({
-          id: 'gate',
-          inputSchema: z.object({}),
-          outputSchema: z.object({ note: z.string() }),
-          resumeSchema: z.object({ note: z.string() }),
-          execute: async ({ resumeData, suspend }) => {
-            seen.gate.push(resumeData);
-            if (resumeData === undefined) return suspend({});
-            return resumeData;
-          },
-        });
-        const after = createStep({
-          id: 'after',
-          inputSchema: z.object({ note: z.string() }),
-          outputSchema: z.object({ note: z.string() }),
-          execute: async ({ inputData }) => {
-            seen.after.push(inputData);
-            afterStarted.resolve();
-            if (blockAfter) await never;
-            return inputData;
-          },
-        });
-        const nested = createWorkflow({
-          id: 'child-flow',
-          inputSchema: z.object({}),
-          outputSchema: z.object({ note: z.string() }),
-        })
-          .then(gate)
-          .then(after)
-          .commit();
-        const parent = createWorkflow({
-          id: 'parent-flow',
-          inputSchema: z.object({}),
-          outputSchema: z.object({ note: z.string() }),
-        })
-          .then(nested)
-          .commit();
-        const mastra = new Mastra({
-          logger: false,
-          storage,
-          workflows: registerChild ? { 'parent-flow': parent, 'child-flow': nested } : { 'parent-flow': parent },
-        });
-        return { parent, nested, mastra, seen, afterStarted: afterStarted.promise };
-      };
+      const runId = await crashDuringDirectChildResume(storage);
 
-      const a = build(true);
-      const runA = await a.parent.createRun();
-      expect((await runA.start({ inputData: {} })).status).toBe('suspended');
-      const childRun = await a.nested.createRun({ runId: runA.runId });
-      void childRun.resume({ step: 'gate', resumeData: { note: 'edited' } });
-      await a.afterStarted;
-      await crash(storage, runA.runId);
-
-      const b = build(false);
+      const b = childResumeHost(storage, { registerChild });
       await within(b.mastra.restartAllActiveWorkflowRuns());
-      const store = (await storage.getStore('workflows'))!;
-      await vi.waitFor(
-        async () => {
-          const parentSnapshot = await store.loadWorkflowSnapshot({ workflowName: 'parent-flow', runId: runA.runId });
-          expect(parentSnapshot?.status).toBe('success');
-        },
-        { timeout: 10_000 },
-      );
-      const parentSnapshot = await store.loadWorkflowSnapshot({ workflowName: 'parent-flow', runId: runA.runId });
-      expect(parentSnapshot?.result).toEqual({ note: 'edited' });
+      await vi.waitFor(async () => expect((await loadParent(storage, runId))?.status).toBe('success'), {
+        timeout: 10_000,
+      });
+      expect((await loadParent(storage, runId))?.result).toEqual({ note: 'edited' });
       expect(b.seen.gate).toEqual([{ note: 'edited' }]);
       expect(b.seen.after).toEqual([{ note: 'edited' }]);
       await b.mastra.shutdown();
     },
   );
+
+  // While a parent restart drives the child, a restart of the child on its own (another host's
+  // sweep, or the same host's) is refused, so `gate` runs once, inside the parent's restart.
+  it.each([['another host'], ['the same host']])(
+    'a sweep on %s while the parent restart drives the child leaves the child to the parent',
+    async where => {
+      const storage = new MockStore();
+      const runId = await crashDuringDirectChildResume(storage);
+      const store = (await storage.getStore('workflows'))!;
+
+      // Pause the parent's restart where its nested step first reads the child's row: the
+      // parent has claimed its restart and recorded the nested step, the child is not taken yet.
+      const reached = deferred();
+      const release = deferred();
+      const load = store.loadWorkflowSnapshot.bind(store);
+      let paused = false;
+      vi.spyOn(store, 'loadWorkflowSnapshot').mockImplementation(async args => {
+        if (!paused && args.workflowName === 'child-flow') {
+          paused = true;
+          reached.resolve();
+          await release.promise;
+        }
+        return load(args);
+      });
+
+      const y = childResumeHost(storage, { registerChild: true });
+      const parentRestart = (await y.parent.createRun({ runId })).restart();
+      await within(reached.promise);
+
+      const x = where === 'the same host' ? y : childResumeHost(storage, { registerChild: true });
+      await within(x.mastra.restartAllActiveWorkflowRuns());
+      await expect(within((await x.nested.createRun({ runId })).restart())).rejects.toMatchObject({
+        id: 'WORKFLOW_RESTART_DEFERRED_TO_PARENT',
+        details: { reason: 'driven_by_parent', parentWorkflowId: 'parent-flow', parentStepId: 'child-flow' },
+      });
+      expect(x.seen.gate).toEqual([]);
+
+      release.resolve();
+      expect((await within(parentRestart)).status).toBe('success');
+      const gateRuns = x === y ? y.seen.gate : [...x.seen.gate, ...y.seen.gate];
+      const afterRuns = x === y ? y.seen.after : [...x.seen.after, ...y.seen.after];
+      expect(gateRuns).toEqual([{ note: 'edited' }]);
+      expect(afterRuns).toEqual([{ note: 'edited' }]);
+      expect((await loadParent(storage, runId))?.result).toEqual({ note: 'edited' });
+      await y.mastra.shutdown();
+      if (x !== y) await x.mastra.shutdown();
+    },
+  );
+
+  // P3-A: a host that cannot recover the parent (its workflow is not registered there) and sees
+  // no live parent lease does not wait for it: the child continues the accepted resume, and the
+  // parent completes from the settled child once a host that has it recovers it.
+  it('a sweep that cannot recover the parent continues the child instead of deferring', async () => {
+    const storage = new MockStore();
+    const runId = await crashDuringDirectChildResume(storage);
+
+    const childOnly = childResumeHost(storage, { registerParent: false, registerChild: true });
+    await within(childOnly.mastra.restartAllActiveWorkflowRuns());
+    expect(childOnly.seen.gate).toEqual([{ note: 'edited' }]);
+    expect(childOnly.seen.after).toEqual([{ note: 'edited' }]);
+
+    const parentOnly = childResumeHost(storage);
+    await within(parentOnly.mastra.restartAllActiveWorkflowRuns());
+    await vi.waitFor(async () => expect((await loadParent(storage, runId))?.status).toBe('success'), {
+      timeout: 10_000,
+    });
+    expect((await loadParent(storage, runId))?.result).toEqual({ note: 'edited' });
+    expect(parentOnly.seen.gate).toEqual([]);
+    await childOnly.mastra.shutdown();
+    await parentOnly.mastra.shutdown();
+  });
 });
 
 describe('restart() after a crash during a foreach iteration resume (PF-7806)', () => {
