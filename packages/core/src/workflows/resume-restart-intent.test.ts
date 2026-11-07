@@ -13,7 +13,7 @@
  * host whose step never returns and whose run-ownership lease is released.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import { Mastra } from '../mastra';
@@ -103,7 +103,12 @@ function hostWorkflow(engine: Engine, behaviour: HostBehaviour) {
   };
 }
 
-async function host(engine: Engine, storage: MastraStorage, behaviour: HostBehaviour) {
+async function host(
+  engine: Engine,
+  storage: MastraStorage,
+  behaviour: HostBehaviour,
+  { startWorkers = true }: { startWorkers?: boolean } = {},
+) {
   const h = hostWorkflow(engine, behaviour);
   const mastra = new Mastra({
     logger: false,
@@ -111,8 +116,17 @@ async function host(engine: Engine, storage: MastraStorage, behaviour: HostBehav
     workflows: { 'checkpoint-flow': h.workflow },
     ...(engine === 'evented' ? { pubsub: new EventEmitterPubSub() } : {}),
   });
-  if (engine === 'evented') await mastra.startWorkers();
+  if (engine === 'evented' && startWorkers) await mastra.startWorkers();
   return { ...h, mastra };
+}
+
+/** Rejects when `promise` has not settled in time, so a stalled run fails instead of hanging. */
+function within<T>(promise: Promise<T>, ms = 10_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`still pending after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -168,8 +182,9 @@ describe('restart() after a crash during a resume (PF-7806)', () => {
 
       // Host B restarts the run: the answer is applied, and B dies inside `publish`.
       const b = await host(engine, storage, { review: 'run', apply: 'run', publish: 'block' });
-      void (await b.workflow.createRun({ runId: runA.runId })).restart();
-      await b.started.publish;
+      // A restart that lost the answer settles (suspended) instead of reaching `publish`.
+      const restartB = (await b.workflow.createRun({ runId: runA.runId })).restart();
+      await Promise.race([b.started.publish, restartB]);
       expect(b.seen.review).toEqual([answer]);
       expect(b.seen.apply).toEqual([expectedDraft]);
       expect(b.seen.publish).toEqual([expectedDraft]);
@@ -187,6 +202,77 @@ describe('restart() after a crash during a resume (PF-7806)', () => {
       if (result.status === 'success') expect(result.result).toEqual({ published: expectedDraft });
     },
   );
+
+  // P3-1: the restart claim re-keys the stored answer to the lineage it installs, so a
+  // host that dies right after claiming the restart still leaves it for the next one.
+  it.each([
+    ['default', approve, 'v1'],
+    ['default', revise, 'v2-edited'],
+    ['evented', revise, 'v2-edited'],
+  ] as const)(
+    '%s engine: a host that dies right after its restart claim leaves the answer %o for the next one',
+    async (engine, answer, expectedDraft) => {
+      const storage = new MockStore();
+      const store = (await storage.getStore('workflows'))!;
+      const a = await host(engine, storage, { review: 'block', apply: 'run', publish: 'run' });
+      const runA = await a.workflow.createRun();
+      expect((await runA.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+      void runA.resume({ step: 'review', resumeData: answer });
+      await a.started.review;
+      await crash(storage, runA.runId, a.mastra);
+
+      // Host B claims the restart and dies before the continued step records anything: on
+      // the default engine its first step write never returns; the evented engine records
+      // the resumed step only when it settles, so B dies inside it.
+      const b = await host(engine, storage, {
+        review: engine === 'evented' ? 'block' : 'run',
+        apply: 'run',
+        publish: 'run',
+      });
+      const claimed = deferred();
+      const stepWrite = vi.spyOn(store, 'persistWorkflowStepUpdate');
+      if (engine === 'default') {
+        stepWrite.mockImplementationOnce(() => {
+          claimed.resolve();
+          return new Promise(() => {});
+        });
+      }
+      const restartB = (await b.workflow.createRun({ runId: runA.runId })).restart();
+      await within(Promise.race([engine === 'default' ? claimed.promise : b.started.review, restartB]));
+      stepWrite.mockRestore();
+      const afterClaim = await load(storage, runA.runId);
+      expect(afterClaim?.status).toBe('running');
+      expect(afterClaim?.context.review).toMatchObject({ status: 'suspended' });
+      await crash(storage, runA.runId, b.mastra);
+
+      const c = await host(engine, storage, { review: 'run', apply: 'run', publish: 'run' });
+      const result = await within((async () => (await c.workflow.createRun({ runId: runA.runId })).restart())());
+      if (engine === 'evented') await c.mastra.stopWorkers();
+      expect(c.seen.review).toEqual([answer]);
+      expect(c.seen.apply).toEqual([expectedDraft]);
+      expect(c.seen.publish).toEqual([expectedDraft]);
+      expect(result.status).toBe('success');
+      if (result.status === 'success') expect(result.result).toEqual({ published: expectedDraft });
+    },
+  );
+
+  // P2-1: continuing a resume dispatches a resume event, which needs running workers.
+  it('evented engine: a restart before startWorkers() continues the answer and settles', async () => {
+    const storage = new MockStore();
+    const a = await host('evented', storage, { review: 'block', apply: 'run', publish: 'run' });
+    const runA = await a.workflow.createRun();
+    expect((await runA.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+    void runA.resume({ step: 'review', resumeData: revise });
+    await a.started.review;
+    await crash(storage, runA.runId, a.mastra);
+
+    const b = await host('evented', storage, { review: 'run', apply: 'run', publish: 'run' }, { startWorkers: false });
+    const result = await within((async () => (await b.workflow.createRun({ runId: runA.runId })).restart())());
+    await b.mastra.stopWorkers();
+    expect(b.seen.review).toEqual([revise]);
+    expect(result.status).toBe('success');
+    if (result.status === 'success') expect(result.result).toEqual({ published: 'v2-edited' });
+  });
 
   it('re-executes a run that crashed before it ever suspended', async () => {
     const storage = new MockStore();
@@ -298,6 +384,93 @@ describe('restart() after a crash during a nested resume (PF-7806)', () => {
     expect(result.status).toBe('success');
     if (result.status === 'success') expect(result.result).toEqual({ approved: false, note: 'edited' });
   });
+});
+
+describe('recovery after a crash during a direct nested-child resume (PF-7806)', () => {
+  // P2-2: resuming the child run directly claims the parent too, and the parent continues only
+  // once the child settles. The parent's claim stores the resume through the child, so the
+  // recovery sweep continues the parent and, through it, the child exactly once.
+  it.each([
+    ['only the parent is registered', false],
+    ['the child is registered too', true],
+  ])(
+    'the recovery sweep completes the parent and the child step sees the accepted data (%s)',
+    async (_, registerChild) => {
+      const storage = new MockStore();
+      const build = (blockAfter: boolean) => {
+        const seen = { gate: [] as unknown[], after: [] as unknown[] };
+        const afterStarted = deferred();
+        const never = new Promise<never>(() => {});
+        const gate = createStep({
+          id: 'gate',
+          inputSchema: z.object({}),
+          outputSchema: z.object({ note: z.string() }),
+          resumeSchema: z.object({ note: z.string() }),
+          execute: async ({ resumeData, suspend }) => {
+            seen.gate.push(resumeData);
+            if (resumeData === undefined) return suspend({});
+            return resumeData;
+          },
+        });
+        const after = createStep({
+          id: 'after',
+          inputSchema: z.object({ note: z.string() }),
+          outputSchema: z.object({ note: z.string() }),
+          execute: async ({ inputData }) => {
+            seen.after.push(inputData);
+            afterStarted.resolve();
+            if (blockAfter) await never;
+            return inputData;
+          },
+        });
+        const nested = createWorkflow({
+          id: 'child-flow',
+          inputSchema: z.object({}),
+          outputSchema: z.object({ note: z.string() }),
+        })
+          .then(gate)
+          .then(after)
+          .commit();
+        const parent = createWorkflow({
+          id: 'parent-flow',
+          inputSchema: z.object({}),
+          outputSchema: z.object({ note: z.string() }),
+        })
+          .then(nested)
+          .commit();
+        const mastra = new Mastra({
+          logger: false,
+          storage,
+          workflows: registerChild ? { 'parent-flow': parent, 'child-flow': nested } : { 'parent-flow': parent },
+        });
+        return { parent, nested, mastra, seen, afterStarted: afterStarted.promise };
+      };
+
+      const a = build(true);
+      const runA = await a.parent.createRun();
+      expect((await runA.start({ inputData: {} })).status).toBe('suspended');
+      const childRun = await a.nested.createRun({ runId: runA.runId });
+      void childRun.resume({ step: 'gate', resumeData: { note: 'edited' } });
+      await a.afterStarted;
+      await crash(storage, runA.runId);
+
+      const b = build(false);
+      await within(b.mastra.restartAllActiveWorkflowRuns());
+      const store = (await storage.getStore('workflows'))!;
+      await vi.waitFor(
+        async () => {
+          const parentSnapshot = await store.loadWorkflowSnapshot({ workflowName: 'parent-flow', runId: runA.runId });
+          expect(parentSnapshot?.status).toBe('success');
+        },
+        { timeout: 10_000 },
+      );
+      const parentSnapshot = await store.loadWorkflowSnapshot({ workflowName: 'parent-flow', runId: runA.runId });
+      expect(parentSnapshot?.result).toEqual({ note: 'edited' });
+      expect(b.seen.gate).toEqual([{ note: 'edited' }]);
+      expect(b.seen.after).toEqual([{ note: 'edited' }]);
+      await b.mastra.shutdown();
+    },
+  );
 });
 
 describe('restart() after a crash during a foreach iteration resume (PF-7806)', () => {

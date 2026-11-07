@@ -112,4 +112,45 @@ describe('PF-2216 resumed nested step payload', () => {
     expect(seen).toEqual([false]);
     if (restarted.status === 'success') expect(restarted.result).toEqual({ approved: false });
   });
+
+  it('never runs the resumed nested step without its payload when the claim stored none', async () => {
+    // Fail-closed pin: a store without atomic claims, or a claim written before PF-7806, leaves a
+    // `running` row whose resumed step is still suspended and no stored payload. restart() must
+    // fail the run rather than run the step with a missing payload.
+    const storage1 = new MockStore();
+    let markRunning!: () => void;
+    const running = new Promise<void>(resolve => (markRunning = resolve));
+    const p1 = build(async () => {
+      markRunning();
+      await new Promise(() => {});
+    });
+    new Mastra({ logger: false, storage: storage1, workflows: { parent: p1.parent, nested: p1.nested } });
+    const run1 = await p1.parent.createRun();
+    expect((await run1.start({ inputData: {} })).status).toBe('suspended');
+    void run1.resume({ step: ['nested', 'gate'], resumeData: false });
+    await running;
+
+    const store1 = (await storage1.getStore('workflows'))!;
+    const storage2 = new MockStore();
+    const store2 = (await storage2.getStore('workflows'))!;
+    for (const name of ['parent', 'nested']) {
+      const snapshot = await store1.loadWorkflowSnapshot({ workflowName: name, runId: run1.runId });
+      const { resumeIntent: _none, ...withoutIntent } = snapshot!;
+      await store2.persistWorkflowSnapshot({
+        workflowName: name,
+        runId: run1.runId,
+        snapshot: JSON.parse(JSON.stringify(withoutIntent)),
+      });
+    }
+
+    const seen: unknown[] = [];
+    const p2 = build(async data => {
+      seen.push(data);
+    });
+    new Mastra({ logger: false, storage: storage2, workflows: { parent: p2.parent, nested: p2.nested } });
+    const restarted = await (await p2.parent.createRun({ runId: run1.runId })).restart();
+
+    expect(restarted.status).toBe('failed');
+    expect(seen).toEqual([]);
+  });
 });

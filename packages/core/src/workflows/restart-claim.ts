@@ -1,7 +1,7 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { WorkflowsStorage } from '../storage/domains/workflows/base';
 import type { WorkflowExecutionGeneration, WorkflowStepLifecycleStateMap } from './lifecycle-events';
-import type { WorkflowRunState } from './types';
+import type { WorkflowResumeIntentV1, WorkflowRunState } from './types';
 
 /**
  * Atomically adopts a new lifecycle generation for a restart or time-travel
@@ -23,6 +23,7 @@ export async function claimWorkflowRestart({
   lifecycleExecution,
   workflowId,
   runId,
+  resumeIntent,
 }: {
   workflowsStore: WorkflowsStorage | undefined;
   snapshot: WorkflowRunState;
@@ -33,8 +34,25 @@ export async function claimWorkflowRestart({
   };
   workflowId: string;
   runId: string;
+  /**
+   * The accepted resume this restart continues (PF-7806). The claim re-keys it
+   * to the lineage it installs, so a crash before the continued step records
+   * its own progress still leaves it restartable.
+   */
+  resumeIntent?: WorkflowResumeIntentV1;
 }): Promise<void> {
   if (!workflowsStore) return;
+
+  const carriedIntent =
+    resumeIntent === undefined
+      ? {}
+      : {
+          resumeIntent: {
+            ...resumeIntent,
+            executionGeneration: lifecycleExecution.executionGeneration,
+            lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
+          },
+        };
 
   const concurrentCas = workflowsStore.supportsConcurrentUpdates();
   if (!concurrentCas) {
@@ -51,6 +69,7 @@ export async function claimWorkflowRestart({
           executionGeneration: lifecycleExecution.executionGeneration,
           lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
           lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
+          ...carriedIntent,
         },
       });
     } else {
@@ -63,6 +82,7 @@ export async function claimWorkflowRestart({
           executionGeneration: lifecycleExecution.executionGeneration,
           lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
           lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
+          ...carriedIntent,
         },
       });
     }
@@ -76,6 +96,7 @@ export async function claimWorkflowRestart({
       executionGeneration: lifecycleExecution.executionGeneration,
       lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
       lifecycleStepStates: lifecycleExecution.lifecycleStepStates,
+      ...carriedIntent,
       expectedStatus: snapshot.status,
       // A pre-upgrade `running` snapshot carries no lineage fields, so
       // name the absent generation explicitly: the guard then fails for a

@@ -125,7 +125,7 @@ import { derivePredicateLabel, evaluatePredicate } from './predicate';
 import type { Predicate } from './predicate';
 import { claimWorkflowRestart, workflowRestartNotClaimedError } from './restart-claim';
 import { claimWorkflowResume, createWorkflowResumeIntent, getRestartableWorkflowResumeIntent } from './resume-claim';
-import { claimWorkflowRunOwnership } from './run-ownership';
+import { claimWorkflowRunOwnership, WORKFLOW_RUN_LEASE_TTL_MS } from './run-ownership';
 import type { WorkflowRunOwnership } from './run-ownership';
 import { validateCron } from './scheduler/cron';
 import type { WorkflowScheduleConfig } from './scheduler/types';
@@ -3643,7 +3643,7 @@ export class Workflow<
           perStep,
         });
       } else if (restartNested) {
-        res = await run.restart({
+        res = await run.restartNestedByParent({
           requestContext,
           actor,
           ...observabilityContext,
@@ -6275,6 +6275,15 @@ export class Run<
   }
 
   /**
+   * Restarts a nested run from its parent's execution, which owns the
+   * continuation of an accepted resume (PF-7806).
+   * @internal
+   */
+  async restartNestedByParent(params: Parameters<this['restart']>[0] = {}) {
+    return this._restart({ ...params, drivenByParent: true });
+  }
+
+  /**
    * Resumes a run whose suspension the caller already claimed (`suspended -> running`) in storage.
    * Skips the built-in claim and the `suspended` status check, which a claimed run no longer passes.
    * @internal
@@ -6454,6 +6463,7 @@ export class Run<
     workflowsStore,
     snapshot,
     lifecycleExecution,
+    resumeIntent,
   }: {
     workflowsStore: WorkflowsStorage | undefined;
     snapshot: WorkflowRunState;
@@ -6462,6 +6472,7 @@ export class Run<
       lifecycleResumeAttempt: number;
       lifecycleStepStates: WorkflowStepLifecycleStateMap;
     };
+    resumeIntent?: WorkflowResumeIntentV1;
   }): Promise<void> {
     await claimWorkflowRestart({
       workflowsStore,
@@ -6469,6 +6480,7 @@ export class Run<
       lifecycleExecution,
       workflowId: this.workflowId,
       runId: this.runId,
+      resumeIntent,
     });
     await this.preserveClaimedLifecycleCancellation({ workflowsStore, lifecycleExecution });
   }
@@ -6868,6 +6880,15 @@ export class Run<
           workflowsStore,
           snapshot: parentSnapshot,
           executionGeneration: parentGeneration,
+          // The parent continues only after the child settles, and only in this process. Its
+          // claim records the resume through the child, so a restart of the parent continues it.
+          resumeIntent: createWorkflowResumeIntent({
+            snapshot: parentSnapshot,
+            executionGeneration: parentGeneration,
+            steps: [this.parentWorkflow.stepId, ...steps],
+            resumePayload: resumeDataToUse,
+            forEachIndex: this.parentWorkflow.foreachIndex,
+          }),
         });
         claimedParent = { run: parentRun, snapshot: parentSnapshot, generation: parentGeneration };
       } catch (error) {
@@ -6995,6 +7016,7 @@ export class Run<
     tracingOptions,
     outputOptions,
     actor,
+    drivenByParent,
     ...rest
   }: {
     requestContext?: RequestContext<TRequestContext>;
@@ -7005,6 +7027,8 @@ export class Run<
       includeResumeLabels?: boolean;
     };
     actor?: ActorSignal;
+    /** @internal Set by the parent execution that drives this nested run. */
+    drivenByParent?: boolean;
   } & Partial<ObservabilityContext>): Promise<WorkflowResult<TState, TInput, TOutput, TSteps>> {
     this.assertDurableLifecycleOperation('restart');
     const observabilityContext = resolveObservabilityContext(rest);
@@ -7072,6 +7096,9 @@ export class Run<
     // resume instead of re-executing the suspended step without its input. Every
     // other running snapshot restarts from its recorded progress as before.
     const resumeIntent = getRestartableWorkflowResumeIntent(snapshot);
+    if (resumeIntent && this.parentWorkflow && !drivenByParent) {
+      await this.#deferToParentContinuingResume(workflowsStore, this.parentWorkflow);
+    }
     const restartData = resumeIntent
       ? undefined
       : createRestartExecutionParams({ snapshot, graph: this.executionGraph });
@@ -7130,6 +7157,7 @@ export class Run<
         workflowsStore,
         snapshot,
         lifecycleExecution,
+        resumeIntent,
       });
     } catch (error) {
       workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
@@ -7200,9 +7228,49 @@ export class Run<
       this.cleanup?.();
     }
 
+    // A child resumed directly whose parent claim was never written (the process died between
+    // the two claims) wakes the still-suspended parent, as the completed resume would have.
+    if (resumeIntent && !drivenByParent && result.status === 'success') {
+      this.#wakeParentWorkflow({ requestContext: requestContextToUse, actor });
+    }
+
     result.traceId = traceId;
     result.spanId = spanId;
     return result;
+  }
+
+  /**
+   * A nested run whose parent continues an accepted resume through it is
+   * recovered by the parent's restart; restarting it on its own as well would
+   * run the resumed step twice. Throws `WORKFLOW_RESTART_RUN_OWNED`, so the
+   * recovery sweep re-checks it later instead of failing.
+   */
+  async #deferToParentContinuingResume(
+    workflowsStore: WorkflowsStorage | undefined,
+    parent: NestedWorkflowParent,
+  ): Promise<void> {
+    const parentSnapshot = await workflowsStore?.loadWorkflowSnapshot({
+      workflowName: parent.workflowId,
+      runId: parent.runId,
+    });
+    const parentIntent = parentSnapshot ? getRestartableWorkflowResumeIntent(parentSnapshot) : undefined;
+    if (parentIntent?.steps[0] !== parent.stepId) return;
+    throw new MastraError({
+      id: 'WORKFLOW_RESTART_RUN_OWNED',
+      domain: ErrorDomain.MASTRA_WORKFLOW,
+      category: ErrorCategory.USER,
+      text:
+        `Workflow "${this.workflowId}" run "${this.runId}" continues a resume that its parent workflow ` +
+        `"${parent.workflowId}" run "${parent.runId}" is recovering, so it was not restarted on its own. ` +
+        `Restart the parent run instead.`,
+      details: {
+        workflowId: this.workflowId,
+        runId: this.runId,
+        parentWorkflowId: parent.workflowId,
+        parentRunId: parent.runId,
+        leaseExpiresAt: new Date(Date.now() + WORKFLOW_RUN_LEASE_TTL_MS).toISOString(),
+      },
+    });
   }
 
   protected async _timeTravel<TInput>({

@@ -233,6 +233,10 @@ export class EventedExecutionEngine extends ExecutionEngine {
         await pubsub.unsubscribe('workflows-finish', finishCb);
         resolveResult({ prevResult: { status: 'canceled' }, stepResults: {}, state: {} });
       } else if (params.resume) {
+        // restart() continues an accepted resume through this branch (PF-7806), and a
+        // restart can run before startWorkers() (see the restart branch below). Starting
+        // the workers is a no-op when they already run or are disabled.
+        await this.mastra?.__ensureExecutionWorkersStarted();
         const prevStepId = getStepId(this.resolveWorkflow(params.workflowId, params.runId), params.resume.resumePath);
         const prevResult = params.resume.stepResults[prevStepId ?? 'input'];
         // Extract state from stepResults.__state or use initialState
