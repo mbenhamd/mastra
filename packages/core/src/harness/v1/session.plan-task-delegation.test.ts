@@ -275,10 +275,24 @@ describe('task_delegate — with or without taskId', () => {
     withAddedTaskId?: true;
     /** Agent run id; defaults to the shared run. */
     runId?: string;
+    /** Let every child started so far finish, and wait until the target task's delegation completed. */
+    settleTargetFirst?: true;
+    /** With `settleTargetFirst`, then set the completed target task back to pending. */
+    reopenTargetFirst?: true;
   };
   type ResultSummary =
     | { ok: true; taskId: 'target' | 'other'; sameChildAsFirstSuccess: boolean }
-    | { ok: false; errorName: string; field?: string; namesAddedTask: boolean; retryHint: boolean };
+    | {
+        ok: false;
+        errorName: string;
+        field?: string;
+        namesAddedTask: boolean;
+        retryHint: boolean;
+        /** Set when the refusal names a subagent session: its code and outcome, and whether it is the target's completed child. */
+        code?: string;
+        outcome?: string;
+        namesCompletedChild?: boolean;
+      };
   type Row = {
     name: string;
     /** Start with one task added by task_add. */
@@ -306,6 +320,8 @@ describe('task_delegate — with or without taskId', () => {
       lastChildReceives?: string;
       /** Whether any child session was created or reached its model. */
       childStarted?: boolean;
+      /** How many child sessions the calls created. */
+      childSessionsCreated?: number;
     };
   };
 
@@ -323,6 +339,15 @@ describe('task_delegate — with or without taskId', () => {
     ...(extra.field !== undefined ? { field: extra.field } : {}),
     namesAddedTask: extra.namesAddedTask ?? false,
     retryHint: extra.retryHint ?? false,
+  });
+  const refusedAsCompleted = (extra: { namesAddedTask?: boolean } = {}): ResultSummary => ({
+    ok: false,
+    errorName: 'HarnessDelegationAlreadyCompletedError',
+    namesAddedTask: extra.namesAddedTask ?? false,
+    retryHint: false,
+    code: 'harness.delegation_already_completed',
+    outcome: 'completed',
+    namesCompletedChild: true,
   });
 
   const rows: Row[] = [
@@ -397,6 +422,60 @@ describe('task_delegate — with or without taskId', () => {
         results: [refused('HarnessError'), ok(), refused('HarnessValidationError', { field: 'taskId' })],
         targetLinked: true,
         lastChildReceives: 'Different instructions',
+      },
+    },
+    {
+      name: "a replay after another run's child completed the task is refused and names that child",
+      failChildCreationOnce: true,
+      calls: [
+        { task: 'Original instructions', runId: 'run1', toolCallId: 'call1' },
+        { task: 'Different instructions', withAddedTaskId: true, runId: 'run2', toolCallId: 'call1' },
+        { task: 'Original instructions', runId: 'run1', toolCallId: 'call1', settleTargetFirst: true },
+      ],
+      expected: {
+        addedTitles: ['Original instructions'],
+        results: [refused('HarnessError'), ok(), refusedAsCompleted({ namesAddedTask: true })],
+        targetLinked: false,
+        childSessionsCreated: 1,
+      },
+    },
+    {
+      name: 'with taskId a task whose delegation completed is refused and names the completed child',
+      existingTask: true,
+      calls: [
+        { withExistingTaskId: true, task: 'Summarize the trial.' },
+        {
+          withExistingTaskId: true,
+          task: 'Summarize the trial.',
+          toolCallId: 'tc-delegate-2',
+          settleTargetFirst: true,
+        },
+      ],
+      expected: {
+        addedTitles: [],
+        results: [ok(), refusedAsCompleted()],
+        targetLinked: false,
+        childSessionsCreated: 1,
+      },
+    },
+    {
+      name: 'a task reopened after its delegation completed can be delegated again',
+      existingTask: true,
+      calls: [
+        { withExistingTaskId: true, task: 'Summarize the trial.' },
+        {
+          withExistingTaskId: true,
+          task: 'Summarize the trial.',
+          toolCallId: 'tc-delegate-2',
+          settleTargetFirst: true,
+          reopenTargetFirst: true,
+        },
+      ],
+      expected: {
+        addedTitles: [],
+        results: [ok(), ok(false)],
+        targetLinked: true,
+        childSessionsCreated: 2,
       },
     },
     {
@@ -544,16 +623,16 @@ describe('task_delegate — with or without taskId', () => {
       (await caller._internalStorage.listPlanTasks({ sessionId: caller.id, limit: 100 })).tasks;
     const before = new Set((await listTasks()).map(t => t.taskId));
 
+    let childCreations = 0;
+    const originalSession = harness.session.bind(harness);
+    vi.spyOn(harness, 'session').mockImplementation(async (args: any) => {
+      if (args.parentSessionId === caller.id) childCreations++;
+      return originalSession(args);
+    });
     if (row.failChildCreationOnce) {
       vi.spyOn(harness, 'session').mockRejectedValueOnce(new Error('transient storage failure'));
     }
-    let childCreations = 0;
     if (row.stopDuringAdd) {
-      const originalSession = harness.session.bind(harness);
-      vi.spyOn(harness, 'session').mockImplementation(async (args: any) => {
-        if (args.parentSessionId === caller.id) childCreations++;
-        return originalSession(args);
-      });
       // Hold the add before it enters the plan-task write queue, so Stop can
       // run to completion while the add is pending.
       const originalAdd = caller._planTaskAdd.bind(caller);
@@ -592,6 +671,26 @@ describe('task_delegate — with or without taskId', () => {
         await poll(async () => (await planRow(caller, blockerTaskId!))?.status === 'completed');
         await poll(() => caller._internalSubagentExecutionsInFlight === 0);
       }
+      if (call.settleTargetFirst) {
+        const startedChildren = childCreations;
+        await poll(() => childAgent.streamCalls.length >= startedChildren);
+        releases.slice(0, startedChildren).forEach(release => release());
+        const settledTargetId = row.calls.some(c => c.withExistingTaskId)
+          ? existing
+          : (await listTasks()).find(t => !before.has(t.taskId))?.taskId;
+        await poll(async () => {
+          const settled = await planRow(caller, settledTargetId!);
+          return settled?.status === 'completed' && settled.delegatedSubagentSessionId === undefined;
+        });
+        await poll(() => caller._internalSubagentExecutionsInFlight === 0);
+        if (call.reopenTargetFirst) {
+          const reopened = (await tools[TASK_UPDATE_TOOL_ID]!.execute!(
+            { taskId: settledTargetId, status: 'pending' } as any,
+            toolCtx,
+          )) as any;
+          expect(reopened.isError).toBeFalsy();
+        }
+      }
       results.push(await run(call));
     }
 
@@ -599,6 +698,8 @@ describe('task_delegate — with or without taskId', () => {
     const targetId = row.calls.some(call => call.withExistingTaskId) ? existing : added[0]?.taskId;
     const target = targetId === undefined ? undefined : await planRow(caller, targetId);
     const firstSuccess = results.find(r => !r.isError && r.error !== true);
+    const completedChildId =
+      target === undefined ? undefined : readDelegationAttemptMetadata(target)?.subagentSessionId;
     const summary = {
       addedTitles: added.map(t => t.content),
       results: results.map(
@@ -619,6 +720,15 @@ describe('task_delegate — with or without taskId', () => {
                   ...(r.field !== undefined ? { field: r.field } : {}),
                   namesAddedTask: r.taskId !== undefined && r.taskId === added[0]?.taskId,
                   retryHint: /retry task_delegate with taskId "[^"]+" and the same `task`/.test(r.message ?? ''),
+                  ...(r.subagentSessionId === undefined
+                    ? {}
+                    : {
+                        code: r.code,
+                        outcome: r.outcome,
+                        namesCompletedChild:
+                          r.subagentSessionId === completedChildId &&
+                          (r.message ?? '').includes(`"${completedChildId}"`),
+                      }),
                 }
               : {
                   ok: true,
@@ -630,6 +740,7 @@ describe('task_delegate — with or without taskId', () => {
       ...(row.expected.childStarted === undefined
         ? {}
         : { childStarted: childCreations > 0 || childAgent.streamCalls.length > 0 }),
+      ...(row.expected.childSessionsCreated === undefined ? {} : { childSessionsCreated: childCreations }),
       ...(row.expected.lastChildReceives === undefined
         ? {}
         : {
@@ -647,6 +758,29 @@ describe('task_delegate — with or without taskId', () => {
     expect(added.map(t => t.parentTaskId)).toEqual(added.map(() => undefined));
 
     releases.forEach(release => release());
+    close();
+    await harness.shutdown();
+  });
+
+  it('without taskId and without task, a call that skipped input validation gets a typed refusal and adds no task', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const close = await openParentTurn(parent, parentAgent);
+    const tools = createPlanTaskTools(parent);
+    // A resumed call skips the tool's input schema, so `execute` reaches the
+    // task_delegate body with neither `taskId` nor `task`.
+    const result = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!({ agentType: 'worker' } as any, {
+      ...agentCallCtx('tc-no-task'),
+      resumeData: {},
+    })) as any;
+    expect(result).toEqual({
+      isError: true,
+      errorName: 'HarnessValidationError',
+      field: 'task',
+      reason: 'is required when taskId is omitted',
+      message: 'HarnessValidationError at task: is required when taskId is omitted',
+    });
+    expect((await parent._internalStorage.listPlanTasks({ sessionId: parent.id, limit: 100 })).tasks).toEqual([]);
     close();
     await harness.shutdown();
   });
@@ -3814,6 +3948,19 @@ describe('cancelSubagent (§SA1)', () => {
 
     // The delegation driver maps the parent's own cancel → a CANCELLED plan task.
     await poll(async () => (await planRow(parent, task.taskId))?.status === 'cancelled');
+    await poll(() => parent._internalSubagentExecutionsInFlight === 0);
+
+    // A cancelled delegation does not count as completed work: delegating the
+    // task again starts a new child.
+    const reopen = await openParentTurn(parent, parentAgent);
+    const retry = (await tools[TASK_DELEGATE_TOOL_ID]!.execute!(
+      { taskId: task.taskId, agentType: 'worker' } as any,
+      toolCtx,
+    )) as any;
+    expect(retry.isError).toBeFalsy();
+    expect(retry.subagentSessionId).not.toBe(childId);
+    await poll(async () => (await planRow(parent, task.taskId))?.status === 'completed');
+    reopen();
     await harness.shutdown();
   });
 

@@ -24519,7 +24519,8 @@ export class Session {
    * durably link it (`delegatedSubagentSessionId`), drive the task `in_progress`,
    * and arm the live completion hook. Returns the view + the created subagent
    * session id. Throws `HarnessValidationError`,
-   * `HarnessSubagentDepthExceededError`, or
+   * `HarnessDelegationAlreadyCompletedError` (the task's latest delegation
+   * completed), `HarnessSubagentDepthExceededError`, or
    * `HarnessSubagentConcurrencyLimitError` BEFORE any plan-task or session
    * mutation so a rejected delegation is a no-op. `admissionEpoch`, from
    * `_planTaskDelegatePreflight`, admits this delegation under the epoch the
