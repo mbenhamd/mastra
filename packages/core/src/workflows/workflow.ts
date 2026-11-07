@@ -124,7 +124,7 @@ import { validateTemplate } from './mapping-template';
 import { derivePredicateLabel, evaluatePredicate } from './predicate';
 import type { Predicate } from './predicate';
 import { claimWorkflowRestart, workflowRestartNotClaimedError } from './restart-claim';
-import { claimWorkflowResume } from './resume-claim';
+import { claimWorkflowResume, createWorkflowResumeIntent, getRestartableWorkflowResumeIntent } from './resume-claim';
 import { claimWorkflowRunOwnership } from './run-ownership';
 import type { WorkflowRunOwnership } from './run-ownership';
 import { validateCron } from './scheduler/cron';
@@ -165,6 +165,7 @@ import type {
   WorkflowResult,
   WorkflowType,
   WorkflowRunState,
+  WorkflowResumeIntentV1,
   NestedWorkflowParent,
   WorkflowRunStatus,
   WorkflowState,
@@ -6422,15 +6423,19 @@ export class Run<
     workflowsStore,
     snapshot,
     executionGeneration,
+    resumeIntent,
   }: {
     workflowsStore: WorkflowsStorage | undefined;
     snapshot: WorkflowRunState;
     executionGeneration: string;
+    /** Resume input stored with the claim so `restart()` can continue this resume after a crash. */
+    resumeIntent?: WorkflowResumeIntentV1;
   }): Promise<void> {
     await claimWorkflowResume({
       workflowsStore,
       snapshot,
       executionGeneration,
+      resumeIntent,
       workflowId: this.workflowId,
       runId: this.runId,
       logger: this.#mastra?.getLogger(),
@@ -6784,7 +6789,21 @@ export class Run<
     // durable attempt every fenced write of this execution checks against.
     if (!params.claimedSnapshot) {
       try {
-        await this.claimResume({ workflowsStore, snapshot, executionGeneration: loadedExecutionGeneration });
+        await this.claimResume({
+          workflowsStore,
+          snapshot,
+          executionGeneration: loadedExecutionGeneration,
+          // Storage keeps the resumed step suspended until it settles, so the claim is the
+          // only durable record of this input: restart() continues the resume from it.
+          resumeIntent: createWorkflowResumeIntent({
+            snapshot,
+            executionGeneration: loadedExecutionGeneration,
+            steps,
+            resumePayload: resumeDataToUse,
+            label: params.label,
+            forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
+          }),
+        });
       } catch (error) {
         workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
         throw error;
@@ -7048,7 +7067,14 @@ export class Run<
     const requestedCancellation = await this.commitRequestedCancellationInsteadOfExecuting(workflowsStore, snapshot);
     if (requestedCancellation) return requestedCancellation;
 
-    const restartData = createRestartExecutionParams({ snapshot, graph: this.executionGraph });
+    // A resume() claim whose step never settled (the process died while the resumed
+    // step or a later one ran) left its accepted input on the claim. Continue that
+    // resume instead of re-executing the suspended step without its input. Every
+    // other running snapshot restarts from its recorded progress as before.
+    const resumeIntent = getRestartableWorkflowResumeIntent(snapshot);
+    const restartData = resumeIntent
+      ? undefined
+      : createRestartExecutionParams({ snapshot, graph: this.executionGraph });
 
     const ownership = await this.#claimOwnership(false);
     if (!('release' in ownership)) {
@@ -7127,7 +7153,24 @@ export class Run<
           disableScorers: this.disableScorers,
           graph: this.executionGraph,
           serializedStepGraph: this.serializedStepGraph,
-          restart: restartData,
+          ...(resumeIntent
+            ? {
+                input: snapshot.context?.input as TInput,
+                initialState: (snapshot.value ?? {}) as any,
+                resume: {
+                  steps: resumeIntent.steps,
+                  stepResults: { ...(snapshot.context ?? {}), input: snapshot.context?.input } as any,
+                  resumePayload: resumeIntent.resumePayload,
+                  // The evented engine clears top-level suspendedPaths when it dispatches a
+                  // resume, so the claim recorded the path it resumed.
+                  resumePath: (resumeIntent.resumePath ??
+                    snapshot.suspendedPaths?.[resumeIntent.steps[0]!]) as number[],
+                  stepExecutionPath: snapshot.stepExecutionPath,
+                  forEachIndex: resumeIntent.forEachIndex,
+                  label: resumeIntent.label,
+                },
+              }
+            : { restart: restartData }),
           pubsub: this.pubsub,
           retryConfig: this.retryConfig,
           requestContext: requestContextToUse as RequestContext,

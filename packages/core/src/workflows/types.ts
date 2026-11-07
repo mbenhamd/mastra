@@ -611,6 +611,34 @@ export interface WorkflowResumeOperationReplayContextV1 {
 }
 
 /**
+ * The resume input a `resume()` claim accepted, written in the same
+ * compare-and-set that moves the run from `suspended` to `running`.
+ *
+ * Storage refuses `running` writes over the suspended step while that resume
+ * executes, so until the step settles this is the only durable record of the
+ * answer. `restart()` continues the resume with it while the run is still
+ * `running` under the same execution generation and resume attempt and the
+ * target step is still suspended. A later claim, restart or settle makes it
+ * inert.
+ * @internal
+ */
+export interface WorkflowResumeIntentV1 {
+  version: 1;
+  /** Execution generation the claim kept. */
+  executionGeneration: string;
+  /** Resume attempt the claim installed. */
+  lifecycleResumeAttempt: number;
+  /** Resume step path, top-level step first (nested workflow steps follow). */
+  steps: string[];
+  /** Execution path of the suspended step when the claim was taken. */
+  resumePath?: number[];
+  /** Validated resume data. Absent when `resume()` was called without any. */
+  resumePayload?: unknown;
+  label?: string;
+  forEachIndex?: number;
+}
+
+/**
  * A durable request to cancel one execution lineage. `Run.requestCancel()`
  * writes it with a compare-and-set on the lineage it names, so a successor
  * generation or a later resume attempt never honours it. The engine executing
@@ -714,6 +742,12 @@ export interface WorkflowRunState {
   resumeRollbackReceipt?: WorkflowResumeRollbackReceiptV1;
   /** Lineage-bound cancellation request, retained across step writes. */
   cancelRequest?: WorkflowCancelRequestV1;
+  /**
+   * Resume input accepted by the current `resume()` claim; see `WorkflowResumeIntentV1`.
+   * Step writes do not carry it forward.
+   * @internal
+   */
+  resumeIntent?: WorkflowResumeIntentV1;
   /**
    * Epoch ms when an agent resume claimed this suspended run (status `pending`). Lets a later
    * resume recognize a claim abandoned by a process that died before starting the run.

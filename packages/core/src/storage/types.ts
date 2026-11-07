@@ -12,6 +12,7 @@ import type {
   WorkflowResumeResultDataV1,
   WorkflowResumeResultReceiptV1,
   WorkflowResumeOperationReplayContextV1,
+  WorkflowResumeIntentV1,
   WorkflowTerminalStatus,
   WorkflowTerminalizationClaimedRecord,
   WorkflowTerminalEffectKind,
@@ -3797,6 +3798,12 @@ export interface UpdateWorkflowStateOptions {
   resumeClaimedAt?: number;
   /** The claim an agent resume started under a run-ownership lease. See `WorkflowRunState.resumeLeasedClaimAt`. */
   resumeLeasedClaimAt?: number;
+  /**
+   * Resume input accepted with a `resume()` claim, written in the claim's compare-and-set.
+   * See `WorkflowRunState.resumeIntent`.
+   * @internal
+   */
+  resumeIntent?: WorkflowResumeIntentV1;
   /**
    * Optional compare-and-set guard. When provided, the update is applied only if the
    * persisted snapshot's status matches one of these values. Otherwise the update is a

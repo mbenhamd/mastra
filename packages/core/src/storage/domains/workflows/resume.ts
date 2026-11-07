@@ -57,6 +57,9 @@ const WORKFLOW_STATE_RUNTIME_KEYS = new Set([
   'stepExecutionPath',
   'tracingContext',
   'lifecycleOutbox',
+  // A step write settles (or supersedes) the claim that recorded the resume
+  // input, so it is never retained as extension metadata.
+  'resumeIntent',
 ]);
 
 function fail(reason: string): never {

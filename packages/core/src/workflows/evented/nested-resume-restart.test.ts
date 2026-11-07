@@ -5,14 +5,13 @@
  * recoverable via restart(): the resumed step re-runs with its original resume
  * data instead of suspending again.
  *
- * PF-5928 adaptation (fork PF-2216, the same semantic on both engines): the
- * fork never records a resumed step as `running` with its resume payload before
- * it runs, so there is no payload for restart() to replay. A resumed step keeps
- * its suspended record until it settles. After a crash mid-resume, restart()
- * fails a nested run without running the resumed step, and a single-step
- * workflow stays suspended so a new resume() finishes it — exactly as on the
- * default engine (workflows/nested-resume-restart.test.ts,
- * workflows/resume-restart-suspend-data.test.ts, nested-resume-pf2216.test.ts).
+ * Fork (PF-2216, PF-7806, the same semantic on both engines): the fork never
+ * records a resumed step as `running` with its resume payload before it runs; a
+ * resumed step keeps its suspended record until it settles. The resume claim
+ * records the accepted input instead, so after a crash mid-resume restart()
+ * continues the resume with it — as on the default engine
+ * (workflows/nested-resume-restart.test.ts, workflows/resume-restart-suspend-data.test.ts,
+ * workflows/resume-restart-intent.test.ts).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -124,7 +123,7 @@ async function restartOnFreshHost(runId: string, nestedRunId: string, parentSnap
   }
 }
 
-describe('evented nested workflow restart after crash during resume (issue #25365, PF-2216 semantics)', () => {
+describe('evented nested workflow restart after crash during resume (issue #25365, PF-7806 semantics)', () => {
   it('keeps the resumed step records suspended and records no resume payload ahead of execution', async () => {
     const { parentSnapshot, nestedSnapshot } = await crashMidResume();
     expect(parentSnapshot.status).toBe('running');
@@ -143,7 +142,7 @@ describe('evented nested workflow restart after crash during resume (issue #2536
     // a restart over that synthetic state currently never settles (PF-5928 open item: the nested
     // workflow.start goes silent, the same family as the evented recover() hang).
   ] as const)(
-    'fails the restart without running the resumed nested step when the nested run is %s',
+    'continues the resumed nested step with its resume data when the nested run is %s',
     async (_, nestedStatus) => {
       const { runId, nestedRunId, parentSnapshot, nestedSnapshot, suspendedNested } = await crashMidResume();
       const { result, seen } = await restartOnFreshHost(
@@ -159,12 +158,12 @@ describe('evented nested workflow restart after crash during resume (issue #2536
             },
       );
 
-      expect(result.status).toBe('failed');
-      expect(seen).toEqual([]);
+      expect(result.status).toBe('success');
+      expect(seen).toEqual([false]);
     },
   );
 
-  it('keeps a single-step workflow suspended through a crash mid-resume so a new resume() finishes it', async () => {
+  it('continues a single-step workflow resume through a crash mid-resume', async () => {
     const buildSingle = (onResume: (data: any) => Promise<void>) => {
       const ask = createStep({
         id: 'ask',
@@ -212,10 +211,7 @@ describe('evented nested workflow restart after crash during resume (issue #2536
     try {
       const run2 = await p2.parent.createRun({ runId: run.runId });
       const restarted = await run2.restart();
-      expect(restarted.status).toBe('suspended');
-      expect(seen).toEqual([]);
-      const resumed = await run2.resume({ step: 'ask', resumeData: { answer: 'blue' } });
-      expect(resumed.status).toBe('success');
+      expect(restarted.status).toBe('success');
       expect(seen).toEqual([{ answer: 'blue' }]);
     } finally {
       await mastra2.stopWorkers();

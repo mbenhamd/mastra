@@ -6,8 +6,9 @@
  * ordinary resume persistence (PF-2216) refuses a `running` write over the
  * suspended row: the suspended snapshot stays authoritative until the resumed
  * step settles, and the resume payload reaches the step through the resume
- * call itself. A crash mid-resume therefore leaves a run that a new resume()
- * finishes with the payload it carries — including falsy payloads.
+ * call itself. PF-7806 stores the accepted payload with the resume claim, so
+ * restart() after a crash mid-resume continues the step with it — including
+ * falsy payloads.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -64,11 +65,10 @@ describe('PF-2216 resumed nested step payload', () => {
     if (result.status === 'success') expect(result.result).toEqual({ approved: false });
   });
 
-  it('never runs the resumed nested step without its payload after a crash mid-resume', async () => {
-    // The fork records no resume payload on the step before it runs (PF-2216), so restart()
-    // has nothing to replay. It must fail the run rather than run the resumed step with a
-    // missing payload. (Fork e268d40 fails it with WORKFLOW_RUN_NOT_SUSPENDED; the merged
-    // restart path reaches the nested step and its resumeSchema rejects the missing payload.)
+  it('continues the resumed nested step with its falsy payload after a crash mid-resume', async () => {
+    // The fork records no resume payload on the step before it runs (PF-2216); the resume
+    // claim stores it instead (PF-7806), so restart() runs the step with that payload and
+    // never without it.
     const storage1 = new MockStore();
     let markRunning!: () => void;
     const running = new Promise<void>(resolve => (markRunning = resolve));
@@ -108,7 +108,8 @@ describe('PF-2216 resumed nested step payload', () => {
     const run2 = await p2.parent.createRun({ runId: run1.runId });
     const restarted = await run2.restart();
 
-    expect(restarted.status).toBe('failed');
-    expect(seen).toEqual([]);
+    expect(restarted.status).toBe('success');
+    expect(seen).toEqual([false]);
+    if (restarted.status === 'success') expect(restarted.result).toEqual({ approved: false });
   });
 });
