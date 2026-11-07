@@ -49,7 +49,7 @@ type LifecyclePayloadBaseline = {
   contextPayload: unknown;
 };
 
-function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = new WeakMap()): unknown {
+export function cloneLifecyclePayload(value: unknown, seen: WeakMap<object, object> = new WeakMap()): unknown {
   if (value === null || typeof value !== 'object') return value;
 
   const prior = seen.get(value);

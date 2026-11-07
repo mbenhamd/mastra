@@ -124,7 +124,12 @@ import { validateTemplate } from './mapping-template';
 import { derivePredicateLabel, evaluatePredicate } from './predicate';
 import type { Predicate } from './predicate';
 import { claimWorkflowRestart, workflowRestartNotClaimedError } from './restart-claim';
-import { claimWorkflowResume, createWorkflowResumeIntent, getRestartableWorkflowResumeIntent } from './resume-claim';
+import {
+  claimWorkflowResume,
+  createWorkflowResumeIntent,
+  getRestartableWorkflowResumeIntent,
+  persistableResumePayload,
+} from './resume-claim';
 import { claimWorkflowRunOwnership } from './run-ownership';
 import type { WorkflowRunOwnership } from './run-ownership';
 import { validateCron } from './scheduler/cron';
@@ -6818,6 +6823,20 @@ export class Run<
     // the row to `running` in `claim.start()` (see Agent#claimSuspendedAgenticLoopRun). The
     // claimed snapshot carries the pre-claim attempt, so restoring it below yields exactly the
     // durable attempt every fenced write of this execution checks against.
+    // The claims store the resume data only as far as the resumed step's own write would keep it.
+    const persistedResume = persistableResumePayload({
+      snapshot,
+      stepId: steps[0]!,
+      resumePayload: resumeDataToUse,
+      pruneSnapshot: this.executionEngine.options?.pruneSnapshot,
+    });
+    if (!persistedResume.kept) {
+      this.#mastra
+        ?.getLogger()
+        ?.debug(
+          `[Workflow ${this.workflowId}] pruneSnapshot removes the resume data of step ${steps[0]}, so run ${this.runId} stores no resume input for restart()`,
+        );
+    }
     if (!params.claimedSnapshot) {
       try {
         await this.claimResume({
@@ -6826,14 +6845,16 @@ export class Run<
           executionGeneration: loadedExecutionGeneration,
           // Storage keeps the resumed step suspended until it settles, so the claim is the
           // only durable record of this input: restart() continues the resume from it.
-          resumeIntent: createWorkflowResumeIntent({
-            snapshot,
-            executionGeneration: loadedExecutionGeneration,
-            steps,
-            resumePayload: resumeDataToUse,
-            label: params.label,
-            forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
-          }),
+          resumeIntent: persistedResume.kept
+            ? createWorkflowResumeIntent({
+                snapshot,
+                executionGeneration: loadedExecutionGeneration,
+                steps,
+                resumePayload: persistedResume.resumePayload,
+                label: params.label,
+                forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
+              })
+            : undefined,
         });
       } catch (error) {
         workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
@@ -6901,13 +6922,16 @@ export class Run<
           executionGeneration: parentGeneration,
           // The parent continues only after the child settles, and only in this process. Its
           // claim records the resume through the child, so a restart of the parent continues it.
-          resumeIntent: createWorkflowResumeIntent({
-            snapshot: parentSnapshot,
-            executionGeneration: parentGeneration,
-            steps: [this.parentWorkflow.stepId, ...steps],
-            resumePayload: resumeDataToUse,
-            forEachIndex: this.parentWorkflow.foreachIndex,
-          }),
+          // The data is this run's, so this run's pruneSnapshot hook decides what is kept.
+          resumeIntent: persistedResume.kept
+            ? createWorkflowResumeIntent({
+                snapshot: parentSnapshot,
+                executionGeneration: parentGeneration,
+                steps: [this.parentWorkflow.stepId, ...steps],
+                resumePayload: persistedResume.resumePayload,
+                forEachIndex: this.parentWorkflow.foreachIndex,
+              })
+            : undefined,
         });
         claimedParent = { run: parentRun, snapshot: parentSnapshot, generation: parentGeneration };
       } catch (error) {

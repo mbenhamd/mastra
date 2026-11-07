@@ -1,8 +1,44 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { IMastraLogger } from '../logger';
 import type { WorkflowsStorage } from '../storage/domains/workflows/base';
+import { cloneLifecyclePayload } from './handlers/entry';
 import { workflowSnapshotNotFoundError } from './lifecycle-errors';
-import type { WorkflowResumeIntentV1, WorkflowRunState } from './types';
+import type { WorkflowResumeIntentV1, WorkflowRunState, WorkflowRunStatus } from './types';
+
+type PruneSnapshot = (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState;
+
+/**
+ * The resume data a resume claim may store: what the resumed step's own `running` write would
+ * persist through the workflow's `pruneSnapshot` hook, so the claim never keeps data the hook
+ * strips from every other persisted copy. `{ kept: false }` when the hook removes the data; the
+ * claim then stores no resume input and a restart behaves as before.
+ */
+export function persistableResumePayload({
+  snapshot,
+  stepId,
+  resumePayload,
+  pruneSnapshot,
+}: {
+  snapshot: WorkflowRunState;
+  stepId: string;
+  resumePayload: unknown;
+  pruneSnapshot: PruneSnapshot | undefined;
+}): { kept: true; resumePayload: unknown } | { kept: false } {
+  if (!pruneSnapshot || resumePayload === undefined) return { kept: true, resumePayload };
+  const probe = cloneLifecyclePayload(snapshot) as WorkflowRunState;
+  probe.status = 'running';
+  probe.context = {
+    ...probe.context,
+    [stepId]: {
+      ...(probe.context?.[stepId] as object | undefined),
+      status: 'running',
+      resumePayload: cloneLifecyclePayload(resumePayload),
+    },
+  } as WorkflowRunState['context'];
+  const pruned = pruneSnapshot({ snapshot: probe, workflowStatus: 'running' });
+  const persisted = (pruned?.context?.[stepId] as { resumePayload?: unknown } | undefined)?.resumePayload;
+  return persisted === undefined ? { kept: false } : { kept: true, resumePayload: persisted };
+}
 
 /**
  * Builds the resume input record a `resume()` claim stores with its

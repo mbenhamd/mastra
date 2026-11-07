@@ -21,6 +21,7 @@ import type { MastraStorage } from '../storage';
 import { MockStore } from '../storage/mock';
 import { createWorkflow } from './create';
 import { createStep as createEventedStep, createWorkflow as createEventedWorkflow } from './evented';
+import type { WorkflowRunState, WorkflowRunStatus } from './types';
 import { createStep } from './workflow';
 
 type Behaviour = 'block' | 'run';
@@ -42,7 +43,9 @@ interface HostBehaviour {
   publish: Behaviour;
 }
 
-function hostWorkflow(engine: Engine, behaviour: HostBehaviour) {
+type PruneSnapshot = (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState;
+
+function hostWorkflow(engine: Engine, behaviour: HostBehaviour, pruneSnapshot?: PruneSnapshot) {
   const step = (engine === 'evented' ? createEventedStep : createStep) as typeof createStep;
   const workflowOf = (engine === 'evented' ? createEventedWorkflow : createWorkflow) as typeof createWorkflow;
   const seen = { review: [] as unknown[], apply: [] as unknown[], publish: [] as unknown[] };
@@ -91,6 +94,7 @@ function hostWorkflow(engine: Engine, behaviour: HostBehaviour) {
     id: 'checkpoint-flow',
     inputSchema: z.object({ draft: z.string() }),
     outputSchema: z.object({ published: z.string() }),
+    ...(pruneSnapshot ? { options: { pruneSnapshot } } : {}),
   })
     .then(review)
     .then(apply)
@@ -107,9 +111,9 @@ async function host(
   engine: Engine,
   storage: MastraStorage,
   behaviour: HostBehaviour,
-  { startWorkers = true }: { startWorkers?: boolean } = {},
+  { startWorkers = true, pruneSnapshot }: { startWorkers?: boolean; pruneSnapshot?: PruneSnapshot } = {},
 ) {
-  const h = hostWorkflow(engine, behaviour);
+  const h = hostWorkflow(engine, behaviour, pruneSnapshot);
   const mastra = new Mastra({
     logger: false,
     storage,
@@ -320,6 +324,92 @@ describe('restart() after a crash during a resume (PF-7806)', () => {
     expect(seenB).toEqual(['v1']);
     expect(restarted.status).toBe('suspended');
   });
+});
+
+/** Applies `edit` to the resume data of every step while the run is `running`. */
+function pruneRunningResumeData(edit: (resumePayload: unknown) => unknown): PruneSnapshot {
+  return ({ snapshot, workflowStatus }) => {
+    if (workflowStatus !== 'running') return snapshot;
+    const context: Record<string, unknown> = {};
+    for (const [stepId, result] of Object.entries(snapshot.context ?? {})) {
+      if (!result || typeof result !== 'object' || !('resumePayload' in result)) {
+        context[stepId] = result;
+        continue;
+      }
+      const { resumePayload, ...rest } = result as Record<string, unknown>;
+      const edited = edit(resumePayload);
+      context[stepId] = edited === undefined ? rest : { ...rest, resumePayload: edited };
+    }
+    return { ...snapshot, context } as WorkflowRunState;
+  };
+}
+
+describe('resume data and the pruneSnapshot hook (PF-7806)', () => {
+  const revise = { decision: 'revise' as const, draft: 'v2-edited' };
+
+  // The claim stores no more resume data than the resumed step's own `running` write keeps.
+  // A hook that strips it leaves no stored answer, so restart behaves exactly as it did before
+  // PF-7806 (base c181752097): it re-runs `review` without resume data, `review` suspends again
+  // with its original payload, and nothing after it runs.
+  it.each(['default', 'evented'] as const)(
+    '%s engine: a hook that strips running resume data stores no answer, and restart re-runs review without it and suspends again',
+    async engine => {
+      const storage = new MockStore();
+      const pruneSnapshot = pruneRunningResumeData(() => undefined);
+      const a = await host(engine, storage, { review: 'block', apply: 'run', publish: 'run' }, { pruneSnapshot });
+      const runA = await a.workflow.createRun();
+      expect((await runA.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+      void runA.resume({ step: 'review', resumeData: revise });
+      await a.started.review;
+      const stranded = await load(storage, runA.runId);
+      expect(stranded?.status).toBe('running');
+      expect(stranded?.resumeIntent).toBeUndefined();
+      await crash(storage, runA.runId, a.mastra);
+
+      const b = await host(engine, storage, { review: 'run', apply: 'run', publish: 'run' }, { pruneSnapshot });
+      const result = await within((async () => (await b.workflow.createRun({ runId: runA.runId })).restart())());
+      if (engine === 'evented') await b.mastra.stopWorkers();
+      expect(b.seen.review).toEqual([undefined]);
+      expect(b.seen.apply).toEqual([]);
+      expect(b.seen.publish).toEqual([]);
+      expect(result.status).toBe('suspended');
+      const after = await load(storage, runA.runId);
+      expect(after?.status).toBe('suspended');
+      expect(after?.context.review).toMatchObject({ status: 'suspended', suspendPayload: { draft: 'v1' } });
+    },
+  );
+
+  // A hook that keeps running snapshots unchanged (and only prunes terminal ones) keeps the
+  // answer; a hook that rewrites it stores the rewritten value, as the step's own write would.
+  it.each([
+    ['leaves running snapshots unchanged', (data: unknown) => data, revise, 'v2-edited'],
+    [
+      'redacts a field',
+      (data: unknown) => ({ ...(data as object), draft: 'redacted' }),
+      { decision: 'revise', draft: 'redacted' },
+      'redacted',
+    ],
+  ] as const)(
+    'a hook that %s stores what the step write would keep, and restart continues with it',
+    async (_, edit, storedAnswer, expectedDraft) => {
+      const storage = new MockStore();
+      const pruneSnapshot = pruneRunningResumeData(edit);
+      const a = await host('default', storage, { review: 'block', apply: 'run', publish: 'run' }, { pruneSnapshot });
+      const runA = await a.workflow.createRun();
+      expect((await runA.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+      void runA.resume({ step: 'review', resumeData: revise });
+      await a.started.review;
+      expect((await load(storage, runA.runId))?.resumeIntent?.resumePayload).toEqual(storedAnswer);
+      await crash(storage, runA.runId, a.mastra);
+
+      const b = await host('default', storage, { review: 'run', apply: 'run', publish: 'run' }, { pruneSnapshot });
+      const result = await within((async () => (await b.workflow.createRun({ runId: runA.runId })).restart())());
+      expect(b.seen.review).toEqual([storedAnswer]);
+      expect(b.seen.apply).toEqual([expectedDraft]);
+      expect(result.status).toBe('success');
+      if (result.status === 'success') expect(result.result).toEqual({ published: expectedDraft });
+    },
+  );
 });
 
 describe('restart() after a crash during a nested resume (PF-7806)', () => {
