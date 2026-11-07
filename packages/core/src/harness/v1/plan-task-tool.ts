@@ -160,19 +160,6 @@ function toolCallIdempotencyKey(
   }).slice(0, 40)}`;
 }
 
-/**
- * The agent run a tool call belongs to. A real agent execution carries it at
- * the context top level (`runId`), not under `agent`; prefer `agent.runId`
- * when a caller sets it.
- */
-function toolRunId(context: ToolExecutionContext | undefined): string | undefined {
-  if (context?.agent?.runId !== undefined) return context.agent.runId;
-  // `ToolExecutionContext` does not declare the top-level `runId` the tool
-  // builder passes, so read it without widening the public type.
-  const topLevel: unknown = context === undefined ? undefined : Reflect.get(context, 'runId');
-  return typeof topLevel === 'string' ? topLevel : undefined;
-}
-
 /** Cap `value` at `maxBytes` UTF-8 bytes without splitting a code point. */
 function capUtf8Bytes(value: string, maxBytes: number): string {
   const encoder = new TextEncoder();
@@ -523,7 +510,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
             // execution of that call awaits the first one's result.
             const sharedKey =
               input.taskId === undefined && input.task !== undefined
-                ? toolCallIdempotencyKey('plan-task-delegate-add', context?.agent, toolRunId(context), input.task)
+                ? toolCallIdempotencyKey('plan-task-delegate-add', context?.agent, context?.agent?.runId, input.task)
                 : undefined;
             if (sharedKey === undefined) return (await delegate(input, context, undefined)) as any;
             let inFlight = inFlightDelegations.get(session);
@@ -575,7 +562,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
           { content, ...(idempotencyKey === undefined ? {} : { idempotencyKey }) },
           context?.abortSignal,
         );
-        const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId, toolRunId(context));
+        const replayed = replayedDelegation(added, idempotencyKey, context?.agent?.toolCallId, context?.agent?.runId);
         if (replayed !== undefined) return replayed as any;
         taskId = added.taskId;
         addedTaskId = added.taskId;
@@ -584,7 +571,7 @@ export function createPlanTaskTools(session: Session): Record<string, ReturnType
         { ...input, taskId },
         context?.abortSignal,
         context?.agent?.toolCallId,
-        toolRunId(context),
+        context?.agent?.runId,
         context?.requestContext,
         context?.tracingContext,
         admissionEpoch,
