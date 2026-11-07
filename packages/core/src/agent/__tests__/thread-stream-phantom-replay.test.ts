@@ -8,6 +8,14 @@
  * history can never reconcile. Replayed runs whose origin no longer holds the
  * thread lease must be buffered and only released to the subscriber when
  * their backlog proves they finished cleanly.
+ *
+ * Fork contract (PF-2935, PF-3375 "RECORDED GAP" note above
+ * `deferredRunsByStreamId` in thread-stream-runtime.ts): this fork admits
+ * remote events only under their segment's exact lease owner and never defers
+ * an unleased run, so nothing from an origin without a live lease is released,
+ * whatever its terminal says. Rows that upstream uses to prove a deferred run
+ * is flushed therefore assert that nothing surfaces; the live-lease row at the
+ * end still proves leased runs stream through.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -81,7 +89,7 @@ describe('phantom replay of unpersisted runs', () => {
     await consumed;
   });
 
-  it('still replays a run that completed cleanly', async () => {
+  it('does not release a clean run from an origin without a live lease', async () => {
     const { runtime, pubsub, emit, streamPart } = setup();
     const { subscription, collected, consumed } = await collect(runtime, pubsub);
 
@@ -95,7 +103,8 @@ describe('phantom replay of unpersisted runs', () => {
     await emit({ type: 'run-completed', runId, streamId });
     await nextTicks();
 
-    expect(collected.map(part => part.type)).toEqual(['start', 'text-delta', 'finish']);
+    // Fork contract: an unleased origin is never deferred, so no terminal releases it.
+    expect(collected).toEqual([]);
 
     subscription.unsubscribe();
     await consumed;
@@ -122,7 +131,7 @@ describe('phantom replay of unpersisted runs', () => {
     await consumed;
   });
 
-  it('trusts persisted: true even when the backlog is missing its finish chunk', async () => {
+  it('does not release an unleased run on persisted: true, even without a finish chunk', async () => {
     const { runtime, pubsub, emit, streamPart } = setup();
     const { subscription, collected, consumed } = await collect(runtime, pubsub);
 
@@ -134,13 +143,14 @@ describe('phantom replay of unpersisted runs', () => {
     await emit({ type: 'run-completed', runId, streamId, persisted: true });
     await nextTicks();
 
-    expect(collected.map(part => part.type)).toEqual(['start', 'text-delta']);
+    // Fork contract: an unleased origin is never deferred, so no terminal releases it.
+    expect(collected).toEqual([]);
 
     subscription.unsubscribe();
     await consumed;
   });
 
-  it('defers a dead run discovered via stream-part without run-registered', async () => {
+  it('drops a dead run discovered via stream-part without run-registered', async () => {
     const { runtime, pubsub, streamPart, emit } = setup();
     const { subscription, collected, consumed } = await collect(runtime, pubsub);
 
@@ -152,7 +162,7 @@ describe('phantom replay of unpersisted runs', () => {
 
     expect(collected).toEqual([]);
 
-    // A later clean terminal event still releases it.
+    // Upstream releases it on a later clean terminal; the fork never deferred it.
     await streamPart({
       type: 'finish',
       payload: { stepResult: { reason: 'stop' }, output: { usage: {} }, metadata: {} },
@@ -160,7 +170,8 @@ describe('phantom replay of unpersisted runs', () => {
     await emit({ type: 'run-completed', runId, streamId, persisted: true });
     await nextTicks();
 
-    expect(collected.map(part => part.type)).toEqual(['start', 'text-delta', 'finish']);
+    // Fork contract: an unleased origin is never deferred, so no terminal releases it.
+    expect(collected).toEqual([]);
 
     subscription.unsubscribe();
     await consumed;
@@ -189,7 +200,7 @@ describe('phantom replay of unpersisted runs', () => {
     expect(collected).toEqual([]);
   });
 
-  it('flushes a deferred run when it suspends (suspends persist a snapshot)', async () => {
+  it('does not release an unleased run when it suspends', async () => {
     const { runtime, pubsub, emit, streamPart } = setup();
     const { subscription, collected, consumed } = await collect(runtime, pubsub);
 
@@ -199,7 +210,8 @@ describe('phantom replay of unpersisted runs', () => {
     await emit({ type: 'run-suspended', runId, streamId });
     await nextTicks();
 
-    expect(collected.map(part => part.type)).toEqual(['start', 'text-delta']);
+    // Fork contract: an unleased origin is never deferred, so no terminal releases it.
+    expect(collected).toEqual([]);
 
     subscription.unsubscribe();
     await consumed;

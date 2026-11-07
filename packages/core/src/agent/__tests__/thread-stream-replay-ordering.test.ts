@@ -10,6 +10,13 @@
  *   `broadcastFinished`, but a subscriber must stay correct (no phantom, no
  *   hang, in-order delivery) for every interleaving of registration and
  *   terminal events among the stream parts, since older origins do not gate.
+ *
+ * Fork contract (PF-2935, PF-3375 "RECORDED GAP" note above
+ * `deferredRunsByStreamId` in thread-stream-runtime.ts): remote events are
+ * admitted only under their segment's exact lease owner, so this fork never
+ * defers a run from an origin without a live lease. The fixtures here are
+ * unsigned and hold no lease, so every replay below must surface nothing; the
+ * rows still pin that no ordering fabricates, reorders or hangs.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -31,7 +38,7 @@ const finishPart = {
 describe('mixed-version compat: events from an older origin', () => {
   // Older origins publish run-registered without sourceId and run-completed
   // without persisted. Subscriber must use the clean-finish heuristic.
-  it('replays a clean legacy run (no sourceId, no persisted flag)', async () => {
+  it('drops a clean legacy run from an origin without a live lease (fork contract)', async () => {
     const { runtime, pubsub, emit } = setup();
     const { subscription, collected, consumed } = await collect(runtime, pubsub);
 
@@ -54,7 +61,8 @@ describe('mixed-version compat: events from an older origin', () => {
     await emit({ type: 'run-completed', runId, streamId });
     await nextTicks();
 
-    expect(collected.map(part => part.type)).toEqual(['start', 'text-delta', 'finish']);
+    // Upstream defers and then releases this clean run; the fork drops unleased events.
+    expect(collected).toEqual([]);
 
     subscription.unsubscribe();
     await consumed;
@@ -132,11 +140,9 @@ describe('adversarial orderings of registration/terminal among stream parts', ()
   }
 
   for (const seq of orderings()) {
-    it(`dead-run replay stays phantom-free and hang-free for order ${seq.join(' ')}`, async () => {
+    it(`unleased dead-run replay yields nothing and does not hang for order ${seq.join(' ')}`, async () => {
       const { runtime, pubsub, emit } = setup();
       const { subscription, collected, consumed } = await collect(runtime, pubsub);
-
-      const partsBeforeTerminal = seq.slice(0, seq.indexOf('C')).filter(tok => tok.startsWith('P')).length;
 
       for (const token of seq) {
         if (token === 'R') {
@@ -162,9 +168,9 @@ describe('adversarial orderings of registration/terminal among stream parts', ()
         );
         cursor = idx + 1;
       }
-      // 2. persisted: true terminal means everything buffered before the
-      //    terminal must be delivered — a clean run is never silently dropped.
-      expect(collected.length).toBeGreaterThanOrEqual(partsBeforeTerminal);
+      // 2. Fork contract: even a persisted: true terminal does not admit an
+      //    origin without a live lease, so nothing is delivered.
+      expect(collected).toEqual([]);
 
       // 3. No hang: unsubscribe ends the consumer loop promptly.
       subscription.unsubscribe();
