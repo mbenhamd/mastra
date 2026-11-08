@@ -696,11 +696,14 @@ function childResumeHost(
     registerParent = true,
     registerChild = false,
     parentPruneSnapshot,
+    holdAfter,
   }: {
     blockAfter?: boolean;
     registerParent?: boolean;
     registerChild?: boolean;
     parentPruneSnapshot?: PruneSnapshot;
+    /** `after` waits for this before it returns. */
+    holdAfter?: Promise<void>;
   } = {},
 ) {
   const seen = { gate: [] as unknown[], after: [] as unknown[] };
@@ -725,6 +728,7 @@ function childResumeHost(
       seen.after.push(inputData);
       afterStarted.resolve();
       if (blockAfter) await never;
+      if (holdAfter) await holdAfter;
       return inputData;
     },
   });
@@ -1116,5 +1120,65 @@ describe('round 7 review rows (PF-7806)', () => {
     expect(b.seen.review).toEqual([revise]);
     expect(b.seen.apply).toEqual(['v2-edited']);
     expect(b.seen.publish).toEqual(['v2-edited']);
+  });
+});
+
+describe('round 8 review rows (PF-7806)', () => {
+  const revise = { decision: 'revise' as const, draft: 'v2-edited' };
+
+  // S-1: a direct-child resume holds the parent's recovery lease from before the parent claim
+  // until the parent's continuation settles, so a sweep on another host neither restarts the
+  // parent nor the child while this process drives them.
+  it('a sweep on another host during a direct-child resume runs neither the answered step nor the steps after it again', async () => {
+    const storage = new MockStore();
+    const hold = deferred();
+    const a = childResumeHost(storage, { holdAfter: hold.promise });
+    const runA = await a.parent.createRun();
+    expect((await runA.start({ inputData: {} })).status).toBe('suspended');
+    const childRun = await a.nested.createRun({ runId: runA.runId });
+    const resumed = childRun.resume({ step: 'gate', resumeData: { note: 'edited' } });
+    await a.afterStarted;
+    expect((await loadParent(storage, runA.runId))?.resumeIntent?.resumePayload).toEqual({ note: 'edited' });
+
+    const b = childResumeHost(storage, { registerChild: true });
+    await within(b.mastra.restartAllActiveWorkflowRuns());
+    hold.resolve();
+    expect((await within(resumed)).status).toBe('success');
+    await vi.waitFor(async () => expect((await loadParent(storage, runA.runId))?.status).toBe('success'), {
+      timeout: 10_000,
+    });
+    expect([...a.seen.gate, ...b.seen.gate].filter(data => data !== undefined)).toEqual([{ note: 'edited' }]);
+    expect(b.seen.gate).toEqual([]);
+    expect([...a.seen.after, ...b.seen.after]).toEqual([{ note: 'edited' }]);
+    await a.mastra.shutdown();
+    await b.mastra.shutdown();
+  });
+
+  // S-2: a manual restart on the host that started the run. That host recorded the run as
+  // `suspended`; the restart claim makes it `running`, so the restart's step writes persist and
+  // replace the stored answer, as on any other host.
+  it('a manual restart on the starting host persists its step writes, so recovery does not repeat the answer', async () => {
+    const storage = new MockStore();
+    const options = {
+      shouldPersistSnapshot: (({ workflowStatus }) => workflowStatus !== 'success') as ShouldPersistSnapshot,
+    };
+    const p = await host('default', storage, { review: 'run', apply: 'run', publish: 'run' }, options);
+    const run = await p.workflow.createRun();
+    expect((await run.start({ inputData: { draft: 'v1' } })).status).toBe('suspended');
+
+    const q = await host('default', storage, { review: 'block', apply: 'run', publish: 'run' }, options);
+    void (await q.workflow.createRun({ runId: run.runId })).resume({ step: 'review', resumeData: revise });
+    await q.started.review;
+    await crash(storage, run.runId, q.mastra);
+
+    expect((await within(run.restart())).status).toBe('success');
+    const row = await load(storage, run.runId);
+    expect(row?.resumeIntent).toBeUndefined();
+    expect(row?.context.review?.status).toBe('success');
+    await within(p.mastra.restartAllActiveWorkflowRuns());
+    await new Promise(resolve => setTimeout(resolve, 500));
+    expect(p.seen.review).toEqual([undefined, revise]);
+    expect(p.seen.apply).toEqual(['v2-edited']);
+    expect(p.seen.publish).toEqual(['v2-edited']);
   });
 });
