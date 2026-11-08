@@ -172,6 +172,13 @@ export class ChatChannelOutputProcessor {
     state,
     requestContext,
   }: ProcessOutputStreamArgs): Promise<ChunkType | null | undefined> {
+    // Checked before the render context, which a durable resume rebuilds from the thread.
+    const isDeniedResult =
+      part.type === 'tool-result' && this.#agentChannels?.takeDeniedToolResult(part.runId, part.payload.toolCallId);
+    const isTerminalStepFinish = part.type === 'step-finish' && (part as any).payload?.stepResult?.isContinued !== true;
+    const isTerminal = isTerminalStepFinish || part.type === 'error' || part.type === 'abort';
+    if (isTerminal) this.#agentChannels?.releaseDeniedToolCalls(part.runId);
+
     const render = await this.#resolveRenderContext(state, requestContext);
     if (!render) return part;
 
@@ -189,7 +196,7 @@ export class ChatChannelOutputProcessor {
       part.type !== 'tool-call-approval' ||
       !this.#agentChannels ||
       (await this.#agentChannels.shouldRenderToolApproval(requestContext, (part as any).payload?.toolName));
-    if (renderPart) {
+    if (renderPart && !isDeniedResult) {
       session.queue.push(part as AgentChunkType<any>);
     }
 
@@ -198,8 +205,7 @@ export class ChatChannelOutputProcessor {
     // model-continuation) keep streaming after each per-step `finish`, so we
     // must NOT close on `finish`. Close only on the terminal `step-finish`
     // (`isContinued === false`) or on `error`.
-    const isTerminalStepFinish = part.type === 'step-finish' && (part as any).payload?.stepResult?.isContinued !== true;
-    if (isTerminalStepFinish || part.type === 'error' || part.type === 'abort') {
+    if (isTerminal) {
       session.queue.close();
       try {
         await session.driverPromise;

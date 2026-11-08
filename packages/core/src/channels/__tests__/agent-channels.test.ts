@@ -708,8 +708,22 @@ describe('AgentChannels', () => {
             ...makeActionEvent(adapter, actionId),
             thread: { id: 'channel-1:thread-1', channelId: 'channel-1', isDM: false },
           });
-        return { adapter, click, dispatchApproval, dispatchDecline };
+        return { adapter, channels, click, dispatchApproval, dispatchDecline };
       }
+
+      it('keeps no denied-call record when the decline cannot be dispatched', async () => {
+        const { click, channels, dispatchDecline } = await setup(undefined);
+        const sizes: number[] = [];
+        dispatchDecline.mockImplementation(async () => {
+          sizes.push((channels as any).deniedToolCalls.size);
+          throw new Error('No snapshot found');
+        });
+
+        await click('tool_deny:tool-call-1');
+
+        expect(sizes).toEqual([1]);
+        expect((channels as any).deniedToolCalls.size).toBe(0);
+      });
 
       it('edits the card with the renderer output on approve', async () => {
         const toolDisplay = vi.fn((event: any) =>
