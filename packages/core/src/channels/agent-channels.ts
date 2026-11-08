@@ -886,7 +886,7 @@ export class AgentChannels {
                     },
                   });
                 } catch (err) {
-                  this.releaseDeniedToolCalls(runId);
+                  this.takeDeniedToolResult(runId, toolCallId);
                   const isStaleApproval = err instanceof Error && err.message.includes('No snapshot found');
                   if (isStaleApproval) {
                     this.log('info', 'Ignoring stale tool denial action (runId already consumed)', actionEventContext);
