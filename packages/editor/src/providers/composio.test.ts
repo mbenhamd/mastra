@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { resolveStoredToolProviders } from '@mastra/core/tool-provider';
 import type { ToolProviders } from '@mastra/core/tool-provider';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── module mocks ────────────────────────────────────────────────────────
 // `vi.hoisted` because the mock factory below is hoisted above all other
@@ -11,6 +11,7 @@ import type { ToolProviders } from '@mastra/core/tool-provider';
 const { composioInstances, makeFakeComposio } = vi.hoisted(() => {
   interface FakeComposioInstance {
     apiKey: string;
+    allowTracking?: boolean;
     hasProvider: boolean;
     toolkits: { get: ReturnType<typeof vi.fn>; getConnectedAccountInitiationFields: ReturnType<typeof vi.fn> };
     tools: { get: ReturnType<typeof vi.fn>; getRawComposioTools: ReturnType<typeof vi.fn> };
@@ -27,9 +28,10 @@ const { composioInstances, makeFakeComposio } = vi.hoisted(() => {
 
   const instances: FakeComposioInstance[] = [];
 
-  const factory = (opts: { apiKey: string; provider?: unknown }): FakeComposioInstance => {
+  const factory = (opts: { apiKey: string; provider?: unknown; allowTracking?: boolean }): FakeComposioInstance => {
     const inst: FakeComposioInstance = {
       apiKey: opts.apiKey,
+      allowTracking: opts.allowTracking,
       hasProvider: Boolean(opts.provider),
       toolkits: { get: vi.fn(), getConnectedAccountInitiationFields: vi.fn() },
       tools: { get: vi.fn(), getRawComposioTools: vi.fn() },
@@ -47,7 +49,10 @@ const { composioInstances, makeFakeComposio } = vi.hoisted(() => {
 type FakeComposioInstance = ReturnType<typeof makeFakeComposio>;
 
 vi.mock('@composio/core', () => ({
-  Composio: function (this: Record<string, unknown>, opts: { apiKey: string; provider?: unknown }) {
+  Composio: function (
+    this: Record<string, unknown>,
+    opts: { apiKey: string; provider?: unknown; allowTracking?: boolean },
+  ) {
     Object.assign(this, makeFakeComposio(opts));
   },
 }));
@@ -58,11 +63,11 @@ vi.mock('@composio/mastra', () => ({
   },
 }));
 
-// Import after mocks are registered.
-import { ComposioToolProvider } from './composio';
 // Public entry-point surface (`@mastra/editor/composio`) — type-only imports
 // verify the resolver types are exported where consumers import them from.
 import type { ComposioUserIdResolver, ComposioUserIdResolverInput, ComposioToolProviderConfig } from '../composio';
+// Import after mocks are registered (vi.mock is hoisted either way).
+import { ComposioToolProvider } from './composio';
 
 function getRawInstance(): FakeComposioInstance {
   return composioInstances.find(i => !i.hasProvider)!;
@@ -1336,5 +1341,288 @@ describe('ComposioToolProvider — revokeConnection', () => {
     const raw = getRawInstance();
     raw.connectedAccounts.delete.mockRejectedValue(new Error('boom'));
     await expect(integration.revokeConnection('ca_xyz')).rejects.toThrow('boom');
+  });
+});
+
+describe('ComposioToolProvider — approval from Composio tags', () => {
+  // PF-7867: `@composio/mastra` drops Composio's tool tags when it wraps a
+  // tool, so a host could not gate writes by the catalog's own hints. The
+  // provider reads the tags from the raw schema `tools.get` hands
+  // `modifySchema` and applies `requireToolApproval` to the resolved tool.
+  const MASTRA_USER_KEY = 'mastra__user';
+  const RAW_TOOLS = [
+    { slug: 'GMAIL_SEND_EMAIL', toolkit: { slug: 'gmail' }, tags: ['openWorldHint', 'createHint'] },
+    { slug: 'GMAIL_FETCH_EMAILS', toolkit: { slug: 'gmail' }, tags: ['readOnlyHint', 'important'] },
+  ];
+
+  async function resolveWithPolicy(executed: string[], config: Partial<ComposioToolProviderConfig>) {
+    const { createTool } = await import('@mastra/core/tools');
+    const { z } = await import('zod');
+    const integration = new ComposioToolProvider({ apiKey: 'k', ...config });
+    await integration
+      .resolveToolsVNext({ toolSlugs: ['warm'], toolMeta: {}, connectionId: 'ca_0' })
+      .catch(() => undefined);
+    const mastra = getMastraInstance();
+    mastra.tools.get.mockReset();
+    // The SDK's `tools.get`: raw schemas through `modifySchema`, then the
+    // MastraProvider's `createTool` wrapper, which keeps no tags.
+    mastra.tools.get.mockImplementation(
+      async (
+        _userId: string,
+        filters: { tools: string[] },
+        modifiers: {
+          modifySchema?: (input: { toolSlug: string; toolkitSlug: string; schema: unknown }) => unknown;
+        },
+      ) => {
+        const out: Record<string, unknown> = {};
+        for (const raw of RAW_TOOLS.filter(tool => filters.tools.includes(tool.slug))) {
+          await modifiers.modifySchema?.({ toolSlug: raw.slug, toolkitSlug: raw.toolkit.slug, schema: raw });
+          out[raw.slug] = createTool({
+            id: raw.slug,
+            description: raw.slug,
+            inputSchema: z.object({ q: z.string() }),
+            execute: async () => {
+              executed.push(raw.slug);
+              return { ok: true };
+            },
+          });
+        }
+        return out;
+      },
+    );
+    const tools = await integration.resolveToolsVNext({
+      toolSlugs: RAW_TOOLS.map(tool => tool.slug),
+      toolMeta: {},
+      connectionId: 'ca_alice_gmail',
+      kind: 'invoker',
+      toolkit: 'gmail',
+      requestContext: createRequestContext({ [MASTRA_USER_KEY]: { id: 'alice' } }),
+    });
+    return { integration, tools };
+  }
+
+  /** A model that calls `toolName` once, then answers. */
+  async function callingModel(toolName: string) {
+    const { convertArrayToReadableStream, MockLanguageModelV2 } = await import('@internal/ai-sdk-v5/test');
+    let step = 0;
+    const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+    return new MockLanguageModelV2({
+      doStream: async () => {
+        step += 1;
+        const chunks =
+          step === 1
+            ? [
+                { type: 'stream-start' as const, warnings: [] },
+                { type: 'tool-call' as const, toolCallId: 'call-1', toolName, input: '{"q":"x"}' },
+                { type: 'finish' as const, finishReason: 'tool-calls' as const, usage },
+              ]
+            : [
+                { type: 'stream-start' as const, warnings: [] },
+                { type: 'text-start' as const, id: 't' },
+                { type: 'text-delta' as const, id: 't', delta: 'done' },
+                { type: 'text-end' as const, id: 't' },
+                { type: 'finish' as const, finishReason: 'stop' as const, usage },
+              ];
+        return { stream: convertArrayToReadableStream(chunks), rawCall: { rawPrompt: null, rawSettings: {} } };
+      },
+    });
+  }
+
+  it('a write tool suspends for approval in a real agent run and never executes; a read-only tool runs', async () => {
+    const { Agent } = await import('@mastra/core/agent');
+    const executed: string[] = [];
+    const { tools } = await resolveWithPolicy(executed, {
+      requireToolApproval: tool => !tool.tags.includes('readOnlyHint'),
+    });
+    const run = async (toolName: string) => {
+      const agent = new Agent({
+        id: `composio-${toolName}`,
+        name: 'composio',
+        instructions: 'use tools',
+        model: await callingModel(toolName),
+        tools,
+      });
+      const stream = await agent.stream('go');
+      const types: string[] = [];
+      for await (const chunk of stream.fullStream) types.push(chunk.type);
+      return types;
+    };
+
+    const write = await run('GMAIL_SEND_EMAIL');
+    expect(write).toContain('tool-call-approval');
+    expect(executed).toEqual([]);
+
+    const read = await run('GMAIL_FETCH_EMAILS');
+    expect(read).not.toContain('tool-call-approval');
+    expect(executed).toEqual(['GMAIL_FETCH_EMAILS']);
+    // The cold `@mastra/core/agent` import alone can pass the 5 s default.
+  }, 30_000);
+
+  it('forwards allowTracking to both Composio clients only when configured', async () => {
+    const tracked = async (config: Partial<ComposioToolProviderConfig>) => {
+      composioInstances.length = 0;
+      const { integration } = await resolveWithPolicy([], config);
+      getMastraInstance();
+      await integration.listToolkitsVNext().catch(() => undefined);
+      return composioInstances.map(instance => [instance.hasProvider, instance.allowTracking]);
+    };
+    expect(await tracked({ allowTracking: false })).toEqual([
+      [true, false],
+      [false, false],
+    ]);
+    expect(await tracked({})).toEqual([
+      [true, undefined],
+      [false, undefined],
+    ]);
+  });
+});
+
+describe('ComposioToolProvider — shared catalog tools', () => {
+  // PF-7867: a ToolSearch catalog is registered once per agent, so the same
+  // tool object serves every caller. Each call must execute as its own user.
+  async function catalog(
+    resolveIdentity: (input: { requestContext?: RequestContext; toolkit?: string }) => unknown,
+    options: { reportedToolkit?: string; toolMeta?: Record<string, { toolkit?: string }> } = {},
+  ) {
+    const { createTool } = await import('@mastra/core/tools');
+    const { z } = await import('zod');
+    const integration = new ComposioToolProvider({
+      apiKey: 'k',
+      requireToolApproval: tool => !tool.tags.includes('readOnlyHint'),
+    });
+    await integration
+      .resolveToolsVNext({ toolSlugs: ['warm'], toolMeta: {}, connectionId: 'ca_0' })
+      .catch(() => undefined);
+    const mastra = getMastraInstance();
+    mastra.tools.get.mockReset();
+    const sent: Array<{ fetchedAs: string; userId?: string; connectedAccountId?: string }> = [];
+    mastra.tools.get.mockImplementation(
+      async (
+        fetchedAs: string,
+        filters: { tools: string[] },
+        modifiers: {
+          beforeExecute: (input: { toolSlug: string; toolkitSlug: string; params: Record<string, unknown> }) => unknown;
+          modifySchema: (input: { toolSlug: string; toolkitSlug: string; schema: unknown }) => unknown;
+        },
+      ) => {
+        const out: Record<string, unknown> = {};
+        for (const slug of filters.tools) {
+          const tags = slug === 'GMAIL_FETCH_EMAILS' ? ['readOnlyHint'] : ['createHint'];
+          await modifiers.modifySchema({
+            toolSlug: slug,
+            toolkitSlug: options.reportedToolkit ?? 'gmail',
+            schema: { slug, tags },
+          });
+          out[slug] = createTool({
+            id: slug,
+            description: slug,
+            inputSchema: z.object({ q: z.string() }),
+            // The SDK's execute: beforeExecute, then the HTTP call it shapes.
+            execute: async () => {
+              const params = (await modifiers.beforeExecute({
+                toolSlug: slug,
+                toolkitSlug: 'gmail',
+                // A stale account id the identity must replace or clear.
+                params: { userId: fetchedAs, connectedAccountId: 'ca_stale', arguments: {} },
+              })) as { userId?: string; connectedAccountId?: string };
+              sent.push({ fetchedAs, userId: params.userId, connectedAccountId: params.connectedAccountId });
+              return { ok: true };
+            },
+          });
+        }
+        return out;
+      },
+    );
+    const tools = await integration.resolveCatalogTools({
+      toolSlugs: ['GMAIL_FETCH_EMAILS', 'GMAIL_SEND_EMAIL'],
+      ...(options.toolMeta ? { toolMeta: options.toolMeta } : {}),
+      resolveIdentity: input => resolveIdentity(input) as never,
+    });
+    return { tools, sent };
+  }
+
+  const identityFromContext = ({ requestContext }: { requestContext?: RequestContext }) => {
+    const user = requestContext?.get('user') as string | undefined;
+    return user ? { userId: `pf:${user}`, connectedAccountId: `ca_${user}` } : undefined;
+  };
+
+  it('one registered tool executes as each caller, never as the catalog bucket', async () => {
+    const { tools, sent } = await catalog(identityFromContext);
+    const read = tools.GMAIL_FETCH_EMAILS!;
+    await read.execute!({ q: 'x' }, { requestContext: createRequestContext({ user: 'alice' }) } as never);
+    await read.execute!({ q: 'x' }, { requestContext: createRequestContext({ user: 'bob' }) } as never);
+    expect(sent.map(call => [call.userId, call.connectedAccountId])).toEqual([
+      ['pf:alice', 'ca_alice'],
+      ['pf:bob', 'ca_bob'],
+    ]);
+    expect(sent.every(call => call.fetchedAs !== call.userId)).toBe(true);
+  });
+
+  it('refuses a call without an identity before reaching Composio, and gates writes by tags', async () => {
+    const { tools, sent } = await catalog(identityFromContext);
+    await expect(
+      tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never),
+    ).rejects.toThrow('no execution identity');
+    expect(sent).toEqual([]);
+    expect((tools.GMAIL_SEND_EMAIL as { requireApproval?: boolean }).requireApproval).toBe(true);
+    expect((tools.GMAIL_FETCH_EMAILS as { requireApproval?: boolean }).requireApproval).toBe(false);
+  });
+
+  it('keeps concurrent callers of one tool on their own identities', async () => {
+    const { tools, sent } = await catalog(async ({ requestContext }) => {
+      const user = requestContext?.get('user') as string;
+      // Alice resolves last, so her call starts first and finishes after Bob's.
+      await new Promise(resolve => setTimeout(resolve, user === 'alice' ? 20 : 0));
+      return { userId: `pf:${user}`, connectedAccountId: `ca_${user}` };
+    });
+    const read = tools.GMAIL_FETCH_EMAILS!;
+    await Promise.all(
+      ['alice', 'bob'].map(user =>
+        read.execute!({ q: 'x' }, { requestContext: createRequestContext({ user }) } as never),
+      ),
+    );
+    expect(sent.map(call => [call.userId, call.connectedAccountId])).toEqual([
+      ['pf:bob', 'ca_bob'],
+      ['pf:alice', 'ca_alice'],
+    ]);
+  });
+
+  it('clears a stale account id when the identity names none', async () => {
+    const { tools, sent } = await catalog(() => ({ userId: 'pf:alice' }));
+    await tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never);
+    expect(sent).toEqual([
+      { fetchedAs: '__mastra_catalog_schema__', userId: 'pf:alice', connectedAccountId: undefined },
+    ]);
+  });
+
+  it.each([
+    ['a blank user id', { userId: '   ' }],
+    ['the catalog schema bucket', { userId: '__mastra_catalog_schema__' }],
+  ])('refuses %s before reaching Composio', async (_label, identity) => {
+    const { tools, sent } = await catalog(() => identity);
+    await expect(
+      tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never),
+    ).rejects.toThrow('no execution identity');
+    expect(sent).toEqual([]);
+  });
+
+  it('hands resolveIdentity the toolMeta toolkit when Composio reports it as unknown', async () => {
+    const toolkits: Array<string | undefined> = [];
+    const { tools } = await catalog(
+      ({ toolkit }) => {
+        toolkits.push(toolkit);
+        return { userId: 'pf:alice' };
+      },
+      { reportedToolkit: 'unknown', toolMeta: { GMAIL_FETCH_EMAILS: { toolkit: 'gmail' } } },
+    );
+    await tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never);
+    expect(toolkits).toEqual(['gmail']);
+  });
+
+  it('rejects connection-management tools in a shared catalog', async () => {
+    const integration = new ComposioToolProvider({ apiKey: 'k' });
+    await expect(
+      integration.resolveCatalogTools({ toolSlugs: ['COMPOSIO_MANAGE_CONNECTIONS'], resolveIdentity: () => undefined }),
+    ).rejects.toThrow('caller-scoped session');
   });
 });
