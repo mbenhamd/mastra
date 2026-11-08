@@ -1182,3 +1182,41 @@ describe('round 8 review rows (PF-7806)', () => {
     expect(p.seen.publish).toEqual(['v2-edited']);
   });
 });
+
+describe('round 9 review rows (PF-7806)', () => {
+  // N-1: the parent lease a direct-child resume hands to the parent's continuation is released
+  // however that continuation exits, here with a cancel request recorded for the parent's
+  // suspended lineage before the resume.
+  it('a direct-child resume whose parent has a cancel request leaves the parent lease released', async () => {
+    const storage = new MockStore();
+    const a = childResumeHost(storage);
+    const runA = await a.parent.createRun();
+    expect((await runA.start({ inputData: {} })).status).toBe('suspended');
+    const store = (await storage.getStore('workflows'))!;
+    const parentRow = (await loadParent(storage, runA.runId))!;
+    await store.persistWorkflowSnapshot({
+      workflowName: 'parent-flow',
+      runId: runA.runId,
+      snapshot: {
+        ...parentRow,
+        cancelRequest: {
+          version: 1,
+          requestId: 'cancel-before-resume',
+          executionGeneration: parentRow.executionGeneration!,
+          lifecycleResumeAttempt: parentRow.lifecycleResumeAttempt ?? 0,
+          requestedAt: Date.now(),
+        },
+      },
+    });
+
+    const childRun = await a.nested.createRun({ runId: runA.runId });
+    expect((await within(childRun.resume({ step: 'gate', resumeData: { note: 'edited' } }))).status).toBe('success');
+    await vi.waitFor(async () => expect((await loadParent(storage, runA.runId))?.status).not.toBe('running'), {
+      timeout: 10_000,
+    });
+    await vi.waitFor(async () => expect((await store.getRunOwnership({ runId: runA.runId }))?.live).not.toBe(true), {
+      timeout: 5_000,
+    });
+    await a.mastra.shutdown();
+  });
+});

@@ -6427,7 +6427,20 @@ export class Run<
       ownershipLease?: WorkflowRunOwnership;
     },
   ) {
-    return this._resume(params);
+    // The execution releases a handed lease when it settles; every exit before the execution
+    // starts (a thrown check, a committed cancellation) releases it here instead.
+    let executionStarted = false;
+    try {
+      return await this._resume({
+        ...params,
+        onExecutionStarted: () => {
+          executionStarted = true;
+          params.onExecutionStarted?.();
+        },
+      });
+    } finally {
+      if (!executionStarted) await params.ownershipLease?.release();
+    }
   }
 
   async resume<TResume>(
@@ -7199,24 +7212,30 @@ export class Run<
       ),
     ).then(
       async result => {
-        if (!params.claimedSnapshot || (params as { returnDeclinedClaim?: boolean }).returnDeclinedClaim) {
-          await this.returnDeclinedResumeToSuspended({
-            workflowsStore,
-            persistencePredicate,
-            result,
-            resumedStepId: steps[0]!,
-            executionGeneration,
-            lifecycleResumeAttempt,
-          });
-        }
-        if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
-          this.workflowRunStatus = result.status;
-          if (!params.isVNext && result.status !== 'suspended') {
-            this.closeStreamAction?.().catch(() => {});
+        try {
+          if (!params.claimedSnapshot || (params as { returnDeclinedClaim?: boolean }).returnDeclinedClaim) {
+            await this.returnDeclinedResumeToSuspended({
+              workflowsStore,
+              persistencePredicate,
+              result,
+              resumedStepId: steps[0]!,
+              executionGeneration,
+              lifecycleResumeAttempt,
+            });
           }
-          if (result.status !== 'suspended') {
-            this.cleanup?.();
+          if (this.isCurrentLifecycleAttempt(executionGeneration, lifecycleResumeAttempt)) {
+            this.workflowRunStatus = result.status;
+            if (!params.isVNext && result.status !== 'suspended') {
+              this.closeStreamAction?.().catch(() => {});
+            }
+            if (result.status !== 'suspended') {
+              this.cleanup?.();
+            }
           }
+        } catch (error) {
+          // The parent this child claimed was never handed over: give its claim and lease back.
+          await releaseParentClaim();
+          throw error;
         }
         // Upstream #25817: a nested child resumed directly continues the parent it claimed above.
         if (claimedParent && this.parentWorkflow) {
