@@ -86,6 +86,13 @@ type ChannelAgent = Pick<
 /** Platforms whose chat-SDK adapters render interactive approval buttons. */
 const APPROVAL_BUTTON_PLATFORMS = new Set(['slack', 'discord', 'teams', 'gchat', 'google-chat', 'telegram']);
 
+const DENIED_TOOL_CALL_TTL_MS = 10 * 60 * 1000;
+
+/** Providers reuse tool-call ids across runs, so a denial is keyed by both. */
+function deniedToolCallKey(runId: string, toolCallId: string): string {
+  return JSON.stringify([runId, toolCallId]);
+}
+
 /**
  * Manages a single Chat SDK instance for an agent, wiring all adapters
  * to the Mastra pipeline (thread mapping → agent.stream → thread.post).
@@ -162,6 +169,8 @@ export class AgentChannels {
    * context. Entries are removed after the resume completes.
    */
   private pendingApprovalCards = new Map<string, PendingApprovalRecord>();
+  /** Denied tool calls whose resumed run has not yet produced its denial result. */
+  private deniedToolCalls = new Map<string, { runId: string; timer: ReturnType<typeof setTimeout> }>();
 
   /**
    * Platforms we've already warned about for misconfigured `toolDisplay` (e.g.
@@ -866,6 +875,7 @@ export class AgentChannels {
                 requestContext.set(CHAT_CHANNEL_RENDER_CONTEXT_KEY, renderContext);
 
                 try {
+                  this.markToolCallDenied(runId, toolCallId);
                   await this.dispatchDecline({
                     runId,
                     toolCallId,
@@ -876,6 +886,7 @@ export class AgentChannels {
                     },
                   });
                 } catch (err) {
+                  this.takeDeniedToolResult(runId, toolCallId);
                   const isStaleApproval = err instanceof Error && err.message.includes('No snapshot found');
                   if (isStaleApproval) {
                     this.log('info', 'Ignoring stale tool denial action (runId already consumed)', actionEventContext);
@@ -883,8 +894,8 @@ export class AgentChannels {
                     throw err;
                   }
                 } finally {
-                  // Stash entry is no longer needed; the resumed decline stream
-                  // won't emit a tool-result for this call.
+                  // Stash entry is no longer needed; `deniedToolCalls` keeps the
+                  // resumed stream's denial result out of the channel.
                   this.pendingApprovalCards.delete(toolCallId);
                 }
                 return;
@@ -1165,6 +1176,45 @@ export class AgentChannels {
     this.initPromise = null;
     this.chat = null;
     this.pendingApprovalCards.clear();
+    for (const { timer } of this.deniedToolCalls.values()) clearTimeout(timer);
+    this.deniedToolCalls.clear();
+  }
+
+  /** Records a denial so the resumed run's result for this call is not rendered as a card. */
+  private markToolCallDenied(runId: string, toolCallId: string): void {
+    const key = deniedToolCallKey(runId, toolCallId);
+    const existing = this.deniedToolCalls.get(key);
+    if (existing) clearTimeout(existing.timer);
+    // The backstop for runs the output processor never sees.
+    const timer = setTimeout(() => this.deniedToolCalls.delete(key), DENIED_TOOL_CALL_TTL_MS);
+    timer.unref?.();
+    this.deniedToolCalls.set(key, { runId, timer });
+  }
+
+  /**
+   * Whether this tool result is a denial the approval card already shows.
+   * Removes the record, so each denial suppresses at most one result.
+   * @internal
+   */
+  takeDeniedToolResult(runId: string, toolCallId: string): boolean {
+    const key = deniedToolCallKey(runId, toolCallId);
+    const entry = this.deniedToolCalls.get(key);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    this.deniedToolCalls.delete(key);
+    return true;
+  }
+
+  /**
+   * Drops every denial recorded for a run that ended or could not be resumed.
+   * @internal
+   */
+  releaseDeniedToolCalls(runId: string): void {
+    for (const [key, entry] of this.deniedToolCalls) {
+      if (entry.runId !== runId) continue;
+      clearTimeout(entry.timer);
+      this.deniedToolCalls.delete(key);
+    }
   }
 
   // ---------------------------------------------------------------------------
