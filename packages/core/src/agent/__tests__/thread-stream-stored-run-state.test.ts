@@ -198,7 +198,13 @@ describe('thread stream runtime reads stored run state', () => {
     expect(types).toEqual(['start', 'text-delta']);
   });
 
-  it('keeps a replayed suspension pending when only the advertised durable loop row says suspended', async () => {
+  // Fork contract (PF-2935, PF-3375 "RECORDED GAP" note above `deferredRunsByStreamId` in
+  // thread-stream-runtime.ts): upstream defers this unleased replayed run and then consults the
+  // advertised durable-loop row. The fork admits remote events only under a live lease and never
+  // defers, so the replay surfaces nothing. The advertised-row lookup is covered on the fork's
+  // lease-lapse path by 'parks a remote run whose lease lapsed when only the advertised durable
+  // loop row says suspended' above.
+  it('does not replay an unleased suspension even when the advertised durable loop row says suspended', async () => {
     vi.useFakeTimers();
     const harness = createHarness('stored-replay-namespaced');
     withStorage(harness, await storeWithRun(harness.runId, 'suspended', NAMESPACED_LOOP), NAMESPACED_LOOP);
@@ -222,8 +228,7 @@ describe('thread stream runtime reads stored run state', () => {
 
     subscription.unsubscribe();
     await consumed;
-    // The run is still waiting on approval, so the replayed prompt must reach the subscriber.
-    expect(types).toContain('tool-call-approval');
+    expect(types).toEqual([]);
   });
 
   it('does not block the thread on a replayed run-suspended of a run that resumed and finished', async () => {

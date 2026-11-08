@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { getErrorFromUnknown } from '../error';
 import { withAck } from '../events/acking-callback';
 import { EventEmitterPubSub } from '../events/event-emitter';
@@ -1624,7 +1623,7 @@ export class AgentThreadStreamRuntime {
     // idempotent. The public run id can itself be retry-stable, so it cannot be
     // the lease owner: two processes retrying that run id would both "win".
     // Keep the public correlation id inside a process-attempt-unique token.
-    const owner = `${AGENT_THREAD_LEASE_OWNER_PREFIX}${JSON.stringify([runId, this.#getSourceId(), randomUUID()])}`;
+    const owner = `${AGENT_THREAD_LEASE_OWNER_PREFIX}${JSON.stringify([runId, this.#getSourceId(), globalThis.crypto.randomUUID()])}`;
     state.leaseOwnerTokensByRunId.set(runId, owner);
     return owner;
   }
@@ -12173,7 +12172,7 @@ export class AgentThreadStreamRuntime {
     }
 
     if (isActiveTarget && activeBehavior !== 'deliver') {
-      runId ??= randomUUID();
+      runId ??= globalThis.crypto.randomUUID();
       if (activeBehavior === 'persist') {
         if (!resourceId || !threadId) {
           throw new Error('resourceId and threadId are required to persist an active signal');
@@ -12269,7 +12268,7 @@ export class AgentThreadStreamRuntime {
         const claimedOwnerDiscovery = isLocalReservedRun ? state.claimedThreadOwnerDiscoveries.get(key) : undefined;
         if (claimedOwnerDiscovery) {
           const discoveryKey = key;
-          const discoveredRunId = randomUUID();
+          const discoveredRunId = globalThis.crypto.randomUUID();
           const disposition = this.#rememberSignalPayloadForRun(state, key, discoveredRunId, signal, {
             admissionAttemptId,
             allowAttemptSupersede: true,
@@ -12375,7 +12374,7 @@ export class AgentThreadStreamRuntime {
       throw new Error('No active agent run found for signal target');
     }
 
-    runId ??= randomUUID();
+    runId ??= globalThis.crypto.randomUUID();
     key ??= this.#threadKey(resourceId, threadId);
     if (idleBehavior === 'persist') {
       if (signal.transient) {
