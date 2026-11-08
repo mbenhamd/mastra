@@ -3619,6 +3619,7 @@ export class Workflow<
             runId: run.runId,
             opts: {
               status: 'suspended',
+              resumeIntent: undefined,
               expectedStatus: nestedStatus,
               expectedExecutionGeneration: nestedSnapshot.executionGeneration ?? null,
               expectedLifecycleResumeAttempt: nestedSnapshot.lifecycleResumeAttempt ?? 0,
@@ -6544,8 +6545,17 @@ export class Run<
     });
   }
 
-  async #executeOwned<T>(execute: () => Promise<T>): Promise<T> {
-    const ownership = await this.#claimOwnership(true);
+  /**
+   * Takes the boot-recovery ownership lease, or returns `undefined` when another live process
+   * holds it (`force: false`). Runs that are never swept get a no-op lease.
+   */
+  async #takeOwnershipLease(force: boolean): Promise<WorkflowRunOwnership | undefined> {
+    const ownership = await this.#claimOwnership(force);
+    return 'release' in ownership ? ownership : undefined;
+  }
+
+  async #executeOwned<T>(execute: () => Promise<T>, lease?: WorkflowRunOwnership): Promise<T> {
+    const ownership = lease ?? (await this.#claimOwnership(true));
     if (!('release' in ownership)) return execute();
     try {
       return await execute();
@@ -6934,13 +6944,69 @@ export class Run<
     // durable attempt every fenced write of this execution checks against.
     // A claim stores the resume data only where this run's resumed step would persist it
     // unchanged. Checked once, and only for a claim that can store it.
+    //
+    // The boot-recovery lease is taken before the claim, so a sweep on another host that lists the
+    // claimed `running` row skips it instead of continuing the same answer. A lease another live
+    // process still holds is not displaced here: this caller has not yet proven it owns the
+    // suspension, so it takes the lease only after winning the claim, as before.
+    const resumeLease = params.claimedSnapshot ? undefined : await this.#takeOwnershipLease(false);
+    const releaseResumeLease = async () => {
+      await resumeLease?.release();
+    };
+
+    // A nested child resumed directly also claims its parent (below). Both claims store the
+    // answer, or neither does: the parent is read before this run's claim so its check is known.
+    const claimsParent =
+      !!this.parentWorkflow && !params.skipParentWorkflowClaim && !!workflowsStore?.supportsConcurrentUpdates();
+    let parentForClaim:
+      | {
+          ok: true;
+          run: Run<any, any, any, any, any, any>;
+          snapshot: WorkflowRunState;
+          generation: string;
+        }
+      | { ok: false; error: unknown }
+      | undefined;
+    if (claimsParent && this.parentWorkflow && workflowsStore) {
+      try {
+        const parentWorkflow = this.#getParentWorkflow(this.parentWorkflow);
+        if (!parentWorkflow) throw new Error(`Parent workflow ${this.parentWorkflow.workflowId} is not registered`);
+        const parentSnapshot = await workflowsStore.loadWorkflowSnapshot({
+          workflowName: this.parentWorkflow.workflowId,
+          runId: this.parentWorkflow.runId,
+        });
+        if (!parentSnapshot) {
+          throw new Error(`No snapshot found for parent workflow run: ${this.parentWorkflow.runId}`);
+        }
+        const parentGeneration = requireWorkflowExecutionGeneration(
+          parentSnapshot.executionGeneration,
+          `Workflow run ${this.parentWorkflow.workflowId}/${this.parentWorkflow.runId}`,
+        );
+        parentForClaim = {
+          ok: true,
+          run: await parentWorkflow.createRun({ runId: this.parentWorkflow.runId }),
+          snapshot: parentSnapshot,
+          generation: parentGeneration,
+        };
+      } catch (error) {
+        parentForClaim = { ok: false, error };
+      }
+    }
     let answerPersistable: boolean | undefined;
-    const ownAnswerPersistable = () =>
-      (answerPersistable ??= this.resumeAnswerIsPersistable({
-        snapshot,
-        stepId: steps[0]!,
-        resumePayload: resumeDataToUse,
-      }));
+    const answerStorable = () =>
+      (answerPersistable ??=
+        this.resumeAnswerIsPersistable({
+          snapshot,
+          stepId: steps[0]!,
+          resumePayload: resumeDataToUse,
+        }) &&
+        (!claimsParent ||
+          (parentForClaim?.ok === true &&
+            parentForClaim.run.resumeAnswerIsPersistable({
+              snapshot: parentForClaim.snapshot,
+              stepId: this.parentWorkflow!.stepId,
+              resumePayload: resumeDataToUse,
+            }))));
     if (!params.claimedSnapshot) {
       try {
         await this.claimResume({
@@ -6950,7 +7016,7 @@ export class Run<
           // Storage keeps the resumed step suspended until it settles, so the claim is the
           // only durable record of this input: restart() continues the resume from it.
           resumeIntent:
-            workflowsStore?.supportsConcurrentUpdates() && ownAnswerPersistable()
+            workflowsStore?.supportsConcurrentUpdates() && answerStorable()
               ? createWorkflowResumeIntent({
                   snapshot,
                   executionGeneration: loadedExecutionGeneration,
@@ -6962,6 +7028,7 @@ export class Run<
               : undefined,
         });
       } catch (error) {
+        await releaseResumeLease();
         workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
         throw error;
       }
@@ -6984,6 +7051,8 @@ export class Run<
           runId: run.runId,
           opts: {
             status: 'suspended',
+            // A released claim keeps no stored answer.
+            resumeIntent: undefined,
             expectedStatus: 'running',
             expectedExecutionGeneration: generation,
             expectedLifecycleResumeAttempt: (claimed.lifecycleResumeAttempt ?? 0) + 1,
@@ -7001,26 +7070,14 @@ export class Run<
     let claimedParent:
       | { run: Run<any, any, any, any, any, any>; snapshot: WorkflowRunState; generation: string }
       | undefined;
-    if (this.parentWorkflow && !params.skipParentWorkflowClaim && workflowsStore?.supportsConcurrentUpdates()) {
+    if (claimsParent && this.parentWorkflow && workflowsStore && parentForClaim) {
       const releaseOwnClaimIfUnused = () =>
         params.claimedSnapshot
           ? Promise.resolve()
           : releaseResumeClaim({ workflowId: this.workflowId, runId: this.runId }, snapshot, loadedExecutionGeneration);
       try {
-        const parentWorkflow = this.#getParentWorkflow(this.parentWorkflow);
-        if (!parentWorkflow) throw new Error(`Parent workflow ${this.parentWorkflow.workflowId} is not registered`);
-        const parentSnapshot = await workflowsStore.loadWorkflowSnapshot({
-          workflowName: this.parentWorkflow.workflowId,
-          runId: this.parentWorkflow.runId,
-        });
-        if (!parentSnapshot) {
-          throw new Error(`No snapshot found for parent workflow run: ${this.parentWorkflow.runId}`);
-        }
-        const parentGeneration = requireWorkflowExecutionGeneration(
-          parentSnapshot.executionGeneration,
-          `Workflow run ${this.parentWorkflow.workflowId}/${this.parentWorkflow.runId}`,
-        );
-        const parentRun = await parentWorkflow.createRun({ runId: this.parentWorkflow.runId });
+        if (!parentForClaim.ok) throw parentForClaim.error;
+        const { run: parentRun, snapshot: parentSnapshot, generation: parentGeneration } = parentForClaim;
         await parentRun.claimResume({
           workflowsStore,
           snapshot: parentSnapshot,
@@ -7028,26 +7085,21 @@ export class Run<
           // The parent continues only after the child settles, and only in this process. Its
           // claim records the resume through the child, so a restart of the parent continues it.
           // It stores the data only where both this run's resumed step and the parent's nested
-          // step would persist it unchanged.
-          resumeIntent:
-            ownAnswerPersistable() &&
-            parentRun.resumeAnswerIsPersistable({
-              snapshot: parentSnapshot,
-              stepId: this.parentWorkflow.stepId,
-              resumePayload: resumeDataToUse,
-            })
-              ? createWorkflowResumeIntent({
-                  snapshot: parentSnapshot,
-                  executionGeneration: parentGeneration,
-                  steps: [this.parentWorkflow.stepId, ...steps],
-                  resumePayload: resumeDataToUse,
-                  forEachIndex: this.parentWorkflow.foreachIndex,
-                })
-              : undefined,
+          // step would persist it unchanged, exactly when this run's claim stored it.
+          resumeIntent: answerStorable()
+            ? createWorkflowResumeIntent({
+                snapshot: parentSnapshot,
+                executionGeneration: parentGeneration,
+                steps: [this.parentWorkflow.stepId, ...steps],
+                resumePayload: resumeDataToUse,
+                forEachIndex: this.parentWorkflow.foreachIndex,
+              })
+            : undefined,
         });
         claimedParent = { run: parentRun, snapshot: parentSnapshot, generation: parentGeneration };
       } catch (error) {
         await releaseOwnClaimIfUnused();
+        await releaseResumeLease();
         workflowSpan?.error({ error: getErrorFromUnknown(error), endSpan: true });
         throw error;
       }
@@ -7072,42 +7124,44 @@ export class Run<
     params.onExecutionStarted?.();
     const executionResultPromise = this.#withActiveExecution(executionGeneration, () =>
       // Upstream #25579: hold the boot-recovery ownership lease while this process drives the run.
-      this.#executeOwned(() =>
-        this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
-          workflowId: this.workflowId,
-          runId: this.runId,
-          parentWorkflow: this.parentWorkflow,
-          executionGeneration,
-          lifecycleResumeAttempt,
-          lifecycleStepStates,
-          resourceId: this.resourceId,
-          graph: this.executionGraph,
-          serializedStepGraph: this.serializedStepGraph,
-          input: snapshot?.context?.input as TInput,
-          initialState: (snapshot?.value ?? {}) as any,
-          resume: {
-            steps,
-            stepResults,
-            resumePayload: resumeDataToUse,
-            // @ts-expect-error - context type mismatch
-            resumePath: snapshot?.suspendedPaths?.[steps?.[0]] as any,
-            stepExecutionPath: snapshot?.stepExecutionPath,
-            forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
-            label: params.label,
-          },
-          format: params.format,
-          pubsub: this.pubsub,
-          requestContext: requestContextToUse as RequestContext,
-          actor: params.actor,
-          abortController: this.abortController,
-          workflowSpan,
-          outputOptions: params.outputOptions,
-          outputWriter: params.outputWriter,
-          perStep: params.perStep,
-          commitTerminalStatus: status =>
-            this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
-          isCancellationAdmitted: this.isCancellationAdmitted,
-        }),
+      this.#executeOwned(
+        () =>
+          this.executionEngine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
+            workflowId: this.workflowId,
+            runId: this.runId,
+            parentWorkflow: this.parentWorkflow,
+            executionGeneration,
+            lifecycleResumeAttempt,
+            lifecycleStepStates,
+            resourceId: this.resourceId,
+            graph: this.executionGraph,
+            serializedStepGraph: this.serializedStepGraph,
+            input: snapshot?.context?.input as TInput,
+            initialState: (snapshot?.value ?? {}) as any,
+            resume: {
+              steps,
+              stepResults,
+              resumePayload: resumeDataToUse,
+              // @ts-expect-error - context type mismatch
+              resumePath: snapshot?.suspendedPaths?.[steps?.[0]] as any,
+              stepExecutionPath: snapshot?.stepExecutionPath,
+              forEachIndex: params.forEachIndex ?? snapshotResumeLabel?.foreachIndex,
+              label: params.label,
+            },
+            format: params.format,
+            pubsub: this.pubsub,
+            requestContext: requestContextToUse as RequestContext,
+            actor: params.actor,
+            abortController: this.abortController,
+            workflowSpan,
+            outputOptions: params.outputOptions,
+            outputWriter: params.outputWriter,
+            perStep: params.perStep,
+            commitTerminalStatus: status =>
+              this.commitTerminalStatus(executionGeneration, status, lifecycleResumeAttempt),
+            isCancellationAdmitted: this.isCancellationAdmitted,
+          }),
+        resumeLease,
       ),
     ).then(
       async result => {
@@ -7264,7 +7318,19 @@ export class Run<
     // step or a later one ran) left its accepted input on the claim. Continue that
     // resume instead of re-executing the suspended step without its input. Every
     // other running snapshot restarts from its recorded progress as before.
-    const resumeIntent = getRestartableWorkflowResumeIntent(snapshot);
+    let resumeIntent = getRestartableWorkflowResumeIntent(snapshot);
+    // The restarting host's own persistence options decide whether the stored answer still
+    // applies: where its resumed step would not persist the answer unchanged, restart as on base.
+    if (
+      resumeIntent &&
+      !this.resumeAnswerIsPersistable({
+        snapshot,
+        stepId: resumeIntent.steps[0]!,
+        resumePayload: resumeIntent.resumePayload,
+      })
+    ) {
+      resumeIntent = undefined;
+    }
     if (this.parentWorkflow && !drivenByParent) {
       await this.#deferToParentDriving(workflowsStore, this.parentWorkflow, resumeIntent);
     }
@@ -7337,9 +7403,6 @@ export class Run<
 
     this.adoptLifecycleExecution(lifecycleExecution);
     this.workflowRunSpan = workflowSpan;
-    // Read before execution: cleanup() drops the run-scoped override once the run settles.
-    const persistencePredicate =
-      this.executionEngine.getRunPersistenceOverride(this.runId) ?? this.executionEngine.options.shouldPersistSnapshot;
 
     let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
     try {
@@ -7391,18 +7454,6 @@ export class Run<
     } finally {
       // Upstream #25579: the restart held the boot-recovery ownership lease while it ran.
       await ownership.release();
-    }
-
-    // A restart that continued a stored resume settles like that resume.
-    if (resumeIntent) {
-      await this.returnDeclinedResumeToSuspended({
-        workflowsStore,
-        persistencePredicate,
-        result,
-        resumedStepId: resumeIntent.steps[0]!,
-        executionGeneration: lifecycleExecution.executionGeneration,
-        lifecycleResumeAttempt: lifecycleExecution.lifecycleResumeAttempt,
-      });
     }
 
     if (
