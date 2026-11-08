@@ -3,11 +3,9 @@
  *
  * A resumed step that is re-run after a crash must still receive the payload it suspended with.
  *
- * PF-5928 adaptation (fork PF-2216): the resumed step keeps its suspended record (with its
- * suspendPayload) until it settles, and no resume payload is recorded ahead of execution, so
- * restart() leaves the run suspended on that step (it never re-runs it without its resume
- * payload) and a new resume() finishes it with the suspendData intact. Payload
- * delivery through the fork resume path: nested-resume-pf2216.test.ts and lifecycle-events.test.ts.
+ * Fork (PF-2216, PF-7806): the resumed step keeps its suspended record (with its
+ * suspendPayload) until it settles, and the resume claim records the accepted input, so
+ * restart() continues the resume: the step runs with that input and its suspendData intact.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -78,14 +76,10 @@ describe('resumed step restarted after a crash (issue #27012)', () => {
     const run2 = await wf2.createRun({ runId: run1.runId });
     const restarted = await run2.restart();
 
-    expect(seen).toEqual([]);
-    expect(restarted.status).toBe('suspended');
-
-    const result = await run2.resume({ step: 'ask', resumeData: { answer: 'the blue one' } });
     expect(seen).toEqual([{ resumeData: { answer: 'the blue one' }, suspendData: { question: 'which one?' } }]);
-    expect(result.status).toBe('success');
-    if (result.status === 'success') {
-      expect(result.result).toEqual({ question: 'which one?', answer: 'the blue one' });
+    expect(restarted.status).toBe('success');
+    if (restarted.status === 'success') {
+      expect(restarted.result).toEqual({ question: 'which one?', answer: 'the blue one' });
     }
     const finalSnapshot = await store2.loadWorkflowSnapshot({ workflowName: 'ask-flow', runId: run1.runId });
     expect(finalSnapshot?.context.ask).not.toHaveProperty('suspendPayload');

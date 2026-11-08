@@ -5,13 +5,11 @@
  * both parent and nested snapshots `running`. restart() on the parent must
  * recover the run and re-execute the nested step with its resume data.
  *
- * PF-5928 adaptation (fork PF-2216): the fork never records the resumed step as
- * `running` with its resume payload before it runs (storage refuses a `running`
- * write over the suspended record during an ordinary resume), so there is no
- * payload for restart() to replay. These scenarios assert the fork contract:
- * the resumed step keeps its suspended record, and restart() fails the run
- * instead of running the step without its payload. Payload delivery through the
- * fork's resume path is covered by nested-resume-pf2216.test.ts.
+ * Fork (PF-2216, PF-7806): the fork never records the resumed step as `running`
+ * with its resume payload before it runs (storage refuses a `running` write over
+ * the suspended record during an ordinary resume), so the resumed step keeps its
+ * suspended record. The resume claim stores the accepted input instead, and
+ * restart() continues the resume with it (resume-restart-intent.test.ts).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -95,9 +93,9 @@ describe('nested workflow restart after crash during resume (issue #25187)', () 
       const run2 = await p2.parent.createRun({ runId: run1.runId });
       const result = await run2.restart();
 
-      // Fork PF-2216: nothing recorded the resume payload, so the resumed step never runs.
-      expect(result.status).toBe('failed');
-      expect(seen).toEqual([]);
+      // PF-7806: the parent's resume claim recorded the input, so the nested step runs with it.
+      expect(result.status).toBe('success');
+      expect(seen).toEqual([false]);
     },
   );
 
@@ -151,8 +149,8 @@ describe('nested workflow restart after crash during resume (issue #25187)', () 
 
     const result = await (await p2.parent.createRun({ runId: run1.runId })).restart();
 
-    // Fork PF-2216: no recorded payload, so restart() fails the run without running the step.
-    expect(result.status).toBe('failed');
-    expect(seen).toEqual([]);
+    // PF-7806: the parent's resume claim recorded the input, so restart() continues the resume.
+    expect(result.status).toBe('success');
+    expect(seen).toEqual([false]);
   });
 });

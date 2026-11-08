@@ -299,6 +299,17 @@ function ownerWorkflowIdFromRowId(rowId: string): string | undefined {
   }
 }
 
+/** Whether the recovery sweep restarts the active runs of this workflow. */
+function sweepRestartsActiveRuns(workflow: AnyWorkflow): boolean {
+  return (
+    (workflow.engineType === 'default' || workflow.engineType === 'evented') &&
+    // Skip before listing: opted-out workflows shouldn't cost storage queries, and processor
+    // workflows only run inside an agent call, so a lone restart has nothing to resume.
+    workflow.options?.autoRestartActiveRuns !== false &&
+    workflow.type !== 'processor'
+  );
+}
+
 /**
  * Configuration interface for initializing a Mastra instance.
  *
@@ -4935,6 +4946,17 @@ export class Mastra<
     return workflow as TWorkflows[TWorkflowName];
   }
 
+  /**
+   * Whether {@link Mastra.restartAllActiveWorkflowRuns} on this instance restarts the active runs of
+   * the workflow with this id.
+   * @internal
+   */
+  __sweepRestartsWorkflow(workflowId: string): boolean {
+    return Object.values(this.#workflows).some(
+      workflow => workflow.id === workflowId && sweepRestartsActiveRuns(workflow),
+    );
+  }
+
   public async listActiveWorkflowRuns(): Promise<WorkflowRuns> {
     const storage = this.#storage;
     if (!storage) {
@@ -4942,14 +4964,7 @@ export class Mastra<
       return { runs: [], total: 0 };
     }
 
-    const restartableWorkflows = Object.values(this.#workflows).filter(
-      workflow =>
-        (workflow.engineType === 'default' || workflow.engineType === 'evented') &&
-        // Skip before listing: opted-out workflows shouldn't cost storage queries, and processor
-        // workflows only run inside an agent call, so a lone restart has nothing to resume.
-        workflow.options?.autoRestartActiveRuns !== false &&
-        workflow.type !== 'processor',
-    );
+    const restartableWorkflows = Object.values(this.#workflows).filter(workflow => sweepRestartsActiveRuns(workflow));
 
     const activeRunsByWorkflow = await Promise.all(
       restartableWorkflows.map(workflow => workflow.listActiveWorkflowRuns()),
@@ -5005,6 +5020,29 @@ export class Mastra<
         const leaseExpiresAt = error.details?.leaseExpiresAt;
         const retryAt = typeof leaseExpiresAt === 'string' ? Date.parse(leaseExpiresAt) : NaN;
         this.#scheduleWorkflowRecoveryRecheck(workflowName, runId, Number.isNaN(retryAt) ? Date.now() : retryAt);
+        return;
+      }
+      if (error instanceof MastraError && error.id === 'WORKFLOW_RESTART_DEFERRED_TO_PARENT') {
+        // The parent run drives this nested run. A parent held by a live process is re-checked
+        // once its lease could have lapsed; otherwise this sweep restarts the parent itself.
+        const parentLeaseExpiresAt = error.details?.parentLeaseExpiresAt;
+        const retryAt = typeof parentLeaseExpiresAt === 'string' ? Date.parse(parentLeaseExpiresAt) : NaN;
+        const deferral = {
+          workflow: workflowName,
+          runId,
+          parentWorkflow: error.details?.parentWorkflowId,
+          parentRunId: error.details?.parentRunId,
+          parentStepId: error.details?.parentStepId,
+        };
+        if (!Number.isNaN(retryAt)) {
+          this.#logger.debug('Skipped restarting nested workflow run driven by its parent', deferral);
+          this.#scheduleWorkflowRecoveryRecheck(workflowName, runId, retryAt);
+          return;
+        }
+        this.#logger.warn(
+          'Skipped restarting nested workflow run driven by its parent; it waits for the parent run to be restarted',
+          deferral,
+        );
         return;
       }
       const context = { workflow: workflowName, runId, error };

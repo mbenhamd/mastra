@@ -106,6 +106,7 @@ import type { ClassifierStepOutput } from '../entry-executors';
 import { workflowRunNotSuspendedError, workflowSnapshotNotFoundError } from '../lifecycle-errors';
 import { createWorkflowExecutionGeneration, requireWorkflowExecutionGeneration } from '../lifecycle-events';
 import type { WorkflowExecutionGeneration, WorkflowStepLifecycleStateMap } from '../lifecycle-events';
+import { createWorkflowResumeIntent } from '../resume-claim';
 import { getEntryId } from '../step-entry';
 import { createStepFromClassifier } from '../step-factories';
 import type { ClassifierStepOptions } from '../step-factories';
@@ -2899,7 +2900,26 @@ export class EventedRun<
       snapshot.executionGeneration,
       `Workflow run ${this.workflowId}/${this.runId}`,
     );
-    await this.claimResume({ workflowsStore, snapshot, executionGeneration });
+    const forEachIndex = params.label !== undefined ? snapshotResumeLabel?.foreachIndex : params.forEachIndex;
+    await this.claimResume({
+      workflowsStore,
+      snapshot,
+      executionGeneration,
+      // The claim is the durable record of this input until the resumed step settles. It stores
+      // the data only where the resumed step would persist it unchanged.
+      resumeIntent:
+        workflowsStore?.supportsConcurrentUpdates() &&
+        this.resumeAnswerIsPersistable({ snapshot, stepId: steps[0]!, resumePayload: resumeDataToUse })
+          ? createWorkflowResumeIntent({
+              snapshot,
+              executionGeneration,
+              steps,
+              resumePayload: resumeDataToUse,
+              label: params.label,
+              forEachIndex,
+            })
+          : undefined,
+    });
     const lifecycleExecution = this.restoreLifecycleExecution(snapshot);
     this.workflowRunStatus = 'running';
     // Upstream: abort() on a resumed handle publishes workflow.cancel like start() does.
@@ -2919,7 +2939,7 @@ export class EventedRun<
           stepResults: snapshot?.context as any,
           resumePayload: resumeDataToUse,
           resumePath,
-          forEachIndex: params.label !== undefined ? snapshotResumeLabel?.foreachIndex : params.forEachIndex,
+          forEachIndex,
           label: params.label,
         },
         pubsub: this.mastra.pubsub,
