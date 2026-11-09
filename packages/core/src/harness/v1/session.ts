@@ -25282,14 +25282,12 @@ export class Session {
     admissionEpoch: number,
     retryAttempt: number,
     sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
-    parkedRetry = false,
   ): Promise<void> {
-    // PF-8032: a guarded `remind` write that failed, or any retry of a parked
-    // notice that was left owed, stays in the waiting set, so the next turn
-    // retries it before loading history instead of waiting for a background
-    // reconcile pass.
+    // PF-8032: a `remind` notice left owed (a failed write or read, guarded or
+    // not) also waits in the parked set, so the next turn retries it before
+    // loading history instead of waiting for the background reconcile retry.
     const settle = (outcome: DelegationNoticeOutcome) => {
-      if (outcome === 'left_owed' && notice.mode === 'remind' && (sourceWriteGuard !== undefined || parkedRetry)) {
+      if (outcome === 'left_owed' && notice.mode === 'remind') {
         this._delegationNoticesAwaitingGuard.set(`${notice.subagentSessionId}:${notice.digest}`, notice);
       }
       this._settleDelegationNoticeOutcome(outcome, notice, retryAttempt);
@@ -25353,7 +25351,6 @@ export class Session {
             this._delegationNoticeEpochs.get(key) ?? this._activeWorkAdmissionEpoch,
             0,
             guard,
-            true,
           ),
         ),
       );

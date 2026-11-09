@@ -2891,6 +2891,36 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       },
     );
 
+    it('a settlement delivery that fails to read the notice leaves it for the next guarded turn', async () => {
+      let parent!: Session;
+      const fenced = await fencedMemory(() => parent.threadId);
+      const ctx = realParent(true, { db: new InMemoryDB(), memory: fenced.memory, onDelegatedSettlement: 'remind' });
+      parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const internals = parent as any;
+      try {
+        const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+        await endR0();
+        const isOwed = internals._delegationNoticeIsOwed.bind(parent);
+        let failOnce = true;
+        vi.spyOn(internals, '_delegationNoticeIsOwed').mockImplementation(async (...args: unknown[]) => {
+          if (failOnce) {
+            failOnce = false;
+            throw new Error('transient storage read failure');
+          }
+          return isOwed(...args);
+        });
+        releaseChild();
+        await poll(() => !failOnce && internals._delegationNoticesInFlight.size === 0);
+
+        await parent.message({ content: 'guarded turn', observationalMemorySourceWriteGuard: await fenced.guardFor() });
+        expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
     it('a parked notice whose unguarded retry fails stays parked for the next guarded turn', async () => {
       const { ctx, parent, fenced, taskId } = await settledWhileIdle();
       const internals = parent as any;
