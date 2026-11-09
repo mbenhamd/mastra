@@ -1710,11 +1710,12 @@ function delegationScopeFingerprint(
 }
 
 /**
- * The unfinished parents in a settled scope that have an unfinished task below
- * them. Rollup derives `blocked` for each of them from that work. A parent
- * whose children all finished has nothing to derive from and keeps the
- * explicit outcome: for the delegated root that is the subagent's verdict on
- * the unit's own work, which a later delegation of the root can clear.
+ * The unfinished parents in a settled scope that have an unfinished child.
+ * Every unfinished task holds work, a parent's own work included, so rollup
+ * derives `blocked` for each such parent from that child. A parent whose
+ * children all finished has nothing to derive from and keeps the explicit
+ * outcome: for the delegated root that is the subagent's verdict on the unit's
+ * own work, which a later delegation of the root can clear.
  */
 function parentsOfBlockedWork(index: ReturnType<typeof indexPlanTasks>, scopeTaskIds: string[]): Set<string> {
   const unfinished = (id: string) => {
@@ -1722,20 +1723,9 @@ function parentsOfBlockedWork(index: ReturnType<typeof indexPlanTasks>, scopeTas
     return status !== 'completed' && status !== 'cancelled';
   };
   const parents = new Set<string>();
-  // `subtreeTaskIds` lists a parent before its descendants, so walking it in
-  // reverse settles every child before its parent.
-  const holdsWork = new Set<string>();
-  for (const id of [...scopeTaskIds].reverse()) {
+  for (const id of scopeTaskIds) {
     if (!unfinished(id)) continue;
-    const childIds = index.childrenByParent.get(id) ?? [];
-    if (childIds.length === 0) {
-      holdsWork.add(id);
-      continue;
-    }
-    if (childIds.some(childId => holdsWork.has(childId))) {
-      holdsWork.add(id);
-      parents.add(id);
-    }
+    if ((index.childrenByParent.get(id) ?? []).some(unfinished)) parents.add(id);
   }
   return parents;
 }
@@ -2007,7 +1997,13 @@ export async function planTaskReconcileDelegation(
   refreshSummary(port, postTasks, deltas);
   emitBestEffort(port, 'delegate_settled', settledTaskIds, deltas);
   const notice = readPendingDelegationSettlementNotice(updated);
-  return { reconciled: true, view: toView(updated), ...(notice !== undefined ? { notice } : {}) };
+  // A parent left to rollup takes its status from the committed delta.
+  const committedDelta = deltas.find(delta => delta.taskId === input.taskId);
+  const committed =
+    committedDelta === undefined
+      ? updated
+      : { ...updated, status: committedDelta.status, statusSource: committedDelta.statusSource };
+  return { reconciled: true, view: toView(committed), ...(notice !== undefined ? { notice } : {}) };
 }
 
 /**

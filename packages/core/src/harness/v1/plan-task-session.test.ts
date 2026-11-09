@@ -1642,6 +1642,7 @@ describe('a subtree delegation settled as blocked', () => {
       outcome: 'blocked',
     });
     expect(settled.reconciled).toBe(true);
+    expect(settled.view?.status).toBe('blocked');
     const blocked = await listAll(storage);
     for (const task of [root, leaf!, mid!, grandchild!]) expect(blocked.get(task.taskId)?.status).toBe('blocked');
 
