@@ -1217,6 +1217,8 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       onDelegatedSettlement?: 'wake' | 'remind';
       /** Provider call `call` asks for `task_delegate` of one worker task. */
       delegateOnCall?: number;
+      /** Memory for `quiet-agent` (default none). */
+      quietMemory?: MockMemory;
     },
     grant = false,
   ) {
@@ -1280,7 +1282,13 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
           ? { memory: shared?.dynamicMemory ? () => memory : memory }
           : {}),
     });
-    const quietAgent = new Agent({ id: 'quiet-agent', name: 'quiet-agent', instructions: 'answer briefly', model });
+    const quietAgent = new Agent({
+      id: 'quiet-agent',
+      name: 'quiet-agent',
+      instructions: 'answer briefly',
+      model,
+      ...(shared?.quietMemory ? { memory: shared.quietMemory } : {}),
+    });
     const storage = new InMemoryHarness({
       db: shared?.db ?? new InMemoryDB(),
       ...(grant ? { terminalHandoff: { enabled: true }, sessionRecordProjection: { enabled: true } } : {}),
@@ -2659,14 +2667,17 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     }
 
     /** R0 calls `task_delegate` and ends; the child is held, so it settles while the parent is idle. */
-    async function delegatedByRun(mode: 'wake' | 'remind') {
+    async function delegatedByRun(mode: 'wake' | 'remind', fencedQuietMode = false) {
       let parent!: Session;
       const fenced = await fencedMemory(() => parent.threadId);
+      // `quiet-mode` gets its own fenced memory instance and store.
+      const quiet = fencedQuietMode ? await fencedMemory(() => parent.threadId) : undefined;
       const ctx = realParent(true, {
         db: new InMemoryDB(),
         memory: fenced.memory,
         onDelegatedSettlement: mode,
         delegateOnCall: 0,
+        ...(quiet !== undefined ? { quietMemory: quiet.memory } : {}),
       });
       parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
       let releaseChild!: () => void;
@@ -2682,7 +2693,15 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       expect(ctx.prompts).toHaveLength(2);
       // The delegating run minted the one guard it ran under.
       expect(fenced.minted).toHaveLength(1);
-      return { ctx, parent, fenced, taskId: page.tasks[0]!.taskId, releaseChild, delegatingGuard: fenced.minted[0]! };
+      return {
+        ctx,
+        parent,
+        fenced,
+        quiet,
+        taskId: page.tasks[0]!.taskId,
+        releaseChild,
+        delegatingGuard: fenced.minted[0]!,
+      };
     }
 
     it.each(['wake', 'remind'] as const)(
@@ -2706,6 +2725,29 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         }
       },
     );
+
+    it("remind: after a switch to another fenced mode the row goes to the delegating mode's memory under its guard", async () => {
+      const { ctx, parent, fenced, quiet, taskId, releaseChild, delegatingGuard } = await delegatedByRun(
+        'remind',
+        true,
+      );
+      try {
+        await parent.switchMode({ mode: 'quiet-mode' });
+        releaseChild();
+        await deliveryFinished(parent, taskId);
+        expect(fenced.noticeSaves).toEqual([delegatingGuard]);
+        expect(quiet!.noticeSaves).toEqual([]);
+        const { messages } = await fenced.memory.recall({
+          threadId: parent.threadId,
+          resourceId: 'u1',
+          hideSignals: false,
+        });
+        expect(messages.filter(m => JSON.stringify(m.content).includes(NOTICE))).toHaveLength(1);
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
 
     it("wake: a notice whose delegating run's guard was revoked is dropped, not owed, and never re-guarded", async () => {
       const { ctx, parent, fenced, taskId, releaseChild, delegatingGuard } = await delegatedByRun('wake');
