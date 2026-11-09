@@ -1709,12 +1709,12 @@ function delegationScopeFingerprint(
   return sha256Text(JSON.stringify({ includeSubtree, scope, externalDependencies }));
 }
 
-/** Capture the exact execution scope before allocating a durable child. */
 /**
  * The unfinished parents in a settled scope that have an unfinished task below
  * them. Rollup derives `blocked` for each of them from that work. A parent
  * whose children all finished has nothing to derive from and keeps the
- * explicit outcome.
+ * explicit outcome: for the delegated root that is the subagent's verdict on
+ * the unit's own work, which a later delegation of the root can clear.
  */
 function parentsOfBlockedWork(index: ReturnType<typeof indexPlanTasks>, scopeTaskIds: string[]): Set<string> {
   const unfinished = (id: string) => {
@@ -1740,6 +1740,7 @@ function parentsOfBlockedWork(index: ReturnType<typeof indexPlanTasks>, scopeTas
   return parents;
 }
 
+/** Capture the exact execution scope before allocating a durable child. */
 export async function capturePlanTaskDelegationScope(
   port: PlanTaskSessionPort,
   taskId: string,
