@@ -225,15 +225,23 @@ export class ComposioToolProvider extends BaseToolProvider {
     this.allowTracking = config.allowTracking;
   }
 
-  private trackingOption(): { allowTracking?: boolean } {
-    return this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking };
+  /**
+   * Options shared by both clients. `disableVersionCheck` stops the SDK from
+   * asking the npm registry for its latest version whenever a client is
+   * built: a server provider must not depend on npm egress.
+   */
+  private clientOptions(): { allowTracking?: boolean; disableVersionCheck: true } {
+    return {
+      disableVersionCheck: true,
+      ...(this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking }),
+    };
   }
 
   // ── client cache ──────────────────────────────────────────────────────
 
   private getRawClient(): Composio {
     if (!this.rawClient) {
-      this.rawClient = new Composio({ apiKey: this.apiKey, ...this.trackingOption() });
+      this.rawClient = new Composio({ apiKey: this.apiKey, ...this.clientOptions() });
     }
     return this.rawClient;
   }
@@ -243,7 +251,7 @@ export class ComposioToolProvider extends BaseToolProvider {
       this.mastraClient = new Composio({
         apiKey: this.apiKey,
         provider: new MastraProvider(),
-        ...this.trackingOption(),
+        ...this.clientOptions(),
       });
     }
     return this.mastraClient;
