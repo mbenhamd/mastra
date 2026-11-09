@@ -1710,6 +1710,36 @@ function delegationScopeFingerprint(
 }
 
 /** Capture the exact execution scope before allocating a durable child. */
+/**
+ * The unfinished parents in a settled scope that have an unfinished task below
+ * them. Rollup derives `blocked` for each of them from that work. A parent
+ * whose children all finished has nothing to derive from and keeps the
+ * explicit outcome.
+ */
+function parentsOfBlockedWork(index: ReturnType<typeof indexPlanTasks>, scopeTaskIds: string[]): Set<string> {
+  const unfinished = (id: string) => {
+    const status = index.byId.get(id)?.status;
+    return status !== 'completed' && status !== 'cancelled';
+  };
+  const parents = new Set<string>();
+  // `subtreeTaskIds` lists a parent before its descendants, so walking it in
+  // reverse settles every child before its parent.
+  const holdsWork = new Set<string>();
+  for (const id of [...scopeTaskIds].reverse()) {
+    if (!unfinished(id)) continue;
+    const childIds = index.childrenByParent.get(id) ?? [];
+    if (childIds.length === 0) {
+      holdsWork.add(id);
+      continue;
+    }
+    if (childIds.some(childId => holdsWork.has(childId))) {
+      holdsWork.add(id);
+      parents.add(id);
+    }
+  }
+  return parents;
+}
+
 export async function capturePlanTaskDelegationScope(
   port: PlanTaskSessionPort,
   taskId: string,
@@ -1923,6 +1953,11 @@ export async function planTaskReconcileDelegation(
   }
 
   const settledSet = new Set(settledTaskIds);
+  // A `blocked` settlement stores the blocked work on the unfinished leaves. A
+  // settled parent above any of them stays rollup-owned, so it completes once
+  // the model finishes that work: `planTaskUpdate` refuses a status change on a
+  // parent, so an explicit `blocked` there could never be cleared.
+  const derivedParents = nextStatus === 'blocked' ? parentsOfBlockedWork(index, settledTaskIds) : new Set<string>();
   const postTasks = tasks.map(row => {
     if (!settledSet.has(row.taskId)) return row;
     // Preserve already-successful/skipped descendants. Failed descendants are
@@ -1930,7 +1965,9 @@ export async function planTaskReconcileDelegation(
     const preserveTerminalOk = row.status === 'completed' || row.status === 'cancelled';
     const updated: HarnessPlanTask = preserveTerminalOk
       ? { ...row }
-      : { ...row, status: nextStatus, statusSource: 'explicit' };
+      : derivedParents.has(row.taskId)
+        ? { ...row, statusSource: 'derived' }
+        : { ...row, status: nextStatus, statusSource: 'explicit' };
     if (row.taskId === input.taskId) {
       delete updated.delegatedSubagentSessionId;
       delete updated.delegatedSubagentTypeId;
@@ -1945,7 +1982,8 @@ export async function planTaskReconcileDelegation(
   for (const settledTaskId of settledTaskIds) {
     const row = index.byId.get(settledTaskId);
     if (row?.status === 'completed' || row?.status === 'cancelled') continue;
-    staged.explicitStatus.set(settledTaskId, nextStatus);
+    if (derivedParents.has(settledTaskId)) staged.derivedNodes.add(settledTaskId);
+    else staged.explicitStatus.set(settledTaskId, nextStatus);
   }
 
   const { ops, deltas } = buildCommitOps(
