@@ -1680,5 +1680,16 @@ describe('a delegated task keeps its status until the delegation settles', () =>
     const stored = (await listAll(h.storage)).get(leaf.taskId);
     expect(stored?.status).toBe('in_progress');
     expect(stored?.delegatedSubagentSessionId).toBe('sub-leaf');
+
+    // Settlement still writes the outcome and clears the link.
+    const settled = await planTaskReconcileDelegation(h.port, {
+      taskId: leaf.taskId,
+      subagentSessionId: 'sub-leaf',
+      outcome: 'failed',
+    });
+    expect(settled.reconciled).toBe(true);
+    const after = (await listAll(h.storage)).get(leaf.taskId);
+    expect(after?.status).toBe('failed');
+    expect(after?.delegatedSubagentSessionId).toBeUndefined();
   });
 });

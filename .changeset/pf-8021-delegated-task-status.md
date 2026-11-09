@@ -2,4 +2,4 @@
 '@mastra/core': patch
 ---
 
-A delegated plan task now keeps its status until its delegation settles. Before, retrying a subtree that already held a failed child stored the delegated task as `failed`, so restart recovery skipped it and the subtree stayed locked. A reopened dependency also no longer changes a delegated task's status while its subagent runs.
+Fixed delegated plan tasks losing their status while a subagent works on them. A delegated task now stays `in_progress` until its delegation settles. Before, a failed child or a reopened dependency could change it, and retrying a failed subtree could leave it unrecoverable after a restart.
