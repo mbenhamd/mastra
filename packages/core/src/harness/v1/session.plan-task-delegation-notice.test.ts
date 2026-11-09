@@ -29,6 +29,7 @@ import {
   planTaskClaimDelegationSettlementNotice,
   planTaskClearDelegationSettlementNoticeClaim,
   planTaskDowngradeDelegationWakeNotices,
+  PLAN_TASK_UPDATED_EVENT,
   readPendingDelegationSettlementNotice,
 } from './plan-task-session';
 import { createPlanTaskTools, TASK_ADD_TOOL_ID, TASK_DELEGATE_TOOL_ID } from './plan-task-tool';
@@ -2760,6 +2761,76 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         expect(noticeCount(ctx.prompts[1]!)).toBe(1);
         expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
       } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it('a guarded turn started from the settlement event receives the notice', async () => {
+      let parent!: Session;
+      const fenced = await fencedMemory(() => parent.threadId);
+      const ctx = realParent(true, { db: new InMemoryDB(), memory: fenced.memory, onDelegatedSettlement: 'remind' });
+      parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      try {
+        const guard = await fenced.guardFor();
+        const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+        await endR0();
+        let turn: Promise<unknown> | undefined;
+        parent.subscribe(event => {
+          const payload = (event as { payload?: { op?: string } }).payload;
+          if (turn === undefined && event.type === PLAN_TASK_UPDATED_EVENT && payload?.op === 'delegate_settled') {
+            turn = parent.message({ content: 'it settled', observationalMemorySourceWriteGuard: guard });
+          }
+        });
+        releaseChild();
+        await poll(() => turn !== undefined);
+        await turn;
+        expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it('a delivery a reconcile pass starts while the turn waits does not use up the guarded attempt', async () => {
+      const { ctx, parent, fenced, taskId } = await settledWhileIdle();
+      const internals = parent as any;
+      // Another remind delivery is in flight when the turn begins.
+      let releaseOther!: () => void;
+      const other = new Promise<void>(resolve => (releaseOther = resolve));
+      internals._remindDeliveries.add(other);
+      // The reconcile pass's unguarded delivery of the parked notice is held.
+      let releaseReconcile!: () => void;
+      const reconcileHeld = new Promise<void>(resolve => (releaseReconcile = resolve));
+      const isOwed = internals._delegationNoticeIsOwed.bind(parent);
+      let holdOnce = true;
+      vi.spyOn(internals, '_delegationNoticeIsOwed').mockImplementation(async (...args: unknown[]) => {
+        if (holdOnce) {
+          holdOnce = false;
+          await reconcileHeld;
+        }
+        return isOwed(...args);
+      });
+      try {
+        const turn = parent.message({
+          content: 'guarded',
+          observationalMemorySourceWriteGuard: await fenced.guardFor(),
+        });
+        await new Promise(resolve => setTimeout(resolve, 20));
+        const [notice] = [...internals._delegationNoticesAwaitingGuard.values()];
+        void internals._startDelegationSettlementNotice(notice, internals._activeWorkAdmissionEpoch, 0);
+        await poll(() => internals._delegationNoticesInFlight.size === 1);
+        releaseOther();
+        internals._remindDeliveries.delete(other);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        releaseReconcile();
+        await turn;
+        expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
+        releaseOther();
+        releaseReconcile();
         ctx.releaseAll();
         await ctx.harness.shutdown();
       }

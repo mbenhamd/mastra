@@ -2309,6 +2309,14 @@ export class Session {
    */
   private readonly _remindDeliveries = new Set<Promise<void>>();
   /**
+   * PF-8032 — `remind` settlements between their commit (which emits
+   * `delegate_settled`) and the start of their notice delivery. A turn begun
+   * from that event waits for them too, so the delivery it then waits for is
+   * registered. Marked inside the serialized write, so this never waits on the
+   * plan-task write chain.
+   */
+  private readonly _remindSettlementsStarting = new Set<Promise<void>>();
+  /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
    */
@@ -25136,6 +25144,7 @@ export class Session {
       notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
     // A Stop that starts after this point must still suppress the wake.
     const noticeAdmissionEpoch = this._activeWorkAdmissionEpoch;
+    let releaseRemindSettlement: (() => void) | undefined;
     try {
       const durableResult =
         result ??
@@ -25160,15 +25169,22 @@ export class Session {
                 outcome,
               }
             : undefined);
-      const reconcileResult = await this._serializePlanTaskWrite(() =>
-        planTaskReconcileDelegation(this._planTaskPort(), {
+      const reconcileResult = await this._serializePlanTaskWrite(() => {
+        if (noticeMode === 'remind') {
+          const starting = new Promise<void>(resolve => {
+            releaseRemindSettlement = resolve;
+          });
+          this._remindSettlementsStarting.add(starting);
+          void starting.then(() => this._remindSettlementsStarting.delete(starting));
+        }
+        return planTaskReconcileDelegation(this._planTaskPort(), {
           taskId,
           subagentSessionId,
           outcome,
           ...(durableResult !== undefined ? { result: durableResult } : {}),
           ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
-        }),
-      );
+        });
+      });
       if (reconcileResult.reconciled) {
         this._notifyDisplayRefresh();
         for (const listener of Array.from(this._delegatedSettlementListeners)) {
@@ -25191,6 +25207,8 @@ export class Session {
       // scan retry re-reads the exact link and settles it idempotently.
       this._scheduleDelegationReconcileRetry(0);
       return false;
+    } finally {
+      releaseRemindSettlement?.();
     }
   }
 
@@ -25304,12 +25322,17 @@ export class Session {
     // may start a new one meanwhile. A notice is tried once per turn, so a
     // failing guard is not retried in a loop. The bound keeps a busy reconcile
     // loop from holding the turn; anything left reaches the next turn.
+    // A notice another delivery holds stays parked and untried: that delivery
+    // may park it again, and a later round then tries it with this guard.
     const tried = new Set<string>();
     for (let round = 0; round < DELEGATION_NOTICE_GUARD_DRAIN_ROUNDS; round++) {
+      if (this._remindSettlementsStarting.size > 0) await Promise.all(this._remindSettlementsStarting);
       if (this._remindDeliveries.size > 0) await Promise.all(this._remindDeliveries);
-      const notices = [...this._delegationNoticesAwaitingGuard].filter(([key]) => !tried.has(key));
+      const notices = [...this._delegationNoticesAwaitingGuard].filter(
+        ([key]) => !tried.has(key) && !this._delegationNoticesInFlight.has(key),
+      );
       if (notices.length === 0) {
-        if (this._remindDeliveries.size === 0) return;
+        if (this._remindDeliveries.size === 0 && this._remindSettlementsStarting.size === 0) return;
         continue;
       }
       for (const [key] of notices) {
