@@ -25310,8 +25310,15 @@ export class Session {
         return;
       case 'awaiting_guard':
         // No retry: an unguarded write cannot succeed. A restart's reconcile
-        // re-reads the durable notice and parks it here again.
-        this._delegationNoticesAwaitingGuard.set(`${notice.subagentSessionId}:${notice.digest}`, notice);
+        // re-reads the durable notice and parks it here again. Only a turn whose
+        // caller passes `observationalMemorySourceWriteGuard` delivers it.
+        {
+          const key = `${notice.subagentSessionId}:${notice.digest}`;
+          if (!this._delegationNoticesAwaitingGuard.has(key)) {
+            this._logDelegationNotice('debug', 'settlement notice waits for a turn with a source-write guard', notice);
+          }
+          this._delegationNoticesAwaitingGuard.set(key, notice);
+        }
         return;
       case 'lost':
         this._logDelegationNotice(
