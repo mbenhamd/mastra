@@ -25261,12 +25261,21 @@ export class Session {
     retryAttempt: number,
     sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
   ): Promise<void> {
+    // PF-8032: a guarded `remind` write that failed stays in the waiting set
+    // too, so the next turn with a guard retries it before loading history
+    // instead of waiting for a background reconcile pass.
+    const settle = (outcome: DelegationNoticeOutcome) => {
+      if (outcome === 'left_owed' && notice.mode === 'remind' && sourceWriteGuard !== undefined) {
+        this._delegationNoticesAwaitingGuard.set(`${notice.subagentSessionId}:${notice.digest}`, notice);
+      }
+      this._settleDelegationNoticeOutcome(outcome, notice, retryAttempt);
+    };
     // Tracked so shutdown's bounded settle awaits a reminder write in flight.
     const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch, sourceWriteGuard).then(
-      outcome => this._settleDelegationNoticeOutcome(outcome, notice, retryAttempt),
+      settle,
       (error: unknown) => {
         this._logDelegationNotice('error', 'settlement notice delivery failed', notice, error);
-        this._settleDelegationNoticeOutcome('left_owed', notice, retryAttempt);
+        settle('left_owed');
       },
     );
     this._delegationNoticeDeliveries.add(delivery);
@@ -25281,27 +25290,32 @@ export class Session {
   }
 
   /**
-   * PF-8032: deliver, with the current turn's OM source-write guard, the owed
-   * `remind` notices that wait for one. Called while the turn builds its
-   * context, so the rows are saved before its run loads history. A turn without
-   * a guard leaves them waiting. Never rejects: each delivery settles its own
-   * outcome, and one left owed again returns to the waiting set via reconcile.
+   * PF-8032: deliver the owed `remind` notices that wait for a source-write
+   * guard, with this turn's guard if it has one. Called while the turn builds
+   * its context, so the rows are saved before its run loads history. Without a
+   * guard each notice is tried again unguarded: memory that no longer requires
+   * one (another mode's, say) takes the row, and memory that still does parks
+   * the notice again. Never rejects: each delivery settles its own outcome.
    */
   private async _deliverDelegationNoticesAwaitingGuard(): Promise<void> {
     const guard = this._currentTurnSourceWriteGuard;
-    if (guard === undefined) return;
     // Wait for every `remind` delivery in flight, then write what is parked, and
     // repeat: a delivery that finishes may park a notice, and a reconcile pass
-    // may start a new one meanwhile. The bound keeps a busy reconcile loop from
-    // holding the turn; anything left reaches the next guarded turn.
+    // may start a new one meanwhile. A notice is tried once per turn, so a
+    // failing guard is not retried in a loop. The bound keeps a busy reconcile
+    // loop from holding the turn; anything left reaches the next turn.
+    const tried = new Set<string>();
     for (let round = 0; round < DELEGATION_NOTICE_GUARD_DRAIN_ROUNDS; round++) {
       if (this._remindDeliveries.size > 0) await Promise.all(this._remindDeliveries);
-      if (this._delegationNoticesAwaitingGuard.size === 0) {
+      const notices = [...this._delegationNoticesAwaitingGuard].filter(([key]) => !tried.has(key));
+      if (notices.length === 0) {
         if (this._remindDeliveries.size === 0) return;
         continue;
       }
-      const notices = [...this._delegationNoticesAwaitingGuard];
-      this._delegationNoticesAwaitingGuard.clear();
+      for (const [key] of notices) {
+        tried.add(key);
+        this._delegationNoticesAwaitingGuard.delete(key);
+      }
       await Promise.all(
         notices.map(([key, notice]) =>
           this._startDelegationSettlementNotice(

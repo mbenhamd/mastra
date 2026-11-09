@@ -2601,10 +2601,12 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     async function fencedMemory(threadId: () => string) {
       const memory = new MockMemory();
       const merged = memory.getMergedThreadConfig.bind(memory);
-      vi.spyOn(memory, 'getMergedThreadConfig').mockImplementation(config => ({
-        ...merged(config),
-        observationalMemory: { sourceWriteFencing: 'required' },
-      }));
+      let fencingRequired = true;
+      vi.spyOn(memory, 'getMergedThreadConfig').mockImplementation(config =>
+        fencingRequired
+          ? { ...merged(config), observationalMemory: { sourceWriteFencing: 'required' } }
+          : merged(config),
+      );
       let guard: { recordId: string; threadId: string; resourceId: string } | undefined;
       const guardFor = async () => {
         if (guard === undefined) {
@@ -2625,6 +2627,7 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       // Optional: hold the first guarded notice save open until released.
       let holdGuardedNoticeSave: Promise<void> | undefined;
       let guardedNoticeSaveHeld = false;
+      let failNextGuardedNoticeSave = false;
       const save = memory.saveMessages.bind(memory);
       vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
         const isNotice = args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'));
@@ -2634,7 +2637,11 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
           guardedNoticeSaveHeld = true;
           await hold;
         }
-        if (args.observationalMemorySourceWriteGuard === undefined) {
+        if (args.observationalMemorySourceWriteGuard !== undefined && isNotice && failNextGuardedNoticeSave) {
+          failNextGuardedNoticeSave = false;
+          throw new ObservationalMemorySourceWriteConflictError('stale source-write guard');
+        }
+        if (args.observationalMemorySourceWriteGuard === undefined && fencingRequired) {
           if (args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) {
             unguardedNoticeSaves += 1;
           }
@@ -2649,6 +2656,8 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         guardFor,
         unguardedNoticeSaves: () => unguardedNoticeSaves,
         holdNextGuardedNoticeSave: (hold: Promise<void>) => (holdGuardedNoticeSave = hold),
+        failNextGuardedNoticeSave: () => (failNextGuardedNoticeSave = true),
+        stopRequiringFencing: () => (fencingRequired = false),
         guardedNoticeSaveHeld: () => guardedNoticeSaveHeld,
       };
     }
@@ -2720,6 +2729,37 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
       } finally {
         release();
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it('a guarded save that fails is retried by the next guarded turn', async () => {
+      const { ctx, parent, fenced, taskId } = await settledWhileIdle();
+      try {
+        const guard = await fenced.guardFor();
+        fenced.failNextGuardedNoticeSave();
+        await parent.message({ content: 'first', observationalMemorySourceWriteGuard: guard });
+        expect(noticeCount(ctx.prompts[1]!)).toBe(0);
+        expect(owedNotice(await planRow(parent, taskId))).toBeDefined();
+
+        await parent.message({ content: 'second', observationalMemorySourceWriteGuard: guard });
+        expect(noticeCount(ctx.prompts[2]!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it('a parked notice reaches an unguarded turn once the memory no longer requires a guard', async () => {
+      const { ctx, parent, fenced, taskId } = await settledWhileIdle();
+      try {
+        fenced.stopRequiringFencing();
+        await parent.message({ content: 'unguarded turn' });
+        expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
         ctx.releaseAll();
         await ctx.harness.shutdown();
       }
