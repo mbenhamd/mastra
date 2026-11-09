@@ -2299,6 +2299,13 @@ export class Session {
    */
   private readonly _delegationNoticesAwaitingGuard = new Map<string, PendingDelegationSettlementNotice>();
   /**
+   * PF-8032 — `remind` deliveries running without a guard. A guarded turn waits
+   * for them before draining, so one that is about to park is delivered by that
+   * turn. `remind` never waits for the parent to go idle, so this cannot wait on
+   * the turn itself.
+   */
+  private readonly _unguardedRemindDeliveries = new Set<Promise<void>>();
+  /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
    */
@@ -25260,8 +25267,11 @@ export class Session {
       },
     );
     this._delegationNoticeDeliveries.add(delivery);
+    const unguardedRemind = notice.mode === 'remind' && sourceWriteGuard === undefined;
+    if (unguardedRemind) this._unguardedRemindDeliveries.add(delivery);
     const untrack = () => {
       this._delegationNoticeDeliveries.delete(delivery);
+      if (unguardedRemind) this._unguardedRemindDeliveries.delete(delivery);
     };
     void delivery.then(untrack, untrack);
     return delivery;
@@ -25276,7 +25286,11 @@ export class Session {
    */
   private async _deliverDelegationNoticesAwaitingGuard(): Promise<void> {
     const guard = this._currentTurnSourceWriteGuard;
-    if (guard === undefined || this._delegationNoticesAwaitingGuard.size === 0) return;
+    if (guard === undefined) return;
+    // A delivery still deciding without a guard may park its notice after this
+    // check; wait so this turn writes it instead of the next guarded one.
+    if (this._unguardedRemindDeliveries.size > 0) await Promise.all(this._unguardedRemindDeliveries);
+    if (this._delegationNoticesAwaitingGuard.size === 0) return;
     const notices = [...this._delegationNoticesAwaitingGuard];
     this._delegationNoticesAwaitingGuard.clear();
     await Promise.all(
