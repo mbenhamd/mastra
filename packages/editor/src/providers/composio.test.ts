@@ -1252,6 +1252,24 @@ describe('ComposioToolProvider — listConnections', () => {
       expect(result.items[0]).toMatchObject({ status: 'active', authorId: 'admin' });
     });
 
+    it('leaves out other users SHARED accounts when ownedOnly is set', async () => {
+      const { integration, raw } = await setup(
+        [{ id: 'ca_mine', status: 'ACTIVE', isDisabled: false }],
+        [sharedAccount('ca_all', { allowAllUsers: true })],
+      );
+
+      const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'], ownedOnly: true });
+
+      expect(result.items.map(i => i.connectionId)).toEqual(['ca_mine']);
+      expect(raw.connectedAccounts.list).toHaveBeenCalledTimes(1);
+      expect(raw.connectedAccounts.list).toHaveBeenCalledWith({
+        toolkitSlugs: ['gmail'],
+        userIds: ['user_a'],
+        accountType: 'ALL',
+        limit: 50,
+      });
+    });
+
     it('dedupes SHARED accounts already returned for an owning bucket', async () => {
       const own = sharedAccount('ca_own', { allowAllUsers: true });
       const { integration } = await setup([own], [own]);
