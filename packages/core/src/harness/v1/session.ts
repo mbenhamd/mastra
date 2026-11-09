@@ -1051,6 +1051,8 @@ const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
  * partial execution unit that the parent would later settle as complete.
  */
 const DELEGATED_SUBTREE_MAX_NODES = PLAN_TASK_MAX_NODES;
+/** PF-8032: wait-then-write rounds a guarded turn spends on owed `remind` notices. */
+const DELEGATION_NOTICE_GUARD_DRAIN_ROUNDS = 4;
 const ACTION_CATALOG_DEFAULT_LIMIT = 100;
 const ACTION_CATALOG_MAX_LIMIT = 500;
 const ACTION_CATALOG_MCP_LIST_TIMEOUT_MS = 2_000;
@@ -2299,12 +2301,13 @@ export class Session {
    */
   private readonly _delegationNoticesAwaitingGuard = new Map<string, PendingDelegationSettlementNotice>();
   /**
-   * PF-8032 — `remind` deliveries running without a guard. A guarded turn waits
-   * for them before draining, so one that is about to park is delivered by that
-   * turn. `remind` never waits for the parent to go idle, so this cannot wait on
-   * the turn itself.
+   * PF-8032 — `remind` deliveries in flight, with or without a guard. A guarded
+   * turn waits for them before it loads history: an unguarded one may be about
+   * to park its notice, and a guarded one (another turn's, or an aborted
+   * turn's) may still be writing the row. `remind` never waits for the parent
+   * to go idle, so this cannot wait on the turn itself.
    */
-  private readonly _unguardedRemindDeliveries = new Set<Promise<void>>();
+  private readonly _remindDeliveries = new Set<Promise<void>>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -25267,11 +25270,11 @@ export class Session {
       },
     );
     this._delegationNoticeDeliveries.add(delivery);
-    const unguardedRemind = notice.mode === 'remind' && sourceWriteGuard === undefined;
-    if (unguardedRemind) this._unguardedRemindDeliveries.add(delivery);
+    const remind = notice.mode === 'remind';
+    if (remind) this._remindDeliveries.add(delivery);
     const untrack = () => {
       this._delegationNoticeDeliveries.delete(delivery);
-      if (unguardedRemind) this._unguardedRemindDeliveries.delete(delivery);
+      if (remind) this._remindDeliveries.delete(delivery);
     };
     void delivery.then(untrack, untrack);
     return delivery;
@@ -25287,22 +25290,29 @@ export class Session {
   private async _deliverDelegationNoticesAwaitingGuard(): Promise<void> {
     const guard = this._currentTurnSourceWriteGuard;
     if (guard === undefined) return;
-    // A delivery still deciding without a guard may park its notice after this
-    // check; wait so this turn writes it instead of the next guarded one.
-    if (this._unguardedRemindDeliveries.size > 0) await Promise.all(this._unguardedRemindDeliveries);
-    if (this._delegationNoticesAwaitingGuard.size === 0) return;
-    const notices = [...this._delegationNoticesAwaitingGuard];
-    this._delegationNoticesAwaitingGuard.clear();
-    await Promise.all(
-      notices.map(([key, notice]) =>
-        this._startDelegationSettlementNotice(
-          notice,
-          this._delegationNoticeEpochs.get(key) ?? this._activeWorkAdmissionEpoch,
-          0,
-          guard,
+    // Wait for every `remind` delivery in flight, then write what is parked, and
+    // repeat: a delivery that finishes may park a notice, and a reconcile pass
+    // may start a new one meanwhile. The bound keeps a busy reconcile loop from
+    // holding the turn; anything left reaches the next guarded turn.
+    for (let round = 0; round < DELEGATION_NOTICE_GUARD_DRAIN_ROUNDS; round++) {
+      if (this._remindDeliveries.size > 0) await Promise.all(this._remindDeliveries);
+      if (this._delegationNoticesAwaitingGuard.size === 0) {
+        if (this._remindDeliveries.size === 0) return;
+        continue;
+      }
+      const notices = [...this._delegationNoticesAwaitingGuard];
+      this._delegationNoticesAwaitingGuard.clear();
+      await Promise.all(
+        notices.map(([key, notice]) =>
+          this._startDelegationSettlementNotice(
+            notice,
+            this._delegationNoticeEpochs.get(key) ?? this._activeWorkAdmissionEpoch,
+            0,
+            guard,
+          ),
         ),
-      ),
-    );
+      );
+    }
   }
 
   /** PF-7679: act on a delivery's typed outcome. No outcome falls through as success. */

@@ -2622,8 +2622,18 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       // A run without a caller guard mints its own, as OM memory does.
       vi.spyOn(memory, 'prepareObservationalMemorySourceWriteGuard').mockImplementation(guardFor);
       let unguardedNoticeSaves = 0;
+      // Optional: hold the first guarded notice save open until released.
+      let holdGuardedNoticeSave: Promise<void> | undefined;
+      let guardedNoticeSaveHeld = false;
       const save = memory.saveMessages.bind(memory);
       vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
+        const isNotice = args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'));
+        if (args.observationalMemorySourceWriteGuard !== undefined && isNotice && holdGuardedNoticeSave) {
+          const hold = holdGuardedNoticeSave;
+          holdGuardedNoticeSave = undefined;
+          guardedNoticeSaveHeld = true;
+          await hold;
+        }
         if (args.observationalMemorySourceWriteGuard === undefined) {
           if (args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) {
             unguardedNoticeSaves += 1;
@@ -2634,7 +2644,13 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         }
         return save(args);
       });
-      return { memory, guardFor, unguardedNoticeSaves: () => unguardedNoticeSaves };
+      return {
+        memory,
+        guardFor,
+        unguardedNoticeSaves: () => unguardedNoticeSaves,
+        holdNextGuardedNoticeSave: (hold: Promise<void>) => (holdGuardedNoticeSave = hold),
+        guardedNoticeSaveHeld: () => guardedNoticeSaveHeld,
+      };
     }
 
     async function settledWhileIdle() {
@@ -2679,6 +2695,31 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         expect(fenced.unguardedNoticeSaves()).toBe(0);
         expect(warnings()).toEqual([]);
       } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it('a guarded turn that starts while another turn is still saving the notice waits for that save', async () => {
+      const { ctx, parent, fenced, taskId } = await settledWhileIdle();
+      let release!: () => void;
+      fenced.holdNextGuardedNoticeSave(new Promise<void>(resolve => (release = resolve)));
+      try {
+        const guard = await fenced.guardFor();
+        const first = parent.message({ content: 'first', observationalMemorySourceWriteGuard: guard });
+        await poll(() => fenced.guardedNoticeSaveHeld());
+        const second = parent.message({ content: 'second', observationalMemorySourceWriteGuard: guard });
+        await new Promise(resolve => setTimeout(resolve, 50));
+        release();
+        await Promise.allSettled([first, second]);
+
+        // Every prompt the model received after settlement carries the notice once.
+        const turnPrompts = ctx.prompts.slice(1);
+        expect(turnPrompts.length).toBeGreaterThan(0);
+        for (const prompt of turnPrompts) expect(noticeCount(prompt)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
+        release();
         ctx.releaseAll();
         await ctx.harness.shutdown();
       }
