@@ -128,6 +128,21 @@ export interface WorkspaceToolConfig {
   name?: string;
 
   /**
+   * Custom description to show the LLM instead of the tool's default one.
+   * Use it when the workspace's provider changes what the tool acts on, for
+   * example computer tools that drive the user's own screen rather than a
+   * sandbox desktop.
+   *
+   * @example
+   * ```typescript
+   * tools: {
+   *   mastra_workspace_computer_click: { description: "Left-click on the user's screen." },
+   * }
+   * ```
+   */
+  description?: string;
+
+  /**
    * For write tools only: require reading a file before writing to it.
    * Prevents accidental overwrites when the agent hasn't seen the current content.
    * When a function, evaluated at execution time with requestContext, workspace, and args.
