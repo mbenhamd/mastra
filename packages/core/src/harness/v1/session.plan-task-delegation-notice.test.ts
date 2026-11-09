@@ -1504,7 +1504,11 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
    * (summed across restarts), no caller `agent_start` carries a wake label, and
    * nothing is owed at the end. Rows run with and without parent memory.
    */
-  async function delegateFromR0(ctx: ReturnType<typeof realParent>, parent: Session) {
+  async function delegateFromR0(
+    ctx: ReturnType<typeof realParent>,
+    parent: Session,
+    guard?: { recordId: string; threadId: string; resourceId: string },
+  ) {
     let releaseChild!: () => void;
     ctx.childAgent.enqueueRun({
       holdUntil: new Promise<void>(r => (releaseChild = r)),
@@ -1512,7 +1516,10 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       terminalToolResult: completedReport,
     });
     const releaseR0 = ctx.holdCall(0);
-    const r0 = parent.message({ content: 'go' });
+    const r0 = parent.message({
+      content: 'go',
+      ...(guard !== undefined ? { observationalMemorySourceWriteGuard: guard } : {}),
+    });
     void r0.catch(() => {});
     await poll(() => ctx.prompts.length === 1);
     const tools = createPlanTaskTools(parent);
@@ -2831,6 +2838,44 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       } finally {
         releaseOther();
         releaseReconcile();
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it('a signal whose run ends before it is sent wakes a run that receives the parked notice', async () => {
+      let parent!: Session;
+      const fenced = await fencedMemory(() => parent.threadId);
+      const ctx = realParent(true, { db: new InMemoryDB(), memory: fenced.memory, onDelegatedSettlement: 'remind' });
+      parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const internals = parent as any;
+      let releaseContents!: () => void;
+      const contentsHeld = new Promise<void>(resolve => (releaseContents = resolve));
+      try {
+        const guard = await fenced.guardFor();
+        const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent, guard);
+        // The child settles during the guarded run: the notice parks.
+        releaseChild();
+        await poll(() => internals._delegationNoticesAwaitingGuard.size === 1);
+        const buildContents = internals._buildSignalContentsWithAttachments.bind(parent);
+        let contentsReached = false;
+        vi.spyOn(internals, '_buildSignalContentsWithAttachments').mockImplementation(async (...args: unknown[]) => {
+          contentsReached = true;
+          await contentsHeld;
+          return buildContents(...args);
+        });
+        const signal = parent.signal({ content: 'one more thing', observationalMemorySourceWriteGuard: guard });
+        await poll(() => contentsReached);
+        // The run ends while the signal builds its contents; the signal wakes a fresh run.
+        await endR0();
+        releaseContents();
+        const handle = await signal;
+        await handle.result;
+        expect(ctx.prompts.length).toBeGreaterThan(1);
+        expect(noticeCount(ctx.prompts.at(-1)!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
+        releaseContents();
         ctx.releaseAll();
         await ctx.harness.shutdown();
       }

@@ -15489,6 +15489,11 @@ export class Session {
       try {
         this._assertOpenForTurn('signal()');
         const interleavedContents = await this._buildSignalContentsWithAttachments(opts.content, internal?.attachments);
+        // PF-8032: the run may have ended meanwhile, so the idle fallback below
+        // can wake a fresh run that loads history without the owned turn's
+        // context build. Write parked reminders with the caller's guard first.
+        const noticeGuard = sourceWriteGuard ?? this._currentTurnSourceWriteGuard;
+        if (noticeGuard !== undefined) await this._deliverDelegationNoticesAwaitingGuard(noticeGuard);
         this._assertOpenForTurn('signal()');
         dispatched = agent.sendSignal(
           {
@@ -24322,7 +24327,7 @@ export class Session {
     const [context, instructions] = await Promise.all([
       requestContext,
       this._turnInstructions(mode, requestContext),
-      this._deliverDelegationNoticesAwaitingGuard(),
+      this._deliverDelegationNoticesAwaitingGuard(this._currentTurnSourceWriteGuard),
     ]);
     return [context, instructions];
   }
@@ -25315,8 +25320,9 @@ export class Session {
    * one (another mode's, say) takes the row, and memory that still does parks
    * the notice again. Never rejects: each delivery settles its own outcome.
    */
-  private async _deliverDelegationNoticesAwaitingGuard(): Promise<void> {
-    const guard = this._currentTurnSourceWriteGuard;
+  private async _deliverDelegationNoticesAwaitingGuard(
+    guard: ObservationalMemorySourceWriteGuard | undefined,
+  ): Promise<void> {
     // Wait for every `remind` delivery in flight, then write what is parked, and
     // repeat: a delivery that finishes may park a notice, and a reconcile pass
     // may start a new one meanwhile. A notice is tried once per turn, so a
