@@ -468,6 +468,11 @@ export function rollupTree(
     if (source === 'explicit' && TERMINAL_PLAN_TASK_STATUSES.has(current)) continue;
 
     const task = index.byId.get(id)!;
+    // A delegated task's status belongs to its subagent until the delegation
+    // settles (settlement clears the link in the same write). A child's
+    // `failed` or a reopened dependency must not overwrite it: a terminal
+    // status here would hide the live link from restart recovery.
+    if (task.delegatedSubagentSessionId !== undefined) continue;
     const childIds = index.childrenByParent.get(id) ?? [];
     const next = deriveStatus(task, childIds, statusOf);
 
