@@ -1628,6 +1628,32 @@ describe('transaction atomicity', () => {
   });
 });
 
+describe('a subtree delegation settled as blocked', () => {
+  it('lets the parents complete once the model finishes the blocked work', async () => {
+    const { storage, port } = await setup();
+    const root = await planTaskAdd(port, { content: 'root' });
+    const [leaf, mid] = await planTaskDecompose(port, root.taskId, [{ content: 'leaf' }, { content: 'mid' }]);
+    const [grandchild] = await planTaskDecompose(port, mid!.taskId, [{ content: 'grandchild' }]);
+
+    await planTaskDelegate(port, { taskId: root.taskId, subagentSessionId: 'sub-blocked', includeSubtree: true });
+    const settled = await planTaskReconcileDelegation(port, {
+      taskId: root.taskId,
+      subagentSessionId: 'sub-blocked',
+      outcome: 'blocked',
+    });
+    expect(settled.reconciled).toBe(true);
+    expect(settled.view?.status).toBe('blocked');
+    const blocked = await listAll(storage);
+    for (const task of [root, leaf!, mid!, grandchild!]) expect(blocked.get(task.taskId)?.status).toBe('blocked');
+
+    await planTaskComplete(port, leaf!.taskId);
+    await planTaskComplete(port, grandchild!.taskId);
+    const after = await listAll(storage);
+    expect(after.get(mid!.taskId)?.status).toBe('completed');
+    expect(after.get(root.taskId)?.status).toBe('completed');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // PF-8021: a delegated task's status belongs to its subagent until settlement
 // ---------------------------------------------------------------------------
