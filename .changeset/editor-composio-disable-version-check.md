@@ -2,4 +2,4 @@
 '@mastra/editor': patch
 ---
 
-The Composio tool provider no longer asks the npm registry for the latest `@composio/core` version. Both Composio clients it builds now pass `disableVersionCheck: true`, so a server using the provider makes no npm request when it starts.
+The Composio tool provider no longer makes an npm registry request for the latest `@composio/core` version when it creates its clients. Both Composio clients it builds now pass `disableVersionCheck: true`.
