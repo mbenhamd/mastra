@@ -15492,8 +15492,7 @@ export class Session {
         // PF-8032: the run may have ended meanwhile, so the idle fallback below
         // can wake a fresh run that loads history without the owned turn's
         // context build. Write parked reminders with the caller's guard first.
-        const noticeGuard = sourceWriteGuard ?? this._currentTurnSourceWriteGuard;
-        if (noticeGuard !== undefined) await this._deliverDelegationNoticesAwaitingGuard(noticeGuard);
+        await this._deliverDelegationNoticesAwaitingGuard(sourceWriteGuard ?? this._currentTurnSourceWriteGuard);
         this._assertOpenForTurn('signal()');
         dispatched = agent.sendSignal(
           {
@@ -25283,12 +25282,14 @@ export class Session {
     admissionEpoch: number,
     retryAttempt: number,
     sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
+    parkedRetry = false,
   ): Promise<void> {
-    // PF-8032: a guarded `remind` write that failed stays in the waiting set
-    // too, so the next turn with a guard retries it before loading history
-    // instead of waiting for a background reconcile pass.
+    // PF-8032: a guarded `remind` write that failed, or any retry of a parked
+    // notice that was left owed, stays in the waiting set, so the next turn
+    // retries it before loading history instead of waiting for a background
+    // reconcile pass.
     const settle = (outcome: DelegationNoticeOutcome) => {
-      if (outcome === 'left_owed' && notice.mode === 'remind' && sourceWriteGuard !== undefined) {
+      if (outcome === 'left_owed' && notice.mode === 'remind' && (sourceWriteGuard !== undefined || parkedRetry)) {
         this._delegationNoticesAwaitingGuard.set(`${notice.subagentSessionId}:${notice.digest}`, notice);
       }
       this._settleDelegationNoticeOutcome(outcome, notice, retryAttempt);
@@ -25352,6 +25353,7 @@ export class Session {
             this._delegationNoticeEpochs.get(key) ?? this._activeWorkAdmissionEpoch,
             0,
             guard,
+            true,
           ),
         ),
       );

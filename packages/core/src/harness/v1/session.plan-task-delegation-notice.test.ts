@@ -2843,39 +2843,75 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       }
     });
 
-    it('a signal whose run ends before it is sent wakes a run that receives the parked notice', async () => {
-      let parent!: Session;
-      const fenced = await fencedMemory(() => parent.threadId);
-      const ctx = realParent(true, { db: new InMemoryDB(), memory: fenced.memory, onDelegatedSettlement: 'remind' });
-      parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    it.each([
+      ['guarded', true],
+      ['unguarded (memory no longer requiring a guard)', false],
+    ])(
+      'a %s signal whose run ends before it is sent wakes a run that receives the parked notice',
+      async (_, guarded) => {
+        let parent!: Session;
+        const fenced = await fencedMemory(() => parent.threadId);
+        const ctx = realParent(true, { db: new InMemoryDB(), memory: fenced.memory, onDelegatedSettlement: 'remind' });
+        parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+        const internals = parent as any;
+        let releaseContents!: () => void;
+        const contentsHeld = new Promise<void>(resolve => (releaseContents = resolve));
+        try {
+          const guard = await fenced.guardFor();
+          const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent, guarded ? guard : undefined);
+          // The child settles during the run: the notice parks.
+          releaseChild();
+          await poll(() => internals._delegationNoticesAwaitingGuard.size === 1);
+          if (!guarded) fenced.stopRequiringFencing();
+          const buildContents = internals._buildSignalContentsWithAttachments.bind(parent);
+          let contentsReached = false;
+          vi.spyOn(internals, '_buildSignalContentsWithAttachments').mockImplementation(async (...args: unknown[]) => {
+            contentsReached = true;
+            await contentsHeld;
+            return buildContents(...args);
+          });
+          const signal = parent.signal({
+            content: 'one more thing',
+            ...(guarded ? { observationalMemorySourceWriteGuard: guard } : {}),
+          });
+          await poll(() => contentsReached);
+          // The run ends while the signal builds its contents; the signal wakes a fresh run.
+          await endR0();
+          releaseContents();
+          const handle = await signal;
+          await handle.result;
+          expect(ctx.prompts.length).toBeGreaterThan(1);
+          expect(noticeCount(ctx.prompts.at(-1)!)).toBe(1);
+          expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+        } finally {
+          releaseContents();
+          ctx.releaseAll();
+          await ctx.harness.shutdown();
+        }
+      },
+    );
+
+    it('a parked notice whose unguarded retry fails stays parked for the next guarded turn', async () => {
+      const { ctx, parent, fenced, taskId } = await settledWhileIdle();
       const internals = parent as any;
-      let releaseContents!: () => void;
-      const contentsHeld = new Promise<void>(resolve => (releaseContents = resolve));
+      const isOwed = internals._delegationNoticeIsOwed.bind(parent);
+      let failOnce = true;
+      vi.spyOn(internals, '_delegationNoticeIsOwed').mockImplementation(async (...args: unknown[]) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('transient storage read failure');
+        }
+        return isOwed(...args);
+      });
       try {
-        const guard = await fenced.guardFor();
-        const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent, guard);
-        // The child settles during the guarded run: the notice parks.
-        releaseChild();
-        await poll(() => internals._delegationNoticesAwaitingGuard.size === 1);
-        const buildContents = internals._buildSignalContentsWithAttachments.bind(parent);
-        let contentsReached = false;
-        vi.spyOn(internals, '_buildSignalContentsWithAttachments').mockImplementation(async (...args: unknown[]) => {
-          contentsReached = true;
-          await contentsHeld;
-          return buildContents(...args);
-        });
-        const signal = parent.signal({ content: 'one more thing', observationalMemorySourceWriteGuard: guard });
-        await poll(() => contentsReached);
-        // The run ends while the signal builds its contents; the signal wakes a fresh run.
-        await endR0();
-        releaseContents();
-        const handle = await signal;
-        await handle.result;
-        expect(ctx.prompts.length).toBeGreaterThan(1);
-        expect(noticeCount(ctx.prompts.at(-1)!)).toBe(1);
+        await parent.message({ content: 'unguarded turn' });
+        expect(noticeCount(ctx.prompts[1]!)).toBe(0);
+        expect(internals._delegationNoticesAwaitingGuard.size).toBe(1);
+
+        await parent.message({ content: 'guarded turn', observationalMemorySourceWriteGuard: await fenced.guardFor() });
+        expect(noticeCount(ctx.prompts[2]!)).toBe(1);
         expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
       } finally {
-        releaseContents();
         ctx.releaseAll();
         await ctx.harness.shutdown();
       }
