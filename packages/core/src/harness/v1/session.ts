@@ -2171,6 +2171,15 @@ export class Session {
    */
   private _currentRunSignalId?: string;
   /**
+   * [PF-8058] The run an owned `signal()` turn dispatched, with that signal's
+   * id. The suspend capture stamps this signal as the pending's
+   * `originSignalId`; a tool that registers its interaction mid-turn for the
+   * same run stamps it too, so a crash between the registration and the
+   * capture still leaves a pending that settles the signal. Set at dispatch
+   * (the run id is known synchronously) and cleared with the turn.
+   */
+  private _ownedSignalTurnOrigin?: { runId: string; signalId: string };
+  /**
    * §5.1 — the active turn's caller request context (the `app` metadata bag +
    * trusted `channel` projection). Stashed in `_buildRequestContext` so a
    * suspension can persist it on `PendingResume` and a `respondTo*` resume can
@@ -3703,6 +3712,7 @@ export class Session {
     this._currentRunModeId = undefined;
     this._currentRunModelId = undefined;
     this._currentRunSignalId = undefined;
+    this._ownedSignalTurnOrigin = undefined;
     this._currentTurnRequestContext = undefined;
     this._currentAgentRequestContext = undefined;
     this._currentTurnReplacementToolSurface = undefined;
@@ -3744,6 +3754,7 @@ export class Session {
       this._currentRunModeId = undefined;
       this._currentRunModelId = undefined;
       this._currentRunSignalId = undefined;
+      this._ownedSignalTurnOrigin = undefined;
       this._currentTurnRequestContext = undefined;
       this._currentAgentRequestContext = undefined;
       this._currentTurnReplacementToolSurface = undefined;
@@ -15067,6 +15078,7 @@ export class Session {
               ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
             },
           );
+          this._ownedSignalTurnOrigin = { runId: dispatched.runId, signalId: dispatched.signal.id };
           if (responseLogicalMessageIdentity !== undefined) {
             nativeLineagedDispatchStarted = true;
             const accepted = await this._awaitSignalNativeAcceptance(
@@ -15165,6 +15177,7 @@ export class Session {
                   } as never,
                 } as never,
               );
+              this._ownedSignalTurnOrigin = { runId: dispatching.runId, signalId: signalAdmission.identity.signalId };
               signalAdmissionNativeDispatchStarted = true;
               nativeLineagedDispatchStarted = responseLogicalMessageIdentity !== undefined;
               const accepted = await this._awaitSignalNativeAcceptance(
@@ -22469,6 +22482,16 @@ export class Session {
     return runId === undefined || runId === this._currentRunId;
   }
 
+  /**
+   * [PF-8058] The origin a tool pre-registration stamps on its pending: the
+   * owned `signal()` turn's signal, when `runId` is the run that turn
+   * dispatched. This is the `originSignalId` the suspend capture would add.
+   */
+  private _preRegistrationOrigin(runId: string): { originSignalId?: string } {
+    const origin = this._ownedSignalTurnOrigin;
+    return origin !== undefined && origin.runId === runId ? { originSignalId: origin.signalId } : {};
+  }
+
   private async _registerQuestion(
     params: RegisterQuestionParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
@@ -22499,6 +22522,7 @@ export class Session {
       toolCallId,
       toolName: ASK_USER_TOOL_NAME,
       ...this._pendingResumeSourceFields(),
+      ...this._preRegistrationOrigin(runId),
       ...this._newPendingInteractionTiming('question'),
       modeId: params.modeId ?? this._record.modeId,
       // §4.2e — carry the active turn's yolo so a later tool approval on the
@@ -22571,6 +22595,7 @@ export class Session {
       runId,
       toolCallId,
       ...this._pendingResumeSourceFields(),
+      ...this._preRegistrationOrigin(runId),
       ...this._newPendingInteractionTiming('sandbox-access'),
       modeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
@@ -22654,6 +22679,7 @@ export class Session {
       toolCallId,
       toolName: SUBMIT_PLAN_TOOL_NAME,
       ...this._pendingResumeSourceFields(),
+      ...this._preRegistrationOrigin(runId),
       ...this._newPendingInteractionTiming('plan-approval'),
       modeId: submittingModeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
