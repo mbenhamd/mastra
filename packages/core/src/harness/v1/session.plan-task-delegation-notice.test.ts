@@ -19,6 +19,7 @@ import { InMemoryStore } from '../../storage';
 import type { HarnessTerminalFinalizer } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
+import { ObservationalMemorySourceWriteConflictError } from '../../storage/domains/memory/base';
 
 import { MockAgent } from './__test-utils__';
 import { HarnessConfigError } from './errors';
@@ -1210,6 +1211,8 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       memoryFactory?: () => MockMemory;
       /** The reply text of provider call `call` (default `reply <call>`). */
       reply?: (call: number) => string;
+      /** The notice mode (default `wake`). */
+      onDelegatedSettlement?: 'wake' | 'remind';
     },
     grant = false,
   ) {
@@ -1266,6 +1269,9 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       ...(grant ? { terminalHandoff: { enabled: true }, sessionRecordProjection: { enabled: true } } : {}),
     });
     const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
+    const onDelegatedSettlement = shared?.onDelegatedSettlement ?? 'wake';
+    // `remind` requires memory on every mode that can delegate, `worker-mode` included.
+    if (onDelegatedSettlement === 'remind') vi.spyOn(childAgent, 'hasOwnMemory').mockReturnValue(true);
     const harness = new Harness({
       agents: { 'parent-agent': parentAgent, 'quiet-agent': quietAgent, 'child-agent': childAgent } as any,
       modes: [
@@ -1279,7 +1285,7 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         : { storage },
       subagents: {
         maxDepth: 2,
-        onDelegatedSettlement: 'wake',
+        onDelegatedSettlement,
         types: {
           worker: {
             agentId: 'child-agent',
@@ -2584,6 +2590,115 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         b.releaseAll();
         await b.harness.shutdown();
         await a.harness.shutdown().catch(() => {});
+      }
+    });
+  });
+
+  // PF-8032: memory whose OM requires source-write fencing (`sourceWriteFencing:
+  // 'required'`) refuses an unguarded save, so a `remind` row can only be written
+  // with a turn's source-write guard.
+  describe('remind under required source-write fencing', () => {
+    async function fencedMemory(threadId: () => string) {
+      const memory = new MockMemory();
+      const merged = memory.getMergedThreadConfig.bind(memory);
+      vi.spyOn(memory, 'getMergedThreadConfig').mockImplementation(config => ({
+        ...merged(config),
+        observationalMemory: { sourceWriteFencing: 'required' },
+      }));
+      let guard: { recordId: string; threadId: string; resourceId: string } | undefined;
+      const guardFor = async () => {
+        if (guard === undefined) {
+          const store = await memory.getMemoryStore();
+          const record = await store.initializeObservationalMemory({
+            threadId: threadId(),
+            resourceId: 'u1',
+            scope: 'thread',
+            config: {},
+          });
+          guard = { recordId: record.id, threadId: threadId(), resourceId: 'u1' };
+        }
+        return guard;
+      };
+      // A run without a caller guard mints its own, as OM memory does.
+      vi.spyOn(memory, 'prepareObservationalMemorySourceWriteGuard').mockImplementation(guardFor);
+      let unguardedNoticeSaves = 0;
+      const save = memory.saveMessages.bind(memory);
+      vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
+        if (args.observationalMemorySourceWriteGuard === undefined) {
+          if (args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) {
+            unguardedNoticeSaves += 1;
+          }
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source write fencing is required but no captured record guard was provided.',
+          );
+        }
+        return save(args);
+      });
+      return { memory, guardFor, unguardedNoticeSaves: () => unguardedNoticeSaves };
+    }
+
+    async function settledWhileIdle() {
+      let parent!: Session;
+      const fenced = await fencedMemory(() => parent.threadId);
+      const ctx = realParent(true, { db: new InMemoryDB(), memory: fenced.memory, onDelegatedSettlement: 'remind' });
+      parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const logged = vi.spyOn(parent as any, '_logDelegationNotice');
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      await endR0();
+      releaseChild();
+      await poll(async () => (await planRow(parent, taskId))?.status === 'completed');
+      await poll(() => (parent as any)._delegationNoticesInFlight.size === 0);
+      await parent.waitForIdle({ timeoutMs: 2000 });
+      const warnings = () => logged.mock.calls.filter(call => call[0] !== 'debug').map(call => call[1]);
+      return { ctx, parent, fenced, taskId, warnings };
+    }
+
+    it('a child that settles while the parent is idle reaches the next guarded turn once', async () => {
+      const { ctx, parent, fenced, taskId, warnings } = await settledWhileIdle();
+      try {
+        // No unguarded write is attempted at settlement time; the notice stays owed.
+        expect(fenced.unguardedNoticeSaves()).toBe(0);
+        expect(warnings()).toEqual([]);
+        expect(owedNotice(await planRow(parent, taskId))).toBeDefined();
+
+        const guard = await fenced.guardFor();
+        await parent.message({ content: 'what happened?', observationalMemorySourceWriteGuard: guard });
+        expect(ctx.prompts).toHaveLength(2);
+        expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+
+        // The next turn is not delivered the notice again: history holds one row.
+        await parent.message({ content: 'and now?', observationalMemorySourceWriteGuard: guard });
+        expect(noticeCount(ctx.prompts[2]!)).toBe(1);
+        const { messages } = await fenced.memory.recall({
+          threadId: parent.threadId,
+          resourceId: 'u1',
+          hideSignals: false,
+        });
+        expect(messages.filter(m => JSON.stringify(m.content).includes(NOTICE))).toHaveLength(1);
+        expect(fenced.unguardedNoticeSaves()).toBe(0);
+        expect(warnings()).toEqual([]);
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it('a turn without a guard leaves the notice owed quietly; a later guarded turn delivers it', async () => {
+      const { ctx, parent, fenced, taskId, warnings } = await settledWhileIdle();
+      try {
+        await parent.message({ content: 'unguarded turn' });
+        expect(noticeCount(ctx.prompts[1]!)).toBe(0);
+        expect(owedNotice(await planRow(parent, taskId))).toBeDefined();
+        expect(fenced.unguardedNoticeSaves()).toBe(0);
+        expect(warnings()).toEqual([]);
+
+        await parent.message({ content: 'guarded turn', observationalMemorySourceWriteGuard: await fenced.guardFor() });
+        expect(noticeCount(ctx.prompts[2]!)).toBe(1);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
       }
     });
   });

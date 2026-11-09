@@ -71,6 +71,7 @@ import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { watchHistoryLoad } from '../../memory/history-load-watch';
 import type { HistoryLoadWatch } from '../../memory/history-load-watch';
 import type { MastraMemory } from '../../memory/memory';
+import { isObservationalMemoryEnabled } from '../../memory/types';
 import type { TracingContext } from '../../observability';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -412,6 +413,12 @@ function normalizeObservationalMemorySourceWriteGuard(
     threadId: value.threadId,
     resourceId: value.resourceId,
   };
+}
+
+/** True when the memory's OM requires every source write to carry a captured guard. */
+function requiresObservationalMemorySourceWriteGuard(memory: MastraMemory): boolean {
+  const config = memory.getMergedThreadConfig().observationalMemory;
+  return isObservationalMemoryEnabled(config) && typeof config === 'object' && config.sourceWriteFencing === 'required';
 }
 
 function sameObservationalMemorySourceWriteGuard(
@@ -859,8 +866,11 @@ class DelegationNoticeWakeNotSentError extends Error {
  * (closing, lease lost, a failure, or a claim given up); reconcile retries
  * while the parent is live. `lost`: dispatched without a confirmed wake run,
  * counted as delivered. `superseded`: no longer owed by this delivery.
+ * `awaiting_guard` (PF-8032): a `remind` row whose memory requires OM
+ * source-write fencing and no turn guard is at hand; still owed, delivered at
+ * the start of the next turn that carries a guard.
  */
-type DelegationNoticeOutcome = 'wake' | 'history' | 'fenced' | 'left_owed' | 'lost' | 'superseded';
+type DelegationNoticeOutcome = 'wake' | 'history' | 'fenced' | 'left_owed' | 'lost' | 'superseded' | 'awaiting_guard';
 type NoticeClaimResult = 'claimed' | 'claim_lost' | 'fenced' | 'left_owed';
 type NoticeFenceSite = 'owed_reread' | 'row_save' | 'quiescence' | 'claim' | 'dispatch' | 'restore';
 /** PF-7679: a struct, so every guarded notice transition decides on each part. */
@@ -2283,6 +2293,11 @@ export class Session {
   private readonly _delegationNoticesInFlight = new Set<string>();
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
   private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
+  /**
+   * PF-8032 — owed `remind` notices (by child id + digest) whose row needs a
+   * turn's OM source-write guard; the next turn begun with a guard delivers them.
+   */
+  private readonly _delegationNoticesAwaitingGuard = new Map<string, PendingDelegationSettlementNotice>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -24279,12 +24294,19 @@ export class Session {
    * Build a turn's request context and its instructions together. The
    * instructions read the same frozen permission resolver the context carries.
    */
-  private _buildTurnContextAndInstructions(
+  private async _buildTurnContextAndInstructions(
     turn: Parameters<Session['_buildRequestContext']>[0],
     mode: Pick<HarnessMode, 'instructions' | 'harnessBuiltins'>,
   ): Promise<[RequestContext<unknown>, string | undefined]> {
     const requestContext = this._buildRequestContext(turn);
-    return Promise.all([requestContext, this._turnInstructions(mode, requestContext)]);
+    // PF-8032: owed `remind` rows that need this turn's source-write guard are
+    // written before the turn's run loads its history.
+    const [context, instructions] = await Promise.all([
+      requestContext,
+      this._turnInstructions(mode, requestContext),
+      this._deliverDelegationNoticesAwaitingGuard(),
+    ]);
+    return [context, instructions];
   }
 
   /**
@@ -25150,7 +25172,7 @@ export class Session {
         }
       }
       if (reconcileResult.notice !== undefined) {
-        this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
+        void this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
       return reconcileResult.reconciled;
     } catch {
@@ -25201,7 +25223,10 @@ export class Session {
    *    ungated follow-up run; the next parent turn reads it from history. A
    *    history-load watch on the row, registered before the save, records any
    *    run in this process that loads the row into its context.
-   * 3. `remind` acknowledges the notice and never starts a turn.
+   * 3. `remind` acknowledges the notice and never starts a turn. When the
+   *    memory requires OM source-write fencing (PF-8032), the row is written
+   *    only with a turn's guard: without one the notice stays owed, quietly,
+   *    and the next turn begun with a guard writes it before its run.
    * 4. `wake` (PF-7679) waits, unclaimed, until the parent has no running turn,
    *    parked interaction or queued turn, so a close, shutdown or crash during
    *    that wait leaves the notice owed. A Stop or edit since the settlement, or
@@ -25224,9 +25249,10 @@ export class Session {
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
     retryAttempt: number,
-  ): void {
+    sourceWriteGuard?: ObservationalMemorySourceWriteGuard,
+  ): Promise<void> {
     // Tracked so shutdown's bounded settle awaits a reminder write in flight.
-    const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch).then(
+    const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch, sourceWriteGuard).then(
       outcome => this._settleDelegationNoticeOutcome(outcome, notice, retryAttempt),
       (error: unknown) => {
         this._logDelegationNotice('error', 'settlement notice delivery failed', notice, error);
@@ -25238,6 +25264,31 @@ export class Session {
       this._delegationNoticeDeliveries.delete(delivery);
     };
     void delivery.then(untrack, untrack);
+    return delivery;
+  }
+
+  /**
+   * PF-8032: deliver, with the current turn's OM source-write guard, the owed
+   * `remind` notices that wait for one. Called while the turn builds its
+   * context, so the rows are saved before its run loads history. A turn without
+   * a guard leaves them waiting. Never rejects: each delivery settles its own
+   * outcome, and one left owed again returns to the waiting set via reconcile.
+   */
+  private async _deliverDelegationNoticesAwaitingGuard(): Promise<void> {
+    const guard = this._currentTurnSourceWriteGuard;
+    if (guard === undefined || this._delegationNoticesAwaitingGuard.size === 0) return;
+    const notices = [...this._delegationNoticesAwaitingGuard];
+    this._delegationNoticesAwaitingGuard.clear();
+    await Promise.all(
+      notices.map(([key, notice]) =>
+        this._startDelegationSettlementNotice(
+          notice,
+          this._delegationNoticeEpochs.get(key) ?? this._activeWorkAdmissionEpoch,
+          0,
+          guard,
+        ),
+      ),
+    );
   }
 
   /** PF-7679: act on a delivery's typed outcome. No outcome falls through as success. */
@@ -25256,6 +25307,11 @@ export class Session {
         if (this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown()) {
           this._scheduleDelegationReconcileRetry(retryAttempt);
         }
+        return;
+      case 'awaiting_guard':
+        // No retry: an unguarded write cannot succeed. A restart's reconcile
+        // re-reads the durable notice and parks it here again.
+        this._delegationNoticesAwaitingGuard.set(`${notice.subagentSessionId}:${notice.digest}`, notice);
         return;
       case 'lost':
         this._logDelegationNotice(
@@ -25338,6 +25394,7 @@ export class Session {
   private async _deliverDelegationSettlementNotice(
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
+    sourceWriteGuard: ObservationalMemorySourceWriteGuard | undefined,
   ): Promise<DelegationNoticeOutcome> {
     const key = `${notice.subagentSessionId}:${notice.digest}`;
     // A shutting-down Harness starts no new delivery work; the notice stays
@@ -25349,14 +25406,14 @@ export class Session {
     this._delegationNoticesInFlight.add(key);
     let outcome: DelegationNoticeOutcome = 'left_owed';
     try {
-      outcome = await this._runDelegationSettlementNotice(notice, admissionEpoch, key, live);
+      outcome = await this._runDelegationSettlementNotice(notice, admissionEpoch, key, live, sourceWriteGuard);
       return outcome;
     } finally {
       this._delegationNoticesInFlight.delete(key);
       // The row's watch is kept for this session's own retry only while the
       // notice is left owed in a live session that holds the lease (a lost
       // lease hands the notice to the next holder); teardown disposes the rest.
-      if (outcome !== 'left_owed' || !live() || !this._sessionLeaseHeld()) {
+      if ((outcome !== 'left_owed' && outcome !== 'awaiting_guard') || !live() || !this._sessionLeaseHeld()) {
         this._delegationNoticeWatches.get(key)?.dispose();
         this._delegationNoticeWatches.delete(key);
       }
@@ -25368,6 +25425,7 @@ export class Session {
     admissionEpoch: number,
     key: string,
     live: () => boolean,
+    sourceWriteGuard: ObservationalMemorySourceWriteGuard | undefined,
   ): Promise<DelegationNoticeOutcome> {
     const firstEpoch = this._delegationNoticeEpochs.get(key);
     if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
@@ -25521,6 +25579,16 @@ export class Session {
       if (!live()) return 'left_owed';
       // PF-7631: which agent's memory saved the row, set only once it is written.
       let reminderRow: WakeReminderRowOrigin | undefined;
+      // PF-8032: memory that requires OM source-write fencing refuses an
+      // unguarded save, so a `remind` row waits for a turn's guard.
+      if (
+        resolved !== undefined &&
+        notice.mode === 'remind' &&
+        sourceWriteGuard === undefined &&
+        requiresObservationalMemorySourceWriteGuard(resolved.memory)
+      ) {
+        return 'awaiting_guard';
+      }
       if (resolved !== undefined) {
         // PF-7679: watch before the save, so a run that loads history while the
         // row is written either sees it (and is recorded) or does not.
@@ -25541,6 +25609,7 @@ export class Session {
               threadId: this.threadId,
             }),
           ],
+          ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
         });
         reminderRow = { ...resolved, modeEpoch };
       }
@@ -26164,7 +26233,7 @@ export class Session {
     // owed (another owner or path resolved it), so no watch outlives it.
     this._disposeKeptDelegationNoticeWatches(key => keptBeforeListing.has(key) && !owedKeys.has(key));
     for (const owedNotice of owedNotices) {
-      this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
+      void this._startDelegationSettlementNotice(owedNotice, admissionEpoch, attempt);
     }
 
     let needsRetry = false;
