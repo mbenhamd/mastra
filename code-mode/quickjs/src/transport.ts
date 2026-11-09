@@ -22,9 +22,11 @@
  * Host calls cross the WASM boundary as JSON strings in both directions, so no
  * host object references are ever exposed to guest code.
  *
- * TypeScript is stripped on the host with `ts-blank-space` — a pure-JavaScript
- * type eraser, deliberately chosen over esbuild, which is itself a native binary
- * and would reintroduce the very dependency this package exists to avoid.
+ * TypeScript is stripped on the host. By default this uses `ts-blank-space` — a
+ * pure-JavaScript type eraser, deliberately chosen over esbuild, which is itself
+ * a native binary and would reintroduce the very dependency this package exists
+ * to avoid. Callers can supply their own transpiler through the `transpile`
+ * option.
  *
  * ## Concurrency
  *
@@ -86,6 +88,12 @@ export interface QuickJsCodeModeTransportOptions {
    * with its leak sanitizer during testing.
    */
   module?: QuickJSWASMModule;
+
+  /**
+   * Transpiles the wrapped TypeScript source `(async () => {\n<program>\n})` to JavaScript before QuickJS evaluates it.
+   * Default: ts-blank-space (types erased in place). A rejection or throw is reported as the program's SyntaxError result.
+   */
+  transpile?: (source: string) => string | Promise<string>;
 }
 
 /** The success and failure handles of a QuickJS call result, either of which must be freed. */
@@ -132,11 +140,13 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
   readonly #memoryLimitMb: number;
   readonly #maxStackSizeBytes: number;
   readonly #module: QuickJSWASMModule | undefined;
+  readonly #transpile: ((source: string) => string | Promise<string>) | undefined;
 
   constructor(options: QuickJsCodeModeTransportOptions = {}) {
     this.#memoryLimitMb = options.memoryLimitMb ?? DEFAULT_MEMORY_LIMIT_MB;
     this.#maxStackSizeBytes = options.maxStackSizeBytes ?? DEFAULT_MAX_STACK_SIZE_BYTES;
     this.#module = options.module;
+    this.#transpile = options.transpile;
   }
 
   async run(opts: Parameters<CodeModeTransport['run']>[0]): Promise<CodeModeToolResult> {
@@ -168,10 +178,13 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
     // an async arrow makes top-level `return`/`await`/`const` legal, same as the
     // core runner's program module. ts-blank-space only erases types, so it
     // leaves genuine syntax errors alone — those surface from `evalCode` below
-    // as a real SyntaxError, with QuickJS's own diagnostics.
+    // as a real SyntaxError, with QuickJS's own diagnostics. A caller-supplied
+    // `transpile` replaces ts-blank-space; its throw or rejection is reported
+    // the same way.
     let strippedProgram: string;
     try {
-      strippedProgram = tsBlankSpace(`(async () => {\n${program}\n})`);
+      const wrappedSource = `(async () => {\n${program}\n})`;
+      strippedProgram = this.#transpile ? await this.#transpile(wrappedSource) : tsBlankSpace(wrappedSource);
     } catch (error) {
       const err = error as { message?: string };
       return {

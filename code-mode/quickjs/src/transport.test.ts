@@ -197,6 +197,33 @@ describe('QuickJsCodeModeTransport', () => {
     expect(result.error?.name).toBe('SyntaxError');
   });
 
+  it('evaluates the output of a custom async transpile instead of ts-blank-space', async () => {
+    const received: string[] = [];
+    const transport = new QuickJsCodeModeTransport({
+      transpile: async source => {
+        received.push(source);
+        return source.replace('__ANSWER__', '42');
+      },
+    });
+    const result = await run(`return __ANSWER__;`, { transport });
+    expect(received).toEqual(['(async () => {\nreturn __ANSWER__;\n})']);
+    expect(result).toEqual({ success: true, result: 42, logs: [] });
+  });
+
+  it('returns a SyntaxError result when a custom transpile throws', async () => {
+    const transport = new QuickJsCodeModeTransport({
+      transpile: () => {
+        throw new Error('TS1005: ; expected');
+      },
+    });
+    const result = await run(`return 1;`, { transport });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'TS1005: ; expected', name: 'SyntaxError' },
+    });
+  });
+
   it('returns an error result for non-JSON-serializable results', async () => {
     const result = await run(`const a = {}; a.self = a; return a;`);
     expect(result.success).toBe(false);
