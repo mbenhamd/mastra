@@ -15100,7 +15100,7 @@ export class Session {
               ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
             },
           );
-          this._ownedSignalTurnOrigin = { runId: dispatched.runId, signalId: dispatched.signal.id };
+          this._claimOwnedSignalTurnOrigin(dispatched.runId, dispatched.signal.id);
           if (responseLogicalMessageIdentity !== undefined) {
             nativeLineagedDispatchStarted = true;
             const accepted = await this._awaitSignalNativeAcceptance(
@@ -15199,7 +15199,7 @@ export class Session {
                   } as never,
                 } as never,
               );
-              this._ownedSignalTurnOrigin = { runId: dispatching.runId, signalId: signalAdmission.identity.signalId };
+              this._claimOwnedSignalTurnOrigin(dispatching.runId, signalAdmission.identity.signalId);
               signalAdmissionNativeDispatchStarted = true;
               nativeLineagedDispatchStarted = responseLogicalMessageIdentity !== undefined;
               const accepted = await this._awaitSignalNativeAcceptance(
@@ -22502,6 +22502,16 @@ export class Session {
    */
   private _ownsPreRegistrationRun(runId: string | undefined): boolean {
     return runId === undefined || runId === this._currentRunId;
+  }
+
+  /**
+   * [PF-8221] Record the signal that owns `runId`. A concurrent `signal()` that
+   * joins a run another signal already dispatched leaves that owner in place.
+   */
+  private _claimOwnedSignalTurnOrigin(runId: string, signalId: string): void {
+    if (this._ownedSignalTurnOrigin?.runId !== runId) {
+      this._ownedSignalTurnOrigin = { runId, signalId };
+    }
   }
 
   /**
