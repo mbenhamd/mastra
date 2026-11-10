@@ -2129,6 +2129,72 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
     }
   });
 
+  it('remind: a turn started while the reminder row is being saved sees the notice exactly once', async () => {
+    const gated = gatedMemory();
+    const ctx = realParent(true, { db: new InMemoryDB(), memory: gated.memory, onDelegatedSettlement: 'remind' });
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      await endR0();
+      releaseChild();
+      await gated.entered;
+      // The next turn starts while the row save is held.
+      const next = parent.message({ content: 'what happened?' });
+      void Promise.resolve(next).catch(() => {});
+      await poll(() => ctx.prompts.length === 2, 300).catch(() => {});
+      gated.release();
+      await next;
+      await deliveryFinished(parent, taskId);
+
+      expect(ctx.prompts).toHaveLength(2);
+      expect(noticeCount(ctx.prompts[1]!)).toBe(1);
+      expect(total(ctx.prompts)).toBe(1);
+    } finally {
+      gated.release();
+      ctx.releaseAll();
+      await ctx.harness.shutdown();
+    }
+  });
+
+  it('remind: a turn proceeds past a stalled reminder row save, and a later turn sees the notice once', async () => {
+    const gated = gatedMemory();
+    const ctx = realParent(true, { db: new InMemoryDB(), memory: gated.memory, onDelegatedSettlement: 'remind' });
+    try {
+      const parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      const { taskId, releaseChild, endR0 } = await delegateFromR0(ctx, parent);
+      await endR0();
+      releaseChild();
+      await gated.entered;
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+      const next = parent.message({ content: 'what happened?' });
+      void Promise.resolve(next).catch(() => {});
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(ctx.prompts).toHaveLength(1);
+      // Past the deadline the turn runs while the save is still held.
+      await poll(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+        return ctx.prompts.length === 2;
+      }, 3_000);
+      await next;
+      expect(noticeCount(ctx.prompts[1]!)).toBe(0);
+      expect(gated.written()).toBe(false);
+
+      gated.release();
+      await deliveryFinished(parent, taskId);
+      await parent.message({ content: 'and now?' });
+
+      expect(ctx.prompts).toHaveLength(3);
+      expect(noticeCount(ctx.prompts[2]!)).toBe(1);
+      expect(total(ctx.prompts)).toBe(1);
+    } finally {
+      gated.release();
+      ctx.releaseAll();
+      await ctx.harness.shutdown();
+      vi.useRealTimers();
+    }
+  });
+
   it('row 8d: a close while a fresh run that loaded the row is still running does not re-wake after reopen', async () => {
     const ctx = realParent(true);
     try {
