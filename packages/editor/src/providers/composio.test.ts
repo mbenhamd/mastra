@@ -1605,6 +1605,20 @@ describe('ComposioToolProvider — shared catalog tools', () => {
     ]);
   });
 
+  it('does not reach Composio when the run is aborted while its identity resolves', async () => {
+    let resolveAlice!: (identity: { userId: string }) => void;
+    const { tools, sent } = await catalog(() => new Promise(resolve => (resolveAlice = resolve)));
+    const stop = new AbortController();
+    const call = tools.GMAIL_SEND_EMAIL!.execute!({ q: 'x' }, {
+      requestContext: createRequestContext({}),
+      abortSignal: stop.signal,
+    } as never);
+    stop.abort();
+    resolveAlice({ userId: 'pf:alice' });
+    await expect(call).rejects.toThrow();
+    expect(sent).toEqual([]);
+  });
+
   it('clears a stale account id when the identity names none', async () => {
     const { tools, sent } = await catalog(() => ({ userId: 'pf:alice' }));
     await tools.GMAIL_FETCH_EMAILS!.execute!({ q: 'x' }, { requestContext: createRequestContext({}) } as never);
