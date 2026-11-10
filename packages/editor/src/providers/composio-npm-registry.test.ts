@@ -1,17 +1,26 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ComposioToolProvider } from './composio';
-
 // PF-8016: unlike `composio.test.ts`, this file does not mock `@composio/core`.
 // The real SDK asks the npm registry for its latest version unless
 // `disableVersionCheck` is set, so every request is recorded here and answered
 // locally; nothing reaches the network.
+//
+// The package runs with `isolate: false`, so a worker can already hold a
+// `./composio` bound to the mocks from `composio.test.ts`. The test therefore
+// loads a fresh, unmocked provider, and resets the module cache afterwards so
+// later files in the worker do not inherit the real SDK.
 describe('ComposioToolProvider — npm registry traffic', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.resetModules();
   });
 
   it('makes no npm registry request while building and using its real Composio clients', async () => {
+    vi.resetModules();
+    vi.doUnmock('@composio/core');
+    vi.doUnmock('@composio/mastra');
+    const { ComposioToolProvider } = await import('./composio');
+
     const requested: string[] = [];
     vi.stubGlobal(
       'fetch',
@@ -33,5 +42,6 @@ describe('ComposioToolProvider — npm registry traffic', () => {
 
     expect(requested.length).toBeGreaterThan(0);
     expect(requested.filter(url => new URL(url).hostname === 'registry.npmjs.org')).toEqual([]);
-  });
+    // The cold import of the real SDK alone can pass the 5 s default.
+  }, 30_000);
 });
