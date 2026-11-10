@@ -8165,6 +8165,29 @@ NODE
   head_sha="$(
     cd "$fixture_repo"
     git reset -q --hard "$base_sha"
+    printf '%s\n' '{"scripts":{"build":"true","lint":"true"}}' > code-mode/quickjs/package.json
+    git add .
+    git commit -q -m 'replace QuickJS package scripts'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/quickjs-manifest-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'QuickJS manifest edit fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'outside the PF-2044 owned source-and-test maps' "$output"
+  assert_contains 'code-mode/quickjs/package.json' "$output"
+  assert_not_contains '--filter ./code-mode/quickjs' "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
     node - <<'NODE'
 const fs = require('node:fs');
 const manifestPath = 'workflows/inngest/package.json';
@@ -14792,6 +14815,15 @@ queue_owned_workspace_test() {
     printf '%s\n' "$test_file" >> "$forced_workspace_tests"
   fi
 }
+
+# PF-8105: the validator runs QuickJS's own build and lint scripts, so a PR may
+# change only its TypeScript sources and tests under src/. A manifest, build or
+# test config edit fails closed before any PR-controlled package command runs.
+while IFS= read -r file; do
+  if [[ "$file" == code-mode/quickjs/* && ! "$file" =~ ^code-mode/quickjs/src/.*\.ts$ ]]; then
+    printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+  fi
+done < "$changed_files"
 
 types_builder_changed=false
 while IFS= read -r file; do
