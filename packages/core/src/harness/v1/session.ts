@@ -1057,6 +1057,10 @@ const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
 /** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
 const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
 const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
+/** PF-8202: rounds a turn waits for `remind` notice saves before it loads history. */
+const REMIND_NOTICE_BARRIER_ROUNDS = 4;
+/** PF-8202: a stalled `remind` save must not hold every later turn; its row reaches the next one. */
+const REMIND_NOTICE_BARRIER_TIMEOUT_MS = 5_000;
 /**
  * TM-6 `includeSubtree` transfers the complete valid plan. The plan writer
  * already enforces this bound, so a normal delegated child never receives a
@@ -2314,6 +2318,21 @@ export class Session {
   private readonly _delegationNoticesInFlight = new Set<string>();
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
   private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
+  /**
+   * PF-8202 — `remind` deliveries in flight. A turn waits for them before its
+   * run loads history, so a row being saved is in that history and is not
+   * acknowledged behind the turn's back. `remind` never waits for the parent
+   * to go idle, so this cannot wait on the turn itself.
+   */
+  private readonly _remindDeliveries = new Set<Promise<void>>();
+  /**
+   * PF-8202 — `remind` settlements between their commit (which emits
+   * `delegate_settled`) and the start of their notice delivery. A turn begun
+   * from that event waits for them too, so the delivery it then waits for is
+   * registered. Marked inside the serialized write, so this never waits on the
+   * plan-task write chain.
+   */
+  private readonly _remindSettlementsStarting = new Set<Promise<void>>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -24327,12 +24346,50 @@ export class Session {
    * Build a turn's request context and its instructions together. The
    * instructions read the same frozen permission resolver the context carries.
    */
-  private _buildTurnContextAndInstructions(
+  private async _buildTurnContextAndInstructions(
     turn: Parameters<Session['_buildRequestContext']>[0],
     mode: Pick<HarnessMode, 'instructions' | 'harnessBuiltins'>,
   ): Promise<[RequestContext<unknown>, string | undefined]> {
     const requestContext = this._buildRequestContext(turn);
-    return Promise.all([requestContext, this._turnInstructions(mode, requestContext)]);
+    // PF-8202: `remind` rows being saved land before the turn's run loads history.
+    const [context, instructions] = await Promise.all([
+      requestContext,
+      this._turnInstructions(mode, requestContext),
+      this._awaitRemindNoticeSaves(),
+    ]);
+    return [context, instructions];
+  }
+
+  /**
+   * PF-8202: wait for the `remind` settlements committed but not yet started,
+   * and for the `remind` deliveries in flight, so their rows are saved before a
+   * turn's run loads history. A delivery that finishes may be followed by a
+   * reconcile pass that starts another, so this repeats; the bound keeps a busy
+   * reconcile loop from holding the turn, and one overall deadline keeps a
+   * stalled save from doing so. Anything later reaches the next turn. A `remind`
+   * delivery never waits for a turn, so this cannot deadlock. Never rejects:
+   * each delivery settles its own outcome.
+   */
+  private async _awaitRemindNoticeSaves(): Promise<void> {
+    if (this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, REMIND_NOTICE_BARRIER_TIMEOUT_MS);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    try {
+      await Promise.race([this._drainRemindNoticeSaves(), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async _drainRemindNoticeSaves(): Promise<void> {
+    for (let round = 0; round < REMIND_NOTICE_BARRIER_ROUNDS; round++) {
+      if (this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0) return;
+      await Promise.all(this._remindSettlementsStarting);
+      await Promise.all(this._remindDeliveries);
+    }
   }
 
   /**
@@ -25181,6 +25238,7 @@ export class Session {
       notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
     // A Stop that starts after this point must still suppress the wake.
     const noticeAdmissionEpoch = this._activeWorkAdmissionEpoch;
+    let releaseRemindSettlement: (() => void) | undefined;
     try {
       const durableResult =
         result ??
@@ -25205,15 +25263,22 @@ export class Session {
                 outcome,
               }
             : undefined);
-      const reconcileResult = await this._serializePlanTaskWrite(() =>
-        planTaskReconcileDelegation(this._planTaskPort(), {
+      const reconcileResult = await this._serializePlanTaskWrite(() => {
+        if (noticeMode === 'remind') {
+          const starting = new Promise<void>(resolve => {
+            releaseRemindSettlement = resolve;
+          });
+          this._remindSettlementsStarting.add(starting);
+          void starting.then(() => this._remindSettlementsStarting.delete(starting));
+        }
+        return planTaskReconcileDelegation(this._planTaskPort(), {
           taskId,
           subagentSessionId,
           outcome,
           ...(durableResult !== undefined ? { result: durableResult } : {}),
           ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
-        }),
-      );
+        });
+      });
       if (reconcileResult.reconciled) {
         this._notifyDisplayRefresh();
         for (const listener of Array.from(this._delegatedSettlementListeners)) {
@@ -25236,6 +25301,8 @@ export class Session {
       // scan retry re-reads the exact link and settles it idempotently.
       this._scheduleDelegationReconcileRetry(0);
       return false;
+    } finally {
+      releaseRemindSettlement?.();
     }
   }
 
@@ -25319,8 +25386,11 @@ export class Session {
       },
     );
     this._delegationNoticeDeliveries.add(delivery);
+    const remind = notice.mode === 'remind';
+    if (remind) this._remindDeliveries.add(delivery);
     const untrack = () => {
       this._delegationNoticeDeliveries.delete(delivery);
+      if (remind) this._remindDeliveries.delete(delivery);
     };
     void delivery.then(untrack, untrack);
   }
