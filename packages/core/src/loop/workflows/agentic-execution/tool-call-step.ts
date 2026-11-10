@@ -1587,6 +1587,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                   args: approvalArgs,
                   parentToolName: inputData.toolName,
                   parentArgs: inputData.args,
+                  ...(options.runId && options.runId !== runId ? { delegatedRunId: options.runId } : {}),
                   resumeSchema: approvalResumeSchema,
                 },
               },

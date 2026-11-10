@@ -16,6 +16,7 @@ import { AgentChannels } from '../agent-channels';
 import { getChatModule } from '../chat-lazy';
 import { ChannelSessionRejectedError } from '../errors';
 import { matchesDomain, extractUrls } from '../inline-media';
+import { ChatChannelOutputProcessor, CHAT_CHANNEL_RENDER_CONTEXT_KEY } from '../output-processor';
 import type { ChannelHandler } from '../types';
 
 // Minimal mock adapter that satisfies the Chat SDK's Adapter interface
@@ -723,6 +724,65 @@ describe('AgentChannels', () => {
 
         expect(sizes).toEqual([1]);
         expect((channels as any).deniedToolCalls.size).toBe(0);
+      });
+
+      it("denied delegated approval still renders the delegation call's real result", async () => {
+        const { adapter, channels, click, dispatchDecline } = await setup(undefined);
+        const chatThread: any = {
+          id: 'channel-1:thread-1',
+          channelId: 'channel-1',
+          isDM: false,
+          post: vi.fn(async () => ({ id: 'card-2', text: '' })),
+          startTyping: vi.fn().mockResolvedValue(undefined),
+        };
+        const processor = new ChatChannelOutputProcessor(channels);
+        const render = (channels as any)._buildRenderContext(chatThread, 'slack', {});
+        const requestContext = { get: (key: string) => (key === CHAT_CHANNEL_RENDER_CONTEXT_KEY ? render : undefined) };
+        const runEnd = { type: 'step-finish', runId: 'run-1', payload: { stepResult: { isContinued: false } } };
+        const driveRun = async (parts: any[]) => {
+          const state = {};
+          for (const part of parts) await processor.processOutputStream({ part, state, requestContext } as any);
+        };
+
+        const approval = (toolCallId: string, names: object, provenance: object = {}) => ({
+          type: 'tool-call-approval',
+          runId: 'run-1',
+          from: 'AGENT',
+          payload: { toolCallId, args: {}, parentArgs: {}, resumeSchema: '{}', ...names, ...provenance },
+        });
+        const toolResult = (toolCallId: string, toolName: string, result: unknown) => ({
+          type: 'tool-result',
+          runId: 'run-1',
+          from: 'AGENT',
+          payload: { toolCallId, toolName, args: {}, result },
+        });
+        const denial = 'Declined by the reviewer.';
+
+        await driveRun([
+          // A child run raised this one, and its inner tool shares the delegation's name.
+          approval(
+            'delegate-1',
+            { toolName: 'agent-subAgent', parentToolName: 'agent-subAgent' },
+            { delegatedRunId: 'child-run-1' },
+          ),
+          // This run's own tool asked for approval under another name.
+          approval('direct-1', { toolName: 'send-internal', parentToolName: 'send' }),
+          runEnd,
+        ]);
+        await click('tool_deny:delegate-1');
+        await click('tool_deny:direct-1');
+        expect(dispatchDecline).toHaveBeenCalledTimes(2);
+        await driveRun([
+          toolResult('delegate-1', 'agent-subAgent', { text: 'Sub-agent handled it.' }),
+          toolResult('direct-1', 'send', denial),
+          runEnd,
+        ]);
+
+        const rendered = JSON.stringify([...chatThread.post.mock.calls, ...adapter.editMessage.mock.calls]);
+        expect({
+          delegatedResultShown: rendered.includes('Sub-agent handled it.'),
+          directDenialShown: rendered.includes(denial),
+        }).toEqual({ delegatedResultShown: true, directDenialShown: false });
       });
 
       it('edits the card with the renderer output on approve', async () => {

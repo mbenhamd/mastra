@@ -162,6 +162,7 @@ const APPROVAL_PAYLOAD_KEYS = [
   'args',
   'parentToolName',
   'parentArgs',
+  'delegatedRunId',
   'resumeSchema',
   'approvalReasons',
 ] as const;

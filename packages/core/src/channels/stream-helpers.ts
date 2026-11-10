@@ -28,6 +28,13 @@ export interface PendingApprovalRecord {
   args?: Record<string, unknown>;
   /** Platform user id of the person whose message triggered the tool call. */
   requesterId?: string;
+  /** The approval came from a nested tool, so its id belongs to the parent delegation call. */
+  delegated?: boolean;
+}
+
+/** Whether a child run raised this approval, on its chunk or its persisted entry. */
+export function isDelegatedApproval(approval: { delegatedRunId?: string }): boolean {
+  return Boolean(approval.delegatedRunId);
 }
 
 /**

@@ -9,6 +9,7 @@ import type { PendingApprovalRecord } from './stream-helpers';
 import {
   ToolTracker,
   editOrPostMessage,
+  isDelegatedApproval,
   postFileAttachment,
   postStreamError,
   postTripwire,
@@ -814,6 +815,7 @@ export async function runStreamingDriver({
         runId: (chunk as { runId?: string }).runId,
         toolName: enr.toolName,
         args: (enr.args ?? {}) as Record<string, unknown>,
+        delegated: isDelegatedApproval(chunk.payload),
       });
       continue;
     }
