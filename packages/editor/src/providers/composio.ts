@@ -115,6 +115,16 @@ export type ComposioCallIdentityResolver = (
 ) => Promise<ComposioCallIdentity | undefined> | ComposioCallIdentity | undefined;
 
 /** Options for {@link ComposioToolProvider.resolveCatalogTools}. */
+/** Options for {@link ComposioToolProvider.listConnections}. */
+export interface ComposioListConnectionsOpts extends ListConnectionsOpts {
+  /**
+   * List only accounts the requested buckets own. SHARED accounts owned by
+   * other users are left out even when their ACL admits a requested bucket.
+   * Use it when "connected" must mean the user's own account.
+   */
+  ownedOnly?: boolean;
+}
+
 export interface ResolveComposioCatalogToolsOpts {
   /** Composio tool slugs to materialise. */
   toolSlugs: string[];
@@ -225,15 +235,23 @@ export class ComposioToolProvider extends BaseToolProvider {
     this.allowTracking = config.allowTracking;
   }
 
-  private trackingOption(): { allowTracking?: boolean } {
-    return this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking };
+  /**
+   * Options shared by both clients. `disableVersionCheck` stops the SDK from
+   * asking the npm registry for its latest version whenever a client is
+   * built: a server provider must not depend on npm egress.
+   */
+  private clientOptions(): { allowTracking?: boolean; disableVersionCheck: true } {
+    return {
+      disableVersionCheck: true,
+      ...(this.allowTracking === undefined ? {} : { allowTracking: this.allowTracking }),
+    };
   }
 
   // ── client cache ──────────────────────────────────────────────────────
 
   private getRawClient(): Composio {
     if (!this.rawClient) {
-      this.rawClient = new Composio({ apiKey: this.apiKey, ...this.trackingOption() });
+      this.rawClient = new Composio({ apiKey: this.apiKey, ...this.clientOptions() });
     }
     return this.rawClient;
   }
@@ -243,7 +261,7 @@ export class ComposioToolProvider extends BaseToolProvider {
       this.mastraClient = new Composio({
         apiKey: this.apiKey,
         provider: new MastraProvider(),
-        ...this.trackingOption(),
+        ...this.clientOptions(),
       });
     }
     return this.mastraClient;
@@ -694,7 +712,7 @@ export class ComposioToolProvider extends BaseToolProvider {
     return result;
   }
 
-  async listConnections(opts: ListConnectionsOpts): Promise<ListConnectionsResult> {
+  async listConnections(opts: ComposioListConnectionsOpts): Promise<ListConnectionsResult> {
     const composio = this.getRawClient();
     const page = opts.page ?? 1;
     const perPage = clampLimit(opts.perPage);
@@ -724,8 +742,8 @@ export class ComposioToolProvider extends BaseToolProvider {
     // SHARED accounts owned by other users are usable by the requested buckets
     // when their ACL grants access. List them separately and evaluate the ACL
     // locally so the result doesn't depend on how Composio combines `userIds`
-    // with `accountType`.
-    if (userIds) {
+    // with `accountType`. `ownedOnly` skips them.
+    if (userIds && opts.ownedOnly !== true) {
       const shared: ConnectedAccountListResponse = await composio.connectedAccounts.list({
         toolkitSlugs: [opts.toolkit],
         accountType: 'SHARED',

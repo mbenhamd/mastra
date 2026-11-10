@@ -147,6 +147,7 @@ export interface ResolvedToolConfig {
   requireReadBeforeWrite?: DynamicToolConfigValue<ToolConfigWithArgsContext>;
   maxOutputTokens?: number;
   name?: string;
+  description?: string;
   hooks?: WorkspaceToolHooks;
 }
 
@@ -189,6 +190,7 @@ export async function resolveToolConfig(
   let requireReadBeforeWrite: DynamicToolConfigValue<ToolConfigWithArgsContext> | undefined;
   let maxOutputTokens: number | undefined;
   let name: string | undefined;
+  let description: string | undefined;
   const hooks = toolsConfig?.hooks;
 
   if (toolsConfig) {
@@ -219,6 +221,9 @@ export async function resolveToolConfig(
       if (perToolConfig.name !== undefined) {
         name = perToolConfig.name;
       }
+      if (perToolConfig.description !== undefined) {
+        description = perToolConfig.description;
+      }
     }
   }
 
@@ -232,6 +237,7 @@ export async function resolveToolConfig(
     requireReadBeforeWrite,
     maxOutputTokens,
     name,
+    description,
     hooks,
   };
 }
@@ -615,6 +621,9 @@ export async function createWorkspaceTools(
     // the model to call the tool using the old default name.
     if (exposedName !== name && 'id' in wrapped) {
       wrapped = { ...wrapped, id: exposedName };
+    }
+    if (config.description !== undefined) {
+      wrapped = { ...wrapped, description: config.description };
     }
 
     if (config.hooks) {

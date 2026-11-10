@@ -191,6 +191,24 @@ describe('createWorkspaceTools', () => {
       expect(tools).not.toHaveProperty(WORKSPACE_TOOLS.FILESYSTEM.GREP);
     });
 
+    it('should show a configured description and keep the default elsewhere', async () => {
+      const workspace = new Workspace({
+        filesystem: new LocalFilesystem({ basePath: tempDir }),
+        tools: {
+          mastra_workspace_read_file: { name: 'view', description: 'Read a file from the project.' },
+        },
+      });
+      const defaults = await createWorkspaceTools(
+        new Workspace({ filesystem: new LocalFilesystem({ basePath: tempDir }) }),
+      );
+      const tools = await createWorkspaceTools(workspace);
+
+      expect(tools['view'].description).toBe('Read a file from the project.');
+      expect(tools[WORKSPACE_TOOLS.FILESYSTEM.GREP].description).toBe(
+        defaults[WORKSPACE_TOOLS.FILESYSTEM.GREP].description,
+      );
+    });
+
     it('should keep default names for non-remapped tools', async () => {
       const workspace = new Workspace({
         filesystem: new LocalFilesystem({ basePath: tempDir }),
