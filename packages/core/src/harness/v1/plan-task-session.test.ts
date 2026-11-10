@@ -1627,3 +1627,95 @@ describe('transaction atomicity', () => {
     expect(PLAN_TASK_UPDATED_EVENT.includes('.')).toBe(true);
   });
 });
+
+describe('a subtree delegation settled as blocked', () => {
+  it('lets the parents complete once the model finishes the blocked work', async () => {
+    const { storage, port } = await setup();
+    const root = await planTaskAdd(port, { content: 'root' });
+    const [leaf, mid] = await planTaskDecompose(port, root.taskId, [{ content: 'leaf' }, { content: 'mid' }]);
+    const [grandchild] = await planTaskDecompose(port, mid!.taskId, [{ content: 'grandchild' }]);
+
+    await planTaskDelegate(port, { taskId: root.taskId, subagentSessionId: 'sub-blocked', includeSubtree: true });
+    const settled = await planTaskReconcileDelegation(port, {
+      taskId: root.taskId,
+      subagentSessionId: 'sub-blocked',
+      outcome: 'blocked',
+    });
+    expect(settled.reconciled).toBe(true);
+    expect(settled.view?.status).toBe('blocked');
+    const blocked = await listAll(storage);
+    for (const task of [root, leaf!, mid!, grandchild!]) expect(blocked.get(task.taskId)?.status).toBe('blocked');
+
+    await planTaskComplete(port, leaf!.taskId);
+    await planTaskComplete(port, grandchild!.taskId);
+    const after = await listAll(storage);
+    expect(after.get(mid!.taskId)?.status).toBe('completed');
+    expect(after.get(root.taskId)?.status).toBe('completed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PF-8021: a delegated task's status belongs to its subagent until settlement
+// ---------------------------------------------------------------------------
+
+describe('a delegated task keeps its status until the delegation settles', () => {
+  async function seed(h: Harness, rows: HarnessPlanTask[]) {
+    await h.storage.mutatePlanTasksForSession({
+      fence: { harnessName: 'default', sessionId: SESSION_ID, ownerId: OWNER, ifSessionVersion: 1 },
+      ops: rows.map(task => ({ kind: 'create' as const, task })),
+    });
+  }
+
+  it('retrying a failed subtree stores the root in progress and settles it', async () => {
+    const h = await setup();
+    const root = seedRow('failed');
+    const child = seedRow('failed', { parentTaskId: root.taskId });
+    await seed(h, [root, child]);
+
+    const view = await planTaskDelegate(h.port, {
+      taskId: root.taskId,
+      subagentSessionId: 'sub-retry',
+      includeSubtree: true,
+    });
+
+    const stored = (await listAll(h.storage)).get(root.taskId);
+    expect(view.status).toBe('in_progress');
+    expect(stored?.status).toBe('in_progress');
+    expect(stored?.delegatedSubagentSessionId).toBe('sub-retry');
+
+    const settled = await planTaskReconcileDelegation(h.port, {
+      taskId: root.taskId,
+      subagentSessionId: 'sub-retry',
+      outcome: 'completed',
+    });
+    expect(settled.reconciled).toBe(true);
+    const after = await listAll(h.storage);
+    expect(after.get(root.taskId)?.status).toBe('completed');
+    expect(after.get(root.taskId)?.delegatedSubagentSessionId).toBeUndefined();
+  });
+
+  it('reopening a dependency does not change a running delegated task', async () => {
+    const h = await setup();
+    const dependency = seedRow('completed');
+    const leaf = seedRow('pending', { blockedBy: [dependency.taskId] });
+    await seed(h, [dependency, leaf]);
+    await planTaskDelegate(h.port, { taskId: leaf.taskId, subagentSessionId: 'sub-leaf' });
+
+    await planTaskUpdate(h.port, dependency.taskId, { status: 'pending' });
+
+    const stored = (await listAll(h.storage)).get(leaf.taskId);
+    expect(stored?.status).toBe('in_progress');
+    expect(stored?.delegatedSubagentSessionId).toBe('sub-leaf');
+
+    // Settlement still writes the outcome and clears the link.
+    const settled = await planTaskReconcileDelegation(h.port, {
+      taskId: leaf.taskId,
+      subagentSessionId: 'sub-leaf',
+      outcome: 'failed',
+    });
+    expect(settled.reconciled).toBe(true);
+    const after = (await listAll(h.storage)).get(leaf.taskId);
+    expect(after?.status).toBe('failed');
+    expect(after?.delegatedSubagentSessionId).toBeUndefined();
+  });
+});

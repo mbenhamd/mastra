@@ -31,6 +31,7 @@ import type {
   LoadPlanTaskSubtreeResult,
   PlanTaskMutationOp,
 } from '../../storage/domains/harness/types';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import { assertJsonValue, sha256CanonicalJsonChecked } from './canonical-json';
 import { HarnessDelegationAlreadyCompletedError, HarnessValidationError } from './errors';
 import {
@@ -1324,6 +1325,12 @@ export interface DelegateTaskInput {
    * representation must fit the inherited request-context app budget.
    */
   requestContextApp?: Record<string, JsonValue>;
+  /**
+   * PF-8034: the OM source-write guard of the parent run that delegated. Under
+   * `sourceWriteFencing: 'required'` the settlement notice row is written with
+   * it, and only with it.
+   */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }
 
 export interface PlanTaskDelegationScopeSnapshot {
@@ -1344,6 +1351,8 @@ interface DelegationAttemptMetadata {
   parentToolCallId: string;
   parentRunId?: string;
   parentModeId?: string;
+  /** PF-8034: the delegating parent run's OM source-write guard, when it had one. */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   includeSubtree: boolean;
   startedAt: number;
   deadlineAt: number;
@@ -1386,8 +1395,31 @@ export interface PendingDelegationSettlementNotice {
   outcome: DelegatedSubagentOutcome;
   /** Mode the parent delegated from, when recorded. */
   parentModeId?: string;
+  /** PF-8034: the OM source-write guard of the parent run that delegated, when recorded. */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   /** PF-7679: the delivery claim on this notice, when one is held. */
   claim?: DelegationNoticeClaim;
+}
+
+/** PF-8034: the guard as stored in the attempt's JSON metadata. */
+function encodeSourceWriteGuard(guard: ObservationalMemorySourceWriteGuard): Record<string, JsonValue> {
+  return { recordId: guard.recordId, threadId: guard.threadId, resourceId: guard.resourceId };
+}
+
+/** PF-8034: a well-formed stored guard; a malformed one is dropped (its notice then has no guard). */
+function parseSourceWriteGuard(raw: unknown): ObservationalMemorySourceWriteGuard | undefined {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const guard = raw as Record<string, unknown>;
+  if (
+    typeof guard.recordId !== 'string' ||
+    guard.recordId.length === 0 ||
+    (guard.threadId !== null && typeof guard.threadId !== 'string') ||
+    typeof guard.resourceId !== 'string' ||
+    guard.resourceId.length === 0
+  ) {
+    return undefined;
+  }
+  return { recordId: guard.recordId, threadId: guard.threadId, resourceId: guard.resourceId };
 }
 
 function sha256Text(value: string): string {
@@ -1432,6 +1464,7 @@ function delegationAttemptMetadata(
   }
   if (input.parentRunId !== undefined) attempt.parentRunId = input.parentRunId;
   if (input.parentModeId !== undefined) attempt.parentModeId = input.parentModeId;
+  if (input.sourceWriteGuard !== undefined) attempt.sourceWriteGuard = encodeSourceWriteGuard(input.sourceWriteGuard);
   if (priorMetadata !== undefined) attempt.priorMetadata = priorMetadata;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: attempt };
 }
@@ -1468,6 +1501,8 @@ function settledDelegationAttemptMetadata(
   };
   if (attempt.parentRunId !== undefined) encoded.parentRunId = attempt.parentRunId;
   if (attempt.parentModeId !== undefined) encoded.parentModeId = attempt.parentModeId;
+  if (attempt.sourceWriteGuard !== undefined)
+    encoded.sourceWriteGuard = encodeSourceWriteGuard(attempt.sourceWriteGuard);
   if (attempt.hadPriorMetadata) encoded.priorMetadata = attempt.priorMetadata!;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: encoded };
 }
@@ -1550,6 +1585,7 @@ export function readDelegationAttemptMetadata(
       return undefined;
     }
   }
+  const sourceWriteGuard = parseSourceWriteGuard(raw.sourceWriteGuard);
   let settlement: DelegationAttemptMetadata['settlement'];
   if (raw.settlement !== undefined) {
     if (raw.settlement === null || typeof raw.settlement !== 'object' || Array.isArray(raw.settlement))
@@ -1599,6 +1635,7 @@ export function readDelegationAttemptMetadata(
     parentToolCallId: raw.parentToolCallId,
     ...(typeof raw.parentRunId === 'string' ? { parentRunId: raw.parentRunId } : {}),
     ...(typeof raw.parentModeId === 'string' ? { parentModeId: raw.parentModeId } : {}),
+    ...(sourceWriteGuard !== undefined ? { sourceWriteGuard } : {}),
     includeSubtree: raw.includeSubtree,
     startedAt: raw.startedAt,
     deadlineAt: raw.deadlineAt,
@@ -1707,6 +1744,27 @@ function delegationScopeFingerprint(
     }))
     .sort((a, b) => a.taskId.localeCompare(b.taskId));
   return sha256Text(JSON.stringify({ includeSubtree, scope, externalDependencies }));
+}
+
+/**
+ * The unfinished parents in a settled scope that have an unfinished child.
+ * Every unfinished task holds work, a parent's own work included, so rollup
+ * derives `blocked` for each such parent from that child. A parent whose
+ * children all finished has nothing to derive from and keeps the explicit
+ * outcome: for the delegated root that is the subagent's verdict on the unit's
+ * own work, which a later delegation of the root can clear.
+ */
+function parentsOfBlockedWork(index: ReturnType<typeof indexPlanTasks>, scopeTaskIds: string[]): Set<string> {
+  const unfinished = (id: string) => {
+    const status = index.byId.get(id)?.status;
+    return status !== 'completed' && status !== 'cancelled';
+  };
+  const parents = new Set<string>();
+  for (const id of scopeTaskIds) {
+    if (!unfinished(id)) continue;
+    if ((index.childrenByParent.get(id) ?? []).some(unfinished)) parents.add(id);
+  }
+  return parents;
 }
 
 /** Capture the exact execution scope before allocating a durable child. */
@@ -1923,6 +1981,11 @@ export async function planTaskReconcileDelegation(
   }
 
   const settledSet = new Set(settledTaskIds);
+  // A `blocked` settlement stores the blocked work on the unfinished leaves. A
+  // settled parent above any of them stays rollup-owned, so it completes once
+  // the model finishes that work: `planTaskUpdate` refuses a status change on a
+  // parent, so an explicit `blocked` there could never be cleared.
+  const derivedParents = nextStatus === 'blocked' ? parentsOfBlockedWork(index, settledTaskIds) : new Set<string>();
   const postTasks = tasks.map(row => {
     if (!settledSet.has(row.taskId)) return row;
     // Preserve already-successful/skipped descendants. Failed descendants are
@@ -1930,7 +1993,9 @@ export async function planTaskReconcileDelegation(
     const preserveTerminalOk = row.status === 'completed' || row.status === 'cancelled';
     const updated: HarnessPlanTask = preserveTerminalOk
       ? { ...row }
-      : { ...row, status: nextStatus, statusSource: 'explicit' };
+      : derivedParents.has(row.taskId)
+        ? { ...row, statusSource: 'derived' }
+        : { ...row, status: nextStatus, statusSource: 'explicit' };
     if (row.taskId === input.taskId) {
       delete updated.delegatedSubagentSessionId;
       delete updated.delegatedSubagentTypeId;
@@ -1945,7 +2010,8 @@ export async function planTaskReconcileDelegation(
   for (const settledTaskId of settledTaskIds) {
     const row = index.byId.get(settledTaskId);
     if (row?.status === 'completed' || row?.status === 'cancelled') continue;
-    staged.explicitStatus.set(settledTaskId, nextStatus);
+    if (derivedParents.has(settledTaskId)) staged.derivedNodes.add(settledTaskId);
+    else staged.explicitStatus.set(settledTaskId, nextStatus);
   }
 
   const { ops, deltas } = buildCommitOps(
@@ -1968,7 +2034,13 @@ export async function planTaskReconcileDelegation(
   refreshSummary(port, postTasks, deltas);
   emitBestEffort(port, 'delegate_settled', settledTaskIds, deltas);
   const notice = readPendingDelegationSettlementNotice(updated);
-  return { reconciled: true, view: toView(updated), ...(notice !== undefined ? { notice } : {}) };
+  // A parent left to rollup takes its status from the committed delta.
+  const committedDelta = deltas.find(delta => delta.taskId === input.taskId);
+  const committed =
+    committedDelta === undefined
+      ? updated
+      : { ...updated, status: committedDelta.status, statusSource: committedDelta.statusSource };
+  return { reconciled: true, view: toView(committed), ...(notice !== undefined ? { notice } : {}) };
 }
 
 /**
@@ -1990,6 +2062,7 @@ export function readPendingDelegationSettlementNotice(
     digest: settlement.notice.digest,
     outcome: settlement.outcome,
     ...(attempt.parentModeId !== undefined ? { parentModeId: attempt.parentModeId } : {}),
+    ...(attempt.sourceWriteGuard !== undefined ? { sourceWriteGuard: attempt.sourceWriteGuard } : {}),
     ...(settlement.notice.claim !== undefined ? { claim: settlement.notice.claim } : {}),
   };
 }

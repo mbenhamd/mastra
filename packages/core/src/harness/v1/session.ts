@@ -71,6 +71,7 @@ import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { watchHistoryLoad } from '../../memory/history-load-watch';
 import type { HistoryLoadWatch } from '../../memory/history-load-watch';
 import type { MastraMemory } from '../../memory/memory';
+import { isObservationalMemoryEnabled } from '../../memory/types';
 import type { TracingContext } from '../../observability';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -139,6 +140,10 @@ import type {
   SessionRecord,
   SessionSummary,
 } from '../../storage/domains/harness';
+import {
+  assertObservationalMemorySourceWriteGuardSupported,
+  ObservationalMemorySourceWriteConflictError,
+} from '../../storage/domains/memory/base';
 import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
@@ -412,6 +417,20 @@ function normalizeObservationalMemorySourceWriteGuard(
     threadId: value.threadId,
     resourceId: value.resourceId,
   };
+}
+
+/** True when the memory's OM requires every source write to carry a captured guard. */
+function requiresObservationalMemorySourceWriteGuard(memory: MastraMemory): boolean {
+  const config = memory.getMergedThreadConfig().observationalMemory;
+  return isObservationalMemoryEnabled(config) && typeof config === 'object' && config.sourceWriteFencing === 'required';
+}
+
+/** PF-8034: the store refused a guarded write because the guard no longer holds. */
+function isObservationalMemorySourceWriteConflict(error: unknown): boolean {
+  return (
+    error instanceof ObservationalMemorySourceWriteConflictError ||
+    (error instanceof Error && error.name === 'ObservationalMemorySourceWriteConflictError')
+  );
 }
 
 function sameObservationalMemorySourceWriteGuard(
@@ -859,8 +878,11 @@ class DelegationNoticeWakeNotSentError extends Error {
  * (closing, lease lost, a failure, or a claim given up); reconcile retries
  * while the parent is live. `lost`: dispatched without a confirmed wake run,
  * counted as delivered. `superseded`: no longer owed by this delivery.
+ * `obsolete` (PF-8034): the memory requires OM source-write fencing and the
+ * delegating run's guard is missing or revoked (its record was retracted, as
+ * when the transcript is deleted). Acknowledged without a row or a wake.
  */
-type DelegationNoticeOutcome = 'wake' | 'history' | 'fenced' | 'left_owed' | 'lost' | 'superseded';
+type DelegationNoticeOutcome = 'wake' | 'history' | 'fenced' | 'left_owed' | 'lost' | 'superseded' | 'obsolete';
 type NoticeClaimResult = 'claimed' | 'claim_lost' | 'fenced' | 'left_owed';
 type NoticeFenceSite = 'owed_reread' | 'row_save' | 'quiescence' | 'claim' | 'dispatch' | 'restore';
 /** PF-7679: a struct, so every guarded notice transition decides on each part. */
@@ -24515,6 +24537,33 @@ export class Session {
   }
 
   /**
+   * PF-8034: the OM source-write guard of the run that calls `task_delegate`,
+   * recorded with the delegation so its settlement notice is written under it.
+   * The run's memory step puts it in the run's request context; the turn's
+   * caller guard is the fallback. A guard that is malformed or scoped to another
+   * resource or thread is not recorded.
+   */
+  private _delegatingRunSourceWriteGuard(
+    callerRequestContext: RequestContext | undefined,
+  ): ObservationalMemorySourceWriteGuard | undefined {
+    const memoryContext = callerRequestContext?.get('MastraMemory') as
+      | { observationalMemorySourceWriteGuard?: ObservationalMemorySourceWriteGuard }
+      | undefined;
+    for (const candidate of [memoryContext?.observationalMemorySourceWriteGuard, this._currentTurnSourceWriteGuard]) {
+      if (candidate === undefined) continue;
+      try {
+        const guard = normalizeObservationalMemorySourceWriteGuard(candidate, 'observationalMemorySourceWriteGuard');
+        if (guard === undefined) continue;
+        this._assertSourceWriteGuardScope(guard, 'observationalMemorySourceWriteGuard');
+        return guard;
+      } catch {
+        // Not this session's guard: try the next source.
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * @internal — `task_delegate`. Spawn/create a subagent SESSION for `taskId`,
    * durably link it (`delegatedSubagentSessionId`), drive the task `in_progress`,
    * and arm the live completion hook. Returns the view + the created subagent
@@ -24549,6 +24598,7 @@ export class Session {
       callerRequestContext,
       this._harness._getSubagentInheritedRequestContextAppKeys(),
     );
+    const sourceWriteGuard = this._delegatingRunSourceWriteGuard(callerRequestContext);
 
     // Reject unknown, already-running, or dependency-blocked tasks before
     // reserving capacity or creating a durable child. The fenced link commit
@@ -24605,6 +24655,7 @@ export class Session {
           ...(parentRunId !== undefined ? { parentRunId } : {}),
           parentModeId: this._currentRunModeId ?? this._record.modeId,
           ...(delegatedRequestContext !== undefined ? { requestContextApp: delegatedRequestContext.app } : {}),
+          ...(sourceWriteGuard !== undefined ? { sourceWriteGuard } : {}),
         }),
       );
       this._assertActiveWorkAdmission(admissionEpoch, 'task_delegate', callerSignal);
@@ -25214,6 +25265,14 @@ export class Session {
    *    clears it as `remind`) and the delivery waits again; a claim that cannot
    *    be cleared is marked dead in this process, so reconcile takes it over.
    *
+   * Under OM `sourceWriteFencing: 'required'` (PF-8034) the row goes to the
+   * delegating mode's memory under the source-write guard of the parent run
+   * that delegated the task, recorded with the delegation; a wake run in that
+   * mode reuses it (`_resolveDelegationNoticeTarget`). A notice with no guard
+   * for fenced memory, or whose guard was revoked since (its OM record
+   * retracted, as when the transcript is deleted), is obsolete: acknowledged
+   * without a row or a wake, never under a new guard.
+   *
    * Every exit is a typed outcome (`DelegationNoticeOutcome`). A cancelled
    * parent drops the notice. A closed or torn-down parent, or one whose Harness
    * is shutting down, leaves it owed for restart reconcile; a running delivery
@@ -25256,6 +25315,15 @@ export class Session {
         if (this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown()) {
           this._scheduleDelegationReconcileRetry(retryAttempt);
         }
+        return;
+      case 'obsolete':
+        // Acknowledged durably, like a delivered notice: reconcile does not
+        // see it again. Retraction wins over the reminder.
+        this._logDelegationNotice(
+          'warn',
+          "settlement notice dropped: the delegating run's source-write guard is missing or revoked",
+          notice,
+        );
         return;
       case 'lost':
         this._logDelegationNotice(
@@ -25399,7 +25467,7 @@ export class Session {
       });
     const acknowledged = async (
       site: NoticeFenceSite,
-      outcome: 'history' | 'fenced',
+      outcome: 'history' | 'fenced' | 'obsolete',
     ): Promise<DelegationNoticeOutcome> => {
       const result = await acknowledge(site);
       return result === 'removed' ? outcome : result === 'not_owed' ? 'superseded' : 'left_owed';
@@ -25516,9 +25584,12 @@ export class Session {
       // PF-7631: the mode marker is taken before resolution, so any switch from
       // here on disqualifies the wake grant.
       const modeEpoch = this._modeSwitchEpoch;
-      const resolved = await this._resolveDelegationNoticeMemory(notice);
+      const target = await this._resolveDelegationNoticeTarget(notice);
       // Shutdown may have begun while the notice was re-read and memory resolved.
       if (!live()) return 'left_owed';
+      // PF-8034: fenced memory with no guard of the delegating run for it.
+      if (target === 'obsolete') return acknowledged('row_save', 'obsolete');
+      const { resolved, sourceWriteGuard } = target;
       // PF-7631: which agent's memory saved the row, set only once it is written.
       let reminderRow: WakeReminderRowOrigin | undefined;
       if (resolved !== undefined) {
@@ -25528,20 +25599,35 @@ export class Session {
           watch = watchHistoryLoad(this.threadId, this.resourceId, signalId, () => this._notifyMaybeIdle());
           this._delegationNoticeWatches.set(key, watch);
         }
-        await resolved.memory.saveMessages({
-          messages: [
-            createSignal({
-              type: 'system-reminder',
-              id: signalId,
-              contents: content,
-              attributes,
-              metadata,
-            }).toDBMessage({
-              resourceId: this.resourceId,
-              threadId: this.threadId,
-            }),
-          ],
-        });
+        // PF-8034: an adapter that cannot check a guard is a configuration
+        // error, not a revocation: the notice stays owed.
+        if (sourceWriteGuard !== undefined) {
+          assertObservationalMemorySourceWriteGuardSupported(await resolved.memory.storage.getStore('memory'));
+        }
+        try {
+          await resolved.memory.saveMessages({
+            messages: [
+              createSignal({
+                type: 'system-reminder',
+                id: signalId,
+                contents: content,
+                attributes,
+                metadata,
+              }).toDBMessage({
+                resourceId: this.resourceId,
+                threadId: this.threadId,
+              }),
+            ],
+            ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
+          });
+        } catch (error) {
+          // PF-8034: the delegating run's guard was revoked (retraction wins).
+          // Any other failure leaves the notice owed, as before.
+          if (sourceWriteGuard !== undefined && isObservationalMemorySourceWriteConflict(error)) {
+            return acknowledged('row_save', 'obsolete');
+          }
+          throw error;
+        }
         reminderRow = { ...resolved, modeEpoch };
       }
       if (!live()) return 'left_owed';
@@ -25569,7 +25655,16 @@ export class Session {
         try {
           await this._injectSystemReminder(
             content,
-            { attributes, metadata },
+            {
+              attributes,
+              metadata,
+              // PF-8034: a wake run in the mode whose memory took the row writes
+              // under the guard the row was saved with; another mode's memory
+              // never sees that guard.
+              ...(sourceWriteGuard !== undefined && reminderRow?.modeId === this._record.modeId
+                ? { observationalMemorySourceWriteGuard: sourceWriteGuard }
+                : {}),
+            },
             {
               signalId,
               admissionEpoch,
@@ -25684,19 +25779,72 @@ export class Session {
       if (this._harness._hasMode(notice.parentModeId)) modeIds.push(notice.parentModeId);
     }
     for (const modeId of modeIds) {
-      const agent = this._harness.getAgentForMode(modeId);
-      const requestContext = await this._buildRequestContext({
-        modeId,
-        modelId: this._record.modelId,
-        abortSignal: new AbortController().signal,
-        ...(this._currentTurnRequestContext !== undefined
-          ? { persistedRequestContext: this._currentTurnRequestContext }
-          : {}),
-      });
-      const memory = await agent.getMemory({ requestContext });
-      if (memory !== undefined && memory !== null) return { agent, memory, modeId };
+      const resolved = await this._resolveModeNoticeMemory(modeId);
+      if (resolved !== undefined) return resolved;
     }
     return undefined;
+  }
+
+  /** One mode's agent memory, resolved with the parent's own request context. */
+  private async _resolveModeNoticeMemory(
+    modeId: string,
+  ): Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> {
+    const agent = this._harness.getAgentForMode(modeId);
+    const requestContext = await this._buildRequestContext({
+      modeId,
+      modelId: this._record.modelId,
+      abortSignal: new AbortController().signal,
+      ...(this._currentTurnRequestContext !== undefined
+        ? { persistedRequestContext: this._currentTurnRequestContext }
+        : {}),
+    });
+    const memory = await agent.getMemory({ requestContext });
+    return memory !== undefined && memory !== null ? { agent, memory, modeId } : undefined;
+  }
+
+  /**
+   * PF-8034: where a settlement reminder row goes, and under which guard.
+   * Memory that requires no OM source-write fencing keeps the order of
+   * `_resolveDelegationNoticeMemory` and is written unguarded. The recorded
+   * guard belongs to the delegating mode's memory, so a notice that carries
+   * one goes there first when that memory requires it. When the memory chosen
+   * requires fencing and the guard is not its own, a delegating mode whose
+   * memory requires none takes the row unguarded, as its run had no fence;
+   * otherwise the recorded guard is tried (its memory rejects it if it is not
+   * its own). With no guard at all, the notice is obsolete.
+   */
+  private async _resolveDelegationNoticeTarget(notice: PendingDelegationSettlementNotice): Promise<
+    | {
+        resolved?: { agent: Agent; memory: MastraMemory; modeId: string };
+        sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
+      }
+    | 'obsolete'
+  > {
+    const delegatingModeId =
+      notice.parentModeId !== undefined && this._harness._hasMode(notice.parentModeId)
+        ? notice.parentModeId
+        : undefined;
+    let delegating: Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> | undefined;
+    const resolveDelegating = () =>
+      delegatingModeId === undefined
+        ? Promise.resolve(undefined)
+        : (delegating ??= this._resolveModeNoticeMemory(delegatingModeId));
+    const guard = notice.sourceWriteGuard;
+    if (guard !== undefined) {
+      const own = await resolveDelegating();
+      if (own !== undefined && requiresObservationalMemorySourceWriteGuard(own.memory)) {
+        return { resolved: own, sourceWriteGuard: guard };
+      }
+    }
+    const resolved = await this._resolveDelegationNoticeMemory(notice);
+    if (resolved === undefined || !requiresObservationalMemorySourceWriteGuard(resolved.memory)) {
+      return resolved === undefined ? {} : { resolved };
+    }
+    const unfenced = await resolveDelegating();
+    if (unfenced !== undefined && !requiresObservationalMemorySourceWriteGuard(unfenced.memory)) {
+      return { resolved: unfenced };
+    }
+    return guard !== undefined ? { resolved, sourceWriteGuard: guard } : 'obsolete';
   }
 
   /**

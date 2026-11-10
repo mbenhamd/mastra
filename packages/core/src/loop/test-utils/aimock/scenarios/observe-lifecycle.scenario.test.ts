@@ -70,6 +70,10 @@ describeForAllEngines(
   'AIMock loop scenario: observe lifecycle',
   engine => {
     const getMock = useLoopScenarioAimock();
+    // The stubbed randomUUID restarts per test, so every test's first run would
+    // reuse one id on the shared agent; a later test then cannot recover it.
+    let runSeq = 0;
+    const nextRunId = () => `observe-lifecycle-${engine}-${++runSeq}`;
 
     it('closes an observation of a run that never existed', async () => {
       const { agent } = await createSharedAgent(getMock(), { engine });
@@ -83,7 +87,7 @@ describeForAllEngines(
       const llm = getMock();
       llm.on({ endpoint: 'chat' }, { content: 'Finished reply.' });
       const { agent } = await createSharedAgent(llm, { engine });
-      const run = await agent.stream('Go', { maxSteps: 2 });
+      const run = await agent.stream('Go', { runId: nextRunId(), maxSteps: 2 });
       await run.output.consumeStream();
 
       try {
@@ -103,7 +107,7 @@ describeForAllEngines(
       const llm = getMock();
       llm.on({ endpoint: 'chat' }, { error: { message: 'Provider down', type: 'invalid_request_error' }, status: 400 });
       const { agent } = await createSharedAgent(llm, { engine });
-      const run = await agent.stream('Go', { maxSteps: 2 });
+      const run = await agent.stream('Go', { runId: nextRunId(), maxSteps: 2 });
       await run.output.consumeStream().catch(() => undefined);
 
       try {
@@ -122,7 +126,7 @@ describeForAllEngines(
       const llm = getMock();
       llm.on({ endpoint: 'chat' }, { content: 'Slow but alive.' }, { streamingProfile: { ttft: SILENCE_MS } });
       const { agent } = await createSharedAgent(llm, { engine });
-      const run = await agent.stream('Go', { maxSteps: 2 });
+      const run = await agent.stream('Go', { runId: nextRunId(), maxSteps: 2 });
       const producerDone = run.output.consumeStream();
 
       try {
@@ -158,7 +162,7 @@ describeForAllEngines(
         },
       });
       const { agent } = await createSharedAgent(llm, { engine, tools: { slow_lookup: slowLookup } });
-      const run = await agent.stream('Go', { stopWhen: stepCountIs(3), maxSteps: 3 });
+      const run = await agent.stream('Go', { runId: nextRunId(), stopWhen: stepCountIs(3), maxSteps: 3 });
       const producerDone = run.output.consumeStream();
 
       try {
@@ -195,7 +199,7 @@ describeForAllEngines(
         execute: async ({ query }) => ({ status: `OK:${query}` }),
       });
       const { agent } = await createSharedAgent(llm, { engine, tools: { lookup_status: lookup } });
-      const run = await agent.stream('Look up alpha', { requireToolApproval: true, maxSteps: 5 });
+      const run = await agent.stream('Look up alpha', { runId: nextRunId(), requireToolApproval: true, maxSteps: 5 });
       let toolCallId: string | undefined;
       for await (const chunk of run.fullStream) {
         if (chunk.type === 'tool-call-approval') {
@@ -248,7 +252,7 @@ describeForAllEngines(
         },
       });
       const { agent } = await createSharedAgent(llm, { engine, tools: { lookup_status: lookup } });
-      const run = await agent.stream('Look up alpha', { requireToolApproval: true, maxSteps: 5 });
+      const run = await agent.stream('Look up alpha', { runId: nextRunId(), requireToolApproval: true, maxSteps: 5 });
       for await (const chunk of run.fullStream) if (chunk.type === 'tool-call-approval') break;
 
       try {
@@ -296,7 +300,7 @@ describeForAllEngines(
       const cache = new RecordingCache();
       const { agent } = await createSharedAgent(llm, { engine, cache, tools: { lookup_status: lookup } });
 
-      const run = await agent.stream('Look up alpha', { requireToolApproval: true, maxSteps: 5 });
+      const run = await agent.stream('Look up alpha', { runId: nextRunId(), requireToolApproval: true, maxSteps: 5 });
       try {
         for await (const chunk of run.fullStream) if (chunk.type === 'tool-call-approval') break;
 
@@ -305,7 +309,9 @@ describeForAllEngines(
         // 300s default is shorter than an approval wait.
         await vi.waitFor(
           () => {
-            const runAppends = cache.appends.filter(([key]) => key.includes(run.runId));
+            // Only the run's own stream log; workflow-lifecycle topics that include the
+            // run id keep their own retention.
+            const runAppends = cache.appends.filter(([key]) => key.endsWith(`agent.stream.${run.runId}`));
             expect(runAppends.length).toBeGreaterThan(0);
             expect(runAppends.every(([, ttl]) => ttl === RUN_LOG_TTL_MS)).toBe(true);
           },

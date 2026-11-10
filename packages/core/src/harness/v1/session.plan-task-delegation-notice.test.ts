@@ -19,6 +19,7 @@ import { InMemoryStore } from '../../storage';
 import type { HarnessTerminalFinalizer } from '../../storage/domains/harness';
 import { InMemoryHarness } from '../../storage/domains/harness/inmemory';
 import { InMemoryDB } from '../../storage/domains/inmemory-db';
+import { ObservationalMemorySourceWriteConflictError } from '../../storage/domains/memory/base';
 
 import { MockAgent } from './__test-utils__';
 import { HarnessConfigError } from './errors';
@@ -573,6 +574,7 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     // row lands: every parent-thread write fails on instance A.
     const attemptedReminderIds: string[] = [];
     vi.spyOn(a.parentAgent, 'getMemory').mockResolvedValue({
+      getMergedThreadConfig: () => ({}),
       saveMessages: (args: { messages: Array<{ id?: string }> }) => {
         for (const m of args.messages) if (m.id !== undefined) attemptedReminderIds.push(m.id);
         return Promise.reject(new Error('storage down'));
@@ -790,6 +792,7 @@ describe('task_delegate settlement notice (subagents.onDelegatedSettlement)', ()
     const parentA = await a.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const attemptedReminderIds: string[] = [];
     vi.spyOn(a.parentAgent, 'getMemory').mockResolvedValue({
+      getMergedThreadConfig: () => ({}),
       saveMessages: (args: { messages: Array<{ id?: string }> }) => {
         for (const m of args.messages) if (m.id !== undefined) attemptedReminderIds.push(m.id);
         return Promise.reject(new Error('storage down'));
@@ -1210,6 +1213,12 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
       memoryFactory?: () => MockMemory;
       /** The reply text of provider call `call` (default `reply <call>`). */
       reply?: (call: number) => string;
+      /** The notice mode (default `wake`). */
+      onDelegatedSettlement?: 'wake' | 'remind';
+      /** Provider call `call` asks for `task_delegate` of one worker task. */
+      delegateOnCall?: number;
+      /** Memory for `quiet-agent` (default none). */
+      quietMemory?: MockMemory;
     },
     grant = false,
   ) {
@@ -1234,6 +1243,19 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         const call = prompts.length;
         prompts.push(JSON.stringify((options as { prompt: unknown }).prompt));
         await holds.get(call);
+        if (call === shared?.delegateOnCall) {
+          const input = JSON.stringify({ task: 'background work', agentType: 'worker' });
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+            stream: convertArrayToReadableStream([
+              { type: 'stream-start', warnings: [] },
+              { type: 'response-metadata', id: `id-${call}`, modelId: 'mock-model-id', timestamp: new Date(0) },
+              { type: 'tool-call', toolCallId: 'delegate-1', toolName: TASK_DELEGATE_TOOL_ID, input },
+              { type: 'finish', finishReason: 'tool-calls', usage },
+            ]),
+          };
+        }
         return {
           rawCall: { rawPrompt: null, rawSettings: {} },
           warnings: [],
@@ -1260,12 +1282,21 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
           ? { memory: shared?.dynamicMemory ? () => memory : memory }
           : {}),
     });
-    const quietAgent = new Agent({ id: 'quiet-agent', name: 'quiet-agent', instructions: 'answer briefly', model });
+    const quietAgent = new Agent({
+      id: 'quiet-agent',
+      name: 'quiet-agent',
+      instructions: 'answer briefly',
+      model,
+      ...(shared?.quietMemory ? { memory: shared.quietMemory } : {}),
+    });
     const storage = new InMemoryHarness({
       db: shared?.db ?? new InMemoryDB(),
       ...(grant ? { terminalHandoff: { enabled: true }, sessionRecordProjection: { enabled: true } } : {}),
     });
     const childAgent = new MockAgent({ id: 'child-agent', defaultOutput: { terminalToolResult: completedReport } });
+    const onDelegatedSettlement = shared?.onDelegatedSettlement ?? 'wake';
+    // `remind` requires memory on every mode that can delegate, `worker-mode` included.
+    if (onDelegatedSettlement === 'remind') vi.spyOn(childAgent, 'hasOwnMemory').mockReturnValue(true);
     const harness = new Harness({
       agents: { 'parent-agent': parentAgent, 'quiet-agent': quietAgent, 'child-agent': childAgent } as any,
       modes: [
@@ -1279,7 +1310,7 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         : { storage },
       subagents: {
         maxDepth: 2,
-        onDelegatedSettlement: 'wake',
+        onDelegatedSettlement,
         types: {
           worker: {
             agentId: 'child-agent',
@@ -2584,6 +2615,166 @@ describe('a caller turn that takes the slot from the claimed wake (real Agent mo
         b.releaseAll();
         await b.harness.shutdown();
         await a.harness.shutdown().catch(() => {});
+      }
+    });
+  });
+
+  // PF-8034: under OM `sourceWriteFencing: 'required'` a settlement notice row
+  // is written with the source-write guard of the parent run that delegated the
+  // task. Retraction wins: a notice whose guard was revoked since is dropped.
+  // `MockMemory` on the in-memory store, which refuses a guarded write whose OM
+  // record is gone; the spies add the `required` policy (no unguarded write)
+  // and the per-run guard minting that OM memory does.
+  describe('settlement notice under required source-write fencing (PF-8034)', () => {
+    type Guard = { recordId: string; threadId: string | null; resourceId: string };
+
+    async function fencedMemory(threadId: () => string) {
+      const memory = new MockMemory();
+      const merged = memory.getMergedThreadConfig.bind(memory);
+      vi.spyOn(memory, 'getMergedThreadConfig').mockImplementation(config => ({
+        ...merged(config),
+        observationalMemory: { sourceWriteFencing: 'required' },
+      }));
+      const store = await (memory as any).getMemoryStore();
+      const minted: Guard[] = [];
+      vi.spyOn(memory, 'prepareObservationalMemorySourceWriteGuard').mockImplementation(async () => {
+        const record = await store.initializeObservationalMemory({
+          threadId: threadId(),
+          resourceId: 'u1',
+          scope: 'thread',
+          config: {},
+        });
+        const guard = { recordId: record.id, threadId: threadId(), resourceId: 'u1' };
+        minted.push(guard);
+        return guard;
+      });
+      const noticeSaves: Array<Guard | undefined> = [];
+      const save = memory.saveMessages.bind(memory);
+      vi.spyOn(memory, 'saveMessages').mockImplementation(async (args: any) => {
+        if (args.messages.some((m: { id?: string }) => m.id?.startsWith('harness-delegation-notice-'))) {
+          noticeSaves.push(args.observationalMemorySourceWriteGuard);
+        }
+        if (args.observationalMemorySourceWriteGuard === undefined) {
+          throw new ObservationalMemorySourceWriteConflictError(
+            'Observational memory source write fencing is required but no captured record guard was provided.',
+          );
+        }
+        return save(args);
+      });
+      /** Retract the thread's OM record, as deleting the transcript does. */
+      const retract = () => store.retractObservationalMemory({ resourceId: 'u1', threadId: threadId() });
+      return { memory, minted, noticeSaves, retract };
+    }
+
+    /** R0 calls `task_delegate` and ends; the child is held, so it settles while the parent is idle. */
+    async function delegatedByRun(mode: 'wake' | 'remind', fencedQuietMode = false) {
+      let parent!: Session;
+      const fenced = await fencedMemory(() => parent.threadId);
+      // `quiet-mode` gets its own fenced memory instance and store.
+      const quiet = fencedQuietMode ? await fencedMemory(() => parent.threadId) : undefined;
+      const ctx = realParent(true, {
+        db: new InMemoryDB(),
+        memory: fenced.memory,
+        onDelegatedSettlement: mode,
+        delegateOnCall: 0,
+        ...(quiet !== undefined ? { quietMemory: quiet.memory } : {}),
+      });
+      parent = await ctx.harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+      let releaseChild!: () => void;
+      ctx.childAgent.enqueueRun({
+        holdUntil: new Promise<void>(r => (releaseChild = r)),
+        finishReason: 'tool-calls',
+        terminalToolResult: completedReport,
+      });
+      await parent.message({ content: 'go' });
+      await poll(() => ctx.childAgent.streamCalls.length === 1);
+      const page = await parent._internalStorage.listPlanTasks({ sessionId: parent.id, limit: 10 });
+      expect(page.tasks).toHaveLength(1);
+      expect(ctx.prompts).toHaveLength(2);
+      // The delegating run minted the one guard it ran under.
+      expect(fenced.minted).toHaveLength(1);
+      return {
+        ctx,
+        parent,
+        fenced,
+        quiet,
+        taskId: page.tasks[0]!.taskId,
+        releaseChild,
+        delegatingGuard: fenced.minted[0]!,
+      };
+    }
+
+    it.each(['wake', 'remind'] as const)(
+      "%s: the notice row is saved with the delegating run's guard and reaches the parent's next run once",
+      async mode => {
+        const { ctx, parent, fenced, taskId, releaseChild, delegatingGuard } = await delegatedByRun(mode);
+        try {
+          releaseChild();
+          await poll(() => fenced.noticeSaves.length > 0);
+          expect(fenced.noticeSaves[0]).toEqual(delegatingGuard);
+          await deliveryFinished(parent, taskId);
+          if (mode === 'remind') await parent.message({ content: 'what happened?' });
+          expect(ctx.prompts).toHaveLength(3);
+          expect(noticeCount(ctx.prompts[2]!)).toBe(1);
+          expect(fenced.noticeSaves).toEqual([delegatingGuard]);
+          // The wake run writes under the same guard; it mints none of its own.
+          if (mode === 'wake') expect(fenced.minted).toEqual([delegatingGuard]);
+        } finally {
+          ctx.releaseAll();
+          await ctx.harness.shutdown();
+        }
+      },
+    );
+
+    it("remind: after a switch to another fenced mode the row goes to the delegating mode's memory under its guard", async () => {
+      const { ctx, parent, fenced, quiet, taskId, releaseChild, delegatingGuard } = await delegatedByRun(
+        'remind',
+        true,
+      );
+      try {
+        await parent.switchMode({ mode: 'quiet-mode' });
+        releaseChild();
+        await deliveryFinished(parent, taskId);
+        expect(fenced.noticeSaves).toEqual([delegatingGuard]);
+        expect(quiet!.noticeSaves).toEqual([]);
+        const { messages } = await fenced.memory.recall({
+          threadId: parent.threadId,
+          resourceId: 'u1',
+          hideSignals: false,
+        });
+        expect(messages.filter(m => JSON.stringify(m.content).includes(NOTICE))).toHaveLength(1);
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
+      }
+    });
+
+    it("wake: a notice whose delegating run's guard was revoked is dropped, not owed, and never re-guarded", async () => {
+      const { ctx, parent, fenced, taskId, releaseChild, delegatingGuard } = await delegatedByRun('wake');
+      const logged = vi.spyOn(parent as any, '_logDelegationNotice');
+      try {
+        await fenced.retract();
+        releaseChild();
+        await poll(async () => (await planRow(parent, taskId))?.status === 'completed');
+        await poll(() => fenced.noticeSaves.length > 0 && (parent as any)._delegationNoticesInFlight.size === 0);
+        expect(owedNotice(await planRow(parent, taskId))).toBeUndefined();
+        await parent.waitForIdle({ timeoutMs: 2000 });
+        // No wake run, no row, and no guard other than the revoked one.
+        expect(ctx.prompts).toHaveLength(2);
+        expect(fenced.noticeSaves).toEqual([delegatingGuard]);
+        expect(fenced.minted).toEqual([delegatingGuard]);
+        const { messages } = await fenced.memory.recall({
+          threadId: parent.threadId,
+          resourceId: 'u1',
+          hideSignals: false,
+        });
+        expect(messages.filter(m => JSON.stringify(m.content).includes(NOTICE))).toHaveLength(0);
+        expect(logged.mock.calls.filter(call => call[0] === 'warn').map(call => call[1])).toEqual([
+          expect.stringContaining('settlement notice dropped'),
+        ]);
+      } finally {
+        ctx.releaseAll();
+        await ctx.harness.shutdown();
       }
     });
   });
