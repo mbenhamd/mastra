@@ -3,6 +3,7 @@ export type {
   ComposioCallIdentity,
   ComposioCallIdentityInput,
   ComposioCallIdentityResolver,
+  ComposioListConnectionsOpts,
   ComposioRequireToolApproval,
   ResolveComposioCatalogToolsOpts,
   ComposioToolApprovalInput,
