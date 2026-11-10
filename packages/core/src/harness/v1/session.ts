@@ -2334,12 +2334,13 @@ export class Session {
    */
   private readonly _remindSettlementsStarting = new Set<Promise<void>>();
   /**
-   * PF-8202 — the one drain of the two sets above, shared by every turn waiting
-   * on it, and the wake-up of each waiting turn. A turn leaves at its own
+   * PF-8202 — whether the one drain of the two sets above is running, and each
+   * waiting turn's wake-up with the drain rounds it still waits for. Every turn
+   * gets its own rounds from the point it joins, and leaves at its own
    * deadline, so a save that never settles holds one drain and no waiters.
    */
-  private _remindNoticeDrain?: Promise<void>;
-  private readonly _remindNoticeDrainWaiters = new Set<() => void>();
+  private _remindNoticeDraining = false;
+  private readonly _remindNoticeDrainWaiters = new Map<() => void, number>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -24378,14 +24379,7 @@ export class Session {
    * each delivery settles its own outcome.
    */
   private async _awaitRemindNoticeSaves(): Promise<void> {
-    if (this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0) return;
-    if (this._remindNoticeDrain === undefined) {
-      const finish = () => {
-        this._remindNoticeDrain = undefined;
-        for (const wake of this._remindNoticeDrainWaiters) wake();
-      };
-      this._remindNoticeDrain = this._drainRemindNoticeSaves().then(finish, finish);
-    }
+    if (this._remindNoticeSavesSettled()) return;
     await new Promise<void>(resolve => {
       const wake = () => {
         clearTimeout(timer);
@@ -24394,16 +24388,36 @@ export class Session {
       };
       const timer = setTimeout(wake, REMIND_NOTICE_BARRIER_TIMEOUT_MS);
       (timer as { unref?: () => void }).unref?.();
-      this._remindNoticeDrainWaiters.add(wake);
+      this._remindNoticeDrainWaiters.set(wake, REMIND_NOTICE_BARRIER_ROUNDS);
+      if (!this._remindNoticeDraining) void this._drainRemindNoticeSaves();
     });
   }
 
+  private _remindNoticeSavesSettled(): boolean {
+    return this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0;
+  }
+
+  /**
+   * Runs while any turn waits. Each round waits for everything in both sets at
+   * that point, then counts down every waiter's rounds; a waiter wakes when its
+   * rounds run out or both sets are empty. The flag clears in the same step
+   * that sees no waiters, so a turn that joins later starts a new drain.
+   */
   private async _drainRemindNoticeSaves(): Promise<void> {
-    for (let round = 0; round < REMIND_NOTICE_BARRIER_ROUNDS; round++) {
-      if (this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0) return;
-      await Promise.all(this._remindSettlementsStarting);
-      await Promise.all(this._remindDeliveries);
+    this._remindNoticeDraining = true;
+    while (this._remindNoticeDrainWaiters.size > 0) {
+      if (this._remindNoticeSavesSettled()) {
+        for (const wake of [...this._remindNoticeDrainWaiters.keys()]) wake();
+        break;
+      }
+      await Promise.allSettled(this._remindSettlementsStarting);
+      await Promise.allSettled(this._remindDeliveries);
+      for (const [wake, rounds] of [...this._remindNoticeDrainWaiters]) {
+        if (rounds <= 1) wake();
+        else this._remindNoticeDrainWaiters.set(wake, rounds - 1);
+      }
     }
+    this._remindNoticeDraining = false;
   }
 
   /**
