@@ -2334,6 +2334,13 @@ export class Session {
    */
   private readonly _remindSettlementsStarting = new Set<Promise<void>>();
   /**
+   * PF-8202 — the one drain of the two sets above, shared by every turn waiting
+   * on it, and the wake-up of each waiting turn. A turn leaves at its own
+   * deadline, so a save that never settles holds one drain and no waiters.
+   */
+  private _remindNoticeDrain?: Promise<void>;
+  private readonly _remindNoticeDrainWaiters = new Set<() => void>();
+  /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
    */
@@ -24372,16 +24379,23 @@ export class Session {
    */
   private async _awaitRemindNoticeSaves(): Promise<void> {
     if (this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<void>(resolve => {
-      timer = setTimeout(resolve, REMIND_NOTICE_BARRIER_TIMEOUT_MS);
-      (timer as { unref?: () => void }).unref?.();
-    });
-    try {
-      await Promise.race([this._drainRemindNoticeSaves(), deadline]);
-    } finally {
-      clearTimeout(timer);
+    if (this._remindNoticeDrain === undefined) {
+      const finish = () => {
+        this._remindNoticeDrain = undefined;
+        for (const wake of this._remindNoticeDrainWaiters) wake();
+      };
+      this._remindNoticeDrain = this._drainRemindNoticeSaves().then(finish, finish);
     }
+    await new Promise<void>(resolve => {
+      const wake = () => {
+        clearTimeout(timer);
+        this._remindNoticeDrainWaiters.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, REMIND_NOTICE_BARRIER_TIMEOUT_MS);
+      (timer as { unref?: () => void }).unref?.();
+      this._remindNoticeDrainWaiters.add(wake);
+    });
   }
 
   private async _drainRemindNoticeSaves(): Promise<void> {
