@@ -2039,6 +2039,7 @@ export function createDurableToolCallStep(options: CreateDurableToolCallStepOpti
                     args: approvalArgs,
                     parentToolName: toolName,
                     parentArgs: args,
+                    ...(delegatedRunId ? { delegatedRunId } : {}),
                     resumeSchema: approvalResumeSchema,
                     updatedAt: Date.now(),
                   },

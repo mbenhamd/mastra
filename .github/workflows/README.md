@@ -198,7 +198,9 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   compiles and lints only its changed files that exist at the head, because the
   package-wide typecheck and root oxlint both fail on the base; a touched file
   must be clean. Changed unit tests run, and its LibSQL integration suite stays
-  fail-closed. Nested
+  fail-closed. The QuickJS Code Mode transport (PF-8105) builds, typechecks and
+  lints as a package, and its changed tests run; only its `src/**/*.ts` files may
+  change, so a manifest or config edit fails closed. Nested
   fixture manifests are not treated as workspace boundaries. The validator discovers
   workspace ownership from the nearest non-fixture `package.json` and
   fails closed when a changed workspace has no owned fork-safe validation

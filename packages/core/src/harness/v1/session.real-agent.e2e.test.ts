@@ -199,6 +199,22 @@ class DelayedDeliveryPubSub extends PubSub {
   async flush(): Promise<void> {}
 }
 
+/**
+ * Delivers every event except a run's `run-suspended` terminal, whose
+ * publication never settles. The native run is suspended in storage, but the
+ * Harness never captures the suspension, as when the process dies in between.
+ */
+class UnsettledSuspendedPubSub extends DelayedDeliveryPubSub {
+  constructor() {
+    super(0);
+  }
+
+  override async publish(topic: string, event: Omit<Event, 'id' | 'createdAt'>): Promise<void> {
+    if ((event.data as { type?: string } | undefined)?.type === 'run-suspended') return new Promise(() => {});
+    return super.publish(topic, event);
+  }
+}
+
 describe('DelayedDeliveryPubSub rejection injection', () => {
   it('does not reject an untyped event when rejection injection is omitted', async () => {
     const pubsub = new DelayedDeliveryPubSub(0);
@@ -1507,6 +1523,43 @@ describe('Harness v1 real-agent E2E — interaction pre-registration stays with 
     }
   });
 
+  it('settles the first signal when a concurrent idle signal joins the run that asks', async () => {
+    const harness = new Harness({
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'ask',
+          model: scriptedModel([() => toolCallsStream(['q1', 'ask_user', question]), () => textStream(['answered'])]),
+          tools: { ask_user: askUser },
+        }),
+      } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default', harnessBuiltins: 'exclude' }],
+      defaultModeId: 'default',
+    });
+    try {
+      const session = await harness.session({ resourceId: 'concurrent-signal-user', threadId: { fresh: true } });
+      const [first, second] = await Promise.all([
+        session.signal({ content: 'first' }),
+        session.signal({ content: 'second' }),
+      ]);
+      expect(second.id).not.toBe(first.id);
+      expect(second.runId).toBe(first.runId);
+
+      await waitFor(() => session.getRecord().pendingResume !== undefined, 'pre-registered question');
+      expect(session.getRecord().pendingResume?.originSignalId).toBe(first.id);
+
+      await session.respondToQuestion({ answer: 'yes' });
+      await vi.waitFor(async () => {
+        const lookup = await session.lookupMessageResult(first.id);
+        expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+      });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   describe('when the owning process dies', () => {
     /**
      * Two Harness instances over one store. The first is abandoned without a
@@ -1517,28 +1570,29 @@ describe('Harness v1 real-agent E2E — interaction pre-registration stays with 
       const storage = new InMemoryStore();
       const db = new InMemoryDB();
       const sessionStorage = new InMemoryHarness({ db });
-      const harnessWith = (askTool: any, steps: Array<() => ReadableStream<any>>) =>
-        new Harness({
-          agents: {
-            default: new Agent({
-              id: 'default',
-              name: 'default',
-              instructions: 'ask',
-              model: scriptedModel(steps),
-              tools: { ask_user: askTool },
-            }),
-          } as any,
-          storage,
+      const harnessWith = (askTool: any, steps: Array<() => ReadableStream<any>>, pubsub?: PubSub) => {
+        const agent = new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'ask',
+          model: scriptedModel(steps),
+          tools: { ask_user: askTool },
+        });
+        return new Harness({
+          ...(pubsub === undefined
+            ? { agents: { default: agent } as any, storage }
+            : { mastra: new Mastra({ agents: { default: agent }, storage, pubsub }) }),
           modes: [{ id: 'default', agentId: 'default', harnessBuiltins: 'exclude' }],
           defaultModeId: 'default',
           sessions: { storage: sessionStorage },
         });
+      };
       const crash = () => {
         for (const [key, row] of db.harnessSessions) {
           db.harnessSessions.set(key, { ...row, leaseExpiresAt: Date.now() - 60_000 });
         }
       };
-      return { harnessWith, crash, db };
+      return { harnessWith, crash, db, storage };
     }
 
     it('releases a question registered by a run that never suspended', async () => {
@@ -1640,6 +1694,41 @@ describe('Harness v1 real-agent E2E — interaction pre-registration stays with 
             error: expect.objectContaining({ code: 'harness.pending_interaction_expired' }),
           }),
         ]);
+      } finally {
+        await second.shutdown();
+      }
+    });
+
+    it('settles the signal that asked a question its run suspended on before the Harness captured it', async () => {
+      const { harnessWith, crash, storage } = sharedStore();
+      const first = harnessWith(
+        askUser,
+        [() => toolCallsStream(['q1', 'ask_user', question])],
+        new UnsettledSuspendedPubSub(),
+      );
+      const second = harnessWith(askUser, [() => textStream(['answered after restart'])]);
+      try {
+        const session = await first.session({ resourceId: 'signal-crash-user', threadId: { fresh: true } });
+        const handle = await session.signal({ content: 'ask' });
+        // The first process is abandoned: its own result for this signal never
+        // settles, and rejects when that process later loses the session.
+        void handle.result.catch(() => undefined);
+        await waitFor(() => session.getRecord().pendingResume !== undefined, 'pre-registered question');
+        const runId = session.getRecord().pendingResume!.runId;
+        const workflows = await storage.getStore('workflows');
+        await vi.waitFor(async () => {
+          const run = await workflows!.getWorkflowRunById({ workflowName: 'agentic-loop', runId });
+          expect(typeof run?.snapshot === 'object' ? run.snapshot.status : undefined).toBe('suspended');
+        });
+        crash();
+
+        const adopted = await second.session({ resourceId: 'signal-crash-user', threadId: session.threadId });
+        expect(pendingCall(adopted)).toEqual({ kind: 'question', toolCallId: 'q1' });
+        expect(((await adopted.respondToQuestion({ answer: 'yes' })) as any).text).toBe('answered after restart');
+        await vi.waitFor(async () => {
+          const lookup = await adopted.lookupMessageResult(handle.id);
+          expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+        });
       } finally {
         await second.shutdown();
       }

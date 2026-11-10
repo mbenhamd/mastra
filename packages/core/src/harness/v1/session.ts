@@ -1057,6 +1057,10 @@ const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
 /** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
 const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
 const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
+/** PF-8202: rounds a turn waits for `remind` notice saves before it loads history. */
+const REMIND_NOTICE_BARRIER_ROUNDS = 4;
+/** PF-8202: a stalled `remind` save must not hold every later turn; its row reaches the next one. */
+const REMIND_NOTICE_BARRIER_TIMEOUT_MS = 5_000;
 /**
  * TM-6 `includeSubtree` transfers the complete valid plan. The plan writer
  * already enforces this bound, so a normal delegated child never receives a
@@ -2193,6 +2197,15 @@ export class Session {
    */
   private _currentRunSignalId?: string;
   /**
+   * [PF-8058] The run an owned `signal()` turn dispatched, with that signal's
+   * id. The suspend capture stamps this signal as the pending's
+   * `originSignalId`; a tool that registers its interaction mid-turn for the
+   * same run stamps it too, so a crash between the registration and the
+   * capture still leaves a pending that settles the signal. Set at dispatch
+   * (the run id is known synchronously) and cleared with the turn.
+   */
+  private _ownedSignalTurnOrigin?: { runId: string; signalId: string };
+  /**
    * §5.1 — the active turn's caller request context (the `app` metadata bag +
    * trusted `channel` projection). Stashed in `_buildRequestContext` so a
    * suspension can persist it on `PendingResume` and a `respondTo*` resume can
@@ -2305,6 +2318,29 @@ export class Session {
   private readonly _delegationNoticesInFlight = new Set<string>();
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
   private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
+  /**
+   * PF-8202 — `remind` deliveries in flight. A turn waits for them before its
+   * run loads history, so a row being saved is in that history and is not
+   * acknowledged behind the turn's back. `remind` never waits for the parent
+   * to go idle, so this cannot wait on the turn itself.
+   */
+  private readonly _remindDeliveries = new Set<Promise<void>>();
+  /**
+   * PF-8202 — `remind` settlements between their commit (which emits
+   * `delegate_settled`) and the start of their notice delivery. A turn begun
+   * from that event waits for them too, so the delivery it then waits for is
+   * registered. Marked inside the serialized write, so this never waits on the
+   * plan-task write chain.
+   */
+  private readonly _remindSettlementsStarting = new Set<Promise<void>>();
+  /**
+   * PF-8202 — whether the one drain of the two sets above is running, and each
+   * waiting turn's wake-up with the drain rounds it still waits for. Every turn
+   * gets its own rounds from the point it joins, and leaves at its own
+   * deadline, so a save that never settles holds one drain and no waiters.
+   */
+  private _remindNoticeDraining = false;
+  private readonly _remindNoticeDrainWaiters = new Map<() => void, number>();
   /**
    * First admission epoch seen for each owed notice in this process, so a retry
    * or a later reconcile pass cannot launder a Stop that happened in between.
@@ -3725,6 +3761,7 @@ export class Session {
     this._currentRunModeId = undefined;
     this._currentRunModelId = undefined;
     this._currentRunSignalId = undefined;
+    this._ownedSignalTurnOrigin = undefined;
     this._currentTurnRequestContext = undefined;
     this._currentAgentRequestContext = undefined;
     this._currentTurnReplacementToolSurface = undefined;
@@ -3766,6 +3803,7 @@ export class Session {
       this._currentRunModeId = undefined;
       this._currentRunModelId = undefined;
       this._currentRunSignalId = undefined;
+      this._ownedSignalTurnOrigin = undefined;
       this._currentTurnRequestContext = undefined;
       this._currentAgentRequestContext = undefined;
       this._currentTurnReplacementToolSurface = undefined;
@@ -15089,6 +15127,7 @@ export class Session {
               ifIdle: { behavior: 'wake', streamOptions: baseExecOptions as never },
             },
           );
+          this._claimOwnedSignalTurnOrigin(dispatched.runId, dispatched.signal.id);
           if (responseLogicalMessageIdentity !== undefined) {
             nativeLineagedDispatchStarted = true;
             const accepted = await this._awaitSignalNativeAcceptance(
@@ -15187,6 +15226,7 @@ export class Session {
                   } as never,
                 } as never,
               );
+              this._claimOwnedSignalTurnOrigin(dispatching.runId, signalAdmission.identity.signalId);
               signalAdmissionNativeDispatchStarted = true;
               nativeLineagedDispatchStarted = responseLogicalMessageIdentity !== undefined;
               const accepted = await this._awaitSignalNativeAcceptance(
@@ -22491,6 +22531,26 @@ export class Session {
     return runId === undefined || runId === this._currentRunId;
   }
 
+  /**
+   * [PF-8221] Record the signal that owns `runId`. A concurrent `signal()` that
+   * joins a run another signal already dispatched leaves that owner in place.
+   */
+  private _claimOwnedSignalTurnOrigin(runId: string, signalId: string): void {
+    if (this._ownedSignalTurnOrigin?.runId !== runId) {
+      this._ownedSignalTurnOrigin = { runId, signalId };
+    }
+  }
+
+  /**
+   * [PF-8058] The origin a tool pre-registration stamps on its pending: the
+   * owned `signal()` turn's signal, when `runId` is the run that turn
+   * dispatched. This is the `originSignalId` the suspend capture would add.
+   */
+  private _preRegistrationOrigin(runId: string): { originSignalId?: string } {
+    const origin = this._ownedSignalTurnOrigin;
+    return origin !== undefined && origin.runId === runId ? { originSignalId: origin.signalId } : {};
+  }
+
   private async _registerQuestion(
     params: RegisterQuestionParams & { runId?: string; toolCallId?: string; modeId?: string; modelId?: string },
   ): Promise<void> {
@@ -22521,6 +22581,7 @@ export class Session {
       toolCallId,
       toolName: ASK_USER_TOOL_NAME,
       ...this._pendingResumeSourceFields(),
+      ...this._preRegistrationOrigin(runId),
       ...this._newPendingInteractionTiming('question'),
       modeId: params.modeId ?? this._record.modeId,
       // §4.2e — carry the active turn's yolo so a later tool approval on the
@@ -22593,6 +22654,7 @@ export class Session {
       runId,
       toolCallId,
       ...this._pendingResumeSourceFields(),
+      ...this._preRegistrationOrigin(runId),
       ...this._newPendingInteractionTiming('sandbox-access'),
       modeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
@@ -22676,6 +22738,7 @@ export class Session {
       toolCallId,
       toolName: SUBMIT_PLAN_TOOL_NAME,
       ...this._pendingResumeSourceFields(),
+      ...this._preRegistrationOrigin(runId),
       ...this._newPendingInteractionTiming('plan-approval'),
       modeId: submittingModeId,
       // §4.2e — see _registerQuestion: carry yolo through pre-registered pendings.
@@ -24301,12 +24364,70 @@ export class Session {
    * Build a turn's request context and its instructions together. The
    * instructions read the same frozen permission resolver the context carries.
    */
-  private _buildTurnContextAndInstructions(
+  private async _buildTurnContextAndInstructions(
     turn: Parameters<Session['_buildRequestContext']>[0],
     mode: Pick<HarnessMode, 'instructions' | 'harnessBuiltins'>,
   ): Promise<[RequestContext<unknown>, string | undefined]> {
     const requestContext = this._buildRequestContext(turn);
-    return Promise.all([requestContext, this._turnInstructions(mode, requestContext)]);
+    // PF-8202: `remind` rows being saved land before the turn's run loads history.
+    const [context, instructions] = await Promise.all([
+      requestContext,
+      this._turnInstructions(mode, requestContext),
+      this._awaitRemindNoticeSaves(),
+    ]);
+    return [context, instructions];
+  }
+
+  /**
+   * PF-8202: wait for the `remind` settlements committed but not yet started,
+   * and for the `remind` deliveries in flight, so their rows are saved before a
+   * turn's run loads history. A delivery that finishes may be followed by a
+   * reconcile pass that starts another, so this repeats; the bound keeps a busy
+   * reconcile loop from holding the turn, and one overall deadline keeps a
+   * stalled save from doing so. Anything later reaches the next turn. A `remind`
+   * delivery never waits for a turn, so this cannot deadlock. Never rejects:
+   * each delivery settles its own outcome.
+   */
+  private async _awaitRemindNoticeSaves(): Promise<void> {
+    if (this._remindNoticeSavesSettled()) return;
+    await new Promise<void>(resolve => {
+      const wake = () => {
+        clearTimeout(timer);
+        this._remindNoticeDrainWaiters.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, REMIND_NOTICE_BARRIER_TIMEOUT_MS);
+      (timer as { unref?: () => void }).unref?.();
+      this._remindNoticeDrainWaiters.set(wake, REMIND_NOTICE_BARRIER_ROUNDS);
+      if (!this._remindNoticeDraining) void this._drainRemindNoticeSaves();
+    });
+  }
+
+  private _remindNoticeSavesSettled(): boolean {
+    return this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0;
+  }
+
+  /**
+   * Runs while any turn waits. Each round waits for everything in both sets at
+   * that point, then counts down every waiter's rounds; a waiter wakes when its
+   * rounds run out or both sets are empty. The flag clears in the same step
+   * that sees no waiters, so a turn that joins later starts a new drain.
+   */
+  private async _drainRemindNoticeSaves(): Promise<void> {
+    this._remindNoticeDraining = true;
+    while (this._remindNoticeDrainWaiters.size > 0) {
+      if (this._remindNoticeSavesSettled()) {
+        for (const wake of [...this._remindNoticeDrainWaiters.keys()]) wake();
+        break;
+      }
+      await Promise.allSettled(this._remindSettlementsStarting);
+      await Promise.allSettled(this._remindDeliveries);
+      for (const [wake, rounds] of [...this._remindNoticeDrainWaiters]) {
+        if (rounds <= 1) wake();
+        else this._remindNoticeDrainWaiters.set(wake, rounds - 1);
+      }
+    }
+    this._remindNoticeDraining = false;
   }
 
   /**
@@ -25155,6 +25276,7 @@ export class Session {
       notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
     // A Stop that starts after this point must still suppress the wake.
     const noticeAdmissionEpoch = this._activeWorkAdmissionEpoch;
+    let releaseRemindSettlement: (() => void) | undefined;
     try {
       const durableResult =
         result ??
@@ -25179,15 +25301,22 @@ export class Session {
                 outcome,
               }
             : undefined);
-      const reconcileResult = await this._serializePlanTaskWrite(() =>
-        planTaskReconcileDelegation(this._planTaskPort(), {
+      const reconcileResult = await this._serializePlanTaskWrite(() => {
+        if (noticeMode === 'remind') {
+          const starting = new Promise<void>(resolve => {
+            releaseRemindSettlement = resolve;
+          });
+          this._remindSettlementsStarting.add(starting);
+          void starting.then(() => this._remindSettlementsStarting.delete(starting));
+        }
+        return planTaskReconcileDelegation(this._planTaskPort(), {
           taskId,
           subagentSessionId,
           outcome,
           ...(durableResult !== undefined ? { result: durableResult } : {}),
           ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
-        }),
-      );
+        });
+      });
       if (reconcileResult.reconciled) {
         this._notifyDisplayRefresh();
         for (const listener of Array.from(this._delegatedSettlementListeners)) {
@@ -25210,6 +25339,8 @@ export class Session {
       // scan retry re-reads the exact link and settles it idempotently.
       this._scheduleDelegationReconcileRetry(0);
       return false;
+    } finally {
+      releaseRemindSettlement?.();
     }
   }
 
@@ -25293,8 +25424,11 @@ export class Session {
       },
     );
     this._delegationNoticeDeliveries.add(delivery);
+    const remind = notice.mode === 'remind';
+    if (remind) this._remindDeliveries.add(delivery);
     const untrack = () => {
       this._delegationNoticeDeliveries.delete(delivery);
+      if (remind) this._remindDeliveries.delete(delivery);
     };
     void delivery.then(untrack, untrack);
   }

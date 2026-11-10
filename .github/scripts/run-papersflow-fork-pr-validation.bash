@@ -5048,6 +5048,7 @@ run_validator_self_tests() {
     "$fixture_repo/workflows/temporal/src" \
     "$fixture_repo/packages/schema-compat/src/provider-compats" \
     "$fixture_repo/packages/editor/src/providers" \
+    "$fixture_repo/code-mode/quickjs/src" \
     "$fixture_repo/node_modules" \
     "$mock_bin"
   # The production validator is copied to RUNNER_TEMP and resolves TypeScript
@@ -5470,6 +5471,10 @@ run_validator_self_tests() {
       > packages/editor/src/providers/composio.test.ts
     printf '%s\n' "import { it } from 'vitest';" "it('editor libsql', () => {});" \
       > packages/editor/src/editor-libsql.integration.test.ts
+    printf '%s\n' '{}' > code-mode/quickjs/package.json
+    printf '%s\n' 'export const quickJsTransport = true;' > code-mode/quickjs/src/transport.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('quickjs transport', () => {});" \
+      > code-mode/quickjs/src/transport.test.ts
     printf '%s\n' \
       'name: Fork validation fixture' \
       'jobs:' \
@@ -8128,6 +8133,57 @@ NODE
   assert_contains 'require a dedicated fork-safe workflow or suite-specific infrastructure' "$output"
   assert_contains 'packages/editor/src/editor-libsql.integration.test.ts' "$output"
   assert_not_contains '--dir packages/editor exec vitest run' "$command_log"
+
+  # PF-8105: the QuickJS Code Mode transport is an owned workspace. It builds,
+  # typechecks and lints as a package, and each changed test file runs.
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' 'export const quickJsTransport = "transpile-hook";' \
+      > code-mode/quickjs/src/transport.ts
+    printf '%s\n' "import { it } from 'vitest';" "it('quickjs transpile hook', () => {});" \
+      > code-mode/quickjs/src/transport.test.ts
+    git add .
+    git commit -q -m 'exercise QuickJS owned workspace'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/quickjs-owned-workspace-success.log"
+  if ! run_fixture "$head_sha" "$output"; then
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_not_contains 'do not have an owned fork-safe validation target' "$output"
+  assert_contains 'Running changed test file in full: code-mode/quickjs/src/transport.test.ts' "$output"
+  assert_line_count 1 '--filter ./code-mode/quickjs --fail-if-no-match build' "$command_log"
+  assert_line_count 1 '--filter ./code-mode/quickjs --fail-if-no-match exec tsc --noEmit' "$command_log"
+  assert_line_count 1 '--filter ./code-mode/quickjs --fail-if-no-match lint' "$command_log"
+  assert_line_matches \
+    '^--dir code-mode/quickjs exec vitest run --reporter=dot --reporter=json --outputFile\.json=[^ ]+ src/transport\.test\.ts$' \
+    "$command_log"
+
+  head_sha="$(
+    cd "$fixture_repo"
+    git reset -q --hard "$base_sha"
+    printf '%s\n' '{"scripts":{"build":"true","lint":"true"}}' > code-mode/quickjs/package.json
+    git add .
+    git commit -q -m 'replace QuickJS package scripts'
+    git rev-parse HEAD
+  )"
+  : > "$command_log"
+  output="$test_root/quickjs-manifest-failure.log"
+  set +e
+  run_fixture "$head_sha" "$output"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    echo 'QuickJS manifest edit fixture unexpectedly passed.' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+  assert_contains 'outside the PF-2044 owned source-and-test maps' "$output"
+  assert_contains 'code-mode/quickjs/package.json' "$output"
+  assert_not_contains '--filter ./code-mode/quickjs' "$command_log"
 
   head_sha="$(
     cd "$fixture_repo"
@@ -14326,7 +14382,7 @@ while IFS= read -r workspace; do
     continue
   fi
   case "$workspace" in
-    auth/okta | browser/stagehand | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/editor | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
+    auth/okta | browser/stagehand | code-mode/quickjs | packages/_internal-core | packages/_types-builder | packages/agent-builder | packages/cli | packages/codemod | packages/core | packages/deployer | packages/editor | packages/mcp | packages/memory | packages/schema-compat | packages/server | client-sdks/ai-sdk | client-sdks/client-js | stores/_test-utils | stores/clickhouse | stores/cloudflare | stores/convex | stores/dsql | stores/dynamodb | stores/elasticsearch | stores/mssql | stores/mysql | stores/oracledb | stores/spanner | stores/valkey | stores/libsql | stores/mongodb | stores/pg | stores/redis | stores/upstash | mastracode | mastracode/sdk | mastracode/tui | pubsub/google-cloud-pubsub | pubsub/redis-streams | workflows/inngest | workflows/temporal | observability/mastra | docs) ;;
     packages/memory/integration-tests)
       # PF-4233 admits exactly one real-PostgreSQL suite from this nested,
       # separately locked package. Its manifest, lockfile, Vitest config,
@@ -14759,6 +14815,15 @@ queue_owned_workspace_test() {
     printf '%s\n' "$test_file" >> "$forced_workspace_tests"
   fi
 }
+
+# PF-8105: the validator runs QuickJS's own build and lint scripts, so a PR may
+# change only its TypeScript sources and tests under src/. A manifest, build or
+# test config edit fails closed before any PR-controlled package command runs.
+while IFS= read -r file; do
+  if [[ "$file" == code-mode/quickjs/* && ! "$file" =~ ^code-mode/quickjs/src/.*\.ts$ ]]; then
+    printf '%s\n' "$file" >> "$unsupported_owned_workspace_sources"
+  fi
+done < "$changed_files"
 
 types_builder_changed=false
 while IFS= read -r file; do
@@ -15785,6 +15850,14 @@ if workspace_changed packages/editor; then
   if (( ${#editor_lint_files[@]} > 0 )); then
     run_with_validation_budget 600 pnpm exec oxlint --no-error-on-unmatched-pattern "${editor_lint_files[@]}"
   fi
+fi
+
+if workspace_changed code-mode/quickjs; then
+  # PF-8105: the QuickJS Code Mode transport builds, typechecks and lints as a
+  # package against the Core build above; changed test files run below.
+  run_with_validation_budget 900 pnpm --filter ./code-mode/quickjs --fail-if-no-match build
+  run_with_validation_budget 600 pnpm --filter ./code-mode/quickjs --fail-if-no-match exec tsc --noEmit
+  run_with_validation_budget 600 pnpm --filter ./code-mode/quickjs --fail-if-no-match lint
 fi
 
 if workspace_changed packages/server; then
