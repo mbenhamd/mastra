@@ -1907,6 +1907,61 @@ describe('Agent signals', () => {
     }
   });
 
+  it('closes an output drain during registration without an unhandled rejection', async () => {
+    const runtime = new AgentThreadStreamRuntime();
+    const pubsub = new ControlledLeasePubSub();
+    let releaseRegistration!: () => void;
+    const registrationBlocked = new Promise<void>(resolve => {
+      releaseRegistration = resolve;
+    });
+    const publish = pubsub.publish.bind(pubsub);
+    pubsub.publish = async (topic, event) => {
+      if ((event as { data?: { type?: string } }).data?.type === 'run-registered') {
+        await registrationBlocked;
+      }
+      await publish(topic, event);
+    };
+    const agent = { id: 'drain-closed-registration-agent' } as Agent<any, any, any, any>;
+    const threadId = 'drain-closed-registration-thread';
+    const resourceId = 'drain-closed-registration-user';
+    const runId = 'drain-closed-registration-run';
+    const output = {
+      runId,
+      status: 'running',
+      fullStream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: 'start', runId });
+        },
+      }),
+      _waitUntilFinished: () => new Promise<void>(() => {}),
+    } as any;
+    const options = runtime.prepareRunOptions(
+      { runId, memory: { thread: threadId, resource: resourceId } } as any,
+      pubsub,
+    );
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    const subscription = await runtime.subscribeToThread(agent, { threadId, resourceId }, pubsub);
+
+    try {
+      const completion = runtime.registerRun(agent, output, options, pubsub)!;
+      void completion.catch(() => {});
+      const outputDrain = subscription._waitForOutputDrain!(output)!;
+      void outputDrain.catch(() => {});
+      // Eviction tears the subscription down while registration is still
+      // pending, so the drain waiter is rejected before anything awaits it.
+      subscription.unsubscribe();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      releaseRegistration();
+      runtime.abortRun(runId, pubsub);
+      await waitForCondition(() => !pubsub.owners.has(`${resourceId}\u0000${threadId}`));
+    }
+  });
+
   it('returns an abort-ignoring async iterator after the bounded grace', async () => {
     const runtime = new AgentThreadStreamRuntime();
     const pubsub = new ControlledLeasePubSub();
