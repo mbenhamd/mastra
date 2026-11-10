@@ -12,7 +12,6 @@ const { composioInstances, makeFakeComposio } = vi.hoisted(() => {
   interface FakeComposioInstance {
     apiKey: string;
     allowTracking?: boolean;
-    disableVersionCheck?: boolean;
     hasProvider: boolean;
     toolkits: { get: ReturnType<typeof vi.fn>; getConnectedAccountInitiationFields: ReturnType<typeof vi.fn> };
     tools: { get: ReturnType<typeof vi.fn>; getRawComposioTools: ReturnType<typeof vi.fn> };
@@ -29,16 +28,10 @@ const { composioInstances, makeFakeComposio } = vi.hoisted(() => {
 
   const instances: FakeComposioInstance[] = [];
 
-  const factory = (opts: {
-    apiKey: string;
-    provider?: unknown;
-    allowTracking?: boolean;
-    disableVersionCheck?: boolean;
-  }): FakeComposioInstance => {
+  const factory = (opts: { apiKey: string; provider?: unknown; allowTracking?: boolean }): FakeComposioInstance => {
     const inst: FakeComposioInstance = {
       apiKey: opts.apiKey,
       allowTracking: opts.allowTracking,
-      disableVersionCheck: opts.disableVersionCheck,
       hasProvider: Boolean(opts.provider),
       toolkits: { get: vi.fn(), getConnectedAccountInitiationFields: vi.fn() },
       tools: { get: vi.fn(), getRawComposioTools: vi.fn() },
@@ -58,7 +51,7 @@ type FakeComposioInstance = ReturnType<typeof makeFakeComposio>;
 vi.mock('@composio/core', () => ({
   Composio: function (
     this: Record<string, unknown>,
-    opts: { apiKey: string; provider?: unknown; allowTracking?: boolean; disableVersionCheck?: boolean },
+    opts: { apiKey: string; provider?: unknown; allowTracking?: boolean },
   ) {
     Object.assign(this, makeFakeComposio(opts));
   },
@@ -1480,17 +1473,6 @@ describe('ComposioToolProvider — approval from Composio tags', () => {
     expect(await tracked({})).toEqual([
       [true, undefined],
       [false, undefined],
-    ]);
-  });
-
-  it('never lets either Composio client ask npm for its latest version', async () => {
-    composioInstances.length = 0;
-    const { integration } = await resolveWithPolicy([], {});
-    getMastraInstance();
-    await integration.listToolkitsVNext().catch(() => undefined);
-    expect(composioInstances.map(instance => [instance.hasProvider, instance.disableVersionCheck])).toEqual([
-      [true, true],
-      [false, true],
     ]);
   });
 });
