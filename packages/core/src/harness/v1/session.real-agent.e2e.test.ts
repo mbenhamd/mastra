@@ -1523,6 +1523,43 @@ describe('Harness v1 real-agent E2E — interaction pre-registration stays with 
     }
   });
 
+  it('settles the first signal when a concurrent idle signal joins the run that asks', async () => {
+    const harness = new Harness({
+      agents: {
+        default: new Agent({
+          id: 'default',
+          name: 'default',
+          instructions: 'ask',
+          model: scriptedModel([() => toolCallsStream(['q1', 'ask_user', question]), () => textStream(['answered'])]),
+          tools: { ask_user: askUser },
+        }),
+      } as any,
+      storage: new InMemoryStore(),
+      modes: [{ id: 'default', agentId: 'default', harnessBuiltins: 'exclude' }],
+      defaultModeId: 'default',
+    });
+    try {
+      const session = await harness.session({ resourceId: 'concurrent-signal-user', threadId: { fresh: true } });
+      const [first, second] = await Promise.all([
+        session.signal({ content: 'first' }),
+        session.signal({ content: 'second' }),
+      ]);
+      expect(second.id).not.toBe(first.id);
+      expect(second.runId).toBe(first.runId);
+
+      await waitFor(() => session.getRecord().pendingResume !== undefined, 'pre-registered question');
+      expect(session.getRecord().pendingResume?.originSignalId).toBe(first.id);
+
+      await session.respondToQuestion({ answer: 'yes' });
+      await vi.waitFor(async () => {
+        const lookup = await session.lookupMessageResult(first.id);
+        expect(lookup && 'status' in lookup ? lookup.status : null).toBe('completed');
+      });
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
   describe('when the owning process dies', () => {
     /**
      * Two Harness instances over one store. The first is abandoned without a
