@@ -9998,6 +9998,11 @@ export class AgentThreadStreamRuntime {
       const drained = new Promise<void>((resolve, reject) => {
         waiter = { resolve, reject };
       });
+      // Unsubscribe can reject this waiter while registration or the terminal
+      // fence below is still pending, before `waitWithTimeout` observes it. The
+      // returned chain still sees the rejection; this only keeps the early one
+      // from surfacing as an unhandled rejection.
+      void drained.catch(() => {});
       pending.add(waiter);
       outputDrainWaiters.set(output, pending);
       return registration
