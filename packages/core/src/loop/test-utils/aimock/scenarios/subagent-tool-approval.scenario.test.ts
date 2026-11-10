@@ -91,10 +91,10 @@ describeForAllEngines(
         ...(gateDelegation ? { requireToolApproval: true } : {}),
       })) as unknown as RunHandle;
 
-      let approval: { toolName: string } | undefined;
+      let approval: { toolName: string; delegatedRunId?: string } | undefined;
       for await (const chunk of run.fullStream) {
         if (chunk.type === 'tool-call-approval') {
-          approval = chunk.payload as { toolName: string };
+          approval = chunk.payload as { toolName: string; delegatedRunId?: string };
           // Durable streams stay open while suspended; stop at the approval.
           break;
         }
@@ -131,7 +131,10 @@ describeForAllEngines(
 
     it('forwards a declined subagent tool approval and its reason to the subagent', async () => {
       const mock = getMock();
-      const { agent, executions, entry, thread, resource } = await runToApproval(mock);
+      const { agent, executions, approval, entry, thread, resource } = await runToApproval(mock);
+      expect(approval.delegatedRunId).toEqual(expect.any(String));
+      expect(approval.delegatedRunId).toBe(entry.delegatedRunId);
+      expect(entry.delegatedRunId).not.toBe(entry.runId);
 
       const resumed = (await agent.declineToolCall({
         runId: entry.runId,
@@ -184,6 +187,7 @@ describeForAllEngines(
         gateDelegation: true,
       });
       expect(approval.toolName).toBe('agent-subAgent');
+      expect(approval.delegatedRunId).toBeUndefined();
 
       const resumed = (await agent.declineToolCall({
         runId: entry.runId,

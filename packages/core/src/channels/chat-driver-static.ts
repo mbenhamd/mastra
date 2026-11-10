@@ -7,6 +7,7 @@ import {
   ToolTracker,
   chunkToFallbackMessage,
   editOrPostMessage,
+  isDelegatedApproval,
   postFileAttachment,
   postStreamError,
   postTripwire,
@@ -345,6 +346,7 @@ export async function runStaticDriver({
         runId: chunk.runId,
         toolName: enr.toolName,
         args: (enr.args ?? {}) as Record<string, unknown>,
+        delegated: isDelegatedApproval(chunk.payload),
       });
       continue;
     }

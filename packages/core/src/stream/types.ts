@@ -839,6 +839,8 @@ interface ToolCallApprovalPayload {
   /** Outer tool occurrence when approval was requested by a nested/delegated tool call. */
   parentToolName?: string;
   parentArgs?: unknown;
+  /** Child run that raised this approval. Absent when the current run's own tool asked for it. */
+  delegatedRunId?: string;
   resumeSchema: string;
   /** Reasons a conditional approval predicate surfaced for why the tool needs approval. */
   approvalReasons?: readonly string[];

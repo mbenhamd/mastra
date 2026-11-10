@@ -42,7 +42,7 @@ import type { ChatChannelRenderContext } from './output-processor';
 import { ChatChannelProcessor } from './processor';
 import { MastraStateAdapter } from './state-adapter';
 import type { PendingApprovalRecord } from './stream-helpers';
-import { extractErrorMessage, renderBuiltInToolEvent } from './stream-helpers';
+import { isDelegatedApproval, extractErrorMessage, renderBuiltInToolEvent } from './stream-helpers';
 import {
   collectThreadHistory,
   formatLegacyHistoryBlock,
@@ -86,7 +86,12 @@ type ChannelAgent = Pick<
 /** Platforms whose chat-SDK adapters render interactive approval buttons. */
 const APPROVAL_BUTTON_PLATFORMS = new Set(['slack', 'discord', 'teams', 'gchat', 'google-chat', 'telegram']);
 
-const DENIED_TOOL_CALL_TTL_MS = 10 * 60 * 1000;
+/**
+ * Backstop for denials whose run the output processor never sees. A durable run can emit
+ * its denial result only after its whole tool-call batch finishes, so the record normally
+ * lives until that result arrives or the run ends.
+ */
+const DENIED_TOOL_CALL_BACKSTOP_MS = 24 * 60 * 60 * 1000;
 
 /** Providers reuse tool-call ids across runs, so a denial is keyed by both. */
 function deniedToolCallKey(runId: string, toolCallId: string): string {
@@ -709,6 +714,7 @@ export class AgentChannels {
 
               const stashed = this.pendingApprovalCards.get(toolCallId);
               let requesterId = stashed?.requesterId;
+              let delegated = stashed?.delegated === true;
               if (stashed?.runId) {
                 runId = stashed.runId;
                 toolName = stashed.toolName;
@@ -735,6 +741,7 @@ export class AgentChannels {
                           runId: string;
                           parentRunId?: string;
                           toolName: string;
+                          delegatedRunId?: string;
                           args: Record<string, unknown>;
                         }
                       >
@@ -745,6 +752,7 @@ export class AgentChannels {
                         runId = toolData.parentRunId ?? toolData.runId;
                         toolName = toolData.toolName;
                         toolArgs = toolData.args;
+                        delegated = isDelegatedApproval(toolData);
                         // Recover the card's owner from the user turn that led to it
                         // (messages are newest-first). If that turn has messages from
                         // more than one author we can't tell who triggered the tool,
@@ -875,7 +883,8 @@ export class AgentChannels {
                 requestContext.set(CHAT_CHANNEL_RENDER_CONTEXT_KEY, renderContext);
 
                 try {
-                  this.markToolCallDenied(runId, toolCallId);
+                  // A delegated denial goes to the subagent; the delegation call's result is real.
+                  if (!delegated) this.markToolCallDenied(runId, toolCallId);
                   await this.dispatchDecline({
                     runId,
                     toolCallId,
@@ -1185,8 +1194,7 @@ export class AgentChannels {
     const key = deniedToolCallKey(runId, toolCallId);
     const existing = this.deniedToolCalls.get(key);
     if (existing) clearTimeout(existing.timer);
-    // The backstop for runs the output processor never sees.
-    const timer = setTimeout(() => this.deniedToolCalls.delete(key), DENIED_TOOL_CALL_TTL_MS);
+    const timer = setTimeout(() => this.deniedToolCalls.delete(key), DENIED_TOOL_CALL_BACKSTOP_MS);
     timer.unref?.();
     this.deniedToolCalls.set(key, { runId, timer });
   }
