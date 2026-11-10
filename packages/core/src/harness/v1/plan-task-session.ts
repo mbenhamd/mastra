@@ -31,6 +31,7 @@ import type {
   LoadPlanTaskSubtreeResult,
   PlanTaskMutationOp,
 } from '../../storage/domains/harness/types';
+import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import { assertJsonValue, sha256CanonicalJsonChecked } from './canonical-json';
 import { HarnessDelegationAlreadyCompletedError, HarnessValidationError } from './errors';
 import {
@@ -1324,6 +1325,12 @@ export interface DelegateTaskInput {
    * representation must fit the inherited request-context app budget.
    */
   requestContextApp?: Record<string, JsonValue>;
+  /**
+   * PF-8034: the OM source-write guard of the parent run that delegated. Under
+   * `sourceWriteFencing: 'required'` the settlement notice row is written with
+   * it, and only with it.
+   */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
 }
 
 export interface PlanTaskDelegationScopeSnapshot {
@@ -1344,6 +1351,8 @@ interface DelegationAttemptMetadata {
   parentToolCallId: string;
   parentRunId?: string;
   parentModeId?: string;
+  /** PF-8034: the delegating parent run's OM source-write guard, when it had one. */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   includeSubtree: boolean;
   startedAt: number;
   deadlineAt: number;
@@ -1386,8 +1395,31 @@ export interface PendingDelegationSettlementNotice {
   outcome: DelegatedSubagentOutcome;
   /** Mode the parent delegated from, when recorded. */
   parentModeId?: string;
+  /** PF-8034: the OM source-write guard of the parent run that delegated, when recorded. */
+  sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
   /** PF-7679: the delivery claim on this notice, when one is held. */
   claim?: DelegationNoticeClaim;
+}
+
+/** PF-8034: the guard as stored in the attempt's JSON metadata. */
+function encodeSourceWriteGuard(guard: ObservationalMemorySourceWriteGuard): Record<string, JsonValue> {
+  return { recordId: guard.recordId, threadId: guard.threadId, resourceId: guard.resourceId };
+}
+
+/** PF-8034: a well-formed stored guard; a malformed one is dropped (its notice then has no guard). */
+function parseSourceWriteGuard(raw: unknown): ObservationalMemorySourceWriteGuard | undefined {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const guard = raw as Record<string, unknown>;
+  if (
+    typeof guard.recordId !== 'string' ||
+    guard.recordId.length === 0 ||
+    (guard.threadId !== null && typeof guard.threadId !== 'string') ||
+    typeof guard.resourceId !== 'string' ||
+    guard.resourceId.length === 0
+  ) {
+    return undefined;
+  }
+  return { recordId: guard.recordId, threadId: guard.threadId, resourceId: guard.resourceId };
 }
 
 function sha256Text(value: string): string {
@@ -1432,6 +1464,7 @@ function delegationAttemptMetadata(
   }
   if (input.parentRunId !== undefined) attempt.parentRunId = input.parentRunId;
   if (input.parentModeId !== undefined) attempt.parentModeId = input.parentModeId;
+  if (input.sourceWriteGuard !== undefined) attempt.sourceWriteGuard = encodeSourceWriteGuard(input.sourceWriteGuard);
   if (priorMetadata !== undefined) attempt.priorMetadata = priorMetadata;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: attempt };
 }
@@ -1468,6 +1501,8 @@ function settledDelegationAttemptMetadata(
   };
   if (attempt.parentRunId !== undefined) encoded.parentRunId = attempt.parentRunId;
   if (attempt.parentModeId !== undefined) encoded.parentModeId = attempt.parentModeId;
+  if (attempt.sourceWriteGuard !== undefined)
+    encoded.sourceWriteGuard = encodeSourceWriteGuard(attempt.sourceWriteGuard);
   if (attempt.hadPriorMetadata) encoded.priorMetadata = attempt.priorMetadata!;
   return { [DELEGATION_ATTEMPT_METADATA_KEY]: encoded };
 }
@@ -1550,6 +1585,7 @@ export function readDelegationAttemptMetadata(
       return undefined;
     }
   }
+  const sourceWriteGuard = parseSourceWriteGuard(raw.sourceWriteGuard);
   let settlement: DelegationAttemptMetadata['settlement'];
   if (raw.settlement !== undefined) {
     if (raw.settlement === null || typeof raw.settlement !== 'object' || Array.isArray(raw.settlement))
@@ -1599,6 +1635,7 @@ export function readDelegationAttemptMetadata(
     parentToolCallId: raw.parentToolCallId,
     ...(typeof raw.parentRunId === 'string' ? { parentRunId: raw.parentRunId } : {}),
     ...(typeof raw.parentModeId === 'string' ? { parentModeId: raw.parentModeId } : {}),
+    ...(sourceWriteGuard !== undefined ? { sourceWriteGuard } : {}),
     includeSubtree: raw.includeSubtree,
     startedAt: raw.startedAt,
     deadlineAt: raw.deadlineAt,
@@ -2025,6 +2062,7 @@ export function readPendingDelegationSettlementNotice(
     digest: settlement.notice.digest,
     outcome: settlement.outcome,
     ...(attempt.parentModeId !== undefined ? { parentModeId: attempt.parentModeId } : {}),
+    ...(attempt.sourceWriteGuard !== undefined ? { sourceWriteGuard: attempt.sourceWriteGuard } : {}),
     ...(settlement.notice.claim !== undefined ? { claim: settlement.notice.claim } : {}),
   };
 }
