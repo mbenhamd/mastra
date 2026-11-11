@@ -429,6 +429,42 @@ describe('runEvals', () => {
       expect(quality.run).not.toHaveBeenCalled();
     });
 
+    it('with stopOnError: false, a caller abort while only scoring is running still rejects the run', async () => {
+      const controller = new AbortController();
+      const reason = new Error('caller cancelled');
+      let scorerStarted!: () => void;
+      const scoring = new Promise<void>(resolve => (scorerStarted = resolve));
+      let releaseScorer!: () => void;
+      const scorerReleased = new Promise<void>(resolve => (releaseScorer = resolve));
+      let scorerFinished = false;
+      const heldScorer = createScorer({ id: 'held', description: 'Held open on a barrier' }).generateScore(async () => {
+        scorerStarted();
+        await scorerReleased;
+        scorerFinished = true;
+        return 1;
+      });
+      const completed: unknown[] = [];
+      const data = [{ input: 'scored item' }];
+
+      const run = runEvals({
+        data,
+        scorers: [heldScorer],
+        target: createMockAgentV2('answer'),
+        targetOptions: { abortSignal: controller.signal },
+        stopOnError: false,
+        onItemComplete: ({ item }) => {
+          completed.push(item);
+        },
+      });
+      await scoring;
+      controller.abort(reason);
+      releaseScorer();
+
+      await expect(run).rejects.toBe(reason);
+      expect(scorerFinished).toBe(true);
+      expect(completed).toEqual(data);
+    });
+
     it.each([
       {
         assertion: 'a max threshold',

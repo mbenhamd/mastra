@@ -224,10 +224,11 @@ type RunEvalsBaseConfig<TTarget> = {
    * When `false`, an item whose Agent call or Workflow run throws is reported
    * in `failures` and the remaining items keep running. The run resolves only
    * after every started item has settled. If every item fails, the result has
-   * no assertion results and no verdict. An aborted `targetOptions.abortSignal`
-   * starts no further items, leaves unscored any item whose target call settles
-   * after the abort, and rejects the run once the started items settle.
-   * Default `true`: the first failure rejects the run.
+   * no assertion results and no verdict. If `targetOptions.abortSignal` is
+   * aborted at any point before the run settles, the run rejects once the
+   * started items settle; no further items start, and any item whose target
+   * call settles after the abort is left unscored. Default `true`: the first
+   * failure rejects the run.
    */
   stopOnError?: boolean;
 };
@@ -418,13 +419,14 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
   // starting and rejects the run once the started items settle.
   //
   // A caller abort (`targetOptions.abortSignal`) is read from the signal, not from
-  // a thrown error, because an Agent can resolve when aborted. Once the signal is
-  // aborted no item starts, and an item whose target call settles after the abort
-  // is neither scored, saved, passed to `onItemComplete`, nor recorded in
-  // `failures`. The run then rejects once the started items settle: with the
-  // target's error when the target call rejected, otherwise with
-  // `abortSignal.reason`. An item whose target finished before the abort is
-  // scored normally.
+  // a thrown error, because an Agent can resolve when aborted. If the signal is
+  // aborted at any point before the run settles, the run rejects once the started
+  // items settle: with the fatal error already recorded if there is one (the
+  // target's error when the target call rejected on abort), otherwise with
+  // `abortSignal.reason`. Once the signal is aborted no item starts, and an item
+  // whose target call settles after the abort is neither scored, saved, passed
+  // to `onItemComplete`, nor recorded in `failures`. An item whose target
+  // finished before the abort finishes scoring and `onItemComplete` normally.
   const failures: Array<RunEvalsItemFailure | undefined> = new Array(data.length);
   let fatalError: { error: unknown } | undefined;
   const abortSignal = (targetOptions as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
@@ -582,6 +584,8 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
     { concurrency },
   );
 
+  // An abort that arrived while only scoring was still running (see settleItem).
+  if (!stopOnError && abortSignal?.aborted) fatalError ??= { error: abortSignal.reason };
   if (fatalError) throw fatalError.error;
 
   for (const [scorerId, count] of Object.entries(scoreAccumulator.getNotScorableCounts())) {
