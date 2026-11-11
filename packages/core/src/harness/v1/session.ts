@@ -1827,13 +1827,6 @@ export class Session {
    * native admission mark, cached pending admission).
    */
   private readonly _terminalStagingLedger = new TerminalStagingLedger();
-  /** Pending native completions whose usage has joined the durable session counter. */
-  private get _terminalTokenAccountedRunIds(): ReadonlySet<string> {
-    return this._terminalStagingLedger['_terminalTokenAccountedRunIds'];
-  }
-  private get _stagedTerminalRunIds(): ReadonlySet<string> {
-    return this._terminalStagingLedger['_stagedTerminalRunIds'];
-  }
   /**
    * Runs whose terminal agent_end this Session already emitted through
    * recovered publication. A live owner finishing the same run afterwards
@@ -1843,18 +1836,6 @@ export class Session {
   private readonly _recoveredAgentEndRunIds = new Set<string>();
   /** In-flight recovered completion publications, one per run. */
   private readonly _recoveredRunPublications = new Map<string, Promise<void>>();
-  /** Runs this process admitted under native terminal handoff. */
-  private get _nativeTerminalRunIds(): ReadonlySet<string> {
-    return this._terminalStagingLedger['_nativeTerminalRunIds'];
-  }
-  /**
-   * Pending terminal admissions known to this process, by run id, so staging a
-   * run's output is one storage transaction. Storage re-validates identity and
-   * status under its locks, so a stale entry only yields `not_pending`.
-   */
-  private get _terminalStagingAdmissions(): ReadonlyMap<string, HarnessTerminalAdmissionRecord> {
-    return this._terminalStagingLedger['_terminalStagingAdmissions'];
-  }
   /** Staging runs outside the message boundary that owns its failure observer. */
   private readonly _terminalStagingFailuresAwaitingObserver = new WeakSet<HarnessTerminalHandoffError>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
@@ -5394,7 +5375,7 @@ export class Session {
     this._captureTurnRunId(full);
     if (
       full.runId &&
-      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalTokenAccountedRunIds.has(full.runId))
+      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalStagingLedger.isAccounted(full.runId))
     ) {
       return { tokenUsageAccounted: true };
     }
@@ -5402,7 +5383,7 @@ export class Session {
     this._applyTokenUsageDelta(tokenUsageDelta);
     if (tokenUsageDelta !== undefined) {
       if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
-      if (full.runId && this._stagedTerminalRunIds.has(full.runId)) {
+      if (full.runId && this._terminalStagingLedger.isStaged(full.runId)) {
         this._terminalStagingLedger.markAccounted(full.runId);
       }
       if (opts.persist !== false) this._schedulePersistTokenUsage();
@@ -7542,7 +7523,7 @@ export class Session {
 
   /** Whether this exact provider result is durably staged for the run. */
   private async _providerResultStagedDurably(runId: string, full: FullOutput<unknown>): Promise<boolean> {
-    const admission = this._terminalStagingAdmissions.get(runId);
+    const admission = this._terminalStagingLedger.admissionFor(runId);
     if (admission === undefined) return false;
     try {
       const evidence = await this._storage.loadMessageResultEvidence({
@@ -7604,7 +7585,7 @@ export class Session {
       return;
     }
     try {
-      const cached = this._terminalStagingAdmissions.get(runId);
+      const cached = this._terminalStagingLedger.admissionFor(runId);
       let admission: HarnessTerminalAdmissionRecord | null;
       if (cached !== undefined && cached.sessionIncarnation === sessionIncarnation) {
         admission = cached;
@@ -7617,7 +7598,7 @@ export class Session {
             runId,
           });
         } catch (error) {
-          if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
+          if (opts.tolerateUnknownRun === true && !this._terminalStagingLedger.isNative(runId)) return;
           throw error;
         }
         this._terminalStagingLedger.cachePending(runId, admission);
@@ -7628,7 +7609,9 @@ export class Session {
         // terminal canonical evidence retires a fence: a cancelled admission
         // can leave its staged evidence pending for recovery. A run already
         // staged here (its provider result) has run this sweep.
-        const fencesToSweep = this._stagedTerminalRunIds.has(runId) ? [] : this._terminalTokenAccountedRunIds;
+        const fencesToSweep = this._terminalStagingLedger.isStaged(runId)
+          ? []
+          : this._terminalStagingLedger.accountedRunIds;
         for (const accountedRunId of fencesToSweep) {
           if (accountedRunId === runId) continue;
           const prior = await this._storage.loadTerminalAdmissionByRun({
@@ -10364,7 +10347,7 @@ export class Session {
     staged: FullOutput<unknown>,
     queuedItemId?: string,
   ): Promise<void> {
-    if (this._terminalTokenAccountedRunIds.has(runId)) {
+    if (this._terminalStagingLedger.isAccounted(runId)) {
       // Counted here before, but that save may have failed: settlement may
       // drop the staged output only once the fence and counter are durable.
       if (!this._record.accountedTerminalRunIds?.includes(runId) || !this._recordTokenUsageMatchesLive()) {
@@ -20930,8 +20913,7 @@ export class Session {
           // construction and post-save assignment are not lost — we re-overlay
           // from the live counter below.
           tokenUsage: { ...tokenUsageForSave },
-          accountedTerminalRunIds:
-            this._terminalTokenAccountedRunIds.size > 0 ? [...this._terminalTokenAccountedRunIds] : undefined,
+          accountedTerminalRunIds: this._terminalStagingLedger.accountedSnapshot(),
           lastActivityAt: Date.now(),
         };
         // Resume-usage fence: while armed, any write that persists the bumped
