@@ -18,4 +18,6 @@ for (const { itemIndex, error } of result.failures ?? []) {
 }
 ```
 
-The default stays `true`, so existing runs still reject on the first failed item. Failed items are left out of `summary.totalItems`, scores and the verdict, so check `failures` before trusting the verdict.
+The default stays `true`, so existing runs still reject on the first failed item. Failed items are left out of `summary.totalItems`, scores and the verdict, so a run with some failed items can still pass: check `failures` before trusting the verdict. If every item fails, the result has `failures`, empty `scores` and `summary.totalItems: 0`, and no gate or threshold results and no verdict.
+
+In a `stopOnError: false` run, aborting `targetOptions.abortSignal` stops the run even when the agent returns instead of throwing on abort: no further items start, an item whose agent call or workflow run finishes after the abort is not scored, saved, passed to `onItemComplete` or listed in `failures`, and `runEvals` rejects once the items already running have finished.

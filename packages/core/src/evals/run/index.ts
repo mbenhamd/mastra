@@ -173,8 +173,11 @@ export type RunEvalsResult = {
   /**
    * Items whose target call failed in a `stopOnError: false` run, ordered by
    * `itemIndex`. Failed items are not counted in `summary.totalItems` and do
-   * not contribute to `scores`, gate or threshold results, or the verdict.
-   * Present only when at least one item failed.
+   * not contribute to `scores`, gate or threshold results, or the verdict, so a
+   * run with some failed items can still carry a passing verdict. When every
+   * item failed, the result has `scores: {}`, `summary.totalItems: 0`, no gate,
+   * threshold or turn results, and no verdict. Present only when at least one
+   * item failed.
    */
   failures?: RunEvalsItemFailure[];
 };
@@ -220,8 +223,11 @@ type RunEvalsBaseConfig<TTarget> = {
   /**
    * When `false`, an item whose Agent call or Workflow run throws is reported
    * in `failures` and the remaining items keep running. The run resolves only
-   * after every started item has settled. Default `true`: the first failure
-   * rejects the run.
+   * after every started item has settled. If every item fails, the result has
+   * no assertion results and no verdict. An aborted `targetOptions.abortSignal`
+   * starts no further items, leaves unscored any item whose target call settles
+   * after the abort, and rejects the run once the started items settle.
+   * Default `true`: the first failure rejects the run.
    */
   stopOnError?: boolean;
 };
@@ -408,8 +414,17 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
 
   // With `stopOnError: false` no item rejects p-map, so p-map resolves only after
   // every started item has settled. A target failure is recorded on its item. Any
-  // other error (a caller abort, or a scorer, storage or callback failure) stops
-  // new items from starting and rejects the run once the started items settle.
+  // other error (a scorer, storage or callback failure) stops new items from
+  // starting and rejects the run once the started items settle.
+  //
+  // A caller abort (`targetOptions.abortSignal`) is read from the signal, not from
+  // a thrown error, because an Agent can resolve when aborted. Once the signal is
+  // aborted no item starts, and an item whose target call settles after the abort
+  // is neither scored, saved, passed to `onItemComplete`, nor recorded in
+  // `failures`. The run then rejects once the started items settle: with the
+  // target's error when the target call rejected, otherwise with
+  // `abortSignal.reason`. An item whose target finished before the abort is
+  // scored normally.
   const failures: Array<RunEvalsItemFailure | undefined> = new Array(data.length);
   let fatalError: { error: unknown } | undefined;
   const abortSignal = (targetOptions as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
@@ -418,6 +433,10 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
     async (item: RunEvalsDataItem<any>, dataIndex: number) => {
       if (stopOnError) return runItem(item, dataIndex);
       if (fatalError) return;
+      if (abortSignal?.aborted) {
+        fatalError = { error: abortSignal.reason };
+        return;
+      }
       try {
         await runItem(item, dataIndex);
       } catch (error) {
@@ -438,6 +457,8 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
         : await executeTarget(target, item, targetOptions).catch((error: MastraError) => {
             throw new TargetFailure(error);
           });
+      // The target resolved after a caller abort: do not score it (see settleItem).
+      if (!stopOnError && abortSignal?.aborted) throw abortSignal.reason;
 
       // Store the trace before gates and scorers read it, and before each
       // scorer's addScore() looks it up.
@@ -589,6 +610,11 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
 
   const orderedFailures = failures.filter((failure): failure is RunEvalsItemFailure => failure !== undefined);
   if (orderedFailures.length > 0) result.failures = orderedFailures;
+
+  // No item completed: every target call failed in a `stopOnError: false` run
+  // (`data` is never empty, and any other failure rejects the run). No gate or
+  // scorer ran, so report no assertion results and no verdict.
+  if (totalItems === 0) return result;
 
   // Compute gate/threshold results. Verdict is set only when at least one
   // assertion produced a numeric score (skip ≠ pass and skip ≠ fail).

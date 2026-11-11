@@ -395,6 +395,70 @@ describe('runEvals', () => {
       expect(String((result.failures![0]!.error.cause as Error)?.message)).toContain('provider unavailable');
     });
 
+    it('with stopOnError: false, a caller abort rejects the run without scoring the cancelled or queued item', async () => {
+      const controller = new AbortController();
+      const reason = new Error('caller cancelled');
+      let modelStarted!: () => void;
+      const started = new Promise<void>(resolve => (modelStarted = resolve));
+      let modelCalls = 0;
+      const model = new MockLanguageModelV2({
+        doGenerate: async ({ abortSignal }) => {
+          modelCalls++;
+          modelStarted();
+          return new Promise((_, reject) => {
+            abortSignal?.addEventListener('abort', () => reject(abortSignal.reason), { once: true });
+          });
+        },
+      });
+      const agent = new Agent({ id: 'abortAgent', name: 'abortAgent', instructions: 'Answer', model });
+      const quality = createMockScorer('quality', 1);
+
+      const run = runEvals({
+        data: [{ input: 'cancel this' }, { input: 'queued' }],
+        scorers: [quality],
+        target: agent,
+        targetOptions: { abortSignal: controller.signal },
+        concurrency: 1,
+        stopOnError: false,
+      });
+      await started;
+      controller.abort(reason);
+
+      await expect(run).rejects.toBe(reason);
+      expect(modelCalls).toBe(1);
+      expect(quality.run).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        assertion: 'a max threshold',
+        configure: (scorer: MastraScorer) => ({ scorers: [{ scorer, threshold: { max: 0.5 } }] }),
+      },
+      { assertion: 'a gate', configure: (scorer: MastraScorer) => ({ gates: [scorer] }) },
+    ])(
+      'with stopOnError: false and every item failing, reports no result or verdict for $assertion',
+      async ({ configure }) => {
+        const model = new MockLanguageModelV2({
+          doGenerate: async () => {
+            throw new Error('provider unavailable');
+          },
+        });
+        const agent = new Agent({ id: 'downAgent', name: 'downAgent', instructions: 'Answer', model });
+        const toxicity = createMockScorer('toxicity', 0);
+        const data = [{ input: 'first' }, { input: 'second' }];
+
+        const result = await runEvals({ data, target: agent, stopOnError: false, ...configure(toxicity) });
+
+        expect(result.gateResults).toBeUndefined();
+        expect(result.thresholdResults).toBeUndefined();
+        expect(result.verdict).toBeUndefined();
+        expect(result.scores).toEqual({});
+        expect(result.summary.totalItems).toBe(0);
+        expect(result.failures?.map(failure => failure.item)).toEqual(data);
+        expect(toxicity.run).not.toHaveBeenCalled();
+      },
+    );
+
     it('should handle empty data array', async () => {
       await expect(
         runEvals({
