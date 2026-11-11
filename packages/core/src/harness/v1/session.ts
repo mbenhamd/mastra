@@ -1442,10 +1442,6 @@ export class Session {
 
   /** PF-8365: the queue head (current queued item, its source, the `queue()` resolvers). */
   private readonly _queueHead = new QueueHead();
-  /** Read bridge to `_queueHead.currentId` (PF-8365, removed once the reads go through the owner). */
-  private get _currentQueuedItemId(): string | undefined {
-    return this._queueHead.currentId;
-  }
   /**
    * `yolo` of the turn currently running. Set at drain-begin from the queued
    * item so suspend-capture can persist it onto `pendingResume` and a resumed
@@ -1454,10 +1450,6 @@ export class Session {
   private _currentTurnYolo = false;
   /** Captured native OM source-write fence for the live turn, if supplied. */
   private _currentTurnSourceWriteGuard?: ObservationalMemorySourceWriteGuard;
-  /** Read bridge to `_queueHead.currentSource` (PF-8365, removed once the reads go through the owner). */
-  private get _currentQueuedItemSource(): 'user' | 'goal' | undefined {
-    return this._queueHead.currentSource;
-  }
   /** Fresh remote queue admissions have no local promise resolver but are not crash replays. */
   private readonly _liveAdmittedQueuedItemIds = new Set<string>();
   /** True while `_maybeDrainQueue` is running so re-entrant kicks are no-ops. */
@@ -2477,7 +2469,7 @@ export class Session {
 
   /**
    * Emit an event that belongs to a turn (agent_*, message_*, tool_*,
-   * suspension_*). Auto-stamps `queuedItemId` from `_currentQueuedItemId`
+   * suspension_*). Auto-stamps `queuedItemId` from `_queueHead.currentId`
    * when a queued turn is running so subscribers can correlate every event
    * back to its `queue()` item.
    */
@@ -2495,8 +2487,8 @@ export class Session {
     // the same value. Returns the (possibly enriched) event to emit.
     const toEmit = this._trackRunSpanPreEmit(event);
     let emitted: HarnessEvent;
-    if (this._currentQueuedItemId !== undefined && (toEmit as { queuedItemId?: string }).queuedItemId === undefined) {
-      emitted = this._emitter.emit({ ...toEmit, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    if (this._queueHead.currentId !== undefined && (toEmit as { queuedItemId?: string }).queuedItemId === undefined) {
+      emitted = this._emitter.emit({ ...toEmit, queuedItemId: this._queueHead.currentId } as EmitInput);
     } else {
       emitted = this._emitter.emit(toEmit);
     }
@@ -2636,7 +2628,7 @@ export class Session {
       agentId: modeAgentId(this._modeModelConfigPort(), modeId),
       modeId,
       modelId: this._currentRunModelId ?? rec.modelId,
-      operationKind: this._currentQueuedItemId !== undefined ? 'queue' : 'signal',
+      operationKind: this._queueHead.currentId !== undefined ? 'queue' : 'signal',
     };
     if (rec.parentSessionId !== undefined) identity.parentSessionId = rec.parentSessionId;
     if (this._currentTraceId !== undefined) identity.traceId = this._currentTraceId;
@@ -2798,7 +2790,7 @@ export class Session {
    * `subagent_*` event (§10.6).
    *
    * Auto-stamps `parentId` (this session's id) and `queuedItemId` from
-   * `_currentQueuedItemId` so a subscriber can correlate every nested
+   * `_queueHead.currentId` so a subscriber can correlate every nested
    * event back to the parent's `queue()` item that spawned it. Callers
    * supply `depth` (child's depth in the subagent tree) and the rest of
    * the event payload.
@@ -2814,8 +2806,8 @@ export class Session {
       | Omit<SubagentEndEvent, 'id' | 'timestamp' | 'sessionId' | 'parentId'>,
   ): HarnessEvent {
     const stamped = { ...event, parentId: this.id } as EmitInput;
-    if (this._currentQueuedItemId !== undefined && (stamped as { queuedItemId?: string }).queuedItemId === undefined) {
-      return this._emitter.emit({ ...stamped, queuedItemId: this._currentQueuedItemId } as EmitInput);
+    if (this._queueHead.currentId !== undefined && (stamped as { queuedItemId?: string }).queuedItemId === undefined) {
+      return this._emitter.emit({ ...stamped, queuedItemId: this._queueHead.currentId } as EmitInput);
     }
     return this._emitter.emit(stamped);
   }
@@ -3243,7 +3235,7 @@ export class Session {
       resourceId: this.resourceId,
       threadId: this.threadId,
       ...(this._currentRunSignalId !== undefined ? { signalId: this._currentRunSignalId } : {}),
-      ...(this._currentQueuedItemId !== undefined ? { queuedItemId: this._currentQueuedItemId } : {}),
+      ...(this._queueHead.currentId !== undefined ? { queuedItemId: this._queueHead.currentId } : {}),
       ...((opts.messageId ?? previous?.messageId) ? { messageId: opts.messageId ?? previous?.messageId } : {}),
       text: text.text,
       status: previousIsTerminal ? previous.status : 'streaming',
@@ -4910,7 +4902,7 @@ export class Session {
     if (!recoveryStarted || recoveringPending === undefined) {
       if (
         expectedQueuedItemId !== undefined &&
-        this._currentQueuedItemId === expectedQueuedItemId &&
+        this._queueHead.currentId === expectedQueuedItemId &&
         this._record.pendingResume?.queuedItemId !== expectedQueuedItemId &&
         !this._record.pendingQueue.some(item => item.id === expectedQueuedItemId)
       ) {
@@ -5686,7 +5678,7 @@ export class Session {
   isBusy(): boolean {
     if (this._currentTurnAbortController !== undefined) return true;
     if (this._draining) return true;
-    if (this._currentQueuedItemId !== undefined) return true;
+    if (this._queueHead.currentId !== undefined) return true;
     if ((this._record.pendingQueue?.length ?? 0) > 0) return true;
     if (this._record.pendingResume !== undefined && this._record.cancelRequest === undefined) return true;
     if (this._subagentExecutionsInFlight > 0) return true;
@@ -5717,7 +5709,7 @@ export class Session {
     if (this._currentTurnAbortController !== undefined) return true;
     if (this._activeWorkInvalidationsInFlight > 0) return true;
     if (this._draining) return true;
-    if (this._currentQueuedItemId !== undefined) return true;
+    if (this._queueHead.currentId !== undefined) return true;
     if ((this._record.pendingQueue?.length ?? 0) > 0) return true;
     return this._record.pendingResume !== undefined && this._record.cancelRequest === undefined;
   }
@@ -5753,14 +5745,14 @@ export class Session {
     if (this._subagentExecutionsInFlight > 0) return true;
     if (this._record.pendingResume !== undefined) return false;
     if (this._draining) return true;
-    if (this._currentQueuedItemId !== undefined) return true;
+    if (this._queueHead.currentId !== undefined) return true;
     return (this._record.pendingQueue?.length ?? 0) > 0;
   }
 
   /**
    * Number of items currently waiting in `pendingQueue` (excluding any
    * queued item already drained into a live turn — that one is tracked
-   * via `_currentQueuedItemId`). Cheap, synchronous, safe to poll from UI.
+   * via `_queueHead.currentId`). Cheap, synchronous, safe to poll from UI.
    */
   getQueueDepth(): number {
     return this._record.pendingQueue?.length ?? 0;
@@ -6503,8 +6495,8 @@ export class Session {
     }
     if (
       this._currentTurnAbortController === undefined &&
-      this._currentQueuedItemId !== undefined &&
-      removedItems.some(item => item.queuedItemId === this._currentQueuedItemId)
+      this._queueHead.currentId !== undefined &&
+      removedItems.some(item => item.queuedItemId === this._queueHead.currentId)
     ) {
       this._queueHead.release();
     }
@@ -6781,7 +6773,7 @@ export class Session {
       const idx = queue.findIndex(item => item.id === targetId);
       const activeResumeId =
         prev.pendingResume !== undefined ? this._queuedItemIdForPendingResume(prev.pendingResume) : undefined;
-      if (idx <= 0 || this._currentQueuedItemId === targetId || activeResumeId === targetId) return prev;
+      if (idx <= 0 || this._queueHead.currentId === targetId || activeResumeId === targetId) return prev;
 
       const item = queue[idx]!;
       const receipts = prev.queueAdmissionReceipts ?? {};
@@ -14440,7 +14432,7 @@ export class Session {
    */
   private async _maybeCaptureSuspend(
     full: FullOutput<unknown>,
-    queuedItemId = this._currentQueuedItemId,
+    queuedItemId = this._queueHead.currentId,
     modeId = this._record.modeId,
     modelId = this._modelIdForQueuedItem(queuedItemId),
     opts: {
@@ -14599,7 +14591,7 @@ export class Session {
       suspendPayload?: unknown;
       approvalReasons?: string[];
     },
-    queuedItemId = this._currentQueuedItemId,
+    queuedItemId = this._queueHead.currentId,
     modeId = this._record.modeId,
     modelId = this._modelIdForQueuedItem(queuedItemId),
     originSignalId?: string,
@@ -15016,7 +15008,7 @@ export class Session {
     if (this._currentRunId !== undefined) snapshot.currentRunId = this._currentRunId;
     if (this._currentMessageId !== undefined) snapshot.currentMessageId = this._currentMessageId;
     if (this._currentTraceId !== undefined) snapshot.currentTraceId = this._currentTraceId;
-    if (this._currentQueuedItemId !== undefined) snapshot.currentQueuedItemId = this._currentQueuedItemId;
+    if (this._queueHead.currentId !== undefined) snapshot.currentQueuedItemId = this._queueHead.currentId;
     if (rec.goal !== undefined) snapshot.goal = rec.goal;
     const currentRun = this._buildCurrentRunProjection();
     if (currentRun !== undefined) snapshot.currentRun = currentRun;
@@ -15077,7 +15069,7 @@ export class Session {
     // effective identity), captured by `_beginTurn`.
     if (this._currentRunId !== undefined) {
       const modeId = this._currentRunModeId ?? rec.modeId;
-      const queuedItemId = this._currentQueuedItemId;
+      const queuedItemId = this._queueHead.currentId;
       const projection: SessionRunProjection = {
         runId: this._currentRunId,
         status: 'running',
@@ -17793,7 +17785,7 @@ export class Session {
       // resolver, remove the head item, clear current, then kick the drain
       // for the next item.
       if (firstFinalize) {
-        const wasGoalDriven = (this._currentQueuedItemSource ?? 'user') === 'goal';
+        const wasGoalDriven = (this._queueHead.currentSource ?? 'user') === 'goal';
         await Promise.race([this._runGoalJudge(full, wasGoalDriven), deletedTurnWaiter]);
       }
       if (completingQueuedItemId !== undefined) {
@@ -18203,7 +18195,7 @@ export class Session {
 
   private _queuedItemIdForPendingResume(pending: PendingResume): string | undefined {
     if (pending.queuedItemId !== undefined) return pending.queuedItemId;
-    if (this._currentQueuedItemId !== undefined) return this._currentQueuedItemId;
+    if (this._queueHead.currentId !== undefined) return this._queueHead.currentId;
     return (this._record.pendingQueue ?? []).find(item => {
       const receipt = this._record.queueAdmissionReceipts?.[item.id];
       return (receipt?.status === 'accepted' || receipt?.status === 'completed') && receipt.runId === pending.runId;
@@ -18421,7 +18413,7 @@ export class Session {
   //      all flow with `queuedItemId` stamped automatically by
   //      `_emitTurnEvent`).
   //   3. If the turn suspends, the head item stays in `pendingQueue` and
-  //      `_currentQueuedItemId` stays set. The next `respondTo*` call calls
+  //      `_queueHead.currentId` stays set. The next `respondTo*` call calls
   //      into `_resume`; on terminal completion the resume path settles the
   //      resolver + removes the head + kicks drain again.
   //   4. If the turn completes without suspending, the queue receipt,
@@ -19085,7 +19077,7 @@ export class Session {
     },
   ): SessionRecord {
     const policy = this._harness._internalQueueBackpressure;
-    const activeId = this._currentQueuedItemId ?? prev.pendingResume?.queuedItemId;
+    const activeId = this._queueHead.currentId ?? prev.pendingResume?.queuedItemId;
     const queue = [...(prev.pendingQueue ?? [])];
     const existingReceipts = prev.queueAdmissionReceipts ?? {};
     let nextReceipts: Record<string, QueueAdmissionReceipt> | undefined;
@@ -19367,7 +19359,7 @@ export class Session {
       const recovery = await this._maybeRecoverStaleQueuedResume({ kickDrainOnStale: false });
       if (recovery.status === 'none') return;
     }
-    if (this._currentQueuedItemId !== undefined) return;
+    if (this._queueHead.currentId !== undefined) return;
     // A manual `message()` turn is in flight — wait for it to settle.
     // `_recordTurnCompletion` will re-kick the drain on its way out.
     if (this._currentTurnAbortController !== undefined) return;
@@ -20266,7 +20258,7 @@ export class Session {
       ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         params.modeId ?? this._record.modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
+        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
       ),
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
@@ -20337,7 +20329,7 @@ export class Session {
       ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         modeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
+        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
       ),
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
@@ -20421,7 +20413,7 @@ export class Session {
       ...(this._currentTurnYolo ? { yolo: true } : {}),
       runtimeDependencies: this._harness._runtimeDependenciesForMode(
         submittingModeId,
-        params.modelId ?? this._modelIdForQueuedItem(this._currentQueuedItemId),
+        params.modelId ?? this._modelIdForQueuedItem(this._queueHead.currentId),
       ),
       // §5.1 — carry the active turn's caller app bag onto the pending resume.
       ...(this._currentTurnRequestContext
@@ -20687,7 +20679,7 @@ export class Session {
   }
 
   private _ensureQueuedItemContext(queuedItemId: string): void {
-    if (this._currentQueuedItemId !== undefined) return;
+    if (this._queueHead.currentId !== undefined) return;
     const queuedItem = this._record.pendingQueue.find(item => item.id === queuedItemId);
     this._queueHead.claim(queuedItemId, queuedItem?.source ?? 'user');
   }

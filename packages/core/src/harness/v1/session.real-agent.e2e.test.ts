@@ -2652,7 +2652,7 @@ describe('Harness v1 real-agent E2E — S4 settlement evidence', () => {
       ]);
       expect(events.indexOf(secondToolEnds[0]!)).toBeGreaterThan(secondToolStartIndex);
       expect({
-        currentQueuedItemId: (session as any)._currentQueuedItemId,
+        currentQueuedItemId: (session as any)._queueHead.currentId,
         draining: (session as any)._draining,
         hasActiveTurn: (session as any)._currentTurnAbortController !== undefined,
         hasRecoveryTimer: (session as any)._queuedResumeRecoveryTimer !== undefined,

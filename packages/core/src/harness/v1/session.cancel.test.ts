@@ -166,7 +166,7 @@ describe('Session.cancel()', () => {
     await session.cancel({ reason: 'cancel-before-dispatch' });
 
     expect(session.getRecord().pendingQueue).toEqual([]);
-    expect((session as any)._currentQueuedItemId).toBeUndefined();
+    expect((session as any)._queueHead.currentId).toBeUndefined();
     await expect(queued.promise).rejects.toBeInstanceOf(HarnessSessionCancelledError);
   });
 
@@ -483,7 +483,7 @@ describe('Session.cancel()', () => {
 
     expect(session.getRecord().pendingQueue).toEqual([]);
     expect(session.getRecord().pendingResume?.queuedItemId).toBe('suspended');
-    expect((session as any)._currentQueuedItemId).toBeUndefined();
+    expect((session as any)._queueHead.currentId).toBeUndefined();
     expect(session.isBusy()).toBe(false);
     await expect(idle).resolves.toBeUndefined();
     await expect(queued.promise).rejects.toBeInstanceOf(HarnessSessionCancelledError);
