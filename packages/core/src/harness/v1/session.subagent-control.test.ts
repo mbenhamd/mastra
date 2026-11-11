@@ -1301,6 +1301,76 @@ describe('delegated settlement listeners', () => {
     }
   });
 
+  it('wait until any returns a recovered settlement whose write landed but was not acknowledged at the call', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const recovered = await delegateHeldChild(parent, childAgent, 'recovered job');
+    const other = await delegateHeldChild(parent, childAgent, 'keeps running');
+    let releaseAck!: () => void;
+    const ackGate = new Promise<void>(resolve => (releaseAck = resolve));
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>(resolve => (releaseRead = resolve));
+    try {
+      // As after a restart: no in-process driver for this child, so recovery settles it.
+      (parent as any)._activeSubagents.delete(`delegate:${recovered.childId}`);
+      let landed = false;
+      const writes = (parent as any)._storage;
+      (parent as any)._storage = new Proxy(writes, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== 'function') return value;
+          if (key !== 'mutatePlanTasksForSession') return value.bind(target);
+          return async (...args: unknown[]) => {
+            const result = await value.apply(target, args);
+            landed = true;
+            await ackGate;
+            return result;
+          };
+        },
+      });
+      let readHeld = false;
+      const reads = parent._internalStorage;
+      Object.defineProperty(parent, '_internalStorage', {
+        configurable: true,
+        value: new Proxy(reads, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (typeof value !== 'function') return value;
+            if (key !== 'listPlanTasks' || readHeld) return value.bind(target);
+            readHeld = true;
+            return (...args: unknown[]) => readGate.then(() => value.apply(target, args));
+          },
+        }),
+      });
+      const tool = createSubagentControlTool(parent)!;
+      delete (parent as any)._internalStorage;
+      const reconciled = parent._reconcileDelegatedTask(recovered.taskId, recovered.childId, 'completed');
+      const pending = tool.execute!(
+        { action: 'wait', until: 'any', timeoutMs: 1_500 } as any,
+        toolCtx as any,
+      ) as Promise<any>;
+      await poll(() => landed, 5_000);
+      // The first read sees the durable settlement before its writer hears back.
+      releaseRead();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      releaseAck();
+      await reconciled;
+      const output = await pending;
+
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output)).toEqual([recovered.childId]);
+      expect(runningIds(output)).toEqual([other.childId]);
+    } finally {
+      releaseRead();
+      releaseAck();
+      recovered.releaseChild();
+      other.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
   it('a throwing listener neither skips the other listeners nor the settlement notice', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), {
       ...subagentsConfig(),

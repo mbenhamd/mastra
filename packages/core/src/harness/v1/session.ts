@@ -2315,10 +2315,10 @@ export class Session {
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
   /**
-   * Delegated children this process's driver has stopped driving but not yet
-   * settled: from the moment the active entry goes until the settlement commits
-   * or the drive gives up. Their durable link is still live, so they read as
-   * running.
+   * Delegated children this process is settling: from the moment the driver
+   * drops the active entry, or a recovery or cancel reconcile starts, until the
+   * settlement commits or the attempt gives up. Their durable link is still
+   * live, so they read as running.
    */
   private readonly _settlingDelegations = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
@@ -25293,6 +25293,9 @@ export class Session {
     notify?: { childCancelRequest: SessionRecord['cancelRequest'] },
   ): Promise<boolean> {
     if (this._state === 'closed') return false;
+    // Before the first await, so a wait that begins while this write is in
+    // flight counts the child as running when it began.
+    this._settlingDelegations.add(subagentSessionId);
     const noticeMode =
       notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
     // A Stop that starts after this point must still suppress the wake.
@@ -25364,6 +25367,7 @@ export class Session {
       this._scheduleDelegationReconcileRetry(0);
       return false;
     } finally {
+      this._settlingDelegations.delete(subagentSessionId);
       releaseRemindSettlement?.();
     }
   }
