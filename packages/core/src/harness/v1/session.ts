@@ -366,6 +366,7 @@ import type {
 import { NativeSignalAcceptanceTimeoutError, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS } from './session-signal-acceptance';
 import { SessionSkillsMcpActions } from './session-skills-mcp-actions';
 import type { SkillsMcpActionsSessionPort } from './session-skills-mcp-actions';
+import { TerminalStagingLedger } from './session-terminal-staging-ledger';
 import {
   assertPolicy,
   assertToolCategory,
@@ -384,6 +385,7 @@ import type {
   HarnessPrepareStep,
   ResumeAnswerProgress,
 } from './session-turn-options';
+import { WakeAdmissions } from './session-wake-admissions';
 import { SessionWorkspace } from './session-workspace';
 import type { WorkspaceSessionPort } from './session-workspace';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
@@ -1817,23 +1819,14 @@ export class Session {
   private readonly _terminalFinalizersByIdentity = new Map<string, HarnessTerminalFinalizer>();
   /** PF-7631: the wrapped wake finalizer settlement wake turns admit under. */
   private readonly _terminalWakeFinalizer?: HarnessTerminalFinalizer;
-  /**
-   * PF-7631: admission ids of settlement wake turns between their pending
-   * reservation and dispatch, so recovery never interrupts one in flight here.
-   */
-  private readonly _wakeTerminalAdmissionsInFlight = new Set<string>();
-  /**
-   * PF-7631: wake admissions this process admitted and then gave up on before
-   * their terminal commit (a Stop, delete or eviction during admission or
-   * dispatch, or an exhausted commit re-drive). No run of theirs is live here,
-   * so dispatch recovery settles them at once rather than waiting out a
-   * dispatch claim this process stamped itself.
-   */
-  private readonly _releasedWakeAdmissions = new Set<string>();
+  /** PF-8389: the settlement wake admissions (in flight here, released to recovery). */
+  private readonly _wakeAdmissions = new WakeAdmissions();
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
-  /** Pending native completions whose usage has joined the durable session counter. */
-  private readonly _terminalTokenAccountedRunIds = new Set<string>();
-  private readonly _stagedTerminalRunIds = new Set<string>();
+  /**
+   * PF-8389: the terminal staging ledger (per run: usage fence, staged mark,
+   * native admission mark, cached pending admission).
+   */
+  private readonly _terminalStagingLedger = new TerminalStagingLedger();
   /**
    * Runs whose terminal agent_end this Session already emitted through
    * recovered publication. A live owner finishing the same run afterwards
@@ -1843,14 +1836,6 @@ export class Session {
   private readonly _recoveredAgentEndRunIds = new Set<string>();
   /** In-flight recovered completion publications, one per run. */
   private readonly _recoveredRunPublications = new Map<string, Promise<void>>();
-  /** Runs this process admitted under native terminal handoff. */
-  private readonly _nativeTerminalRunIds = new Set<string>();
-  /**
-   * Pending terminal admissions known to this process, by run id, so staging a
-   * run's output is one storage transaction. Storage re-validates identity and
-   * status under its locks, so a stale entry only yields `not_pending`.
-   */
-  private readonly _terminalStagingAdmissions = new Map<string, HarnessTerminalAdmissionRecord>();
   /** Staging runs outside the message boundary that owns its failure observer. */
   private readonly _terminalStagingFailuresAwaitingObserver = new WeakSet<HarnessTerminalHandoffError>();
   private readonly _messageAdmissionStarts = new Map<string, MessageAdmissionStart>();
@@ -1946,7 +1931,7 @@ export class Session {
       };
     }
     for (const runId of internals.record.accountedTerminalRunIds ?? []) {
-      this._terminalTokenAccountedRunIds.add(runId);
+      this._terminalStagingLedger.markAccounted(runId);
     }
     if (this._record.closedAt !== undefined) {
       this._state = 'closed';
@@ -3955,7 +3940,7 @@ export class Session {
     };
     // Released wake admissions this full scan still lists as pending. Only ids
     // released before the scan began can be judged by it.
-    const releasedAtScanStart = [...this._releasedWakeAdmissions];
+    const releasedAtScanStart = this._wakeAdmissions.releasedSnapshot();
     const releasedStillPending = new Set<string>();
     let cursor: PendingMessageAdmissionScanCursor | undefined;
     do {
@@ -3970,7 +3955,7 @@ export class Session {
       });
       for (const admission of page.items) {
         const { evidence } = admission;
-        if (evidence.admissionId !== undefined && this._releasedWakeAdmissions.has(evidence.admissionId)) {
+        if (evidence.admissionId !== undefined && this._wakeAdmissions.isReleased(evidence.admissionId)) {
           releasedStillPending.add(evidence.admissionId);
         }
         if (
@@ -3993,7 +3978,7 @@ export class Session {
     // another owner, or a settlement below) leaves the set, so it stays bounded
     // by the wakes still pending here.
     for (const admissionId of releasedAtScanStart) {
-      if (!releasedStillPending.has(admissionId)) this._releasedWakeAdmissions.delete(admissionId);
+      if (!releasedStillPending.has(admissionId)) this._wakeAdmissions.forgetReleased(admissionId);
     }
     for (const evidence of orphaned) {
       const wakeAdmission = evidence.admissionId !== undefined && isHarnessWakeReservedKey(evidence.admissionId);
@@ -4014,7 +3999,7 @@ export class Session {
         block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
         continue;
       }
-      if (settled && wakeAdmission) this._releasedWakeAdmissions.delete(evidence.admissionId!);
+      if (settled && wakeAdmission) this._wakeAdmissions.forgetReleased(evidence.admissionId!);
       const latest = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -4081,7 +4066,7 @@ export class Session {
     // A run in flight here is live (or settling) in this process.
     if (
       this._messageAdmissionStarts.has(evidence.admissionId) ||
-      this._wakeTerminalAdmissionsInFlight.has(evidence.admissionId) ||
+      this._wakeAdmissions.isInFlight(evidence.admissionId) ||
       this._runCompletionPromises.has(runId)
     ) {
       return 'active';
@@ -4094,7 +4079,7 @@ export class Session {
       if (!(error instanceof HarnessConfigError)) throw error;
     }
     if (agent?.getRunOutput(runId)) return 'active';
-    if (this._releasedWakeAdmissions.has(evidence.admissionId)) return 'orphaned';
+    if (this._wakeAdmissions.isReleased(evidence.admissionId)) return 'orphaned';
     const completed = this._completedRuns.get(runId);
     if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
@@ -4143,9 +4128,7 @@ export class Session {
     // A lost CAS means the dispatch changed or the lease moved: its new owner
     // settles and reports the turn.
     if (swapped.applied) {
-      this._terminalTokenAccountedRunIds.delete(runId);
-      this._stagedTerminalRunIds.delete(runId);
-      this._terminalStagingAdmissions.delete(runId);
+      this._terminalStagingLedger.forgetStaging(runId);
     }
     return swapped.applied;
   }
@@ -4291,9 +4274,7 @@ export class Session {
       // fence until the canonical evidence is terminal, or a restart would
       // account the still-staged output again.
       if (admission.status === 'committed') {
-        this._terminalTokenAccountedRunIds.delete(runId);
-        this._stagedTerminalRunIds.delete(runId);
-        this._terminalStagingAdmissions.delete(runId);
+        this._terminalStagingLedger.forgetStaging(runId);
       }
       return 'unowned';
     }
@@ -4378,9 +4359,7 @@ export class Session {
       recovery: { expectedDispatch: evidence.dispatch ?? null, leaseOwner },
     });
     if (receipt.status === 'committed') {
-      this._terminalTokenAccountedRunIds.delete(runId);
-      this._stagedTerminalRunIds.delete(runId);
-      this._terminalStagingAdmissions.delete(runId);
+      this._terminalStagingLedger.forgetStaging(runId);
       this._drainTerminalObservers(runId, receipt);
       return staged !== undefined ? 'completed' : 'committed';
     }
@@ -5397,7 +5376,7 @@ export class Session {
     this._captureTurnRunId(full);
     if (
       full.runId &&
-      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalTokenAccountedRunIds.has(full.runId))
+      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalStagingLedger.isAccounted(full.runId))
     ) {
       return { tokenUsageAccounted: true };
     }
@@ -5405,8 +5384,8 @@ export class Session {
     this._applyTokenUsageDelta(tokenUsageDelta);
     if (tokenUsageDelta !== undefined) {
       if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
-      if (full.runId && this._stagedTerminalRunIds.has(full.runId)) {
-        this._terminalTokenAccountedRunIds.add(full.runId);
+      if (full.runId && this._terminalStagingLedger.isStaged(full.runId)) {
+        this._terminalStagingLedger.markAccounted(full.runId);
       }
       if (opts.persist !== false) this._schedulePersistTokenUsage();
       return { tokenUsageDelta, tokenUsageAccounted: true };
@@ -7546,7 +7525,7 @@ export class Session {
 
   /** Whether this exact provider result is durably staged for the run. */
   private async _providerResultStagedDurably(runId: string, full: FullOutput<unknown>): Promise<boolean> {
-    const admission = this._terminalStagingAdmissions.get(runId);
+    const admission = this._terminalStagingLedger.admissionFor(runId);
     if (admission === undefined) return false;
     try {
       const evidence = await this._storage.loadMessageResultEvidence({
@@ -7577,7 +7556,7 @@ export class Session {
       ) {
         return false;
       }
-      this._stagedTerminalRunIds.add(runId);
+      this._terminalStagingLedger.markStaged(runId);
       return true;
     } catch {
       return false;
@@ -7608,7 +7587,7 @@ export class Session {
       return;
     }
     try {
-      const cached = this._terminalStagingAdmissions.get(runId);
+      const cached = this._terminalStagingLedger.admissionFor(runId);
       let admission: HarnessTerminalAdmissionRecord | null;
       if (cached !== undefined && cached.sessionIncarnation === sessionIncarnation) {
         admission = cached;
@@ -7621,10 +7600,10 @@ export class Session {
             runId,
           });
         } catch (error) {
-          if (opts.tolerateUnknownRun === true && !this._nativeTerminalRunIds.has(runId)) return;
+          if (opts.tolerateUnknownRun === true && !this._terminalStagingLedger.isNative(runId)) return;
           throw error;
         }
-        if (admission?.status === 'pending') this._terminalStagingAdmissions.set(runId, admission);
+        this._terminalStagingLedger.cachePending(runId, admission);
       }
       if (admission?.status === 'pending') {
         // A process may have died after settling a prior completion but
@@ -7632,7 +7611,9 @@ export class Session {
         // terminal canonical evidence retires a fence: a cancelled admission
         // can leave its staged evidence pending for recovery. A run already
         // staged here (its provider result) has run this sweep.
-        const fencesToSweep = this._stagedTerminalRunIds.has(runId) ? [] : this._terminalTokenAccountedRunIds;
+        const fencesToSweep = this._terminalStagingLedger.isStaged(runId)
+          ? []
+          : this._terminalStagingLedger.accountedRunIds;
         for (const accountedRunId of fencesToSweep) {
           if (accountedRunId === runId) continue;
           const prior = await this._storage.loadTerminalAdmissionByRun({
@@ -7652,11 +7633,11 @@ export class Session {
             });
             if (evidence !== null && 'status' in evidence && evidence.status === 'pending') continue;
           }
-          this._terminalTokenAccountedRunIds.delete(accountedRunId);
+          this._terminalStagingLedger.sweepFence(accountedRunId);
         }
         const receipt = await this._storage.stageTerminalCompletion({ identity: admission, result: full });
-        if (receipt.status === 'staged') this._stagedTerminalRunIds.add(runId);
-        else this._terminalStagingAdmissions.delete(runId);
+        if (receipt.status === 'staged') this._terminalStagingLedger.markStaged(runId);
+        else this._terminalStagingLedger.forgetAdmission(runId);
       }
     } catch (error) {
       // A provisional stage has no observer of its own; the completed-output
@@ -10368,7 +10349,7 @@ export class Session {
     staged: FullOutput<unknown>,
     queuedItemId?: string,
   ): Promise<void> {
-    if (this._terminalTokenAccountedRunIds.has(runId)) {
+    if (this._terminalStagingLedger.isAccounted(runId)) {
       // Counted here before, but that save may have failed: settlement may
       // drop the staged output only once the fence and counter are durable.
       if (!this._record.accountedTerminalRunIds?.includes(runId) || !this._recordTokenUsageMatchesLive()) {
@@ -10407,8 +10388,7 @@ export class Session {
     } else {
       this._recordMessageTurnCompletion(staged, { persist: false });
     }
-    this._stagedTerminalRunIds.add(runId);
-    this._terminalTokenAccountedRunIds.add(runId);
+    this._terminalStagingLedger.markStagedAndAccounted(runId);
     await this._persistTokenUsageOrLatch();
   }
 
@@ -10991,10 +10971,9 @@ export class Session {
     };
     validateHarnessTerminalExecutionGrant(executionGrant, 'wake.executionGrant');
     // Another attempt for this notice is admitting or running here.
-    if (this._wakeTerminalAdmissionsInFlight.has(identity.admissionId)) {
+    if (!this._wakeAdmissions.enter(identity.admissionId)) {
       throw new HarnessBusyError(this.id, 'in_flight');
     }
-    this._wakeTerminalAdmissionsInFlight.add(identity.admissionId);
     try {
       const reservation = await this._writeMessageResultEvidence(
         {
@@ -11036,7 +11015,7 @@ export class Session {
       if (!stamped.applied) throw new HarnessBusyError(this.id, 'in_flight');
       return { identity, claimExpiresAt };
     } catch (error) {
-      this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+      this._wakeAdmissions.leave(identity.admissionId);
       // A reservation left behind is settled interrupted by dispatch recovery.
       this._scheduleOrphanRecheck(Date.now());
       // The notice was acknowledged before this wake, so a refusal other than
@@ -11060,8 +11039,7 @@ export class Session {
    * the next recheck or close, or leaves it durable for the next owner.
    */
   private _releaseWakeTerminalAdmission(admissionId: string): void {
-    this._wakeTerminalAdmissionsInFlight.delete(admissionId);
-    this._releasedWakeAdmissions.add(admissionId);
+    this._wakeAdmissions.release(admissionId);
     this._scheduleOrphanRecheck(Date.now());
   }
 
@@ -11098,11 +11076,8 @@ export class Session {
             await this._settleCancelledTerminalMessage(receipt.admission ?? identity, reason.message);
             // Nothing ran under the cancelled grant: drop its per-run state, as
             // a terminal commit does.
-            this._terminalTokenAccountedRunIds.delete(identity.runId);
-            this._stagedTerminalRunIds.delete(identity.runId);
-            this._terminalStagingAdmissions.delete(identity.runId);
-            this._nativeTerminalRunIds.delete(identity.runId);
-            this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+            this._terminalStagingLedger.forgetRun(identity.runId);
+            this._wakeAdmissions.leave(identity.admissionId);
             return;
           }
         } catch {
@@ -11240,8 +11215,7 @@ export class Session {
         ),
       );
     }
-    this._nativeTerminalRunIds.add(identity.runId);
-    this._terminalStagingAdmissions.set(identity.runId, receipt.admission);
+    this._terminalStagingLedger.admitNative(identity.runId, receipt.admission);
   }
 
   /**
@@ -11415,10 +11389,7 @@ export class Session {
         admission,
         ...(intent !== null ? { intent } : {}),
       };
-      this._terminalTokenAccountedRunIds.delete(identity.runId);
-      this._stagedTerminalRunIds.delete(identity.runId);
-      this._terminalStagingAdmissions.delete(identity.runId);
-      this._nativeTerminalRunIds.delete(identity.runId);
+      this._terminalStagingLedger.forgetRun(identity.runId);
       try {
         options.onReceipt?.(receipt);
       } catch {
@@ -11586,10 +11557,7 @@ export class Session {
       return reportFailure(new HarnessTerminalHandoffFencedError(identity.sessionId));
     }
     if (receipt.status === 'committed' || receipt.status === 'duplicate') {
-      this._terminalTokenAccountedRunIds.delete(identity.runId);
-      this._stagedTerminalRunIds.delete(identity.runId);
-      this._terminalStagingAdmissions.delete(identity.runId);
-      this._nativeTerminalRunIds.delete(identity.runId);
+      this._terminalStagingLedger.forgetRun(identity.runId);
     }
     try {
       options.onReceipt?.(receipt);
@@ -14014,7 +13982,7 @@ export class Session {
           const admission = wakeAdmission;
           wakeAdmission = undefined;
           if (wakeSettled) {
-            this._wakeTerminalAdmissionsInFlight.delete(wakeTerminal!.admissionId);
+            this._wakeAdmissions.leave(wakeTerminal!.admissionId);
           } else if (!wakeDispatchSent) {
             // A Stop, edit, delete or eviction refused the turn before its
             // dispatch: cancel the admission whenever it lands, as a grant
@@ -16848,8 +16816,7 @@ export class Session {
       // A pending native admission resumes here: its completed output must
       // stage fail-closed on every completion path.
       if (boundAdmission?.status === 'pending') {
-        this._nativeTerminalRunIds.add(pending.runId);
-        this._terminalStagingAdmissions.set(pending.runId, boundAdmission);
+        this._terminalStagingLedger.admitNative(pending.runId, boundAdmission);
       }
     }
 
@@ -20968,8 +20935,7 @@ export class Session {
           // construction and post-save assignment are not lost — we re-overlay
           // from the live counter below.
           tokenUsage: { ...tokenUsageForSave },
-          accountedTerminalRunIds:
-            this._terminalTokenAccountedRunIds.size > 0 ? [...this._terminalTokenAccountedRunIds] : undefined,
+          accountedTerminalRunIds: this._terminalStagingLedger.accountedSnapshot(),
           lastActivityAt: Date.now(),
         };
         // Resume-usage fence: while armed, any write that persists the bumped
