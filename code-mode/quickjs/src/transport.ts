@@ -297,7 +297,11 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
 
     const wasm = this.#module ?? (await getQuickJS());
 
+    // Transpilation and the first module load spend the run's budget, and
+    // synchronous work cannot be preempted. Report an expired run before
+    // starting the interpreter.
     if (abortSignal?.aborted) return abortedResult();
+    if (Date.now() >= deadline) return timedOutResult();
 
     const runtime = wasm.newRuntime();
     runtime.setMemoryLimit(this.#memoryLimitMb * 1024 * 1024);
@@ -463,6 +467,8 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
       if (bootstrap.error) {
         const err = context.dump(bootstrap.error) as { message?: string };
         bootstrap.error.dispose();
+        if (interrupted === 'abort') return abortedResult();
+        if (interrupted === 'timeout') return timedOutResult();
         return { success: false, logs, error: { message: err?.message ?? 'Code Mode bootstrap failed' } };
       }
       bootstrap.value.dispose();

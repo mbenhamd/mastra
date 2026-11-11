@@ -248,6 +248,25 @@ describe('QuickJsCodeModeTransport', () => {
     });
   });
 
+  it('does not call a custom transpile when the run is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let calls = 0;
+    const transport = new QuickJsCodeModeTransport({
+      transpile: async source => {
+        calls += 1;
+        return source;
+      },
+    });
+    const result = await run(`return 1;`, { transport, abortSignal: controller.signal });
+    expect(calls).toBe(0);
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution aborted', name: 'AbortError' },
+    });
+  });
+
   it('returns an AbortError result when the run is aborted during a custom transpile', async () => {
     const controller = new AbortController();
     const transport = new QuickJsCodeModeTransport({
