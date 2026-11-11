@@ -914,11 +914,22 @@ export function createSubagentControlTool(parent: Session) {
     // await: the active ones, and returned inline children whose automatic
     // close is still draining, which read as running until closedAt lands
     // (the session stays closing a moment longer, already closed).
-    const activeAtCall = new Set(activeSubagents().map(state => state.subagentSessionId));
-    for (const id of parent._internalReturnedInlineSubagents(runId).keys()) {
+    // A child counts only while its live session is not yet closed: a forced
+    // close can land before its active entry goes. Delegated children the
+    // driver is settling count until their commit.
+    const openHere = (id: string) => {
       const session = harness._internalGetLiveSession(id);
-      if (session?.isClosing === true && session.getRecord().closedAt === undefined) activeAtCall.add(id);
+      return session !== undefined && session.getRecord().closedAt === undefined;
+    };
+    const activeAtCall = new Set(
+      activeSubagents()
+        .map(state => state.subagentSessionId)
+        .filter(openHere),
+    );
+    for (const id of parent._internalReturnedInlineSubagents(runId).keys()) {
+      if (openHere(id) && harness._internalGetLiveSession(id)!.isClosing) activeAtCall.add(id);
     }
+    for (const id of parent._internalSettlingDelegations()) activeAtCall.add(id);
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
     let interval = WAIT_POLL_INTERVAL_MS;

@@ -957,6 +957,8 @@ type WaitRow = {
   holdFirstRead?: boolean;
   /** Settles this child before the call, with its durable commit held until `releaseCommit`. */
   commitPendingAtCall?: number;
+  /** Settles this child before the call: its plan write lands, its acknowledgement waits for `releaseAck`. */
+  ackPendingAtCall?: number;
   abortAfterMs?: number;
   check: (output: any, ctx: WaitRowContext & { returnedAt: number; startedAt: number; storageReads: number }) => void;
 };
@@ -971,6 +973,7 @@ type WaitRowContext = {
   settled: (index: number) => Promise<void>;
   releaseFirstRead: () => void;
   releaseCommit: () => void;
+  releaseAck: () => void;
 };
 
 const settledIds = (output: any) => (output.settledSubagents as any[]).map(view => view.subagentSessionId);
@@ -1071,6 +1074,23 @@ const waitRows: WaitRow[] = [
     },
   },
   {
+    name: 'until any returns a delegated child whose settlement write landed but was not acknowledged at the call',
+    children: 2,
+    holdFirstRead: true,
+    ackPendingAtCall: 0,
+    input: () => ({ action: 'wait', until: 'any', timeoutMs: 3_000 }),
+    drive: async ({ releaseFirstRead, firstReadDone, releaseAck }) => {
+      releaseFirstRead();
+      await firstReadDone();
+      releaseAck();
+    },
+    check: (output, { ids }) => {
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output)).toEqual([ids[0]]);
+      expect(runningIds(output)).toEqual([ids[1]]);
+    },
+  },
+  {
     name: 'until any still times out when no child settles',
     children: 2,
     input: () => ({ action: 'wait', until: 'any', timeoutMs: 200 }),
@@ -1143,6 +1163,29 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
         // The drive has ended and left the active map; its plan write waits.
         await poll(() => !(parent as any)._activeSubagents.has(`delegate:${ids[index]}`), 5_000);
       }
+      let releaseAck = () => {};
+      if (row.ackPendingAtCall !== undefined) {
+        const index = row.ackPendingAtCall;
+        const ackGate = new Promise<void>(resolve => (releaseAck = resolve));
+        let landed = false;
+        const writes = (parent as any)._storage;
+        (parent as any)._storage = new Proxy(writes, {
+          get(target, key) {
+            const value = Reflect.get(target, key, target);
+            if (typeof value !== 'function') return value;
+            if (key !== 'mutatePlanTasksForSession') return value.bind(target);
+            return async (...args: unknown[]) => {
+              const result = await value.apply(target, args);
+              landed = true;
+              await ackGate;
+              return result;
+            };
+          },
+        });
+        releases[index]!();
+        // The settlement write is durable; the driver has not heard back yet.
+        await poll(() => landed, 5_000);
+      }
       if (row.noInProcessSignal) {
         vi.spyOn(parent, '_internalOnDelegatedSettlement').mockReturnValue(() => {});
       }
@@ -1199,6 +1242,7 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
         },
         releaseFirstRead,
         releaseCommit: () => releaseCommit(),
+        releaseAck: () => releaseAck(),
       };
       const startedAt = Date.now();
       try {
@@ -1214,6 +1258,7 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
         vi.restoreAllMocks();
         releaseFirstRead();
         releaseCommit();
+        releaseAck();
         for (const release of releases) release();
         closeTurn();
         await harness.shutdown();
@@ -1914,6 +1959,30 @@ describe('subagent control tool — stable offsets', () => {
     } finally {
       releaseSave();
       await closed?.catch(() => undefined);
+      unregister(parent, keys);
+      for (const child of sessions) await child.close();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
+  it('wait until any is not woken by an inline child closed before the call while its active entry remains', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    const sessions = await addInlineChildren(harness, parent, 2);
+    try {
+      keys = register(parent, sessions, index => Date.now() - 1_000 + index);
+      // A forced close lands before the spawn's cleanup removes the active entry.
+      await sessions[0]!.close();
+
+      const output = await run({ action: 'wait', until: 'any', timeoutMs: 300 });
+
+      expect(output.timedOut).toBe(true);
+      expect(output.runningSubagents.map((view: any) => view.subagentSessionId)).toEqual([sessions[1]!.id]);
+    } finally {
       unregister(parent, keys);
       for (const child of sessions) await child.close();
       closeTurn();

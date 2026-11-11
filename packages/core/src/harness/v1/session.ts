@@ -2314,6 +2314,13 @@ export class Session {
   private _returnedInlineRunId: string | undefined;
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
+  /**
+   * Delegated children this process's driver has stopped driving but not yet
+   * settled: from the moment the active entry goes until the settlement commits
+   * or the drive gives up. Their durable link is still live, so they read as
+   * running.
+   */
+  private readonly _settlingDelegations = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
   private readonly _delegatedSettlementListeners = new Set<(subagentSessionId: string) => void>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
@@ -6976,6 +6983,11 @@ export class Session {
     } catch {
       // Best-effort: a late race (child already settling/closed) must not throw.
     }
+  }
+
+  /** @internal — the delegated children this process is settling now (see `_settlingDelegations`). */
+  _internalSettlingDelegations(): ReadonlySet<string> {
+    return this._settlingDelegations;
   }
 
   /**
@@ -25204,6 +25216,9 @@ export class Session {
     } finally {
       child._subagentAnswerDeltaListener = undefined;
       unsubProgress();
+      // In the same step as the active entry goes, so the child never reads as
+      // neither active nor settling here.
+      this._settlingDelegations.add(child.id);
       this._activeSubagents.delete(`delegate:${child.id}`);
       child._subagentTracingContext = undefined;
     }
@@ -25252,6 +25267,7 @@ export class Session {
         depth: childDepth,
       });
     } finally {
+      this._settlingDelegations.delete(child.id);
       this._delegationDriverClaims.delete(child.id);
       this._internalReleaseSubagentExecution();
       endDelegatedSubagentSpan(delegationSpan, outcome, settlement);
@@ -25323,6 +25339,7 @@ export class Session {
           // Before the public delegate_settled event: a wait that event starts
           // must not take this settlement as one from after its call.
           onCommitted: () => {
+            this._settlingDelegations.delete(subagentSessionId);
             for (const listener of Array.from(this._delegatedSettlementListeners)) {
               try {
                 listener(subagentSessionId);
