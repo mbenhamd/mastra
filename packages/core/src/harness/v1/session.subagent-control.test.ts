@@ -1876,6 +1876,51 @@ describe('subagent control tool — stable offsets', () => {
     }
   });
 
+  it('wait until any is not woken by an inline child whose close began but whose closing marker is not written', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    const sessions = await addInlineChildren(harness, parent, 2);
+    const closing = sessions[0]!;
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>(resolve => (releaseSave = resolve));
+    let closed: Promise<void> | undefined;
+    try {
+      keys = register(parent, sessions, index => Date.now() - 1_000 + index);
+      // The child's closing marker write is held, so close stays in flight.
+      const storage = (closing as any)._storage;
+      (closing as any)._storage = new Proxy(storage, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== 'function') return value;
+          if (key !== 'saveSession') return value.bind(target);
+          return (...args: unknown[]) => saveGate.then(() => value.apply(target, args));
+        },
+      });
+      const pending = run({ action: 'wait', until: 'any', timeoutMs: 400 });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      // As spawn_subagent does: return the child, then start its automatic close.
+      parent._internalReturnInlineSubagent(`inline:${closing.id}`, 'mock-run');
+      closed = harness._internalCloseSessionIfUnclaimed(closing);
+      const output = await pending;
+
+      expect(closing.isClosing).toBe(true);
+      expect(output.timedOut).toBe(true);
+      expect(output.runningSubagents.map((view: any) => view.subagentSessionId)).toEqual(
+        sessions.map(child => child.id),
+      );
+    } finally {
+      releaseSave();
+      await closed?.catch(() => undefined);
+      unregister(parent, keys);
+      for (const child of sessions) await child.close();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
   it('wait until any is woken by a closing inline child whose close finishes during the first read', async () => {
     const { harness, parentAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });

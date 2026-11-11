@@ -668,6 +668,9 @@ export function createSubagentControlTool(parent: Session) {
     childId: string,
     record: SessionRecord,
     live: boolean,
+    // A live session is closing from the moment close begins, before its
+    // durable closingAt marker lands.
+    closing: boolean,
     active: ActiveSubagentState | undefined,
     delegated: HarnessPlanTask | undefined,
     returned?: ReturnedInlineSubagentState,
@@ -701,7 +704,7 @@ export function createSubagentControlTool(parent: Session) {
       status = 'running';
     } else if (record.closedAt !== undefined) {
       status = 'closed';
-    } else if (active !== undefined || record.closingAt !== undefined) {
+    } else if (active !== undefined || closing || record.closingAt !== undefined) {
       // A closing child is still draining admitted work until closedAt lands.
       status = 'running';
     } else {
@@ -786,14 +789,23 @@ export function createSubagentControlTool(parent: Session) {
         const { live } = loaded[index]!;
         // A live record read before a slower load in the batch may predate a
         // return or close since; read it again beside the returned state.
-        const record = live
-          ? ((harness._internalGetLiveSession(id)?.getRecord() as SessionRecord | undefined) ?? loaded[index]!.record)
-          : loaded[index]!.record;
+        const session = live ? harness._internalGetLiveSession(id) : undefined;
+        const record = (session?.getRecord() as SessionRecord | undefined) ?? loaded[index]!.record;
         if (isOwnChild(record)) {
           // An inline child leaves the active map and gains its returned state in
           // one step, so a returned state recorded after the snapshot wins.
           const returned = returnedById.get(id);
-          views.push(project(id, record, live, returned ? undefined : activeById.get(id), delegated.get(id), returned));
+          views.push(
+            project(
+              id,
+              record,
+              live,
+              session?.isClosing === true,
+              returned ? undefined : activeById.get(id),
+              delegated.get(id),
+              returned,
+            ),
+          );
         } else if (record === null && opts.knownOwned?.has(id) === true) {
           views.push({
             subagentSessionId: id,
@@ -900,11 +912,10 @@ export function createSubagentControlTool(parent: Session) {
     const deadline = calledAt + timeoutMs;
     // The in-process children running when the call began, read before any
     // await: the active ones, and returned inline children whose automatic
-    // close is still draining, which read as running until closedAt lands.
+    // close is still draining, which read as running until it finishes.
     const activeAtCall = new Set(activeSubagents().map(state => state.subagentSessionId));
     for (const id of parent._internalReturnedInlineSubagents(runId).keys()) {
-      const record = harness._internalGetLiveSession(id)?.getRecord() as SessionRecord | undefined;
-      if (record?.closingAt !== undefined && record.closedAt === undefined) activeAtCall.add(id);
+      if (harness._internalGetLiveSession(id)?.isClosing === true) activeAtCall.add(id);
     }
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
