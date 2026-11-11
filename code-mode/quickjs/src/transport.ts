@@ -123,19 +123,17 @@ interface HostRpcEnvelope {
 
 /**
  * Waits for a caller-supplied transpile, or for the run's deadline or abort,
- * whichever comes first. A rejection propagates. A hook that loses the race is
+ * whichever comes first. The caller checks an already-aborted signal before
+ * starting the hook. A rejection propagates. A hook that loses the race is
  * left to settle on its own; its result is ignored.
  */
 async function raceTranspile(
-  output: string | Promise<string>,
+  hookOutput: string | Promise<string>,
   deadline: number,
   abortSignal: AbortSignal | undefined,
 ): Promise<{ kind: 'done'; output: string } | { kind: 'timeout' } | { kind: 'abort' }> {
-  if (typeof output === 'string') return { kind: 'done', output };
-  if (abortSignal?.aborted) {
-    output.catch(() => undefined);
-    return { kind: 'abort' };
-  }
+  if (typeof hookOutput === 'string') return { kind: 'done', output: hookOutput };
+  const output = Promise.resolve(hookOutput);
   let timer: NodeJS.Timeout | undefined;
   let onAbort: (() => void) | undefined;
   try {
@@ -243,6 +241,7 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
       if (!this.#transpile) {
         strippedProgram = tsBlankSpace(wrappedSource);
       } else {
+        if (abortSignal?.aborted) return abortedResult();
         const transpiled = await raceTranspile(this.#transpile(wrappedSource), deadline, abortSignal);
         if (transpiled.kind === 'timeout') return timedOutResult();
         if (transpiled.kind === 'abort') return abortedResult();
