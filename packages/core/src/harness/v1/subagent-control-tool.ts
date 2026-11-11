@@ -785,16 +785,10 @@ export function createSubagentControlTool(parent: Session) {
       for (const [index, id] of batch.entries()) {
         const { record, live } = loaded[index]!;
         if (isOwnChild(record)) {
-          views.push(
-            project(
-              id,
-              record,
-              live,
-              activeById.get(id),
-              delegated.get(id),
-              activeById.has(id) ? undefined : returnedById.get(id),
-            ),
-          );
+          // An inline child leaves the active map and gains its returned state in
+          // one step, so a returned state recorded after the snapshot wins.
+          const returned = returnedById.get(id);
+          views.push(project(id, record, live, returned ? undefined : activeById.get(id), delegated.get(id), returned));
         } else if (record === null && opts.knownOwned?.has(id) === true) {
           views.push({
             subagentSessionId: id,
@@ -891,6 +885,11 @@ export function createSubagentControlTool(parent: Session) {
   ): Promise<SubagentControlOutput> {
     const calledAt = Date.now();
     const deadline = calledAt + timeoutMs;
+    // Which in-process children were running, and which inline children had
+    // returned, when the call began. Read before any await, so a settlement
+    // can't slip between this snapshot and the call.
+    const activeAtCall = new Set(activeSubagents().map(state => state.subagentSessionId));
+    const returnedAtCall = new Set(parent._internalReturnedInlineSubagents(runId).keys());
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
     let interval = WAIT_POLL_INTERVAL_MS;
@@ -970,9 +969,16 @@ export function createSubagentControlTool(parent: Session) {
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
       // A child that settled while the first read was in flight was running
       // when the call began: it can end the wait and is pinned like the others.
+      // In-process children are classified by the snapshot taken at the call; a
+      // child driven elsewhere counts as running unless storage settled it before
+      // the call's millisecond.
       runningAtStart ??= new Set(
         views
-          .filter(view => !view.settled || (view.settledAt !== undefined && view.settledAt >= calledAt))
+          .filter(view => {
+            if (activeAtCall.has(view.subagentSessionId)) return true;
+            if (returnedAtCall.has(view.subagentSessionId)) return false;
+            return !view.settled || (view.settledAt !== undefined && view.settledAt > calledAt);
+          })
           .map(view => view.subagentSessionId),
       );
       // An implicit wait pins every child that was running when it started;

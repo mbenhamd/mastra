@@ -1757,6 +1757,86 @@ describe('subagent control tool — stable offsets', () => {
     }
   }, 60_000);
 
+  it('wait until any is not woken by an inline child that returned before the call, whatever its timestamp', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    const sessions = await addInlineChildren(harness, parent, 2);
+    try {
+      const now = Date.now();
+      keys = register(parent, sessions, index => now - 60_000 + index);
+      await returnInline(parent, sessions[0]!);
+      // A clock tie or skew can put the return at or after the call's time.
+      const returned = parent._internalReturnedInlineSubagents('mock-run').get(sessions[0]!.id) as {
+        returnedAt: number;
+      };
+      returned.returnedAt = Date.now() + 60_000;
+
+      const output = await run({ action: 'wait', until: 'any', timeoutMs: 300 });
+
+      expect(output.timedOut).toBe(true);
+      expect(output.runningSubagents.map((view: any) => view.subagentSessionId)).toEqual([sessions[1]!.id]);
+    } finally {
+      unregister(parent, keys);
+      for (const child of sessions) await child.close();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
+  it('wait until any is woken by an inline child that returns while an earlier load batch is in flight', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    let keys: string[] = [];
+    // 17 children: the last one loads in the second batch of 16.
+    const sessions = await addInlineChildren(harness, parent, 17);
+    const last = sessions[16]!;
+    try {
+      const now = Date.now();
+      keys = register(parent, sessions, index => now - 60_000 + index);
+      // The first child returned before the call; closed, it loads from storage.
+      await returnInline(parent, sessions[0]!);
+      let releaseRead!: () => void;
+      const readGate = new Promise<void>(resolve => (releaseRead = resolve));
+      let gated: (() => void) | undefined;
+      const readStarted = new Promise<void>(resolve => (gated = resolve));
+      const storage = parent._internalStorage;
+      const held = new Proxy(storage, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== 'function') return value;
+          if (key !== 'loadSession' || gated === undefined) return value.bind(target);
+          return (...args: unknown[]) => {
+            const signal = gated!;
+            gated = undefined;
+            signal();
+            return readGate.then(() => value.apply(target, args));
+          };
+        },
+      });
+      Object.defineProperty(parent, '_internalStorage', { value: held, configurable: true });
+      // The tool reads the parent's storage when it is created.
+      const run = control(parent);
+
+      const pending = run({ action: 'wait', until: 'any', timeoutMs: 3_000 });
+      await readStarted;
+      await returnInline(parent, last);
+      releaseRead();
+      const output = await pending;
+
+      expect(output.timedOut).toBe(false);
+      expect(output.settledSubagents.map((view: any) => view.subagentSessionId)).toEqual([last.id]);
+    } finally {
+      unregister(parent, keys);
+      for (const child of sessions) await child.close();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
   /** Page an implicit list from offset 0 through the hints, running `between` before each next page. */
   async function pageAll(
     run: (input: Record<string, unknown>) => Promise<any>,
