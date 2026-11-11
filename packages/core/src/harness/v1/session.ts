@@ -347,6 +347,7 @@ import {
   topRecordFieldSizes,
   UNSUSPENDED_AGENTIC_LOOP_STATUSES,
 } from './session-persistence';
+import { QueueHead } from './session-queue-head';
 import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
 import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
 import {
@@ -1439,6 +1440,8 @@ export class Session {
    */
   private readonly _displayRefreshListeners = new Set<() => void>();
 
+  /** PF-8365: the queue head (current queued item, its source, the `queue()` resolvers). */
+  private readonly _queueHead = new QueueHead();
   /**
    * Queue resolvers indexed by `queuedItem.id`. Set in `queue()` so the
    * caller's promise settles when the head turn completes (or rejects on
