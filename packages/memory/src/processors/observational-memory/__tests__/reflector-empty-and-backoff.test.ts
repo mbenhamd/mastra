@@ -1,5 +1,5 @@
 import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { BufferingCoordinator } from '../buffering-coordinator';
 import { OmModelExecutionError } from '../error';
@@ -71,6 +71,27 @@ function createFailingModel(failuresBeforeSuccess = Number.POSITIVE_INFINITY) {
         }),
         warnings: [],
       };
+    },
+  });
+  return {
+    model,
+    get callCount() {
+      return calls;
+    },
+  };
+}
+
+/** A provider that accepts the request and never answers; like fetch, it settles only on abort. */
+function createHangingModel(onAttempt?: () => void) {
+  let calls = 0;
+  const model = new MockLanguageModelV2({
+    modelId: 'mock-hanging-reflector',
+    doStream: ({ abortSignal }: any) => {
+      calls++;
+      onAttempt?.();
+      return new Promise<never>((_, reject) => {
+        abortSignal?.addEventListener('abort', () => reject(abortSignal.reason), { once: true });
+      });
     },
   });
   return {
@@ -360,6 +381,65 @@ describe('reflector retry budget and terminal policy', () => {
       reflection: expect.stringContaining('recovered summary'),
     });
     expect(record).toMatchObject(stateBeforeFailure);
+  });
+
+  describe('when the Reflector model never answers', () => {
+    const idleTimeoutMs = RETRY_CONFIG.modelCallIdleTimeoutMs;
+
+    beforeEach(() => {
+      // Shrink OM's idle limit so a silent Reflector call ends in milliseconds.
+      RETRY_CONFIG.modelCallIdleTimeoutMs = 50;
+    });
+
+    afterEach(() => {
+      RETRY_CONFIG.modelCallIdleTimeoutMs = idleTimeoutMs;
+    });
+
+    // Fork (PF-7236): OM's own idle timeout or deadline is a reflector-model failure, so a
+    // reflection whose first token is slower than the idle limit does not end the turn.
+    it('continues the turn when OM times the Reflector out', async () => {
+      const hanging = createHangingModel();
+      const { runner, createReflectionGeneration, persistMarkerToStorage } = createReflectorRunner(hanging.model, {
+        reflectionConfig: { failurePolicy: 'continue', maxRetries: 0 },
+      });
+
+      await runner.maybeReflect({
+        record: makeRecord(),
+        observationTokens: SOURCE_OBSERVATIONS.length,
+        threadId: 'thread-1',
+      });
+
+      expect(hanging.callCount).toBe(1);
+      expect(createReflectionGeneration).not.toHaveBeenCalled();
+      expect(persistMarkerToStorage.mock.calls[0]![0]).toMatchObject({
+        type: 'data-om-observation-failed',
+        data: { operationType: 'reflection', failurePolicy: 'continue', failureKind: 'reflector-model' },
+      });
+    });
+
+    it('keeps a caller abort fatal under continue', async () => {
+      const controller = new AbortController();
+      const hanging = createHangingModel(() => setTimeout(() => controller.abort(new Error('caller cancelled')), 10));
+      const { runner } = createReflectorRunner(hanging.model, {
+        reflectionConfig: { failurePolicy: 'continue', maxRetries: 0 },
+      });
+
+      const error = await runner
+        .maybeReflect({
+          record: makeRecord(),
+          observationTokens: SOURCE_OBSERVATIONS.length,
+          threadId: 'thread-1',
+          abortSignal: controller.signal,
+        })
+        .then(
+          () => undefined,
+          (rejection: unknown) => rejection,
+        );
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(OmModelExecutionError);
+      expect(hanging.callCount).toBe(1);
+    });
   });
 
   it('keeps the exhausted reflector-model failure fatal under abort policy', async () => {
