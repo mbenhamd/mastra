@@ -1277,15 +1277,21 @@ describe('ComposioToolProvider — listConnections', () => {
       await integration.listConnections({ toolkit: 'gmail' }).catch(() => undefined);
       const raw = getRawInstance();
       raw.connectedAccounts.list.mockClear();
-      raw.connectedAccounts.list.mockImplementation(async (query: { accountType?: string; userIds?: string[] }) => {
-        if (query.accountType === 'ALL') {
-          return { items: [{ id: 'ca_mine', status: 'ACTIVE', isDisabled: false }], nextCursor: 'more' };
-        }
-        // SHARED without userIds: every SHARED account; with userIds: the bucket's own.
-        return query.userIds
-          ? { items: [ownShared], nextCursor: null }
-          : { items: [ownShared, sharedAccount('ca_admin', { allowAllUsers: true })], nextCursor: null };
-      });
+      raw.connectedAccounts.list.mockImplementation(
+        async (query: { accountType?: string; userIds?: string[]; cursor?: string }) => {
+          if (query.accountType === 'ALL') {
+            return { items: [{ id: 'ca_mine', status: 'ACTIVE', isDisabled: false }], nextCursor: 'more' };
+          }
+          if (!query.userIds) {
+            // Every SHARED account, regardless of owner.
+            return { items: [ownShared, sharedAccount('ca_admin', { allowAllUsers: true })], nextCursor: null };
+          }
+          // The bucket's own SHARED accounts, over two pages.
+          return query.cursor === 'own_2'
+            ? { items: [ownShared], nextCursor: null }
+            : { items: [sharedAccount('ca_other_own')], nextCursor: 'own_2' };
+        },
+      );
 
       const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'], perPage: 1 });
 

@@ -129,8 +129,7 @@ export interface ComposioListConnectionsOpts extends ListConnectionsOpts {
 export interface ComposioExistingConnection extends ExistingConnection {
   /**
    * The account belongs to a requested bucket. `false` for another user's
-   * SHARED account whose ACL admits a requested bucket. A bucket's own SHARED
-   * account beyond the first 200 it owns for the toolkit also reads `false`.
+   * SHARED account whose ACL admits a requested bucket.
    */
   owned: boolean;
   /** Composio's sharing model for the account, when Composio reports one. */
@@ -788,14 +787,28 @@ export class ComposioToolProvider extends BaseToolProvider {
     // it may still be the bucket's own, so look those up among its own SHARED
     // accounts before calling them another user's.
     const ownedIds = new Set((owned.items ?? []).map(account => account.id));
-    if (hasNextCursor(owned) && sharedItems.some(account => !ownedIds.has(account.id))) {
-      const ownShared: ConnectedAccountListResponse = await composio.connectedAccounts.list({
-        toolkitSlugs: [opts.toolkit],
-        ...(userIds ? { userIds } : {}),
-        accountType: 'SHARED',
-        limit: MAX_LIMIT,
-      });
-      for (const account of ownShared.items ?? []) ownedIds.add(account.id);
+    if (hasNextCursor(owned)) {
+      const unresolved = new Set(sharedItems.map(account => account.id).filter(id => !ownedIds.has(id)));
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      while (unresolved.size > 0) {
+        const ownShared: ConnectedAccountListResponse = await composio.connectedAccounts.list({
+          toolkitSlugs: [opts.toolkit],
+          ...(userIds ? { userIds } : {}),
+          accountType: 'SHARED',
+          limit: MAX_LIMIT,
+          ...(cursor ? { cursor } : {}),
+        });
+        for (const account of ownShared.items ?? []) {
+          ownedIds.add(account.id);
+          unresolved.delete(account.id);
+        }
+        // A repeated cursor would loop forever; stop as if the list ended.
+        const next = hasNextCursor(ownShared) ? (ownShared as { nextCursor: string }).nextCursor : undefined;
+        if (next === undefined || cursors.has(next)) break;
+        cursors.add(next);
+        cursor = next;
+      }
     }
     const items: ComposioExistingConnection[] = [];
     const seen = new Set<string>();
