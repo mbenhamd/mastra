@@ -12,9 +12,9 @@
  *   - `forgetStaging` and `forgetRun` both drop a run's fence, staged mark and
  *     cached admission; only `forgetRun` also drops the native-admission mark.
  *     The session's call sites differ in exactly that, and this ledger does not
- *     decide which one is right (orphaned-dispatch interruption and recovered
- *     commits keep the native mark; native commits and cancelled wake grants
- *     drop it).
+ *     decide which one is right (`_interruptOrphanedMessageDispatch` and
+ *     `_commitInterruptedTerminalHandoff` keep the native mark;
+ *     `_runTerminalHandoffCommit` and `_cancelWakeTerminalAdmission` drop it).
  *   - `cachePending` caches an admission only while it is pending.
  *   - `markAccounted` does not check that the run is staged: one caller checks
  *     that first, and the constructor restores the durable fences as they are.
