@@ -15,7 +15,9 @@
  *     decide which one is right (`_interruptOrphanedMessageDispatch` and
  *     `_commitInterruptedTerminalHandoff` keep the native mark;
  *     `_runTerminalHandoffCommit` and `_cancelWakeTerminalAdmission` drop it).
- *   - `cachePending` caches an admission only while it is pending.
+ *   - The admissions map holds only pending admissions: `cachePending` caches
+ *     only a pending one, and `admitNative` refuses (returns `false`, changing
+ *     nothing) one that is not.
  *   - `markAccounted` does not check that the run is staged: one caller checks
  *     that first, and the constructor restores the durable fences as they are.
  *   - `accountedRunIds` is the live set, which the fence sweep iterates across
@@ -38,14 +40,28 @@ export class TerminalStagingLedger {
    */
   private readonly _terminalStagingAdmissions = new Map<string, HarnessTerminalAdmissionRecord>();
 
-  /** Drop the run's usage fence, staged mark and cached admission; keep its native mark. */
+  /**
+   * Drop the run's usage fence, staged mark and cached admission; keep its
+   * native mark. The recovery paths use this when they settle a run whose
+   * dispatch was orphaned (`_interruptOrphanedMessageDispatch`,
+   * `_commitInterruptedTerminalHandoff`): usually a run another process
+   * admitted, so this process never marked it native. Of what it drops, only
+   * the usage fence is read again (every later session save persists it); the
+   * staged mark, the cached admission and the native mark are read only while
+   * the same run stages or completes here, which a settled run does not.
+   */
   forgetStaging(runId: string): void {
     this._terminalTokenAccountedRunIds.delete(runId);
     this._stagedTerminalRunIds.delete(runId);
     this._terminalStagingAdmissions.delete(runId);
   }
 
-  /** Drop the run's usage fence, staged mark, cached admission and native mark. */
+  /**
+   * Drop the run's usage fence, staged mark, cached admission and native mark.
+   * Used where this process settles a run it admitted natively itself: its
+   * terminal commit (`_runTerminalHandoffCommit`) or a wake grant it gave up
+   * before dispatch (`_cancelWakeTerminalAdmission`).
+   */
   forgetRun(runId: string): void {
     this._terminalTokenAccountedRunIds.delete(runId);
     this._stagedTerminalRunIds.delete(runId);
@@ -53,10 +69,17 @@ export class TerminalStagingLedger {
     this._nativeTerminalRunIds.delete(runId);
   }
 
-  /** Mark the run as admitted natively here and cache its admission. */
-  admitNative(runId: string, admission: HarnessTerminalAdmissionRecord): void {
+  /**
+   * Mark the run as admitted natively here and cache its admission, only if
+   * the admission is pending. Otherwise it changes nothing and returns `false`,
+   * so the admissions map holds only pending admissions, as with
+   * `cachePending`. Both callers pass only pending admissions.
+   */
+  admitNative(runId: string, admission: HarnessTerminalAdmissionRecord): boolean {
+    if (admission.status !== 'pending') return false;
     this._nativeTerminalRunIds.add(runId);
     this._terminalStagingAdmissions.set(runId, admission);
+    return true;
   }
 
   /** Cache a loaded admission for the run, only if it is pending. */

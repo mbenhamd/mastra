@@ -114,6 +114,28 @@ function orphanedAdmission(
   };
 }
 
+const STAGED_USAGE = { inputTokens: 8, outputTokens: 5, totalTokens: 13 };
+
+/**
+ * The dead owner's held run finished and staged its output durably, then the
+ * owner died before counting its usage or committing the turn.
+ */
+async function stageOutputOfHeldTurn(owner: Awaited<ReturnType<typeof dispatchHeldTurn>>) {
+  const admission = await owner.storage.loadTerminalAdmission({
+    harnessName: 'default',
+    sessionId: owner.sessionId,
+    admissionId: 'orphaned-turn',
+    executionGrant: grant,
+  });
+  await expect(
+    owner.storage.stageTerminalCompletion({
+      identity: admission!,
+      result: { runId: owner.runId, text: 'staged answer', finishReason: 'stop', totalUsage: STAGED_USAGE },
+    }),
+  ).resolves.toEqual({ status: 'staged' });
+  return admission!;
+}
+
 async function stopDeadOwner(owner: { harness: Harness; release: () => void }) {
   owner.release();
   await owner.harness.shutdown().catch(() => {});
@@ -1374,5 +1396,124 @@ describe('Session adoption — orphaned message dispatch', () => {
       await adopter.harness.shutdown();
       await stopDeadOwner(deadOwner);
     }
+  });
+
+  // PF-8406: recovery counts a staged run's usage behind a per-run fence that
+  // every session save persists (`accountedTerminalRunIds`) and a restart
+  // restores. Once the run's evidence is final the fence is forgotten, so the
+  // next save no longer carries it. Each case reaches a different forget.
+  describe('the usage fence of a recovered staged run leaves the session record once the run is settled', () => {
+    async function adoptLapsedSession(
+      db: InMemoryDB,
+      sessionId: string,
+      configure?: (storage: InMemoryHarness) => void,
+    ) {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(Date.now() + LEASE_AND_DISPATCH_CLAIM_LAPSED_MS);
+      const adopterAgent = new MockAgent({ id: 'default', defaultOutput: { text: 'must not run' } });
+      const adopter = harnessProcess(db, adopterAgent, true);
+      configure?.(adopter.storage);
+      const session = await adopter.harness.session({ sessionId, resourceId: 'u1' });
+      return { ...adopter, adopterAgent, session };
+    }
+
+    it('when recovery commits the staged output (interrupted handoff, committed receipt)', async () => {
+      const db = new InMemoryDB();
+      const deadOwner = await dispatchHeldTurn(db, terminalHandoffMessage);
+      const admission = await stageOutputOfHeldTurn(deadOwner);
+      const adopter = await adoptLapsedSession(db, deadOwner.sessionId);
+      try {
+        await expect(adopter.storage.loadTerminalAdmission(admission)).resolves.toMatchObject({
+          status: 'committed',
+          terminalResult: { status: 'completed' },
+        });
+        await adopter.session.models.switch({ model: 'any-later-save' });
+
+        const saved = await adopter.storage.loadSession({ sessionId: deadOwner.sessionId });
+        expect(saved?.tokenUsage).toMatchObject({ totalTokens: 13 });
+        expect(saved?.accountedTerminalRunIds).toBeUndefined();
+        expect(adopter.adopterAgent.streamCalls).toHaveLength(0);
+      } finally {
+        await adopter.harness.shutdown();
+        await stopDeadOwner(deadOwner);
+      }
+    });
+
+    it('when another owner already committed the run after this owner listed it (admission found committed)', async () => {
+      const db = new InMemoryDB();
+      const deadOwner = await dispatchHeldTurn(db, terminalHandoffMessage);
+      const admission = await stageOutputOfHeldTurn(deadOwner);
+      // The page the winning owner listed before its commit landed: a scan
+      // read concurrently with that commit lists the run pending, with its
+      // staged output.
+      let listedBeforeCommit: Awaited<ReturnType<InMemoryHarness['listPendingMessageAdmissions']>> | undefined;
+      const winner = await adoptLapsedSession(db, deadOwner.sessionId, storage => {
+        const list = storage.listPendingMessageAdmissions.bind(storage);
+        storage.listPendingMessageAdmissions = async input => {
+          const page = await list(input);
+          listedBeforeCommit ??= structuredClone(page);
+          return page;
+        };
+      });
+      await expect(winner.storage.loadTerminalAdmission(admission)).resolves.toMatchObject({ status: 'committed' });
+      await winner.harness.shutdown();
+
+      let staleScan = true;
+      const adopter = await adoptLapsedSession(db, deadOwner.sessionId, storage => {
+        const list = storage.listPendingMessageAdmissions.bind(storage);
+        storage.listPendingMessageAdmissions = async input => {
+          if (!staleScan) return list(input);
+          staleScan = false;
+          return listedBeforeCommit!;
+        };
+      });
+      try {
+        expect(staleScan).toBe(false);
+        await adopter.session.models.switch({ model: 'any-later-save' });
+
+        const saved = await adopter.storage.loadSession({ sessionId: deadOwner.sessionId });
+        expect(saved?.tokenUsage).toMatchObject({ totalTokens: 13 });
+        expect(saved?.accountedTerminalRunIds).toBeUndefined();
+        expect(adopter.adopterAgent.streamCalls).toHaveLength(0);
+      } finally {
+        await adopter.harness.shutdown();
+        await stopDeadOwner(deadOwner);
+      }
+    });
+
+    it('when the row of a cancelled admission is settled interrupted (orphaned dispatch, applied swap)', async () => {
+      const db = new InMemoryDB();
+      const deadOwner = await dispatchHeldTurn(db, terminalHandoffMessage);
+      const admission = await stageOutputOfHeldTurn(deadOwner);
+      // A Stop cancelled the grant after the output was staged; its row stays
+      // pending until recovery settles it.
+      await expect(
+        deadOwner.storage.cancelTerminalHandoff({
+          harnessName: admission.harnessName,
+          sessionId: admission.sessionId,
+          sessionIncarnation: admission.sessionIncarnation,
+          admissionId: admission.admissionId,
+          admissionHash: admission.admissionHash,
+          executionGrant: admission.executionGrant,
+          reason: { code: 'harness.terminal_cancelled', message: 'stopped' },
+          cancelledAt: Date.now(),
+        }),
+      ).resolves.toMatchObject({ status: 'cancelled' });
+      const adopter = await adoptLapsedSession(db, deadOwner.sessionId);
+      try {
+        await expect(
+          adopter.storage.loadMessageResultEvidence({ ...deadOwner.scope, signalId: deadOwner.signalId }),
+        ).resolves.toMatchObject({ status: 'failed', error: { code: 'harness.run_interrupted' } });
+        await adopter.session.models.switch({ model: 'any-later-save' });
+
+        const saved = await adopter.storage.loadSession({ sessionId: deadOwner.sessionId });
+        expect(saved?.tokenUsage).toMatchObject({ totalTokens: 13 });
+        expect(saved?.accountedTerminalRunIds).toBeUndefined();
+        expect(adopter.adopterAgent.streamCalls).toHaveLength(0);
+      } finally {
+        await adopter.harness.shutdown();
+        await stopDeadOwner(deadOwner);
+      }
+    });
   });
 });

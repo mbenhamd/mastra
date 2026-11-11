@@ -49,6 +49,22 @@ describe('TerminalStagingLedger', () => {
     expect(ledger.isNative('run-c')).toBe(false);
   });
 
+  it('admitNative admits only a pending admission, and refuses a settled one without marking the run native', () => {
+    const ledger = new TerminalStagingLedger();
+    const pending = admission('pending');
+
+    expect(ledger.admitNative('run-pending', pending)).toBe(true);
+    for (const status of ['committed', 'cancelled', 'fenced'] as const) {
+      expect(ledger.admitNative(`run-${status}`, admission(status))).toBe(false);
+      expect(ledger.isNative(`run-${status}`)).toBe(false);
+      expect(ledger.admissionFor(`run-${status}`)).toBeUndefined();
+    }
+    expect(ledger.isNative('run-pending')).toBe(true);
+    expect(ledger.admissionFor('run-pending')).toBe(pending);
+    expect(ledger.admissionCount).toBe(1);
+    expect(ledger.nativeRunCount).toBe(1);
+  });
+
   it('accountedSnapshot is a copy of the fences at call time, and undefined when there are none', () => {
     const ledger = new TerminalStagingLedger();
     expect(ledger.accountedSnapshot()).toBeUndefined();
