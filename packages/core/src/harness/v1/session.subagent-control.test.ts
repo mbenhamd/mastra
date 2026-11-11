@@ -1875,6 +1875,59 @@ describe('subagent control tool — stable offsets', () => {
     }
   });
 
+  it('wait until any is woken by a closing inline child whose close finishes during the first read', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    let keys: string[] = [];
+    const sessions = await addInlineChildren(harness, parent, 2);
+    const closing = sessions[0]!;
+    try {
+      keys = register(parent, sessions, index => Date.now() - 1_000 + index);
+      // The first spawn returned and its automatic close has begun; the second runs.
+      parent._internalReturnInlineSubagent(`inline:${closing.id}`, 'mock-run');
+      (closing as any)._record.closingAt = Date.now();
+      let releaseRead!: () => void;
+      const readGate = new Promise<void>(resolve => (releaseRead = resolve));
+      let gated: (() => void) | undefined;
+      const readStarted = new Promise<void>(resolve => (gated = resolve));
+      const storage = parent._internalStorage;
+      const held = new Proxy(storage, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== 'function') return value;
+          if (key !== 'listPlanTasks' || gated === undefined) return value.bind(target);
+          return (...args: unknown[]) => {
+            const signal = gated!;
+            gated = undefined;
+            signal();
+            return readGate.then(() => value.apply(target, args));
+          };
+        },
+      });
+      Object.defineProperty(parent, '_internalStorage', { value: held, configurable: true });
+      const run = control(parent);
+
+      const pending = run({ action: 'wait', until: 'any', timeoutMs: 1_000 });
+      await readStarted;
+      // The close finishes while the first read is held.
+      (closing as any)._record.closedAt = Date.now();
+      releaseRead();
+      const output = await pending;
+
+      expect(output.timedOut).toBe(false);
+      expect(output.settledSubagents.map((view: any) => view.subagentSessionId)).toEqual([closing.id]);
+      expect(output.runningSubagents.map((view: any) => view.subagentSessionId)).toEqual([sessions[1]!.id]);
+    } finally {
+      unregister(parent, keys);
+      delete (closing as any)._record.closingAt;
+      delete (closing as any)._record.closedAt;
+      for (const child of sessions) await child.close();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
   it('wait until any is woken by an inline child that returns while an earlier load batch is in flight', async () => {
     const { harness, parentAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
