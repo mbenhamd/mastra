@@ -248,6 +248,42 @@ describe('QuickJsCodeModeTransport', () => {
     });
   });
 
+  it('evaluates the output of a custom transpile that returns a bare thenable', async () => {
+    // A JavaScript caller may return any thenable, not only a native Promise.
+    const thenable = {
+      then(resolve: (value: string) => void) {
+        resolve('(async () => { return 7; })');
+      },
+    };
+    const transport = new QuickJsCodeModeTransport({
+      transpile: () => thenable as unknown as Promise<string>,
+    });
+    const result = await run(`return 1;`, { transport });
+    expect(result).toEqual({ success: true, result: 7, logs: [] });
+  });
+
+  it('does not leave an unhandled rejection when a timed-out transpile rejects later', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const transport = new QuickJsCodeModeTransport({
+        transpile: () =>
+          new Promise<string>((_, reject) => setTimeout(() => reject(new Error('late transpile failure')), 60)),
+      });
+      const result = await run(`return 1;`, { transport, timeout: 20 });
+      expect(result).toEqual({
+        success: false,
+        logs: [],
+        error: { message: 'Code Mode execution timed out after 20ms', name: 'TimeoutError' },
+      });
+      await new Promise(resolve => setTimeout(resolve, 120));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('does not call a custom transpile when the run is already aborted', async () => {
     const controller = new AbortController();
     controller.abort();
