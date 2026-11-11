@@ -67,7 +67,6 @@ import {
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
-import { watchHistoryLoad } from '../../memory/history-load-watch';
 import type { HistoryLoadWatch } from '../../memory/history-load-watch';
 import type { MastraMemory } from '../../memory/memory';
 import type { TracingContext } from '../../observability';
@@ -137,7 +136,6 @@ import type {
   SessionRecord,
   SessionSummary,
 } from '../../storage/domains/harness';
-import { assertObservationalMemorySourceWriteGuardSupported } from '../../storage/domains/memory/base';
 import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
@@ -231,7 +229,6 @@ import type {
   DecomposeChildInput,
   DelegatedSettlementNoticeMode,
   DelegatedSubagentOutcome,
-  DelegationNoticeClaim,
   PendingDelegationSettlementNotice,
   PlanTaskSessionPort,
   PlanTaskSummary,
@@ -241,9 +238,6 @@ import type {
 } from './plan-task-session';
 import {
   capturePlanTaskDelegationScope,
-  planTaskAcknowledgeDelegationSettlementNotice,
-  planTaskClaimDelegationSettlementNotice,
-  planTaskClearDelegationSettlementNoticeClaim,
   planTaskAdd,
   planTaskCheck,
   planTaskComplete,
@@ -271,6 +265,8 @@ import {
   DELEGATED_SUBAGENT_CANCELLED_ERROR,
   DELEGATED_SUBTREE_MAX_NODES,
   DELEGATION_DEADLINE_REACHED,
+  DELEGATION_RECONCILE_RETRY_BASE_MS,
+  DELEGATION_RECONCILE_RETRY_MAX_MS,
   delegationAdmissionId,
   delegationSignalId,
   isParentRequestedSubagentCancel,
@@ -351,26 +347,22 @@ import {
   topRecordFieldSizes,
   UNSUSPENDED_AGENTIC_LOOP_STATUSES,
 } from './session-persistence';
+import { SessionSettlementNoticeDelivery } from './session-settlement-notice-delivery';
+import type { SettlementNoticeDeliverySessionPort } from './session-settlement-notice-delivery';
 import {
-  delegationSettlementNoticeText,
-  holdNoticeClaim,
-  isObservationalMemorySourceWriteConflict,
-  noticeClaimTakeoverEligible,
-  releaseNoticeClaim,
-  REMIND_NOTICE_BARRIER_ROUNDS,
-  REMIND_NOTICE_BARRIER_TIMEOUT_MS,
-  requiresObservationalMemorySourceWriteGuard,
+  DelegationNoticeWakeNotSentError,
   WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS,
   WAKE_TERMINAL_COMMIT_RETRY_BASE_MS,
   WAKE_TERMINAL_COMMIT_RETRY_MAX_MS,
 } from './session-settlement-notices';
 import type {
   DelegationNoticeOutcome,
-  NoticeClaimResult,
   NoticeDelivery,
   NoticeFence,
   NoticeFenceSite,
+  WakeReminderRowOrigin,
 } from './session-settlement-notices';
+import { NativeSignalAcceptanceTimeoutError, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS } from './session-signal-acceptance';
 import { SessionSkillsMcpActions } from './session-skills-mcp-actions';
 import type { SkillsMcpActionsSessionPort } from './session-skills-mcp-actions';
 import {
@@ -918,24 +910,6 @@ class HarnessOrdinaryStepBudgetExhaustedError extends Error {
   }
 }
 
-/**
- * PF-7679: a settlement wake that did not dispatch, by reason. `claim_lost`:
- * the claim was not won (another claim holds the notice, the notice moved, or
- * the claim fence refused it). `slot_lost`: a caller turn took the idle slot
- * after the claim (the delivery clears its claim and waits again). `delivered`:
- * a run already loaded the reminder row into its context. `stale`: a Stop or
- * edit since the settlement. `lease_lost`: this owner no longer holds the
- * session lease at dispatch. `unconfirmed`: the dispatch was sent but the
- * runtime answered with neither a wake on the expected run nor a discard, so a
- * run may have started.
- */
-class DelegationNoticeWakeNotSentError extends Error {
-  constructor(readonly reason: 'claim_lost' | 'slot_lost' | 'delivered' | 'stale' | 'lease_lost' | 'unconfirmed') {
-    super(`Settlement notice wake not sent: ${reason}`);
-    this.name = 'DelegationNoticeWakeNotSentError';
-  }
-}
-
 // §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
 // itself is idempotency state, so only a recent window is needed, and a stored
 // result must never carry provider payloads large enough to push the session
@@ -984,7 +958,6 @@ const MESSAGE_ADMISSION_DURABLE_WAIT_MAX_INTERVAL_MS = 15_000;
 const SIGNAL_DISPATCH_CLAIM_TTL_MS = 30_000;
 const SIGNAL_DISPATCH_CLAIM_RENEW_MS = 10_000;
 const SIGNAL_ACCEPTED_RECOVERY_STALE_MS = 30_000;
-const SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS = 30_000;
 const MESSAGE_RESULT_EVIDENCE_BACKGROUND_OBSERVE_TIMEOUT_MS = 5_000;
 const QUEUE_ACCEPTED_RECOVERY_STALE_MS = 30_000;
 const QUEUE_POST_RUN_FINALIZATION_RETRY_MS = 1_000;
@@ -996,9 +969,6 @@ const HARNESS_RUN_INTERRUPTED_MESSAGE =
   'The run was interrupted when the process that owned it stopped; it was not re-run.';
 /** Back-off before recovery retries a turn whose settlement did not commit. */
 const ORPHANED_DISPATCH_RETRY_MS = 1_000;
-/** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
-const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
-const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
 // Cap explicit extensions to one day so a lost worker cannot pin a session indefinitely.
 const MAX_LEASE_EXTENSION_MS = 24 * 60 * 60 * 1_000;
 
@@ -1444,13 +1414,6 @@ export async function delegatedChildOwesRecoveredCompletion(
   }
 }
 
-/**
- * PF-7631: where a settlement notice's reminder row was saved: the agent whose
- * memory saved it, that memory instance, the mode it was resolved for, and the
- * session's mode-switch epoch taken before resolution.
- */
-type WakeReminderRowOrigin = { agent: Agent; memory: MastraMemory; modeId: string; modeEpoch: number };
-
 export class Session {
   /** Stable identity. Frozen at construction. */
   readonly id: string;
@@ -1668,17 +1631,15 @@ export class Session {
   private readonly _settlingDelegations = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
   private readonly _delegatedSettlementListeners = new Set<(subagentSessionId: string) => void>();
-  /** Settlement notices (child id + digest) this process is delivering right now. */
-  private readonly _delegationNoticesInFlight = new Set<string>();
+  /** PF-8326: settlement-notice delivery, with its own state; it reaches this session through its port. */
+  private readonly _settlementNoticeDelivery = new SessionSettlementNoticeDelivery(
+    this._settlementNoticeDeliveryPort(),
+  );
+  private get _delegationNoticesInFlight(): Set<string> {
+    return this._settlementNoticeDelivery._delegationNoticesInFlight;
+  }
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
   private readonly _delegationNoticeDeliveries = new Set<Promise<void>>();
-  /**
-   * PF-8202 — `remind` deliveries in flight. A turn waits for them before its
-   * run loads history, so a row being saved is in that history and is not
-   * acknowledged behind the turn's back. `remind` never waits for the parent
-   * to go idle, so this cannot wait on the turn itself.
-   */
-  private readonly _remindDeliveries = new Set<Promise<void>>();
   /**
    * PF-8202 — `remind` settlements between their commit (which emits
    * `delegate_settled`) and the start of their notice delivery. A turn begun
@@ -1687,19 +1648,6 @@ export class Session {
    * plan-task write chain.
    */
   private readonly _remindSettlementsStarting = new Set<Promise<void>>();
-  /**
-   * PF-8202 — whether the one drain of the two sets above is running, and each
-   * waiting turn's wake-up with the drain rounds it still waits for. Every turn
-   * gets its own rounds from the point it joins, and leaves at its own
-   * deadline, so a save that never settles holds one drain and no waiters.
-   */
-  private _remindNoticeDraining = false;
-  private readonly _remindNoticeDrainWaiters = new Map<() => void, number>();
-  /**
-   * First admission epoch seen for each owed notice in this process, so a retry
-   * or a later reconcile pass cannot launder a Stop that happened in between.
-   */
-  private readonly _delegationNoticeEpochs = new Map<string, number>();
   /**
    * PF-7679: the history-load watch on each owed notice's reminder row, kept
    * across delivery attempts until the notice is resolved or the session tears
@@ -22143,56 +22091,8 @@ export class Session {
     return [context, instructions];
   }
 
-  /**
-   * PF-8202: wait for the `remind` settlements committed but not yet started,
-   * and for the `remind` deliveries in flight, so their rows are saved before a
-   * turn's run loads history. A delivery that finishes may be followed by a
-   * reconcile pass that starts another, so this repeats; the bound keeps a busy
-   * reconcile loop from holding the turn, and one overall deadline keeps a
-   * stalled save from doing so. Anything later reaches the next turn. A `remind`
-   * delivery never waits for a turn, so this cannot deadlock. Never rejects:
-   * each delivery settles its own outcome.
-   */
-  private async _awaitRemindNoticeSaves(): Promise<void> {
-    if (this._remindNoticeSavesSettled()) return;
-    await new Promise<void>(resolve => {
-      const wake = () => {
-        clearTimeout(timer);
-        this._remindNoticeDrainWaiters.delete(wake);
-        resolve();
-      };
-      const timer = setTimeout(wake, REMIND_NOTICE_BARRIER_TIMEOUT_MS);
-      (timer as { unref?: () => void }).unref?.();
-      this._remindNoticeDrainWaiters.set(wake, REMIND_NOTICE_BARRIER_ROUNDS);
-      if (!this._remindNoticeDraining) void this._drainRemindNoticeSaves();
-    });
-  }
-
-  private _remindNoticeSavesSettled(): boolean {
-    return this._remindSettlementsStarting.size === 0 && this._remindDeliveries.size === 0;
-  }
-
-  /**
-   * Runs while any turn waits. Each round waits for everything in both sets at
-   * that point, then counts down every waiter's rounds; a waiter wakes when its
-   * rounds run out or both sets are empty. The flag clears in the same step
-   * that sees no waiters, so a turn that joins later starts a new drain.
-   */
-  private async _drainRemindNoticeSaves(): Promise<void> {
-    this._remindNoticeDraining = true;
-    while (this._remindNoticeDrainWaiters.size > 0) {
-      if (this._remindNoticeSavesSettled()) {
-        for (const wake of [...this._remindNoticeDrainWaiters.keys()]) wake();
-        break;
-      }
-      await Promise.allSettled(this._remindSettlementsStarting);
-      await Promise.allSettled(this._remindDeliveries);
-      for (const [wake, rounds] of [...this._remindNoticeDrainWaiters]) {
-        if (rounds <= 1) wake();
-        else this._remindNoticeDrainWaiters.set(wake, rounds - 1);
-      }
-    }
-    this._remindNoticeDraining = false;
+  private _awaitRemindNoticeSaves(): Promise<void> {
+    return this._settlementNoticeDelivery._awaitRemindNoticeSaves();
   }
 
   /**
@@ -23147,106 +23047,91 @@ export class Session {
   }
 
   /**
-   * Deliver one owed settlement notice as a `system-reminder` signal, at most
-   * once per child session id + settlement digest (`key`, hashed into a
-   * deterministic signal id, so every redelivery rewrites one message row).
-   *
-   * 1. Re-read the task: a notice another pass acknowledged, or one held by a
-   *    live claim, is not delivered again.
-   * 2. Persist the reminder row on the parent thread through the agent's
-   *    memory, as the runtime's `persist` signal behaviour does. Nothing is
-   *    delivered into a running turn, so the runtime never hands it to an
-   *    ungated follow-up run; the next parent turn reads it from history. A
-   *    history-load watch on the row, registered before the save, records any
-   *    run in this process that loads the row into its context.
-   * 3. `remind` acknowledges the notice and never starts a turn.
-   * 4. `wake` (PF-7679) waits, unclaimed, until the parent has no running turn,
-   *    parked interaction or queued turn, so a close, shutdown or crash during
-   *    that wait leaves the notice owed. A Stop or edit since the settlement, or
-   *    a run that loaded the row (the watch fired), acknowledges without waking.
-   *    Otherwise the wake turn builds its context and claims the notice: the
-   *    claim (`notice.claim`, valid while its claimer holds the session lease)
-   *    keeps the notice durable, and only its holder dispatches, after a
-   *    same-tick re-check and lease check. An accepted wake acknowledges the
-   *    notice under the claim. A wake not sent clears its claim (a stale fence
-   *    clears it as `remind`) and the delivery waits again; a claim that cannot
-   *    be cleared is marked dead in this process, so reconcile takes it over.
-   *
-   * Under OM `sourceWriteFencing: 'required'` (PF-8034) the row goes to the
-   * delegating mode's memory under the source-write guard of the parent run
-   * that delegated the task, recorded with the delegation; a wake run in that
-   * mode reuses it (`_resolveDelegationNoticeTarget`). A notice with no guard
-   * for fenced memory, or whose guard was revoked since (its OM record
-   * retracted, as when the transcript is deleted), is obsolete: acknowledged
-   * without a row or a wake, never under a new guard.
-   *
-   * Every exit is a typed outcome (`DelegationNoticeOutcome`). A cancelled
-   * parent drops the notice. A closed or torn-down parent, or one whose Harness
-   * is shutting down, leaves it owed for restart reconcile; a running delivery
-   * is awaited by the shutdown barrier (PF-7595). A notice left owed while the
-   * parent is live re-arms reconciliation with the caller's backoff attempt.
+   * PF-8326: the port settlement-notice delivery reaches this session through.
+   * Every member reads or calls the session when used, so reassigned state and
+   * instance spies are always current.
    */
+  private _settlementNoticeDeliveryPort(): SettlementNoticeDeliverySessionPort {
+    const session = this;
+    return {
+      get id() {
+        return session.id;
+      },
+      get resourceId() {
+        return session.resourceId;
+      },
+      get threadId() {
+        return session.threadId;
+      },
+      get state() {
+        return session._state;
+      },
+      get isClosing() {
+        return session.isClosing;
+      },
+      get harness() {
+        return session._harness;
+      },
+      get record() {
+        return session._record;
+      },
+      get storage() {
+        return session._storage;
+      },
+      get modeSwitchEpoch() {
+        return session._modeSwitchEpoch;
+      },
+      get currentRunModeId() {
+        return session._currentRunModeId;
+      },
+      get currentTurnRequestContext() {
+        return session._currentTurnRequestContext;
+      },
+      get delegationNoticeDeliveries() {
+        return session._delegationNoticeDeliveries;
+      },
+      get delegationNoticeWatches() {
+        return session._delegationNoticeWatches;
+      },
+      get remindSettlementsStarting() {
+        return session._remindSettlementsStarting;
+      },
+      isRunning: () => session.isRunning(),
+      activeWorkAdmissionIsCurrent: epoch => session._activeWorkAdmissionIsCurrent(epoch),
+      sessionLeaseHeld: () => session._sessionLeaseHeld(),
+      buildRequestContext: turn => session._buildRequestContext(turn),
+      injectSystemReminder: (content, opts, internal) => session._injectSystemReminder(content, opts, internal),
+      nextStateTransition: timeoutMs => session._nextStateTransition(timeoutMs),
+      notifyMaybeIdle: () => session._notifyMaybeIdle(),
+      planTaskPort: () => session._planTaskPort(),
+      scheduleDelegationReconcileRetry: attempt => session._scheduleDelegationReconcileRetry(attempt),
+      serializePlanTaskWrite: run => session._serializePlanTaskWrite(run),
+      settleDelegationNoticeOutcome: (outcome, notice, retryAttempt) =>
+        session._settleDelegationNoticeOutcome(outcome, notice, retryAttempt),
+      logDelegationNotice: (...args) => session._logDelegationNotice(...args),
+      withNoticeFence: (delivery, site, body) => session._withNoticeFence(delivery, site, body),
+      resolveDelegationNoticeMemory: notice => session._resolveDelegationNoticeMemory(notice),
+      awaitDelegationNoticeQuiescence: live => session._awaitDelegationNoticeQuiescence(live),
+      delegationNoticeClaimable: notice => session._delegationNoticeClaimable(notice),
+      delegationNoticeIsOwed: notice => session._delegationNoticeIsOwed(notice),
+      delegationNoticeBackoff: (attempt, live) => session._delegationNoticeBackoff(attempt, live),
+    };
+  }
+
   private _startDelegationSettlementNotice(
     notice: PendingDelegationSettlementNotice,
     admissionEpoch: number,
     retryAttempt: number,
   ): void {
-    // Tracked so shutdown's bounded settle awaits a reminder write in flight.
-    const delivery = this._deliverDelegationSettlementNotice(notice, admissionEpoch).then(
-      outcome => this._settleDelegationNoticeOutcome(outcome, notice, retryAttempt),
-      (error: unknown) => {
-        this._logDelegationNotice('error', 'settlement notice delivery failed', notice, error);
-        this._settleDelegationNoticeOutcome('left_owed', notice, retryAttempt);
-      },
-    );
-    this._delegationNoticeDeliveries.add(delivery);
-    const remind = notice.mode === 'remind';
-    if (remind) this._remindDeliveries.add(delivery);
-    const untrack = () => {
-      this._delegationNoticeDeliveries.delete(delivery);
-      if (remind) this._remindDeliveries.delete(delivery);
-    };
-    void delivery.then(untrack, untrack);
+    this._settlementNoticeDelivery._startDelegationSettlementNotice(notice, admissionEpoch, retryAttempt);
   }
 
-  /** PF-7679: act on a delivery's typed outcome. No outcome falls through as success. */
   private _settleDelegationNoticeOutcome(
     outcome: DelegationNoticeOutcome,
     notice: PendingDelegationSettlementNotice,
     retryAttempt: number,
   ): void {
-    switch (outcome) {
-      case 'wake':
-      case 'history':
-      case 'fenced':
-      case 'superseded':
-        return;
-      case 'left_owed':
-        if (this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown()) {
-          this._scheduleDelegationReconcileRetry(retryAttempt);
-        }
-        return;
-      case 'obsolete':
-        // Acknowledged durably, like a delivered notice: reconcile does not
-        // see it again. Retraction wins over the reminder.
-        this._logDelegationNotice(
-          'warn',
-          "settlement notice dropped: the delegating run's source-write guard is missing or revoked",
-          notice,
-        );
-        return;
-      case 'lost':
-        this._logDelegationNotice(
-          'error',
-          'settlement notice wake dispatched without a confirmed wake run; counted as delivered',
-          notice,
-        );
-        return;
-      default: {
-        const unexpected: never = outcome;
-        throw new Error(`unexpected settlement notice outcome: ${String(unexpected)}`);
-      }
-    }
+    this._settlementNoticeDelivery._settleDelegationNoticeOutcome(outcome, notice, retryAttempt);
   }
 
   private _logDelegationNotice(
@@ -23255,506 +23140,21 @@ export class Session {
     notice: PendingDelegationSettlementNotice,
     error?: unknown,
   ): void {
-    try {
-      this._harness.mastra.getLogger()[level](`Harness ${message}`, {
-        sessionId: this.id,
-        taskId: notice.taskId,
-        subagentSessionId: notice.subagentSessionId,
-        digest: notice.digest,
-        ...(error !== undefined ? { error } : {}),
-      });
-    } catch {
-      // Logging never changes the delivery outcome.
-    }
+    this._settlementNoticeDelivery._logDelegationNotice(level, message, notice, error);
   }
 
-  /** PF-7679: the delivery's fence, read synchronously in the tick of the guarded action. */
-  private _readNoticeFence(delivery: NoticeDelivery): NoticeFence {
-    const lifecycle: NoticeFence['lifecycle'] =
-      this._state === 'deleted'
-        ? 'deleted'
-        : this._state !== 'live'
-          ? 'closed'
-          : this._harness._internalIsShuttingDown()
-            ? 'shutting_down'
-            : this.isClosing
-              ? 'closing'
-              : 'live';
-    return {
-      lifecycle,
-      stale: !this._activeWorkAdmissionIsCurrent(delivery.epoch),
-      cancelled: this._record.cancelRequest !== undefined,
-      leaseHeld: this._sessionLeaseHeld(),
-    };
-  }
-
-  /**
-   * PF-7679: run a notice write at the head of the plan-task write chain (the
-   * chain Stop's downgrade uses), with the fence read when it gets there. The
-   * body must not queue another serialized write.
-   */
   private _withNoticeFence<T>(
     delivery: NoticeDelivery,
     site: NoticeFenceSite,
     body: (fence: NoticeFence) => Promise<T>,
   ): Promise<T> {
-    return this._serializePlanTaskWrite(() => {
-      const fence = this._readNoticeFence(delivery);
-      if (fence.lifecycle !== 'live' || fence.stale || fence.cancelled || !fence.leaseHeld) {
-        this._logDelegationNotice(
-          'debug',
-          `settlement notice fence at ${site}: ${fence.lifecycle}${fence.stale ? ', stale' : ''}${
-            fence.cancelled ? ', cancelled' : ''
-          }${fence.leaseHeld ? '' : ', lease not held'}`,
-          delivery.notice,
-        );
-      }
-      return body(fence);
-    });
+    return this._settlementNoticeDelivery._withNoticeFence(delivery, site, body);
   }
 
-  private async _deliverDelegationSettlementNotice(
-    notice: PendingDelegationSettlementNotice,
-    admissionEpoch: number,
-  ): Promise<DelegationNoticeOutcome> {
-    const key = `${notice.subagentSessionId}:${notice.digest}`;
-    // A shutting-down Harness starts no new delivery work; the notice stays
-    // owed for the next owner's reconcile.
-    const live = () => this._state === 'live' && !this.isClosing && !this._harness._internalIsShuttingDown();
-    if (!live()) return 'left_owed';
-    // Another pass of this session is delivering it.
-    if (this._delegationNoticesInFlight.has(key)) return 'superseded';
-    this._delegationNoticesInFlight.add(key);
-    let outcome: DelegationNoticeOutcome = 'left_owed';
-    try {
-      outcome = await this._runDelegationSettlementNotice(notice, admissionEpoch, key, live);
-      return outcome;
-    } finally {
-      this._delegationNoticesInFlight.delete(key);
-      // The row's watch is kept for this session's own retry only while the
-      // notice is left owed in a live session that holds the lease (a lost
-      // lease hands the notice to the next holder); teardown disposes the rest.
-      if (outcome !== 'left_owed' || !live() || !this._sessionLeaseHeld()) {
-        this._delegationNoticeWatches.get(key)?.dispose();
-        this._delegationNoticeWatches.delete(key);
-      }
-    }
-  }
-
-  private async _runDelegationSettlementNotice(
-    notice: PendingDelegationSettlementNotice,
-    admissionEpoch: number,
-    key: string,
-    live: () => boolean,
-  ): Promise<DelegationNoticeOutcome> {
-    const firstEpoch = this._delegationNoticeEpochs.get(key);
-    if (firstEpoch === undefined) this._delegationNoticeEpochs.set(key, admissionEpoch);
-    else admissionEpoch = firstEpoch;
-    const delivery: NoticeDelivery = { key, notice, epoch: admissionEpoch };
-    const ids = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-    const takeover = (claim: DelegationNoticeClaim) => noticeClaimTakeoverEligible(this._harness, claim);
-    // The claim this delivery holds (its write may have landed), until resolved.
-    let claimId: string | undefined;
-    let watch = this._delegationNoticeWatches.get(key);
-    const backoff = (attempt: number): Promise<boolean> => this._delegationNoticeBackoff(attempt, live);
-    // Unserialized body: the caller runs it inside `_withNoticeFence`. A held
-    // claim removes only itself; an unclaimed delivery removes a notice with no
-    // claim or a claim reconcile may take over.
-    const removeNotice = async (): Promise<boolean> => {
-      const removed = await planTaskAcknowledgeDelegationSettlementNotice(
-        this._planTaskPort(),
-        claimId !== undefined ? { ...ids, claimId } : { ...ids, takeover },
-      );
-      if (removed) this._delegationNoticeEpochs.delete(key);
-      return removed;
-    };
-    // Delivered-ack, or the fenced ack of a Stop/edit/cancel. No write after a
-    // hard delete or once the lease is lost: the next holder re-checks.
-    const acknowledge = (site: NoticeFenceSite): Promise<'removed' | 'not_owed' | 'no_write'> =>
-      this._withNoticeFence(delivery, site, async fence => {
-        if (fence.lifecycle === 'deleted' || !fence.leaseHeld) return 'no_write';
-        return (await removeNotice()) ? 'removed' : 'not_owed';
-      });
-    const acknowledged = async (
-      site: NoticeFenceSite,
-      outcome: 'history' | 'fenced' | 'obsolete',
-    ): Promise<DelegationNoticeOutcome> => {
-      const result = await acknowledge(site);
-      return result === 'removed' ? outcome : result === 'not_owed' ? 'superseded' : 'left_owed';
-    };
-    const claim = (id: string): Promise<NoticeClaimResult> =>
-      this._withNoticeFence(delivery, 'claim', async fence => {
-        if (fence.lifecycle !== 'live' || !fence.leaseHeld) return 'left_owed';
-        // A Stop, edit or cancel since the settlement: never claim, never wake.
-        if (fence.stale || fence.cancelled) return (await removeNotice()) ? 'fenced' : 'claim_lost';
-        return planTaskClaimDelegationSettlementNotice(this._planTaskPort(), {
-          ...ids,
-          claim: { claimId: id, ownerId: this._harness.ownerId, claimedAt: Date.now() },
-          takeover,
-        });
-      });
-    // Clear this delivery's claim without a delivery (a stale or cancelled fence
-    // clears it as `remind`). The claim leaves the live set either way: cleared
-    // (or never landed, the notice still owed and claimable), gone, or (no
-    // write, or a failed one) dead, so reconcile may take it over.
-    const resolveClaim = async (): Promise<'cleared' | 'superseded' | 'dead'> => {
-      const id = claimId!;
-      try {
-        return await this._withNoticeFence(delivery, 'restore', async fence => {
-          if (fence.lifecycle === 'deleted' || !fence.leaseHeld) return 'dead';
-          const cleared = await planTaskClearDelegationSettlementNoticeClaim(this._planTaskPort(), {
-            ...ids,
-            claimId: id,
-            mode: fence.stale || fence.cancelled ? 'remind' : notice.mode,
-          });
-          if (cleared) return 'cleared';
-          // Not ours: a claim write that never landed leaves the notice owed
-          // with no claim, or a dead claim of this owner. A moved digest, a
-          // claim live here, or a foreign claim (its owner may hold the lease
-          // in storage) supersedes: this delivery never claims over it again.
-          const current = await this._loadDelegationNotice(notice);
-          const reclaimable =
-            current !== undefined &&
-            (current.claim === undefined ||
-              (current.claim.ownerId === this._harness.ownerId && this._delegationNoticeClaimable(current)));
-          return reclaimable ? 'cleared' : 'superseded';
-        });
-      } catch (error) {
-        this._logDelegationNotice('warn', 'settlement notice claim could not be cleared', notice, error);
-        return 'dead';
-      } finally {
-        claimId = undefined;
-        releaseNoticeClaim(this._harness, id);
-      }
-    };
-    // The wake ran (or a run loaded the row, or a fence ended it): acknowledge
-    // under the claim. A fenced-out ack leaves the claim for the next holder. A
-    // failed ack is retried with the reconcile backoff while the claim stays
-    // live, so no retry of this process re-delivers it. Past the backoff cap,
-    // or once the lease, the session or the epoch is lost, the claim is left
-    // dead: reconcile or the next holder takes it over (a possible duplicate).
-    const finishClaimed = async (outcome: 'wake' | 'history' | 'fenced' | 'lost'): Promise<DelegationNoticeOutcome> => {
-      const id = claimId!;
-      try {
-        for (let attempt = 0; ; attempt += 1) {
-          let failure: unknown;
-          try {
-            const result = await acknowledge('dispatch');
-            if (result === 'no_write') {
-              this._logDelegationNotice('error', 'settlement notice acknowledgement fenced out; claim left', notice);
-            }
-            return outcome;
-          } catch (error) {
-            failure = error;
-          }
-          this._logDelegationNotice(
-            'warn',
-            `settlement notice acknowledgement failed (attempt ${attempt + 1})`,
-            notice,
-            failure,
-          );
-          const fence = this._readNoticeFence(delivery);
-          const retry =
-            fence.lifecycle === 'live' &&
-            fence.leaseHeld &&
-            !fence.stale &&
-            !fence.cancelled &&
-            (await backoff(attempt));
-          if (!retry) {
-            this._logDelegationNotice(
-              'error',
-              'settlement notice acknowledgement given up; claim left dead, so it may be taken over and wake twice',
-              notice,
-              failure,
-            );
-            return 'left_owed';
-          }
-        }
-      } finally {
-        claimId = undefined;
-        releaseNoticeClaim(this._harness, id);
-      }
-    };
-    try {
-      if (!(await this._delegationNoticeIsOwed(notice))) {
-        this._delegationNoticeEpochs.delete(key);
-        return 'superseded';
-      }
-      const entry = this._readNoticeFence(delivery);
-      if (entry.lifecycle !== 'live' || !entry.leaseHeld) return 'left_owed';
-      if (entry.cancelled) return acknowledged('owed_reread', 'fenced');
-      const signalId = `harness-delegation-notice-${sha256CanonicalJson({ sessionId: this.id, key }).slice(0, 32)}`;
-      const content = delegationSettlementNoticeText(notice);
-      const attributes = { type: 'delegated-task-settled' };
-      const metadata = { taskId: notice.taskId, subagentSessionId: notice.subagentSessionId, digest: notice.digest };
-      // Write the reminder row directly, as the runtime's `persist` behaviour
-      // does: no synthetic broadcast run occupies the thread, so a following
-      // idle wake is not mistaken for an interleave, and nothing is handed to
-      // an ungated follow-up run.
-      // PF-7631: the mode marker is taken before resolution, so any switch from
-      // here on disqualifies the wake grant.
-      const modeEpoch = this._modeSwitchEpoch;
-      const target = await this._resolveDelegationNoticeTarget(notice);
-      // Shutdown may have begun while the notice was re-read and memory resolved.
-      if (!live()) return 'left_owed';
-      // PF-8034: fenced memory with no guard of the delegating run for it.
-      if (target === 'obsolete') return acknowledged('row_save', 'obsolete');
-      const { resolved, sourceWriteGuard } = target;
-      // PF-7631: which agent's memory saved the row, set only once it is written.
-      let reminderRow: WakeReminderRowOrigin | undefined;
-      if (resolved !== undefined) {
-        // PF-7679: watch before the save, so a run that loads history while the
-        // row is written either sees it (and is recorded) or does not.
-        if (watch === undefined) {
-          watch = watchHistoryLoad(this.threadId, this.resourceId, signalId, () => this._notifyMaybeIdle());
-          this._delegationNoticeWatches.set(key, watch);
-        }
-        // PF-8034: an adapter that cannot check a guard is a configuration
-        // error, not a revocation: the notice stays owed.
-        if (sourceWriteGuard !== undefined) {
-          assertObservationalMemorySourceWriteGuardSupported(await resolved.memory.storage.getStore('memory'));
-        }
-        try {
-          await resolved.memory.saveMessages({
-            messages: [
-              createSignal({
-                type: 'system-reminder',
-                id: signalId,
-                contents: content,
-                attributes,
-                metadata,
-              }).toDBMessage({
-                resourceId: this.resourceId,
-                threadId: this.threadId,
-              }),
-            ],
-            ...(sourceWriteGuard ? { observationalMemorySourceWriteGuard: sourceWriteGuard } : {}),
-          });
-        } catch (error) {
-          // PF-8034: the delegating run's guard was revoked (retraction wins).
-          // Any other failure leaves the notice owed, as before.
-          if (sourceWriteGuard !== undefined && isObservationalMemorySourceWriteConflict(error)) {
-            return acknowledged('row_save', 'obsolete');
-          }
-          throw error;
-        }
-        reminderRow = { ...resolved, modeEpoch };
-      }
-      if (!live()) return 'left_owed';
-      if (notice.mode === 'remind') return acknowledged('row_save', reminderRow !== undefined ? 'history' : 'fenced');
-      const rowDelivered = () => watch?.loaded() === true;
-      let claimWriteFailures = 0;
-      for (;;) {
-        // PF-7679: wait for quiescence before the claim, so a close, shutdown or
-        // crash during the wait leaves the notice owed. A run that already
-        // loaded the row ends the wait: the notice was delivered, even if a
-        // close follows before that run ends.
-        await this._awaitDelegationNoticeQuiescence(() => live() && !rowDelivered());
-        if (rowDelivered()) return acknowledged('quiescence', 'history');
-        const fence = this._readNoticeFence(delivery);
-        if (fence.lifecycle !== 'live' || !fence.leaseHeld) return 'left_owed';
-        // A Stop or edit since the settlement: the row stays; no wake.
-        if (fence.stale || fence.cancelled) return acknowledged('quiescence', 'fenced');
-        // Live before its write is queued, so a racing reconcile never takes
-        // this claim over.
-        const id = randomUUID();
-        holdNoticeClaim(this._harness, id);
-        // The wake turn races the claim write against an abort; the outcome
-        // below waits for the write itself, so it knows whether it claimed.
-        let claimWrite: Promise<NoticeClaimResult> | undefined;
-        try {
-          await this._injectSystemReminder(
-            content,
-            {
-              attributes,
-              metadata,
-              // PF-8034: a wake run in the mode whose memory took the row writes
-              // under the guard the row was saved with; another mode's memory
-              // never sees that guard.
-              ...(sourceWriteGuard !== undefined && reminderRow?.modeId === this._record.modeId
-                ? { observationalMemorySourceWriteGuard: sourceWriteGuard }
-                : {}),
-            },
-            {
-              signalId,
-              admissionEpoch,
-              wakeNoticeId: signalId,
-              // Only the claim's holder may wake.
-              claimNotice: () => {
-                claimWrite = claim(id).then(
-                  result => {
-                    if (result === 'claimed') claimId = id;
-                    else releaseNoticeClaim(this._harness, id);
-                    return result;
-                  },
-                  (error: unknown) => {
-                    // The write may have landed: resolve it as held.
-                    claimId = id;
-                    throw error;
-                  },
-                );
-                return claimWrite.then(result => result === 'claimed');
-              },
-              noticeRowDelivered: rowDelivered,
-              // PF-7631: the wake grant is considered only over a saved reminder
-              // row, and kept only while `_wakeGrantAllowed` holds.
-              ...(reminderRow !== undefined
-                ? {
-                    wakeSettlement: {
-                      taskId: notice.taskId,
-                      subagentSessionId: notice.subagentSessionId,
-                      outcome: notice.outcome,
-                    },
-                    wakeReminderRow: reminderRow,
-                  }
-                : {}),
-            },
-          );
-          return finishClaimed('wake');
-        } catch (err) {
-          let claimResult: NoticeClaimResult | 'failed' | undefined;
-          if (claimWrite === undefined) releaseNoticeClaim(this._harness, id);
-          else claimResult = await claimWrite.catch(() => 'failed' as const);
-          if (claimId === undefined) {
-            if (claimResult === 'claim_lost') return 'superseded';
-            if (claimResult === 'fenced') return 'fenced';
-            if (claimResult === 'left_owed') return 'left_owed';
-            // A turn or foreign run took the slot before the claim: wait again.
-            if (err instanceof HarnessBusyError && live()) {
-              await this._nextStateTransition(250);
-              continue;
-            }
-            this._logDelegationNotice('warn', 'settlement notice wake not sent', notice, err);
-            return 'left_owed';
-          }
-          if (err instanceof DelegationNoticeWakeNotSentError) {
-            // A run loaded the row after the claim: that run is the delivery.
-            if (err.reason === 'delivered') return finishClaimed('history');
-            // A Stop or edit after the claim: the row stays; no wake.
-            if (err.reason === 'stale') return finishClaimed('fenced');
-            // The dispatch may have started a run (T20): counted as delivered.
-            if (err.reason === 'unconfirmed') return finishClaimed('lost');
-          }
-          if (err instanceof NativeSignalAcceptanceTimeoutError) return finishClaimed('lost');
-          // Claimed but not sent: clear the claim before anything else.
-          const resolution = await resolveClaim();
-          if (resolution === 'superseded') return 'superseded';
-          if (resolution === 'dead') return 'left_owed';
-          if (claimResult === 'failed') {
-            // The claim write failed (a storage error or a version conflict):
-            // the notice is still owed, so back off and re-read it by claiming
-            // again, up to the reconcile backoff cap.
-            this._logDelegationNotice('warn', 'settlement notice claim write failed', notice, err);
-            if (await backoff(claimWriteFailures++)) continue;
-            return 'left_owed';
-          }
-          if (err instanceof DelegationNoticeWakeNotSentError && err.reason === 'slot_lost' && live()) {
-            // A run this process cannot see (a foreign lease holder, or one not
-            // yet registered here) refuses every retry: back off as the
-            // pre-claim busy path does. A close or Stop ends the loop above.
-            await this._nextStateTransition(250);
-            continue;
-          }
-          this._logDelegationNotice('warn', 'settlement notice wake not sent', notice, err);
-          return 'left_owed';
-        }
-      }
-    } catch (error) {
-      // Before the claim, or after it is resolved, the notice stays durable and
-      // the row is rewritten in place on retry, so copies cannot accumulate.
-      this._logDelegationNotice('warn', 'settlement notice delivery left owed', notice, error);
-      if (claimId !== undefined) await resolveClaim();
-      return 'left_owed';
-    }
-  }
-
-  /**
-   * Memory that receives a settlement reminder row. The active mode's agent
-   * memory comes first (a per-turn override may run another agent). When that
-   * agent has none (the parent switched to a memory-less mode that cannot
-   * delegate), the reminder goes to the memory of the mode that delegated the
-   * task: binding requires memory there for `remind`, and the parent's next
-   * turn in that mode reads the row from its thread history. Memory resolves
-   * with the parent's own request context, as its turns do, so a dynamic memory
-   * resolver selects the parent's store. Undefined only when neither mode has
-   * memory (a Stop-downgraded `wake` notice of a memory-less parent, or a
-   * delegating mode removed from the configuration since).
-   */
-  private async _resolveDelegationNoticeMemory(
+  private _resolveDelegationNoticeMemory(
     notice: PendingDelegationSettlementNotice,
   ): Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> {
-    const activeModeId = this._currentRunModeId ?? this._record.modeId;
-    const modeIds = [activeModeId];
-    if (notice.parentModeId !== undefined && notice.parentModeId !== activeModeId) {
-      if (this._harness._hasMode(notice.parentModeId)) modeIds.push(notice.parentModeId);
-    }
-    for (const modeId of modeIds) {
-      const resolved = await this._resolveModeNoticeMemory(modeId);
-      if (resolved !== undefined) return resolved;
-    }
-    return undefined;
-  }
-
-  /** One mode's agent memory, resolved with the parent's own request context. */
-  private async _resolveModeNoticeMemory(
-    modeId: string,
-  ): Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> {
-    const agent = this._harness.getAgentForMode(modeId);
-    const requestContext = await this._buildRequestContext({
-      modeId,
-      modelId: this._record.modelId,
-      abortSignal: new AbortController().signal,
-      ...(this._currentTurnRequestContext !== undefined
-        ? { persistedRequestContext: this._currentTurnRequestContext }
-        : {}),
-    });
-    const memory = await agent.getMemory({ requestContext });
-    return memory !== undefined && memory !== null ? { agent, memory, modeId } : undefined;
-  }
-
-  /**
-   * PF-8034: where a settlement reminder row goes, and under which guard.
-   * Memory that requires no OM source-write fencing keeps the order of
-   * `_resolveDelegationNoticeMemory` and is written unguarded. The recorded
-   * guard belongs to the delegating mode's memory, so a notice that carries
-   * one goes there first when that memory requires it. When the memory chosen
-   * requires fencing and the guard is not its own, a delegating mode whose
-   * memory requires none takes the row unguarded, as its run had no fence;
-   * otherwise the recorded guard is tried (its memory rejects it if it is not
-   * its own). With no guard at all, the notice is obsolete.
-   */
-  private async _resolveDelegationNoticeTarget(notice: PendingDelegationSettlementNotice): Promise<
-    | {
-        resolved?: { agent: Agent; memory: MastraMemory; modeId: string };
-        sourceWriteGuard?: ObservationalMemorySourceWriteGuard;
-      }
-    | 'obsolete'
-  > {
-    const delegatingModeId =
-      notice.parentModeId !== undefined && this._harness._hasMode(notice.parentModeId)
-        ? notice.parentModeId
-        : undefined;
-    let delegating: Promise<{ agent: Agent; memory: MastraMemory; modeId: string } | undefined> | undefined;
-    const resolveDelegating = () =>
-      delegatingModeId === undefined
-        ? Promise.resolve(undefined)
-        : (delegating ??= this._resolveModeNoticeMemory(delegatingModeId));
-    const guard = notice.sourceWriteGuard;
-    if (guard !== undefined) {
-      const own = await resolveDelegating();
-      if (own !== undefined && requiresObservationalMemorySourceWriteGuard(own.memory)) {
-        return { resolved: own, sourceWriteGuard: guard };
-      }
-    }
-    const resolved = await this._resolveDelegationNoticeMemory(notice);
-    if (resolved === undefined || !requiresObservationalMemorySourceWriteGuard(resolved.memory)) {
-      return resolved === undefined ? {} : { resolved };
-    }
-    const unfenced = await resolveDelegating();
-    if (unfenced !== undefined && !requiresObservationalMemorySourceWriteGuard(unfenced.memory)) {
-      return { resolved: unfenced };
-    }
-    return guard !== undefined ? { resolved, sourceWriteGuard: guard } : 'obsolete';
+    return this._settlementNoticeDelivery._resolveDelegationNoticeMemory(notice);
   }
 
   /**
@@ -23776,63 +23176,20 @@ export class Session {
     );
   }
 
-  /**
-   * PF-7679: wait until the parent has no running turn, no parked interaction
-   * and no queued turn, or until the delivery is no longer live. Each of those
-   * ends through `_notifyMaybeIdle`; the bounded poll only re-reads the record.
-   */
-  private async _awaitDelegationNoticeQuiescence(live: () => boolean): Promise<void> {
-    while (
-      live() &&
-      (this.isRunning() || this._record.pendingResume !== undefined || (this._record.pendingQueue ?? []).length > 0)
-    ) {
-      await this._nextStateTransition(1_000);
-    }
+  private _awaitDelegationNoticeQuiescence(live: () => boolean): Promise<void> {
+    return this._settlementNoticeDelivery._awaitDelegationNoticeQuiescence(live);
   }
 
-  /**
-   * PF-7679: whether this Harness may deliver an owed notice: it carries no
-   * claim, or a claim reconcile may take over (its claimer lost the lease, or
-   * it is not live in this Harness).
-   */
   private _delegationNoticeClaimable(notice: PendingDelegationSettlementNotice): boolean {
-    return notice.claim === undefined || noticeClaimTakeoverEligible(this._harness, notice.claim);
+    return this._settlementNoticeDelivery._delegationNoticeClaimable(notice);
   }
 
-  /** Exact re-read: the stored notice, while the one with this digest is still owed on its task. */
-  private async _loadDelegationNotice(
-    notice: PendingDelegationSettlementNotice,
-  ): Promise<PendingDelegationSettlementNotice | undefined> {
-    const snapshot = await this._storage.loadPlanTaskSubtree({
-      harnessName: this._record.harnessName,
-      sessionId: this.id,
-      rootTaskId: notice.taskId,
-      limit: 1,
-    });
-    const task = snapshot.tasks.find(row => row.taskId === notice.taskId);
-    const current = task === undefined ? undefined : readPendingDelegationSettlementNotice(task);
-    return current?.subagentSessionId === notice.subagentSessionId && current.digest === notice.digest
-      ? current
-      : undefined;
+  private _delegationNoticeIsOwed(notice: PendingDelegationSettlementNotice): Promise<boolean> {
+    return this._settlementNoticeDelivery._delegationNoticeIsOwed(notice);
   }
 
-  /** Exact re-read: the notice with this digest is still owed on its task, and claimable. */
-  private async _delegationNoticeIsOwed(notice: PendingDelegationSettlementNotice): Promise<boolean> {
-    const current = await this._loadDelegationNotice(notice);
-    return current !== undefined && this._delegationNoticeClaimable(current);
-  }
-
-  /**
-   * PF-7750: wait the reconcile backoff for `attempt` (0-based) of a notice
-   * write retry, unless the session stops being live. False once the backoff
-   * passes its cap, or not live.
-   */
-  private async _delegationNoticeBackoff(attempt: number, live: () => boolean): Promise<boolean> {
-    const backoffMs = DELEGATION_RECONCILE_RETRY_BASE_MS * 2 ** attempt;
-    if (backoffMs > DELEGATION_RECONCILE_RETRY_MAX_MS) return false;
-    const until = Date.now() + backoffMs;
-    while (live() && Date.now() < until) await this._nextStateTransition(until - Date.now());
-    return live();
+  private _delegationNoticeBackoff(attempt: number, live: () => boolean): Promise<boolean> {
+    return this._settlementNoticeDelivery._delegationNoticeBackoff(attempt, live);
   }
 
   /**
@@ -24484,13 +23841,8 @@ export class Session {
     return current?.delegatedSubagentSessionId === childId && !TERMINAL_PLAN_TASK_STATUSES.has(current.status);
   }
 
-  /** PF-7679: dispose the kept row watches whose key `drop` selects, unless a delivery of it runs. */
   private _disposeKeptDelegationNoticeWatches(drop: (key: string) => boolean): void {
-    for (const [key, watch] of this._delegationNoticeWatches) {
-      if (!drop(key) || this._delegationNoticesInFlight.has(key)) continue;
-      watch.dispose();
-      this._delegationNoticeWatches.delete(key);
-    }
+    this._settlementNoticeDelivery._disposeKeptDelegationNoticeWatches(drop);
   }
 
   /**
@@ -24765,12 +24117,6 @@ class QueueRecoveryPendingError extends HarnessError {
     super('queued turn was accepted by the signal runtime and is awaiting durable terminal result evidence');
     this.name = 'harness.queue_recovery_pending';
     this.retryAt = retryAt;
-  }
-}
-
-class NativeSignalAcceptanceTimeoutError extends HarnessValidationError {
-  constructor(validationPath: string) {
-    super(validationPath, `native signal acceptance timed out after ${SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS}ms`);
   }
 }
 

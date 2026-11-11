@@ -109,3 +109,7 @@ export function isParentRequestedSubagentCancel(
 ): boolean {
   return cancelRequest?.targeted === true && cancelRequest.requestedBy === parentSessionId;
 }
+
+/** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
+export const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
+export const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
