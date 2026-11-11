@@ -24,6 +24,26 @@ export type WorkflowLifecycleErrorId =
   | 'WORKFLOW_RUN_NOT_SUSPENDED'
   | 'WORKFLOW_RUN_STILL_RUNNING';
 
+/**
+ * Stable ids for a lost run claim: another caller or process owns the run, so
+ * this call stood down without executing any step. Callers match on
+ * `MastraError.id`; the message text is kept for readability and is not part
+ * of the contract.
+ *
+ * - `WORKFLOW_RESUME_ALREADY_CLAIMED`: resume() lost the compare-and-set that
+ *   claims a suspended run, because another caller already claimed this
+ *   suspension.
+ * - `WORKFLOW_RESTART_NOT_CLAIMED`: restart() or timeTravel() lost the
+ *   compare-and-set that adopts a new lifecycle generation, because another
+ *   generation already owns the run.
+ * - `WORKFLOW_RESTART_RUN_OWNED`: restart() found the run still being executed
+ *   by another process whose ownership lease has not expired.
+ */
+export type WorkflowClaimErrorId =
+  | 'WORKFLOW_RESUME_ALREADY_CLAIMED'
+  | 'WORKFLOW_RESTART_NOT_CLAIMED'
+  | 'WORKFLOW_RESTART_RUN_OWNED';
+
 export function workflowRunNotActiveError({
   workflowId,
   runId,

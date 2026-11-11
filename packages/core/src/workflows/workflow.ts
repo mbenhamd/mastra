@@ -107,6 +107,7 @@ import {
   workflowRunStillRunningError,
   workflowSnapshotNotFoundError,
 } from './lifecycle-errors';
+import type { WorkflowClaimErrorId } from './lifecycle-errors';
 import {
   createWorkflowExecutionGeneration,
   getWorkflowLifecycleTopic,
@@ -7403,7 +7404,7 @@ export class Run<
     const ownership = await this.#claimOwnership(false);
     if (!('release' in ownership)) {
       throw new MastraError({
-        id: 'WORKFLOW_RESTART_RUN_OWNED',
+        id: 'WORKFLOW_RESTART_RUN_OWNED' satisfies WorkflowClaimErrorId,
         domain: ErrorDomain.MASTRA_WORKFLOW,
         category: ErrorCategory.USER,
         text:
