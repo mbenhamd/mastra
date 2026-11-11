@@ -4256,9 +4256,12 @@ export class Session {
     // run consumed. Persist its staged usage before any terminal evidence
     // rewrite, using the same durable per-run accounting fence.
     let staged = evidence.status === 'pending' ? evidence.stagedResult : undefined;
-    if (staged === undefined && admission.status !== 'pending') {
-      // The scan may predate staging; staging needs a pending admission, so
-      // the evidence read after observing it settled is final.
+    if (admission.status !== 'pending') {
+      // The scan may predate staging, or predate another owner's settlement,
+      // which counted the staged usage before rewriting the evidence and then
+      // retired its fence. Staging needs a pending admission, so the evidence
+      // read after observing it settled is final: only output it still holds
+      // pending is counted here.
       const current = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -4266,7 +4269,8 @@ export class Session {
         threadId: this.threadId,
         signalId: evidence.signalId,
       });
-      if (current !== null && 'status' in current && current.status === 'pending') staged = current.stagedResult;
+      staged =
+        current !== null && 'status' in current && current.status === 'pending' ? current.stagedResult : undefined;
     }
     if (staged !== undefined) await this._accountStagedTerminalUsage(runId, staged as FullOutput<unknown>);
     if (admission.status !== 'pending') {
