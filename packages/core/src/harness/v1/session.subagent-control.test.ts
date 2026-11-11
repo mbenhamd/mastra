@@ -953,6 +953,8 @@ type WaitRow = {
   settledBefore?: number[];
   /** Hides the in-process settlement signal from the wait, as for a settlement by another process. */
   noInProcessSignal?: boolean;
+  /** Holds the wait's first storage read until `releaseFirstRead`. */
+  holdFirstRead?: boolean;
   abortAfterMs?: number;
   check: (output: any, ctx: WaitRowContext & { returnedAt: number; startedAt: number; storageReads: number }) => void;
 };
@@ -963,6 +965,9 @@ type WaitRowContext = {
   /** Resolves once the wait's first storage read has answered. */
   firstReadDone: () => Promise<void>;
   settledAt: (output: any, index: number) => number;
+  /** Waits until child `index` reads as settled in storage. */
+  settled: (index: number) => Promise<void>;
+  releaseFirstRead: () => void;
 };
 
 const settledIds = (output: any) => (output.settledSubagents as any[]).map(view => view.subagentSessionId);
@@ -1027,6 +1032,22 @@ const waitRows: WaitRow[] = [
       expect(output.timedOut).toBe(false);
       expect(settledIds(output)).toEqual([ids[0]]);
       expect(returnedAt - settledAt(output, 0)).toBeLessThan(6_000);
+    },
+  },
+  {
+    name: 'until any returns a child that settles while the first read is in flight',
+    children: 2,
+    holdFirstRead: true,
+    input: () => ({ action: 'wait', until: 'any', timeoutMs: 3_000 }),
+    drive: async ({ release, settled, releaseFirstRead }) => {
+      release(0);
+      await settled(0);
+      releaseFirstRead();
+    },
+    check: (output, { ids }) => {
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output)).toEqual([ids[0]]);
+      expect(runningIds(output)).toEqual([ids[1]]);
     },
   },
   {
@@ -1098,14 +1119,22 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
       // The tool reads storage through the handle it takes at creation; count its own reads.
       let toolReads = 0;
       let answeredReads = 0;
+      let releaseFirstRead!: () => void;
+      const firstReadGate = new Promise<void>(resolve => (releaseFirstRead = resolve));
       const storage = parent._internalStorage;
       const counting = new Proxy(storage, {
         get(target, key) {
           const value = Reflect.get(target, key, target);
           if (typeof value !== 'function') return value;
           return (...args: unknown[]) => {
+            const isRead = key === 'listPlanTasks' || key === 'loadSession';
+            if (isRead && row.holdFirstRead && toolReads === 0) {
+              toolReads += 1;
+              // The read runs only once released, so it sees what landed meanwhile.
+              return firstReadGate.then(() => value.apply(target, args)).finally(() => (answeredReads += 1));
+            }
             const result = value.apply(target, args);
-            if (key === 'listPlanTasks' || key === 'loadSession') {
+            if (isRead) {
               toolReads += 1;
               void Promise.resolve(result).then(
                 () => (answeredReads += 1),
@@ -1131,6 +1160,14 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
         },
         settledAt: (output, index) =>
           (output.settledSubagents as any[]).find(view => view.subagentSessionId === ids[index]).settledAt,
+        settled: async index => {
+          const statusOf = control(parent);
+          await poll(
+            async () =>
+              (await statusOf({ action: 'status', subagentSessionId: ids[index]! })).subagents?.[0]?.settled === true,
+          );
+        },
+        releaseFirstRead,
       };
       const startedAt = Date.now();
       try {
@@ -1144,6 +1181,7 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
         row.check(output, { ...ctx, returnedAt, startedAt, storageReads: toolReads });
       } finally {
         vi.restoreAllMocks();
+        releaseFirstRead();
         for (const release of releases) release();
         closeTurn();
         await harness.shutdown();
@@ -1685,6 +1723,35 @@ describe('subagent control tool — stable offsets', () => {
     } finally {
       unregister(parent, keys);
       waker?.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  }, 60_000);
+
+  it('wait until any woken by a burst of settlements too large for one page returns some of them and a hint to the rest', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    const sessions = await addInlineChildren(harness, parent, 400);
+    try {
+      const now = Date.now();
+      keys = register(parent, sessions, index => now - 60_000 + index);
+      const pending = run({ action: 'wait', until: 'any', timeoutMs: 20_000 });
+      await new Promise(resolve => setTimeout(resolve, 200));
+      // Every child returns before the wait reads again, so all 400 woke it.
+      for (const child of sessions) parent._internalReturnInlineSubagent(`inline:${child.id}`, 'mock-run');
+      const output = await pending;
+      expect(output.isError).toBeUndefined();
+      expect(output.timedOut).toBe(false);
+      expect(utf8Length(output)).toBeLessThanOrEqual(64 * 1024);
+      expect(output.settledSubagents.length).toBeGreaterThan(0);
+      expect(output.settledSubagents.length + output.omittedSubagentCount).toBe(400);
+      expect(output.resultsHint).toMatch(/offset \d+/);
+    } finally {
+      unregister(parent, keys);
+      for (const child of sessions) await child.close();
       closeTurn();
       await harness.shutdown();
     }

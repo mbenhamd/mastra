@@ -407,35 +407,32 @@ function boundResults(
   // shortened: an output whose full results fit as they are carries no notice.
   const unshortened = fitResults(build, views, views, fullResultIds, continuation, false, required);
   if (unshortened !== undefined) return unshortened;
-  const whole =
-    fitResults(build, views, views, fullResultIds, continuation, true, required) ??
-    fitResults(build, views, views.map(shortTask), fullResultIds, continuation, true, required);
-  if (whole !== undefined) return whole;
-  // A required child (one whose settlement ended an `until: "any"` wait) is
-  // always kept, wherever it sits; the prefix is taken from the others.
+  // A whole page that drops a required child's result is not taken: leaving
+  // out other children comes first.
+  for (const candidate of [views, views.map(shortTask)]) {
+    const whole = fitResults(build, views, candidate, fullResultIds, continuation, true, required);
+    if (whole !== undefined && !omitsRequiredResult(whole, required)) return whole;
+  }
+  // A required child (one whose settlement ended an `until: "any"` wait) comes
+  // first, wherever it sits; the page is the longest prefix of required-then-
+  // rest that keeps every required result it holds. Required children past
+  // that prefix are left out like any other (the hint reads them), so a burst
+  // of settlements too large for one page still returns at least one child.
   const short = views.map(shortTask);
-  const shortRequired = short.filter(view => required.has(view.subagentSessionId));
-  const shortRest = short.filter(view => !required.has(view.subagentSessionId));
+  const ordered = [
+    ...short.filter(view => required.has(view.subagentSessionId)),
+    ...short.filter(view => !required.has(view.subagentSessionId)),
+  ];
   // The envelope grows with each kept child (a child's own fields are larger
-  // than its id in the hint), so the largest prefix that fits is found by
-  // bisection.
-  let low = 0;
-  let high = shortRest.length - 1;
+  // than its id in the hint), so the longest prefix is found by bisection. A
+  // single child is kept even without its result, so paging always moves on.
+  let low = 1;
+  let high = ordered.length;
   let best: SubagentControlOutput | undefined;
   while (low <= high) {
     const keep = Math.floor((low + high) / 2);
-    const fitted = fitResults(
-      build,
-      views,
-      [...shortRequired, ...shortRest.slice(0, keep)],
-      fullResultIds,
-      continuation,
-      true,
-      required,
-    );
-    // A required child keeps its result (at least its preview) before the
-    // prefix grows; with no prefix left it is kept even without its result.
-    if (fitted === undefined || (keep > 0 && omitsRequiredResult(fitted, required))) {
+    const fitted = fitResults(build, views, ordered.slice(0, keep), fullResultIds, continuation, true, required);
+    if (fitted === undefined || (keep > 1 && omitsRequiredResult(fitted, required))) {
       high = keep - 1;
     } else {
       best = fitted;
@@ -710,6 +707,10 @@ export function createSubagentControlTool(parent: Session) {
     } else {
       status = 'idle';
     }
+    // A returned inline child settled when its spawn_subagent call returned.
+    if (settledAt === undefined && returned !== undefined && SETTLED_STATUSES.has(status)) {
+      settledAt = returned.returnedAt;
+    }
     const task = attempt?.taskBody ?? active?.task;
     const startedAt = attempt?.startedAt ?? active?.startedAt ?? returned?.startedAt;
     const inlineAgentType = active?.agentType ?? returned?.agentType;
@@ -888,7 +889,8 @@ export function createSubagentControlTool(parent: Session) {
     offset: number | undefined,
     settlement: { consume: () => boolean; sleep: (ms: number) => Promise<void> },
   ): Promise<SubagentControlOutput> {
-    const deadline = Date.now() + timeoutMs;
+    const calledAt = Date.now();
+    const deadline = calledAt + timeoutMs;
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
     let interval = WAIT_POLL_INTERVAL_MS;
@@ -966,13 +968,21 @@ export function createSubagentControlTool(parent: Session) {
       if (foreign.length > 0) return foreignError(foreign);
       // Ownership is proven once; a child row deleted mid-wait then reads as closed.
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
-      runningAtStart ??= new Set(views.filter(view => !view.settled).map(view => view.subagentSessionId));
+      // A child that settled while the first read was in flight was running
+      // when the call began: it can end the wait and is pinned like the others.
+      runningAtStart ??= new Set(
+        views
+          .filter(view => !view.settled || (view.settledAt !== undefined && view.settledAt >= calledAt))
+          .map(view => view.subagentSessionId),
+      );
       // An implicit wait pins every child that was running when it started;
       // with an offset it pins every child from that place of the stable list,
       // so the settled ones on its page are returned too.
       if (targets === undefined) {
         position = resolution.value.position;
-        targets = views.filter(view => offset !== undefined || !view.settled).map(view => view.subagentSessionId);
+        targets = views
+          .filter(view => offset !== undefined || runningAtStart!.has(view.subagentSessionId))
+          .map(view => view.subagentSessionId);
       }
       const pinned = new Set(targets);
       const current = views.filter(view => pinned.has(view.subagentSessionId));

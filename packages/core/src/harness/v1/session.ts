@@ -1692,6 +1692,8 @@ export interface ActiveToolState {
 export interface ReturnedInlineSubagentState {
   startedAt: number;
   agentType: string;
+  /** When its spawn_subagent call returned. */
+  returnedAt: number;
 }
 
 export interface ActiveSubagentState {
@@ -3673,6 +3675,7 @@ export class Session {
     this._returnedInlineSubagentsOf(runId).set(state.subagentSessionId, {
       startedAt: state.startedAt,
       agentType: state.agentType,
+      returnedAt: Date.now(),
     });
   }
 
