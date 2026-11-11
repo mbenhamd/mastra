@@ -224,6 +224,46 @@ describe('QuickJsCodeModeTransport', () => {
     });
   });
 
+  it('returns a SyntaxError result when a custom async transpile rejects', async () => {
+    const transport = new QuickJsCodeModeTransport({
+      transpile: async () => {
+        throw new Error('program.ts(1,9): error TS1005');
+      },
+    });
+    const result = await run(`return 1;`, { transport });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'program.ts(1,9): error TS1005', name: 'SyntaxError' },
+    });
+  });
+
+  it('times out a custom transpile that never settles', async () => {
+    const transport = new QuickJsCodeModeTransport({ transpile: () => new Promise<string>(() => {}) });
+    const result = await run(`return 1;`, { transport, timeout: 50 });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution timed out after 50ms', name: 'TimeoutError' },
+    });
+  });
+
+  it('returns an AbortError result when the run is aborted during a custom transpile', async () => {
+    const controller = new AbortController();
+    const transport = new QuickJsCodeModeTransport({
+      transpile: () => {
+        setTimeout(() => controller.abort(), 0);
+        return new Promise<string>(() => {});
+      },
+    });
+    const result = await run(`return 1;`, { transport, abortSignal: controller.signal });
+    expect(result).toEqual({
+      success: false,
+      logs: [],
+      error: { message: 'Code Mode execution aborted', name: 'AbortError' },
+    });
+  });
+
   it('returns an error result for non-JSON-serializable results', async () => {
     const result = await run(`const a = {}; a.self = a; return a;`);
     expect(result.success).toBe(false);
