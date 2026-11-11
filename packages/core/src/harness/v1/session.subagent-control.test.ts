@@ -1224,7 +1224,7 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
 });
 
 describe('delegated settlement listeners', () => {
-  it('a wait begun from a settlement notification is not woken by that settlement', async () => {
+  it('a wait begun from the public delegate_settled event is not woken by that settlement', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
     const closeTurn = await openParentTurn(parent, parentAgent);
@@ -1232,8 +1232,9 @@ describe('delegated settlement listeners', () => {
     const second = await delegateHeldChild(parent, childAgent, 'keeps running');
     const tool = createSubagentControlTool(parent)!;
     let pending: Promise<any> | undefined;
-    // Like a turn started by the notification: the wait begins after the commit.
-    const unsubscribe = parent._internalOnDelegatedSettlement(() => {
+    // Like a turn started by the event: the wait begins after the commit.
+    const unsubscribe = parent.subscribe((event: any) => {
+      if (event.type !== 'papersflow.plan_task.updated' || event.payload?.op !== 'delegate_settled') return;
       pending ??= tool.execute!(
         { action: 'wait', until: 'any', timeoutMs: 500 } as any,
         toolCtx as any,

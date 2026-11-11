@@ -6981,7 +6981,8 @@ export class Session {
   /**
    * @internal — call `listener` with the child id each time this process
    * durably settles one of this session's delegated tasks, after the commit and
-   * from every settlement path (driver, recovery, cancel). A settlement written by another process is
+   * before the public `delegate_settled` event, from every settlement path
+   * (driver, recovery, cancel). A settlement written by another process is
    * not signalled; readers that must see it still poll storage. A listener
    * that throws is ignored. Returns the unsubscribe function.
    */
@@ -25319,20 +25320,22 @@ export class Session {
           outcome,
           ...(durableResult !== undefined ? { result: durableResult } : {}),
           ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
+          // Before the public delegate_settled event: a wait that event starts
+          // must not take this settlement as one from after its call.
+          onCommitted: () => {
+            for (const listener of Array.from(this._delegatedSettlementListeners)) {
+              try {
+                listener(subagentSessionId);
+              } catch {
+                // A listener only wakes a reader early. One that throws must not
+                // skip the other listeners, the notice below, or reach the
+                // reconcile retry for a settlement that is already durable.
+              }
+            }
+          },
         });
       });
-      if (reconcileResult.reconciled) {
-        this._notifyDisplayRefresh();
-        for (const listener of Array.from(this._delegatedSettlementListeners)) {
-          try {
-            listener(subagentSessionId);
-          } catch {
-            // A listener only wakes a reader early. One that throws must not
-            // skip the other listeners, the notice below, or reach the
-            // reconcile retry for a settlement that is already durable.
-          }
-        }
-      }
+      if (reconcileResult.reconciled) this._notifyDisplayRefresh();
       if (reconcileResult.notice !== undefined) {
         this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
