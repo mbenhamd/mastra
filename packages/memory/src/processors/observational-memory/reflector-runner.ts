@@ -21,7 +21,7 @@ import { getMarkerActivationTTL, resolveActivationTTL } from './activation-ttl';
 import { BufferingCoordinator } from './buffering-coordinator';
 import { runOMCommit } from './commit-queue';
 import { omDebug, omError } from './debug';
-import { isOmModelExecutionError, isOmModelExecutionFailure, OmModelExecutionError } from './error';
+import { isOmModelExecutionError, isOmModelExecutionFailure, isOmOwnTimeout, OmModelExecutionError } from './error';
 import {
   applyExtractorHooks,
   buildThreadMetadataFromExtractedValues,
@@ -181,6 +181,18 @@ async function withAbortCheck<T>(fn: () => Promise<T>, abortSignal?: AbortSignal
   const result = await fn();
   if (abortSignal?.aborted) throw new Error('The operation was aborted.');
   return result;
+}
+
+/**
+ * Fork (PF-7236): when OM's own deadline or per-attempt timeout ends the Reflector call, report it
+ * as a reflector-model failure so `failurePolicy: 'continue'` can defer reflection and the turn
+ * continues. A caller abort is rethrown unchanged and stays fatal.
+ */
+function rethrowOwnTimeoutAsReflectorFailure(error: unknown, abortSignal: AbortSignal | undefined): never {
+  if (!abortSignal?.aborted && isOmOwnTimeout(error)) {
+    throw new OmModelExecutionError('reflector-model', error);
+  }
+  throw error;
 }
 
 /**
@@ -596,7 +608,7 @@ export class ReflectorRunner {
           idleTimeoutMs: RETRY_CONFIG.modelCallIdleTimeoutMs,
           maxRetries: this.reflectionConfig.maxRetries,
         },
-      );
+      ).catch(error => rethrowOwnTimeoutAsReflectorFailure(error, abortSignal));
 
       omDebug(
         `[OM:callReflector] attempt #${attemptNumber} returned: textLen=${result.text?.length}, textPreview="${result.text?.slice(0, 120)}...", inputTokens=${result.usage?.inputTokens ?? result.totalUsage?.inputTokens}, outputTokens=${result.usage?.outputTokens ?? result.totalUsage?.outputTokens}`,

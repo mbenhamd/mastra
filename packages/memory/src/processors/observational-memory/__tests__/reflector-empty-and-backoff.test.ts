@@ -81,6 +81,34 @@ function createFailingModel(failuresBeforeSuccess = Number.POSITIVE_INFINITY) {
   };
 }
 
+/** A provider that accepts the request and never answers; like fetch, it settles only on abort. */
+function createHangingModel() {
+  let calls = 0;
+  let markRequested!: () => void;
+  const requested = new Promise<void>(resolve => {
+    markRequested = resolve;
+  });
+  const model = new MockLanguageModelV2({
+    modelId: 'mock-hanging-reflector',
+    doStream: ({ abortSignal }: any) => {
+      calls++;
+      const pending = new Promise<never>((_, reject) => {
+        abortSignal?.addEventListener('abort', () => reject(abortSignal.reason), { once: true });
+      });
+      markRequested();
+      return pending;
+    },
+  });
+  return {
+    model,
+    /** Resolves once the provider has received the request and is waiting on it. */
+    requested,
+    get callCount() {
+      return calls;
+    },
+  };
+}
+
 function observationsPayload(body: string) {
   return `<observations>\n* ${body}\n</observations>`;
 }
@@ -360,6 +388,35 @@ describe('reflector retry budget and terminal policy', () => {
       reflection: expect.stringContaining('recovered summary'),
     });
     expect(record).toMatchObject(stateBeforeFailure);
+  });
+
+  // Fork (PF-7236): under failurePolicy 'continue', OM's own Reflector timeout is deferred, but a
+  // caller abort while the Reflector is waiting on the provider still ends the cycle.
+  it('keeps a caller abort fatal under continue while the Reflector model never answers', async () => {
+    const controller = new AbortController();
+    const hanging = createHangingModel();
+    const { runner } = createReflectorRunner(hanging.model, {
+      reflectionConfig: { failurePolicy: 'continue', maxRetries: 0 },
+    });
+
+    const reflection = runner
+      .maybeReflect({
+        record: makeRecord(),
+        observationTokens: SOURCE_OBSERVATIONS.length,
+        threadId: 'thread-1',
+        abortSignal: controller.signal,
+      })
+      .then(
+        () => undefined,
+        (rejection: unknown) => rejection,
+      );
+    await hanging.requested;
+    controller.abort(new Error('caller cancelled'));
+    const error = await reflection;
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(OmModelExecutionError);
+    expect(hanging.callCount).toBe(1);
   });
 
   it('keeps the exhausted reflector-model failure fatal under abort policy', async () => {
