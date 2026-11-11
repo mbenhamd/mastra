@@ -124,7 +124,7 @@ interface HostRpcEnvelope {
 /**
  * Waits for a caller-supplied transpile, or for the run's deadline or abort,
  * whichever comes first. The caller checks an already-aborted signal before
- * starting the hook. A rejection propagates. A hook that loses the race is
+ * starting the hook; an abort during the hook's synchronous part is seen here. A rejection propagates. A hook that loses the race is
  * left to settle on its own; its result is ignored.
  */
 async function raceTranspile(
@@ -144,6 +144,9 @@ async function raceTranspile(
       }),
       new Promise<{ kind: 'abort' }>(resolve => {
         if (!abortSignal) return;
+        // The hook has already run its synchronous part, which can abort the
+        // signal before this listener exists.
+        if (abortSignal.aborted) return resolve({ kind: 'abort' });
         onAbort = () => resolve({ kind: 'abort' });
         abortSignal.addEventListener('abort', onAbort, { once: true });
       }),
