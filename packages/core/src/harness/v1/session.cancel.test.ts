@@ -74,8 +74,8 @@ describe('Session.cancel()', () => {
     }));
     const first = deferred();
     const second = deferred();
-    (session as any)._queueResolvers.set('queued-1', first);
-    (session as any)._queueResolvers.set('queued-2', second);
+    (session as any)._queueHead.register('queued-1', first);
+    (session as any)._queueHead.register('queued-2', second);
 
     await session.cancel({ reason: 'stop-all' });
 
@@ -111,7 +111,7 @@ describe('Session.cancel()', () => {
           },
         ],
       }));
-      (session as any)._queueResolvers.set('delayed', queued);
+      (session as any)._queueHead.register('delayed', queued);
       (session as any)._scheduleQueueWakeupForPendingQueue();
       expect((session as any)._queueWakeTimer).toBeDefined();
 
@@ -140,7 +140,7 @@ describe('Session.cancel()', () => {
     (session as any)._currentQueuedItemId = 'active';
     (session as any)._currentTurnAbortController = controller;
     const active = deferred();
-    (session as any)._queueResolvers.set('active', active);
+    (session as any)._queueHead.register('active', active);
 
     await session.cancel({ reason: 'stop-session' });
 
@@ -161,7 +161,7 @@ describe('Session.cancel()', () => {
     }));
     (session as any)._currentQueuedItemId = 'preflight';
     const queued = deferred();
-    (session as any)._queueResolvers.set('preflight', queued);
+    (session as any)._queueHead.register('preflight', queued);
 
     await session.cancel({ reason: 'cancel-before-dispatch' });
 
@@ -195,7 +195,7 @@ describe('Session.cancel()', () => {
       },
     }));
     const queued = deferred();
-    (session as any)._queueResolvers.set('completed', queued);
+    (session as any)._queueHead.register('completed', queued);
 
     await session.cancel({ reason: 'cancel-after-complete' });
 
@@ -238,7 +238,7 @@ describe('Session.cancel()', () => {
       },
     }));
     const queued = deferred();
-    (session as any)._queueResolvers.set('completed-unfinalized', queued);
+    (session as any)._queueHead.register('completed-unfinalized', queued);
 
     await session.cancel({ reason: 'cancel-after-complete-before-finalize' });
 
@@ -288,7 +288,7 @@ describe('Session.cancel()', () => {
       },
     }));
     const queued = deferred();
-    (session as any)._queueResolvers.set('completed-after-cancel', queued);
+    (session as any)._queueHead.register('completed-after-cancel', queued);
 
     await (session as any)._kickQueueDrain();
 
@@ -343,7 +343,7 @@ describe('Session.cancel()', () => {
         return originalMarkPostRunFinalized(...args);
       };
       const queued = deferred();
-      (session as any)._queueResolvers.set('completed-retry', queued);
+      (session as any)._queueHead.register('completed-retry', queued);
 
       await session.cancel({ reason: 'cancel-after-complete-before-finalize' });
 
@@ -432,8 +432,8 @@ describe('Session.cancel()', () => {
       };
       const first = deferred();
       const second = deferred();
-      (session as any)._queueResolvers.set('completed-first', first);
-      (session as any)._queueResolvers.set('completed-second', second);
+      (session as any)._queueHead.register('completed-first', first);
+      (session as any)._queueHead.register('completed-second', second);
 
       await session.cancel({ reason: 'cancel-two-completed' });
 
@@ -476,7 +476,7 @@ describe('Session.cancel()', () => {
     }));
     (session as any)._currentQueuedItemId = 'suspended';
     const queued = deferred();
-    (session as any)._queueResolvers.set('suspended', queued);
+    (session as any)._queueHead.register('suspended', queued);
     const idle = session.waitForIdle({ timeoutMs: 100 });
 
     await session.cancel({ reason: 'cancel-suspended' });
@@ -651,7 +651,7 @@ describe('Session.cancelQueuedItem()', () => {
       ],
     }));
     const second = deferred();
-    (session as any)._queueResolvers.set('queued-2', second);
+    (session as any)._queueHead.register('queued-2', second);
 
     await session.cancelQueuedItem({ queuedItemId: 'queued-2', reason: 'single-drop' });
 

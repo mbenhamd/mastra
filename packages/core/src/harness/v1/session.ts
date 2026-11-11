@@ -1442,17 +1442,6 @@ export class Session {
 
   /** PF-8365: the queue head (current queued item, its source, the `queue()` resolvers). */
   private readonly _queueHead = new QueueHead();
-  /**
-   * Queue resolvers indexed by `queuedItem.id`. Set in `queue()` so the
-   * caller's promise settles when the head turn completes (or rejects on
-   * permanent failure). Cleared after settle. Items recovered from
-   * `pendingQueue` on hydration have no resolver — `queue_item_replayed` is
-   * emitted instead and the turn runs purely for its side-effects.
-   */
-  private readonly _queueResolvers = new Map<
-    string,
-    { promise: Promise<AgentResult>; resolve: (result: AgentResult) => void; reject: (err: unknown) => void }
-  >();
   /** `queuedItem.id` of the turn currently running (live or suspended). */
   private _currentQueuedItemId?: string;
   /**
@@ -4617,9 +4606,8 @@ export class Session {
           error: projectedError,
         });
       }
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(expiryError);
       }
       if (this._currentQueuedItemId === queuedItemId) {
@@ -4994,9 +4982,8 @@ export class Session {
         ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
         error: projectedError,
       });
-      const resolver = this._queueResolvers.get(recoveringQueuedItemId);
+      const resolver = this._queueHead.takeResolver(recoveringQueuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(recoveringQueuedItemId);
         resolver.reject(recoveryError);
       }
       if (this._currentQueuedItemId === recoveringQueuedItemId) {
@@ -6507,16 +6494,14 @@ export class Session {
     // observable effect is the rejected operation promises + cleared queue +
     // updated display snapshot below.
     for (const dropped of removedItems) {
-      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      const resolver = this._queueHead.takeResolver(dropped.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(dropped.queuedItemId);
         resolver.reject(new HarnessSessionCancelledError(this.id, durableReason));
       }
     }
     for (const completed of completedItems) {
-      const resolver = this._queueResolvers.get(completed.queuedItemId);
+      const resolver = this._queueHead.takeResolver(completed.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(completed.queuedItemId);
         resolver.resolve(completed.result);
       }
     }
@@ -6725,9 +6710,8 @@ export class Session {
     this._clearPendingInteractionExpiryTimer();
     this._pendingReplacementToolSurfaces.delete(pending.runId);
     if (queuedItemId !== undefined) {
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(abortError);
       }
       if (this._currentQueuedItemId === queuedItemId) {
@@ -6844,9 +6828,8 @@ export class Session {
 
     // §10.2: queue-item cancellation is not a public event — the observable
     // effect is the rejected operation promise below + the cleared queue.
-    const resolver = this._queueResolvers.get(removed.queuedItemId);
+    const resolver = this._queueHead.takeResolver(removed.queuedItemId);
     if (resolver) {
-      this._queueResolvers.delete(removed.queuedItemId);
       resolver.reject(new HarnessSessionCancelledError(this.id, reason));
     }
     if ((this._record.pendingQueue?.length ?? 0) > 0) {
@@ -15934,9 +15917,8 @@ export class Session {
     this._clearPendingInteractionExpiryTimer();
     this._pendingReplacementToolSurfaces.delete(claimedPending.runId);
     if (queuedItemId !== undefined) {
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(discardError);
       }
       if (this._currentQueuedItemId === queuedItemId) {
@@ -17830,9 +17812,8 @@ export class Session {
       if (completingQueuedItemId !== undefined) {
         this._currentQueuedItemId = undefined;
         this._currentQueuedItemSource = undefined;
-        const resolver = this._queueResolvers.get(completingQueuedItemId);
+        const resolver = this._queueHead.takeResolver(completingQueuedItemId);
         if (resolver) {
-          this._queueResolvers.delete(completingQueuedItemId);
           resolver.resolve(full as AgentResult);
         }
         this._notifyMaybeIdle();
@@ -17980,9 +17961,8 @@ export class Session {
         ...(settledReceipt?.admissionId ? { admissionId: settledReceipt.admissionId } : {}),
         error: projectedError,
       });
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.reject(publicErrorProjectionToError(projectedError));
       }
     }
@@ -18406,9 +18386,8 @@ export class Session {
       }
       this._currentQueuedItemId = undefined;
       this._currentQueuedItemSource = undefined;
-      const resolver = this._queueResolvers.get(queuedItemId);
+      const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(queuedItemId);
         resolver.resolve(currentReceipt.result as AgentResult);
       }
       this._notifyMaybeIdle();
@@ -18507,7 +18486,7 @@ export class Session {
       return promise;
     }
 
-    this._queueResolvers.set(admission.queuedItemId, { promise, resolve: queued.resolve, reject: queued.reject });
+    this._queueHead.register(admission.queuedItemId, { promise, resolve: queued.resolve, reject: queued.reject });
     // Kick the drain — fire-and-forget. Drain handles its own errors and
     // settles the resolver via `_completeQueuedTurn` / `_failQueuedTurn`.
     void this._maybeDrainQueue();
@@ -18965,7 +18944,7 @@ export class Session {
         evidence.error ?? { code: 'harness.queue_exhausted', message: 'queued turn exhausted retry attempts' },
       );
     }
-    const resolver = this._queueResolvers.get(evidence.queuedItemId);
+    const resolver = this._queueHead.peekResolver(evidence.queuedItemId);
     if (resolver) return this._raceActiveTurnWaiter(resolver.promise, activeDeleted);
     void this._maybeDrainQueue();
     return this._awaitDurableQueueResult(evidence, activeDeleted);
@@ -19200,9 +19179,8 @@ export class Session {
   // throws HarnessQueueFullError at the caller and admits nothing.)
   private _failBackpressureDroppedItems(droppedItems: QueueBackpressureDrop[]): void {
     for (const dropped of droppedItems) {
-      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      const resolver = this._queueHead.takeResolver(dropped.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(dropped.queuedItemId);
         resolver.reject(new HarnessQueueFullDroppedError(dropped.queuedItemId));
       }
     }
@@ -19381,9 +19359,8 @@ export class Session {
     for (const dropped of expired) {
       // §10.2: no queue_item_expired event — the observable effect is the
       // rejected operation promise (HarnessQueueItemExpiredError) below.
-      const resolver = this._queueResolvers.get(dropped.queuedItemId);
+      const resolver = this._queueHead.takeResolver(dropped.queuedItemId);
       if (resolver) {
-        this._queueResolvers.delete(dropped.queuedItemId);
         resolver.reject(new HarnessQueueItemExpiredError(this.id, dropped.queuedItemId, dropped.deadline));
       }
     }
@@ -19435,7 +19412,7 @@ export class Session {
         // marks the boundary. We still clear the live-admission marker (only
         // when no live resolver is tracking the item, mirroring the prior
         // short-circuit) so `_liveAdmittedQueuedItemIds` does not leak.
-        if (!this._queueResolvers.has(head.id)) {
+        if (!this._queueHead.hasResolver(head.id)) {
           this._liveAdmittedQueuedItemIds.delete(head.id);
         }
 
@@ -20503,9 +20480,8 @@ export class Session {
    */
   private async _completeQueuedTurn(itemId: string, result: AgentResult): Promise<void> {
     if (this.isClosed) {
-      const resolver = this._queueResolvers.get(itemId);
+      const resolver = this._queueHead.takeResolver(itemId);
       if (resolver) {
-        this._queueResolvers.delete(itemId);
         resolver.resolve(result);
       }
       return;
@@ -20556,9 +20532,8 @@ export class Session {
         });
       }
     }
-    const resolver = this._queueResolvers.get(itemId);
+    const resolver = this._queueHead.takeResolver(itemId);
     if (resolver) {
-      this._queueResolvers.delete(itemId);
       if (terminalFailure) {
         resolver.reject(terminalFailure);
       } else {
@@ -20576,9 +20551,8 @@ export class Session {
     // Eviction rejects local waiters and leaves durable queued work for its next
     // owner. Failure cleanup must not write through the lost lease.
     if (this.isClosed || this._state === 'evicted') {
-      const resolver = this._queueResolvers.get(itemId);
+      const resolver = this._queueHead.takeResolver(itemId);
       if (resolver) {
-        this._queueResolvers.delete(itemId);
         resolver.reject(err);
       }
       return;
@@ -20653,9 +20627,8 @@ export class Session {
         });
       }
     }
-    const resolver = this._queueResolvers.get(itemId);
+    const resolver = this._queueHead.takeResolver(itemId);
     if (resolver) {
-      this._queueResolvers.delete(itemId);
       if (completedResult !== undefined) {
         resolver.resolve(completedResult);
       } else {
@@ -20706,9 +20679,8 @@ export class Session {
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
     for (const itemId of queuedIds) {
-      const resolver = this._queueResolvers.get(itemId);
+      const resolver = this._queueHead.takeResolver(itemId);
       if (!resolver) continue;
-      this._queueResolvers.delete(itemId);
       const completed = completedResults.get(itemId);
       if (completed !== undefined) {
         resolver.resolve(completed);
@@ -20729,9 +20701,8 @@ export class Session {
       this._unrefQueueTimerIfBackgroundOnly(timer);
       return;
     }
-    const resolver = this._queueResolvers.get(itemId);
+    const resolver = this._queueHead.takeResolver(itemId);
     if (resolver) {
-      this._queueResolvers.delete(itemId);
       resolver.reject(err);
     }
   }
@@ -20801,7 +20772,7 @@ export class Session {
   }
 
   private _unrefQueueTimerIfBackgroundOnly(timer: ReturnType<typeof setTimeout>): void {
-    if (this._queueResolvers.size === 0) {
+    if (this._queueHead.resolverCount === 0) {
       timer.unref?.();
     }
   }
@@ -21867,10 +21838,7 @@ export class Session {
     this._clearDelegationReconcileTimers();
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
-    for (const [queuedItemId, resolver] of this._queueResolvers) {
-      this._queueResolvers.delete(queuedItemId);
-      resolver.reject(err);
-    }
+    this._queueHead.rejectAll(err);
     this._tearDownThreadSubscription(err);
   }
 
@@ -21919,10 +21887,7 @@ export class Session {
     this._clearDelegationReconcileTimers();
     this._currentQueuedItemId = undefined;
     this._currentQueuedItemSource = undefined;
-    for (const [queuedItemId, resolver] of this._queueResolvers) {
-      this._queueResolvers.delete(queuedItemId);
-      resolver.reject(err);
-    }
+    this._queueHead.rejectAll(err);
   }
 
   /** @internal — update local lease metadata after the owning Harness renews storage. */
