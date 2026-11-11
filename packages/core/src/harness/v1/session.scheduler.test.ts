@@ -219,7 +219,7 @@ describe('_scheduleNextQueueHead — deadline expiry', () => {
         },
       },
     }));
-    (session as any)._queueResolvers.set('q-expired', { resolve: vi.fn(), reject: rejectExpired });
+    (session as any)._queueHead.register('q-expired', { resolve: vi.fn(), reject: rejectExpired });
 
     await (session as any)._scheduleNextQueueHead();
 
