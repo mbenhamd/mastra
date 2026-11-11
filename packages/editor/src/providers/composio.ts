@@ -553,12 +553,18 @@ export class ComposioToolProvider extends BaseToolProvider {
         input: unknown,
         context?: unknown,
       ) => {
-        const requestContext = (context as { requestContext?: RequestContext } | undefined)?.requestContext;
+        const { requestContext, abortSignal } =
+          (context as { requestContext?: RequestContext; abortSignal?: AbortSignal } | undefined) ?? {};
+        // A Stop that lands before or while the identity resolves must not
+        // reach Composio: the action may already be approved and act on the
+        // user's external account.
+        abortSignal?.throwIfAborted();
         const identity = await opts.resolveIdentity({
           requestContext,
           toolSlug: slug,
           ...(toolkit ? { toolkit } : {}),
         });
+        abortSignal?.throwIfAborted();
         const userId = typeof identity?.userId === 'string' ? identity.userId.trim() : '';
         if (!identity || userId.length === 0 || userId === CATALOG_SCHEMA_USER_ID) {
           throw new Error(`[composio] no execution identity for ${slug}`);
