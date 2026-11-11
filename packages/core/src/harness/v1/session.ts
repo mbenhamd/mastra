@@ -31,7 +31,7 @@
 import { randomUUID } from 'node:crypto';
 import type { z } from 'zod';
 
-import { Agent } from '../../agent';
+import type { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
 import {
   AGENT_EXECUTION_OPTION_COMPOSERS,
@@ -67,12 +67,10 @@ import {
 } from '../../agent/tool-surface-fence';
 import type { ToolSurfaceFence } from '../../agent/tool-surface-fence';
 import type { AgentThreadSubscription, ToolsInput } from '../../agent/types';
-import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { watchHistoryLoad } from '../../memory/history-load-watch';
 import type { HistoryLoadWatch } from '../../memory/history-load-watch';
 import type { MastraMemory } from '../../memory/memory';
 import type { TracingContext } from '../../observability';
-import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
 import {
   HarnessStorageAdmissionConflictError,
@@ -283,13 +281,44 @@ import {
 import { MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS, pendingResumeForDisplay } from './session-display';
 import type { SessionDisplayState, SessionRunProjection } from './session-display';
 import {
-  buildJudgeContinuation,
-  buildKickoffContinuation,
-  buildResumeContinuation,
-  GoalJudgeSchema,
-  JUDGE_SYSTEM_PROMPT,
-  truncateForJudge,
+  clearSessionGoal,
+  createGoalJudgeAgent,
+  getGoalJudgeContext,
+  getSessionGoal,
+  pauseSessionGoal,
+  resumeSessionGoal,
+  runGoalJudge,
+  setSessionGoal,
+  updateGoalJudgeDefaults,
 } from './session-goal-judge';
+import type { GoalJudgeSessionPort } from './session-goal-judge';
+import {
+  currentMode,
+  currentModeId,
+  deleteSessionAttachment,
+  modeAgentId,
+  modelsCurrent,
+  modelsCurrentAuthStatus,
+  modelsGetSubagent,
+  modelsHasSelected,
+  modelsSetSubagent,
+  modelsSwitch,
+  setSessionThreadSetting,
+  switchSessionMode,
+  uploadSessionAttachment,
+} from './session-mode-model-config';
+import type { ModeModelConfigSessionPort } from './session-mode-model-config';
+import {
+  hasUnsupportedObservationalMemoryIntent,
+  omClearOverride,
+  omObservationThreshold,
+  omObserverModelId,
+  omReflectionThreshold,
+  omReflectorModelId,
+  omSwitchObserverModel,
+  omSwitchReflectorModel,
+} from './session-observational-memory';
+import type { ObservationalMemorySessionPort } from './session-observational-memory';
 import {
   ASK_USER_TOOL_NAME,
   cancelledPendingAudit,
@@ -1093,7 +1122,7 @@ function done(seen: Set<object>, obj: object, path: string): string {
 
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
 
-interface QueueBackpressureDrop {
+export interface QueueBackpressureDrop {
   queuedItemId: string;
   admissionId?: string;
   replacementQueuedItemId?: string;
@@ -1101,18 +1130,6 @@ interface QueueBackpressureDrop {
   maxQueueDepth: number;
   source: 'queue' | 'goal';
   goalId?: string;
-}
-
-function assertAgentType(method: string, value: unknown): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new HarnessValidationError(method, 'agentType must be a non-empty string');
-  }
-}
-
-function assertModelId(method: string, value: unknown): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new HarnessValidationError(method, 'model must be a non-empty string');
-  }
 }
 
 function isStorageAttachmentUnavailableError(err: unknown): err is HarnessStorageAttachmentUnavailableError {
@@ -2673,7 +2690,7 @@ export class Session {
     const identity: RunSpanIdentity = {
       resourceId: rec.resourceId,
       threadId: rec.threadId,
-      agentId: this._modeAgentId(modeId),
+      agentId: modeAgentId(this._modeModelConfigPort(), modeId),
       modeId,
       modelId: this._currentRunModelId ?? rec.modelId,
       operationKind: this._currentQueuedItemId !== undefined ? 'queue' : 'signal',
@@ -4248,7 +4265,7 @@ export class Session {
     const { event, status, reconstructed } = this._buildRunCompletedEvent(runId, finishReason, usage, Date.now(), {
       resourceId: this.resourceId,
       threadId: this.threadId,
-      agentId: this._modeAgentId(modeId),
+      agentId: modeAgentId(this._modeModelConfigPort(), modeId),
       modeId,
       modelId: evidence.modelId ?? this._record.modelId,
       operationKind: 'signal',
@@ -14772,16 +14789,37 @@ export class Session {
   // observe a stale value.
   // -------------------------------------------------------------------------
 
+  /** Build the small port the mode, model and session-configuration operations need. */
+  private _modeModelConfigPort(): ModeModelConfigSessionPort {
+    const session = this;
+    return {
+      id: this.id,
+      resourceId: this.resourceId,
+      threadId: this.threadId,
+      get record() {
+        return session._record;
+      },
+      harness: this._harness,
+      emitter: this._emitter,
+      get modeSwitchEpoch() {
+        return session._modeSwitchEpoch;
+      },
+      set modeSwitchEpoch(value) {
+        session._modeSwitchEpoch = value;
+      },
+      assertLive: method => session._assertLive(method),
+      flushUpdate: update => session._flushUpdate(update),
+    };
+  }
+
   /** §4.2a: the session's current mode id (the durable default modeId). */
   getCurrentModeId(): string {
-    this._assertLive('getCurrentModeId()');
-    return this._record.modeId;
+    return currentModeId(this._modeModelConfigPort());
   }
 
   /** Resolved active mode (per the session record). */
   getCurrentMode(): HarnessMode {
-    this._assertLive('getCurrentMode()');
-    return this._harness._getMode(this._record.modeId);
+    return currentMode(this._modeModelConfigPort());
   }
 
   /**
@@ -14789,25 +14827,8 @@ export class Session {
    * with the next `message()`/`queue()` call. Throws if the mode id is
    * unknown.
    */
-  async switchMode(opts: { mode: string }): Promise<void> {
-    this._assertLive('switchMode()');
-    // Validates and throws on unknown id.
-    this._harness._getMode(opts.mode);
-    const previousModeId = this._record.modeId;
-    if (previousModeId === opts.mode) return;
-    this._modeSwitchEpoch += 1;
-    // §4.2e — entering a mode re-establishes its base permission policy when it
-    // declares one (the mode owns the base; runtime grants/setPolicy overlay it).
-    // A mode that declares no `permissions` leaves the existing rules untouched.
-    const seededRules = this._harness._modePermissionRules(opts.mode);
-    await this._flushUpdate(prev => ({
-      ...prev,
-      modeId: opts.mode,
-      ...(seededRules !== undefined
-        ? { permissionRules: seededRules, permissionRulesSeedHash: sha256CanonicalJson(seededRules) }
-        : {}),
-    }));
-    this._emitter.emit({ type: 'mode_changed', modeId: opts.mode, previousModeId });
+  switchMode(opts: { mode: string }): Promise<void> {
+    return switchSessionMode(this._modeModelConfigPort(), opts);
   }
 
   /**
@@ -14816,89 +14837,14 @@ export class Session {
    * and resolve only after the durable transition commits.
    */
   readonly models = Object.freeze({
-    current: (): string => this._modelsCurrent(),
-    hasSelected: (): boolean => this._modelsHasSelected(),
-    currentAuthStatus: (): Promise<ModelAuthStatus> => this._modelsCurrentAuthStatus(),
-    switch: (opts: { model: string }): Promise<void> => this._modelsSwitch(opts),
-    setSubagent: (opts: { agentType: string; model: string }): Promise<void> => this._modelsSetSubagent(opts),
-    getSubagent: (opts: { agentType: string }): string | null => this._modelsGetSubagent(opts),
+    current: (): string => modelsCurrent(this._modeModelConfigPort()),
+    hasSelected: (): boolean => modelsHasSelected(this._modeModelConfigPort()),
+    currentAuthStatus: (): Promise<ModelAuthStatus> => modelsCurrentAuthStatus(this._modeModelConfigPort()),
+    switch: (opts: { model: string }): Promise<void> => modelsSwitch(this._modeModelConfigPort(), opts),
+    setSubagent: (opts: { agentType: string; model: string }): Promise<void> =>
+      modelsSetSubagent(this._modeModelConfigPort(), opts),
+    getSubagent: (opts: { agentType: string }): string | null => modelsGetSubagent(this._modeModelConfigPort(), opts),
   });
-
-  /** Resolved model id for the next turn. Falls back to `''` when nothing has been selected. */
-  private _modelsCurrent(): string {
-    this._assertLive('models.current()');
-    return this._record.modelId;
-  }
-
-  /**
-   * True once any model has been chosen for this session — either an
-   * explicit `models.switch()` call or a `models.setSubagent()` pin. Useful
-   * for boot flows that want to gate UI on "has the user picked yet?"
-   * without inspecting raw record fields.
-   */
-  private _modelsHasSelected(): boolean {
-    this._assertLive('models.hasSelected()');
-    if (this._record.modelId && this._record.modelId.length > 0) return true;
-    if (Object.keys(this._record.subagentModelOverrides ?? {}).length > 0) return true;
-    return false;
-  }
-
-  /**
-   * Auth status for the currently resolved model. Routed through
-   * `harness.models.getAuthStatus()` when the current model is in the
-   * catalog; returns `'unknown'` when no model is selected or the model
-   * isn't registered (we don't want the auth-status check to throw on a
-   * free-form id the agent layer will accept anyway).
-   */
-  private async _modelsCurrentAuthStatus(): Promise<ModelAuthStatus> {
-    this._assertLive('models.currentAuthStatus()');
-    const modelId = this._record.modelId;
-    if (!modelId) return 'unknown';
-    const entry = await this._harness.models.get(modelId);
-    if (!entry) return 'unknown';
-    return this._harness.models.getAuthStatus(modelId);
-  }
-
-  /** Switch the session's default model id. Free-form string — validated by the agent layer. */
-  private async _modelsSwitch(opts: { model: string }): Promise<void> {
-    this._assertLive('models.switch()');
-    assertModelId('models.switch', opts.model);
-    const previousModelId = this._record.modelId;
-    if (previousModelId === opts.model) return;
-    await this._flushUpdate(prev => ({ ...prev, modelId: opts.model }));
-    this._emitter.emit({ type: 'model_changed', modelId: opts.model, previousModelId });
-  }
-
-  /**
-   * Pin a model for spawned subagents of a given `agentType`. Override is
-   * persisted in `SessionRecord.subagentModelOverrides` and read back by
-   * the spawn machinery via `models.getSubagent()`. Emits
-   * `model_override_set`. No-op when the same mapping is already set.
-   */
-  private async _modelsSetSubagent(opts: { agentType: string; model: string }): Promise<void> {
-    this._assertLive('models.setSubagent()');
-    assertAgentType('models.setSubagent', opts.agentType);
-    assertModelId('models.setSubagent', opts.model);
-    const previousModelId = this._record.subagentModelOverrides?.[opts.agentType] ?? null;
-    if (previousModelId === opts.model) return;
-    await this._flushUpdate(prev => ({
-      ...prev,
-      subagentModelOverrides: {
-        ...(prev.subagentModelOverrides ?? {}),
-        [opts.agentType]: opts.model,
-      },
-    }));
-    // §10.2: subagent model overrides are not a public event — the override is
-    // reflected in `SessionRecord.subagentModelOverrides` and the display
-    // snapshot (the StateEvent set has only the session-level `model_changed`).
-  }
-
-  /** Read the pinned subagent model for an `agentType`, or `null` when unset. */
-  private _modelsGetSubagent(opts: { agentType: string }): string | null {
-    this._assertLive('models.getSubagent()');
-    assertAgentType('models.getSubagent', opts.agentType);
-    return this._record.subagentModelOverrides?.[opts.agentType] ?? null;
-  }
 
   // -------------------------------------------------------------------------
   // Custom state (§4.2 / §6.1).
@@ -14965,36 +14911,21 @@ export class Session {
    * `(byteLength, byteLength)` — the in-process upload completes atomically, so there is
    * no incremental progress to report.
    */
-  async uploadAttachment(opts: {
+  uploadAttachment(opts: {
     name: string;
     mimeType: string;
     data: Uint8Array;
     onProgress?: (loaded: number, total: number) => void;
   }): Promise<{ attachmentId: string }> {
-    this._assertLive('uploadAttachment()');
-    const ref = await this._harness.attachments.upload({
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      kind: 'file',
-      filename: opts.name,
-      contentType: opts.mimeType,
-      data: opts.data,
-    });
-    opts.onProgress?.(opts.data.byteLength, opts.data.byteLength);
-    return { attachmentId: ref.attachmentId };
+    return uploadSessionAttachment(this._modeModelConfigPort(), opts);
   }
 
   /**
    * §4.2e — delete a session-scoped attachment by id. A flat convenience over
    * {@link Harness.attachments}`.delete` that supplies this session's identity.
    */
-  async deleteAttachment(opts: { attachmentId: string }): Promise<void> {
-    this._assertLive('deleteAttachment()');
-    await this._harness.attachments.delete({
-      sessionId: this.id,
-      resourceId: this.resourceId,
-      attachmentId: opts.attachmentId,
-    });
+  deleteAttachment(opts: { attachmentId: string }): Promise<void> {
+    return deleteSessionAttachment(this._modeModelConfigPort(), opts);
   }
 
   /**
@@ -15010,40 +14941,8 @@ export class Session {
    * (e.g. thread rename), this requires the session's thread to already exist in storage —
    * a brand-new thread is persisted on first activity; otherwise `HarnessThreadNotFoundError`.
    */
-  async setThreadSetting(opts: { key: string; value: JsonValue }): Promise<void> {
-    this._assertLive('setThreadSetting()');
-    const { key } = opts;
-    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) {
-      throw new HarnessValidationError('setThreadSetting().key', 'must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$');
-    }
-    if (
-      key === '__proto__' ||
-      key === 'prototype' ||
-      key === 'constructor' ||
-      key.startsWith('__mastra') ||
-      key.startsWith('mastra__')
-    ) {
-      throw new HarnessValidationError(
-        'setThreadSetting().key',
-        `key "${key}" is reserved (prototype-pollution or Harness/Mastra namespace)`,
-      );
-    }
-    // Validate + normalize to canonical JSON before touching storage (drops undefined props).
-    const normalized = assertJsonValue(opts.value, 'setThreadSetting().value');
-    const settings = await this._harness._threadOps.getSettings({
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-    });
-    const rawApp = (settings as { app?: unknown }).app;
-    const currentApp =
-      rawApp !== null && typeof rawApp === 'object' && !Array.isArray(rawApp)
-        ? (rawApp as Record<string, JsonValue>)
-        : {};
-    await this._harness._threadOps.setSettings({
-      resourceId: this.resourceId,
-      threadId: this.threadId,
-      patch: { app: { ...currentApp, [key]: normalized } },
-    });
+  setThreadSetting(opts: { key: string; value: JsonValue }): Promise<void> {
+    return setSessionThreadSetting(this._modeModelConfigPort(), opts);
   }
 
   /**
@@ -15242,7 +15141,7 @@ export class Session {
         operation,
         modeId,
         modelId: pending.runtimeDependencies?.modelId ?? rec.modelId,
-        agentId: this._modeAgentId(modeId),
+        agentId: modeAgentId(this._modeModelConfigPort(), modeId),
         startedAt: pending.requestedAt,
         updatedAt: pending.resumedAt ?? pending.requestedAt,
       };
@@ -15265,7 +15164,7 @@ export class Session {
               },
         modeId,
         modelId: this._currentRunModelId ?? rec.modelId,
-        agentId: this._modeAgentId(modeId),
+        agentId: modeAgentId(this._modeModelConfigPort(), modeId),
         startedAt: this._currentRunStartedAt ?? rec.lastActivityAt,
         updatedAt: rec.lastActivityAt,
       };
@@ -15273,16 +15172,6 @@ export class Session {
       return projection;
     }
     return undefined;
-  }
-
-  /** Resolve a mode's backing agentId for the run projection, tolerating a mode
-   * that has since been removed from config (fall back to the session default). */
-  private _modeAgentId(modeId: string): string {
-    try {
-      return this._harness._getMode(modeId).agentId;
-    } catch {
-      return this._harness._getMode(this._record.modeId).agentId;
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -15545,6 +15434,32 @@ export class Session {
   // terminate at task completion.
   // -------------------------------------------------------------------------
 
+  /** Build the small port the goal-judge operations need. */
+  private _goalJudgePort(): GoalJudgeSessionPort {
+    const session = this;
+    return {
+      parentSessionId: this.parentSessionId,
+      get record() {
+        return session._record;
+      },
+      harness: this._harness,
+      get currentTurnSourceWriteGuard() {
+        return session._currentTurnSourceWriteGuard;
+      },
+      get testJudge() {
+        return session.__testJudge;
+      },
+      assertLive: method => session._assertLive(method),
+      flushUpdate: update => session._flushUpdate(update),
+      emit: event => session._emit(event),
+      currentCancelRequest: () => session._currentCancelRequest(),
+      applyQueueBackpressureForAppend: (prev, opts) => session._applyQueueBackpressureForAppend(prev, opts),
+      failBackpressureDroppedItems: droppedItems => session._failBackpressureDroppedItems(droppedItems),
+      maybeDrainQueue: () => session._maybeDrainQueue(),
+      listMessages: () => session.listMessages(),
+    };
+  }
+
   /**
    * Attach a goal to this session. Replaces any existing goal (emits
    * `goal_cleared` for the prior goal first, then `goal_set`). Resets the
@@ -15553,95 +15468,31 @@ export class Session {
    * When `kickoff` is `true` (default), an initial continuation turn is
    * enqueued so the agent starts working without an explicit `message()`.
    */
-  async setGoal(opts: GoalOptions): Promise<GoalState> {
-    this._assertLive('setGoal()');
-    if (this.parentSessionId !== undefined || this._record.origin === 'subagent-tool') {
-      throw new HarnessValidationError('setGoal', 'goals cannot be set on subagent sessions (parent owns the loop)');
-    }
-    if (typeof opts.objective !== 'string' || opts.objective.length === 0) {
-      throw new HarnessValidationError('setGoal.objective', 'must be a non-empty string');
-    }
-    if (opts.maxTurns !== undefined && (!Number.isInteger(opts.maxTurns) || opts.maxTurns < 1)) {
-      throw new HarnessValidationError('setGoal.maxTurns', 'must be a positive integer');
-    }
-
-    const defaults = this._harness._internalGoalDefaults;
-    const judgeModelId = opts.judgeModel ?? defaults.defaultJudgeModel;
-    if (typeof judgeModelId !== 'string' || judgeModelId.length === 0) {
-      throw new HarnessValidationError(
-        'setGoal.judgeModel',
-        'no judge model provided and `goals.defaultJudgeModel` is not configured',
-      );
-    }
-
-    const priorId = this._record.goal?.id;
-    const goal: GoalState = {
-      id: `goal-${randomUUID()}`,
-      objective: opts.objective,
-      status: 'active',
-      turnsUsed: 0,
-      maxTurns: opts.maxTurns ?? defaults.defaultMaxTurns,
-      judgeModelId,
-      createdAt: Date.now(),
-    };
-
-    await this._flushUpdate(prev => ({ ...prev, goal }));
-    if (priorId !== undefined) {
-      this._emit({ type: 'goal_cleared', goalId: priorId });
-    }
-    this._emit({ type: 'goal_set', goal });
-
-    if (opts.kickoff !== false) {
-      await this._enqueueGoalContinuation(goal, buildKickoffContinuation(opts.objective));
-    }
-
-    return goal;
+  setGoal(opts: GoalOptions): Promise<GoalState> {
+    return setSessionGoal(this._goalJudgePort(), opts);
   }
 
   /** Return the active goal, if any. */
   getGoal(): GoalState | undefined {
-    this._assertLive('getGoal()');
-    return this._record.goal;
+    return getSessionGoal(this._goalJudgePort());
   }
 
   /** Pause auto-continuations without losing the goal. Emits `goal_paused`. */
-  async pauseGoal(): Promise<GoalState | undefined> {
-    this._assertLive('pauseGoal()');
-    const goal = this._record.goal;
-    if (!goal || goal.status === 'paused') return goal;
-    const updated: GoalState = { ...goal, status: 'paused' };
-    await this._flushUpdate(prev => ({ ...prev, goal: updated }));
-    this._emit({ type: 'goal_paused', goalId: goal.id, reason: 'requested' });
-    return updated;
+  pauseGoal(): Promise<GoalState | undefined> {
+    return pauseSessionGoal(this._goalJudgePort());
   }
 
   /**
    * Resume an inactive goal. Re-emits `goal_resumed` and enqueues a fresh
    * continuation turn so the agent picks up where it left off.
    */
-  async resumeGoal(): Promise<GoalState | undefined> {
-    this._assertLive('resumeGoal()');
-    const goal = this._record.goal;
-    if (!goal) return undefined;
-    if (goal.status === 'active') return goal;
-    const updated: GoalState = { ...goal, status: 'active' };
-    await this._flushUpdate(prev => ({ ...prev, goal: updated }));
-    this._emit({ type: 'goal_resumed', goalId: goal.id });
-    await this._enqueueGoalContinuation(updated, buildResumeContinuation(updated.objective));
-    return updated;
+  resumeGoal(): Promise<GoalState | undefined> {
+    return resumeSessionGoal(this._goalJudgePort());
   }
 
   /** Drop the goal entirely. Emits `goal_cleared`. */
-  async clearGoal(): Promise<void> {
-    this._assertLive('clearGoal()');
-    const goal = this._record.goal;
-    if (!goal) return;
-    await this._flushUpdate(prev => {
-      const next = { ...prev };
-      delete next.goal;
-      return next;
-    });
-    this._emit({ type: 'goal_cleared', goalId: goal.id });
+  clearGoal(): Promise<void> {
+    return clearSessionGoal(this._goalJudgePort());
   }
 
   /**
@@ -15652,72 +15503,8 @@ export class Session {
    *
    * Returns the updated goal, or `undefined` if there's nothing to update.
    */
-  async updateJudgeDefaults(opts: { judgeModelId?: string; maxTurns?: number }): Promise<GoalState | undefined> {
-    this._assertLive('updateJudgeDefaults()');
-    const goal = this._record.goal;
-    if (!goal) return undefined;
-    if (opts.judgeModelId === undefined && opts.maxTurns === undefined) return goal;
-    if (opts.maxTurns !== undefined && (!Number.isFinite(opts.maxTurns) || opts.maxTurns <= 0)) {
-      throw new HarnessValidationError('maxTurns', 'maxTurns must be a positive number');
-    }
-    const updated: GoalState = {
-      ...goal,
-      ...(opts.judgeModelId !== undefined ? { judgeModelId: opts.judgeModelId } : {}),
-      ...(opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {}),
-    };
-    await this._flushUpdate(prev => ({ ...prev, goal: updated }));
-    return updated;
-  }
-
-  /**
-   * @internal — enqueue a goal-driven continuation turn. Caller is responsible
-   * for building the final prompt content (kickoff / resume / judge-continue
-   * each use a distinct template — see `buildKickoffContinuation` /
-   * `buildResumeContinuation` / `buildJudgeContinuation`). Marked with
-   * `source: 'goal'` so the judge loop knows to skip re-judging on the
-   * resulting turn (otherwise the loop would never terminate).
-   */
-  private async _enqueueGoalContinuation(goal: GoalState, content: string): Promise<void> {
-    if (this._currentCancelRequest() !== undefined) return;
-    const cap = this._harness._internalMaxQueueDepth;
-    const item: QueuedItem = {
-      id: `q-${randomUUID()}`,
-      enqueuedAt: Date.now(),
-      content,
-      attachments: [],
-      mode: this._record.modeId,
-      source: 'goal',
-      goalId: goal.id,
-      ...(this._currentTurnSourceWriteGuard
-        ? { observationalMemorySourceWriteGuard: this._currentTurnSourceWriteGuard }
-        : {}),
-    };
-    const droppedItems: QueueBackpressureDrop[] = [];
-    let admitted = false;
-    await this._flushUpdate(prev => {
-      if (prev.cancelRequest !== undefined) return prev;
-      return this._applyQueueBackpressureForAppend(prev, {
-        item,
-        receipt: undefined,
-        maxQueueDepth: cap,
-        source: 'goal',
-        goalId: goal.id,
-        droppedItems,
-        onRejected: () => {
-          admitted = false;
-        },
-        onAdmitted: () => {
-          admitted = true;
-        },
-      });
-    });
-    this._failBackpressureDroppedItems(droppedItems);
-    if (!admitted) {
-      // §10.2: queue-full/backpressure is not a public event — the goal item is
-      // simply not admitted (rejected at the caller for direct queue()).
-      return;
-    }
-    void this._maybeDrainQueue();
+  updateJudgeDefaults(opts: { judgeModelId?: string; maxTurns?: number }): Promise<GoalState | undefined> {
+    return updateGoalJudgeDefaults(this._goalJudgePort(), opts);
   }
 
   /**
@@ -15729,193 +15516,8 @@ export class Session {
    * any check fails the verdict is discarded silently (no event, no state
    * change) — the user has already moved on.
    */
-  private async _runGoalJudge(turn: FullOutput<unknown>, wasGoalDriven: boolean): Promise<void> {
-    // Skip re-judging on goal-driven continuation turns to avoid a tight
-    // loop where every continuation triggers another judge call. The
-    // judge only runs after user-driven turns; continuations are auto-
-    // generated from the prior judge call.
-    if (wasGoalDriven) return;
-
-    const goal = this._record.goal;
-    if (!goal || goal.status !== 'active') return;
-
-    const evaluatedGoalId = goal.id;
-
-    // Suspended turns don't count toward the judge loop — wait for resume.
-    if (turn.finishReason === 'suspended') return;
-
-    // Gate 1 — re-read goal after the async context fetch. If it's been
-    // cleared / paused / replaced, drop this judge cycle silently.
-    const context = await this._getJudgeContext(turn);
-    if (this._record.goal?.id !== evaluatedGoalId || this._record.goal.status !== 'active') return;
-
-    // No-assistant-message fallback: parity with TUI's evaluateAfterTurn.
-    // The judge has nothing to score, but the agent still made some attempt
-    // (typically a tool call without a closing assistant message). Push a
-    // gentle nudge unless we've hit the budget.
-    if (!context.lastAssistantContent) {
-      if (goal.turnsUsed >= goal.maxTurns) {
-        await this._flushUpdate(prev =>
-          prev.goal && prev.goal.id === evaluatedGoalId
-            ? { ...prev, goal: { ...prev.goal, status: 'paused' as const } }
-            : prev,
-        );
-        this._emit({ type: 'goal_paused', goalId: evaluatedGoalId, reason: 'budget_exhausted' });
-        return;
-      }
-      await this._enqueueGoalContinuation(
-        goal,
-        buildJudgeContinuation({
-          turn: goal.turnsUsed,
-          max: goal.maxTurns,
-          objective: goal.objective,
-          judgeReason: 'No response yet, keep working.',
-        }),
-      );
-      return;
-    }
-
-    let decision: GoalJudgeDecision;
-    try {
-      decision = await this._callJudge(goal, turn);
-    } catch {
-      // Gate 2a — goal might have changed during the judge call.
-      if (this._record.goal?.id !== evaluatedGoalId) return;
-      await this._flushUpdate(prev =>
-        prev.goal && prev.goal.id === evaluatedGoalId
-          ? { ...prev, goal: { ...prev.goal, status: 'paused' as const } }
-          : prev,
-      );
-      this._emit({ type: 'goal_paused', goalId: evaluatedGoalId, reason: 'judge_failed' });
-      return;
-    }
-
-    // Gate 2b — goal might have changed during the judge call.
-    if (this._record.goal?.id !== evaluatedGoalId) return;
-
-    const turnsUsed = decision.decision === 'waiting' ? goal.turnsUsed : goal.turnsUsed + 1;
-    const updated: GoalState = { ...goal, turnsUsed, lastDecision: decision };
-
-    await this._flushUpdate(prev =>
-      prev.goal && prev.goal.id === evaluatedGoalId ? { ...prev, goal: updated } : prev,
-    );
-
-    this._emit({
-      type: 'goal_judged',
-      goalId: evaluatedGoalId,
-      decision,
-      turnsUsed,
-      maxTurns: updated.maxTurns,
-    });
-
-    if (decision.decision === 'done') {
-      await this._flushUpdate(prev =>
-        prev.goal && prev.goal.id === evaluatedGoalId
-          ? { ...prev, goal: { ...prev.goal, status: 'done' as const } }
-          : prev,
-      );
-      this._emit({ type: 'goal_done', goalId: evaluatedGoalId, reason: decision.reason, turnsUsed });
-      return;
-    }
-
-    if (decision.decision === 'waiting') {
-      // §10.2: the judge parked the goal at an external checkpoint. Surface it
-      // as `goal_waiting` (turnsUsed is unchanged — see the computation above)
-      // so subscribers can distinguish a checkpoint pause from a budget/judge
-      // failure (`goal_paused`) or completion (`goal_done`).
-      this._emit({ type: 'goal_waiting', goalId: evaluatedGoalId, reason: decision.reason, turnsUsed });
-      return;
-    }
-
-    // decision.decision === 'continue'
-    if (turnsUsed >= updated.maxTurns) {
-      await this._flushUpdate(prev =>
-        prev.goal && prev.goal.id === evaluatedGoalId
-          ? { ...prev, goal: { ...prev.goal, status: 'paused' as const } }
-          : prev,
-      );
-      this._emit({ type: 'goal_paused', goalId: evaluatedGoalId, reason: 'budget_exhausted' });
-      return;
-    }
-
-    // Gate 3 — final stale check before enqueueing.
-    if (this._record.goal?.id !== evaluatedGoalId || this._record.goal.status !== 'active') return;
-    await this._enqueueGoalContinuation(
-      updated,
-      buildJudgeContinuation({
-        turn: turnsUsed,
-        max: updated.maxTurns,
-        objective: updated.objective,
-        judgeReason: decision.reason,
-      }),
-    );
-  }
-
-  /**
-   * @internal — execute the judge model. Returns a `GoalJudgeDecision`.
-   *
-   * Test-injection hook: when `__testJudge` is set on this session, it
-   * runs in place of the real judge call so unit tests can drive verdicts
-   * deterministically without standing up a live model.
-   */
-  private async _callJudge(goal: GoalState, turn: FullOutput<unknown>): Promise<GoalJudgeDecision> {
-    const hook = this.__testJudge;
-    if (hook) {
-      const verdict = await hook(goal);
-      return { ...verdict, judgedAt: Date.now() };
-    }
-    // Real judge path. Mirrors the TUI's GoalManager.callJudge:
-    //   - dedicated `goal-judge` Agent with JUDGE_SYSTEM_PROMPT baked in
-    //   - input processor: ProviderHistoryCompat (history-shape parity
-    //     across providers, esp. Anthropic)
-    //   - error processors: StreamErrorRetryProcessor, PrefillErrorHandler,
-    //     ProviderHistoryCompat (retry flaky judge streams cleanly)
-    //   - dedicated memory thread `${sessionId}-${goalId}` so the judge
-    //     sees continuity across iterations (its own prior verdicts)
-    //   - structured output via the judge schema
-    //   - context: goal + last user content + assistantStepsSinceLastUser
-    //     + truncated last assistant content (4000-char cap)
-    const context = await this._getJudgeContext(turn);
-    const judgeAgent = this._createJudgeAgent(goal);
-    const memory = await judgeAgent.getMemory({ requestContext: new RequestContext() });
-    const judgeThreadId = `${this._record.id}-${goal.id}`;
-
-    if (memory) {
-      const existing = await memory.getThreadById({ threadId: judgeThreadId });
-      if (!existing) {
-        await memory.createThread({
-          threadId: judgeThreadId,
-          resourceId: this._record.resourceId,
-          title: `Goal judge: ${goal.objective.slice(0, 80)}`,
-          metadata: {
-            goalJudge: true,
-            parentSessionId: this._record.id,
-            goalId: goal.id,
-          },
-        });
-      }
-    }
-
-    const truncatedAssistant = truncateForJudge(context.lastAssistantContent ?? 'No response yet, keep working.');
-    const recentUser = context.lastUserContent
-      ? `\n\nLatest user message:\n${truncateForJudge(context.lastUserContent)}\n\nAssistant steps since that user message: ${context.assistantStepsSinceLastUser}`
-      : '';
-    const prompt = `Goal: ${goal.objective}${recentUser}\n\nLatest assistant message:\n${truncatedAssistant}`;
-
-    const stream = await judgeAgent.stream(prompt, {
-      ...(memory ? { memory: { thread: judgeThreadId, resource: this._record.resourceId } } : {}),
-      structuredOutput: { schema: GoalJudgeSchema },
-    } as never);
-
-    await (stream as { consumeStream: () => Promise<void> }).consumeStream();
-    const full = (await (stream as { getFullOutput: () => Promise<unknown> }).getFullOutput()) as {
-      object?: unknown;
-    };
-    const obj = full.object as { decision: 'done' | 'continue' | 'waiting'; reason: string } | undefined;
-    if (!obj || typeof obj !== 'object') {
-      throw new Error('judge returned no structured output');
-    }
-    return { decision: obj.decision, reason: obj.reason, judgedAt: Date.now() };
+  private _runGoalJudge(turn: FullOutput<unknown>, wasGoalDriven: boolean): Promise<void> {
+    return runGoalJudge(this._goalJudgePort(), turn, wasGoalDriven);
   }
 
   /** @internal — test-only hook used by `session.goal.test.ts`. */
@@ -15926,66 +15528,12 @@ export class Session {
    * how many assistant steps have happened since that user message, and the
    * latest assistant content. Mirrors `GoalManager.getRecentConversationContext`.
    */
-  private async _getJudgeContext(turn?: FullOutput<unknown>): Promise<{
+  private _getJudgeContext(turn?: FullOutput<unknown>): Promise<{
     lastUserContent: string | null;
     assistantStepsSinceLastUser: number;
     lastAssistantContent: string | null;
   }> {
-    let messages: HarnessMessage[] = [];
-    try {
-      messages = await this.listMessages();
-    } catch {
-      // listMessages can fail in ad-hoc-thread setups; we'll fall back to
-      // the in-memory turn text below.
-    }
-
-    let lastUserIndex = -1;
-    let lastAssistantContent: string | null = null;
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i] as { role?: string; content?: unknown } | undefined;
-      if (!msg) continue;
-      if (!lastAssistantContent && msg.role === 'assistant') {
-        lastAssistantContent = this._extractTextContent(msg.content);
-      }
-      if (msg.role === 'user') {
-        lastUserIndex = i;
-        break;
-      }
-    }
-
-    // Storage may not have the assistant turn yet (depends on the agent
-    // wiring). Fall back to the in-memory `turn.text` we just produced.
-    if (!lastAssistantContent && turn) {
-      const text = (turn as { text?: string }).text;
-      if (typeof text === 'string' && text.length > 0) {
-        lastAssistantContent = text;
-      }
-    }
-
-    const lastUserContent =
-      lastUserIndex >= 0 ? this._extractTextContent((messages[lastUserIndex] as { content?: unknown }).content) : null;
-    const assistantStepsSinceLastUser =
-      lastUserIndex >= 0
-        ? messages.slice(lastUserIndex + 1).filter(m => (m as { role?: string }).role === 'assistant').length
-        : 0;
-
-    return {
-      lastUserContent,
-      assistantStepsSinceLastUser,
-      lastAssistantContent,
-    };
-  }
-
-  private _extractTextContent(content: unknown): string {
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-      return content
-        .filter(part => (part as { type?: string })?.type === 'text')
-        .map(part => (part as { text?: string }).text ?? '')
-        .join('\n');
-    }
-    return String(content ?? '');
+    return getGoalJudgeContext(this._goalJudgePort(), turn);
   }
 
   /**
@@ -15997,16 +15545,7 @@ export class Session {
    * session so it inherits memory/storage wiring.
    */
   private _createJudgeAgent(goal: GoalState): Agent {
-    const model = new ModelRouterLanguageModel(goal.judgeModelId as never);
-    return new Agent({
-      id: 'goal-judge',
-      name: 'Goal Judge',
-      instructions: JUDGE_SYSTEM_PROMPT,
-      model,
-      mastra: this._harness.mastra,
-      inputProcessors: [new ProviderHistoryCompat()],
-      errorProcessors: [new StreamErrorRetryProcessor(), new PrefillErrorHandler(), new ProviderHistoryCompat()],
-    });
+    return createGoalJudgeAgent(this._goalJudgePort(), goal);
   }
 
   // -------------------------------------------------------------------------
@@ -16781,81 +16320,29 @@ export class Session {
   // -------------------------------------------------------------------------
 
   readonly om = Object.freeze({
-    getObserverModelId: (): string | null => this._omObserverModelId(),
-    getReflectorModelId: (): string | null => this._omReflectorModelId(),
-    getObservationThreshold: (): number => this._omObservationThreshold(),
-    getReflectionThreshold: (): number => this._omReflectionThreshold(),
-    switchObserverModel: (opts: { model: string }): Promise<void> => this._omSwitchObserverModel(opts),
-    switchReflectorModel: (opts: { model: string }): Promise<void> => this._omSwitchReflectorModel(opts),
-    clearOverride: (): Promise<void> => this._omClearOverride(),
+    getObserverModelId: (): string | null => omObserverModelId(this._observationalMemoryPort()),
+    getReflectorModelId: (): string | null => omReflectorModelId(this._observationalMemoryPort()),
+    getObservationThreshold: (): number => omObservationThreshold(this._observationalMemoryPort()),
+    getReflectionThreshold: (): number => omReflectionThreshold(this._observationalMemoryPort()),
+    switchObserverModel: (opts: { model: string }): Promise<void> =>
+      omSwitchObserverModel(this._observationalMemoryPort(), opts),
+    switchReflectorModel: (opts: { model: string }): Promise<void> =>
+      omSwitchReflectorModel(this._observationalMemoryPort(), opts),
+    clearOverride: (): Promise<void> => omClearOverride(this._observationalMemoryPort()),
   });
 
-  private _omDefaults() {
-    return this._harness._getObservationalMemoryDefaults();
-  }
-
-  private _omObserverModelId(): string | null {
-    this._assertLive('om.getObserverModelId()');
-    return this._record.observationalMemory?.observerModelId ?? this._omDefaults().observerModelId ?? null;
-  }
-
-  private _omReflectorModelId(): string | null {
-    this._assertLive('om.getReflectorModelId()');
-    return this._record.observationalMemory?.reflectorModelId ?? this._omDefaults().reflectorModelId ?? null;
-  }
-
-  /** Effective observation trigger threshold. `0` means "use the memory adapter default". */
-  private _omObservationThreshold(): number {
-    this._assertLive('om.getObservationThreshold()');
-    return this._record.observationalMemory?.observationThreshold ?? this._omDefaults().observationThreshold ?? 0;
-  }
-
-  /** Effective reflection trigger threshold. `0` means "use the memory adapter default". */
-  private _omReflectionThreshold(): number {
-    this._assertLive('om.getReflectionThreshold()');
-    return this._record.observationalMemory?.reflectionThreshold ?? this._omDefaults().reflectionThreshold ?? 0;
-  }
-
-  private async _omSwitchObserverModel(opts: { model: string }): Promise<void> {
-    this._assertLive('om.switchObserverModel()');
-    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
-      throw new HarnessValidationError('om.switchObserverModel.model', 'must be a non-empty string');
-    }
-    throw new HarnessConfigError(
-      'observationalMemory',
-      'per-session model switches are not supported until @mastra/memory can select an OM engine from the effective per-turn config',
-    );
-  }
-
-  private async _omSwitchReflectorModel(opts: { model: string }): Promise<void> {
-    this._assertLive('om.switchReflectorModel()');
-    if (typeof opts?.model !== 'string' || opts.model.length === 0) {
-      throw new HarnessValidationError('om.switchReflectorModel.model', 'must be a non-empty string');
-    }
-    throw new HarnessConfigError(
-      'observationalMemory',
-      'per-session model switches are not supported until @mastra/memory can select an OM engine from the effective per-turn config',
-    );
-  }
-
-  /** Remove unsupported intent persisted by an older Harness build. */
-  private async _omClearOverride(): Promise<void> {
-    this._assertLive('om.clearOverride()');
-    await this._flushUpdate(prev => {
-      if (prev.observationalMemory === undefined) return prev;
-      const next = { ...prev };
-      delete next.observationalMemory;
-      return next;
-    });
-    // Recovered queue work parks while a legacy override is present. Wake it
-    // only after the clearing CAS commits; a failed write leaves the durable
-    // poison authoritative. This mirrors the other fire-and-forget queue kicks
-    // and is idempotent when another drain already owns the session.
-    void this._maybeDrainQueue();
-  }
-
-  private _hasUnsupportedObservationalMemoryIntent(): boolean {
-    return this._harness._getObservationalMemoryDefaults().enabled || this._record.observationalMemory !== undefined;
+  /** Build the small port the Observational Memory operations need. */
+  private _observationalMemoryPort(): ObservationalMemorySessionPort {
+    const session = this;
+    return {
+      get record() {
+        return session._record;
+      },
+      harness: this._harness,
+      assertLive: method => session._assertLive(method),
+      flushUpdate: update => session._flushUpdate(update),
+      maybeDrainQueue: () => session._maybeDrainQueue(),
+    };
   }
 
   // §9.2 PER-TURN OM ENABLEMENT — DEFERRED (BLOCKED ON @mastra/memory).
@@ -21413,7 +20900,7 @@ export class Session {
     // engine never honored. Recovered work must park before scheduling, expiry,
     // receipt admission, or failure settlement mutates durable queue state.
     // `session.om.clearOverride()` commits recovery and then re-kicks the drain.
-    if (this._hasUnsupportedObservationalMemoryIntent()) return false;
+    if (hasUnsupportedObservationalMemoryIntent(this._observationalMemoryPort())) return false;
     if (this._record.cancelRequest !== undefined) return this._hasCompletedQueuedItemsAfterCancellation();
     if (this._state === 'live') return true;
     if (!this.isClosing) return false;
@@ -21952,7 +21439,7 @@ export class Session {
      */
     yolo?: boolean;
   }): Promise<RequestContext> {
-    if (this._hasUnsupportedObservationalMemoryIntent()) {
+    if (hasUnsupportedObservationalMemoryIntent(this._observationalMemoryPort())) {
       throw new HarnessConfigError(
         'observationalMemory',
         'Harness per-session Observational Memory is not supported until @mastra/memory can select an OM engine from the per-turn memory config. Configure OM on the Agent Memory instance and omit HarnessConfig.observationalMemory.',
