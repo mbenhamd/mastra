@@ -1,3 +1,4 @@
+import type { Agent } from '../../agent';
 import type { MastraMemory } from '../../memory/memory';
 import { isObservationalMemoryEnabled } from '../../memory/types';
 import { ObservationalMemorySourceWriteConflictError } from '../../storage/domains/memory/base';
@@ -102,3 +103,28 @@ export const REMIND_NOTICE_BARRIER_TIMEOUT_MS = 5_000;
 export function delegationSettlementNoticeText(notice: { taskId: string; outcome: string }): string {
   return `Delegated plan task ${JSON.stringify(notice.taskId)} settled with outcome "${notice.outcome}". Call ${TASK_CHECK_TOOL_ID} with rootTaskId ${JSON.stringify(notice.taskId)} to read its result before continuing that work.`;
 }
+
+/**
+ * PF-7679: a settlement wake that did not dispatch, by reason. `claim_lost`:
+ * the claim was not won (another claim holds the notice, the notice moved, or
+ * the claim fence refused it). `slot_lost`: a caller turn took the idle slot
+ * after the claim (the delivery clears its claim and waits again). `delivered`:
+ * a run already loaded the reminder row into its context. `stale`: a Stop or
+ * edit since the settlement. `lease_lost`: this owner no longer holds the
+ * session lease at dispatch. `unconfirmed`: the dispatch was sent but the
+ * runtime answered with neither a wake on the expected run nor a discard, so a
+ * run may have started.
+ */
+export class DelegationNoticeWakeNotSentError extends Error {
+  constructor(readonly reason: 'claim_lost' | 'slot_lost' | 'delivered' | 'stale' | 'lease_lost' | 'unconfirmed') {
+    super(`Settlement notice wake not sent: ${reason}`);
+    this.name = 'DelegationNoticeWakeNotSentError';
+  }
+}
+
+/**
+ * PF-7631: where a settlement notice's reminder row was saved: the agent whose
+ * memory saved it, that memory instance, the mode it was resolved for, and the
+ * session's mode-switch epoch taken before resolution.
+ */
+export type WakeReminderRowOrigin = { agent: Agent; memory: MastraMemory; modeId: string; modeEpoch: number };
