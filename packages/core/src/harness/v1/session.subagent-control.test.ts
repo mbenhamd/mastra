@@ -955,6 +955,8 @@ type WaitRow = {
   noInProcessSignal?: boolean;
   /** Holds the wait's first storage read until `releaseFirstRead`. */
   holdFirstRead?: boolean;
+  /** Settles this child before the call, with its durable commit held until `releaseCommit`. */
+  commitPendingAtCall?: number;
   abortAfterMs?: number;
   check: (output: any, ctx: WaitRowContext & { returnedAt: number; startedAt: number; storageReads: number }) => void;
 };
@@ -968,6 +970,7 @@ type WaitRowContext = {
   /** Waits until child `index` reads as settled in storage. */
   settled: (index: number) => Promise<void>;
   releaseFirstRead: () => void;
+  releaseCommit: () => void;
 };
 
 const settledIds = (output: any) => (output.settledSubagents as any[]).map(view => view.subagentSessionId);
@@ -1051,6 +1054,23 @@ const waitRows: WaitRow[] = [
     },
   },
   {
+    name: 'until any returns a delegated child whose settlement commit was pending when the call began',
+    children: 2,
+    holdFirstRead: true,
+    commitPendingAtCall: 0,
+    input: () => ({ action: 'wait', until: 'any', timeoutMs: 3_000 }),
+    drive: async ({ releaseCommit, settled, releaseFirstRead }) => {
+      releaseCommit();
+      await settled(0);
+      releaseFirstRead();
+    },
+    check: (output, { ids }) => {
+      expect(output.timedOut).toBe(false);
+      expect(settledIds(output)).toEqual([ids[0]]);
+      expect(runningIds(output)).toEqual([ids[1]]);
+    },
+  },
+  {
     name: 'until any still times out when no child settles',
     children: 2,
     input: () => ({ action: 'wait', until: 'any', timeoutMs: 200 }),
@@ -1113,6 +1133,16 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
           );
         }
       }
+      let releaseCommit = () => {};
+      if (row.commitPendingAtCall !== undefined) {
+        const index = row.commitPendingAtCall;
+        const commitGate = new Promise<void>(resolve => (releaseCommit = resolve));
+        const serialize = (parent as any)._serializePlanTaskWrite.bind(parent);
+        (parent as any)._serializePlanTaskWrite = (write: unknown) => commitGate.then(() => serialize(write));
+        releases[index]!();
+        // The drive has ended and left the active map; its plan write waits.
+        await poll(() => !(parent as any)._activeSubagents.has(`delegate:${ids[index]}`), 5_000);
+      }
       if (row.noInProcessSignal) {
         vi.spyOn(parent, '_internalOnDelegatedSettlement').mockReturnValue(() => {});
       }
@@ -1168,6 +1198,7 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
           );
         },
         releaseFirstRead,
+        releaseCommit: () => releaseCommit(),
       };
       const startedAt = Date.now();
       try {
@@ -1182,6 +1213,7 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
       } finally {
         vi.restoreAllMocks();
         releaseFirstRead();
+        releaseCommit();
         for (const release of releases) release();
         closeTurn();
         await harness.shutdown();
@@ -1780,6 +1812,32 @@ describe('subagent control tool — stable offsets', () => {
       expect(output.runningSubagents.map((view: any) => view.subagentSessionId)).toEqual([sessions[1]!.id]);
     } finally {
       unregister(parent, keys);
+      for (const child of sessions) await child.close();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
+  it('an implicit wait keeps tracking an inline child whose spawn returned while its close is in flight', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    const sessions = await addInlineChildren(harness, parent, 1);
+    try {
+      keys = register(parent, sessions, () => Date.now() - 1_000);
+      // The spawn returned and its automatic close has begun but not finished.
+      parent._internalReturnInlineSubagent(`inline:${sessions[0]!.id}`, 'mock-run');
+      (sessions[0] as any)._record.closingAt = Date.now();
+
+      const output = await run({ action: 'wait', until: 'any', timeoutMs: 300 });
+
+      expect(output.timedOut).toBe(true);
+      expect(output.runningSubagents.map((view: any) => view.subagentSessionId)).toEqual([sessions[0]!.id]);
+    } finally {
+      unregister(parent, keys);
+      delete (sessions[0] as any)._record.closingAt;
       for (const child of sessions) await child.close();
       closeTurn();
       await harness.shutdown();

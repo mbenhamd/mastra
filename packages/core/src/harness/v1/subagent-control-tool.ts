@@ -622,6 +622,8 @@ export function createSubagentControlTool(parent: Session) {
   const harnessName = parent.getRecord().harnessName;
   const activeSubagents = () =>
     Array.from((parent as unknown as { _activeSubagents: Map<string, ActiveSubagentState> })._activeSubagents.values());
+  const driverClaims = () =>
+    Array.from((parent as unknown as { _delegationDriverClaims: ReadonlySet<string> })._delegationDriverClaims);
 
   type DelegationAttemptMetadata = ReturnType<typeof readDelegationAttemptMetadata>;
   // Parsing an attempt hashes its task body (up to 64 KiB); a task row's
@@ -885,11 +887,10 @@ export function createSubagentControlTool(parent: Session) {
   ): Promise<SubagentControlOutput> {
     const calledAt = Date.now();
     const deadline = calledAt + timeoutMs;
-    // Which in-process children were running, and which inline children had
-    // returned, when the call began. Read before any await, so a settlement
-    // can't slip between this snapshot and the call.
-    const activeAtCall = new Set(activeSubagents().map(state => state.subagentSessionId));
-    const returnedAtCall = new Set(parent._internalReturnedInlineSubagents(runId).keys());
+    // The children this process was driving when the call began, read before
+    // any await. An inline child leaves the active map when its spawn returns;
+    // a delegated child keeps its driver claim until its settlement is durable.
+    const drivenAtCall = new Set([...activeSubagents().map(state => state.subagentSessionId), ...driverClaims()]);
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
     let interval = WAIT_POLL_INTERVAL_MS;
@@ -969,16 +970,13 @@ export function createSubagentControlTool(parent: Session) {
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
       // A child that settled while the first read was in flight was running
       // when the call began: it can end the wait and is pinned like the others.
-      // In-process children are classified by the snapshot taken at the call; a
-      // child driven elsewhere counts as running unless storage settled it before
-      // the call's millisecond.
+      // Only a child this process was driving at the call can count as settled
+      // during it; timestamps from storage say nothing about order across
+      // processes. A child another process settles during this first read
+      // therefore counts as settled before the call.
       runningAtStart ??= new Set(
         views
-          .filter(view => {
-            if (activeAtCall.has(view.subagentSessionId)) return true;
-            if (returnedAtCall.has(view.subagentSessionId)) return false;
-            return !view.settled || (view.settledAt !== undefined && view.settledAt > calledAt);
-          })
+          .filter(view => !view.settled || drivenAtCall.has(view.subagentSessionId))
           .map(view => view.subagentSessionId),
       );
       // An implicit wait pins every child that was running when it started;
