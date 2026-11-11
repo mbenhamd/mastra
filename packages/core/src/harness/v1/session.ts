@@ -1823,7 +1823,9 @@ export class Session {
    * PF-7631: admission ids of settlement wake turns between their pending
    * reservation and dispatch, so recovery never interrupts one in flight here.
    */
-  private readonly _wakeTerminalAdmissionsInFlight = new Set<string>();
+  private get _wakeTerminalAdmissionsInFlight(): ReadonlySet<string> {
+    return this._wakeAdmissions['_wakeTerminalAdmissionsInFlight'];
+  }
   /** PF-8389: the settlement wake admissions (in flight here, released to recovery). */
   private readonly _wakeAdmissions = new WakeAdmissions();
   /**
@@ -1833,7 +1835,9 @@ export class Session {
    * so dispatch recovery settles them at once rather than waiting out a
    * dispatch claim this process stamped itself.
    */
-  private readonly _releasedWakeAdmissions = new Set<string>();
+  private get _releasedWakeAdmissions(): ReadonlySet<string> {
+    return this._wakeAdmissions['_releasedWakeAdmissions'];
+  }
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   /**
    * PF-8389: the terminal staging ledger (per run: usage fence, staged mark,
@@ -4002,7 +4006,7 @@ export class Session {
     // another owner, or a settlement below) leaves the set, so it stays bounded
     // by the wakes still pending here.
     for (const admissionId of releasedAtScanStart) {
-      if (!releasedStillPending.has(admissionId)) this._releasedWakeAdmissions.delete(admissionId);
+      if (!releasedStillPending.has(admissionId)) this._wakeAdmissions.forgetReleased(admissionId);
     }
     for (const evidence of orphaned) {
       const wakeAdmission = evidence.admissionId !== undefined && isHarnessWakeReservedKey(evidence.admissionId);
@@ -4023,7 +4027,7 @@ export class Session {
         block('unsettled-admission', Date.now() + ORPHANED_DISPATCH_RETRY_MS);
         continue;
       }
-      if (settled && wakeAdmission) this._releasedWakeAdmissions.delete(evidence.admissionId!);
+      if (settled && wakeAdmission) this._wakeAdmissions.forgetReleased(evidence.admissionId!);
       const latest = await this._storage.loadMessageResultEvidence({
         harnessName: this._record.harnessName,
         sessionId: this.id,
@@ -10998,10 +11002,9 @@ export class Session {
     };
     validateHarnessTerminalExecutionGrant(executionGrant, 'wake.executionGrant');
     // Another attempt for this notice is admitting or running here.
-    if (this._wakeTerminalAdmissionsInFlight.has(identity.admissionId)) {
+    if (!this._wakeAdmissions.enter(identity.admissionId)) {
       throw new HarnessBusyError(this.id, 'in_flight');
     }
-    this._wakeTerminalAdmissionsInFlight.add(identity.admissionId);
     try {
       const reservation = await this._writeMessageResultEvidence(
         {
@@ -11043,7 +11046,7 @@ export class Session {
       if (!stamped.applied) throw new HarnessBusyError(this.id, 'in_flight');
       return { identity, claimExpiresAt };
     } catch (error) {
-      this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+      this._wakeAdmissions.leave(identity.admissionId);
       // A reservation left behind is settled interrupted by dispatch recovery.
       this._scheduleOrphanRecheck(Date.now());
       // The notice was acknowledged before this wake, so a refusal other than
@@ -11067,8 +11070,7 @@ export class Session {
    * the next recheck or close, or leaves it durable for the next owner.
    */
   private _releaseWakeTerminalAdmission(admissionId: string): void {
-    this._wakeTerminalAdmissionsInFlight.delete(admissionId);
-    this._releasedWakeAdmissions.add(admissionId);
+    this._wakeAdmissions.release(admissionId);
     this._scheduleOrphanRecheck(Date.now());
   }
 
@@ -11109,7 +11111,7 @@ export class Session {
             this._stagedTerminalRunIds.delete(identity.runId);
             this._terminalStagingAdmissions.delete(identity.runId);
             this._nativeTerminalRunIds.delete(identity.runId);
-            this._wakeTerminalAdmissionsInFlight.delete(identity.admissionId);
+            this._wakeAdmissions.leave(identity.admissionId);
             return;
           }
         } catch {
@@ -14021,7 +14023,7 @@ export class Session {
           const admission = wakeAdmission;
           wakeAdmission = undefined;
           if (wakeSettled) {
-            this._wakeTerminalAdmissionsInFlight.delete(wakeTerminal!.admissionId);
+            this._wakeAdmissions.leave(wakeTerminal!.admissionId);
           } else if (!wakeDispatchSent) {
             // A Stop, edit, delete or eviction refused the turn before its
             // dispatch: cancel the admission whenever it lands, as a grant
