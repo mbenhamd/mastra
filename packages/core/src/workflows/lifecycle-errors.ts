@@ -25,17 +25,18 @@ export type WorkflowLifecycleErrorId =
   | 'WORKFLOW_RUN_STILL_RUNNING';
 
 /**
- * Stable ids for a lost run claim: another caller or process owns the run, so
- * this call stood down without executing any step. Callers match on
- * `MastraError.id`; the message text is kept for readability and is not part
- * of the contract.
+ * Stable ids for a run claim this call does not hold, so it stood down without
+ * executing any step. Callers match on `MastraError.id`; the message text is
+ * kept for readability and is not part of the contract.
  *
- * - `WORKFLOW_RESUME_ALREADY_CLAIMED`: resume() lost the compare-and-set that
- *   claims a suspended run, because another caller already claimed this
- *   suspension.
- * - `WORKFLOW_RESTART_NOT_CLAIMED`: restart() or timeTravel() lost the
- *   compare-and-set that adopts a new lifecycle generation, because another
- *   generation already owns the run.
+ * - `WORKFLOW_RESUME_ALREADY_CLAIMED`: resume() could not claim the suspended
+ *   run, or the stored snapshot no longer matched the claim before dispatch
+ *   because it was changed (for example resumed by another caller), cancelled
+ *   or removed.
+ * - `WORKFLOW_RESTART_NOT_CLAIMED`: restart() or timeTravel() could not adopt
+ *   a new lifecycle generation, or the stored snapshot no longer matched the
+ *   adopted generation because it was changed (for example adopted by another
+ *   restart), cancelled or removed.
  * - `WORKFLOW_RESTART_RUN_OWNED`: restart() found the run still being executed
  *   by another process whose ownership lease has not expired.
  */
