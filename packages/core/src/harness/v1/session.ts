@@ -2315,7 +2315,7 @@ export class Session {
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
-  private readonly _delegatedSettlementListeners = new Set<() => void>();
+  private readonly _delegatedSettlementListeners = new Set<(subagentSessionId: string) => void>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
@@ -6979,12 +6979,13 @@ export class Session {
   }
 
   /**
-   * @internal — call `listener` each time this process durably settles one of
-   * this session's delegated tasks. A settlement written by another process is
+   * @internal — call `listener` with the child id each time this process
+   * durably settles one of this session's delegated tasks, after the commit and
+   * from every settlement path (driver, recovery, cancel). A settlement written by another process is
    * not signalled; readers that must see it still poll storage. A listener
    * that throws is ignored. Returns the unsubscribe function.
    */
-  _internalOnDelegatedSettlement(listener: () => void): () => void {
+  _internalOnDelegatedSettlement(listener: (subagentSessionId: string) => void): () => void {
     this._delegatedSettlementListeners.add(listener);
     return () => {
       this._delegatedSettlementListeners.delete(listener);
@@ -25324,7 +25325,7 @@ export class Session {
         this._notifyDisplayRefresh();
         for (const listener of Array.from(this._delegatedSettlementListeners)) {
           try {
-            listener();
+            listener(subagentSessionId);
           } catch {
             // A listener only wakes a reader early. One that throws must not
             // skip the other listeners, the notice below, or reach the

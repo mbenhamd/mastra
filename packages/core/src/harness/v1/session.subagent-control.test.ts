@@ -1224,6 +1224,37 @@ describe('subagent control tool — wait until any, woken by settlement', () => 
 });
 
 describe('delegated settlement listeners', () => {
+  it('a wait begun from a settlement notification is not woken by that settlement', async () => {
+    const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const first = await delegateHeldChild(parent, childAgent, 'settles first');
+    const second = await delegateHeldChild(parent, childAgent, 'keeps running');
+    const tool = createSubagentControlTool(parent)!;
+    let pending: Promise<any> | undefined;
+    // Like a turn started by the notification: the wait begins after the commit.
+    const unsubscribe = parent._internalOnDelegatedSettlement(() => {
+      pending ??= tool.execute!(
+        { action: 'wait', until: 'any', timeoutMs: 500 } as any,
+        toolCtx as any,
+      ) as Promise<any>;
+    });
+    try {
+      first.releaseChild();
+      await poll(() => pending !== undefined, 5_000);
+      const output = await pending!;
+
+      expect(output.timedOut).toBe(true);
+      expect(runningIds(output)).toEqual([second.childId]);
+    } finally {
+      unsubscribe();
+      first.releaseChild();
+      second.releaseChild();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
   it('a throwing listener neither skips the other listeners nor the settlement notice', async () => {
     const { harness, parentAgent, childAgent } = buildHarness(new InMemoryDB(), {
       ...subagentsConfig(),

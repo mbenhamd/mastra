@@ -622,8 +622,6 @@ export function createSubagentControlTool(parent: Session) {
   const harnessName = parent.getRecord().harnessName;
   const activeSubagents = () =>
     Array.from((parent as unknown as { _activeSubagents: Map<string, ActiveSubagentState> })._activeSubagents.values());
-  const driverClaims = () =>
-    Array.from((parent as unknown as { _delegationDriverClaims: ReadonlySet<string> })._delegationDriverClaims);
 
   type DelegationAttemptMetadata = ReturnType<typeof readDelegationAttemptMetadata>;
   // Parsing an attempt hashes its task body (up to 64 KiB); a task row's
@@ -785,7 +783,12 @@ export function createSubagentControlTool(parent: Session) {
       next += batch.length;
       const loaded = await Promise.all(batch.map(id => loadChildRecord(id)));
       for (const [index, id] of batch.entries()) {
-        const { record, live } = loaded[index]!;
+        const { live } = loaded[index]!;
+        // A live record read before a slower load in the batch may predate a
+        // return or close since; read it again beside the returned state.
+        const record = live
+          ? ((harness._internalGetLiveSession(id)?.getRecord() as SessionRecord | undefined) ?? loaded[index]!.record)
+          : loaded[index]!.record;
         if (isOwnChild(record)) {
           // An inline child leaves the active map and gains its returned state in
           // one step, so a returned state recorded after the snapshot wins.
@@ -853,12 +856,16 @@ export function createSubagentControlTool(parent: Session) {
     // also covers one that lands while a storage read is in flight.
     let woken = false;
     let wake: (() => void) | undefined;
-    const unsubscribe = parent._internalOnDelegatedSettlement(() => {
+    // The delegated children this process durably settled after the wait began.
+    const settledSince = new Set<string>();
+    const unsubscribe = parent._internalOnDelegatedSettlement(subagentSessionId => {
+      settledSince.add(subagentSessionId);
       woken = true;
       wake?.();
     });
     try {
       return await waitLoop(runId, childIds, timeoutMs, until, signal, offset, {
+        settledSince,
         consume: () => {
           const was = woken;
           woken = false;
@@ -883,14 +890,17 @@ export function createSubagentControlTool(parent: Session) {
     until: 'any' | 'all',
     signal: AbortSignal | undefined,
     offset: number | undefined,
-    settlement: { consume: () => boolean; sleep: (ms: number) => Promise<void> },
+    settlement: {
+      settledSince: ReadonlySet<string>;
+      consume: () => boolean;
+      sleep: (ms: number) => Promise<void>;
+    },
   ): Promise<SubagentControlOutput> {
     const calledAt = Date.now();
     const deadline = calledAt + timeoutMs;
-    // The children this process was driving when the call began, read before
-    // any await. An inline child leaves the active map when its spawn returns;
-    // a delegated child keeps its driver claim until its settlement is durable.
-    const drivenAtCall = new Set([...activeSubagents().map(state => state.subagentSessionId), ...driverClaims()]);
+    // The in-process children running when the call began, read before any
+    // await. An inline child leaves this map when its spawn returns.
+    const activeAtCall = new Set(activeSubagents().map(state => state.subagentSessionId));
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;
     let interval = WAIT_POLL_INTERVAL_MS;
@@ -922,9 +932,9 @@ export function createSubagentControlTool(parent: Session) {
         fullResultIds,
         namedOne,
         childIds === undefined ? { action: 'wait', position } : undefined,
-        // The children whose settlement ended an `until: "any"` wait are always
-        // in its output, even past the page the budget keeps; they may then
-        // appear again on a later page.
+        // The children whose settlement ended an `until: "any"` wait come first
+        // in its output; those past what the budget keeps are paged like the
+        // rest, through the hint, and may then appear again on a later page.
         until === 'any'
           ? new Set(
               lastSettled
@@ -970,13 +980,19 @@ export function createSubagentControlTool(parent: Session) {
       knownOwned ??= new Set(views.map(view => view.subagentSessionId));
       // A child that settled while the first read was in flight was running
       // when the call began: it can end the wait and is pinned like the others.
-      // Only a child this process was driving at the call can count as settled
-      // during it; timestamps from storage say nothing about order across
-      // processes. A child another process settles during this first read
-      // therefore counts as settled before the call.
+      // A settled child counts as settled during the call only on in-process
+      // evidence: it was running here when the call began, or this process
+      // committed its settlement after the wait subscribed. Storage timestamps
+      // say nothing about order across processes, so a child another process
+      // settles during this first read counts as settled before the call.
       runningAtStart ??= new Set(
         views
-          .filter(view => !view.settled || drivenAtCall.has(view.subagentSessionId))
+          .filter(
+            view =>
+              !view.settled ||
+              activeAtCall.has(view.subagentSessionId) ||
+              settlement.settledSince.has(view.subagentSessionId),
+          )
           .map(view => view.subagentSessionId),
       );
       // An implicit wait pins every child that was running when it started;
@@ -1162,8 +1178,9 @@ export function createSubagentControlTool(parent: Session) {
       'subagentSessionId to read it. ' +
       '`wait` blocks until the named subagents (or every running one) settle, or the timeout passes, and ' +
       'returns those settled and those still running; with `until: "any"` it returns once one of them has ' +
-      'settled, and the subagents that settled during the call are always in the output, even when the rest ' +
-      'of the list is cut short (they may then appear again on a later page). If the first status read ' +
+      'settled. The subagents that settled during the call come first in the output; when they do not all ' +
+      'fit, the rest are left for a later page and `resultsHint` gives the offset to read them (they may ' +
+      'then appear again on a later page). If the first status read ' +
       'stalls, wait fails with ' +
       '`harness.storage` (retry it); if a later read stalls past the timeout, the lists are the statuses from ' +
       'its last completed read and may be stale. ' +
