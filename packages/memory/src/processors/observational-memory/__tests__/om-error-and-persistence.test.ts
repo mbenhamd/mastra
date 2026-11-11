@@ -34,7 +34,8 @@ type StreamPart =
       usage: { inputTokens: number; outputTokens: number; totalTokens: number };
     };
 
-function createMockOmModel(responseText: string) {
+/** `partDelayMs: 0` streams without timers, so a test can own the clock. */
+function createMockOmModel(responseText: string, { partDelayMs = 2 }: { partDelayMs?: number } = {}) {
   let callCount = 0;
 
   return {
@@ -112,7 +113,7 @@ function createMockOmModel(responseText: string) {
         async start(controller) {
           for (const part of parts) {
             controller.enqueue(part);
-            await new Promise(resolve => setTimeout(resolve, 2));
+            if (partDelayMs > 0) await new Promise(resolve => setTimeout(resolve, partDelayMs));
           }
           controller.close();
         },
@@ -243,6 +244,49 @@ function createHangingObserverModel(onAttempt: () => void) {
     });
   };
   return { ...createFailingObserverModel(), doGenerate: hang, doStream: hang };
+}
+
+/** A Reflector provider that accepts each request and never answers; it settles only on abort. */
+function createHangingReflectorModel() {
+  let requests = 0;
+  let waiting = 0;
+  let onRequest: (() => void) | undefined;
+  const hang = ({ abortSignal }: { abortSignal?: AbortSignal }) => {
+    requests++;
+    waiting++;
+    const pending = new Promise<never>((_, reject) => {
+      abortSignal?.addEventListener(
+        'abort',
+        () => {
+          waiting--;
+          reject(abortSignal.reason);
+        },
+        { once: true },
+      );
+    });
+    onRequest?.();
+    return pending;
+  };
+  return {
+    ...createFailingObserverModel(),
+    provider: 'mock-hanging-reflector',
+    modelId: 'mock-hanging-reflector-model',
+    doGenerate: hang,
+    doStream: hang,
+    get requests() {
+      return requests;
+    },
+    /** Resolves once a request is waiting on this provider. */
+    requestWaiting() {
+      if (waiting > 0) return Promise.resolve(true as const);
+      return new Promise<true>(resolve => {
+        onRequest = () => {
+          onRequest = undefined;
+          resolve(true);
+        };
+      });
+    },
+  };
 }
 
 function createMockReflectorModel() {
@@ -680,6 +724,78 @@ describe('OM hung Observer under failurePolicy continue', { timeout: 30_000 }, (
     // The step never reached the model, and the Observer ran once: no end-of-turn observation.
     expect(outcome.text).not.toBe(longResponseText);
     expect(attempts).toBe(1);
+  });
+});
+
+describe('OM hung Reflector under failurePolicy continue', { timeout: 30_000 }, () => {
+  beforeEach(() => {
+    // OM arms its idle timer before the Reflector agent reaches the provider, and that setup is
+    // slow on a cold module cache. Owning the clock lets time pass only while the provider hangs.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Fork (PF-7236): OM's own idle timeout on the Reflector is a reflector-model failure, so under
+  // failurePolicy 'continue' reflection is deferred and the user still gets the reply.
+  it('replies and keeps the observations unreflected when OM times the Reflector out', async () => {
+    const store = new InMemoryStore();
+    const reflector = createHangingReflectorModel();
+    const agent = new Agent({
+      id: 'test-hung-reflector-agent',
+      name: 'Test Hung Reflector Agent',
+      instructions: 'You are a helpful assistant. Always use the test tool first.',
+      model: createMockOmModel(longResponseText, { partDelayMs: 0 }) as any,
+      tools: { test: omTriggerTool },
+      memory: new Memory({
+        storage: store,
+        options: {
+          observationalMemory: {
+            enabled: true,
+            observation: { model: createMockObserverModel() as any, messageTokens: 20, bufferTokens: false },
+            // Any observation exceeds this threshold, so every observation cycle asks to reflect.
+            reflection: { model: reflector as any, observationTokens: 10, maxRetries: 0, failurePolicy: 'continue' },
+          },
+        },
+      }),
+    });
+
+    let settled = false;
+    const generation = agent
+      .generate('Hello, I need help.', { memory: { thread: 'test-hung-reflector', resource: 'test-resource' } })
+      .finally(() => {
+        settled = true;
+      });
+    // Each time the Reflector provider is waiting on the request, let OM's idle limit pass.
+    while (!settled) {
+      const hung = await Promise.race([reflector.requestWaiting(), generation.then(() => false)]);
+      if (hung) await vi.advanceTimersByTimeAsync(RETRY_CONFIG.modelCallIdleTimeoutMs);
+    }
+    const result = await generation;
+
+    expect(reflector.requests).toBeGreaterThan(0);
+    expect(result.tripwire).toBeUndefined();
+    expect(result.text).toBe(longResponseText);
+
+    const memoryStore = await store.getStore('memory');
+    const record = await memoryStore!.getObservationalMemory('test-hung-reflector', 'test-resource');
+    const generations = await memoryStore!.getObservationalMemoryHistory('test-hung-reflector', 'test-resource');
+    expect(record?.activeObservations).toContain('User asked for help with a task');
+    expect(record?.generationCount).toBe(0);
+    expect(generations).toHaveLength(1);
+
+    const { messages } = await memoryStore!.listMessages({ threadId: 'test-hung-reflector' });
+    const reflectionFailures = messages
+      .flatMap(message => message.content.parts)
+      .filter((part: any) => part.type === 'data-om-observation-failed' && part.data?.operationType === 'reflection');
+    expect(reflectionFailures.length).toBeGreaterThan(0);
+    expect(reflectionFailures).toEqual(
+      reflectionFailures.map(() =>
+        expect.objectContaining({ data: expect.objectContaining({ failureKind: 'reflector-model' }) }),
+      ),
+    );
   });
 });
 
