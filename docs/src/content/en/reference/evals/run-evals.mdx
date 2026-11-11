@@ -132,6 +132,14 @@ result.thresholdResults // [{ id, passed, averageScore, threshold }]
       'Callback function called after each test case completes. Receives item, target result, and scorer results.',
     isOptional: true,
   },
+  {
+    name: 'stopOnError',
+    type: 'boolean',
+    description:
+      "When `true`, the first test case whose agent call or workflow run throws rejects `runEvals`. When `false`, that test case is reported in `failures`, the remaining test cases keep running, and `runEvals` resolves only after every started test case has finished. A workflow run that finishes with a `failed` status doesn't throw, so it's scored rather than reported in `failures`. An aborted `targetOptions.abortSignal`, or an error from a scorer, storage, or `onItemComplete`, still rejects the run, after the test cases already running have finished.",
+    isOptional: true,
+    defaultValue: 'true',
+  },
 ]}
 />
 
@@ -298,6 +306,13 @@ For workflows, use `WorkflowScorerConfig` to specify scorers at different levels
     type: 'TurnResult[]',
     description:
       'Present when any data item uses `turns`. Each entry has `index` (zero-based turn), optional `gateResults`, `thresholdResults`, and `scores` (bare-scorer averages keyed by scorer id), aggregated by turn index across data items.',
+    isOptional: true,
+  },
+  {
+    name: 'failures',
+    type: 'RunEvalsItemFailure[]',
+    description:
+      'Test cases whose agent call or workflow run threw in a `stopOnError: false` run, ordered by position in `data`. Each entry has `itemIndex` (zero-based position in `data`), `item` (the data item), and `error` (a `MastraError` whose `cause` is the thrown error). Failed test cases are not counted in `summary.totalItems` and are left out of `scores`, gate and threshold results, and the verdict, so check `failures` before trusting the verdict. Present only when at least one test case failed.',
     isOptional: true,
   },
 ]}

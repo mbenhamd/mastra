@@ -170,6 +170,23 @@ export type RunEvalsResult = {
   thresholdResults?: Array<{ id: string; passed: boolean; averageScore: number; threshold: ThresholdConfig }>;
   /** Per-turn assertion results, present when any data item uses `turns` with gates/scorers. */
   turnResults?: TurnResult[];
+  /**
+   * Items whose target call failed in a `stopOnError: false` run, ordered by
+   * `itemIndex`. Failed items are not counted in `summary.totalItems` and do
+   * not contribute to `scores`, gate or threshold results, or the verdict.
+   * Present only when at least one item failed.
+   */
+  failures?: RunEvalsItemFailure[];
+};
+
+/** A data item whose Agent call or Workflow run threw during a `stopOnError: false` run. */
+export type RunEvalsItemFailure = {
+  /** Zero-based index of the item in `data`. */
+  itemIndex: number;
+  /** The data item, as passed in `data`. */
+  item: RunEvalsDataItem<any>;
+  /** The target failure. Its `cause` is the error the Agent or Workflow threw. */
+  error: MastraError;
 };
 
 /**
@@ -200,6 +217,13 @@ type RunEvalsBaseConfig<TTarget> = {
     scorerResults: any;
   }) => void | Promise<void>;
   concurrency?: number;
+  /**
+   * When `false`, an item whose Agent call or Workflow run throws is reported
+   * in `failures` and the remaining items keep running. The run resolves only
+   * after every started item has settled. Default `true`: the first failure
+   * rejects the run.
+   */
+  stopOnError?: boolean;
 };
 
 /** Agent-targeted `runEvals` configuration: agent-compatible data, scorers and execution options only. */
@@ -231,6 +255,7 @@ type RunEvalsAnyConfig = {
     scorerResults: any;
   }) => void | Promise<void>;
   concurrency?: number;
+  stopOnError?: boolean;
 };
 
 // Agent with gates (scorers optional) — gate-only runs are allowed
@@ -247,6 +272,8 @@ export function runEvals<TAgent extends Agent>(config: {
     scorerResults: Record<string, any>; // Flat structure: { scorerName: result }
   }) => void | Promise<void>;
   concurrency?: number;
+  /** When `false`, a failed target call is reported in `failures` instead of rejecting the run. Default `true`. */
+  stopOnError?: boolean;
 }): Promise<RunEvalsResult>;
 
 // Agent with scorers array (gates optional)
@@ -263,6 +290,8 @@ export function runEvals<TAgent extends Agent>(config: {
     scorerResults: Record<string, any>; // Flat structure: { scorerName: result }
   }) => void | Promise<void>;
   concurrency?: number;
+  /** When `false`, a failed target call is reported in `failures` instead of rejecting the run. Default `true`. */
+  stopOnError?: boolean;
 }): Promise<RunEvalsResult>;
 
 // Workflow with scorers array
@@ -279,6 +308,8 @@ export function runEvals<TWorkflow extends AnyWorkflow>(config: {
     scorerResults: Record<string, any>; // Flat structure: { scorerName: result }
   }) => void | Promise<void>;
   concurrency?: number;
+  /** When `false`, a failed target call is reported in `failures` instead of rejecting the run. Default `true`. */
+  stopOnError?: boolean;
 }): Promise<RunEvalsResult>;
 
 // Workflow with workflow configuration
@@ -299,6 +330,8 @@ export function runEvals<TWorkflow extends AnyWorkflow>(config: {
     };
   }) => void | Promise<void>;
   concurrency?: number;
+  /** When `false`, a failed target call is reported in `failures` instead of rejecting the run. Default `true`. */
+  stopOnError?: boolean;
 }): Promise<RunEvalsResult>;
 
 // Agent with agent scorer configuration (agent-level + trajectory scorers)
@@ -318,10 +351,21 @@ export function runEvals<TAgent extends Agent>(config: {
     };
   }) => void | Promise<void>;
   concurrency?: number;
+  /** When `false`, a failed target call is reported in `failures` instead of rejecting the run. Default `true`. */
+  stopOnError?: boolean;
 }): Promise<RunEvalsResult>;
 
 export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResult> {
-  const { data, scorers = [], gates, target, targetOptions, onItemComplete, concurrency = 1 } = config;
+  const {
+    data,
+    scorers = [],
+    gates,
+    target,
+    targetOptions,
+    onItemComplete,
+    concurrency = 1,
+    stopOnError = true,
+  } = config;
 
   // Normalize ScorerEntry[] into bare scorers + threshold metadata
   const { bareScorers, thresholdMap } = normalizeScorerEntries(scorers);
@@ -362,11 +406,38 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
   const mastra = (target as any).getMastraInstance?.() || (target as any).mastra;
   const storage = mastra?.getStorage();
 
+  // With `stopOnError: false` no item rejects p-map, so p-map resolves only after
+  // every started item has settled. A target failure is recorded on its item. Any
+  // other error (a caller abort, or a scorer, storage or callback failure) stops
+  // new items from starting and rejects the run once the started items settle.
+  const failures: Array<RunEvalsItemFailure | undefined> = new Array(data.length);
+  let fatalError: { error: unknown } | undefined;
+  const abortSignal = (targetOptions as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
+  const settleItem =
+    (runItem: (item: RunEvalsDataItem<any>, dataIndex: number) => Promise<void>) =>
+    async (item: RunEvalsDataItem<any>, dataIndex: number) => {
+      if (stopOnError) return runItem(item, dataIndex);
+      if (fatalError) return;
+      try {
+        await runItem(item, dataIndex);
+      } catch (error) {
+        if (error instanceof TargetFailure && !abortSignal?.aborted) {
+          failures[dataIndex] = { itemIndex: dataIndex, item, error: error.error };
+        } else {
+          fatalError ??= { error: error instanceof TargetFailure ? error.error : error };
+        }
+      }
+    };
+
   const pMap = (await import('p-map')).default;
   await pMap(
     data,
-    async (item: RunEvalsDataItem<any>, dataIndex: number) => {
-      const targetResult = await executeTarget(target, item, targetOptions);
+    settleItem(async (item: RunEvalsDataItem<any>, dataIndex: number) => {
+      const targetResult = stopOnError
+        ? await executeTarget(target, item, targetOptions)
+        : await executeTarget(target, item, targetOptions).catch((error: MastraError) => {
+            throw new TargetFailure(error);
+          });
 
       // Store the trace before gates and scorers read it, and before each
       // scorer's addScore() looks it up.
@@ -486,9 +557,11 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
       }
 
       totalItems++;
-    },
+    }),
     { concurrency },
   );
+
+  if (fatalError) throw fatalError.error;
 
   for (const [scorerId, count] of Object.entries(scoreAccumulator.getNotScorableCounts())) {
     notScorableCounts[scorerId] = (notScorableCounts[scorerId] ?? 0) + count;
@@ -513,6 +586,9 @@ export async function runEvals(config: RunEvalsAnyConfig): Promise<RunEvalsResul
   if (turnAggregate && turnAggregate.turnResults.length > 0) {
     result.turnResults = turnAggregate.turnResults;
   }
+
+  const orderedFailures = failures.filter((failure): failure is RunEvalsItemFailure => failure !== undefined);
+  if (orderedFailures.length > 0) result.failures = orderedFailures;
 
   // Compute gate/threshold results. Verdict is set only when at least one
   // assertion produced a numeric score (skip ≠ pass and skip ≠ fail).
@@ -1110,6 +1186,11 @@ function validateEvalsInputs(
   }
 
   return turnAssertionPlan;
+}
+
+/** Marks a target failure so a `stopOnError: false` run can record it on its item. */
+class TargetFailure {
+  constructor(readonly error: MastraError) {}
 }
 
 async function executeTarget(

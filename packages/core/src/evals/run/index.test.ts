@@ -312,6 +312,89 @@ describe('runEvals', () => {
       ).rejects.toThrow();
     });
 
+    // PF-5822: a model that fails on one input and holds another until released,
+    // so a failing item and a still-running sibling coexist inside one run.
+    const createItemFailureAgent = () => {
+      let releaseSlow!: () => void;
+      const slowReleased = new Promise<void>(resolve => (releaseSlow = resolve));
+      let failureThrown!: () => void;
+      const failed = new Promise<void>(resolve => (failureThrown = resolve));
+      const promptText = (prompt: unknown) => JSON.stringify(prompt);
+      const model = new MockLanguageModelV2({
+        doGenerate: async ({ prompt }) => {
+          const text = promptText(prompt);
+          if (text.includes('fail me')) {
+            failureThrown();
+            throw new Error('provider unavailable');
+          }
+          if (text.includes('slow item')) await slowReleased;
+          return {
+            content: [{ type: 'text', text: 'answer' }],
+            finishReason: 'stop',
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            warnings: [],
+          };
+        },
+      });
+      const agent = new Agent({ id: 'flakyAgent', name: 'flakyAgent', instructions: 'Answer', model });
+      return { agent, failed, releaseSlow };
+    };
+
+    it('rejects the run when one item fails by default', async () => {
+      const { agent, releaseSlow } = createItemFailureAgent();
+      releaseSlow();
+
+      await expect(
+        runEvals({
+          data: [{ input: 'fail me' }, { input: 'fine item' }],
+          scorers: [createMockScorer('quality', 1)],
+          target: agent,
+          concurrency: 2,
+        }),
+      ).rejects.toMatchObject({ id: 'RUN_EXPERIMENT_TARGET_FAILED_TO_GENERATE_RESULT' });
+    });
+
+    it('with stopOnError: false, reports a failed item and resolves only after its siblings finish', async () => {
+      const { agent, failed, releaseSlow } = createItemFailureAgent();
+      const completed: unknown[] = [];
+      const data = [{ input: 'fail me' }, { input: 'slow item' }, { input: 'fine item' }];
+
+      let settled = false;
+      const run = runEvals({
+        data,
+        scorers: [createMockScorer('quality', 1)],
+        target: agent,
+        concurrency: 3,
+        stopOnError: false,
+        onItemComplete: ({ item }) => {
+          completed.push(item);
+        },
+      }).finally(() => {
+        settled = true;
+      });
+
+      await failed;
+      await new Promise(resolve => setTimeout(resolve, 50));
+      // The failure is known, but the slow sibling is still running.
+      expect(settled).toBe(false);
+      expect(completed).toEqual([data[2]]);
+
+      releaseSlow();
+      const result = await run;
+
+      expect(completed).toEqual([data[2], data[1]]);
+      expect(result.summary.totalItems).toBe(2);
+      expect(result.scores.quality).toBe(1);
+      expect(result.failures).toHaveLength(1);
+      expect(result.failures![0]).toMatchObject({
+        itemIndex: 0,
+        item: data[0],
+        error: { id: 'RUN_EXPERIMENT_TARGET_FAILED_TO_GENERATE_RESULT' },
+      });
+      expect(String((result.failures![0]!.error.cause as Error)?.message)).toContain('provider unavailable');
+    });
+
     it('should handle empty data array', async () => {
       await expect(
         runEvals({
