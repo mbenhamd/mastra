@@ -85,6 +85,7 @@ export {
   HarnessConfigError,
   HarnessAdmissionConflictError,
   HarnessDelegationAlreadyCompletedError,
+  HarnessExecutionError,
   HarnessInboxItemNotFoundError,
   HarnessInboxResponseConflictError,
   HarnessLiveSessionLimitError,

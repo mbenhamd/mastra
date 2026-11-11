@@ -1,5 +1,6 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '../error';
 import type { WorkflowsStorage } from '../storage/domains/workflows/base';
+import type { WorkflowClaimErrorId } from './lifecycle-errors';
 import type { WorkflowExecutionGeneration, WorkflowStepLifecycleStateMap } from './lifecycle-events';
 import type { WorkflowResumeIntentV1, WorkflowRunState } from './types';
 
@@ -163,7 +164,7 @@ export function workflowRestartNotClaimedError({
   };
 }): MastraError {
   return new MastraError({
-    id: 'WORKFLOW_RESTART_NOT_CLAIMED',
+    id: 'WORKFLOW_RESTART_NOT_CLAIMED' satisfies WorkflowClaimErrorId,
     domain: ErrorDomain.MASTRA_WORKFLOW,
     category: ErrorCategory.USER,
     text:

@@ -5,6 +5,7 @@ import { deepEqual } from '../utils/deep-equal';
 import type { ExecutionEngineOptions } from './execution-engine';
 import { cloneLifecyclePayload } from './handlers/entry';
 import { workflowSnapshotNotFoundError } from './lifecycle-errors';
+import type { WorkflowClaimErrorId } from './lifecycle-errors';
 import type { WorkflowResumeIntentV1, WorkflowRunState } from './types';
 import { omitPriorCompletionFields } from './utils';
 
@@ -216,7 +217,7 @@ export async function claimWorkflowResume({
   }
 
   throw new MastraError({
-    id: 'WORKFLOW_RESUME_ALREADY_CLAIMED',
+    id: 'WORKFLOW_RESUME_ALREADY_CLAIMED' satisfies WorkflowClaimErrorId,
     domain: ErrorDomain.MASTRA_WORKFLOW,
     category: ErrorCategory.USER,
     text:
