@@ -4668,6 +4668,7 @@ export class Session {
     // the abort above makes that path finish. A parked suspension has no live
     // owner, so expiry closes its run here.
     if (activeController === undefined) {
+      this._releaseParkedRun(expiredPending);
       this._emitAgentEnd({ runId: expiredPending.runId, finishReason: 'error' });
     }
     this._notifyMaybeIdle();
@@ -6719,6 +6720,7 @@ export class Session {
       error: projectedError,
     });
     if (this._currentTurnAbortController === undefined) {
+      this._releaseParkedRun(pending);
       this._emitAgentEnd({ runId: pending.runId, finishReason: 'error' });
     }
     this._notifyMaybeIdle();
@@ -15919,6 +15921,7 @@ export class Session {
     // turn owns the interaction); close it here. Tool rows and agent_end
     // belong to a live turn when one is running, so leave those alone.
     const turnActive = this._currentTurnAbortController !== undefined;
+    if (!turnActive) this._releaseParkedRun(claimedPending);
     if (!turnActive) this._emitAbortedToolEnds({ force: true });
     this._emitTurnEvent({
       type: 'resume_failed',
@@ -15930,6 +15933,25 @@ export class Session {
     this._notifyMaybeIdle();
     if (this._state === 'live' && opts.drainQueue !== false) void this._maybeDrainQueue();
     return true;
+  }
+
+  /**
+   * PF-8122: a suspension settled with no live turn (discarded, expired or stopped)
+   * leaves its agent run parked on the thread, and a parked run holds the
+   * thread until the suspended-run TTL sweeps it, so the next message cannot
+   * start a fresh run. Abort that parked run so the thread is free again.
+   */
+  private _releaseParkedRun(pending: PendingResume): void {
+    try {
+      const { agent } = this._harness._resolveAgentForRuntimeDependencies(
+        this._runtimeDependenciesForPendingResume(pending),
+        'settled pending interaction release',
+      );
+      agent.abortRunStream(pending.runId);
+    } catch (err) {
+      // The interaction is already settled; the TTL sweep still releases the run.
+      console.error('[harness/v1] parked run release after a settled pending interaction failed:', err);
+    }
   }
 
   /** The discard receipt whose claim is stamped on `pending`, if any. */
