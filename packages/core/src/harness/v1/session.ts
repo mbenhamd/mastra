@@ -1692,6 +1692,8 @@ export interface ActiveToolState {
 export interface ReturnedInlineSubagentState {
   startedAt: number;
   agentType: string;
+  /** When its spawn_subagent call returned. */
+  returnedAt: number;
 }
 
 export interface ActiveSubagentState {
@@ -2312,8 +2314,15 @@ export class Session {
   private _returnedInlineRunId: string | undefined;
   /** Exact child ids claimed by either a new delegation or its recovery driver. */
   private readonly _delegationDriverClaims = new Set<string>();
+  /**
+   * Delegated children this process is settling: from the moment the driver
+   * drops the active entry, or a recovery or cancel reconcile starts, until the
+   * settlement commits or the attempt gives up. Their durable link is still
+   * live, so they read as running.
+   */
+  private readonly _settlingDelegations = new Set<string>();
   /** In-process listeners told when this process settles one of this session's delegated tasks. */
-  private readonly _delegatedSettlementListeners = new Set<() => void>();
+  private readonly _delegatedSettlementListeners = new Set<(subagentSessionId: string) => void>();
   /** Settlement notices (child id + digest) this process is delivering right now. */
   private readonly _delegationNoticesInFlight = new Set<string>();
   /** PF-7595 — running notice deliveries, awaited by the shutdown barrier. */
@@ -3673,6 +3682,7 @@ export class Session {
     this._returnedInlineSubagentsOf(runId).set(state.subagentSessionId, {
       startedAt: state.startedAt,
       agentType: state.agentType,
+      returnedAt: Date.now(),
     });
   }
 
@@ -6975,13 +6985,20 @@ export class Session {
     }
   }
 
+  /** @internal — the delegated children this process is settling now (see `_settlingDelegations`). */
+  _internalSettlingDelegations(): ReadonlySet<string> {
+    return this._settlingDelegations;
+  }
+
   /**
-   * @internal — call `listener` each time this process durably settles one of
-   * this session's delegated tasks. A settlement written by another process is
+   * @internal — call `listener` with the child id each time this process
+   * durably settles one of this session's delegated tasks, after the commit and
+   * before the public `delegate_settled` event, from every settlement path
+   * (driver, recovery, cancel). A settlement written by another process is
    * not signalled; readers that must see it still poll storage. A listener
    * that throws is ignored. Returns the unsubscribe function.
    */
-  _internalOnDelegatedSettlement(listener: () => void): () => void {
+  _internalOnDelegatedSettlement(listener: (subagentSessionId: string) => void): () => void {
     this._delegatedSettlementListeners.add(listener);
     return () => {
       this._delegatedSettlementListeners.delete(listener);
@@ -25199,6 +25216,9 @@ export class Session {
     } finally {
       child._subagentAnswerDeltaListener = undefined;
       unsubProgress();
+      // In the same step as the active entry goes, so the child never reads as
+      // neither active nor settling here.
+      this._settlingDelegations.add(child.id);
       this._activeSubagents.delete(`delegate:${child.id}`);
       child._subagentTracingContext = undefined;
     }
@@ -25247,6 +25267,7 @@ export class Session {
         depth: childDepth,
       });
     } finally {
+      this._settlingDelegations.delete(child.id);
       this._delegationDriverClaims.delete(child.id);
       this._internalReleaseSubagentExecution();
       endDelegatedSubagentSpan(delegationSpan, outcome, settlement);
@@ -25272,6 +25293,9 @@ export class Session {
     notify?: { childCancelRequest: SessionRecord['cancelRequest'] },
   ): Promise<boolean> {
     if (this._state === 'closed') return false;
+    // Before the first await, so a wait that begins while this write is in
+    // flight counts the child as running when it began.
+    this._settlingDelegations.add(subagentSessionId);
     const noticeMode =
       notify === undefined ? undefined : this._delegatedSettlementNoticeMode(notify.childCancelRequest, outcome);
     // A Stop that starts after this point must still suppress the wake.
@@ -25315,20 +25339,23 @@ export class Session {
           outcome,
           ...(durableResult !== undefined ? { result: durableResult } : {}),
           ...(noticeMode !== undefined ? { notice: noticeMode } : {}),
+          // Before the public delegate_settled event: a wait that event starts
+          // must not take this settlement as one from after its call.
+          onCommitted: () => {
+            this._settlingDelegations.delete(subagentSessionId);
+            for (const listener of Array.from(this._delegatedSettlementListeners)) {
+              try {
+                listener(subagentSessionId);
+              } catch {
+                // A listener only wakes a reader early. One that throws must not
+                // skip the other listeners, the notice below, or reach the
+                // reconcile retry for a settlement that is already durable.
+              }
+            }
+          },
         });
       });
-      if (reconcileResult.reconciled) {
-        this._notifyDisplayRefresh();
-        for (const listener of Array.from(this._delegatedSettlementListeners)) {
-          try {
-            listener();
-          } catch {
-            // A listener only wakes a reader early. One that throws must not
-            // skip the other listeners, the notice below, or reach the
-            // reconcile retry for a settlement that is already durable.
-          }
-        }
-      }
+      if (reconcileResult.reconciled) this._notifyDisplayRefresh();
       if (reconcileResult.notice !== undefined) {
         this._startDelegationSettlementNotice(reconcileResult.notice, noticeAdmissionEpoch, 0);
       }
@@ -25340,6 +25367,7 @@ export class Session {
       this._scheduleDelegationReconcileRetry(0);
       return false;
     } finally {
+      this._settlingDelegations.delete(subagentSessionId);
       releaseRemindSettlement?.();
     }
   }
