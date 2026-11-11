@@ -1819,25 +1819,8 @@ export class Session {
   private readonly _terminalFinalizersByIdentity = new Map<string, HarnessTerminalFinalizer>();
   /** PF-7631: the wrapped wake finalizer settlement wake turns admit under. */
   private readonly _terminalWakeFinalizer?: HarnessTerminalFinalizer;
-  /**
-   * PF-7631: admission ids of settlement wake turns between their pending
-   * reservation and dispatch, so recovery never interrupts one in flight here.
-   */
-  private get _wakeTerminalAdmissionsInFlight(): ReadonlySet<string> {
-    return this._wakeAdmissions['_wakeTerminalAdmissionsInFlight'];
-  }
   /** PF-8389: the settlement wake admissions (in flight here, released to recovery). */
   private readonly _wakeAdmissions = new WakeAdmissions();
-  /**
-   * PF-7631: wake admissions this process admitted and then gave up on before
-   * their terminal commit (a Stop, delete or eviction during admission or
-   * dispatch, or an exhausted commit re-drive). No run of theirs is live here,
-   * so dispatch recovery settles them at once rather than waiting out a
-   * dispatch claim this process stamped itself.
-   */
-  private get _releasedWakeAdmissions(): ReadonlySet<string> {
-    return this._wakeAdmissions['_releasedWakeAdmissions'];
-  }
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   /**
    * PF-8389: the terminal staging ledger (per run: usage fence, staged mark,
@@ -3968,7 +3951,7 @@ export class Session {
     };
     // Released wake admissions this full scan still lists as pending. Only ids
     // released before the scan began can be judged by it.
-    const releasedAtScanStart = [...this._releasedWakeAdmissions];
+    const releasedAtScanStart = this._wakeAdmissions.releasedSnapshot();
     const releasedStillPending = new Set<string>();
     let cursor: PendingMessageAdmissionScanCursor | undefined;
     do {
@@ -3983,7 +3966,7 @@ export class Session {
       });
       for (const admission of page.items) {
         const { evidence } = admission;
-        if (evidence.admissionId !== undefined && this._releasedWakeAdmissions.has(evidence.admissionId)) {
+        if (evidence.admissionId !== undefined && this._wakeAdmissions.isReleased(evidence.admissionId)) {
           releasedStillPending.add(evidence.admissionId);
         }
         if (
@@ -4094,7 +4077,7 @@ export class Session {
     // A run in flight here is live (or settling) in this process.
     if (
       this._messageAdmissionStarts.has(evidence.admissionId) ||
-      this._wakeTerminalAdmissionsInFlight.has(evidence.admissionId) ||
+      this._wakeAdmissions.isInFlight(evidence.admissionId) ||
       this._runCompletionPromises.has(runId)
     ) {
       return 'active';
@@ -4107,7 +4090,7 @@ export class Session {
       if (!(error instanceof HarnessConfigError)) throw error;
     }
     if (agent?.getRunOutput(runId)) return 'active';
-    if (this._releasedWakeAdmissions.has(evidence.admissionId)) return 'orphaned';
+    if (this._wakeAdmissions.isReleased(evidence.admissionId)) return 'orphaned';
     const completed = this._completedRuns.get(runId);
     if (completed !== undefined && !(completed.ok && completed.full.finishReason === 'suspended')) return 'finished';
     return dispatchClaim === 'live' ? 'claimed' : 'orphaned';
