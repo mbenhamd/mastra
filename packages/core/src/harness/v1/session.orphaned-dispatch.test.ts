@@ -1515,5 +1515,74 @@ describe('Session adoption — orphaned message dispatch', () => {
         await stopDeadOwner(deadOwner);
       }
     });
+
+    // PF-8429: an owner working from a scan page read before another owner
+    // settled the run must not count the run's staged usage again, even once
+    // that owner has forgotten the fence and saved without it.
+    it.each([
+      { name: 'committed by recovery', cancelFirst: false, settled: { status: 'committed' } },
+      { name: 'cancelled, its row settled interrupted', cancelFirst: true, settled: { status: 'cancelled' } },
+    ])(
+      'a stale scan does not count again the usage of a run another owner already settled: $name',
+      async ({ cancelFirst, settled }) => {
+        const db = new InMemoryDB();
+        const deadOwner = await dispatchHeldTurn(db, terminalHandoffMessage);
+        const admission = await stageOutputOfHeldTurn(deadOwner);
+        if (cancelFirst) {
+          await deadOwner.storage.cancelTerminalHandoff({
+            harnessName: admission.harnessName,
+            sessionId: admission.sessionId,
+            sessionIncarnation: admission.sessionIncarnation,
+            admissionId: admission.admissionId,
+            admissionHash: admission.admissionHash,
+            executionGrant: admission.executionGrant,
+            reason: { code: 'harness.terminal_cancelled', message: 'stopped' },
+            cancelledAt: Date.now(),
+          });
+        }
+        let listedBeforeSettlement: Awaited<ReturnType<InMemoryHarness['listPendingMessageAdmissions']>> | undefined;
+        const winner = await adoptLapsedSession(db, deadOwner.sessionId, storage => {
+          const list = storage.listPendingMessageAdmissions.bind(storage);
+          storage.listPendingMessageAdmissions = async input => {
+            const page = await list(input);
+            listedBeforeSettlement ??= structuredClone(page);
+            return page;
+          };
+        });
+        await expect(winner.storage.loadTerminalAdmission(admission)).resolves.toMatchObject(settled);
+        await expect(
+          winner.storage.loadMessageResultEvidence({ ...deadOwner.scope, signalId: deadOwner.signalId }),
+        ).resolves.not.toMatchObject({ status: 'pending' });
+        // The winner saves again after forgetting the settled run's fence.
+        await winner.session.models.switch({ model: 'winner-later-save' });
+        await expect(winner.storage.loadSession({ sessionId: deadOwner.sessionId })).resolves.toMatchObject({
+          tokenUsage: { totalTokens: 13 },
+          accountedTerminalRunIds: undefined,
+        });
+        await winner.harness.shutdown();
+
+        let staleScan = true;
+        const adopter = await adoptLapsedSession(db, deadOwner.sessionId, storage => {
+          const list = storage.listPendingMessageAdmissions.bind(storage);
+          storage.listPendingMessageAdmissions = async input => {
+            if (!staleScan) return list(input);
+            staleScan = false;
+            return listedBeforeSettlement!;
+          };
+        });
+        try {
+          expect(staleScan).toBe(false);
+          await adopter.session.models.switch({ model: 'any-later-save' });
+
+          const saved = await adopter.storage.loadSession({ sessionId: deadOwner.sessionId });
+          expect(saved?.tokenUsage).toMatchObject({ totalTokens: 13 });
+          expect(saved?.accountedTerminalRunIds).toBeUndefined();
+          expect(adopter.adopterAgent.streamCalls).toHaveLength(0);
+        } finally {
+          await adopter.harness.shutdown();
+          await stopDeadOwner(deadOwner);
+        }
+      },
+    );
   });
 });
