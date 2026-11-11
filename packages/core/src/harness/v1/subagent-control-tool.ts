@@ -912,10 +912,12 @@ export function createSubagentControlTool(parent: Session) {
     const deadline = calledAt + timeoutMs;
     // The in-process children running when the call began, read before any
     // await: the active ones, and returned inline children whose automatic
-    // close is still draining, which read as running until it finishes.
+    // close is still draining, which read as running until closedAt lands
+    // (the session stays closing a moment longer, already closed).
     const activeAtCall = new Set(activeSubagents().map(state => state.subagentSessionId));
     for (const id of parent._internalReturnedInlineSubagents(runId).keys()) {
-      if (harness._internalGetLiveSession(id)?.isClosing === true) activeAtCall.add(id);
+      const session = harness._internalGetLiveSession(id);
+      if (session?.isClosing === true && session.getRecord().closedAt === undefined) activeAtCall.add(id);
     }
     let targets = childIds;
     let knownOwned: ReadonlySet<string> | undefined;

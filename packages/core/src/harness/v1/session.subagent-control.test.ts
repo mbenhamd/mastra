@@ -1921,6 +1921,39 @@ describe('subagent control tool — stable offsets', () => {
     }
   });
 
+  it('wait until any is not woken by an inline child whose closed marker landed before the call', async () => {
+    const { harness, parentAgent } = buildHarness(new InMemoryDB());
+    const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
+    const closeTurn = await openParentTurn(parent, parentAgent);
+    const run = control(parent);
+    let keys: string[] = [];
+    const sessions = await addInlineChildren(harness, parent, 2);
+    const closing = sessions[0]!;
+    let pending: Promise<any> | undefined;
+    try {
+      keys = register(parent, sessions, index => Date.now() - 1_000 + index);
+      // The wait begins once closedAt is written, while the session is still closing.
+      const flushClosed = (closing as any)._flushClosedMarker.bind(closing);
+      (closing as any)._flushClosedMarker = async (closedAt: number) => {
+        const record = await flushClosed(closedAt);
+        expect(closing.isClosing).toBe(true);
+        pending = run({ action: 'wait', until: 'any', timeoutMs: 300 });
+        return record;
+      };
+      parent._internalReturnInlineSubagent(`inline:${closing.id}`, 'mock-run');
+      await harness._internalCloseSessionIfUnclaimed(closing);
+      const output = await pending!;
+
+      expect(output.timedOut).toBe(true);
+      expect(output.runningSubagents.map((view: any) => view.subagentSessionId)).toEqual([sessions[1]!.id]);
+    } finally {
+      unregister(parent, keys);
+      for (const child of sessions) await child.close();
+      closeTurn();
+      await harness.shutdown();
+    }
+  });
+
   it('wait until any is woken by a closing inline child whose close finishes during the first read', async () => {
     const { harness, parentAgent } = buildHarness(new InMemoryDB());
     const parent = await harness.session({ resourceId: 'u1', threadId: { fresh: true } });
