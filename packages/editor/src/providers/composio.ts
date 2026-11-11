@@ -125,6 +125,22 @@ export interface ComposioListConnectionsOpts extends ListConnectionsOpts {
   ownedOnly?: boolean;
 }
 
+/** One connected account listed by {@link ComposioToolProvider.listConnections}. */
+export interface ComposioExistingConnection extends ExistingConnection {
+  /**
+   * The account belongs to a requested bucket. `false` for another user's
+   * SHARED account whose ACL admits a requested bucket.
+   */
+  owned: boolean;
+  /** Composio's sharing model for the account, when Composio reports one. */
+  accountType?: 'PRIVATE' | 'SHARED';
+}
+
+/** Result of {@link ComposioToolProvider.listConnections}. */
+export interface ComposioListConnectionsResult extends ListConnectionsResult {
+  items: ComposioExistingConnection[];
+}
+
 export interface ResolveComposioCatalogToolsOpts {
   /** Composio tool slugs to materialise. */
   toolSlugs: string[];
@@ -718,7 +734,7 @@ export class ComposioToolProvider extends BaseToolProvider {
     return result;
   }
 
-  async listConnections(opts: ComposioListConnectionsOpts): Promise<ListConnectionsResult> {
+  async listConnections(opts: ComposioListConnectionsOpts): Promise<ComposioListConnectionsResult> {
     const composio = this.getRawClient();
     const page = opts.page ?? 1;
     const perPage = clampLimit(opts.perPage);
@@ -744,6 +760,7 @@ export class ComposioToolProvider extends BaseToolProvider {
       limit: perPage,
     });
     const lists = [owned];
+    let sharedItems: ConnectedAccountListResponse['items'] = [];
 
     // SHARED accounts owned by other users are usable by the requested buckets
     // when their ACL grants access. List them separately and evaluate the ACL
@@ -755,30 +772,35 @@ export class ComposioToolProvider extends BaseToolProvider {
         accountType: 'SHARED',
         limit: perPage,
       });
-      lists.push({
-        ...shared,
-        items: (shared.items ?? []).filter(account =>
-          userIds.some(userId => isSharedAccountAccessible(account.experimental?.aclConfigForShared, userId)),
-        ),
-      });
+      sharedItems = (shared.items ?? []).filter(account =>
+        userIds.some(userId => isSharedAccountAccessible(account.experimental?.aclConfigForShared, userId)),
+      );
+      lists.push(shared);
     }
 
     // Defensive: tolerate undocumented SDK shape drift where `items` is
     // missing or `nextCursor` is `null`/`undefined`/`''`.
-    const items: ExistingConnection[] = [];
+    //
+    // The SDK's response schema drops the raw `user_id`, so an account's owner
+    // is known only from which list it came from. The first list holds the
+    // requested buckets' own accounts; with one bucket, that bucket owns it.
+    const items: ComposioExistingConnection[] = [];
     const seen = new Set<string>();
-    for (const account of lists.flatMap(list => list.items ?? [])) {
-      if (seen.has(account.id)) continue;
+    const add = (account: ConnectedAccountListResponse['items'][number], isOwned: boolean) => {
+      if (seen.has(account.id)) return;
       seen.add(account.id);
+      const accountType = account.experimental?.accountType;
       items.push({
         connectionId: account.id,
         status: mapComposioStatus(account.status, account.isDisabled),
         createdAt: account.createdAt,
-        // `user_id` is preserved by the Composio SDK transform via spread but
-        // isn't on the typed shape. Read it via a narrow cast.
-        authorId: (account as unknown as { user_id?: string }).user_id,
+        ...(isOwned && userIds?.length === 1 ? { authorId: userIds[0] } : {}),
+        owned: isOwned,
+        ...(accountType ? { accountType } : {}),
       });
-    }
+    };
+    for (const account of owned.items ?? []) add(account, true);
+    for (const account of sharedItems) add(account, false);
 
     const hasMore = lists.some(list => {
       const nextCursor = (list as { nextCursor?: string | null }).nextCursor ?? null;

@@ -1101,9 +1101,9 @@ describe('ComposioToolProvider — listConnections', () => {
       limit: 50,
     });
     expect(result.items).toEqual([
-      { connectionId: 'ca_1', status: 'active', createdAt: '2026-01-01T00:00:00Z' },
-      { connectionId: 'ca_2', status: 'inactive', createdAt: undefined },
-      { connectionId: 'ca_3', status: 'inactive', createdAt: undefined },
+      { connectionId: 'ca_1', status: 'active', createdAt: '2026-01-01T00:00:00Z', authorId: 'user_42', owned: true },
+      { connectionId: 'ca_2', status: 'inactive', createdAt: undefined, authorId: 'user_42', owned: true },
+      { connectionId: 'ca_3', status: 'inactive', createdAt: undefined, authorId: 'user_42', owned: true },
     ]);
   });
 
@@ -1155,7 +1155,7 @@ describe('ComposioToolProvider — listConnections', () => {
     expect(raw.connectedAccounts.list).not.toHaveBeenCalled();
   });
 
-  it('clamps perPage and surfaces hasMore + per-item authorId from adapter', async () => {
+  it('clamps perPage and surfaces hasMore + the requested bucket as authorId', async () => {
     const integration = new ComposioToolProvider({ apiKey: 'k' });
     await integration.listConnections({ toolkit: 'gmail' }).catch(() => undefined);
     const raw = getRawInstance();
@@ -1167,7 +1167,6 @@ describe('ComposioToolProvider — listConnections', () => {
           status: 'ACTIVE',
           isDisabled: false,
           createdAt: '2026-01-01T00:00:00Z',
-          user_id: 'user_42',
         },
       ],
       nextCursor: 'next_page',
@@ -1193,6 +1192,7 @@ describe('ComposioToolProvider — listConnections', () => {
           status: 'active',
           createdAt: '2026-01-01T00:00:00Z',
           authorId: 'user_42',
+          owned: true,
         },
       ],
       pagination: { page: 1, perPage: 200, hasMore: true },
@@ -1249,7 +1249,26 @@ describe('ComposioToolProvider — listConnections', () => {
       const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a', 'user_b'] });
 
       expect(result.items.map(i => i.connectionId)).toEqual(['ca_all', 'ca_allowed']);
-      expect(result.items[0]).toMatchObject({ status: 'active', authorId: 'admin' });
+      expect(result.items[0]).toMatchObject({ status: 'active', owned: false, accountType: 'SHARED' });
+      // The raw `user_id` is not on the SDK's response schema, so it is never read.
+      expect(result.items[0]).not.toHaveProperty('authorId');
+    });
+
+    it.each([
+      { name: 'an EXPIRED own account next to an ACTIVE SHARED one', ownStatus: 'EXPIRED', ownMapped: 'failed' },
+      { name: 'an ACTIVE own account next to an ACTIVE SHARED one', ownStatus: 'ACTIVE', ownMapped: 'active' },
+    ])("marks which account is the user's own for $name", async ({ ownStatus, ownMapped }) => {
+      const { integration } = await setup(
+        [{ id: 'ca_mine', status: ownStatus, isDisabled: false, experimental: { accountType: 'PRIVATE' } }],
+        [sharedAccount('ca_admin', { allowAllUsers: true })],
+      );
+
+      const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'] });
+
+      expect(result.items).toEqual([
+        { connectionId: 'ca_mine', status: ownMapped, authorId: 'user_a', owned: true, accountType: 'PRIVATE' },
+        { connectionId: 'ca_admin', status: 'active', owned: false, accountType: 'SHARED' },
+      ]);
     });
 
     it('leaves out other users SHARED accounts when ownedOnly is set', async () => {
