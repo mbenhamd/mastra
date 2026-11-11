@@ -1251,7 +1251,7 @@ describe('ComposioToolProvider — listConnections', () => {
       expect(result.items.map(i => i.connectionId)).toEqual(['ca_all', 'ca_allowed']);
       expect(result.items[0]).toMatchObject({ status: 'active', owned: false, accountType: 'SHARED' });
       // The raw `user_id` is not on the SDK's response schema, so it is never read.
-      expect(result.items[0]).not.toHaveProperty('authorId');
+      expect(result.items[0]!.authorId).toBeUndefined();
     });
 
     it.each([
@@ -1269,6 +1269,32 @@ describe('ComposioToolProvider — listConnections', () => {
         { connectionId: 'ca_mine', status: ownMapped, authorId: 'user_a', owned: true, accountType: 'PRIVATE' },
         { connectionId: 'ca_admin', status: 'active', owned: false, accountType: 'SHARED' },
       ]);
+    });
+
+    it("keeps the user's own SHARED account owned when the owned page is cut short", async () => {
+      const ownShared = sharedAccount('ca_own_shared', { allowAllUsers: true });
+      const integration = new ComposioToolProvider({ apiKey: 'k' });
+      await integration.listConnections({ toolkit: 'gmail' }).catch(() => undefined);
+      const raw = getRawInstance();
+      raw.connectedAccounts.list.mockClear();
+      raw.connectedAccounts.list.mockImplementation(async (query: { accountType?: string; userIds?: string[] }) => {
+        if (query.accountType === 'ALL') {
+          return { items: [{ id: 'ca_mine', status: 'ACTIVE', isDisabled: false }], nextCursor: 'more' };
+        }
+        // SHARED without userIds: every SHARED account; with userIds: the bucket's own.
+        return query.userIds
+          ? { items: [ownShared], nextCursor: null }
+          : { items: [ownShared, sharedAccount('ca_admin', { allowAllUsers: true })], nextCursor: null };
+      });
+
+      const result = await integration.listConnections({ toolkit: 'gmail', userIds: ['user_a'], perPage: 1 });
+
+      expect(result.items.map(i => [i.connectionId, i.owned])).toEqual([
+        ['ca_mine', true],
+        ['ca_own_shared', true],
+        ['ca_admin', false],
+      ]);
+      expect(result.pagination.hasMore).toBe(true);
     });
 
     it('leaves out other users SHARED accounts when ownedOnly is set', async () => {

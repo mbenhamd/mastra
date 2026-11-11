@@ -129,7 +129,8 @@ export interface ComposioListConnectionsOpts extends ListConnectionsOpts {
 export interface ComposioExistingConnection extends ExistingConnection {
   /**
    * The account belongs to a requested bucket. `false` for another user's
-   * SHARED account whose ACL admits a requested bucket.
+   * SHARED account whose ACL admits a requested bucket. A bucket's own SHARED
+   * account beyond the first 200 it owns for the toolkit also reads `false`.
    */
   owned: boolean;
   /** Composio's sharing model for the account, when Composio reports one. */
@@ -782,8 +783,20 @@ export class ComposioToolProvider extends BaseToolProvider {
     // missing or `nextCursor` is `null`/`undefined`/`''`.
     //
     // The SDK's response schema drops the raw `user_id`, so an account's owner
-    // is known only from which list it came from. The first list holds the
-    // requested buckets' own accounts; with one bucket, that bucket owns it.
+    // is known only from an owner-filtered list; with one bucket, that bucket
+    // owns it. When the owned page is cut short, a SHARED account missing from
+    // it may still be the bucket's own, so look those up among its own SHARED
+    // accounts before calling them another user's.
+    const ownedIds = new Set((owned.items ?? []).map(account => account.id));
+    if (hasNextCursor(owned) && sharedItems.some(account => !ownedIds.has(account.id))) {
+      const ownShared: ConnectedAccountListResponse = await composio.connectedAccounts.list({
+        toolkitSlugs: [opts.toolkit],
+        ...(userIds ? { userIds } : {}),
+        accountType: 'SHARED',
+        limit: MAX_LIMIT,
+      });
+      for (const account of ownShared.items ?? []) ownedIds.add(account.id);
+    }
     const items: ComposioExistingConnection[] = [];
     const seen = new Set<string>();
     const add = (account: ConnectedAccountListResponse['items'][number], isOwned: boolean) => {
@@ -800,12 +813,9 @@ export class ComposioToolProvider extends BaseToolProvider {
       });
     };
     for (const account of owned.items ?? []) add(account, true);
-    for (const account of sharedItems) add(account, false);
+    for (const account of sharedItems) add(account, ownedIds.has(account.id));
 
-    const hasMore = lists.some(list => {
-      const nextCursor = (list as { nextCursor?: string | null }).nextCursor ?? null;
-      return typeof nextCursor === 'string' && nextCursor.length > 0;
-    });
+    const hasMore = lists.some(hasNextCursor);
     return { items, pagination: { page, perPage, hasMore } };
   }
 
@@ -1015,6 +1025,11 @@ function resolveUserIds(opts: ListConnectionsOpts): string[] | undefined {
   if (Array.isArray(opts.userIds)) return opts.userIds;
   if (typeof opts.userId === 'string' && opts.userId.length > 0) return [opts.userId];
   return [DEFAULT_INTERNAL_USER_ID];
+}
+
+function hasNextCursor(list: ConnectedAccountListResponse): boolean {
+  const nextCursor = (list as { nextCursor?: string | null }).nextCursor ?? null;
+  return typeof nextCursor === 'string' && nextCursor.length > 0;
 }
 
 const DEFAULT_LIMIT = 50;
