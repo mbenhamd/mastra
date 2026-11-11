@@ -29,7 +29,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
+import type { z } from 'zod';
 
 import { Agent } from '../../agent';
 import type { AgentExecutionOptionsBase } from '../../agent/agent.types';
@@ -39,8 +39,8 @@ import {
   AGENT_RESPONSE_RECOVERY_STEP,
 } from '../../agent/merge-execution-options';
 import type { AgentExecutionOptionComposers } from '../../agent/merge-execution-options';
-import { normalizeLogicalMessageInputIdentity, normalizeLogicalMessageIdentity } from '../../agent/message-list';
-import type { LogicalMessageIdentity, LogicalMessageSignalIdentity } from '../../agent/message-list';
+import { normalizeLogicalMessageIdentity } from '../../agent/message-list';
+import type { LogicalMessageIdentity } from '../../agent/message-list';
 import { createSignal } from '../../agent/signals';
 import type { AgentSignalContents, CreatedAgentSignal } from '../../agent/signals';
 import {
@@ -71,7 +71,6 @@ import { ModelRouterLanguageModel } from '../../llm/model/router';
 import { watchHistoryLoad } from '../../memory/history-load-watch';
 import type { HistoryLoadWatch } from '../../memory/history-load-watch';
 import type { MastraMemory } from '../../memory/memory';
-import { isObservationalMemoryEnabled } from '../../memory/types';
 import type { TracingContext } from '../../observability';
 import { PrefillErrorHandler, ProviderHistoryCompat, StreamErrorRetryProcessor } from '../../processors';
 import { RequestContext } from '../../request-context';
@@ -140,15 +139,11 @@ import type {
   SessionRecord,
   SessionSummary,
 } from '../../storage/domains/harness';
-import {
-  assertObservationalMemorySourceWriteGuardSupported,
-  ObservationalMemorySourceWriteConflictError,
-} from '../../storage/domains/memory/base';
+import { assertObservationalMemorySourceWriteGuardSupported } from '../../storage/domains/memory/base';
 import type { ObservationalMemorySourceWriteGuard } from '../../storage/types';
 import { ProviderResultCancelledError } from '../../stream/base/output';
 import type { MastraModelOutput, FullOutput } from '../../stream/base/output';
 
-import { ASK_USER_TOOL_ID, SUBMIT_PLAN_TOOL_ID } from '../../tools/builtin';
 import {
   getTransformedToolPayload,
   hasTransformedToolPayload,
@@ -270,7 +265,6 @@ import {
   planTaskReset,
   planTaskUpdate,
   PLAN_TASK_DELEGATED_BODY_MAX_BYTES,
-  PLAN_TASK_MAX_NODES,
   PLAN_TASK_UPDATED_EVENT,
   readDelegationAttemptMetadata,
   readPendingDelegationSettlementNotice,
@@ -282,6 +276,124 @@ import {
   projectInheritedRequestContextAppBag,
   validateCallerRequestContext,
 } from './request-context-input';
+import {
+  ACTION_CATALOG_DEFAULT_LIMIT,
+  ACTION_CATALOG_MAX_LIMIT,
+  ACTION_CATALOG_MCP_FAILURE_CACHE_MS,
+  ACTION_CATALOG_MCP_MAX_TIMEOUT_RETRIES,
+  ACTION_CATALOG_MCP_SUCCESS_CACHE_MS,
+  ACTION_CATALOG_SOURCE_KINDS,
+  ACTION_CATALOG_SOURCE_ORDER,
+  ActionCatalogMcpListTimeoutError,
+  cloneActionCatalogEntry,
+  cloneActionMetadataLike,
+  cloneMcpCatalogRecord,
+  cloneMcpCatalogRecordArray,
+  cloneMcpCatalogValue,
+  cloneMcpSchemaLike,
+  compareActionCatalogIds,
+  encodeActionCatalogIdPart,
+  RESERVED_MCP_SERVER_KEYS,
+  startActionCatalogMcpListWithTimeout,
+  SUPPORTED_SKILL_ARG_SCHEMA_KEYS,
+} from './session-catalog';
+import type {
+  ActionCatalogMcpCacheEntry,
+  ActionCatalogMcpTimedOutWork,
+  ActionCatalogSkillDescriptor,
+} from './session-catalog';
+import {
+  admissionLost,
+  DELEGATED_SUBAGENT_CANCELLED_ERROR,
+  DELEGATED_SUBTREE_MAX_NODES,
+  DELEGATION_DEADLINE_REACHED,
+  delegationAdmissionId,
+  delegationSignalId,
+  isParentRequestedSubagentCancel,
+  owesRecoveredCompletion,
+  summarizeDelegationDeadline,
+  waitForDelegationResult,
+} from './session-delegation';
+import { MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS, pendingResumeForDisplay } from './session-display';
+import type { SessionDisplayState, SessionRunProjection } from './session-display';
+import {
+  buildJudgeContinuation,
+  buildKickoffContinuation,
+  buildResumeContinuation,
+  GoalJudgeSchema,
+  JUDGE_SYSTEM_PROMPT,
+  truncateForJudge,
+} from './session-goal-judge';
+import {
+  ASK_USER_TOOL_NAME,
+  cancelledPendingAudit,
+  compactJsonObject,
+  DISCARD_PENDING_INTERACTION_KINDS,
+  discardReceiptResult,
+  MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH,
+  preRegistrationSlot,
+  SUBMIT_PLAN_TOOL_NAME,
+} from './session-pending-interactions';
+import type {
+  InboxReceiptResponseOptions,
+  LegacyInboxResponseOptions,
+  PendingExpiryOutcome,
+  QueueResumeRecoveryResult,
+} from './session-pending-interactions';
+import {
+  ASSISTANT_DRAFT_FLUSH_DELAY_MS,
+  ASSISTANT_DRAFT_TEXT_DECODER,
+  ASSISTANT_DRAFT_TEXT_ENCODER,
+  isPlainStateObject,
+  MAX_ASSISTANT_DRAFT_FIELD_BYTES,
+  MAX_PENDING_FAILED_EVENT_APPENDS,
+  MAX_PERSISTED_ASSISTANT_DRAFT_BYTES,
+  MAX_PERSISTED_ASSISTANT_DRAFTS,
+  queueReceiptRecency,
+  safeSerializedSize,
+  SESSION_RECORD_SIZE_BUDGET_BYTES,
+  STATE_ROOT_SENTINEL,
+  topRecordFieldSizes,
+  UNSUSPENDED_AGENTIC_LOOP_STATUSES,
+} from './session-persistence';
+import {
+  delegationSettlementNoticeText,
+  holdNoticeClaim,
+  isObservationalMemorySourceWriteConflict,
+  noticeClaimTakeoverEligible,
+  releaseNoticeClaim,
+  REMIND_NOTICE_BARRIER_ROUNDS,
+  REMIND_NOTICE_BARRIER_TIMEOUT_MS,
+  requiresObservationalMemorySourceWriteGuard,
+  WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS,
+  WAKE_TERMINAL_COMMIT_RETRY_BASE_MS,
+  WAKE_TERMINAL_COMMIT_RETRY_MAX_MS,
+} from './session-settlement-notices';
+import type {
+  DelegationNoticeOutcome,
+  NoticeClaimResult,
+  NoticeDelivery,
+  NoticeFence,
+  NoticeFenceSite,
+} from './session-settlement-notices';
+import {
+  assertPolicy,
+  assertToolCategory,
+  assertToolName,
+  UNGATED_HARNESS_BUILTIN_TOOL_IDS,
+} from './session-tool-surface';
+import {
+  assertCallerGrantKeyNotReserved,
+  boundInboxReceiptResult,
+  HarnessResponseRecoveryAlreadyPreparedError,
+  normalizeSessionLogicalMessageInputIdentity,
+} from './session-turn-options';
+import type {
+  HarnessExecutionHookErrorReporter,
+  HarnessIterationCompleteHandler,
+  HarnessPrepareStep,
+  ResumeAnswerProgress,
+} from './session-turn-options';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
 import { SubagentReportSummaryDecoder } from './subagent-answer-stream';
 import { createHarnessSubagentBudgetMeter, harnessSubagentBudgetExhaustedError } from './subagent-budget';
@@ -330,7 +442,6 @@ import type {
   HarnessCustomEventInput,
   HarnessRequestContext,
   HarnessSkill,
-  HarnessSkillActionMetadata,
   UseSkillOptions,
   ListMessagesOptions,
   MessageAdmissionResult,
@@ -356,6 +467,13 @@ import type {
   SessionActivityTimeline,
   MessageAdmissionPhase,
 } from './types';
+
+export type {
+  HarnessRunStatus,
+  SessionDisplayPending,
+  SessionDisplayState,
+  SessionRunProjection,
+} from './session-display';
 
 type MessageAdmissionIdentity = {
   signalId: string;
@@ -419,20 +537,6 @@ function normalizeObservationalMemorySourceWriteGuard(
   };
 }
 
-/** True when the memory's OM requires every source write to carry a captured guard. */
-function requiresObservationalMemorySourceWriteGuard(memory: MastraMemory): boolean {
-  const config = memory.getMergedThreadConfig().observationalMemory;
-  return isObservationalMemoryEnabled(config) && typeof config === 'object' && config.sourceWriteFencing === 'required';
-}
-
-/** PF-8034: the store refused a guarded write because the guard no longer holds. */
-function isObservationalMemorySourceWriteConflict(error: unknown): boolean {
-  return (
-    error instanceof ObservationalMemorySourceWriteConflictError ||
-    (error instanceof Error && error.name === 'ObservationalMemorySourceWriteConflictError')
-  );
-}
-
 function sameObservationalMemorySourceWriteGuard(
   left: ObservationalMemorySourceWriteGuard | undefined,
   right: ObservationalMemorySourceWriteGuard | undefined,
@@ -494,28 +598,7 @@ type MessageAdmissionHashes = {
   legacyCompatible: readonly string[];
 };
 
-type QueueResumeRecoveryResult =
-  | { status: 'none' }
-  | { status: 'completed'; result: AgentResult }
-  | { status: 'stale' };
-
 type ResumeResponseMode = 'agent-result' | 'inbox-receipt';
-type InboxReceiptResponseOptions = Extract<InboxResponseOptions, { responseId: string }>;
-type LegacyInboxResponseOptions = Extract<InboxResponseOptions, { responseId?: undefined }>;
-type ActionCatalogSkillDescriptor = Pick<
-  HarnessSkill,
-  'name' | 'description' | 'filePath' | 'category' | 'action' | 'metadata'
->;
-type ActionCatalogMcpCacheEntry = {
-  entries: HarnessActionCatalogEntry[];
-  expiresAt?: number;
-  successful?: boolean;
-};
-type ActionCatalogMcpTimedOutWork = {
-  work: Promise<HarnessActionCatalogEntry[]>;
-  retryAfter: number;
-  retryCount: number;
-};
 
 /**
  * Tool IDs the harness translates from `tool-call-approval` /
@@ -542,9 +625,6 @@ const MAX_EXPIRED_PENDING_INTERACTIONS = 100;
 // (CONTROLLER_MAX_STEPS); the harness governs runaway turns through its own
 // budgets and abort lanes, so this is an escape-proof ceiling, not pacing.
 const HARNESS_SESSION_MAX_STEPS = 1000;
-type HarnessIterationCompleteHandler = NonNullable<AgentExecutionOptionsBase<unknown>['onIterationComplete']>;
-type HarnessPrepareStep = NonNullable<AgentExecutionOptionsBase<unknown>['prepareStep']>;
-type HarnessExecutionHookErrorReporter = (hook: 'onIterationComplete' | 'prepareStep', error: unknown) => void;
 
 /**
  * Empty-final-synthesis nudge. Live-diagnosed twice on the same day (a chat
@@ -839,13 +919,6 @@ function createHarnessEmptySynthesisOptions(
   };
 }
 
-class HarnessResponseRecoveryAlreadyPreparedError extends Error {
-  constructor() {
-    super('Harness response recovery has already admitted its one provider attempt');
-    this.name = 'HarnessResponseRecoveryAlreadyPreparedError';
-  }
-}
-
 class HarnessOrdinaryStepBudgetExhaustedError extends Error {
   constructor() {
     super(`Harness ordinary step budget exhausted at ${HARNESS_SESSION_MAX_STEPS} steps`);
@@ -871,64 +944,6 @@ class DelegationNoticeWakeNotSentError extends Error {
   }
 }
 
-/**
- * PF-7679: how one settlement notice delivery ended. `wake`: an accepted wake
- * turn. `history`: a row the parent's run loaded (or a `remind` row). `fenced`:
- * a Stop, edit or cancel removed it without a wake. `left_owed`: still owed
- * (closing, lease lost, a failure, or a claim given up); reconcile retries
- * while the parent is live. `lost`: dispatched without a confirmed wake run,
- * counted as delivered. `superseded`: no longer owed by this delivery.
- * `obsolete` (PF-8034): the memory requires OM source-write fencing and the
- * delegating run's guard is missing or revoked (its record was retracted, as
- * when the transcript is deleted). Acknowledged without a row or a wake.
- */
-type DelegationNoticeOutcome = 'wake' | 'history' | 'fenced' | 'left_owed' | 'lost' | 'superseded' | 'obsolete';
-type NoticeClaimResult = 'claimed' | 'claim_lost' | 'fenced' | 'left_owed';
-type NoticeFenceSite = 'owed_reread' | 'row_save' | 'quiescence' | 'claim' | 'dispatch' | 'restore';
-/** PF-7679: a struct, so every guarded notice transition decides on each part. */
-interface NoticeFence {
-  lifecycle: 'live' | 'closing' | 'closed' | 'deleted' | 'shutting_down';
-  /** A Stop or edit since the settlement (the pinned admission epoch is stale). */
-  stale: boolean;
-  cancelled: boolean;
-  /** This process holds the session lease, by its last known expiry. */
-  leaseHeld: boolean;
-}
-interface NoticeDelivery {
-  key: string;
-  notice: PendingDelegationSettlementNotice;
-  /** The admission epoch pinned for this notice's key. */
-  epoch: number;
-}
-
-/**
- * PF-7679: settlement-notice claims (`claimId`) each Harness instance holds and
- * has not resolved yet. A stored claim with that instance's `ownerId` whose id
- * is absent here belongs to an earlier tenure, a replaced session object, or a
- * delivery that gave it up, so it may be taken over.
- */
-const liveNoticeClaims = new WeakMap<Harness, Set<string>>();
-
-/** Record a notice claim as live in `harness`, before its write is queued. */
-function holdNoticeClaim(harness: Harness, claimId: string): void {
-  let held = liveNoticeClaims.get(harness);
-  if (held === undefined) {
-    held = new Set();
-    liveNoticeClaims.set(harness, held);
-  }
-  held.add(claimId);
-}
-
-/** The claim is resolved (cleared, delivered, refused, or given up). */
-function releaseNoticeClaim(harness: Harness, claimId: string): void {
-  liveNoticeClaims.get(harness)?.delete(claimId);
-}
-
-/** Whether a stored notice claim may be taken over by `harness`. */
-function noticeClaimTakeoverEligible(harness: Harness, claim: { claimId: string; ownerId: string }): boolean {
-  return claim.ownerId !== harness.ownerId || liveNoticeClaims.get(harness)?.has(claim.claimId) !== true;
-}
-
 // §10.2 receipts stay bounded on BOTH axes (PF-2250, live-diagnosed): the map
 // itself is idempotency state, so only a recent window is needed, and a stored
 // result must never carry provider payloads large enough to push the session
@@ -936,31 +951,6 @@ function noticeClaimTakeoverEligible(harness: Harness, claim: { claimId: string;
 // single applied receipt ~400KB and broke every later saveSession with an
 // HTTP 500).
 const MAX_INBOX_RESPONSE_RECEIPTS = 64;
-const MAX_INBOX_RECEIPT_RESULT_BYTES = 64_000;
-
-function boundInboxReceiptResult(full: unknown): unknown {
-  try {
-    const serialized = JSON.stringify(full);
-    if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') <= MAX_INBOX_RECEIPT_RESULT_BYTES) {
-      return full;
-    }
-  } catch {
-    // Unserializable results cannot be persisted faithfully either way.
-  }
-  const source = (full ?? {}) as { finishReason?: unknown; text?: unknown; usage?: unknown };
-  return {
-    truncated: true,
-    ...(source.finishReason === undefined ? {} : { finishReason: source.finishReason }),
-    ...(typeof source.text === 'string' ? { text: source.text.slice(0, 8_000) } : {}),
-    ...(source.usage === undefined ? {} : { usage: source.usage }),
-  };
-}
-
-function queueReceiptRecency(receipt: QueueAdmissionReceipt): number {
-  return (
-    receipt.completedAt ?? receipt.failedAt ?? receipt.acceptedAt ?? receipt.admittingAt ?? receipt.enqueuedAt ?? 0
-  );
-}
 
 function pruneQueueAdmissionReceipts(
   receipts: Record<string, QueueAdmissionReceipt>,
@@ -969,26 +959,6 @@ function pruneQueueAdmissionReceipts(
   if (entries.length <= MAX_INBOX_RESPONSE_RECEIPTS) return receipts;
   entries.sort((left, right) => queueReceiptRecency(right[1]) - queueReceiptRecency(left[1]));
   return Object.fromEntries(entries.slice(0, MAX_INBOX_RESPONSE_RECEIPTS));
-}
-
-// Just under Convex's ~1MiB document limit, leaving headroom for envelope
-// fields the adapter adds around the record.
-const SESSION_RECORD_SIZE_BUDGET_BYTES = 900_000;
-
-function safeSerializedSize(value: unknown): number {
-  try {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? 0 : Buffer.byteLength(serialized, 'utf8');
-  } catch {
-    return Number.MAX_SAFE_INTEGER;
-  }
-}
-
-function topRecordFieldSizes(record: SessionRecord): Array<[string, number]> {
-  return Object.entries(record as unknown as Record<string, unknown>)
-    .map(([key, value]) => [key, safeSerializedSize(value)] as [string, number])
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, 5);
 }
 
 function pruneInboxResponseReceipts(
@@ -1013,8 +983,6 @@ function pruneInboxResponseReceipts(
 /** Discard receipts retained ahead of recency pruning (bounded). */
 const MAX_RETAINED_DISCARD_RECEIPTS = 8;
 
-const ASK_USER_TOOL_NAME = ASK_USER_TOOL_ID;
-const SUBMIT_PLAN_TOOL_NAME = SUBMIT_PLAN_TOOL_ID;
 /** Backoff before the one retry of a failed provider-result stage. */
 const PROVIDER_RESULT_STAGE_RETRY_MS = 100;
 const MESSAGE_ADMISSION_DURABLE_WAIT_TIMEOUT_MS = 30_000;
@@ -1036,74 +1004,11 @@ const HARNESS_RUN_INTERRUPTED_MESSAGE =
   'The run was interrupted when the process that owned it stopped; it was not re-run.';
 /** Back-off before recovery retries a turn whose settlement did not commit. */
 const ORPHANED_DISPATCH_RETRY_MS = 1_000;
-/**
- * PF-7631: a settlement wake turn has no caller to retry its terminal commit,
- * so its owning turn re-drives it: at most this many attempts, backing off
- * from the base delay, doubling, capped at the max delay. After the last one
- * the admission is released to dispatch recovery (close or the next owner).
- */
-const WAKE_TERMINAL_COMMIT_MAX_ATTEMPTS = 4;
-const WAKE_TERMINAL_COMMIT_RETRY_BASE_MS = 100;
-const WAKE_TERMINAL_COMMIT_RETRY_MAX_MS = 1_000;
-/**
- * §S4.1 — max transiently-failed event-ledger appends retained for retry before
- * fail-stop. A transient `appendSessionEvent` failure no longer permanently latches
- * the durable log: the failed slot is backlogged and retried (in order) ahead of any
- * later sequence on the next append, preserving ledger contiguity. Past this bound we
- * can no longer guarantee retry without unbounded memory, so we hard-latch and let a
- * reconnect recover via the §10.5 snapshot path.
- */
-const MAX_PENDING_FAILED_EVENT_APPENDS = 256;
 /** TM-6 reconcile-on-rehydrate retry (transient/CAS/locked failures). */
 const DELEGATION_RECONCILE_RETRY_BASE_MS = 500;
 const DELEGATION_RECONCILE_RETRY_MAX_MS = 30_000;
-/** PF-8202: rounds a turn waits for `remind` notice saves before it loads history. */
-const REMIND_NOTICE_BARRIER_ROUNDS = 4;
-/** PF-8202: a stalled `remind` save must not hold every later turn; its row reaches the next one. */
-const REMIND_NOTICE_BARRIER_TIMEOUT_MS = 5_000;
-/**
- * TM-6 `includeSubtree` transfers the complete valid plan. The plan writer
- * already enforces this bound, so a normal delegated child never receives a
- * partial execution unit that the parent would later settle as complete.
- */
-const DELEGATED_SUBTREE_MAX_NODES = PLAN_TASK_MAX_NODES;
-const ACTION_CATALOG_DEFAULT_LIMIT = 100;
-const ACTION_CATALOG_MAX_LIMIT = 500;
-const ACTION_CATALOG_MCP_LIST_TIMEOUT_MS = 2_000;
 // Cap explicit extensions to one day so a lost worker cannot pin a session indefinitely.
 const MAX_LEASE_EXTENSION_MS = 24 * 60 * 60 * 1_000;
-const ACTION_CATALOG_MCP_SUCCESS_CACHE_MS = 5_000;
-const ACTION_CATALOG_MCP_FAILURE_CACHE_MS = 30_000;
-const ACTION_CATALOG_MCP_MAX_TIMEOUT_RETRIES = 1;
-const ACTION_CATALOG_SOURCE_KINDS: readonly HarnessActionCatalogSourceKind[] = ['skill', 'mcp-server', 'mcp-tool'];
-const ACTION_CATALOG_SOURCE_ORDER: Record<HarnessActionCatalogSourceKind, number> = {
-  skill: 0,
-  'mcp-server': 1,
-  'mcp-tool': 2,
-};
-const SUPPORTED_SKILL_ARG_SCHEMA_KEYS = new Set([
-  'required',
-  'properties',
-  'type',
-  'enum',
-  'items',
-  'additionalProperties',
-]);
-const RESERVED_MCP_SERVER_KEYS = new Set([...Object.getOwnPropertyNames(Object.prototype), '__proto__']);
-
-function isPlainStateObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/**
- * §10.2 state_changed sentinel for a whole-root change. `session.state` is
- * `unknown` — it may legitimately be a scalar, array, or plain object root (see
- * `firstNonJsonStatePath`, which explicitly allows scalar/array roots). When
- * the root itself is not a plain object on both sides, there are no top-level
- * keys to diff, so a genuine root change is reported under this sentinel key,
- * matching the `$`-for-root path convention used elsewhere in this module.
- */
-const STATE_ROOT_SENTINEL = '$';
 
 /**
  * §10.2 state_changed: the keys whose value changed between two durable
@@ -1223,219 +1128,6 @@ function done(seen: Set<object>, obj: object, path: string): string {
   return path;
 }
 
-function cloneMcpCatalogValue(value: unknown): unknown | undefined {
-  if (value === undefined) return undefined;
-  try {
-    return structuredClone(value);
-  } catch {
-    try {
-      return JSON.parse(JSON.stringify(value)) as unknown;
-    } catch {
-      return undefined;
-    }
-  }
-}
-
-function isPlainMcpCatalogObject(value: unknown): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  if (Object.prototype.toString.call(value) !== '[object Object]') return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function cloneMcpCatalogRecord(value: unknown): Record<string, unknown> | undefined {
-  const cloned = cloneMcpCatalogValue(value);
-  return isPlainMcpCatalogObject(cloned) ? cloned : undefined;
-}
-
-function cloneMcpCatalogRecordArray(value: unknown): readonly Record<string, unknown>[] | undefined {
-  const cloned = cloneMcpCatalogValue(value);
-  if (!Array.isArray(cloned) || cloned.some(item => !isPlainMcpCatalogObject(item))) {
-    return undefined;
-  }
-  return cloned as Record<string, unknown>[];
-}
-
-function cloneMcpSchemaLike(value: unknown): unknown | undefined {
-  if (value && typeof value === 'object' && 'jsonSchema' in value) {
-    return cloneMcpCatalogValue((value as { jsonSchema?: unknown }).jsonSchema);
-  }
-  return cloneMcpCatalogValue(value);
-}
-
-function encodeActionCatalogIdPart(value: string): string {
-  return encodeURIComponent(value);
-}
-
-function compareActionCatalogIds(a: string, b: string): number {
-  if (a < b) return -1;
-  if (a > b) return 1;
-  return 0;
-}
-
-function cloneActionCatalogEntry(entry: HarnessActionCatalogEntry): HarnessActionCatalogEntry {
-  const cloned = cloneMcpCatalogValue(entry);
-  if (cloned === undefined) {
-    throw new HarnessValidationError(
-      'actions.list()',
-      `could not clone action catalog entry ${JSON.stringify(entry.id)}`,
-    );
-  }
-  return cloned as HarnessActionCatalogEntry;
-}
-
-function cloneActionCatalogStringArray(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.length === 0)) {
-    return undefined;
-  }
-  return [...value];
-}
-
-function cloneActionCatalogShortcuts(value: unknown): HarnessSkillActionMetadata['shortcuts'] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const shortcuts = value.map(item => {
-    if (!isPlainMcpCatalogObject(item) || typeof item.id !== 'string' || item.id.length === 0) return undefined;
-    const keys = cloneActionCatalogStringArray(item.keys);
-    if (item.keys !== undefined && !keys) return undefined;
-    if (item.label !== undefined && typeof item.label !== 'string') return undefined;
-    return {
-      id: item.id,
-      ...(item.label ? { label: item.label } : {}),
-      ...(keys ? { keys } : {}),
-    };
-  });
-  return shortcuts.some(shortcut => !shortcut) ? undefined : (shortcuts as HarnessSkillActionMetadata['shortcuts']);
-}
-
-function cloneActionCatalogPermissions(value: unknown): HarnessSkillActionMetadata['permissions'] | undefined {
-  if (!isPlainMcpCatalogObject(value)) return undefined;
-  const tools = cloneActionCatalogStringArray(value.tools);
-  const fileScopes = cloneActionCatalogStringArray(value.fileScopes);
-  const networkScopes = cloneActionCatalogStringArray(value.networkScopes);
-  const mcpScopes = cloneActionCatalogStringArray(value.mcpScopes);
-  if (
-    (value.tools !== undefined && !tools) ||
-    (value.fileScopes !== undefined && !fileScopes) ||
-    (value.networkScopes !== undefined && !networkScopes) ||
-    (value.mcpScopes !== undefined && !mcpScopes)
-  ) {
-    return undefined;
-  }
-  return {
-    ...(tools ? { tools } : {}),
-    ...(fileScopes ? { fileScopes } : {}),
-    ...(networkScopes ? { networkScopes } : {}),
-    ...(mcpScopes ? { mcpScopes } : {}),
-  };
-}
-
-function cloneActionMetadataLike(value: unknown): HarnessSkillActionMetadata | undefined {
-  if (!isPlainMcpCatalogObject(value)) return undefined;
-  if (value.displayName !== undefined && typeof value.displayName !== 'string') return undefined;
-  if (value.icon !== undefined && typeof value.icon !== 'string') return undefined;
-  const shortcuts = cloneActionCatalogShortcuts(value.shortcuts);
-  const inputSchema = cloneMcpCatalogRecord(value.inputSchema);
-  const outputSchema = cloneMcpCatalogRecord(value.outputSchema);
-  const artifactTypes = cloneActionCatalogStringArray(value.artifactTypes);
-  const permissions = cloneActionCatalogPermissions(value.permissions);
-  if (
-    (value.shortcuts !== undefined && !shortcuts) ||
-    (value.inputSchema !== undefined && !inputSchema) ||
-    (value.outputSchema !== undefined && !outputSchema) ||
-    (value.artifactTypes !== undefined && !artifactTypes) ||
-    (value.permissions !== undefined && !permissions)
-  ) {
-    return undefined;
-  }
-  return {
-    ...(value.displayName ? { displayName: value.displayName } : {}),
-    ...(value.icon ? { icon: value.icon } : {}),
-    ...(shortcuts ? { shortcuts } : {}),
-    ...(inputSchema ? { inputSchema } : {}),
-    ...(outputSchema ? { outputSchema } : {}),
-    ...(artifactTypes ? { artifactTypes } : {}),
-    ...(permissions ? { permissions } : {}),
-  };
-}
-
-class ActionCatalogMcpListTimeoutError extends Error {
-  constructor() {
-    super(`MCP tool catalog did not resolve within ${ACTION_CATALOG_MCP_LIST_TIMEOUT_MS}ms`);
-    this.name = 'ActionCatalogMcpListTimeoutError';
-  }
-}
-
-function startActionCatalogMcpListWithTimeout<T>(
-  run: (abortSignal: AbortSignal) => Promise<T>,
-  onTimeout?: (work: Promise<T>) => void,
-): {
-  pending: Promise<T>;
-  work: Promise<T>;
-  didTimeout: () => boolean;
-} {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
-  const work = run(controller.signal);
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      const timeoutError = new ActionCatalogMcpListTimeoutError();
-      timedOut = true;
-      onTimeout?.(work);
-      controller.abort(timeoutError);
-      reject(timeoutError);
-    }, ACTION_CATALOG_MCP_LIST_TIMEOUT_MS);
-  });
-  const pending = Promise.race([work, timeout]).finally(() => {
-    if (timer !== undefined) clearTimeout(timer);
-  });
-  return {
-    pending,
-    work,
-    didTimeout: () => timedOut,
-  };
-}
-
-const DELEGATION_DEADLINE_REACHED = Symbol('delegation-deadline-reached');
-
-/** Race one durable delegation result against its persisted absolute deadline. */
-async function waitForDelegationResult<T>(
-  promise: Promise<T>,
-  deadlineAt: number,
-): Promise<T | typeof DELEGATION_DEADLINE_REACHED> {
-  const remainingMs = Math.max(0, deadlineAt - Date.now());
-  if (remainingMs === 0) return DELEGATION_DEADLINE_REACHED;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<typeof DELEGATION_DEADLINE_REACHED>(resolve => {
-    timer = setTimeout(() => resolve(DELEGATION_DEADLINE_REACHED), remainingMs);
-    if (typeof timer.unref === 'function') timer.unref();
-  });
-  try {
-    return await Promise.race([promise, deadline]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-/** The public error of a delegated task its parent cancelled (`cancelled` outcome). */
-const DELEGATED_SUBAGENT_CANCELLED_ERROR = {
-  code: 'harness.subagent_cancelled',
-  message: 'The delegated subagent was cancelled before it completed',
-} as const;
-
-function summarizeDelegationDeadline(deadlineAt: number): HarnessSubagentResultSummary {
-  const summary = summarizeHarnessSubagentEventResult(
-    summarizeHarnessSubagentResult(undefined, {
-      isError: true,
-      error: {
-        code: 'harness.delegation_timeout',
-        message: `The delegated subagent did not complete before its durable deadline (${deadlineAt})`,
-      },
-    }),
-  );
-  return { ...summary, outcome: 'failed' };
-}
-
 export type SessionLifecycleState = 'live' | 'closing' | 'closed' | 'deleted' | 'evicted';
 
 interface QueueBackpressureDrop {
@@ -1446,74 +1138,6 @@ interface QueueBackpressureDrop {
   maxQueueDepth: number;
   source: 'queue' | 'goal';
   goalId?: string;
-}
-
-/**
- * System prompt for the goal judge. Lifted verbatim from
- * mastracode/src/tui/goal-manager.ts so the harness-native judge produces
- * the same verdicts as the TUI implementation. The wording matters — the
- * "don't wait for yourself" rule and the asked-question-vs-checkpoint
- * distinction prevent the loop from flip-flopping.
- */
-const JUDGE_SYSTEM_PROMPT = `You are the goal judge. Your decision directly controls whether the assistant continues working toward the goal.
-
-Given a goal and the assistant's latest response, reason about whether the goal's requirements have been satisfied. Compare what the goal asks for against what the assistant has actually produced. Focus on substance, not phrasing.
-
-Use "done" when the goal is fully achieved.
-Use "waiting" only when the goal explicitly requires a user checkpoint, user feedback, human verification, human confirmation, or another external event outside the goal-judge loop before the assistant should continue, and the assistant has correctly stopped at that checkpoint. Do not use "waiting" merely because the assistant asked a question or could benefit from user input.
-Use "continue" when the goal is not done and the assistant should keep working autonomously, including when it asked for input that the goal did not explicitly require.
-If your previous decision was "waiting" for an explicit user checkpoint, keep choosing "waiting" when the user's latest response asks a question, requests clarification, or otherwise does not satisfy the checkpoint. Do not continue until the required user feedback/confirmation/verification has actually been provided.
-If the goal says to wait for the goal judge, judge, evaluator, or you to respond, approve, verify, validate, tell the assistant to continue, or otherwise provide the next signal, treat your own decision as that judge response. Verification can be performed by you unless the goal explicitly says it needs human/user verification. Choose "continue" when the assistant should proceed to the next step. Do not choose "waiting" for judge-controlled checkpoints, because that would mean waiting for yourself.
-
-Your "reason" field is sent back to the assistant as guidance when the goal is not yet done — be specific about what still needs to be accomplished. When choosing "continue", write the reason as an instruction for what the assistant should do next. When choosing "waiting", explain what specific user checkpoint is still outstanding.`;
-
-/** Structured-output schema used by the goal judge call (§4.7). */
-const GoalJudgeSchema = z.object({
-  decision: z
-    .enum(['done', 'continue', 'waiting'])
-    .describe(
-      'Whether the goal is done, should continue autonomously, or is at an explicit user checkpoint required by the goal',
-    ),
-  reason: z.string().describe('Brief explanation of what was accomplished or what remains to be done'),
-});
-
-/** Per-message cap on judge-context strings to keep judge latency bounded. */
-const JUDGE_TRUNCATE_LIMIT = 4000;
-
-// ---------------------------------------------------------------------------
-// Permission helpers (§4.2e). Tiny shape validators kept module-scoped so the
-// session methods stay focused on persistence + event emission.
-// ---------------------------------------------------------------------------
-
-const TOOL_CATEGORIES: readonly ToolCategory[] = ['read', 'edit', 'execute', 'mcp', 'other'];
-const PERMISSION_POLICIES: readonly PermissionPolicy[] = ['allow', 'ask', 'deny'];
-
-/**
- * Harness-owned control tools that must remain callable for the protocol itself
- * to make progress. `ask_user` / `submit_plan` are the suspension boundary and
- * `report_subagent_outcome` is the child session's mandatory terminal envelope.
- *
- * Plan mutation/check/delegation tools and `spawn_subagent` are intentionally
- * absent: they mutate durable state or expand execution capability, so they obey
- * the same permission policy and subagent capability allowlist as application
- * tools. Kept in sync with `_buildToolSurface`.
- */
-const UNGATED_HARNESS_BUILTIN_TOOL_IDS: ReadonlySet<string> = new Set<string>([
-  HARNESS_SUBAGENT_OUTCOME_REPORT_TOOL_ID,
-  ASK_USER_TOOL_ID,
-  SUBMIT_PLAN_TOOL_ID,
-]);
-
-function assertToolCategory(method: string, value: unknown): asserts value is ToolCategory {
-  if (typeof value !== 'string' || !TOOL_CATEGORIES.includes(value as ToolCategory)) {
-    throw new HarnessValidationError(method, `unknown ToolCategory ${JSON.stringify(value)}`);
-  }
-}
-
-function assertToolName(method: string, value: unknown): asserts value is string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new HarnessValidationError(method, 'toolName must be a non-empty string');
-  }
 }
 
 function assertAgentType(method: string, value: unknown): asserts value is string {
@@ -1528,12 +1152,6 @@ function assertModelId(method: string, value: unknown): asserts value is string 
   }
 }
 
-function assertPolicy(method: string, value: unknown): asserts value is PermissionPolicy {
-  if (typeof value !== 'string' || !PERMISSION_POLICIES.includes(value as PermissionPolicy)) {
-    throw new HarnessValidationError(method, `policy must be one of ${PERMISSION_POLICIES.join(' | ')}`);
-  }
-}
-
 function isStorageAttachmentUnavailableError(err: unknown): err is HarnessStorageAttachmentUnavailableError {
   return (
     typeof err === 'object' &&
@@ -1542,40 +1160,6 @@ function isStorageAttachmentUnavailableError(err: unknown): err is HarnessStorag
     typeof (err as { sessionId?: unknown }).sessionId === 'string' &&
     typeof (err as { attachmentId?: unknown }).attachmentId === 'string'
   );
-}
-
-function truncateForJudge(value: string): string {
-  return value.length > JUDGE_TRUNCATE_LIMIT ? value.slice(0, JUDGE_TRUNCATE_LIMIT) + '\n...[truncated]' : value;
-}
-
-function escapeGoalXml(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-}
-
-/**
- * Continuation prompts. The wording matters — these are lifted verbatim
- * from `mastracode/src/tui/goal-manager.ts` + `commands/goal.ts` so the
- * harness-native goal API produces byte-identical kickoff/resume/judge-
- * continue messages.
- */
-
-/** Kickoff sent by `setGoal` (parity with TUI's `createGoalReminderXml`). */
-function buildKickoffContinuation(objective: string): string {
-  return `<system-reminder type="goal">${escapeGoalXml(objective)}</system-reminder>`;
-}
-
-/** Continuation sent by `resumeGoal` (parity with TUI's `/goal resume`). */
-function buildResumeContinuation(objective: string): string {
-  return `Continue working toward the goal: ${objective}`;
-}
-
-/**
- * Continuation sent after a judge `continue` verdict (parity with TUI's
- * `GoalManager.buildContinuationPrompt`).
- */
-function buildJudgeContinuation(opts: { turn: number; max: number; objective: string; judgeReason: string }): string {
-  const message = `[Goal attempt ${opts.turn}/${opts.max}] The goal is not yet complete. Judge feedback: ${opts.judgeReason}\n\nContinue working toward the goal: ${opts.objective}`;
-  return `<system-reminder type="goal-judge">${escapeGoalXml(message)}</system-reminder>`;
 }
 
 /**
@@ -1650,16 +1234,6 @@ function assertCallerAdmissionIdNotReserved(field: string, admissionId: string |
   if (admissionId !== undefined && isHarnessWakeReservedKey(admissionId)) {
     throw new HarnessValidationError(field, 'admissionId uses the Harness-reserved wake namespace');
   }
-}
-
-function assertCallerGrantKeyNotReserved(field: string, grant: { key: string } | undefined): void {
-  if (grant !== undefined && isHarnessWakeReservedKey(grant.key)) {
-    throw new HarnessTerminalHandoffValidationError(field, 'uses the Harness-reserved wake namespace');
-  }
-}
-
-function delegationSettlementNoticeText(notice: { taskId: string; outcome: string }): string {
-  return `Delegated plan task ${JSON.stringify(notice.taskId)} settled with outcome "${notice.outcome}". Call ${TASK_CHECK_TOOL_ID} with rootTaskId ${JSON.stringify(notice.taskId)} to read its result before continuing that work.`;
 }
 
 /**
@@ -1747,43 +1321,7 @@ interface ActiveTurnWaiter {
   cleanup: () => void;
 }
 
-/**
- * Point-in-time snapshot returned by `getDisplayState()` (§4.2). Reads off
- * the in-memory `SessionRecord` plus a few transient run-only fields.
- *
- * Persistent thread-level aggregates (task lists, modified-file ledgers, OM
- * progress) deliberately live in `session.state`, not here — see the
- * `getDisplayState()` doc-comment for the split rationale. All `Record<>`
- * collections returned here are fresh on every call; do not mutate them.
- */
-// ---------------------------------------------------------------------------
-// Run projection (§5.1b SessionRunProjection). A bounded read-model view of the
-// active run for the session list/detail UI — NOT the durable
-// HarnessRunOperationalState recovery record. Populated from live session state;
-// `getDisplayState().currentRun` is present only while a run is in flight.
-// ---------------------------------------------------------------------------
-export type HarnessRunStatus = 'starting' | 'running' | 'waiting' | 'resuming' | 'completed' | 'failed' | 'interrupted';
-
 export type HarnessRunOperationRefKind = 'signal' | 'queue' | 'sync-generate' | 'use-skill' | 'inbox-response';
-
-export interface SessionRunProjection {
-  runId: string;
-  traceId?: string;
-  status: HarnessRunStatus;
-  operation: {
-    kind: HarnessRunOperationRefKind;
-    signalId?: string;
-    queuedItemId?: string;
-    itemId?: string;
-    responseId?: string;
-    skillName?: string;
-  };
-  modeId: string;
-  modelId: string;
-  agentId: string;
-  startedAt: number;
-  updatedAt: number;
-}
 
 // ---------------------------------------------------------------------------
 // Span-summary (S3/S4/O1/O2/O6) — per-run span tracking for the canonical
@@ -1827,102 +1365,10 @@ interface OpenRunSpan {
 
 /** Bound on the finalized-runId dedup set (oldest entries dropped wholesale; re-finalizing an ancient runId is impossible in practice). */
 const MAX_FINALIZED_RUN_IDS = 4096;
-const MAX_DELIVERED_TERMINAL_SUBAGENT_ANSWERS = 4096;
 /** Bounded safe receipt evidence retained per run for subagent settlement. */
 const MAX_HARNESS_RUN_TOOL_RECEIPTS = 256;
 const MAX_HARNESS_RUN_TOOL_RECEIPT_BYTES = 64 * 1024;
 const MAX_HARNESS_RUN_TOOL_RECEIPT_SETS = 64;
-/**
- * Drafts share the parent SessionRecord with queues, receipts, policy and run
- * state. Bound both each streamed field and the whole draft projection in
- * UTF-8 bytes so multibyte output cannot silently exceed a storage adapter's
- * document limit (Convex, for example, caps a document at 1 MiB).
- */
-const MAX_ASSISTANT_DRAFT_FIELD_BYTES = 128_000;
-const MAX_PERSISTED_ASSISTANT_DRAFT_BYTES = 384 * 1024;
-const MAX_PERSISTED_ASSISTANT_DRAFTS = 8;
-const ASSISTANT_DRAFT_FLUSH_DELAY_MS = 250;
-const ASSISTANT_DRAFT_TEXT_ENCODER = new TextEncoder();
-const ASSISTANT_DRAFT_TEXT_DECODER = new TextDecoder();
-
-export interface SessionDisplayState {
-  // Identity
-  sessionId: string;
-  threadId: string;
-  resourceId: string;
-  parentSessionId?: string;
-  lifecycleState: SessionLifecycleState;
-  modeId: string;
-  modelId: string;
-  createdAt: number;
-  lastActivityAt: number;
-
-  // Run
-  isRunning: boolean;
-  currentRunId?: string;
-  currentMessageId?: string;
-  currentTraceId?: string;
-  // §5.1b structured projection of the in-flight run (present only while a run
-  // is active). Consolidates the loose currentRun* fields above into the spec
-  // SessionRunProjection shape for the session list/detail UI.
-  currentRun?: SessionRunProjection;
-
-  // Activity
-  activeTools: Record<string, ActiveToolState>;
-  toolInputBuffers: Record<string, { toolName: string; text: string }>;
-  activeSubagents: Record<string, ActiveSubagentState>;
-  assistantDrafts?: Record<string, HarnessAssistantDraft>;
-
-  // Tokens
-  tokenUsage: TokenUsage;
-
-  // Pending interrupt (full UX payload, not recovery-only metadata)
-  pending: SessionDisplayPending | null;
-
-  // Queue
-  queueDepth: number;
-  currentQueuedItemId?: string;
-
-  // Goal
-  goal?: SessionRecord['goal'];
-
-  // Plan tasks (§5.1k / TM-5): a BOUNDED summary — counts + active in_progress
-  // ids + root count — NOT the full tree. UIs drive detail off the
-  // `papersflow.plan_task.updated` event deltas + the bounded `plan_task_check`
-  // read. Absent until the session has observed its plan tree.
-  planTasks?: PlanTaskSummary;
-}
-
-export type SessionDisplayPending = Omit<
-  NonNullable<SessionRecord['pendingResume']>,
-  | 'runtimeDependencies'
-  | 'requestContext'
-  | 'toolSurfaceFence'
-  | 'toolReceipts'
-  | 'toolReceiptsOverflow'
-  | 'subagentBudgetSpent'
-  | 'expiresAt'
-> & { expiresAt: number };
-
-function pendingResumeForDisplay(pending: SessionRecord['pendingResume']): SessionDisplayPending | null {
-  if (!pending) return null;
-  // Strip storage-internal recovery fields and the caller app bag. Receipt
-  // identities authenticate a terminal report after restart; they are not the
-  // UI's activity feed (tool events already provide that public projection).
-  const {
-    runtimeDependencies: _runtimeDependencies,
-    requestContext: _requestContext,
-    toolSurfaceFence: _toolSurfaceFence,
-    toolReceipts: _toolReceipts,
-    toolReceiptsOverflow: _toolReceiptsOverflow,
-    subagentBudgetSpent: _subagentBudgetSpent,
-    ...displayPending
-  } = pending;
-  return {
-    ...displayPending,
-    expiresAt: pending.expiresAt,
-  };
-}
 
 /**
  * Internal handle the Harness uses to construct + tear down a Session
@@ -1979,38 +1425,6 @@ function normalizeSessionLogicalMessageIdentity(
   }
 }
 
-function normalizeSessionLogicalMessageInputIdentity(
-  value: LogicalMessageSignalIdentity | undefined,
-  methodName: string,
-): LogicalMessageSignalIdentity | undefined {
-  try {
-    return normalizeLogicalMessageInputIdentity(value);
-  } catch (error) {
-    throw new HarnessValidationError(
-      `${methodName}.logicalMessageIdentity`,
-      error instanceof Error ? error.message : 'must contain a valid input id',
-    );
-  }
-}
-
-/** The deterministic admission id of a parent's `task_delegate` signal to its child. */
-function delegationAdmissionId(parentSessionId: string, taskId: string): string {
-  return `harness-delegate:${parentSessionId}:${taskId}`;
-}
-
-/** The child's signal evidence id for one admitted delegation signal. */
-function delegationSignalId(child: SessionRecord, admissionId: string): string {
-  const digest = sha256CanonicalJson({
-    kind: 'channel-signal-admission',
-    harnessName: child.harnessName,
-    sessionId: child.id,
-    resourceId: child.resourceId,
-    threadId: child.threadId,
-    admissionId,
-  });
-  return `harness-channel-signal-${digest.slice(0, 32)}`;
-}
-
 /**
  * @internal — whether a delegated child still owes a recovered completion: a
  * delegation its parent's plan links to it settled (`completed`, or
@@ -2051,60 +1465,11 @@ export async function delegatedChildOwesRecoveredCompletion(
 }
 
 /**
- * Settled evidence recovery publishes (as message recovery does): a completed
- * result that was not erased, or an interruption. Other failures were
- * reported by the run that failed.
- */
-function owesRecoveredCompletion(
-  evidence: AgentSignalResultEvidence,
-): evidence is AgentSignalResultEvidence & { runId: string } {
-  return (
-    evidence.runId !== undefined &&
-    ((evidence.status === 'completed' && evidence.erased !== true) ||
-      (evidence.status === 'failed' && evidence.error.code === HARNESS_RUN_INTERRUPTED_ERROR_CODE))
-  );
-}
-
-/**
  * PF-7631: where a settlement notice's reminder row was saved: the agent whose
  * memory saved it, that memory instance, the mode it was resolved for, and the
  * session's mode-switch epoch taken before resolution.
  */
 type WakeReminderRowOrigin = { agent: Agent; memory: MastraMemory; modeId: string; modeEpoch: number };
-
-/**
- * [PF-7749] `agentic-loop` row statuses that mean the run is not parked on a
- * suspension: it was still executing when its owner died (an executing run's
- * row reads `pending` or `running`), or it finished.
- */
-const UNSUSPENDED_AGENTIC_LOOP_STATUSES: ReadonlySet<string> = new Set([
-  'pending',
-  'running',
-  'success',
-  'failed',
-  'tripwire',
-  'canceled',
-  'bailed',
-  'skipped',
-]);
-
-/**
- * [PF-7749] The pending-interaction slot as seen by a tool pre-registration:
- * `free` (nothing parked), `held` (this same call is already parked, so the
- * registration is a no-op), or `occupied` (another interaction holds it — a
- * second suspending call in the same step, or the answered interaction a
- * resumed run is still parked on). An occupied slot is left to the suspend
- * capture, which parks the call exactly as an unregistered one.
- */
-function preRegistrationSlot(
-  current: PendingResume | undefined,
-  kind: PendingResume['kind'],
-  runId: string,
-  toolCallId: string,
-): 'free' | 'held' | 'occupied' {
-  if (current === undefined) return 'free';
-  return current.kind === kind && current.runId === runId && current.toolCallId === toolCallId ? 'held' : 'occupied';
-}
 
 export class Session {
   /** Stable identity. Frozen at construction. */
@@ -26790,20 +26155,6 @@ export class Session {
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-/** PF-7473: true when the caller's admission check now fails. */
-function admissionLost(assertAdmitted: () => void): boolean {
-  try {
-    assertAdmitted();
-    return false;
-  } catch {
-    return true;
-  }
-}
-
-function compactJsonObject<T extends Record<string, unknown>>(value: T): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
-}
-
 function getOwnRecordValue<T>(record: Record<string, T> | undefined, key: string): T | undefined {
   if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return undefined;
   return record[key];
@@ -26830,14 +26181,6 @@ function pendingInteractionGenerationKey(input: {
   return sha256CanonicalJson([input.kind, input.itemId ?? null, input.runId, input.toolCallId, input.requestedAt]);
 }
 
-const DISCARD_PENDING_INTERACTION_KINDS: ReadonlySet<PendingResume['kind']> = new Set([
-  'tool-approval',
-  'tool-suspension',
-  'question',
-  'plan-approval',
-  'sandbox-access',
-]);
-const MAX_DISCARD_PENDING_INTERACTION_REASON_LENGTH = 512;
 const DISCARDED_ERROR_CODE = 'harness.pending_interaction_discarded';
 
 /** The exact pending generation a discard is fenced to. */
@@ -26919,44 +26262,6 @@ function receiptMatchesDiscardGeneration(receipt: InboxResponseReceipt, generati
   );
 }
 
-/**
- * Audit copy of a cancelled session's pending interaction for its discard
- * receipt: cancellation keeps `pendingResume` as audit evidence, and discard
- * must clear it for the session to settle and delete.
- */
-function cancelledPendingAudit(
-  pending: PendingResume,
-  cancelRequest: NonNullable<SessionRecord['cancelRequest']>,
-): NonNullable<InboxResponseReceipt['cancelledPendingResume']> {
-  // Identity and audit fields only — never payloads, suspend data or args —
-  // so the copy cannot push the claim write toward the record size budget.
-  return {
-    kind: pending.kind,
-    itemId: pending.itemId ?? pending.toolCallId,
-    runId: pending.runId,
-    toolCallId: pending.toolCallId,
-    requestedAt: pending.requestedAt,
-    expiresAt: pending.expiresAt,
-    ...(pending.toolName !== undefined ? { toolName: boundedAuditString(pending.toolName) } : {}),
-    cancelRequest: {
-      requestedAt: cancelRequest.requestedAt,
-      ...(cancelRequest.reason !== undefined ? { reason: boundedAuditString(cancelRequest.reason) } : {}),
-      ...(cancelRequest.requestedBy !== undefined
-        ? { requestedBy: boundedAuditString(cancelRequest.requestedBy) }
-        : {}),
-    },
-  };
-}
-
-const MAX_AUDIT_STRING_LENGTH = 256;
-const AUDIT_TRUNCATION_MARKER = '…[truncated]';
-
-function boundedAuditString(value: string): string {
-  return value.length <= MAX_AUDIT_STRING_LENGTH
-    ? value
-    : `${value.slice(0, MAX_AUDIT_STRING_LENGTH - AUDIT_TRUNCATION_MARKER.length)}${AUDIT_TRUNCATION_MARKER}`;
-}
-
 /** Whether `receipt`'s generation was resolved by `discardPendingInteraction`. */
 function receiptGenerationDiscarded(record: SessionRecord, receipt: InboxResponseReceipt): boolean {
   return (
@@ -26993,33 +26298,6 @@ function discardClaimReceipt(record: SessionRecord, pending: PendingResume): Inb
   return Object.values(record.inboxResponseReceipts ?? {}).find(
     receipt => receipt.discardedAt === pending.expiryStartedAt && receiptMatchesDiscardGeneration(receipt, generation),
   );
-}
-
-/** Shared between `_resume` and `_resumeAnswer` for discard reclassification. */
-interface ResumeAnswerProgress {
-  /** Input validation passed; later rejections may be reclassified. */
-  validated: boolean;
-  /** The pending interaction observed when the answer arrived. */
-  pending: PendingResume | undefined;
-}
-
-/**
- * What `_expirePendingInteraction` did: recorded an expiry, finished a
- * discard-owned generation as its discard (no expiry evidence), or nothing.
- */
-type PendingExpiryOutcome = 'expired' | 'discarded' | 'none';
-
-function discardReceiptResult(
-  status: 'discarded' | 'already_resolved',
-  receipt: InboxResponseReceipt,
-): DiscardPendingInteractionResult {
-  return {
-    status,
-    itemId: receipt.itemId,
-    kind: receipt.kind,
-    responseId: receipt.responseId,
-    discardedAt: receipt.discardedAt ?? receipt.updatedAt,
-  };
 }
 
 function publicErrorProjectionToError(error: { code: string; message: string }): Error {
@@ -27173,19 +26451,4 @@ function createDeferred<T>(): Deferred<T> {
     reject = rej;
   });
   return { promise, resolve, reject };
-}
-
-/**
- * True when `parentSessionId` itself asked to stop exactly this child: the
- * `subagent` tool's cancel or `cancelSubagent`, which alone record the
- * harness-owned `targeted` marker. The reason is not consulted. A delegation
- * timeout, a cancel cascading down from the parent's own cancellation, and a
- * cancel from anyone else carry no marker, so those settle the delegated task
- * `failed`.
- */
-function isParentRequestedSubagentCancel(
-  cancelRequest: SessionRecord['cancelRequest'],
-  parentSessionId: string,
-): boolean {
-  return cancelRequest?.targeted === true && cancelRequest.requestedBy === parentSessionId;
 }
