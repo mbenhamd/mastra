@@ -399,6 +399,17 @@ The `mbenhamd/mastra` fork intentionally runs a small PR validation surface:
   Canonical-only workflows, including the initial Prebuild change detector,
   must guard every Starsling job so fork PRs skip rather than wait forever for
   a runner the fork cannot access.
+- PF-8318 is the separately reviewed fork policy for post-merge validation of
+  `main`. `.github/workflows/papersflow-fork-main.yml` may trigger only on
+  `push` to `main` and `workflow_dispatch`, must run on a GitHub-hosted runner
+  and never a self-hosted one, receives no secrets and starts no services, has
+  `contents: read` only, and is gated to `mbenhamd/mastra`. It runs the Core
+  Harness, Harness-storage, and channels suites and builds and typechecks the
+  shipped packages, then compares the observed failures against the committed
+  known-failure list in `.github/papersflow/main-known-failures.json` using
+  `.github/scripts/papersflow-main-known-failures.mjs`. The PR validator admits
+  exactly these three paths, runs them through the changed-file `oxfmt` check,
+  and still fails closed on any other new workflow.
 
 Run the validator's focused policy fixtures locally after changing its routing
 or command plan:
