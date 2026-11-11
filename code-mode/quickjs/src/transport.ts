@@ -121,19 +121,25 @@ interface HostRpcEnvelope {
   error?: { message: string; name?: string };
 }
 
+function isPromiseLike<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
+  return typeof (value as { then?: unknown } | null | undefined)?.then === 'function';
+}
+
 /**
- * Waits for a caller-supplied transpile, or for the run's deadline or abort,
- * whichever comes first. The caller checks an already-aborted signal before
- * starting the hook; an abort during the hook's synchronous part is seen here. A rejection propagates. A hook that loses the race is
- * left to settle on its own; its result is ignored.
+ * Waits for work that runs before the interpreter starts (a caller-supplied
+ * transpile, or the first QuickJS module load), or for the run's deadline or
+ * abort, whichever comes first. The caller checks an already-aborted signal
+ * before starting the work; an abort during the work's synchronous part is seen
+ * here. A rejection propagates. Work that loses the race is left to settle on
+ * its own; its result is ignored.
  */
-async function raceTranspile(
-  hookOutput: string | Promise<string>,
+async function raceRunBudget<T>(
+  work: T | PromiseLike<T>,
   deadline: number,
   abortSignal: AbortSignal | undefined,
-): Promise<{ kind: 'done'; output: string } | { kind: 'timeout' } | { kind: 'abort' }> {
-  if (typeof hookOutput === 'string') return { kind: 'done', output: hookOutput };
-  const output = Promise.resolve(hookOutput);
+): Promise<{ kind: 'done'; output: T } | { kind: 'timeout' } | { kind: 'abort' }> {
+  if (!isPromiseLike(work)) return { kind: 'done', output: work };
+  const output = Promise.resolve(work);
   let timer: NodeJS.Timeout | undefined;
   let onAbort: (() => void) | undefined;
   try {
@@ -144,7 +150,7 @@ async function raceTranspile(
       }),
       new Promise<{ kind: 'abort' }>(resolve => {
         if (!abortSignal) return;
-        // The hook has already run its synchronous part, which can abort the
+        // The work has already run its synchronous part, which can abort the
         // signal before this listener exists.
         if (abortSignal.aborted) return resolve({ kind: 'abort' });
         onAbort = () => resolve({ kind: 'abort' });
@@ -154,7 +160,7 @@ async function raceTranspile(
   } finally {
     if (timer) clearTimeout(timer);
     if (onAbort) abortSignal?.removeEventListener('abort', onAbort);
-    // A late rejection from a hook that lost the race must not go unhandled.
+    // A late rejection from work that lost the race must not go unhandled.
     output.catch(() => undefined);
   }
 }
@@ -245,7 +251,7 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
         strippedProgram = tsBlankSpace(wrappedSource);
       } else {
         if (abortSignal?.aborted) return abortedResult();
-        const transpiled = await raceTranspile(this.#transpile(wrappedSource), deadline, abortSignal);
+        const transpiled = await raceRunBudget(this.#transpile(wrappedSource), deadline, abortSignal);
         if (transpiled.kind === 'timeout') return timedOutResult();
         if (transpiled.kind === 'abort') return abortedResult();
         strippedProgram = transpiled.output;
@@ -298,7 +304,16 @@ export class QuickJsCodeModeTransport implements CodeModeTransport {
       }
     };
 
-    const wasm = this.#module ?? (await getQuickJS());
+    // The first load of the shared module is raced like the hook, so a slow or
+    // stalled load cannot hold the run past its deadline or abort.
+    let wasm = this.#module;
+    if (!wasm) {
+      if (abortSignal?.aborted) return abortedResult();
+      const loaded = await raceRunBudget(getQuickJS(), deadline, abortSignal);
+      if (loaded.kind === 'timeout') return timedOutResult();
+      if (loaded.kind === 'abort') return abortedResult();
+      wasm = loaded.output;
+    }
 
     // Transpilation and the first module load spend the run's budget, and
     // synchronous work cannot be preempted. Report an expired run before
