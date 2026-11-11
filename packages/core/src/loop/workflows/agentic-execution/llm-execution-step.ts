@@ -176,16 +176,18 @@ function ownDataProperty(value: unknown, key: string): unknown {
   }
 }
 
-function descriptorSafeResponseMetadata(payload: unknown) {
+// Providers may split metadata across several chunks (e.g. id first, modelId later),
+// so keep earlier values for fields a chunk omits.
+function descriptorSafeResponseMetadata(payload: unknown, previous: Record<string, any> | undefined) {
   const id = ownDataProperty(payload, 'id');
   const modelId = ownDataProperty(payload, 'modelId');
   const timestamp = ownDataProperty(payload, 'timestamp');
   const headers = ownDataProperty(payload, 'headers');
   return {
-    ...(typeof id === 'string' ? { id } : {}),
-    ...(typeof modelId === 'string' ? { modelId } : {}),
-    ...(timestamp === undefined ? {} : { timestamp }),
-    ...(headers === undefined ? {} : { headers }),
+    id: typeof id === 'string' ? id : previous?.id,
+    timestamp: timestamp ?? previous?.timestamp,
+    modelId: typeof modelId === 'string' ? modelId : previous?.modelId,
+    headers: headers ?? previous?.headers,
   };
 }
 
@@ -981,7 +983,9 @@ async function processOutputStream<OUTPUT = undefined>({
 
     switch (chunk.type) {
       case 'response-metadata':
-        runState.setState({ responseMetadata: descriptorSafeResponseMetadata(chunk.payload) });
+        runState.setState({
+          responseMetadata: descriptorSafeResponseMetadata(chunk.payload, runState.state.responseMetadata),
+        });
         break;
 
       case 'tool-call-input-streaming-start': {
