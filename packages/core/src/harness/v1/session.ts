@@ -1442,8 +1442,10 @@ export class Session {
 
   /** PF-8365: the queue head (current queued item, its source, the `queue()` resolvers). */
   private readonly _queueHead = new QueueHead();
-  /** `queuedItem.id` of the turn currently running (live or suspended). */
-  private _currentQueuedItemId?: string;
+  /** Read bridge to `_queueHead.currentId` (PF-8365, removed once the reads go through the owner). */
+  private get _currentQueuedItemId(): string | undefined {
+    return this._queueHead.currentId;
+  }
   /**
    * `yolo` of the turn currently running. Set at drain-begin from the queued
    * item so suspend-capture can persist it onto `pendingResume` and a resumed
@@ -1452,9 +1454,10 @@ export class Session {
   private _currentTurnYolo = false;
   /** Captured native OM source-write fence for the live turn, if supplied. */
   private _currentTurnSourceWriteGuard?: ObservationalMemorySourceWriteGuard;
-  /** `queuedItem.source` of the turn currently running. Used by the goal
-   *  judge loop to skip re-judging on goal-driven continuation turns. */
-  private _currentQueuedItemSource?: 'user' | 'goal';
+  /** Read bridge to `_queueHead.currentSource` (PF-8365, removed once the reads go through the owner). */
+  private get _currentQueuedItemSource(): 'user' | 'goal' | undefined {
+    return this._queueHead.currentSource;
+  }
   /** Fresh remote queue admissions have no local promise resolver but are not crash replays. */
   private readonly _liveAdmittedQueuedItemIds = new Set<string>();
   /** True while `_maybeDrainQueue` is running so re-entrant kicks are no-ops. */
@@ -4610,10 +4613,7 @@ export class Session {
       if (resolver) {
         resolver.reject(expiryError);
       }
-      if (this._currentQueuedItemId === queuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(queuedItemId);
     }
 
     if (expiredPending.originSignalId !== undefined) {
@@ -4914,8 +4914,7 @@ export class Session {
         this._record.pendingResume?.queuedItemId !== expectedQueuedItemId &&
         !this._record.pendingQueue.some(item => item.id === expectedQueuedItemId)
       ) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
+        this._queueHead.release();
         this._notifyMaybeIdle();
       }
       return false;
@@ -4986,10 +4985,7 @@ export class Session {
       if (resolver) {
         resolver.reject(recoveryError);
       }
-      if (this._currentQueuedItemId === recoveringQueuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(recoveringQueuedItemId);
     }
     this._emitAbortedToolEnds({ force: true });
     this._emitTurnEvent({
@@ -6510,8 +6506,7 @@ export class Session {
       this._currentQueuedItemId !== undefined &&
       removedItems.some(item => item.queuedItemId === this._currentQueuedItemId)
     ) {
-      this._currentQueuedItemId = undefined;
-      this._currentQueuedItemSource = undefined;
+      this._queueHead.release();
     }
     // §6.2: the tool-visible abort reason is typed. A cancel cascaded from this
     // session's parent (harness-owned `parentOrigin`, matching this child's
@@ -6714,10 +6709,7 @@ export class Session {
       if (resolver) {
         resolver.reject(abortError);
       }
-      if (this._currentQueuedItemId === queuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(queuedItemId);
       this._emit({
         type: 'queue_failed',
         queuedItemId,
@@ -15921,10 +15913,7 @@ export class Session {
       if (resolver) {
         resolver.reject(discardError);
       }
-      if (this._currentQueuedItemId === queuedItemId) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
-      }
+      this._queueHead.releaseIf(queuedItemId);
       this._emit({
         type: 'queue_failed',
         queuedItemId,
@@ -17246,8 +17235,7 @@ export class Session {
           if (!terminalized) this._emitAbortedToolEnds({ force: true });
           finishResumedTurn();
           if (pendingQueuedItemId !== undefined) {
-            this._currentQueuedItemId = undefined;
-            this._currentQueuedItemSource = undefined;
+            this._queueHead.release();
             this._notifyMaybeIdle();
           }
         }
@@ -17364,8 +17352,7 @@ export class Session {
         // drain arms the existing stale-recovery timer instead of leaving the
         // queue parked until an unrelated external call arrives.
         if (pendingQueuedItemId !== undefined) {
-          this._currentQueuedItemId = undefined;
-          this._currentQueuedItemSource = undefined;
+          this._queueHead.release();
           this._notifyMaybeIdle();
         }
       }
@@ -17810,8 +17797,7 @@ export class Session {
         await Promise.race([this._runGoalJudge(full, wasGoalDriven), deletedTurnWaiter]);
       }
       if (completingQueuedItemId !== undefined) {
-        this._currentQueuedItemId = undefined;
-        this._currentQueuedItemSource = undefined;
+        this._queueHead.release();
         const resolver = this._queueHead.takeResolver(completingQueuedItemId);
         if (resolver) {
           resolver.resolve(full as AgentResult);
@@ -18384,8 +18370,7 @@ export class Session {
           { skipTokenAccounting: alreadyAccounted },
         );
       }
-      this._currentQueuedItemId = undefined;
-      this._currentQueuedItemSource = undefined;
+      this._queueHead.release();
       const resolver = this._queueHead.takeResolver(queuedItemId);
       if (resolver) {
         resolver.resolve(currentReceipt.result as AgentResult);
@@ -19405,8 +19390,7 @@ export class Session {
         this._clearQueueWakeTimer();
         const head = this._record.pendingQueue?.[0];
         if (!head) return;
-        this._currentQueuedItemId = head.id;
-        this._currentQueuedItemSource = head.source ?? 'user';
+        this._queueHead.claim(head.id, head.source ?? 'user');
         // §10.2: no queue_item_started / queue_item_replayed events — the closed
         // union has no queue-lifecycle family; the drained turn's `agent_start`
         // marks the boundary. We still clear the live-admission marker (only
@@ -19958,8 +19942,7 @@ export class Session {
     modeId: string,
     err: QueuePostRunFinalizationPendingError,
   ): void {
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._notifyMaybeIdle();
     const delayMs = Math.max(0, err.retryAt - Date.now());
     const timer = setTimeout(() => {
@@ -20514,8 +20497,7 @@ export class Session {
           : {}),
       };
     });
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     // §10.2 OperationEvent — `queue_completed` is the queue settlement boundary,
     // not `agent_end`. Requires the accepted-signal identities (`runId`,
     // `signalId`); skip if the receipt never crossed the agent boundary.
@@ -20598,8 +20580,7 @@ export class Session {
       }
       throw flushError;
     }
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     // §10.2 OperationEvent — a late failure may race a completion that already
     // won (`completedResult`): emit `queue_completed` for that, else
     // `queue_failed`. `signalId`/`runId` are optional on the failed event.
@@ -20676,8 +20657,7 @@ export class Session {
       return next;
     });
 
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     for (const itemId of queuedIds) {
       const resolver = this._queueHead.takeResolver(itemId);
       if (!resolver) continue;
@@ -20692,8 +20672,7 @@ export class Session {
   }
 
   private _parkQueuedTurn(itemId: string, err: unknown): void {
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._notifyMaybeIdle();
     if (err instanceof QueueRecoveryPendingError || err instanceof HarnessQueuedTurnDeferredError) {
       const delayMs = Math.max(0, err.retryAt - Date.now());
@@ -20710,13 +20689,11 @@ export class Session {
   private _ensureQueuedItemContext(queuedItemId: string): void {
     if (this._currentQueuedItemId !== undefined) return;
     const queuedItem = this._record.pendingQueue.find(item => item.id === queuedItemId);
-    this._currentQueuedItemId = queuedItemId;
-    this._currentQueuedItemSource = queuedItem?.source ?? 'user';
+    this._queueHead.claim(queuedItemId, queuedItem?.source ?? 'user');
   }
 
   private _deferQueuedTurnRetry(err: QueuePostRunFinalizationPendingError): void {
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._notifyMaybeIdle();
     const delayMs = Math.max(0, err.retryAt - Date.now());
     const timer = setTimeout(() => void this._maybeDrainQueue(), delayMs);
@@ -21836,8 +21813,7 @@ export class Session {
     }
     this._clearQueueWakeTimer();
     this._clearDelegationReconcileTimers();
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._queueHead.rejectAll(err);
     this._tearDownThreadSubscription(err);
   }
@@ -21885,8 +21861,7 @@ export class Session {
     }
     this._clearQueueWakeTimer();
     this._clearDelegationReconcileTimers();
-    this._currentQueuedItemId = undefined;
-    this._currentQueuedItemSource = undefined;
+    this._queueHead.release();
     this._queueHead.rejectAll(err);
   }
 

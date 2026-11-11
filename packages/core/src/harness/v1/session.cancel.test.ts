@@ -137,7 +137,7 @@ describe('Session.cancel()', () => {
       ],
     }));
     const controller = new AbortController();
-    (session as any)._currentQueuedItemId = 'active';
+    (session as any)._queueHead.claim('active', undefined);
     (session as any)._currentTurnAbortController = controller;
     const active = deferred();
     (session as any)._queueHead.register('active', active);
@@ -159,7 +159,7 @@ describe('Session.cancel()', () => {
         { id: 'preflight', admissionId: 'admission-preflight', enqueuedAt: now, content: 'active', attachments: [] },
       ],
     }));
-    (session as any)._currentQueuedItemId = 'preflight';
+    (session as any)._queueHead.claim('preflight', undefined);
     const queued = deferred();
     (session as any)._queueHead.register('preflight', queued);
 
@@ -474,7 +474,7 @@ describe('Session.cancel()', () => {
         expiresAt: now + 600_000,
       },
     }));
-    (session as any)._currentQueuedItemId = 'suspended';
+    (session as any)._queueHead.claim('suspended', undefined);
     const queued = deferred();
     (session as any)._queueHead.register('suspended', queued);
     const idle = session.waitForIdle({ timeoutMs: 100 });
