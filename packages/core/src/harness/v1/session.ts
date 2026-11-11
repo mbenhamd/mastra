@@ -366,6 +366,7 @@ import type {
 import { NativeSignalAcceptanceTimeoutError, SIGNAL_NATIVE_ACCEPT_TIMEOUT_MS } from './session-signal-acceptance';
 import { SessionSkillsMcpActions } from './session-skills-mcp-actions';
 import type { SkillsMcpActionsSessionPort } from './session-skills-mcp-actions';
+import { TerminalStagingLedger } from './session-terminal-staging-ledger';
 import {
   assertPolicy,
   assertToolCategory,
@@ -384,6 +385,7 @@ import type {
   HarnessPrepareStep,
   ResumeAnswerProgress,
 } from './session-turn-options';
+import { WakeAdmissions } from './session-wake-admissions';
 import { SessionWorkspace } from './session-workspace';
 import type { WorkspaceSessionPort } from './session-workspace';
 import { createSpawnSubagentTool, SPAWN_SUBAGENT_TOOL_ID } from './spawn-subagent-tool';
@@ -1822,6 +1824,8 @@ export class Session {
    * reservation and dispatch, so recovery never interrupts one in flight here.
    */
   private readonly _wakeTerminalAdmissionsInFlight = new Set<string>();
+  /** PF-8389: the settlement wake admissions (in flight here, released to recovery). */
+  private readonly _wakeAdmissions = new WakeAdmissions();
   /**
    * PF-7631: wake admissions this process admitted and then gave up on before
    * their terminal commit (a Stop, delete or eviction during admission or
@@ -1831,6 +1835,11 @@ export class Session {
    */
   private readonly _releasedWakeAdmissions = new Set<string>();
   private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
+  /**
+   * PF-8389: the terminal staging ledger (per run: usage fence, staged mark,
+   * native admission mark, cached pending admission).
+   */
+  private readonly _terminalStagingLedger = new TerminalStagingLedger();
   /** Pending native completions whose usage has joined the durable session counter. */
   private readonly _terminalTokenAccountedRunIds = new Set<string>();
   private readonly _stagedTerminalRunIds = new Set<string>();
