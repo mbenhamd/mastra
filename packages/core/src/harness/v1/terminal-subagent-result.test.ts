@@ -327,7 +327,7 @@ describe('Harness subagent outcome terminal contract', () => {
     ]);
   });
 
-  it('keeps a near-limit direct delivery valid by leaving out earlier receipts that do not fit the report', () => {
+  it('keeps a near-limit direct delivery valid by leaving out only the earlier receipts that do not fit the report', () => {
     const answer = 'a'.repeat(47 * 1024);
     const terminalToolResult = {
       status: 'success',
@@ -347,6 +347,7 @@ describe('Harness subagent outcome terminal contract', () => {
     }));
     const rawResult = withHarnessSubagentToolReceipts({ finishReason: 'tool-calls', terminalToolResult }, [
       ...earlier,
+      { toolCallId: 'python-short', toolName: 'run_python_analysis', status: 'success' },
       { toolCallId: 'python-final', toolName: 'run_python_analysis', status: 'success' },
     ]);
 
@@ -355,6 +356,7 @@ describe('Harness subagent outcome terminal contract', () => {
     expect(completion?.evidence[0]?.toolCallId).toBe('python-final');
     expect(completion?.evidence.length).toBeGreaterThan(1);
     expect(completion?.evidence.length).toBeLessThan(24);
+    expect(completion?.evidence.at(-1)?.toolCallId).toBe('python-short');
     const summary = summarizeHarnessSubagentResult(rawResult);
     expect(summary).toMatchObject({ status: 'success', outcome: 'completed', text: answer });
     expect(projectHarnessSpawnSubagentResult({ subagentSessionId: 'child-session-1', result: summary })).toMatchObject({

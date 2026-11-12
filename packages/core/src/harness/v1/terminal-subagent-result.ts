@@ -979,9 +979,10 @@ export function verifyHarnessSubagentTerminalCompletion(value: unknown): Harness
   // join the evidence in call order: a caller that requires every delegated
   // call to be proven can then verify a multi-call direct delivery. Run
   // tool-result fallbacks are never appended, and an ambiguous earlier call id
-  // is skipped. Appending stops at the report's item and byte bounds, so a
-  // terminal-only report that verified before still verifies; a call left out
-  // stays unproven for the caller.
+  // is skipped. Appending stops at the report's item bound and skips any
+  // receipt that would break its byte bound, so a terminal-only report that
+  // verified before still verifies; a call left out stays unproven for the
+  // caller.
   const encoder = new TextEncoder();
   let reportBytes = encoder.encode(
     JSON.stringify({ kind: HARNESS_SUBAGENT_OUTCOME_REPORT_KIND, outcome: 'completed', summary, evidence }),
@@ -998,7 +999,8 @@ export function verifyHarnessSubagentTerminalCompletion(value: unknown): Harness
     };
     // One more array element serializes as a comma plus the item.
     const itemBytes = encoder.encode(JSON.stringify(item)).byteLength + 1;
-    if (reportBytes + itemBytes > MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES) break;
+    // Skip a receipt that does not fit; a smaller later one still may.
+    if (reportBytes + itemBytes > MAX_HARNESS_SUBAGENT_DIRECT_ANSWER_BYTES) continue;
     reportBytes += itemBytes;
     seenCallIds.add(receipt.toolCallId);
     evidence.push(item);
