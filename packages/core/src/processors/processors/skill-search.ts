@@ -550,7 +550,7 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
     messageList.addSystem(
       autoLoad
         ? 'To discover available skills, call search_skills with a keyword query. ' +
-            'Matching skills are loaded automatically and their instructions apply right away. ' +
+            'Matching skills are loaded automatically and their instructions apply once the search returns. ' +
             'There is no separate load step; after searching, follow the loaded instructions.'
         : 'To discover available skills, call search_skills with a keyword query. ' +
             "To load a skill's instructions, call load_skill with the skill name. " +
@@ -570,7 +570,7 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
       id: 'search_skills',
       description: autoLoad
         ? 'Search for available skills by keyword. ' +
-          'Matching skills are loaded automatically and their instructions apply right away. ' +
+          'Matching skills are loaded automatically and their instructions apply once the search returns. ' +
           'No separate load step is required.'
         : 'Search for available skills by keyword. ' +
           'Returns a list of matching skills with their names and descriptions. ' +

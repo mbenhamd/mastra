@@ -666,7 +666,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
     messageList.addSystem(
       autoLoad
         ? 'To discover available tools, call search_tools with a keyword query. ' +
-            'Matching tools are loaded automatically and are callable right away — ' +
+            'Matching tools are loaded automatically and are callable once the search returns — ' +
             'there is no separate load step. After searching, use the tool directly.'
         : 'To discover available tools, call search_tools with a keyword query. ' +
             'To add one or more tools to the conversation, call load_tool with a toolName or toolNames array. ' +
@@ -681,7 +681,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
         messageList.addSystem(
           (autoLoad
             ? 'The following tools are available. Call search_tools with a keyword to load one — ' +
-              'matching tools are loaded automatically and are callable right away.'
+              'matching tools are loaded automatically and are callable once the search returns.'
             : 'The following tools are available to load. Call load_tool with a toolName or toolNames array ' +
               'to add one or more before using them — no search step is required. ' +
               'search_tools is also available if you need to rediscover tools by keyword.') +
@@ -698,7 +698,7 @@ export class ToolSearchProcessor implements Processor<'tool-search'> {
         ? 'Search for available tools by keyword. ' +
           "Use this when you need a capability you don't currently have. " +
           'Returns a list of matching tools, which are loaded automatically and ' +
-          'callable right away — no separate load step is required.'
+          'callable once the search returns — no separate load step is required.'
         : 'Search for available tools by keyword. ' +
           "Use this when you need a capability you don't currently have. " +
           'Returns a list of matching tools with their names and descriptions. ' +
