@@ -1,3 +1,5 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { MASTRA_RESOURCE_ID_KEY, RequestContext } from '@mastra/core/request-context';
 import { resolveStoredToolProviders } from '@mastra/core/tool-provider';
 import type { ToolProviders } from '@mastra/core/tool-provider';
@@ -1357,7 +1359,7 @@ describe('ComposioToolProvider — listConnections', () => {
   describe('connections through the real SDK and HTTP responses', () => {
     let actual: typeof import('@composio/core');
     let baseURL: string;
-    let response: (query: URLSearchParams) => unknown;
+    let response: (query: URLSearchParams) => object;
     const server = createServer((request, reply) => {
       const url = new URL(request.url!, baseURL);
       if (url.pathname !== '/api/v3/connected_accounts' || request.method !== 'GET') {
@@ -1365,7 +1367,7 @@ describe('ComposioToolProvider — listConnections', () => {
         return;
       }
       reply.writeHead(200, { 'content-type': 'application/json' });
-      reply.end(JSON.stringify(response(url.searchParams)));
+      reply.end(JSON.stringify({ total_pages: 1, ...response(url.searchParams) }));
     });
     beforeAll(async () => {
       actual = await vi.importActual<typeof import('@composio/core')>('@composio/core');
@@ -1830,5 +1832,3 @@ describe('ComposioToolProvider — shared catalog tools', () => {
     ).rejects.toThrow('caller-scoped session');
   });
 });
-import { createServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
