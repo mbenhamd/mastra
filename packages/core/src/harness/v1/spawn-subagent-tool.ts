@@ -495,6 +495,7 @@ export function createSpawnSubagentTool(parent: Session) {
           isError,
           error: publicError,
           ...(budgetExhausted !== undefined ? { budgetExhausted } : {}),
+          includeEarlierReceipts: true,
         });
         // A child can resolve normally with finishReason=error/aborted. Do not
         // mislabel that as a successful tool result merely because it did not

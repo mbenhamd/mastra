@@ -1318,7 +1318,7 @@ describe('planTaskCheck — bounded read', () => {
     }
   });
 
-  it('keeps a near-limit direct delivery with many earlier receipts readable', async () => {
+  it('keeps a settled near-limit direct delivery readable by persisting only its terminal evidence', async () => {
     const answer = 'a'.repeat(47 * 1024);
     const terminalToolResult = {
       status: 'success',
@@ -1355,8 +1355,7 @@ describe('planTaskCheck — bounded read', () => {
     const result = res.tasks[0]?.delegation?.result;
     expect(result).toMatchObject({ status: 'success', outcome: 'completed', text: answer });
     expect(result?.artifacts).toHaveLength(1);
-    expect(result?.evidence?.[0]?.toolCallId).toBe('python-final');
-    expect(result?.evidence?.at(-1)?.toolCallId).toBe('python-short');
+    expect(result?.evidence?.map(item => item.toolCallId)).toEqual(['python-final']);
     expect(new TextEncoder().encode(JSON.stringify(res)).byteLength).toBeLessThanOrEqual(
       PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
     );

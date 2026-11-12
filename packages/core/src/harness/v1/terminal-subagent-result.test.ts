@@ -286,11 +286,12 @@ describe('Harness subagent outcome terminal contract', () => {
       ['python-1', 'success'],
       ['python-2', 'success'],
     ]);
-    expect(summarizeHarnessSubagentResult(rawResult)).toMatchObject({
-      status: 'success',
-      outcome: 'completed',
-      evidence: expect.arrayContaining([expect.objectContaining({ toolCallId: 'python-1' })]),
-    });
+    expect(
+      summarizeHarnessSubagentResult(rawResult, { includeEarlierReceipts: true }).evidence?.map(
+        item => item.toolCallId,
+      ),
+    ).toEqual(['python-3', 'python-1', 'python-2']);
+    expect(summarizeHarnessSubagentResult(rawResult).evidence?.map(item => item.toolCallId)).toEqual(['python-3']);
   });
 
   it('adds no fallback-only or ambiguous call to direct-delivery evidence, and keeps a failed call as an error', () => {
@@ -357,7 +358,7 @@ describe('Harness subagent outcome terminal contract', () => {
     expect(completion?.evidence.length).toBeGreaterThan(1);
     expect(completion?.evidence.length).toBeLessThan(24);
     expect(completion?.evidence.at(-1)?.toolCallId).toBe('python-short');
-    const summary = summarizeHarnessSubagentResult(rawResult);
+    const summary = summarizeHarnessSubagentResult(rawResult, { includeEarlierReceipts: true });
     expect(summary).toMatchObject({ status: 'success', outcome: 'completed', text: answer });
     expect(projectHarnessSpawnSubagentResult({ subagentSessionId: 'child-session-1', result: summary })).toMatchObject({
       kind: 'subagent-direct-answer',

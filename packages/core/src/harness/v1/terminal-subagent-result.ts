@@ -557,6 +557,13 @@ export function summarizeHarnessSubagentResult(
     isError?: boolean;
     error?: { code: string; message: string };
     budgetExhausted?: z.infer<typeof harnessSubagentBudgetExhaustedSchema>;
+    /**
+     * Append a direct delivery's earlier framework receipts to the evidence.
+     * Only the inline `spawn_subagent` result opts in: its envelope is the one
+     * the trace budget below reserves. Persisted plan-task results keep the
+     * required evidence only, so their views never grow.
+     */
+    includeEarlierReceipts?: boolean;
   } = {},
 ): HarnessSubagentResultSummary {
   const record = isRecord(value) ? value : undefined;
@@ -613,10 +620,10 @@ export function summarizeHarnessSubagentResult(
   };
   // Earlier receipts appended to a direct delivery's evidence only use room
   // the rest of the summary leaves inside the envelope the trace budget below
-  // assumes, so they never make a settled task unreadable. A receipt that does
-  // not fit is skipped and stays unproven; the required evidence always stays.
+  // assumes. A receipt that does not fit is skipped and stays unproven; the
+  // required evidence always stays.
   const withEvidence =
-    report === undefined
+    report === undefined || options.includeEarlierReceipts !== true
       ? draft
       : fitAppendedEvidence(
           draft,
