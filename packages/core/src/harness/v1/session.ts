@@ -288,6 +288,7 @@ import {
   updateGoalJudgeDefaults,
 } from './session-goal-judge';
 import type { GoalJudgeSessionPort } from './session-goal-judge';
+import { MessageTokenLedger } from './session-message-token-ledger';
 import {
   currentMode,
   currentModeId,
@@ -1799,14 +1800,8 @@ export class Session {
   >();
   /** Runs of aborted native terminal turns whose output had not settled yet (bounded). */
   private readonly _abortedTerminalRunIds = new Set<string>();
-  /**
-   * Message admission retries can observe `_completedRuns` before the original
-   * message continuation has accounted usage. Track run ids accounted through
-   * either path so the retry can persist before writing evidence without the
-   * original continuation double-counting later.
-   */
-  private readonly _messageTokenAccountedRunIds = new Set<string>();
-  private readonly _messageTokenAccountingRunIds = new Set<string>();
+  /** PF-8451: the message-token ledger (runs counted here, runs a suspended capture is counting). */
+  private readonly _messageTokenLedger = new MessageTokenLedger();
   /** §10.5: when false, transient streaming deltas are not persisted (live-only). */
   private readonly _persistTransientStreamingEvents: boolean;
   /** Registered opt-in sanitizer for the native terminal transaction. */
@@ -1821,7 +1816,6 @@ export class Session {
   private readonly _terminalWakeFinalizer?: HarnessTerminalFinalizer;
   /** PF-8389: the settlement wake admissions (in flight here, released to recovery). */
   private readonly _wakeAdmissions = new WakeAdmissions();
-  private readonly _messageTokenAccountingReservations = new Map<string, Deferred<void>>();
   /**
    * PF-8389: the terminal staging ledger (per run: usage fence, staged mark,
    * native admission mark, cached pending admission).
@@ -5380,14 +5374,14 @@ export class Session {
     this._captureTurnRunId(full);
     if (
       full.runId &&
-      (this._messageTokenAccountedRunIds.has(full.runId) || this._terminalStagingLedger.isAccounted(full.runId))
+      (this._messageTokenLedger.isAccounted(full.runId) || this._terminalStagingLedger.isAccounted(full.runId))
     ) {
       return { tokenUsageAccounted: true };
     }
     const tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
     this._applyTokenUsageDelta(tokenUsageDelta);
     if (tokenUsageDelta !== undefined) {
-      if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
+      if (full.runId) this._messageTokenLedger.markAccounted(full.runId);
       if (full.runId && this._terminalStagingLedger.isStaged(full.runId)) {
         this._terminalStagingLedger.markAccounted(full.runId);
       }
@@ -5400,7 +5394,7 @@ export class Session {
   private _messageSuspendedTokenUsageDelta(full: FullOutput<unknown>): TokenUsage | undefined {
     if (
       full.runId &&
-      (this._messageTokenAccountedRunIds.has(full.runId) || this._messageTokenAccountingRunIds.has(full.runId))
+      (this._messageTokenLedger.isAccounted(full.runId) || this._messageTokenLedger.isReserved(full.runId))
     ) {
       return undefined;
     }
@@ -5422,8 +5416,7 @@ export class Session {
     const tokenUsageDelta = this._messageSuspendedTokenUsageDelta(full);
     if (tokenUsageDelta !== undefined && full.runId) {
       const reservation = createDeferred<void>();
-      this._messageTokenAccountingRunIds.add(full.runId);
-      this._messageTokenAccountingReservations.set(full.runId, reservation);
+      this._messageTokenLedger.reserve(full.runId, reservation);
       void reservation.promise.catch(() => {});
       return { tokenUsageDelta, reservedRunId: full.runId, reservation };
     }
@@ -5435,14 +5428,10 @@ export class Session {
     reservation: { tokenUsageDelta?: TokenUsage; reservedRunId?: string; reservation?: Deferred<void> },
   ): void {
     if (reservation.reservedRunId !== undefined) {
-      this._messageTokenAccountingRunIds.delete(reservation.reservedRunId);
-      if (this._messageTokenAccountingReservations.get(reservation.reservedRunId) === reservation.reservation) {
-        this._messageTokenAccountingReservations.delete(reservation.reservedRunId);
-      }
-      this._messageTokenAccountedRunIds.add(reservation.reservedRunId);
+      this._messageTokenLedger.commit(reservation.reservedRunId, reservation.reservation);
       reservation.reservation?.resolve();
     } else if (reservation.tokenUsageDelta !== undefined && full.runId) {
-      this._messageTokenAccountedRunIds.add(full.runId);
+      this._messageTokenLedger.markAccounted(full.runId);
     }
   }
 
@@ -5451,10 +5440,7 @@ export class Session {
     reservation?: Deferred<void>;
   }): void {
     if (reservation.reservedRunId !== undefined) {
-      this._messageTokenAccountingRunIds.delete(reservation.reservedRunId);
-      if (this._messageTokenAccountingReservations.get(reservation.reservedRunId) === reservation.reservation) {
-        this._messageTokenAccountingReservations.delete(reservation.reservedRunId);
-      }
+      this._messageTokenLedger.rollback(reservation.reservedRunId, reservation.reservation);
       reservation.reservation?.resolve();
     }
   }
@@ -5464,8 +5450,8 @@ export class Session {
     activeTurnWaiter?: Promise<never>,
   ): Promise<void> {
     if (!full.runId) return;
-    while (!this._messageTokenAccountedRunIds.has(full.runId)) {
-      const reservation = this._messageTokenAccountingReservations.get(full.runId);
+    while (!this._messageTokenLedger.isAccounted(full.runId)) {
+      const reservation = this._messageTokenLedger.reservationFor(full.runId);
       if (reservation === undefined) return;
       await this._raceActiveTurnWaiter(reservation.promise, activeTurnWaiter);
     }
@@ -7673,9 +7659,7 @@ export class Session {
       const oldest = this._completedRuns.keys().next().value;
       if (oldest === undefined) return;
       this._completedRuns.delete(oldest);
-      this._messageTokenAccountedRunIds.delete(oldest);
-      this._messageTokenAccountingRunIds.delete(oldest);
-      this._messageTokenAccountingReservations.delete(oldest);
+      this._messageTokenLedger.evict(oldest);
       this._runToolReceipts.delete(oldest);
     }
   }
@@ -10388,7 +10372,7 @@ export class Session {
         const runUsage = this._tokenUsageDeltaFromFullOutput(staged);
         if (runUsage !== undefined) this._resumeUsageBaseline = { generationKey, runUsage };
       }
-      this._messageTokenAccountedRunIds.add(runId);
+      this._messageTokenLedger.markAccounted(runId);
     } else {
       this._recordMessageTurnCompletion(staged, { persist: false });
     }
@@ -17491,7 +17475,7 @@ export class Session {
       // This run's usage is now part of the session total — mark the
       // message-side memo too, or a cached-duplicate replay of the resumed
       // output re-adds the run's cumulative usage.
-      this._messageTokenAccountedRunIds.add(pending.runId);
+      this._messageTokenLedger.markAccounted(pending.runId);
       // Arm the durable fence: the live counter already holds this delta, so
       // every flush until the pending clears must persist the advanced
       // baseline alongside it — a cold retry then computes a zero delta.
@@ -17540,7 +17524,7 @@ export class Session {
           this._captureTurnRunId(full);
           tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
           alreadyAccounted = true;
-          this._messageTokenAccountedRunIds.add(pending.runId);
+          this._messageTokenLedger.markAccounted(pending.runId);
           await Promise.race([
             this._markQueuedPostRunFinalized(completingQueuedItemId, { tokenUsageDelta }),
             deletedTurnWaiter,
@@ -17701,7 +17685,7 @@ export class Session {
       // The flush durably applied the re-suspension's usage delta — mark the
       // message-side memo so a cached-duplicate replay of this run cannot
       // re-apply its cumulative usage after a reopen empties the sets.
-      this._messageTokenAccountedRunIds.add(pending.runId);
+      this._messageTokenLedger.markAccounted(pending.runId);
     } else {
       this._pendingReplacementToolSurfaces.delete(pending.runId);
     }
@@ -18320,7 +18304,7 @@ export class Session {
           this._captureTurnRunId(full);
           tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full, pending.accountedTokenUsage);
           alreadyAccounted = true;
-          this._messageTokenAccountedRunIds.add(pending.runId);
+          this._messageTokenLedger.markAccounted(pending.runId);
           await this._markQueuedPostRunFinalized(queuedItemId, { tokenUsageDelta });
         } catch (err) {
           this._deferQueuedTurnRetry(
@@ -19868,7 +19852,7 @@ export class Session {
         this._captureTurnRunId(full);
         tokenUsageDelta = this._tokenUsageDeltaFromFullOutput(full);
         alreadyAccounted = true;
-        if (full.runId) this._messageTokenAccountedRunIds.add(full.runId);
+        if (full.runId) this._messageTokenLedger.markAccounted(full.runId);
         await this._raceActiveTurnWaiter(
           this._markQueuedPostRunFinalized(item.id, { tokenUsageDelta }),
           activeTurnWaiter,
