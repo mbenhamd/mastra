@@ -1045,13 +1045,17 @@ function resolveHarnessSubagentTerminalCompletion(
   for (const receipt of frameworkToolReceipts(value)) {
     if (evidence.length >= MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS) break;
     if (seenCallIds.has(receipt.toolCallId) || byCallId.get(receipt.toolCallId)?.length !== 1) continue;
-    const item: HarnessSubagentOutcomeReport['evidence'][number] = {
+    const parsed = harnessSubagentOutcomeEvidenceSchema.safeParse({
       kind: 'tool-result',
       toolName: receipt.toolName,
       toolCallId: receipt.toolCallId,
       status: receipt.status,
       description: `Framework-observed result from ${receipt.toolName}.`,
-    };
+    });
+    // An optional receipt the report schema would reject is skipped, so it
+    // can never invalidate the verified terminal completion.
+    if (!parsed.success) continue;
+    const item = parsed.data;
     // One more array element serializes as a comma plus the item.
     const itemBytes = encoder.encode(JSON.stringify(item)).byteLength + 1;
     // Skip a receipt that does not fit; a smaller later one still may.

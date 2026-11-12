@@ -294,7 +294,7 @@ describe('Harness subagent outcome terminal contract', () => {
     expect(summarizeHarnessSubagentResult(rawResult).evidence?.map(item => item.toolCallId)).toEqual(['python-3']);
   });
 
-  it('adds no fallback-only or ambiguous call to direct-delivery evidence, and keeps a failed call as an error', () => {
+  it('adds no fallback-only, ambiguous or out-of-schema call to direct-delivery evidence, and keeps a failed call as an error', () => {
     const terminalToolResult = {
       status: 'success',
       items: [
@@ -316,6 +316,7 @@ describe('Harness subagent outcome terminal contract', () => {
         { toolCallId: 'python-failed', toolName: 'run_python_analysis', status: 'error' },
         { toolCallId: 'python-ambiguous', toolName: 'run_python_analysis', status: 'success' },
         { toolCallId: 'python-ambiguous', toolName: 'run_python_analysis', status: 'error' },
+        { toolCallId: 'x'.repeat(1_025), toolName: 'run_python_analysis', status: 'success' },
         { toolCallId: 'python-final', toolName: 'run_python_analysis', status: 'success' },
       ],
     );
