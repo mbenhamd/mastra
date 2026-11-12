@@ -5423,10 +5423,11 @@ export class Session {
     return { tokenUsageDelta };
   }
 
-  private _commitMessageSuspendedTokenUsage(
-    full: FullOutput<unknown>,
-    reservation: { tokenUsageDelta?: TokenUsage; reservedRunId?: string; reservation?: Deferred<void> },
-  ): void {
+  private _commitMessageSuspendedTokenUsage(reservation: {
+    tokenUsageDelta?: TokenUsage;
+    reservedRunId?: string;
+    reservation?: Deferred<void>;
+  }): void {
     if (reservation.reservedRunId !== undefined) {
       this._messageTokenLedger.commit(reservation.reservedRunId, reservation.reservation);
       reservation.reservation?.resolve();
@@ -5473,7 +5474,7 @@ export class Session {
         }),
         activeTurnWaiter,
       );
-      this._commitMessageSuspendedTokenUsage(full, reservation);
+      this._commitMessageSuspendedTokenUsage(reservation);
     } catch (err) {
       this._rollbackMessageSuspendedTokenUsage(reservation);
       throw err;
