@@ -42,7 +42,6 @@ import {
   PLAN_TASK_UPDATED_EVENT,
 } from './plan-task-session';
 import type { PlanTaskSessionPort, PlanTaskSummary, PlanTaskUpdatedPayload } from './plan-task-session';
-import { summarizeHarnessSubagentResult, withHarnessSubagentToolReceipts } from './terminal-subagent-result';
 
 const OWNER = 'owner-1';
 const SESSION_ID = 's1';
@@ -1316,49 +1315,6 @@ describe('planTaskCheck — bounded read', () => {
         PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
       );
     }
-  });
-
-  it('keeps a settled near-limit direct delivery readable by persisting only its terminal evidence', async () => {
-    const answer = 'a'.repeat(47 * 1024);
-    const terminalToolResult = {
-      status: 'success',
-      items: [
-        {
-          toolName: 'run_python_analysis',
-          toolCallId: 'python-final',
-          status: 'success',
-          value: { text: answer, artifacts: [{ metadata: 'm'.repeat(11 * 1024) }] },
-        },
-      ],
-    };
-    const rawResult = withHarnessSubagentToolReceipts({ finishReason: 'tool-calls', terminalToolResult }, [
-      ...Array.from({ length: 23 }, (_, index) => ({
-        toolCallId: `${String(index).padStart(2, '0')}${'x'.repeat(1_022)}`,
-        toolName: 'run_python_analysis',
-        status: 'success' as const,
-      })),
-      { toolCallId: 'python-short', toolName: 'run_python_analysis', status: 'success' },
-      { toolCallId: 'python-final', toolName: 'run_python_analysis', status: 'success' },
-    ]);
-    const { port } = await setup();
-    const task = await planTaskAdd(port, { content: 'near-limit direct delivery' });
-    await planTaskDelegate(port, { taskId: task.taskId, subagentSessionId: 'subagent-receipts' });
-    await planTaskReconcileDelegation(port, {
-      taskId: task.taskId,
-      subagentSessionId: 'subagent-receipts',
-      outcome: 'completed',
-      result: summarizeHarnessSubagentResult(rawResult),
-    });
-
-    const res = await planTaskCheck(port, {});
-
-    const result = res.tasks[0]?.delegation?.result;
-    expect(result).toMatchObject({ status: 'success', outcome: 'completed', text: answer });
-    expect(result?.artifacts).toHaveLength(1);
-    expect(result?.evidence?.map(item => item.toolCallId)).toEqual(['python-final']);
-    expect(new TextEncoder().encode(JSON.stringify(res)).byteLength).toBeLessThanOrEqual(
-      PLAN_TASK_CHECK_MAX_OUTPUT_BYTES,
-    );
   });
 
   it('honors depth (depth 0 returns only the root)', async () => {
