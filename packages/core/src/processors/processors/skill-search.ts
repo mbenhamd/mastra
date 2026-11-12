@@ -219,8 +219,8 @@ export interface SkillSearchProcessorOptions {
 
     /**
      * When true, skills returned by `search_skills` are activated immediately
-     * and `load_skill` is not exposed. Their instructions become available on
-     * the model's next turn.
+     * and `load_skill` is not exposed. Their instructions are added on the
+     * model's next step of the same run.
      *
      * This removes the separate load turn while keeping discovery model-driven.
      * Because every match is activated, keep `topK` conservative in this mode.
@@ -550,7 +550,7 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
     messageList.addSystem(
       autoLoad
         ? 'To discover available skills, call search_skills with a keyword query. ' +
-            'Matching skills are loaded automatically and their instructions become available on your next turn. ' +
+            'Matching skills are loaded automatically and their instructions apply once the search returns. ' +
             'There is no separate load step; after searching, follow the loaded instructions.'
         : 'To discover available skills, call search_skills with a keyword query. ' +
             "To load a skill's instructions, call load_skill with the skill name. " +
@@ -570,7 +570,7 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
       id: 'search_skills',
       description: autoLoad
         ? 'Search for available skills by keyword. ' +
-          'Matching skills are loaded automatically and their instructions become available on your next turn. ' +
+          'Matching skills are loaded automatically and their instructions apply once the search returns. ' +
           'No separate load step is required.'
         : 'Search for available skills by keyword. ' +
           'Returns a list of matching skills with their names and descriptions. ' +
@@ -685,7 +685,7 @@ export class SkillSearchProcessor implements Processor<'skill-search'> {
             },
             message:
               `Found and loaded ${results.length} skill(s): ${results.map(result => result.name).join(', ')}. ` +
-              'Their instructions are available on your next turn.' +
+              'Their instructions now apply.' +
               (alreadyLoadedCount > 0 ? ' Some were already loaded.' : ''),
           };
         }

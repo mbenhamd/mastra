@@ -394,6 +394,7 @@ describe('SkillSearchProcessor', () => {
         },
         results: [expect.objectContaining({ name: 'api-design' })],
       });
+      expect(searchResult.message).not.toMatch(/next turn/i);
 
       const nextArgs = createMockArgs('auto-load-thread', [], state);
       const systemMessages = spyOnSystemMessages(nextArgs);
