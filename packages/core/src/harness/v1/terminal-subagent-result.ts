@@ -432,6 +432,15 @@ function collectToolReceipts(value: unknown): {
   };
 }
 
+/** Framework-minted receipts only, in recorded order; never run tool-result fallbacks. */
+function frameworkToolReceipts(value: unknown): HarnessSubagentToolReceipt[] {
+  if (!isRecord(value)) return [];
+  return itemArray(value[HARNESS_SUBAGENT_TOOL_RECEIPTS_FIELD]).flatMap(candidate => {
+    const receipt = normalizeToolReceipt(candidate);
+    return receipt === undefined ? [] : [receipt];
+  });
+}
+
 function truncateUtf8(value: string, maxBytes: number, marker = HARNESS_SUBAGENT_TEXT_TRUNCATION_MARKER) {
   const encoder = new TextEncoder();
   const encoded = encoder.encode(value);
@@ -963,6 +972,24 @@ export function verifyHarnessSubagentTerminalCompletion(value: unknown): Harness
       toolCallId: item.toolCallId,
       status: 'success',
       description: `Framework-observed terminal result from ${item.toolName}.`,
+    });
+  }
+  // The terminal items prove only the call that delivered the answer. The
+  // child's other framework-minted receipts are Harness-observed too, so they
+  // join the evidence in call order: a caller that requires every delegated
+  // call to be proven can then verify a multi-call direct delivery. Run
+  // tool-result fallbacks are provider-shaped and never added, an ambiguous
+  // call id is skipped, and the list stays within the report's item bound.
+  for (const receipt of frameworkToolReceipts(value)) {
+    if (evidence.length >= MAX_HARNESS_SUBAGENT_EVIDENCE_ITEMS) break;
+    if (seenCallIds.has(receipt.toolCallId) || byCallId.get(receipt.toolCallId)?.length !== 1) continue;
+    seenCallIds.add(receipt.toolCallId);
+    evidence.push({
+      kind: 'tool-result',
+      toolName: receipt.toolName,
+      toolCallId: receipt.toolCallId,
+      status: receipt.status,
+      description: `Framework-observed result from ${receipt.toolName}.`,
     });
   }
 
