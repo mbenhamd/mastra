@@ -1362,7 +1362,7 @@ describe('ComposioToolProvider — listConnections', () => {
     let response: (query: URLSearchParams) => object;
     const server = createServer((request, reply) => {
       const url = new URL(request.url!, baseURL);
-      if (url.pathname !== '/api/v3/connected_accounts' || request.method !== 'GET') {
+      if (url.pathname !== '/api/v3.1/connected_accounts' || request.method !== 'GET') {
         reply.writeHead(404).end();
         return;
       }
