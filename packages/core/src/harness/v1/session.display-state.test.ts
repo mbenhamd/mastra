@@ -11,7 +11,7 @@
  *   - Queue depth + `currentQueuedItemId` track the running queued item.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MockAgent } from './__test-utils__/mock-agent';
 import { setupHarness } from './__test-utils__/setup';
 import { toHarnessDisplayStateSnapshotV1 } from './display-state';
@@ -919,7 +919,12 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
     }
   });
 
-  it("links its own signal() run to its signal when the run's first chunk arrives before agent_start", async () => {
+  it("links its own signal() run to its signal and its start time when the run's first chunk arrives before agent_start", async () => {
+    // Only Date is faked: the clock moves when the signal is acknowledged, so
+    // the run's start time differs from any earlier record activity time.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(1_000_000);
+    const acknowledgedAt = 2_000_000;
     const { harness, agent } = setupHarness();
     const session = await harness.session({ resourceId: 'u', threadId: { fresh: true } });
     // The runtime may start the stream before it acknowledges the signal: hold
@@ -932,6 +937,7 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
         ...sent,
         accepted: sent.accepted.then(async accepted => {
           await new Promise(resolve => setTimeout(resolve, 30));
+          vi.setSystemTime(acknowledgedAt);
           return accepted;
         }),
       };
@@ -956,10 +962,15 @@ describe('Session.getDisplayState — currentRun §5.1b fidelity (F11b)', () => 
       const signal = await session.signal({ content: 'hi', admissionId: 'own-signal-run' });
       for (let i = 0; i < 100 && atAgentStart === undefined; i++) await new Promise(resolve => setTimeout(resolve, 10));
       expect(order.indexOf('text_delta')).toBeLessThan(order.indexOf('agent_start'));
-      expect(atAgentStart).toMatchObject({ status: 'running', operation: { kind: 'signal', signalId: signal.id } });
+      expect(atAgentStart).toMatchObject({
+        status: 'running',
+        startedAt: acknowledgedAt,
+        operation: { kind: 'signal', signalId: signal.id },
+      });
     } finally {
       release();
       off();
+      vi.useRealTimers();
     }
   });
 
