@@ -21,6 +21,32 @@
  * path has settled the waiter, so it removes something only if that path
  * threw before settling. A caller holding a promise from `promiseFor` can
  * name it to `dropIfCurrent`, as it could before.
+ *
+ * **What changed from the base.** Only the `getFullOutput` failure path of
+ * `_handleRunTerminal` behaves differently. It reads the run's waiter (W1)
+ * before `await out.getFullOutput()`, and on failure it used to delete
+ * whatever waiter the map held after that `await` but reject only W1. It now
+ * calls `fail`, so the waiter it removes is the one it rejects. The
+ * difference needs a second waiter (W2) registered during that `await`. That
+ * happens only if W1 was settled and removed and the run's recorded failure
+ * was then evicted from the session's 64-run completed cache, so a new
+ * `_awaitRunCompletion` registered W2 and started a second watcher. Then:
+ *
+ *   1. If W2's watcher reaches `_handleRunTerminal` after this failure path
+ *      ran: before, W2 was removed unsettled and its caller waited forever.
+ *      Now W2 is rejected with this path's error.
+ *   2. If W2's watcher captured W2 before this failure path ran: before, W2
+ *      was removed unsettled here and then settled by its own watcher through
+ *      its captured handle, with that watcher's outcome. Now W2 is rejected
+ *      here with this path's error, and the second watcher's
+ *      `resolveIfCurrent`/`rejectIfCurrent` does nothing. The outcomes differ
+ *      only if the two watchers read different outputs (a new run under the
+ *      same id). On one output, `getFullOutput` drains the stream once and
+ *      rejects every caller with the same captured error.
+ *
+ * In both cases W2 now carries the failure the session records for the run
+ * in the same step, which is what a caller arriving afterwards gets from the
+ * completed cache.
  */
 
 import type { FullOutput } from '../../stream/base/output';
@@ -33,9 +59,9 @@ type RunCompletionWaiter = {
 
 export class RunCompletionWaiters {
   /**
-   * Per-run completion promises, keyed by `runId`. `_watchRunCompletion()`
-   * resolves or rejects the matching entry after the runtime output finishes.
-   * Entries left over on `close()` are rejected so callers don't hang.
+   * At most one waiter per run, keyed by `runId`: the shared promise with its
+   * settle functions. An entry is removed only by the operation that settles
+   * it, or by `dropIfCurrent`.
    */
   private readonly _waiters = new Map<string, RunCompletionWaiter>();
 

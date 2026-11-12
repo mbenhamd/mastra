@@ -7410,6 +7410,9 @@ export class Session {
       const runFailed = !aborted && out.status === 'failed' && out.error !== undefined && out.error === err;
       this._runToolReceipts.delete(runId);
       this._rememberCompletedRun(runId, { ok: false, err, ...(runFailed ? { runFailed: true as const } : {}) });
+      // Remember before `fail`, as the base did here, while the other failure
+      // sites `fail` first. Either order is the same: `_rememberCompletedRun`
+      // never reads the waiters, and a rejection runs no continuation synchronously.
       this._runCompletionWaiters.fail(runId, err);
       return;
     }
